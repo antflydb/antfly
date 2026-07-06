@@ -81,6 +81,7 @@ pub const TokenKeyword = enum {
     assignment,
     asymmetric,
     avg,
+    backup,
     base_weight,
     before,
     begin,
@@ -160,6 +161,7 @@ pub const TokenKeyword = enum {
     @"for",
     format,
     foreign,
+    freeze,
     freshness,
     full,
     full_text_search,
@@ -302,6 +304,7 @@ pub const TokenKeyword = enum {
     replace,
     repeat,
     range,
+    restore,
     @"return",
     returning,
     revoke,
@@ -518,6 +521,7 @@ test "sql adapter tokens match keyword tags without treating quoted identifiers 
     try std.testing.expectEqual(TokenKeyword.current_date, keywordFromIdentifier("CURRENT_DATE").?);
     try std.testing.expectEqual(TokenKeyword.current_timestamp, keywordFromIdentifier("CURRENT_TIMESTAMP").?);
     try std.testing.expectEqual(TokenKeyword.current, keywordFromIdentifier("CURRENT").?);
+    try std.testing.expectEqual(TokenKeyword.backup, keywordFromIdentifier("BACKUP").?);
     try std.testing.expectEqual(TokenKeyword.call, keywordFromIdentifier("CALL").?);
     try std.testing.expectEqual(TokenKeyword.checkpoint, keywordFromIdentifier("CHECKPOINT").?);
     try std.testing.expectEqual(TokenKeyword.cluster, keywordFromIdentifier("CLUSTER").?);
@@ -532,6 +536,7 @@ test "sql adapter tokens match keyword tags without treating quoted identifiers 
     try std.testing.expectEqual(TokenKeyword.costs, keywordFromIdentifier("COSTS").?);
     try std.testing.expectEqual(TokenKeyword.cross, keywordFromIdentifier("CROSS").?);
     try std.testing.expectEqual(TokenKeyword.format, keywordFromIdentifier("FORMAT").?);
+    try std.testing.expectEqual(TokenKeyword.freeze, keywordFromIdentifier("FREEZE").?);
     try std.testing.expectEqual(TokenKeyword.grant, keywordFromIdentifier("GRANT").?);
     try std.testing.expectEqual(TokenKeyword.label, keywordFromIdentifier("LABEL").?);
     try std.testing.expectEqual(TokenKeyword.btrim, keywordFromIdentifier("BTRIM").?);
@@ -597,6 +602,7 @@ test "sql adapter tokens match keyword tags without treating quoted identifiers 
     try std.testing.expectEqual(TokenKeyword.reindex, keywordFromIdentifier("REINDEX").?);
     try std.testing.expectEqual(TokenKeyword.refresh, keywordFromIdentifier("REFRESH").?);
     try std.testing.expectEqual(TokenKeyword.release, keywordFromIdentifier("RELEASE").?);
+    try std.testing.expectEqual(TokenKeyword.restore, keywordFromIdentifier("RESTORE").?);
     try std.testing.expectEqual(TokenKeyword.@"return", keywordFromIdentifier("RETURN").?);
     try std.testing.expectEqual(TokenKeyword.revoke, keywordFromIdentifier("REVOKE").?);
     try std.testing.expectEqual(TokenKeyword.role, keywordFromIdentifier("ROLE").?);

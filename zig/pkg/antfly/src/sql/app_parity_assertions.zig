@@ -56,6 +56,7 @@ pub fn expectFailClosedUnsupported(result: anytype) !void {
         return error.TestExpectedError;
     } else |err| switch (err) {
         error.UnsupportedSqlShape,
+        error.UnsupportedQueryRequest,
         error.InvalidSqlCatalog,
         error.DocumentSqlMergeRequiresNativeProducer,
         error.DocumentSqlLateralRequiresNativeProducer,
@@ -107,7 +108,7 @@ pub fn adapterNoopFingerprintAlloc(
     };
 }
 
-fn appParityResolveDenseQuery(
+pub fn appParityResolveDenseQuery(
     ptr: *anyopaque,
     allocator: std.mem.Allocator,
     table_name: []const u8,

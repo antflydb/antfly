@@ -2,20 +2,20 @@
   "fixture_format": 1,
   "cases": [
     {
-      "name": "backups-backup-database-generated-rejection",
+      "name": "backups-backup-database-generated-unsupported-ast",
       "family": "backups",
       "sql": "BACKUP DATABASE tenant_ops TO 's3://usage-backups/tenant_ops'",
-      "expected_statement_kind": "",
-      "expected_statement_tag": "",
-      "expected_error": "UnexpectedToken"
+      "expected_statement_kind": "unsupported",
+      "expected_statement_tag": "backup_database",
+      "expected_error": ""
     },
     {
-      "name": "backups-restore-database-generated-rejection",
+      "name": "backups-restore-database-generated-unsupported-ast",
       "family": "backups",
       "sql": "RESTORE DATABASE tenant_ops FROM 's3://usage-backups/tenant_ops'",
-      "expected_statement_kind": "",
-      "expected_statement_tag": "",
-      "expected_error": "UnexpectedToken"
+      "expected_statement_kind": "unsupported",
+      "expected_statement_tag": "restore_database",
+      "expected_error": ""
     },
     {
       "name": "ddl-alter-table-add-primary-key-generated-ast",

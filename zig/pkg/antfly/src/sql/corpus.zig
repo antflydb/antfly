@@ -6919,11 +6919,6 @@ fn parseSourceCorpusRootWithOptionsAlloc(
             continue;
         }
         var parsed_sql = tokenized.ParsedSql.initAlloc(alloc, entry.sql) catch |err| {
-            if (try validateSourceCorpusGeneratedParseFailureEntryAlloc(alloc, entry, err)) {
-                try seen_names.put(alloc, entry.name, {});
-                try entries.append(alloc, entry);
-                continue;
-            }
             std.debug.print("source corpus parse failed: {s}: {s}: {}\n", .{ entry.name, entry.sql, err });
             return error.TestUnexpectedResult;
         };
@@ -6944,46 +6939,6 @@ fn parseSourceCorpusRootWithOptionsAlloc(
 fn sourceCorpusEntryHasClassificationReason(entry: AppParityCorpusEntry, reason: []const u8) bool {
     return std.mem.eql(u8, entry.classification_reason, reason) or
         std.mem.indexOf(u8, entry.plan, reason) != null;
-}
-
-fn sourceCorpusEntryHasSubqueryPredicateReason(entry: AppParityCorpusEntry) bool {
-    return sourceCorpusEntryHasClassificationReason(entry, "subquery_scalar_plan") or
-        sourceCorpusEntryHasClassificationReason(entry, "subquery_semijoin_plan") or
-        sourceCorpusEntryHasClassificationReason(entry, "subquery_quantified_plan");
-}
-
-fn sourceCorpusEntryHasMatchingReason(entry: AppParityCorpusEntry, reason: []const u8) bool {
-    return sourceCorpusEntryHasClassificationReason(entry, reason) and
-        corpusPlanMatchesReason(entry.family, entry.plan, reason);
-}
-
-fn validateSourceCorpusGeneratedParseFailureEntryAlloc(
-    _: std.mem.Allocator,
-    entry: AppParityCorpusEntry,
-    err: anyerror,
-) !bool {
-    switch (err) {
-        error.UnexpectedToken, error.UnsupportedSqlShape => {},
-        else => return false,
-    }
-    if (entry.family == .unsupported_ddl and
-        sourceCorpusEntryHasMatchingReason(entry, "backup_lifecycle_sql_unavailable"))
-    {
-        return true;
-    }
-    return entry.family == .unsupported_read and
-        (sourceCorpusEntryHasMatchingReason(entry, "subquery_expression_plan") or
-            sourceCorpusEntryHasMatchingReason(entry, "subquery_scalar_plan") or
-            sourceCorpusEntryHasMatchingReason(entry, "subquery_semijoin_plan") or
-            sourceCorpusEntryHasMatchingReason(entry, "subquery_quantified_plan"));
-}
-
-pub fn sourceCorpusGeneratedParseFailureEntryAlloc(
-    alloc: std.mem.Allocator,
-    entry: AppParityCorpusEntry,
-    err: anyerror,
-) !bool {
-    return validateSourceCorpusGeneratedParseFailureEntryAlloc(alloc, entry, err);
 }
 
 pub fn freeSourceCorpusRoot(alloc: std.mem.Allocator, root: AppParitySourceCorpusRoot) void {
@@ -12366,6 +12321,28 @@ test "sql adapter corpus parses source corpus root entries" {
     try std.testing.expectEqual(AppParityDdlTag.prepare_statement, root.entries[0].summary.ddl_tag.?);
 }
 
+test "sql adapter source corpus rejects generated parse failure exemptions" {
+    const alloc = std.testing.allocator;
+    const source_json =
+        \\{
+        \\  "source_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "name": "formerly exempt malformed subquery",
+        \\      "family": "unsupported_read",
+        \\      "sql": "SELECT id FROM usage_records WHERE id IN (SELECT",
+        \\      "plan": "unsupported:read:requires=subquery_expression_plan",
+        \\      "classification_reason": "subquery_expression_plan"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, source_json, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectError(error.TestUnexpectedResult, parseSourceCorpusRootWithOptionsAlloc(alloc, parsed.value, .{}));
+}
+
 test "sql adapter source corpus derives native equivalence for every entry" {
     const alloc = std.testing.allocator;
     var source = try parseAppParityExternalSourceCorpusAlloc(alloc);
@@ -12962,7 +12939,8 @@ test "sql adapter corpus validates parser migration table manifest" {
     try std.testing.expectEqualStrings("http", table.root.families[0].entrypoints[0]);
     try std.testing.expectEqualStrings("document_sql", table.root.families[7].entrypoints[1]);
     try std.testing.expectEqualStrings("durable_executor", table.root.families[7].entrypoints[2]);
-    try std.testing.expectEqualStrings("generated_gated_unsupported", table.root.families[0].parser_status);
+    try std.testing.expectEqualStrings("generated_owned", table.root.families[0].parser_status);
+    try std.testing.expectEqualStrings("generated_owned", table.root.families[6].parser_status);
     try std.testing.expectEqualStrings("tokenized parsed sql retained AST corruption rejects generated unsupported DDL", table.root.families[0].retained_ast_corruption_test);
     try std.testing.expectEqual(@as(usize, 2), table.root.families[0].removal_evidence.raw_ast_fixtures.len);
     try std.testing.expectEqual(@as(usize, 4), table.root.families[1].removal_evidence.raw_ast_fixtures.len);
@@ -17673,28 +17651,8 @@ pub const AppParityCorpusCoverage = struct {
                     planHasStringToken(entry.plan, ":returning=")));
     }
 
-    fn observeGeneratedParseFailureEntryAlloc(
-        self: *@This(),
-        alloc: std.mem.Allocator,
-        entry: AppParityCorpusEntry,
-        err: anyerror,
-    ) !bool {
-        if (!(try validateSourceCorpusGeneratedParseFailureEntryAlloc(alloc, entry, err))) return false;
-        if (entry.family == .unsupported_ddl and sourceCorpusEntryHasClassificationReason(entry, "backup_lifecycle_sql_unavailable")) {
-            self.unsupported_ddl = true;
-            self.unsupported_ddl_backup_database_sql_unavailable = self.unsupported_ddl_backup_database_sql_unavailable or
-                std.mem.startsWith(u8, entry.sql, "BACKUP DATABASE ");
-            self.unsupported_ddl_restore_database_sql_unavailable = self.unsupported_ddl_restore_database_sql_unavailable or
-                std.mem.startsWith(u8, entry.sql, "RESTORE DATABASE ");
-        }
-        return true;
-    }
-
     pub fn observe(self: *@This(), alloc: std.mem.Allocator, entry: AppParityCorpusEntry) !void {
-        var parsed_sql = tokenized.ParsedSql.initAlloc(alloc, entry.sql) catch |err| {
-            if (try self.observeGeneratedParseFailureEntryAlloc(alloc, entry, err)) return;
-            return err;
-        };
+        var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, entry.sql);
         defer parsed_sql.deinit(alloc);
         const structured_summary = try appParityStructuredFixtureSummaryWithBinderAlloc(alloc, entry, &parsed_sql);
 

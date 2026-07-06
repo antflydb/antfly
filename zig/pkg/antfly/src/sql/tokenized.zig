@@ -21,6 +21,7 @@ const lexer = @import("lexer.zig");
 const token_mod = @import("token.zig");
 
 pub const Token = token_mod.Token;
+const TokenKind = token_mod.TokenKind;
 const TokenKeyword = token_mod.TokenKeyword;
 pub const SourceSpan = token_mod.SourceSpan;
 
@@ -326,21 +327,30 @@ pub const ParsedSql = struct {
         expected_statement_kind: generated_parser.GeneratedSqlStatementKind,
     ) !ParsedSql {
         if (expected_statement_kind != .ddl and expected_statement_kind != .extension_index) return error.UnsupportedSqlShape;
-        var parsed = try initFromOwnedTokenSliceAlloc(alloc, source_sql, source_tokens);
-        errdefer parsed.deinit(alloc);
-        if (parsed.generatedStatementKind() != expected_statement_kind) return error.UnsupportedSqlShape;
-        const parsed_generated = parsed.generated_statement orelse return error.UnsupportedSqlShape;
-        const parsed_ast = parsed_generated.ast orelse return error.UnsupportedSqlShape;
-        const parsed_ddl = switch (parsed_ast) {
-            .ddl => |ddl| ddl,
-            .extension_index => |ddl| ddl,
+        var tokenized_sql = try TokenizedSql.initFromOwnedTokenSliceAlloc(alloc, source_sql, source_tokens);
+        errdefer tokenized_sql.deinit(alloc);
+        var raw_statement = try parseRawStatementBounds(tokenized_sql.items());
+        var generated_statement = try generatedDdlRawStatementFromRetainedDdlAstAlloc(
+            alloc,
+            tokenized_sql.items(),
+            raw_statement,
+            generated_ddl_ast,
+            expected_statement_kind,
+        );
+        errdefer generated_statement.deinit(alloc);
+        raw_statement.family = rawStatementFamily(tokenized_sql.items(), raw_statement, generated_statement);
+        generated_statement.raw = raw_statement;
+        const statement = parseStatement(raw_statement, generated_statement, &tokenized_sql);
+        switch (statement) {
+            .ddl => {},
             else => return error.UnsupportedSqlShape,
-        };
-        if (parsed_ddl.kind != generated_ddl_ast.kind) return error.UnsupportedSqlShape;
-        if (!generatedDdlAstMatchesOwnedTokens(parsed.items(), parsed.raw_statement, generated_ddl_ast.*, expected_statement_kind)) {
-            return error.UnsupportedSqlShape;
         }
-        return parsed;
+        return .{
+            .tokenized_sql = tokenized_sql,
+            .raw_statement = raw_statement,
+            .generated_statement = generated_statement,
+            .statement = statement,
+        };
     }
 
     pub fn initChildStatementAlloc(
@@ -414,12 +424,34 @@ pub const ParsedSql = struct {
 
     pub fn readStatementKindIncludingGeneratedAst(self: *const ParsedSql) ?sql_statement_kind.SqlReadStatementKind {
         const generated_statement = self.generated_statement orelse return null;
+        if (generated_statement.kind() == .unsupported) {
+            return self.generatedUnsupportedReadStatementKindIncludingGeneratedAst();
+        }
         if (generated_statement.kind() != .read) return null;
         const generated_kind = self.generatedReadStatementKind() orelse return null;
         return switch (self.statement) {
             .read => |statement| if (statement.kind == generated_kind or statement.kind == .query) generated_kind else null,
             else => null,
         };
+    }
+
+    fn generatedUnsupportedReadStatementKindIncludingGeneratedAst(self: *const ParsedSql) ?sql_statement_kind.SqlReadStatementKind {
+        const unsupported_kind = self.unsupportedStatementKindIncludingGeneratedAst() orelse return null;
+        return switch (unsupported_kind) {
+            .graph_query => if (self.generatedUnsupportedGraphQueryPublishesRead()) .query else null,
+            else => null,
+        };
+    }
+
+    fn generatedUnsupportedGraphQueryPublishesRead(self: *const ParsedSql) bool {
+        const generated_statement = self.generated_statement orelse return false;
+        const generated_ast = generated_statement.ast orelse return false;
+        const unsupported_ast = switch (generated_ast) {
+            .unsupported => |unsupported| unsupported,
+            else => return false,
+        };
+        return unsupported_ast.kind == .graph_query and
+            unsupported_ast.graph_source_binding_tokens != null;
     }
 
     pub fn generatedReadStatementKind(self: *const ParsedSql) ?sql_statement_kind.SqlReadStatementKind {
@@ -522,7 +554,7 @@ pub const OwnedParsedSql = struct {
         const tokens = parent.items()[token_start..token_end];
         const owned_sql = try sqlTextFromTokenSliceAlloc(alloc, tokens);
         errdefer alloc.free(owned_sql);
-        var parsed = try ParsedSql.initFromOwnedTokenSliceAlloc(alloc, owned_sql, tokens);
+        var parsed = try ParsedSql.initFromOwnedTokenSliceWithGeneratedDmlAstAlloc(alloc, owned_sql, tokens, generated_dml_ast);
         errdefer parsed.deinit(alloc);
         const parsed_kind = parsed.writeStatementKindIncludingGeneratedAst() orelse return error.UnsupportedSqlShape;
         if (parsed_kind != generatedDmlAstWriteKind(generated_dml_ast.*)) return error.UnsupportedSqlShape;
@@ -570,10 +602,7 @@ fn parseGeneratedRawStatementAlloc(
     tokens: []const Token,
     raw_statement: RawSqlStatement,
 ) !?GeneratedRawSqlStatement {
-    const result = generated_parser.parseGeneratedGateTokensStrictAlloc(alloc, tokens) catch |err| switch (err) {
-        error.UnsupportedSqlShape, error.UnexpectedToken => return err,
-        else => return err,
-    };
+    const result = try generated_parser.parseGeneratedGateTokensStrictAlloc(alloc, tokens);
     if (result) |parsed| {
         return .{ .raw = raw_statement, .statement = parsed.statement, .ast = parsed.ast };
     }
@@ -620,6 +649,37 @@ fn generatedDmlRawStatementFromRetainedDmlAstAlloc(
     };
 }
 
+fn generatedDdlRawStatementFromRetainedDdlAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    raw_statement: RawSqlStatement,
+    source_ddl_ast: *const generated_parser.GeneratedSqlDdlAst,
+    expected_statement_kind: generated_parser.GeneratedSqlStatementKind,
+) !GeneratedRawSqlStatement {
+    if (expected_statement_kind != .ddl and expected_statement_kind != .extension_index) return error.UnsupportedSqlShape;
+    var ddl_ast = try generated_parser.cloneGeneratedDdlAstPtrAlloc(alloc, source_ddl_ast, tokens.len);
+    errdefer {
+        ddl_ast.deinit(alloc);
+        alloc.destroy(ddl_ast);
+    }
+    try normalizeGeneratedDdlAstSpansForOwnedChild(tokens, ddl_ast);
+    const ddl_value = ddl_ast.*;
+    alloc.destroy(ddl_ast);
+    return .{
+        .raw = raw_statement,
+        .statement = switch (expected_statement_kind) {
+            .ddl => .{ .ddl = ddl_value.kind },
+            .extension_index => .{ .extension_index = generatedExtensionIndexKindFromDdlKind(ddl_value.kind) orelse return error.UnsupportedSqlShape },
+            else => unreachable,
+        },
+        .ast = switch (expected_statement_kind) {
+            .ddl => .{ .ddl = ddl_value },
+            .extension_index => .{ .extension_index = ddl_value },
+            else => unreachable,
+        },
+    };
+}
+
 fn normalizeGeneratedReadAstSpansForOwnedChild(
     tokens: []const Token,
     read_ast: *generated_parser.GeneratedSqlReadAst,
@@ -651,7 +711,7 @@ fn normalizeGeneratedDmlAstSpansForOwnedChild(
     var end = tokens.len;
     while (end > 0 and tokens[end - 1].kind == .semicolon) end -= 1;
     if (end == 0) return error.UnsupportedSqlShape;
-    const command_start = generatedDmlCommandStart(tokens, dml_ast.*, end) orelse return error.UnsupportedSqlShape;
+    const command_start = generatedDmlCommandStartForOwnedChildNormalization(tokens, dml_ast.*, end) orelse return error.UnsupportedSqlShape;
     dml_ast.statement_span = .{
         .start = tokens[0].sourceSpan().start,
         .end = tokens[end - 1].sourceSpan().end,
@@ -672,6 +732,57 @@ fn normalizeGeneratedDmlAstSpansForOwnedChild(
         cte_prefix.first_body_dml = cte_prefix.items[0].body_dml;
         cte_prefix.last_body_read = cte_prefix.items[cte_prefix.items.len - 1].body_read;
         cte_prefix.last_body_dml = cte_prefix.items[cte_prefix.items.len - 1].body_dml;
+    }
+}
+
+fn generatedDmlCommandStartForOwnedChildNormalization(
+    tokens: []const Token,
+    dml_ast: generated_parser.GeneratedSqlDmlAst,
+    end: usize,
+) ?usize {
+    if (end == 0 or end > tokens.len) return null;
+    if (dml_ast.cte_tokens) |cte_tokens| {
+        if (!generatedDmlTokenRangeIsValid(tokens, end, cte_tokens)) return null;
+        if (cte_tokens.start != 1 or cte_tokens.end >= end) return null;
+        if (!tokens[0].matchesKeywordTag(.with)) return null;
+        const recursive = cte_tokens.start < cte_tokens.end and tokens[cte_tokens.start].matchesKeywordTag(.recursive);
+        if (recursive != dml_ast.cte_recursive) return null;
+        return if (generatedDmlCommandKeywordMatchesKind(tokens[cte_tokens.end], dml_ast.kind)) cte_tokens.end else null;
+    }
+    if (dml_ast.cte_recursive or dml_ast.cte_prefix != null) return null;
+    if (tokens[0].matchesKeywordTag(.with)) return null;
+    return if (generatedDmlCommandKeywordMatchesKind(tokens[0], dml_ast.kind)) 0 else null;
+}
+
+fn normalizeGeneratedDdlAstSpansForOwnedChild(
+    tokens: []const Token,
+    ddl_ast: *generated_parser.GeneratedSqlDdlAst,
+) !void {
+    if (tokens.len == 0) return error.UnsupportedSqlShape;
+    var end = tokens.len;
+    while (end > 0 and tokens[end - 1].kind == .semicolon) end -= 1;
+    if (end == 0) return error.UnsupportedSqlShape;
+    ddl_ast.statement_span = .{
+        .start = tokens[0].sourceSpan().start,
+        .end = tokens[end - 1].sourceSpan().end,
+    };
+    ddl_ast.command_span = tokens[0].sourceSpan();
+    if (ddl_ast.view_metadata) |view| {
+        if (view.query_read) |read| {
+            const query = view.query_tokens orelse return error.UnsupportedSqlShape;
+            if (query.start >= query.end or query.end > tokens.len) return error.UnsupportedSqlShape;
+            try normalizeGeneratedReadAstSpansForOwnedChild(tokens[query.start..query.end], read);
+        }
+    }
+    if (ddl_ast.relation_population_source_read) |read| {
+        const source = ddl_ast.relation_population_source_tokens orelse return error.UnsupportedSqlShape;
+        if (source.start >= source.end or source.end > tokens.len) return error.UnsupportedSqlShape;
+        try normalizeGeneratedReadAstSpansForOwnedChild(tokens[source.start..source.end], read);
+    }
+    for (ddl_ast.scalar_subquery_default_items) |*item| {
+        const query = item.query_tokens;
+        if (query.start >= query.end or query.end > tokens.len) return error.UnsupportedSqlShape;
+        try normalizeGeneratedReadAstSpansForOwnedChild(tokens[query.start..query.end], item.read_ast);
     }
 }
 
@@ -705,6 +816,23 @@ fn findTopLevelKeyword(tokens: []const Token, start: usize, end: usize, keyword:
     }
     return null;
 }
+
+fn findTopLevelKeywordText(tokens: []const Token, start: usize, end: usize, keyword: []const u8) ?usize {
+    var depth: usize = 0;
+    var index = start;
+    while (index < end and index < tokens.len) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen, .lbracket => depth += 1,
+            .rparen, .rbracket => {
+                if (depth > 0) depth -= 1;
+            },
+            else => {},
+        }
+        if (depth == 0 and tokens[index].matchesKeyword(keyword)) return index;
+    }
+    return null;
+}
+
 fn parseStatement(
     raw_statement: RawSqlStatement,
     generated_statement: ?GeneratedRawSqlStatement,
@@ -757,13 +885,10 @@ fn parseStatement(
                 if (kind == .explain) return .{ .explain = parseGeneratedExplainStatement(raw_statement, tokenized_sql.items(), generated_raw) };
                 return .{ .unsupported = .{ .kind = kind, .raw = raw_statement } };
             },
-            .other => {},
+            .other => return .{ .unknown = raw_statement },
         }
     }
-    return switch (raw_statement.family orelse return .{ .unknown = raw_statement }) {
-        .ddl => classifyDdlLikeStatement(raw_statement, tokenized_sql.items()),
-        else => .{ .unknown = raw_statement },
-    };
+    return .{ .unknown = raw_statement };
 }
 
 fn generatedSessionAstHasValidClassificationPayload(
@@ -864,7 +989,27 @@ fn generatedCursorAstHasValidClassificationPayload(
     const end = generatedControlStatementEnd(tokens, cursor_ast.statement_span) orelse return false;
     if (!std.meta.eql(cursor_ast.command_span, tokens[0].sourceSpan())) return false;
     if (!generatedControlOptionalTokenRangeIsValid(tokens, end, cursor_ast.tail_tokens)) return false;
-    return cursor_ast.tail_tokens != null;
+    const tail = cursor_ast.tail_tokens orelse return false;
+    if (expected_kind == .declare) {
+        const portal_name = cursor_ast.portal_name_tokens orelse return false;
+        if (!generatedControlOptionalTokenRangeIsValid(tokens, end, portal_name)) return false;
+        if (portal_name.start != tail.start or portal_name.end != tail.start + 1) return false;
+        if (tokens[portal_name.start].kind != .identifier) return false;
+        const subject = cursor_ast.subject_tokens orelse return false;
+        if (!generatedControlOptionalTokenRangeIsValid(tokens, end, subject)) return false;
+        if (subject.start <= portal_name.end or subject.end > tail.end) return false;
+        return cursor_ast.subject_ast != null;
+    }
+    if (cursor_ast.portal_name_tokens != null or
+        cursor_ast.subject_tokens != null or
+        cursor_ast.subject_ast != null or
+        cursor_ast.binary or
+        cursor_ast.hold or
+        cursor_ast.scroll_mode != .default)
+    {
+        return false;
+    }
+    return true;
 }
 
 fn generatedControlStatementEnd(tokens: []const Token, statement_span: SourceSpan) ?usize {
@@ -905,30 +1050,6 @@ fn generatedExtensionIndexKindFromDdlKind(kind: generated_parser.GeneratedSqlDdl
         .drop_extension => .drop_extension,
         else => null,
     };
-}
-
-fn generatedDdlAstMatchesOwnedTokens(
-    tokens: []const Token,
-    raw_statement: RawSqlStatement,
-    ddl_ast: generated_parser.GeneratedSqlDdlAst,
-    expected_statement_kind: generated_parser.GeneratedSqlStatementKind,
-) bool {
-    const statement: generated_parser.GeneratedSqlStatement = switch (expected_statement_kind) {
-        .ddl => .{ .ddl = ddl_ast.kind },
-        .extension_index => .{ .extension_index = generatedExtensionIndexKindFromDdlKind(ddl_ast.kind) orelse return false },
-        else => return false,
-    };
-    const ast: generated_parser.GeneratedSqlAst = switch (expected_statement_kind) {
-        .ddl => .{ .ddl = ddl_ast },
-        .extension_index => .{ .extension_index = ddl_ast },
-        else => return false,
-    };
-    const generated_raw = GeneratedRawSqlStatement{
-        .raw = raw_statement,
-        .statement = statement,
-        .ast = ast,
-    };
-    return generatedDdlAstHasValidClassificationPayload(tokens, generated_raw, ddl_ast.kind);
 }
 
 fn generatedDdlAstHasValidClassificationPayload(
@@ -1056,7 +1177,10 @@ fn generatedDdlCommonPayloadIsValid(
         &ddl_ast.create_table_storage_parameter_items,
         &ddl_ast.create_table_document_schema_items,
         &ddl_ast.create_table_partition_key_items,
+        &ddl_ast.index_element_items,
+        &ddl_ast.index_include_items,
         &ddl_ast.alter_table_operation_items,
+        &ddl_ast.alter_table_operation_inline_constraint_items,
         &ddl_ast.domain_operation_items,
         &ddl_ast.sequence_operation_items,
         &ddl_ast.collation_option_items,
@@ -1079,9 +1203,22 @@ fn generatedDdlCommonPayloadIsValid(
         if (!generatedDdlListPayloadIsValid(tokens, end, list)) return false;
     }
 
+    if (!generatedDdlCreateTableLikeOptionPayloadsAreValid(tokens, end, ddl_ast)) return false;
+    if (!generatedDdlCreateTableStorageParameterPayloadsAreValid(tokens, end, ddl_ast)) return false;
+    if (!generatedDdlCreateTablePartitionKeyPayloadsAreValid(tokens, end, ddl_ast)) return false;
     if (!generatedDdlParallelRangeItemsAreValid(tokens, end, ddl_ast.create_table_document_schema_items.count, ddl_ast.create_table_document_schema_name_items)) return false;
     if (!generatedDdlParallelRangeItemsAreValid(tokens, end, ddl_ast.create_table_document_schema_items.count, ddl_ast.create_table_document_schema_format_items)) return false;
     if (!generatedDdlParallelRangeItemsAreValid(tokens, end, ddl_ast.create_table_document_schema_items.count, ddl_ast.create_table_document_schema_json_items)) return false;
+    if (!generatedDdlConstraintPrefixPayloadsAreValid(tokens, end, ddl_ast)) return false;
+    if (!generatedDdlPrimaryUniqueConstraintPayloadsAreValid(tokens, end, ddl_ast)) return false;
+    if (!generatedDdlForeignKeyConstraintPayloadsAreValid(tokens, end, ddl_ast)) return false;
+    if (!generatedDdlCheckConstraintPayloadsAreValid(tokens, end, ddl_ast)) return false;
+    if (!generatedDdlColumnDefinitionPayloadsAreValid(tokens, end, ddl_ast)) return false;
+    if (!generatedDdlInlineConstraintPrefixPayloadsAreValid(tokens, end, ddl_ast)) return false;
+    if (!generatedDdlCreateDomainOptionPayloadsAreValid(tokens, end, ddl_ast)) return false;
+    if (!generatedDdlDefaultValuePayloadsAreValid(tokens, end, ddl_ast)) return false;
+    if (!generatedDdlGeneratedColumnExpressionPayloadsAreValid(tokens, end, ddl_ast)) return false;
+    if (!generatedDdlRewriteExpressionPayloadsAreValid(tokens, end, ddl_ast)) return false;
 
     if (ddl_ast.routine_metadata) |routine| {
         if (!generatedDdlRoutinePayloadIsValid(tokens, end, routine)) return false;
@@ -1093,6 +1230,1261 @@ fn generatedDdlCommonPayloadIsValid(
         const source = ddl_ast.relation_population_source_tokens orelse return false;
         if (!generatedDdlTokenRangeIsValid(tokens, end, source)) return false;
         if (source.end > tokens.len or !generatedReadAstHasValidClassificationPayload(tokens[source.start..source.end], read)) return false;
+    }
+    return true;
+}
+
+fn generatedDdlConstraintPrefixPayloadsAreValid(
+    tokens: []const Token,
+    end: usize,
+    ddl_ast: generated_parser.GeneratedSqlDdlAst,
+) bool {
+    const name_items = ddl_ast.alter_table_operation_constraint_name_items;
+    const kind_items = ddl_ast.alter_table_operation_constraint_kind_items;
+    if (name_items.len == 0 and kind_items.len == 0) {
+        for (ddl_ast.alter_table_operation_items.items) |operation| {
+            if (generatedDdlItemLooksLikeTableConstraint(tokens, operation)) return false;
+        }
+        return true;
+    }
+    if (name_items.len != kind_items.len) return false;
+    if (name_items.len != ddl_ast.alter_table_operation_items.count) return false;
+    if (ddl_ast.alter_table_operation_items.items.len != ddl_ast.alter_table_operation_items.count) return false;
+    for (ddl_ast.alter_table_operation_items.items, 0..) |operation, index| {
+        const name_range = name_items[index];
+        const kind_range = kind_items[index];
+        if (generatedDdlItemLooksLikeTableConstraint(tokens, operation)) {
+            const kind = kind_range orelse return false;
+            if (kind.start < operation.start or kind.end > operation.end or kind.start >= kind.end) return false;
+            if (!generatedDdlTokenRangeIsValid(tokens, end, kind)) return false;
+            if (!generatedDdlConstraintKindRangeIsValid(tokens, kind)) return false;
+            if (name_range) |name| {
+                if (name.start < operation.start or name.end > kind.start or name.end != name.start + 1) return false;
+                if (!generatedDdlTokenRangeIsValid(tokens, end, name) or tokens[name.start].kind != .identifier) return false;
+                if (name.start == operation.start) return false;
+                if (!tokens[name.start - 1].matchesKeywordTag(.constraint)) return false;
+            }
+        } else if (name_range != null or kind_range != null) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn generatedDdlItemLooksLikeTableConstraint(
+    tokens: []const Token,
+    item: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (item.end > tokens.len or item.start >= item.end) return false;
+    var cursor = item.start;
+    if (tokens[cursor].matchesKeywordTag(.add)) {
+        cursor += 1;
+        if (cursor >= item.end or tokens[cursor].matchesKeywordTag(.column)) return false;
+        if (tokens[cursor].matchesKeyword("period")) return true;
+    }
+    if (tokens[cursor].matchesKeywordTag(.constraint)) {
+        cursor += 2;
+        if (cursor > item.end) return false;
+    }
+    if (cursor >= item.end) return false;
+    return tokens[cursor].matchesKeyword("period") or
+        tokens[cursor].matchesKeyword("primary") or
+        tokens[cursor].matchesKeyword("unique") or
+        tokens[cursor].matchesKeyword("foreign") or
+        tokens[cursor].matchesKeyword("check");
+}
+
+fn generatedDdlConstraintKindRangeIsValid(
+    tokens: []const Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (range.end > tokens.len or range.start >= range.end) return false;
+    if (range.end == range.start + 1) {
+        return tokens[range.start].matchesKeyword("period") or
+            tokens[range.start].matchesKeyword("unique") or
+            tokens[range.start].matchesKeyword("check");
+    }
+    if (range.end == range.start + 2) {
+        return (tokens[range.start].matchesKeyword("primary") or tokens[range.start].matchesKeyword("foreign")) and
+            tokens[range.start + 1].matchesKeyword("key");
+    }
+    return false;
+}
+
+fn generatedDdlPrimaryUniqueConstraintPayloadsAreValid(
+    tokens: []const Token,
+    end: usize,
+    ddl_ast: generated_parser.GeneratedSqlDdlAst,
+) bool {
+    const nulls_items = ddl_ast.alter_table_operation_constraint_nulls_distinct_items;
+    const column_list_items = ddl_ast.alter_table_operation_constraint_column_list_items;
+    const include_items = ddl_ast.alter_table_operation_constraint_include_items;
+    const timing_items = ddl_ast.alter_table_operation_constraint_timing_items;
+    const not_valid_items = ddl_ast.alter_table_operation_constraint_not_valid_items;
+    if (nulls_items.len == 0 and column_list_items.len == 0 and include_items.len == 0 and timing_items.len == 0 and not_valid_items.len == 0) {
+        return !generatedDdlHasPrimaryUniqueTableConstraints(tokens, ddl_ast);
+    }
+    if (nulls_items.len != column_list_items.len or
+        nulls_items.len != include_items.len or
+        nulls_items.len != timing_items.len or
+        nulls_items.len != not_valid_items.len or
+        nulls_items.len != ddl_ast.alter_table_operation_items.count or
+        ddl_ast.alter_table_operation_items.items.len != ddl_ast.alter_table_operation_items.count)
+    {
+        return false;
+    }
+    if (ddl_ast.alter_table_operation_constraint_kind_items.len != ddl_ast.alter_table_operation_items.count) return false;
+
+    for (ddl_ast.alter_table_operation_items.items, 0..) |operation, index| {
+        const kind = ddl_ast.alter_table_operation_constraint_kind_items[index];
+        if (kind != null and generatedDdlConstraintKindIsPrimaryOrUnique(tokens, kind.?)) {
+            const column_list = column_list_items[index] orelse return false;
+            if (!generatedDdlTokenRangeIsValid(tokens, end, column_list)) return false;
+            if (column_list.start < kind.?.end or column_list.end > operation.end) return false;
+            if (!generatedDdlParenthesizedRangeIsValid(tokens, column_list)) return false;
+            const expected_nulls = if (tokens[kind.?.start].matchesKeyword("unique"))
+                generatedDdlUniqueNullsDistinctRange(tokens, kind.?.end, operation.end)
+            else
+                null;
+            if (!generatedDdlOptionalRangeMatches(tokens, end, nulls_items[index], expected_nulls)) return false;
+            if (expected_nulls) |range| {
+                if (column_list.start != range.end) return false;
+            } else if (column_list.start != kind.?.end) {
+                return false;
+            }
+            const expected_include = generatedDdlConstraintIncludeRange(tokens, column_list.end, operation.end);
+            if (!generatedDdlOptionalRangeMatches(tokens, end, include_items[index], expected_include)) return false;
+            const timing_start = if (expected_include) |range| range.end else column_list.end;
+            const expected_timing = generatedDdlConstraintTimingRange(tokens, timing_start, operation.end);
+            if (!generatedDdlOptionalRangeMatches(tokens, end, timing_items[index], expected_timing)) return false;
+            const not_valid_start = if (expected_timing) |range| range.end else timing_start;
+            const expected_not_valid = generatedDdlConstraintNotValidRange(tokens, not_valid_start, operation.end);
+            if (!generatedDdlOptionalRangeMatches(tokens, end, not_valid_items[index], expected_not_valid)) return false;
+        } else if (nulls_items[index] != null or column_list_items[index] != null or include_items[index] != null or timing_items[index] != null or not_valid_items[index] != null) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn generatedDdlHasPrimaryUniqueTableConstraints(
+    tokens: []const Token,
+    ddl_ast: generated_parser.GeneratedSqlDdlAst,
+) bool {
+    if (ddl_ast.alter_table_operation_constraint_kind_items.len != ddl_ast.alter_table_operation_items.count) return false;
+    for (ddl_ast.alter_table_operation_constraint_kind_items) |kind| {
+        if (kind != null and generatedDdlConstraintKindIsPrimaryOrUnique(tokens, kind.?)) return true;
+    }
+    return false;
+}
+
+fn generatedDdlForeignKeyConstraintPayloadsAreValid(
+    tokens: []const Token,
+    end: usize,
+    ddl_ast: generated_parser.GeneratedSqlDdlAst,
+) bool {
+    const payload_items = ddl_ast.alter_table_operation_foreign_key_payload_items;
+    const not_valid_items = ddl_ast.alter_table_operation_foreign_key_not_valid_items;
+    if (payload_items.len == 0 and not_valid_items.len == 0) {
+        return !generatedDdlHasForeignKeyTableConstraints(tokens, ddl_ast);
+    }
+    if (payload_items.len != not_valid_items.len or
+        payload_items.len != ddl_ast.alter_table_operation_items.count or
+        ddl_ast.alter_table_operation_items.items.len != ddl_ast.alter_table_operation_items.count)
+    {
+        return false;
+    }
+    if (ddl_ast.alter_table_operation_constraint_kind_items.len != ddl_ast.alter_table_operation_items.count) return false;
+
+    for (ddl_ast.alter_table_operation_items.items, 0..) |operation, index| {
+        const maybe_kind = ddl_ast.alter_table_operation_constraint_kind_items[index];
+        if (maybe_kind != null and generatedDdlConstraintKindIsForeignKey(tokens, maybe_kind.?)) {
+            const kind = maybe_kind.?;
+            const payload = payload_items[index] orelse return false;
+            if (!generatedDdlTokenRangeIsValid(tokens, end, payload)) return false;
+            if (payload.start != kind.start + 1 or payload.end > operation.end) return false;
+            if (payload.start >= payload.end or !tokens[payload.start].matchesKeyword("key")) return false;
+            const expected_not_valid = generatedDdlTrailingConstraintNotValidRange(tokens, payload.start, operation.end);
+            if (!generatedDdlOptionalRangeMatches(tokens, end, not_valid_items[index], expected_not_valid)) return false;
+            const expected_payload_end = if (expected_not_valid) |range| range.start else operation.end;
+            if (payload.end != expected_payload_end) return false;
+        } else if (payload_items[index] != null or not_valid_items[index] != null) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn generatedDdlHasForeignKeyTableConstraints(
+    tokens: []const Token,
+    ddl_ast: generated_parser.GeneratedSqlDdlAst,
+) bool {
+    if (ddl_ast.alter_table_operation_constraint_kind_items.len != ddl_ast.alter_table_operation_items.count) return false;
+    for (ddl_ast.alter_table_operation_constraint_kind_items) |kind| {
+        if (kind != null and generatedDdlConstraintKindIsForeignKey(tokens, kind.?)) return true;
+    }
+    return false;
+}
+
+fn generatedDdlCheckConstraintPayloadsAreValid(
+    tokens: []const Token,
+    end: usize,
+    ddl_ast: generated_parser.GeneratedSqlDdlAst,
+) bool {
+    const payload_items = ddl_ast.alter_table_operation_check_payload_items;
+    const not_valid_items = ddl_ast.alter_table_operation_check_not_valid_items;
+    if (payload_items.len == 0 and not_valid_items.len == 0) {
+        return !generatedDdlHasCheckTableConstraints(tokens, ddl_ast);
+    }
+    if (payload_items.len != not_valid_items.len or
+        payload_items.len != ddl_ast.alter_table_operation_items.count or
+        ddl_ast.alter_table_operation_items.items.len != ddl_ast.alter_table_operation_items.count)
+    {
+        return false;
+    }
+    if (ddl_ast.alter_table_operation_constraint_kind_items.len != ddl_ast.alter_table_operation_items.count) return false;
+
+    for (ddl_ast.alter_table_operation_items.items, 0..) |operation, index| {
+        const maybe_kind = ddl_ast.alter_table_operation_constraint_kind_items[index];
+        if (maybe_kind != null and generatedDdlConstraintKindIsCheck(tokens, maybe_kind.?)) {
+            const kind = maybe_kind.?;
+            const payload = payload_items[index] orelse return false;
+            if (!generatedDdlTokenRangeIsValid(tokens, end, payload)) return false;
+            if (payload.start != kind.end or payload.end > operation.end) return false;
+            if (!generatedDdlParenthesizedRangeIsValid(tokens, payload)) return false;
+            const expected_not_valid = generatedDdlTrailingConstraintNotValidRange(tokens, payload.start, operation.end);
+            if (!generatedDdlOptionalRangeMatches(tokens, end, not_valid_items[index], expected_not_valid)) return false;
+            const expected_payload_end = if (expected_not_valid) |range| range.start else operation.end;
+            if (payload.end != expected_payload_end) return false;
+        } else if (payload_items[index] != null or not_valid_items[index] != null) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn generatedDdlHasCheckTableConstraints(
+    tokens: []const Token,
+    ddl_ast: generated_parser.GeneratedSqlDdlAst,
+) bool {
+    if (ddl_ast.alter_table_operation_constraint_kind_items.len != ddl_ast.alter_table_operation_items.count) return false;
+    for (ddl_ast.alter_table_operation_constraint_kind_items) |kind| {
+        if (kind != null and generatedDdlConstraintKindIsCheck(tokens, kind.?)) return true;
+    }
+    return false;
+}
+
+fn generatedDdlConstraintKindIsPrimaryOrUnique(
+    tokens: []const Token,
+    kind: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (kind.end > tokens.len or kind.start >= kind.end) return false;
+    return tokens[kind.start].matchesKeyword("primary") or tokens[kind.start].matchesKeyword("unique");
+}
+
+fn generatedDdlConstraintKindIsForeignKey(
+    tokens: []const Token,
+    kind: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    return kind.end == kind.start + 2 and
+        kind.end <= tokens.len and
+        tokens[kind.start].matchesKeyword("foreign") and
+        tokens[kind.start + 1].matchesKeyword("key");
+}
+
+fn generatedDdlConstraintKindIsCheck(
+    tokens: []const Token,
+    kind: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    return kind.end == kind.start + 1 and kind.end <= tokens.len and tokens[kind.start].matchesKeyword("check");
+}
+
+fn generatedDdlOptionalRangeMatches(
+    tokens: []const Token,
+    end: usize,
+    actual: ?generated_parser.GeneratedSqlTokenRange,
+    expected: ?generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (expected) |range| {
+        const actual_range = actual orelse return false;
+        return generatedDdlTokenRangeIsValid(tokens, end, actual_range) and std.meta.eql(actual_range, range);
+    }
+    return actual == null;
+}
+
+fn generatedDdlParenthesizedRangeIsValid(
+    tokens: []const Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (range.end > tokens.len or range.start + 1 >= range.end) return false;
+    if (tokens[range.start].kind != .lparen or tokens[range.end - 1].kind != .rparen) return false;
+    return findMatchingParen(tokens, range.start, range.end) == range.end - 1;
+}
+
+fn generatedDdlUniqueNullsDistinctRange(
+    tokens: []const Token,
+    start: usize,
+    end: usize,
+) ?generated_parser.GeneratedSqlTokenRange {
+    if (start >= end or !tokens[start].matchesKeyword("nulls")) return null;
+    if (start + 1 < end and tokens[start + 1].matchesKeyword("distinct")) return .{ .start = start, .end = start + 2 };
+    if (start + 2 < end and tokens[start + 1].matchesKeyword("not") and tokens[start + 2].matchesKeyword("distinct")) {
+        return .{ .start = start, .end = start + 3 };
+    }
+    return null;
+}
+
+fn generatedDdlConstraintIncludeRange(
+    tokens: []const Token,
+    start: usize,
+    end: usize,
+) ?generated_parser.GeneratedSqlTokenRange {
+    if (start >= end or !tokens[start].matchesKeyword("include")) return null;
+    if (start + 1 >= end) return null;
+    const include_close = findMatchingParen(tokens, start + 1, end) orelse return null;
+    return .{ .start = start, .end = include_close + 1 };
+}
+
+fn generatedDdlConstraintTimingRange(
+    tokens: []const Token,
+    start: usize,
+    end: usize,
+) ?generated_parser.GeneratedSqlTokenRange {
+    var cursor = start;
+    var saw_timing = false;
+    while (cursor < end) {
+        if (tokens[cursor].matchesKeyword("deferrable")) {
+            cursor += 1;
+            saw_timing = true;
+        } else if (tokens[cursor].matchesKeyword("not")) {
+            if (cursor + 1 >= end or !tokens[cursor + 1].matchesKeyword("deferrable")) break;
+            cursor += 2;
+            saw_timing = true;
+        } else if (tokens[cursor].matchesKeyword("initially")) {
+            if (cursor + 1 >= end or
+                (!tokens[cursor + 1].matchesKeyword("deferred") and !tokens[cursor + 1].matchesKeyword("immediate")))
+            {
+                break;
+            }
+            cursor += 2;
+            saw_timing = true;
+        } else {
+            break;
+        }
+    }
+    if (!saw_timing) return null;
+    return .{ .start = start, .end = cursor };
+}
+
+fn generatedDdlConstraintNotValidRange(
+    tokens: []const Token,
+    start: usize,
+    end: usize,
+) ?generated_parser.GeneratedSqlTokenRange {
+    if (start + 1 >= end) return null;
+    if (tokens[start].matchesKeyword("not") and tokens[start + 1].matchesKeyword("valid")) {
+        return .{ .start = start, .end = start + 2 };
+    }
+    return null;
+}
+
+fn generatedDdlTrailingConstraintNotValidRange(
+    tokens: []const Token,
+    start: usize,
+    end: usize,
+) ?generated_parser.GeneratedSqlTokenRange {
+    if (end < start + 2 or end > tokens.len) return null;
+    if (tokens[end - 2].matchesKeyword("not") and tokens[end - 1].matchesKeyword("valid")) {
+        return .{ .start = end - 2, .end = end };
+    }
+    return null;
+}
+
+fn findMatchingParen(tokens: []const Token, open_index: usize, end: usize) ?usize {
+    if (open_index >= end or open_index >= tokens.len or tokens[open_index].kind != .lparen) return null;
+    var depth: usize = 1;
+    var index = open_index + 1;
+    while (index < end and index < tokens.len) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen => depth += 1,
+            .rparen => {
+                depth -= 1;
+                if (depth == 0) return index;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn generatedDdlCreateDomainOptionPayloadsAreValid(
+    tokens: []const Token,
+    end: usize,
+    ddl_ast: generated_parser.GeneratedSqlDdlAst,
+) bool {
+    const kind_items = ddl_ast.domain_operation_kind_items;
+    const name_items = ddl_ast.domain_operation_constraint_name_items;
+    const default_items = ddl_ast.domain_operation_default_value_items;
+    const check_items = ddl_ast.domain_operation_check_payload_items;
+    if (ddl_ast.kind != .create_domain) {
+        return kind_items.len == 0 and name_items.len == 0 and default_items.len == 0 and check_items.len == 0;
+    }
+    const count = ddl_ast.domain_operation_items.count;
+    if (count == 0) return kind_items.len == 0 and name_items.len == 0 and default_items.len == 0 and check_items.len == 0;
+    if (ddl_ast.domain_operation_items.items.len != count) return false;
+    if (kind_items.len != count or name_items.len != count or default_items.len != count or check_items.len != count) return false;
+    for (ddl_ast.domain_operation_items.items, 0..) |item, index| {
+        if (!generatedDdlTokenRangeIsValid(tokens, end, item)) return false;
+        const expected = generatedDdlCreateDomainOptionPayloadRanges(tokens, item) orelse return false;
+        const kind = kind_items[index];
+        if (!generatedDdlTokenRangeIsValid(tokens, end, kind) or !std.meta.eql(kind, expected.kind)) return false;
+        if (!generatedDdlOptionalRangeMatches(tokens, end, name_items[index], expected.constraint_name)) return false;
+        if (!generatedDdlOptionalRangeMatches(tokens, end, default_items[index], expected.default_value)) return false;
+        if (!generatedDdlOptionalRangeMatches(tokens, end, check_items[index], expected.check_payload)) return false;
+        if (check_items[index]) |check_payload| {
+            if (!generatedDdlParenthesizedRangeIsValid(tokens, check_payload)) return false;
+        }
+    }
+    return true;
+}
+
+const GeneratedDdlCreateDomainOptionPayloadRanges = struct {
+    kind: generated_parser.GeneratedSqlTokenRange,
+    constraint_name: ?generated_parser.GeneratedSqlTokenRange = null,
+    default_value: ?generated_parser.GeneratedSqlTokenRange = null,
+    check_payload: ?generated_parser.GeneratedSqlTokenRange = null,
+};
+
+fn generatedDdlCreateDomainOptionPayloadRanges(
+    tokens: []const Token,
+    item: generated_parser.GeneratedSqlTokenRange,
+) ?GeneratedDdlCreateDomainOptionPayloadRanges {
+    if (item.start >= item.end or item.end > tokens.len) return null;
+    if (tokens[item.start].matchesKeyword("default")) {
+        if (item.start + 1 >= item.end) return null;
+        return .{
+            .kind = .{ .start = item.start, .end = item.start + 1 },
+            .default_value = .{ .start = item.start + 1, .end = item.end },
+        };
+    }
+    if (tokens[item.start].matchesKeyword("not")) {
+        if (item.start + 2 != item.end or !tokens[item.start + 1].matchesKeyword("null")) return null;
+        return .{ .kind = item };
+    }
+    if (tokens[item.start].matchesKeyword("null")) {
+        if (item.start + 1 != item.end) return null;
+        return .{ .kind = item };
+    }
+    if (tokens[item.start].matchesKeyword("constraint")) {
+        if (item.start + 4 > item.end or tokens[item.start + 1].kind != .identifier or !tokens[item.start + 2].matchesKeyword("check")) return null;
+        return .{
+            .kind = .{ .start = item.start + 2, .end = item.start + 3 },
+            .constraint_name = .{ .start = item.start + 1, .end = item.start + 2 },
+            .check_payload = .{ .start = item.start + 3, .end = item.end },
+        };
+    }
+    if (tokens[item.start].matchesKeyword("check")) {
+        if (item.start + 2 > item.end) return null;
+        return .{
+            .kind = .{ .start = item.start, .end = item.start + 1 },
+            .check_payload = .{ .start = item.start + 1, .end = item.end },
+        };
+    }
+    return null;
+}
+
+fn generatedDdlCreateTableLikeOptionPayloadsAreValid(
+    tokens: []const Token,
+    end: usize,
+    ddl_ast: generated_parser.GeneratedSqlDdlAst,
+) bool {
+    const action_items = ddl_ast.create_table_like_option_action_items;
+    const name_items = ddl_ast.create_table_like_option_name_items;
+    if (ddl_ast.create_table_like_source_tokens == null) {
+        return action_items.len == 0 and name_items.len == 0;
+    }
+    const count = ddl_ast.create_table_like_option_items.count;
+    if (count == 0) return action_items.len == 0 and name_items.len == 0;
+    if (ddl_ast.create_table_like_option_items.items.len != count) return false;
+    if (action_items.len != count or name_items.len != count) return false;
+    for (ddl_ast.create_table_like_option_items.items, 0..) |item, index| {
+        if (!generatedDdlTokenRangeIsValid(tokens, end, item)) return false;
+        const expected = generatedDdlCreateTableLikeOptionPayloadRanges(tokens, item) orelse return false;
+        const action = action_items[index];
+        const name = name_items[index];
+        if (!generatedDdlTokenRangeIsValid(tokens, end, action) or !std.meta.eql(action, expected.action)) return false;
+        if (!generatedDdlTokenRangeIsValid(tokens, end, name) or !std.meta.eql(name, expected.name)) return false;
+    }
+    return true;
+}
+
+const GeneratedDdlCreateTableLikeOptionPayloadRanges = struct {
+    action: generated_parser.GeneratedSqlTokenRange,
+    name: generated_parser.GeneratedSqlTokenRange,
+};
+
+fn generatedDdlCreateTableLikeOptionPayloadRanges(
+    tokens: []const Token,
+    item: generated_parser.GeneratedSqlTokenRange,
+) ?GeneratedDdlCreateTableLikeOptionPayloadRanges {
+    if (item.start >= item.end or item.end > tokens.len) return null;
+    if (!(tokens[item.start].matchesKeyword("including") or tokens[item.start].matchesKeyword("excluding"))) return null;
+    const name_start = item.start + 1;
+    if (name_start >= item.end) return null;
+    const name_end = if (tokens[name_start].matchesKeyword("update")) blk: {
+        if (name_start + 2 != item.end or !tokens[name_start + 1].matchesKeyword("policies")) return null;
+        break :blk item.end;
+    } else blk: {
+        if (name_start + 1 != item.end) return null;
+        break :blk item.end;
+    };
+    return .{
+        .action = .{ .start = item.start, .end = item.start + 1 },
+        .name = .{ .start = name_start, .end = name_end },
+    };
+}
+
+fn generatedDdlCreateTableStorageParameterPayloadsAreValid(
+    tokens: []const Token,
+    end: usize,
+    ddl_ast: generated_parser.GeneratedSqlDdlAst,
+) bool {
+    const name_items = ddl_ast.create_table_storage_parameter_name_items;
+    const value_items = ddl_ast.create_table_storage_parameter_value_items;
+    const count = ddl_ast.create_table_storage_parameter_items.count;
+    if (ddl_ast.create_table_storage_parameter_tokens == null) {
+        return count == 0 and name_items.len == 0 and value_items.len == 0;
+    }
+    if (count == 0) return name_items.len == 0 and value_items.len == 0;
+    if (ddl_ast.create_table_storage_parameter_items.items.len != count) return false;
+    if (name_items.len != count or value_items.len != count) return false;
+    for (ddl_ast.create_table_storage_parameter_items.items, 0..) |item, index| {
+        if (!generatedDdlTokenRangeIsValid(tokens, end, item)) return false;
+        const expected = generatedDdlCreateTableStorageParameterPayloadRanges(tokens, item) orelse return false;
+        const name = name_items[index];
+        const value = value_items[index];
+        if (!generatedDdlTokenRangeIsValid(tokens, end, name) or !std.meta.eql(name, expected.name)) return false;
+        if (!generatedDdlTokenRangeIsValid(tokens, end, value) or !std.meta.eql(value, expected.value)) return false;
+    }
+    return true;
+}
+
+const GeneratedDdlCreateTableStorageParameterPayloadRanges = struct {
+    name: generated_parser.GeneratedSqlTokenRange,
+    value: generated_parser.GeneratedSqlTokenRange,
+};
+
+fn generatedDdlCreateTableStorageParameterPayloadRanges(
+    tokens: []const Token,
+    item: generated_parser.GeneratedSqlTokenRange,
+) ?GeneratedDdlCreateTableStorageParameterPayloadRanges {
+    if (item.end != item.start + 3 or item.end > tokens.len) return null;
+    if (tokens[item.start].kind != .identifier or tokens[item.start + 1].kind != .eq) return null;
+    return .{
+        .name = .{ .start = item.start, .end = item.start + 1 },
+        .value = .{ .start = item.start + 2, .end = item.start + 3 },
+    };
+}
+
+fn generatedDdlCreateTablePartitionKeyPayloadsAreValid(
+    tokens: []const Token,
+    end: usize,
+    ddl_ast: generated_parser.GeneratedSqlDdlAst,
+) bool {
+    const name_items = ddl_ast.create_table_partition_key_name_items;
+    const count = ddl_ast.create_table_partition_key_items.count;
+    if (ddl_ast.create_table_partition_key_tokens == null) {
+        return count == 0 and name_items.len == 0;
+    }
+    if (count == 0) return name_items.len == 0;
+    if (ddl_ast.create_table_partition_key_items.items.len != count) return false;
+    if (name_items.len != count) return false;
+    for (ddl_ast.create_table_partition_key_items.items, 0..) |item, index| {
+        if (!generatedDdlTokenRangeIsValid(tokens, end, item)) return false;
+        if (item.end != item.start + 1 or tokens[item.start].kind != .identifier) return false;
+        const name = name_items[index];
+        if (!generatedDdlTokenRangeIsValid(tokens, end, name) or !std.meta.eql(name, item)) return false;
+    }
+    return true;
+}
+
+fn generatedDdlColumnDefinitionPayloadsAreValid(
+    tokens: []const Token,
+    end: usize,
+    ddl_ast: generated_parser.GeneratedSqlDdlAst,
+) bool {
+    const name_items = ddl_ast.alter_table_operation_column_name_items;
+    const type_items = ddl_ast.alter_table_operation_column_type_items;
+    const nullability_items = ddl_ast.alter_table_operation_column_nullability_items;
+    const collation_items = ddl_ast.alter_table_operation_column_collation_items;
+    const default_clause_items = ddl_ast.alter_table_operation_column_default_clause_items;
+    const generated_clause_items = ddl_ast.alter_table_operation_column_generated_clause_items;
+    if (name_items.len == 0 and type_items.len == 0 and nullability_items.len == 0 and collation_items.len == 0 and default_clause_items.len == 0 and generated_clause_items.len == 0) return true;
+    if (name_items.len != type_items.len or
+        name_items.len != nullability_items.len or
+        name_items.len != collation_items.len or
+        name_items.len != default_clause_items.len or
+        name_items.len != generated_clause_items.len)
+    {
+        return false;
+    }
+    if (name_items.len != ddl_ast.alter_table_operation_items.count) return false;
+    if (ddl_ast.alter_table_operation_items.items.len != ddl_ast.alter_table_operation_items.count) return false;
+    for (ddl_ast.alter_table_operation_items.items, 0..) |operation, index| {
+        const name_range = name_items[index];
+        const type_range = type_items[index];
+        const nullability_range = nullability_items[index];
+        const collation_range = collation_items[index];
+        const default_clause_range = default_clause_items[index];
+        const generated_clause_range = generated_clause_items[index];
+        if (generatedDdlItemLooksLikeColumnDefinition(tokens, operation)) {
+            const name = name_range orelse return false;
+            const type_tokens = type_range orelse return false;
+            if (name.start < operation.start or name.end > operation.end or name.end != name.start + 1) return false;
+            if (type_tokens.start != name.end or type_tokens.end > operation.end or type_tokens.start >= type_tokens.end) return false;
+            if (!generatedDdlTokenRangeIsValid(tokens, end, name)) return false;
+            if (!generatedDdlTokenRangeIsValid(tokens, end, type_tokens)) return false;
+            if (nullability_range) |range| {
+                if (range.start < type_tokens.end or range.end > operation.end or range.start >= range.end) return false;
+                if (!generatedDdlTokenRangeIsValid(tokens, end, range)) return false;
+                if (!generatedDdlColumnNullabilityRangeIsValid(tokens, range)) return false;
+            } else if (generatedDdlColumnDefinitionHasTopLevelNullability(tokens, operation, type_tokens.end)) {
+                return false;
+            }
+            if (collation_range) |range| {
+                if (range.start < type_tokens.end or range.end > operation.end or range.start >= range.end) return false;
+                if (!generatedDdlTokenRangeIsValid(tokens, end, range)) return false;
+                if (!generatedDdlColumnCollationRangeIsValid(tokens, range)) return false;
+            } else if (findTopLevelKeywordText(tokens, type_tokens.end, operation.end, "collate") != null) {
+                return false;
+            }
+            if (default_clause_range) |range| {
+                if (range.start < type_tokens.end or range.end > operation.end or !generatedDdlTokenRangeIsValid(tokens, end, range)) return false;
+                if (!generatedDdlColumnDefaultClauseRangeIsValid(tokens, operation, range)) return false;
+            } else if (generatedDdlColumnDefinitionDefaultClauseRange(tokens, operation) != null) {
+                return false;
+            }
+            if (generated_clause_range) |range| {
+                if (range.start < type_tokens.end or range.end > operation.end or !generatedDdlTokenRangeIsValid(tokens, end, range)) return false;
+                if (!generatedDdlColumnStoredGeneratedClauseRangeIsValid(tokens, operation, range)) return false;
+            } else if (generatedDdlColumnDefinitionStoredGeneratedClauseRange(tokens, operation) != null) {
+                return false;
+            }
+        } else if (name_range != null or type_range != null or nullability_range != null or collation_range != null or default_clause_range != null or generated_clause_range != null) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn generatedDdlInlineConstraintPrefixPayloadsAreValid(
+    tokens: []const Token,
+    end: usize,
+    ddl_ast: generated_parser.GeneratedSqlDdlAst,
+) bool {
+    const inline_items = ddl_ast.alter_table_operation_inline_constraint_items;
+    const name_items = ddl_ast.alter_table_operation_inline_constraint_name_items;
+    const kind_items = ddl_ast.alter_table_operation_inline_constraint_kind_items;
+    const nulls_items = ddl_ast.alter_table_operation_inline_constraint_nulls_distinct_items;
+    const include_items = ddl_ast.alter_table_operation_inline_constraint_include_items;
+    const timing_items = ddl_ast.alter_table_operation_inline_constraint_timing_items;
+    const not_valid_items = ddl_ast.alter_table_operation_inline_constraint_not_valid_items;
+    const foreign_key_payload_items = ddl_ast.alter_table_operation_inline_foreign_key_payload_items;
+    const foreign_key_not_valid_items = ddl_ast.alter_table_operation_inline_foreign_key_not_valid_items;
+    const check_payload_items = ddl_ast.alter_table_operation_inline_check_payload_items;
+    const check_not_valid_items = ddl_ast.alter_table_operation_inline_check_not_valid_items;
+    if (inline_items.items.len != inline_items.count) return false;
+    if (name_items.len != inline_items.count or kind_items.len != inline_items.count) return false;
+    if (nulls_items.len != inline_items.count or include_items.len != inline_items.count or timing_items.len != inline_items.count or not_valid_items.len != inline_items.count) return false;
+    if (foreign_key_payload_items.len != inline_items.count or foreign_key_not_valid_items.len != inline_items.count) return false;
+    if (check_payload_items.len != inline_items.count or check_not_valid_items.len != inline_items.count) return false;
+    if (inline_items.count == 0) {
+        return !generatedDdlColumnDefinitionsHaveInlineConstraints(tokens, ddl_ast);
+    }
+    if (inline_items.first_tokens == null or inline_items.last_tokens == null) return false;
+    if (!std.meta.eql(inline_items.first_tokens.?, inline_items.items[0])) return false;
+    if (!std.meta.eql(inline_items.last_tokens.?, inline_items.items[inline_items.items.len - 1])) return false;
+
+    for (inline_items.items, 0..) |prefix, index| {
+        const kind = kind_items[index];
+        if (!generatedDdlTokenRangeIsValid(tokens, end, prefix)) return false;
+        if (!generatedDdlTokenRangeIsValid(tokens, end, kind)) return false;
+        if (kind.start < prefix.start or kind.end != prefix.end) return false;
+        if (!generatedDdlInlineConstraintKindRangeIsValid(tokens, kind)) return false;
+        if (name_items[index]) |name| {
+            if (!generatedDdlTokenRangeIsValid(tokens, end, name)) return false;
+            if (name.end != name.start + 1 or tokens[name.start].kind != .identifier) return false;
+            if (name.start != prefix.start + 1 or name.end != kind.start) return false;
+            if (!tokens[prefix.start].matchesKeywordTag(.constraint)) return false;
+        } else if (prefix.start != kind.start) {
+            return false;
+        }
+        if (!generatedDdlInlineConstraintPrefixBelongsToColumn(tokens, ddl_ast, prefix, kind, name_items[index])) return false;
+        if (!generatedDdlInlinePrimaryUniqueConstraintPayloadMatches(tokens, end, ddl_ast, index)) return false;
+        if (!generatedDdlInlineForeignKeyConstraintPayloadMatches(tokens, end, ddl_ast, index)) return false;
+        if (!generatedDdlInlineCheckConstraintPayloadMatches(tokens, end, ddl_ast, index)) return false;
+    }
+
+    var expected_count: usize = 0;
+    for (ddl_ast.alter_table_operation_items.items, 0..) |operation, index| {
+        if (!generatedDdlItemLooksLikeColumnDefinition(tokens, operation)) continue;
+        if (ddl_ast.alter_table_operation_column_type_items.len == 0) return false;
+        const type_range = ddl_ast.alter_table_operation_column_type_items[index] orelse return false;
+        var cursor = type_range.end;
+        while (generatedDdlNextColumnInlineConstraintPrefix(tokens, operation, &cursor)) |prefix| {
+            if (expected_count >= inline_items.count) return false;
+            if (!std.meta.eql(prefix.prefix, inline_items.items[expected_count])) return false;
+            if (!std.meta.eql(prefix.kind, kind_items[expected_count])) return false;
+            if (prefix.name == null) {
+                if (name_items[expected_count] != null) return false;
+            } else if (name_items[expected_count] == null or !std.meta.eql(prefix.name.?, name_items[expected_count].?)) {
+                return false;
+            }
+            expected_count += 1;
+            cursor = prefix.kind.end;
+        }
+    }
+    return expected_count == inline_items.count;
+}
+
+fn generatedDdlInlineCheckConstraintPayloadMatches(
+    tokens: []const Token,
+    end: usize,
+    ddl_ast: generated_parser.GeneratedSqlDdlAst,
+    index: usize,
+) bool {
+    const kind = ddl_ast.alter_table_operation_inline_constraint_kind_items[index];
+    const payload = ddl_ast.alter_table_operation_inline_check_payload_items[index];
+    const not_valid = ddl_ast.alter_table_operation_inline_check_not_valid_items[index];
+    if (!generatedDdlConstraintKindIsCheck(tokens, kind)) return payload == null and not_valid == null;
+
+    const operation = generatedDdlInlineConstraintContainingOperation(ddl_ast, kind) orelse return false;
+    const segment_end = generatedDdlNextInlineConstraintPrefixStart(tokens, operation, kind.end) orelse operation.end;
+    const expected_not_valid = generatedDdlTrailingConstraintNotValidRange(tokens, kind.end, segment_end);
+    if (!generatedDdlOptionalRangeMatches(tokens, end, not_valid, expected_not_valid)) return false;
+    const expected_payload_end = if (expected_not_valid) |range| range.start else segment_end;
+    const payload_range = payload orelse return false;
+    if (!generatedDdlTokenRangeIsValid(tokens, end, payload_range)) return false;
+    if (payload_range.start != kind.end or payload_range.end != expected_payload_end) return false;
+    return generatedDdlParenthesizedRangeIsValid(tokens, payload_range);
+}
+
+fn generatedDdlInlineForeignKeyConstraintPayloadMatches(
+    tokens: []const Token,
+    end: usize,
+    ddl_ast: generated_parser.GeneratedSqlDdlAst,
+    index: usize,
+) bool {
+    const kind = ddl_ast.alter_table_operation_inline_constraint_kind_items[index];
+    const payload = ddl_ast.alter_table_operation_inline_foreign_key_payload_items[index];
+    const not_valid = ddl_ast.alter_table_operation_inline_foreign_key_not_valid_items[index];
+    if (!generatedDdlInlineConstraintKindIsReferences(tokens, kind)) return payload == null and not_valid == null;
+
+    const operation = generatedDdlInlineConstraintContainingOperation(ddl_ast, kind) orelse return false;
+    const segment_end = generatedDdlNextInlineConstraintPrefixStart(tokens, operation, kind.end) orelse operation.end;
+    const expected_not_valid = generatedDdlTrailingConstraintNotValidRange(tokens, kind.end, segment_end);
+    if (!generatedDdlOptionalRangeMatches(tokens, end, not_valid, expected_not_valid)) return false;
+    const expected_payload_end = if (expected_not_valid) |range| range.start else segment_end;
+    const payload_range = payload orelse return false;
+    if (!generatedDdlTokenRangeIsValid(tokens, end, payload_range)) return false;
+    return payload_range.start == kind.end and payload_range.end == expected_payload_end and payload_range.start < payload_range.end;
+}
+
+fn generatedDdlInlinePrimaryUniqueConstraintPayloadMatches(
+    tokens: []const Token,
+    end: usize,
+    ddl_ast: generated_parser.GeneratedSqlDdlAst,
+    index: usize,
+) bool {
+    const kind = ddl_ast.alter_table_operation_inline_constraint_kind_items[index];
+    const is_primary_unique = generatedDdlConstraintKindIsPrimaryOrUnique(tokens, kind);
+    const nulls = ddl_ast.alter_table_operation_inline_constraint_nulls_distinct_items[index];
+    const include = ddl_ast.alter_table_operation_inline_constraint_include_items[index];
+    const timing = ddl_ast.alter_table_operation_inline_constraint_timing_items[index];
+    const not_valid = ddl_ast.alter_table_operation_inline_constraint_not_valid_items[index];
+    if (!is_primary_unique) return nulls == null and include == null and timing == null and not_valid == null;
+
+    const expected_nulls = if (tokens[kind.start].matchesKeyword("unique"))
+        generatedDdlUniqueNullsDistinctRange(tokens, kind.end, generatedDdlInlineConstraintContainingOperationEnd(ddl_ast, kind) orelse return false)
+    else
+        null;
+    if (!generatedDdlOptionalRangeMatches(tokens, end, nulls, expected_nulls)) return false;
+    const include_start = if (expected_nulls) |range| range.end else kind.end;
+    const operation_end = generatedDdlInlineConstraintContainingOperationEnd(ddl_ast, kind) orelse return false;
+    const expected_include = generatedDdlConstraintIncludeRange(tokens, include_start, operation_end);
+    if (!generatedDdlOptionalRangeMatches(tokens, end, include, expected_include)) return false;
+    const timing_start = if (expected_include) |range| range.end else include_start;
+    const expected_timing = generatedDdlConstraintTimingRange(tokens, timing_start, operation_end);
+    if (!generatedDdlOptionalRangeMatches(tokens, end, timing, expected_timing)) return false;
+    const not_valid_start = if (expected_timing) |range| range.end else timing_start;
+    const expected_not_valid = generatedDdlConstraintNotValidRange(tokens, not_valid_start, operation_end);
+    return generatedDdlOptionalRangeMatches(tokens, end, not_valid, expected_not_valid);
+}
+
+fn generatedDdlInlineConstraintContainingOperationEnd(
+    ddl_ast: generated_parser.GeneratedSqlDdlAst,
+    kind: generated_parser.GeneratedSqlTokenRange,
+) ?usize {
+    return if (generatedDdlInlineConstraintContainingOperation(ddl_ast, kind)) |operation| operation.end else null;
+}
+
+fn generatedDdlInlineConstraintContainingOperation(
+    ddl_ast: generated_parser.GeneratedSqlDdlAst,
+    kind: generated_parser.GeneratedSqlTokenRange,
+) ?generated_parser.GeneratedSqlTokenRange {
+    for (ddl_ast.alter_table_operation_items.items) |operation| {
+        if (kind.start >= operation.start and kind.end <= operation.end) return operation;
+    }
+    return null;
+}
+
+fn generatedDdlColumnDefinitionsHaveInlineConstraints(
+    tokens: []const Token,
+    ddl_ast: generated_parser.GeneratedSqlDdlAst,
+) bool {
+    if (ddl_ast.alter_table_operation_column_type_items.len == 0) return false;
+    for (ddl_ast.alter_table_operation_items.items, 0..) |operation, index| {
+        if (!generatedDdlItemLooksLikeColumnDefinition(tokens, operation)) continue;
+        const type_range = ddl_ast.alter_table_operation_column_type_items[index] orelse continue;
+        var cursor = type_range.end;
+        if (generatedDdlNextColumnInlineConstraintPrefix(tokens, operation, &cursor) != null) return true;
+    }
+    return false;
+}
+
+const GeneratedDdlInlineConstraintPrefix = struct {
+    prefix: generated_parser.GeneratedSqlTokenRange,
+    name: ?generated_parser.GeneratedSqlTokenRange = null,
+    kind: generated_parser.GeneratedSqlTokenRange,
+};
+
+fn generatedDdlNextColumnInlineConstraintPrefix(
+    tokens: []const Token,
+    operation: generated_parser.GeneratedSqlTokenRange,
+    cursor: *usize,
+) ?GeneratedDdlInlineConstraintPrefix {
+    var index = cursor.*;
+    var depth: usize = 0;
+    while (index < operation.end and index < tokens.len) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen, .lbracket => depth += 1,
+            .rparen, .rbracket => {
+                if (depth == 0) return null;
+                depth -= 1;
+            },
+            else => if (depth == 0) {
+                const prefix = generatedDdlColumnInlineConstraintPrefixAt(tokens, operation, index) orelse continue;
+                cursor.* = index;
+                return prefix;
+            },
+        }
+    }
+    cursor.* = index;
+    return null;
+}
+
+fn generatedDdlColumnInlineConstraintPrefixAt(
+    tokens: []const Token,
+    operation: generated_parser.GeneratedSqlTokenRange,
+    index: usize,
+) ?GeneratedDdlInlineConstraintPrefix {
+    if (index >= operation.end or index >= tokens.len) return null;
+    var kind_start = index;
+    var name: ?generated_parser.GeneratedSqlTokenRange = null;
+    if (tokens[index].matchesKeywordTag(.constraint)) {
+        const name_start = index + 1;
+        if (name_start >= operation.end or tokens[name_start].kind != .identifier) return null;
+        name = .{ .start = name_start, .end = name_start + 1 };
+        kind_start = name_start + 1;
+    }
+    const kind_end = generatedDdlInlineConstraintKindEnd(tokens, kind_start, operation.end) orelse return null;
+    const prefix_start = if (name) |name_range| name_range.start - 1 else kind_start;
+    return .{
+        .prefix = .{ .start = prefix_start, .end = kind_end },
+        .name = name,
+        .kind = .{ .start = kind_start, .end = kind_end },
+    };
+}
+
+fn generatedDdlInlineConstraintKindEnd(
+    tokens: []const Token,
+    start: usize,
+    end: usize,
+) ?usize {
+    if (start >= end or start >= tokens.len) return null;
+    if (tokens[start].matchesKeyword("unique") or
+        tokens[start].matchesKeyword("check") or
+        tokens[start].matchesKeyword("references"))
+    {
+        return start + 1;
+    }
+    if (tokens[start].matchesKeyword("primary")) {
+        if (start + 1 >= end or !tokens[start + 1].matchesKeyword("key")) return null;
+        return start + 2;
+    }
+    return null;
+}
+
+fn generatedDdlInlineConstraintKindRangeIsValid(
+    tokens: []const Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    return generatedDdlInlineConstraintKindEnd(tokens, range.start, range.end) == range.end;
+}
+
+fn generatedDdlInlineConstraintKindIsReferences(
+    tokens: []const Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    return range.end == range.start + 1 and range.end <= tokens.len and tokens[range.start].matchesKeyword("references");
+}
+
+fn generatedDdlNextInlineConstraintPrefixStart(
+    tokens: []const Token,
+    operation: generated_parser.GeneratedSqlTokenRange,
+    start: usize,
+) ?usize {
+    var cursor = start;
+    if (generatedDdlNextColumnInlineConstraintPrefix(tokens, operation, &cursor)) |prefix| return prefix.prefix.start;
+    return null;
+}
+
+fn generatedDdlInlineConstraintPrefixBelongsToColumn(
+    tokens: []const Token,
+    ddl_ast: generated_parser.GeneratedSqlDdlAst,
+    prefix: generated_parser.GeneratedSqlTokenRange,
+    kind: generated_parser.GeneratedSqlTokenRange,
+    name: ?generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (ddl_ast.alter_table_operation_column_type_items.len == 0) return false;
+    for (ddl_ast.alter_table_operation_items.items, 0..) |operation, index| {
+        if (prefix.start < operation.start or prefix.end > operation.end) continue;
+        if (!generatedDdlItemLooksLikeColumnDefinition(tokens, operation)) return false;
+        const type_range = ddl_ast.alter_table_operation_column_type_items[index] orelse return false;
+        if (kind.start < type_range.end) return false;
+        var cursor = type_range.end;
+        while (generatedDdlNextColumnInlineConstraintPrefix(tokens, operation, &cursor)) |expected| {
+            if (std.meta.eql(expected.prefix, prefix)) {
+                if (!std.meta.eql(expected.kind, kind)) return false;
+                if (expected.name == null) return name == null;
+                return name != null and std.meta.eql(expected.name.?, name.?);
+            }
+            cursor = expected.kind.end;
+        }
+        return false;
+    }
+    return false;
+}
+
+fn generatedDdlItemLooksLikeColumnDefinition(
+    tokens: []const Token,
+    item: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (item.end > tokens.len or item.start >= item.end) return false;
+    const first = tokens[item.start];
+    if (first.matchesKeywordTag(.add)) {
+        return item.start + 1 < item.end and tokens[item.start + 1].matchesKeywordTag(.column);
+    }
+    if (first.matchesKeywordTag(.alter) or
+        first.matchesKeywordTag(.drop) or
+        first.matchesKeywordTag(.rename) or
+        first.matchesKeywordTag(.validate) or
+        first.matchesKeyword("attach") or
+        first.matchesKeyword("detach") or
+        first.matchesKeywordTag(.constraint) or
+        first.matchesKeyword("period") or
+        first.matchesKeyword("primary") or
+        first.matchesKeyword("unique") or
+        first.matchesKeyword("foreign") or
+        first.matchesKeyword("check"))
+    {
+        return false;
+    }
+    return first.kind == .identifier;
+}
+
+fn generatedDdlColumnDefinitionHasTopLevelNullability(
+    tokens: []const Token,
+    item: generated_parser.GeneratedSqlTokenRange,
+    start: usize,
+) bool {
+    var index = start;
+    var depth: usize = 0;
+    while (index < item.end and index < tokens.len) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen, .lbracket => depth += 1,
+            .rparen, .rbracket => {
+                if (depth == 0) return false;
+                depth -= 1;
+            },
+            else => if (depth == 0 and
+                (tokens[index].matchesKeywordTag(.null) or
+                    (tokens[index].matchesKeywordTag(.not) and index + 1 < item.end and tokens[index + 1].matchesKeywordTag(.null))))
+            {
+                return true;
+            },
+        }
+    }
+    return false;
+}
+
+fn generatedDdlColumnNullabilityRangeIsValid(
+    tokens: []const Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (range.end == range.start + 1) return tokens[range.start].matchesKeywordTag(.null);
+    if (range.end == range.start + 2) {
+        return tokens[range.start].matchesKeywordTag(.not) and tokens[range.start + 1].matchesKeywordTag(.null);
+    }
+    return false;
+}
+
+fn generatedDdlColumnCollationRangeIsValid(
+    tokens: []const Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (range.end > tokens.len or range.start >= range.end) return false;
+    if (!tokens[range.start].matchesKeyword("collate")) return false;
+    if (range.start + 1 >= range.end or tokens[range.start + 1].kind != .identifier) return false;
+    if (range.end == range.start + 2) return true;
+    if (range.end == range.start + 3) {
+        return std.mem.endsWith(u8, tokens[range.start + 1].text, ".") and tokens[range.start + 2].kind == .identifier;
+    }
+    return false;
+}
+
+fn generatedDdlColumnDefaultClauseRangeIsValid(
+    tokens: []const Token,
+    operation: generated_parser.GeneratedSqlTokenRange,
+    range: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    const expected = generatedDdlColumnDefinitionDefaultClauseRange(tokens, operation) orelse return false;
+    return std.meta.eql(expected, range);
+}
+
+fn generatedDdlColumnDefinitionDefaultClauseRange(
+    tokens: []const Token,
+    operation: generated_parser.GeneratedSqlTokenRange,
+) ?generated_parser.GeneratedSqlTokenRange {
+    var search_start = operation.start;
+    while (findTopLevelKeyword(tokens, search_start, operation.end, .default)) |default_index| {
+        search_start = default_index + 1;
+        if (!generatedDdlDefaultKeywordIntroducesValue(tokens, operation, default_index)) continue;
+        const value_range = generatedDdlColumnDefinitionDefaultValueRange(tokens, operation, default_index + 1) orelse return null;
+        return .{ .start = default_index, .end = value_range.end };
+    }
+    return null;
+}
+
+fn generatedDdlColumnDefinitionDefaultValueRange(
+    tokens: []const Token,
+    operation: generated_parser.GeneratedSqlTokenRange,
+    start: usize,
+) ?generated_parser.GeneratedSqlTokenRange {
+    if (start >= operation.end or start >= tokens.len) return null;
+    const first = tokens[start];
+    if (first.kind == .lparen) {
+        const close_index = findMatchingParen(tokens, start, operation.end) orelse return null;
+        if (close_index <= start + 1) return null;
+        return .{ .start = start, .end = close_index + 1 };
+    }
+    if (first.kind == .plus or first.kind == .minus) {
+        if (start + 1 < operation.end and tokens[start + 1].kind == .number) return .{ .start = start, .end = start + 2 };
+        return null;
+    }
+    if (first.kind == .number or first.kind == .string) return .{ .start = start, .end = start + 1 };
+    if (first.kind != .identifier) return null;
+    if (first.matchesKeywordTag(.true) or first.matchesKeywordTag(.false) or first.matchesKeywordTag(.null) or first.matchesKeyword("current_date")) {
+        return .{ .start = start, .end = start + 1 };
+    }
+    if (first.matchesKeyword("current_timestamp")) {
+        if (start + 1 < operation.end and tokens[start + 1].kind == .lparen) {
+            const close_index = findMatchingParen(tokens, start + 1, operation.end) orelse return null;
+            return .{ .start = start, .end = close_index + 1 };
+        }
+        return .{ .start = start, .end = start + 1 };
+    }
+    if (first.matchesKeyword("gen_random_uuid") or first.matchesKeyword("uuid_generate_v4") or first.matchesKeyword("now")) {
+        if (start + 1 >= operation.end or tokens[start + 1].kind != .lparen) return null;
+        const close_index = findMatchingParen(tokens, start + 1, operation.end) orelse return null;
+        return .{ .start = start, .end = close_index + 1 };
+    }
+    return null;
+}
+
+fn generatedDdlColumnStoredGeneratedClauseRangeIsValid(
+    tokens: []const Token,
+    operation: generated_parser.GeneratedSqlTokenRange,
+    range: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    const expected = generatedDdlColumnDefinitionStoredGeneratedClauseRange(tokens, operation) orelse return false;
+    return std.meta.eql(expected, range);
+}
+
+fn generatedDdlColumnDefinitionStoredGeneratedClauseRange(
+    tokens: []const Token,
+    operation: generated_parser.GeneratedSqlTokenRange,
+) ?generated_parser.GeneratedSqlTokenRange {
+    const generated_index = findTopLevelKeyword(tokens, operation.start, operation.end, .generated) orelse return null;
+    var cursor = generated_index + 1;
+    if (cursor >= operation.end or !tokens[cursor].matchesKeywordTag(.always)) return null;
+    cursor += 1;
+    if (cursor >= operation.end or !tokens[cursor].matchesKeywordTag(.as)) return null;
+    cursor += 1;
+    if (cursor >= operation.end or tokens[cursor].kind != .lparen) return null;
+    const close_index = findMatchingParen(tokens, cursor, operation.end) orelse return null;
+    if (close_index <= cursor + 1) return null;
+    if (close_index + 1 >= operation.end or !tokens[close_index + 1].matchesKeywordTag(.stored)) return null;
+    return .{ .start = generated_index, .end = close_index + 2 };
+}
+
+fn generatedDdlDefaultValuePayloadsAreValid(
+    tokens: []const Token,
+    end: usize,
+    ddl_ast: generated_parser.GeneratedSqlDdlAst,
+) bool {
+    const items = ddl_ast.alter_table_operation_default_value_items;
+    const clause_items = ddl_ast.alter_table_operation_column_default_clause_items;
+    if (items.len == 0 and clause_items.len == 0) return true;
+    if (items.len != ddl_ast.alter_table_operation_items.count or clause_items.len != ddl_ast.alter_table_operation_items.count) return false;
+    if (ddl_ast.alter_table_operation_items.items.len != ddl_ast.alter_table_operation_items.count) return false;
+    for (items, 0..) |maybe_range, index| {
+        const operation = ddl_ast.alter_table_operation_items.items[index];
+        const maybe_clause = clause_items[index];
+        const range = maybe_range orelse continue;
+        const clause = maybe_clause orelse return false;
+        if (range.start < operation.start or range.end > operation.end) return false;
+        if (clause.start < operation.start or clause.end > operation.end or clause.start >= clause.end) return false;
+        if (!generatedDdlTokenRangeIsValid(tokens, end, range)) return false;
+        if (!generatedDdlTokenRangeIsValid(tokens, end, clause)) return false;
+        if (clause.start + 1 != range.start or clause.end != range.end) return false;
+        if (!generatedDdlColumnDefaultClauseRangeIsValid(tokens, operation, clause)) return false;
+    }
+    for (ddl_ast.alter_table_operation_items.items, 0..) |operation, index| {
+        if (items[index] == null and generatedDdlItemRequiresDefaultValueRange(tokens, operation)) return false;
+        if (clause_items[index] == null and generatedDdlColumnDefinitionDefaultClauseRange(tokens, operation) != null) return false;
+        if ((items[index] == null) != (clause_items[index] == null)) return false;
+    }
+    return true;
+}
+
+fn generatedDdlItemRequiresDefaultValueRange(
+    tokens: []const Token,
+    item: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (item.end > tokens.len or item.start >= item.end) return false;
+    var depth: usize = 0;
+    var index = item.start;
+    while (index < item.end) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen, .lbracket => depth += 1,
+            .rparen, .rbracket => {
+                if (depth == 0) return false;
+                depth -= 1;
+            },
+            else => if (depth == 0 and
+                tokens[index].matchesKeywordTag(.default) and
+                generatedDdlDefaultKeywordIntroducesValue(tokens, item, index))
+            {
+                return true;
+            },
+        }
+    }
+    return false;
+}
+
+fn generatedDdlDefaultKeywordIntroducesValue(
+    tokens: []const Token,
+    item: generated_parser.GeneratedSqlTokenRange,
+    default_index: usize,
+) bool {
+    if (default_index <= item.start) return true;
+    const previous = tokens[default_index - 1];
+    if (previous.matchesKeywordTag(.by) or previous.matchesKeywordTag(.drop)) return false;
+    return true;
+}
+
+fn generatedDdlGeneratedColumnExpressionPayloadsAreValid(
+    tokens: []const Token,
+    end: usize,
+    ddl_ast: generated_parser.GeneratedSqlDdlAst,
+) bool {
+    const clause_items = ddl_ast.alter_table_operation_column_generated_clause_items;
+    const expression_items = ddl_ast.alter_table_operation_generated_expression_items;
+    if (clause_items.len == 0 and expression_items.len == 0) {
+        return !generatedDdlOperationsRequireGeneratedColumnClause(tokens, ddl_ast.alter_table_operation_items.items);
+    }
+    if (clause_items.len != ddl_ast.alter_table_operation_items.count or expression_items.len != ddl_ast.alter_table_operation_items.count) return false;
+    if (ddl_ast.alter_table_operation_items.items.len != ddl_ast.alter_table_operation_items.count) return false;
+    for (ddl_ast.alter_table_operation_items.items, 0..) |operation, index| {
+        const maybe_clause = clause_items[index];
+        const maybe_expression = expression_items[index];
+        if ((maybe_clause == null) != (maybe_expression == null)) return false;
+        if (maybe_clause) |clause| {
+            const expression = maybe_expression orelse return false;
+            if (!generatedDdlTokenRangeIsValid(tokens, end, clause)) return false;
+            if (clause.start < operation.start or clause.end > operation.end or clause.start >= clause.end) return false;
+            if (!generatedDdlColumnStoredGeneratedClauseRangeIsValid(tokens, operation, clause)) return false;
+            if (expression.start <= clause.start or expression.end >= clause.end) return false;
+        } else if (generatedDdlColumnDefinitionStoredGeneratedClauseRange(tokens, operation) != null) {
+            return false;
+        }
+    }
+    return generatedDdlAlterTableOperationExpressionPayloadsAreValid(
+        tokens,
+        end,
+        ddl_ast,
+        ddl_ast.alter_table_operation_generated_expression_items,
+        ddl_ast.alter_table_operation_generated_expressions,
+    );
+}
+
+fn generatedDdlOperationsRequireGeneratedColumnClause(
+    tokens: []const Token,
+    operations: []const generated_parser.GeneratedSqlTokenRange,
+) bool {
+    for (operations) |operation| {
+        if (generatedDdlColumnDefinitionStoredGeneratedClauseRange(tokens, operation) != null) return true;
+    }
+    return false;
+}
+
+fn generatedDdlRewriteExpressionPayloadsAreValid(
+    tokens: []const Token,
+    end: usize,
+    ddl_ast: generated_parser.GeneratedSqlDdlAst,
+) bool {
+    return generatedDdlAlterTableOperationExpressionPayloadsAreValid(
+        tokens,
+        end,
+        ddl_ast,
+        ddl_ast.alter_table_operation_rewrite_expression_items,
+        ddl_ast.alter_table_operation_rewrite_expressions,
+    );
+}
+
+fn generatedDdlAlterTableOperationExpressionPayloadsAreValid(
+    tokens: []const Token,
+    end: usize,
+    ddl_ast: generated_parser.GeneratedSqlDdlAst,
+    expression_items: []const ?generated_parser.GeneratedSqlTokenRange,
+    expressions: []const generated_parser.GeneratedSqlExpressionAst,
+) bool {
+    if (expression_items.len == 0 and expressions.len == 0) return true;
+    if (expression_items.len != expressions.len) return false;
+    if (expression_items.len != ddl_ast.alter_table_operation_items.count) return false;
+    if (ddl_ast.alter_table_operation_items.items.len != ddl_ast.alter_table_operation_items.count) return false;
+
+    for (expression_items, 0..) |maybe_range, index| {
+        const expression = expressions[index];
+        if (maybe_range) |range| {
+            const operation = ddl_ast.alter_table_operation_items.items[index];
+            if (range.start < operation.start or range.end > operation.end) return false;
+            if (!generatedDdlTokenRangeIsValid(tokens, end, range)) return false;
+            if (!generatedDdlExpressionPayloadMatchesRange(tokens, end, expression, range)) return false;
+        } else if (!generatedDdlExpressionPayloadIsEmpty(expression)) {
+            return false;
+        }
     }
     return true;
 }
@@ -1135,7 +2527,18 @@ fn generatedDdlRoutinePayloadIsValid(
     }
     return generatedDdlListPayloadIsValid(tokens, end, &routine.argument_items) and
         generatedDdlListPayloadIsValid(tokens, end, &routine.transform_type_items) and
-        generatedDdlListPayloadIsValid(tokens, end, &routine.setting_items);
+        generatedDdlListPayloadIsValid(tokens, end, &routine.setting_items) and
+        generatedDdlRoutineBodyExpressionPayloadIsValid(routine);
+}
+
+fn generatedDdlRoutineBodyExpressionPayloadIsValid(
+    routine: *const generated_parser.GeneratedSqlRoutineAst,
+) bool {
+    if (routine.body_expression_tokens) |range| {
+        if (range.start >= range.end or range.end > routine.body_sql_tokens.len) return false;
+        return generatedReadExpressionPayloadMatchesRange(routine.body_sql_tokens, routine.body_sql_tokens.len, routine.body_expression, range);
+    }
+    return generatedDdlExpressionPayloadIsEmpty(routine.body_expression);
 }
 
 fn generatedDdlViewPayloadIsValid(
@@ -1220,6 +2623,19 @@ fn generatedDdlShapePayloadIsValid(
     };
 }
 
+fn generatedDdlExpressionPayloadIsEmpty(expression: generated_parser.GeneratedSqlExpressionAst) bool {
+    return generatedReadExpressionPayloadIsEmpty(expression);
+}
+
+fn generatedDdlExpressionPayloadMatchesRange(
+    tokens: []const Token,
+    end: usize,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+    range: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    return generatedReadExpressionPayloadMatchesRange(tokens, end, expression, range);
+}
+
 fn generatedDdlCreateIndexPayloadIsValid(
     tokens: []const Token,
     end: usize,
@@ -1281,7 +2697,10 @@ fn generatedDdlCreateIndexPayloadIsValid(
     if (ddl_ast.index_where_tokens) |where| {
         if (cursor >= end or !tokens[cursor].matchesKeywordTag(.where)) return false;
         if (where.start != cursor + 1 or where.end <= where.start or where.end != end) return false;
+        if (!generatedDdlExpressionPayloadMatchesRange(tokens, end, ddl_ast.index_where_expression, where)) return false;
         cursor = where.end;
+    } else if (!generatedDdlExpressionPayloadIsEmpty(ddl_ast.index_where_expression)) {
+        return false;
     }
 
     return cursor == end;
@@ -1669,8 +3088,24 @@ fn generatedUnsupportedShapePayloadIsValid(
     unsupported_ast: generated_parser.GeneratedSqlUnsupportedAst,
 ) bool {
     if (!generatedUnsupportedSubjectRangeMatchesKind(tokens, end, unsupported_ast)) return false;
+    const alter_table_kind = generatedUnsupportedAlterTableOperationKind(unsupported_ast.kind);
+    if (!alter_table_kind and generatedUnsupportedHasAlterTablePayload(unsupported_ast)) return false;
+    const trigger_kind = unsupported_ast.kind == .create_trigger or unsupported_ast.kind == .drop_trigger;
+    if (!trigger_kind and generatedUnsupportedHasTriggerPayload(unsupported_ast)) return false;
+    const notification_kind = unsupported_ast.kind == .listen or unsupported_ast.kind == .notify or unsupported_ast.kind == .unlisten;
+    if (!notification_kind and generatedUnsupportedHasNotificationPayload(unsupported_ast)) return false;
+    const routine_payload_kind = unsupported_ast.kind == .alter_function or unsupported_ast.kind == .alter_procedure or unsupported_ast.kind == .call;
+    if (!routine_payload_kind and generatedUnsupportedHasRoutinePayload(unsupported_ast)) return false;
+    if (unsupported_ast.kind != .lock and generatedUnsupportedHasTableLockPayload(unsupported_ast)) return false;
+    const maintenance_payload_kind = unsupported_ast.kind == .vacuum or unsupported_ast.kind == .analyze or unsupported_ast.kind == .reindex or unsupported_ast.kind == .cluster;
+    if (!maintenance_payload_kind and generatedUnsupportedHasMaintenancePayload(unsupported_ast)) return false;
+    if (unsupported_ast.kind != .copy and generatedUnsupportedHasBulkIoPayload(unsupported_ast)) return false;
     return switch (unsupported_ast.kind) {
         .alter_function, .alter_procedure => generatedAlterRoutineUnsupportedPayloadIsValid(tokens, end, unsupported_ast),
+        .call => generatedProcedureCallUnsupportedPayloadIsValid(tokens, end, unsupported_ast),
+        .lock => generatedTableLockUnsupportedPayloadIsValid(tokens, end, unsupported_ast),
+        .copy => generatedBulkIoUnsupportedPayloadIsValid(tokens, end, unsupported_ast),
+        .vacuum, .analyze, .reindex, .cluster => generatedMaintenanceUnsupportedPayloadIsValid(tokens, end, unsupported_ast),
         .alter_table_access_method,
         .alter_table_cluster,
         .alter_table_column_statistics,
@@ -1686,8 +3121,781 @@ fn generatedUnsupportedShapePayloadIsValid(
         => generatedAlterTableUnsupportedPayloadIsValid(tokens, end, unsupported_ast),
         .explain => generatedExplainUnsupportedPayloadIsValid(tokens, end, unsupported_ast),
         .graph_query => generatedGraphQueryUnsupportedPayloadIsValid(tokens, end, unsupported_ast),
+        .create_trigger, .drop_trigger => generatedTriggerUnsupportedPayloadIsValid(tokens, end, unsupported_ast),
+        .listen, .notify, .unlisten => generatedNotificationUnsupportedPayloadIsValid(tokens, end, unsupported_ast),
         else => true,
     };
+}
+
+fn generatedUnsupportedHasTriggerPayload(unsupported_ast: generated_parser.GeneratedSqlUnsupportedAst) bool {
+    return unsupported_ast.trigger_name_tokens != null or
+        unsupported_ast.trigger_table_tokens != null or
+        unsupported_ast.trigger_function_tokens != null or
+        unsupported_ast.trigger_argument_tokens != null or
+        unsupported_ast.trigger_event != null or
+        unsupported_ast.trigger_if_exists or
+        unsupported_ast.trigger_cascade;
+}
+
+fn generatedUnsupportedHasNotificationPayload(unsupported_ast: generated_parser.GeneratedSqlUnsupportedAst) bool {
+    return unsupported_ast.notification_channel_tokens != null or
+        unsupported_ast.notification_payload_tokens != null or
+        unsupported_ast.notification_unlisten_all;
+}
+
+fn generatedUnsupportedHasRoutinePayload(unsupported_ast: generated_parser.GeneratedSqlUnsupportedAst) bool {
+    return unsupported_ast.routine_name_tokens != null or
+        unsupported_ast.routine_operation_tokens != null or
+        unsupported_ast.routine_metadata != null;
+}
+
+fn generatedUnsupportedHasAlterTablePayload(unsupported_ast: generated_parser.GeneratedSqlUnsupportedAst) bool {
+    return unsupported_ast.alter_table_name_tokens != null or
+        unsupported_ast.alter_table_operation_tokens != null or
+        unsupported_ast.alter_table_operation_kind != null or
+        unsupported_ast.alter_table_operation_subject_tokens != null;
+}
+
+fn generatedUnsupportedHasTableLockPayload(unsupported_ast: generated_parser.GeneratedSqlUnsupportedAst) bool {
+    return unsupported_ast.table_lock_table_items.count != 0 or
+        unsupported_ast.table_lock_table_items.items.len != 0 or
+        unsupported_ast.table_lock_mode != null;
+}
+
+fn generatedUnsupportedHasMaintenancePayload(unsupported_ast: generated_parser.GeneratedSqlUnsupportedAst) bool {
+    return unsupported_ast.maintenance_name_tokens != null or
+        unsupported_ast.maintenance_secondary_name_tokens != null or
+        unsupported_ast.maintenance_reindex_target != null or
+        unsupported_ast.maintenance_concurrently or
+        unsupported_ast.maintenance_verbose or
+        unsupported_ast.maintenance_vacuum_full or
+        unsupported_ast.maintenance_vacuum_freeze or
+        unsupported_ast.maintenance_vacuum_analyze or
+        unsupported_ast.maintenance_column_items.count != 0 or
+        unsupported_ast.maintenance_column_items.items.len != 0;
+}
+
+fn generatedUnsupportedHasBulkIoPayload(unsupported_ast: generated_parser.GeneratedSqlUnsupportedAst) bool {
+    return unsupported_ast.bulk_table_tokens != null or
+        unsupported_ast.bulk_column_items.count != 0 or
+        unsupported_ast.bulk_column_items.items.len != 0 or
+        unsupported_ast.bulk_direction != null or
+        unsupported_ast.bulk_endpoint_kind != null or
+        unsupported_ast.bulk_endpoint_tokens != null or
+        unsupported_ast.bulk_option_items.count != 0 or
+        unsupported_ast.bulk_option_items.items.len != 0 or
+        unsupported_ast.bulk_format_tokens != null or
+        unsupported_ast.bulk_header or
+        unsupported_ast.bulk_freeze or
+        unsupported_ast.bulk_on_error != .stop or
+        unsupported_ast.bulk_reject_limit_tokens != null or
+        unsupported_ast.bulk_log_verbosity != .default or
+        unsupported_ast.bulk_force_quote_all or
+        unsupported_ast.bulk_force_quote_column_items.count != 0 or
+        unsupported_ast.bulk_force_quote_column_items.items.len != 0 or
+        unsupported_ast.bulk_force_not_null_column_items.count != 0 or
+        unsupported_ast.bulk_force_not_null_column_items.items.len != 0 or
+        unsupported_ast.bulk_force_null_column_items.count != 0 or
+        unsupported_ast.bulk_force_null_column_items.items.len != 0 or
+        unsupported_ast.bulk_delimiter_tokens != null or
+        unsupported_ast.bulk_quote_tokens != null or
+        unsupported_ast.bulk_escape_tokens != null or
+        unsupported_ast.bulk_null_tokens != null or
+        unsupported_ast.bulk_default_tokens != null or
+        unsupported_ast.bulk_encoding_tokens != null or
+        unsupported_ast.bulk_where_tokens != null;
+}
+
+fn generatedBulkIoUnsupportedPayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    unsupported_ast: generated_parser.GeneratedSqlUnsupportedAst,
+) bool {
+    if (generatedUnsupportedHasTriggerPayload(unsupported_ast) or
+        generatedUnsupportedHasNotificationPayload(unsupported_ast) or
+        generatedUnsupportedHasRoutinePayload(unsupported_ast) or
+        generatedUnsupportedHasTableLockPayload(unsupported_ast) or
+        generatedUnsupportedHasMaintenancePayload(unsupported_ast))
+    {
+        return false;
+    }
+    if (!generatedUnsupportedHasBulkIoPayload(unsupported_ast)) return true;
+    const subject = unsupported_ast.subject_tokens orelse return false;
+    var index = subject.start;
+    const table_name = unsupported_ast.bulk_table_tokens orelse return false;
+    if (!generatedSingleIdentifierRangeMatches(tokens, end, table_name, index)) return false;
+    index = table_name.end;
+    if (!generatedBulkIoOptionalIdentifierListMatches(tokens, end, &unsupported_ast.bulk_column_items, &index)) return false;
+    const direction = unsupported_ast.bulk_direction orelse return false;
+    switch (direction) {
+        .from => if (!generatedConsumeKeywordTextForValidation(tokens, end, &index, "from")) return false,
+        .to => if (!generatedConsumeKeywordTextForValidation(tokens, end, &index, "to")) return false,
+    }
+    const endpoint_kind = unsupported_ast.bulk_endpoint_kind orelse return false;
+    if (endpoint_kind == .program and !generatedConsumeKeywordTextForValidation(tokens, end, &index, "program")) return false;
+    const endpoint = unsupported_ast.bulk_endpoint_tokens orelse return false;
+    if (endpoint.start != index or endpoint.end != index + 1 or endpoint.end > end) return false;
+    switch (endpoint_kind) {
+        .stream => {
+            if (tokens[endpoint.start].kind != .identifier) return false;
+            switch (direction) {
+                .from => if (!std.ascii.eqlIgnoreCase(tokens[endpoint.start].text, "STDIN")) return false,
+                .to => if (!std.ascii.eqlIgnoreCase(tokens[endpoint.start].text, "STDOUT")) return false,
+            }
+        },
+        .file, .program => if (tokens[endpoint.start].kind != .string) return false,
+    }
+    index = endpoint.end;
+    if (!generatedBulkIoOptionsMatch(tokens, end, unsupported_ast, &index)) return false;
+    if (unsupported_ast.bulk_freeze and direction != .from) return false;
+    if (unsupported_ast.bulk_on_error != .stop and direction != .from) return false;
+    if (unsupported_ast.bulk_reject_limit_tokens != null and direction != .from) return false;
+    if (unsupported_ast.bulk_reject_limit_tokens != null and unsupported_ast.bulk_on_error != .ignore) return false;
+    if (unsupported_ast.bulk_log_verbosity != .default and direction != .from) return false;
+    if (unsupported_ast.bulk_log_verbosity != .default and unsupported_ast.bulk_on_error != .ignore) return false;
+    if (unsupported_ast.bulk_default_tokens != null and direction != .from) return false;
+    if ((unsupported_ast.bulk_force_quote_all or unsupported_ast.bulk_force_quote_column_items.count != 0) and direction != .to) return false;
+    if (unsupported_ast.bulk_force_not_null_column_items.count != 0 and direction != .from) return false;
+    if (unsupported_ast.bulk_force_null_column_items.count != 0 and direction != .from) return false;
+    if (unsupported_ast.bulk_where_tokens) |where_tokens| {
+        if (where_tokens.start != index or where_tokens.end != subject.end or where_tokens.end != end) return false;
+        if (!generatedTokenMatchesKeywordText(tokens, end, where_tokens.start, "where") or where_tokens.start + 1 >= where_tokens.end) return false;
+        index = where_tokens.end;
+    }
+    return index == subject.end and subject.end == end;
+}
+
+fn generatedBulkIoOptionalIdentifierListMatches(
+    tokens: []const Token,
+    end: usize,
+    items: *const generated_parser.GeneratedSqlListAst,
+    index: *usize,
+) bool {
+    if (items.count == 0 and items.items.len == 0) return true;
+    if (index.* >= end or tokens[index.*].kind != .lparen) return false;
+    const close = generatedMatchingParenIndex(tokens, index.*, end) orelse return false;
+    if (!generatedUnsupportedPlainTokenListMatches(tokens, .{ .start = index.* + 1, .end = close }, items)) return false;
+    for (items.items) |item| {
+        if (item.end != item.start + 1 or item.end > end or tokens[item.start].kind != .identifier) return false;
+    }
+    index.* = close + 1;
+    return true;
+}
+
+fn generatedBulkIoOptionsMatch(
+    tokens: []const Token,
+    end: usize,
+    unsupported_ast: generated_parser.GeneratedSqlUnsupportedAst,
+    index: *usize,
+) bool {
+    const option_items = &unsupported_ast.bulk_option_items;
+    if (option_items.count == 0 and option_items.items.len == 0) return true;
+    if (!generatedConsumeKeywordTextForValidation(tokens, end, index, "with")) return false;
+    if (index.* >= end or tokens[index.*].kind != .lparen) return false;
+    const close = generatedMatchingParenIndex(tokens, index.*, end) orelse return false;
+    if (!generatedUnsupportedPlainTokenListMatches(tokens, .{ .start = index.* + 1, .end = close }, option_items)) return false;
+    var saw_header = false;
+    var saw_freeze = false;
+    var saw_on_error = false;
+    var saw_log_verbosity = false;
+    for (option_items.items) |item| {
+        var option_index = item.start;
+        if (generatedConsumeKeywordTextForValidation(tokens, item.end, &option_index, "format")) {
+            if (!generatedBulkIoRangeMatches(unsupported_ast.bulk_format_tokens, option_index, item.end, .identifier, tokens)) return false;
+        } else if (generatedConsumeKeywordTextForValidation(tokens, item.end, &option_index, "header")) {
+            saw_header = true;
+            if (!generatedBulkIoBoolMatches(tokens, &option_index, item.end, unsupported_ast.bulk_header)) return false;
+        } else if (generatedConsumeKeywordTextForValidation(tokens, item.end, &option_index, "freeze")) {
+            saw_freeze = true;
+            if (!generatedBulkIoBoolMatches(tokens, &option_index, item.end, unsupported_ast.bulk_freeze)) return false;
+        } else if (generatedConsumeKeywordTextForValidation(tokens, item.end, &option_index, "on_error")) {
+            saw_on_error = true;
+            const value = generatedSingleIdentifierRangeAt(tokens, option_index, item.end) orelse return false;
+            const expected: []const u8 = switch (unsupported_ast.bulk_on_error) {
+                .stop => "stop",
+                .ignore => "ignore",
+            };
+            if (!std.ascii.eqlIgnoreCase(tokens[value.start].text, expected) or value.end != item.end) return false;
+        } else if (generatedConsumeKeywordTextForValidation(tokens, item.end, &option_index, "reject_limit")) {
+            const reject_limit = unsupported_ast.bulk_reject_limit_tokens orelse return false;
+            if (!std.meta.eql(reject_limit, generated_parser.GeneratedSqlTokenRange{ .start = option_index, .end = item.end })) return false;
+            if (tokens[reject_limit.start].kind != .number or std.mem.indexOfScalar(u8, tokens[reject_limit.start].text, '.') != null) return false;
+            const parsed = std.fmt.parseInt(usize, tokens[reject_limit.start].text, 10) catch return false;
+            if (parsed == 0) return false;
+        } else if (generatedConsumeKeywordTextForValidation(tokens, item.end, &option_index, "log_verbosity")) {
+            saw_log_verbosity = true;
+            const value = generatedSingleIdentifierRangeAt(tokens, option_index, item.end) orelse return false;
+            const expected: []const u8 = switch (unsupported_ast.bulk_log_verbosity) {
+                .default => "default",
+                .verbose => "verbose",
+                .terse => "terse",
+            };
+            if (!std.ascii.eqlIgnoreCase(tokens[value.start].text, expected) or value.end != item.end) return false;
+        } else if (generatedConsumeKeywordTextForValidation(tokens, item.end, &option_index, "force_quote")) {
+            if (unsupported_ast.bulk_force_quote_all) {
+                if (option_index + 1 != item.end or tokens[option_index].kind != .star) return false;
+            } else if (!generatedBulkIoParenthesizedIdentifierListMatches(tokens, item.end, &unsupported_ast.bulk_force_quote_column_items, &option_index)) return false;
+        } else if (generatedConsumeKeywordTextForValidation(tokens, item.end, &option_index, "force_not_null")) {
+            if (!generatedBulkIoParenthesizedIdentifierListMatches(tokens, item.end, &unsupported_ast.bulk_force_not_null_column_items, &option_index)) return false;
+        } else if (generatedConsumeKeywordTextForValidation(tokens, item.end, &option_index, "force_null")) {
+            if (!generatedBulkIoParenthesizedIdentifierListMatches(tokens, item.end, &unsupported_ast.bulk_force_null_column_items, &option_index)) return false;
+        } else if (generatedConsumeKeywordTextForValidation(tokens, item.end, &option_index, "delimiter")) {
+            if (!generatedBulkIoOneByteStringRangeMatches(unsupported_ast.bulk_delimiter_tokens, option_index, item.end, tokens)) return false;
+        } else if (generatedConsumeKeywordTextForValidation(tokens, item.end, &option_index, "quote")) {
+            if (!generatedBulkIoOneByteStringRangeMatches(unsupported_ast.bulk_quote_tokens, option_index, item.end, tokens)) return false;
+        } else if (generatedConsumeKeywordTextForValidation(tokens, item.end, &option_index, "escape")) {
+            if (!generatedBulkIoOneByteStringRangeMatches(unsupported_ast.bulk_escape_tokens, option_index, item.end, tokens)) return false;
+        } else if (generatedConsumeKeywordTextForValidation(tokens, item.end, &option_index, "null")) {
+            if (!generatedBulkIoRangeMatches(unsupported_ast.bulk_null_tokens, option_index, item.end, .string, tokens)) return false;
+        } else if (generatedConsumeKeywordTextForValidation(tokens, item.end, &option_index, "default")) {
+            if (!generatedBulkIoRangeMatches(unsupported_ast.bulk_default_tokens, option_index, item.end, .string, tokens)) return false;
+        } else if (generatedConsumeKeywordTextForValidation(tokens, item.end, &option_index, "encoding")) {
+            if (!generatedBulkIoRangeMatches(unsupported_ast.bulk_encoding_tokens, option_index, item.end, .string, tokens)) return false;
+            if (tokens[unsupported_ast.bulk_encoding_tokens.?.start].text.len == 0) return false;
+        } else if (generatedConsumeKeywordTextForValidation(tokens, item.end, &option_index, "oids")) {
+            if (!generatedBulkIoBoolMatches(tokens, &option_index, item.end, false)) return false;
+        } else return false;
+    }
+    if (!saw_header and unsupported_ast.bulk_header) return false;
+    if (!saw_freeze and unsupported_ast.bulk_freeze) return false;
+    if (!saw_on_error and unsupported_ast.bulk_on_error != .stop) return false;
+    if (!saw_log_verbosity and unsupported_ast.bulk_log_verbosity != .default) return false;
+    index.* = close + 1;
+    return true;
+}
+
+fn generatedBulkIoParenthesizedIdentifierListMatches(
+    tokens: []const Token,
+    end: usize,
+    items: *const generated_parser.GeneratedSqlListAst,
+    index: *usize,
+) bool {
+    if (index.* >= end or tokens[index.*].kind != .lparen) return false;
+    const close = generatedMatchingParenIndex(tokens, index.*, end) orelse return false;
+    if (close + 1 != end) return false;
+    if (!generatedUnsupportedPlainTokenListMatches(tokens, .{ .start = index.* + 1, .end = close }, items)) return false;
+    for (items.items) |item| {
+        if (item.end != item.start + 1 or item.end > end or tokens[item.start].kind != .identifier) return false;
+    }
+    index.* = end;
+    return true;
+}
+
+fn generatedBulkIoRangeMatches(
+    range: ?generated_parser.GeneratedSqlTokenRange,
+    start: usize,
+    end: usize,
+    kind: TokenKind,
+    tokens: []const Token,
+) bool {
+    const actual = range orelse return false;
+    return actual.start == start and actual.end == end and actual.end == actual.start + 1 and actual.end <= tokens.len and tokens[actual.start].kind == kind;
+}
+
+fn generatedBulkIoOneByteStringRangeMatches(
+    range: ?generated_parser.GeneratedSqlTokenRange,
+    start: usize,
+    end: usize,
+    tokens: []const Token,
+) bool {
+    if (!generatedBulkIoRangeMatches(range, start, end, .string, tokens)) return false;
+    return tokens[range.?.start].text.len == 1;
+}
+
+fn generatedSingleIdentifierRangeAt(tokens: []const Token, start: usize, end: usize) ?generated_parser.GeneratedSqlTokenRange {
+    if (start + 1 != end or end > tokens.len or tokens[start].kind != .identifier) return null;
+    return .{ .start = start, .end = end };
+}
+
+fn generatedBulkIoBoolMatches(tokens: []const Token, index: *usize, end: usize, expected: bool) bool {
+    const value = generatedSingleIdentifierRangeAt(tokens, index.*, end) orelse return false;
+    index.* = value.end;
+    if (expected) return std.ascii.eqlIgnoreCase(tokens[value.start].text, "true");
+    return std.ascii.eqlIgnoreCase(tokens[value.start].text, "false");
+}
+
+fn generatedConsumeKeywordTextForValidation(tokens: []const Token, end: usize, index: *usize, keyword: []const u8) bool {
+    if (index.* >= end or !tokens[index.*].matchesKeyword(keyword)) return false;
+    index.* += 1;
+    return true;
+}
+
+fn generatedTokenMatchesKeywordText(tokens: []const Token, end: usize, index: usize, keyword: []const u8) bool {
+    return index < end and tokens[index].matchesKeyword(keyword);
+}
+
+fn generatedProcedureCallUnsupportedPayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    unsupported_ast: generated_parser.GeneratedSqlUnsupportedAst,
+) bool {
+    if (generatedUnsupportedHasTriggerPayload(unsupported_ast) or generatedUnsupportedHasNotificationPayload(unsupported_ast)) return false;
+    if (unsupported_ast.routine_operation_tokens != null or unsupported_ast.routine_metadata != null) return false;
+    if (unsupported_ast.routine_name_tokens == null) return true;
+    const subject = unsupported_ast.subject_tokens orelse return false;
+    const routine_name = unsupported_ast.routine_name_tokens.?;
+    if (!generatedSingleIdentifierRangeMatches(tokens, end, routine_name, subject.start)) return false;
+    const lparen = routine_name.end;
+    return lparen + 1 < end and
+        tokens[lparen].kind == .lparen and
+        tokens[lparen + 1].kind == .rparen and
+        lparen + 2 == subject.end and
+        subject.end == end;
+}
+
+fn generatedMaintenanceUnsupportedPayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    unsupported_ast: generated_parser.GeneratedSqlUnsupportedAst,
+) bool {
+    if (generatedUnsupportedHasTriggerPayload(unsupported_ast) or
+        generatedUnsupportedHasNotificationPayload(unsupported_ast) or
+        generatedUnsupportedHasRoutinePayload(unsupported_ast) or
+        generatedUnsupportedHasTableLockPayload(unsupported_ast))
+    {
+        return false;
+    }
+    if (!generatedUnsupportedHasMaintenancePayload(unsupported_ast)) return true;
+    return switch (unsupported_ast.kind) {
+        .vacuum => generatedVacuumUnsupportedPayloadIsValid(tokens, end, unsupported_ast),
+        .analyze => generatedAnalyzeUnsupportedPayloadIsValid(tokens, end, unsupported_ast),
+        .reindex => generatedReindexUnsupportedPayloadIsValid(tokens, end, unsupported_ast),
+        .cluster => generatedClusterUnsupportedPayloadIsValid(tokens, end, unsupported_ast),
+        else => false,
+    };
+}
+
+fn generatedVacuumUnsupportedPayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    unsupported_ast: generated_parser.GeneratedSqlUnsupportedAst,
+) bool {
+    if (unsupported_ast.maintenance_secondary_name_tokens != null or
+        unsupported_ast.maintenance_reindex_target != null or
+        unsupported_ast.maintenance_concurrently or
+        unsupported_ast.maintenance_column_items.count != 0 or
+        unsupported_ast.maintenance_column_items.items.len != 0)
+    {
+        return false;
+    }
+    const subject = unsupported_ast.subject_tokens orelse return false;
+    var index = subject.start;
+    var full = false;
+    var freeze = false;
+    var verbose = false;
+    var analyze = false;
+    if (index < end and tokens[index].kind == .lparen) {
+        index += 1;
+        while (true) {
+            if (!generatedConsumeVacuumOptionForValidation(tokens, end, &index, &full, &freeze, &verbose, &analyze)) return false;
+            if (index < end and tokens[index].kind == .comma) {
+                index += 1;
+                continue;
+            }
+            break;
+        }
+        if (index >= end or tokens[index].kind != .rparen) return false;
+        index += 1;
+    } else {
+        while (generatedConsumeVacuumOptionForValidation(tokens, end, &index, &full, &freeze, &verbose, &analyze)) {}
+    }
+    if (full != unsupported_ast.maintenance_vacuum_full or
+        freeze != unsupported_ast.maintenance_vacuum_freeze or
+        verbose != unsupported_ast.maintenance_verbose or
+        analyze != unsupported_ast.maintenance_vacuum_analyze)
+    {
+        return false;
+    }
+    const table_name = unsupported_ast.maintenance_name_tokens orelse return false;
+    if (!generatedSingleIdentifierRangeMatches(tokens, end, table_name, index)) return false;
+    index = table_name.end;
+    return index == subject.end and subject.end == end;
+}
+
+fn generatedConsumeVacuumOptionForValidation(
+    tokens: []const Token,
+    end: usize,
+    index: *usize,
+    full: *bool,
+    freeze: *bool,
+    verbose: *bool,
+    analyze: *bool,
+) bool {
+    if (generatedConsumeKeywordForValidation(tokens, end, index, .full)) {
+        full.* = true;
+        return true;
+    }
+    if (generatedConsumeKeywordForValidation(tokens, end, index, .freeze)) {
+        freeze.* = true;
+        return true;
+    }
+    if (generatedConsumeKeywordForValidation(tokens, end, index, .verbose)) {
+        verbose.* = true;
+        return true;
+    }
+    if (generatedConsumeKeywordForValidation(tokens, end, index, .analyze)) {
+        analyze.* = true;
+        return true;
+    }
+    return false;
+}
+
+fn generatedAnalyzeUnsupportedPayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    unsupported_ast: generated_parser.GeneratedSqlUnsupportedAst,
+) bool {
+    if (unsupported_ast.maintenance_secondary_name_tokens != null or
+        unsupported_ast.maintenance_reindex_target != null or
+        unsupported_ast.maintenance_concurrently or
+        unsupported_ast.maintenance_vacuum_full or
+        unsupported_ast.maintenance_vacuum_freeze or
+        unsupported_ast.maintenance_vacuum_analyze)
+    {
+        return false;
+    }
+    const subject = unsupported_ast.subject_tokens orelse return false;
+    var index = subject.start;
+    const verbose = generatedConsumeKeywordForValidation(tokens, end, &index, .verbose);
+    if (verbose != unsupported_ast.maintenance_verbose) return false;
+    const table_name = unsupported_ast.maintenance_name_tokens orelse return false;
+    if (!generatedSingleIdentifierRangeMatches(tokens, end, table_name, index)) return false;
+    index = table_name.end;
+    const column_items = unsupported_ast.maintenance_column_items;
+    if (column_items.count == 0 and column_items.items.len == 0) {
+        return index == subject.end and subject.end == end;
+    }
+    if (column_items.count == 0 or column_items.count != column_items.items.len or column_items.first_tokens == null or column_items.last_tokens == null) return false;
+    if (index >= end or tokens[index].kind != .lparen) return false;
+    index += 1;
+    for (column_items.items, 0..) |item, item_index| {
+        if (item_index > 0) {
+            if (index >= end or tokens[index].kind != .comma) return false;
+            index += 1;
+        }
+        if (!generatedSingleIdentifierRangeMatches(tokens, end, item, index)) return false;
+        index = item.end;
+    }
+    if (!std.meta.eql(column_items.first_tokens.?, column_items.items[0])) return false;
+    if (!std.meta.eql(column_items.last_tokens.?, column_items.items[column_items.items.len - 1])) return false;
+    if (index >= end or tokens[index].kind != .rparen) return false;
+    index += 1;
+    return index == subject.end and subject.end == end;
+}
+
+fn generatedReindexUnsupportedPayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    unsupported_ast: generated_parser.GeneratedSqlUnsupportedAst,
+) bool {
+    if (unsupported_ast.maintenance_secondary_name_tokens != null or unsupported_ast.maintenance_verbose) return false;
+    const subject = unsupported_ast.subject_tokens orelse return false;
+    var index = subject.start;
+    const target = unsupported_ast.maintenance_reindex_target orelse return false;
+    if (!generatedReindexTargetMatches(tokens, end, &index, target)) return false;
+    if (unsupported_ast.maintenance_concurrently) {
+        if (index >= end or !tokens[index].matchesKeyword("concurrently")) return false;
+        index += 1;
+    }
+    const name = unsupported_ast.maintenance_name_tokens orelse return false;
+    if (!generatedSingleIdentifierRangeMatches(tokens, end, name, index)) return false;
+    index = name.end;
+    return index == subject.end and subject.end == end;
+}
+
+fn generatedReindexTargetMatches(
+    tokens: []const Token,
+    end: usize,
+    index: *usize,
+    target: generated_parser.GeneratedSqlReindexTarget,
+) bool {
+    return switch (target) {
+        .index => generatedConsumeKeywordForValidation(tokens, end, index, .index),
+        .table => generatedConsumeKeywordForValidation(tokens, end, index, .table),
+        .schema => generatedConsumeKeywordForValidation(tokens, end, index, .schema),
+        .database => generatedConsumeKeywordForValidation(tokens, end, index, .database),
+        .system => generatedConsumeKeywordForValidation(tokens, end, index, .system),
+    };
+}
+
+fn generatedClusterUnsupportedPayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    unsupported_ast: generated_parser.GeneratedSqlUnsupportedAst,
+) bool {
+    if (unsupported_ast.maintenance_reindex_target != null or unsupported_ast.maintenance_concurrently) return false;
+    const subject = unsupported_ast.subject_tokens orelse return false;
+    var index = subject.start;
+    if (unsupported_ast.maintenance_verbose) {
+        if (!generatedConsumeKeywordForValidation(tokens, end, &index, .verbose)) return false;
+    }
+    const table_name = unsupported_ast.maintenance_name_tokens orelse return false;
+    if (!generatedSingleIdentifierRangeMatches(tokens, end, table_name, index)) return false;
+    index = table_name.end;
+    if (unsupported_ast.maintenance_secondary_name_tokens) |index_name| {
+        if (!generatedConsumeKeywordForValidation(tokens, end, &index, .using)) return false;
+        if (!generatedSingleIdentifierRangeMatches(tokens, end, index_name, index)) return false;
+        index = index_name.end;
+    }
+    return index == subject.end and subject.end == end;
+}
+
+fn generatedTableLockUnsupportedPayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    unsupported_ast: generated_parser.GeneratedSqlUnsupportedAst,
+) bool {
+    if (generatedUnsupportedHasTriggerPayload(unsupported_ast) or
+        generatedUnsupportedHasNotificationPayload(unsupported_ast) or
+        generatedUnsupportedHasRoutinePayload(unsupported_ast))
+    {
+        return false;
+    }
+    if (!generatedUnsupportedHasTableLockPayload(unsupported_ast)) return true;
+    const subject = unsupported_ast.subject_tokens orelse return false;
+    var index = subject.start;
+    if (index < end and tokens[index].matchesKeywordTag(.table)) index += 1;
+    const items = unsupported_ast.table_lock_table_items;
+    if (items.count == 0 or items.count != items.items.len or unsupported_ast.table_lock_mode == null) return false;
+    if (items.first_tokens == null or items.last_tokens == null) return false;
+    for (items.items, 0..) |item, item_index| {
+        if (item_index > 0) {
+            if (index >= end or tokens[index].kind != .comma) return false;
+            index += 1;
+        }
+        if (!generatedSingleIdentifierRangeMatches(tokens, end, item, index)) return false;
+        index = item.end;
+    }
+    if (!std.meta.eql(items.first_tokens.?, items.items[0])) return false;
+    if (!std.meta.eql(items.last_tokens.?, items.items[items.items.len - 1])) return false;
+    if (!generatedTokenMatchesKeyword(tokens, end, index, .in)) return false;
+    index += 1;
+    if (!generatedTableLockModeMatches(tokens, end, &index, unsupported_ast.table_lock_mode.?)) return false;
+    if (index >= end or !tokens[index].matchesKeyword("mode")) return false;
+    index += 1;
+    return index == subject.end and subject.end == end;
+}
+
+fn generatedTableLockModeMatches(
+    tokens: []const Token,
+    end: usize,
+    index: *usize,
+    mode: generated_parser.GeneratedSqlTableLockMode,
+) bool {
+    return switch (mode) {
+        .access_share => generatedConsumeKeywordForValidation(tokens, end, index, .access) and generatedConsumeKeywordForValidation(tokens, end, index, .share),
+        .row_share => generatedConsumeKeywordForValidation(tokens, end, index, .row) and generatedConsumeKeywordForValidation(tokens, end, index, .share),
+        .row_exclusive => generatedConsumeKeywordForValidation(tokens, end, index, .row) and generatedConsumeTextKeywordForValidation(tokens, end, index, "exclusive"),
+        .share_update_exclusive => generatedConsumeKeywordForValidation(tokens, end, index, .share) and generatedConsumeKeywordForValidation(tokens, end, index, .update) and generatedConsumeTextKeywordForValidation(tokens, end, index, "exclusive"),
+        .share => generatedConsumeKeywordForValidation(tokens, end, index, .share),
+        .share_row_exclusive => generatedConsumeKeywordForValidation(tokens, end, index, .share) and generatedConsumeKeywordForValidation(tokens, end, index, .row) and generatedConsumeTextKeywordForValidation(tokens, end, index, "exclusive"),
+        .exclusive => generatedConsumeTextKeywordForValidation(tokens, end, index, "exclusive"),
+        .access_exclusive => generatedConsumeKeywordForValidation(tokens, end, index, .access) and generatedConsumeTextKeywordForValidation(tokens, end, index, "exclusive"),
+    };
+}
+
+fn generatedConsumeKeywordForValidation(tokens: []const Token, end: usize, index: *usize, keyword: TokenKeyword) bool {
+    if (index.* >= end or !tokens[index.*].matchesKeywordTag(keyword)) return false;
+    index.* += 1;
+    return true;
+}
+
+fn generatedConsumeTextKeywordForValidation(tokens: []const Token, end: usize, index: *usize, keyword: []const u8) bool {
+    if (index.* >= end or !tokens[index.*].matchesKeyword(keyword)) return false;
+    index.* += 1;
+    return true;
+}
+
+fn generatedNotificationUnsupportedPayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    unsupported_ast: generated_parser.GeneratedSqlUnsupportedAst,
+) bool {
+    if (generatedUnsupportedHasTriggerPayload(unsupported_ast)) return false;
+    if (!generatedUnsupportedHasNotificationPayload(unsupported_ast)) return true;
+    return switch (unsupported_ast.kind) {
+        .listen => generatedListenUnsupportedPayloadIsValid(tokens, end, unsupported_ast),
+        .notify => generatedNotifyUnsupportedPayloadIsValid(tokens, end, unsupported_ast),
+        .unlisten => generatedUnlistenUnsupportedPayloadIsValid(tokens, end, unsupported_ast),
+        else => false,
+    };
+}
+
+fn generatedListenUnsupportedPayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    unsupported_ast: generated_parser.GeneratedSqlUnsupportedAst,
+) bool {
+    if (unsupported_ast.notification_payload_tokens != null or unsupported_ast.notification_unlisten_all) return false;
+    const subject = unsupported_ast.subject_tokens orelse return false;
+    const channel = unsupported_ast.notification_channel_tokens orelse return false;
+    return generatedSingleIdentifierRangeMatches(tokens, end, channel, subject.start) and channel.end == subject.end and subject.end == end;
+}
+
+fn generatedNotifyUnsupportedPayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    unsupported_ast: generated_parser.GeneratedSqlUnsupportedAst,
+) bool {
+    if (unsupported_ast.notification_unlisten_all) return false;
+    const subject = unsupported_ast.subject_tokens orelse return false;
+    const channel = unsupported_ast.notification_channel_tokens orelse return false;
+    if (!generatedSingleIdentifierRangeMatches(tokens, end, channel, subject.start)) return false;
+    if (unsupported_ast.notification_payload_tokens) |payload| {
+        if (channel.end >= end or tokens[channel.end].kind != .comma) return false;
+        return payload.start == channel.end + 1 and payload.end == subject.end and payload.start < payload.end and subject.end == end;
+    }
+    return channel.end == subject.end and subject.end == end;
+}
+
+fn generatedUnlistenUnsupportedPayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    unsupported_ast: generated_parser.GeneratedSqlUnsupportedAst,
+) bool {
+    if (unsupported_ast.notification_payload_tokens != null) return false;
+    const subject = unsupported_ast.subject_tokens orelse return false;
+    if (unsupported_ast.notification_unlisten_all) {
+        return unsupported_ast.notification_channel_tokens == null and
+            subject.start + 1 == subject.end and
+            subject.end == end and
+            tokens[subject.start].kind == .star;
+    }
+    const channel = unsupported_ast.notification_channel_tokens orelse return false;
+    return generatedSingleIdentifierRangeMatches(tokens, end, channel, subject.start) and channel.end == subject.end and subject.end == end;
+}
+
+fn generatedTriggerUnsupportedPayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    unsupported_ast: generated_parser.GeneratedSqlUnsupportedAst,
+) bool {
+    if (!generatedUnsupportedHasTriggerPayload(unsupported_ast)) return true;
+    return switch (unsupported_ast.kind) {
+        .create_trigger => generatedCreateTriggerUnsupportedPayloadIsValid(tokens, end, unsupported_ast),
+        .drop_trigger => generatedDropTriggerUnsupportedPayloadIsValid(tokens, end, unsupported_ast),
+        else => false,
+    };
+}
+
+fn generatedCreateTriggerUnsupportedPayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    unsupported_ast: generated_parser.GeneratedSqlUnsupportedAst,
+) bool {
+    const subject = unsupported_ast.subject_tokens orelse return false;
+    var index = subject.start;
+    const trigger_name = unsupported_ast.trigger_name_tokens orelse return false;
+    if (!generatedSingleIdentifierRangeMatches(tokens, end, trigger_name, index)) return false;
+    index = trigger_name.end;
+    if (!generatedTokenMatchesKeyword(tokens, end, index, .before)) return false;
+    index += 1;
+    const event = unsupported_ast.trigger_event orelse return false;
+    if (!generatedTriggerEventMatches(tokens, end, index, event)) return false;
+    index += 1;
+    if (event == .update and index < end and tokens[index].matchesKeywordTag(.of)) return false;
+    if (!generatedTokenMatchesKeyword(tokens, end, index, .on)) return false;
+    index += 1;
+    const table = unsupported_ast.trigger_table_tokens orelse return false;
+    if (!generatedSingleIdentifierRangeMatches(tokens, end, table, index)) return false;
+    index = table.end;
+    if (index < end and tokens[index].matchesKeywordTag(.@"for")) {
+        if (index + 2 >= end or
+            !tokens[index + 1].matchesKeywordTag(.each) or
+            !tokens[index + 2].matchesKeywordTag(.row))
+        {
+            return false;
+        }
+        index += 3;
+    }
+    if (!generatedTokenMatchesKeyword(tokens, end, index, .execute)) return false;
+    index += 1;
+    if (index >= end or !(tokens[index].matchesKeywordTag(.function) or tokens[index].matchesKeywordTag(.procedure))) return false;
+    index += 1;
+    const function_name = unsupported_ast.trigger_function_tokens orelse return false;
+    if (!generatedSingleIdentifierRangeMatches(tokens, end, function_name, index)) return false;
+    index = function_name.end;
+    if (index >= end or tokens[index].kind != .lparen) return false;
+    index += 1;
+    if (unsupported_ast.trigger_argument_tokens) |argument| {
+        if (argument.start != index or argument.end != index + 1 or argument.end > end) return false;
+        if (tokens[argument.start].kind != .identifier and tokens[argument.start].kind != .string) return false;
+        index = argument.end;
+    }
+    if (index >= end or tokens[index].kind != .rparen) return false;
+    index += 1;
+    return index == subject.end and subject.end == end;
+}
+
+fn generatedDropTriggerUnsupportedPayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    unsupported_ast: generated_parser.GeneratedSqlUnsupportedAst,
+) bool {
+    if (unsupported_ast.trigger_function_tokens != null or
+        unsupported_ast.trigger_argument_tokens != null or
+        unsupported_ast.trigger_event != null)
+    {
+        return false;
+    }
+    const subject = unsupported_ast.subject_tokens orelse return false;
+    var index = subject.start;
+    const if_exists = generatedConsumeIfExistsForValidation(tokens, end, &index);
+    if (if_exists != unsupported_ast.trigger_if_exists) return false;
+    const trigger_name = unsupported_ast.trigger_name_tokens orelse return false;
+    if (!generatedSingleIdentifierRangeMatches(tokens, end, trigger_name, index)) return false;
+    index = trigger_name.end;
+    if (!generatedTokenMatchesKeyword(tokens, end, index, .on)) return false;
+    index += 1;
+    if (index < end and tokens[index].matchesKeywordTag(.only)) index += 1;
+    const table = unsupported_ast.trigger_table_tokens orelse return false;
+    if (!generatedSingleIdentifierRangeMatches(tokens, end, table, index)) return false;
+    index = table.end;
+    var cascade = false;
+    if (index < end and tokens[index].matchesKeywordTag(.cascade)) {
+        cascade = true;
+        index += 1;
+    } else if (index < end and tokens[index].matchesKeywordTag(.restrict)) {
+        index += 1;
+    }
+    if (cascade != unsupported_ast.trigger_cascade) return false;
+    return index == subject.end and subject.end == end;
+}
+
+fn generatedSingleIdentifierRangeMatches(
+    tokens: []const Token,
+    end: usize,
+    range: generated_parser.GeneratedSqlTokenRange,
+    index: usize,
+) bool {
+    return range.start == index and
+        range.end == index + 1 and
+        range.end <= end and
+        tokens[index].kind == .identifier;
+}
+
+fn generatedTokenMatchesKeyword(tokens: []const Token, end: usize, index: usize, keyword: TokenKeyword) bool {
+    return index < end and tokens[index].matchesKeywordTag(keyword);
+}
+
+fn generatedTriggerEventMatches(
+    tokens: []const Token,
+    end: usize,
+    index: usize,
+    event: generated_parser.GeneratedSqlTriggerEvent,
+) bool {
+    return switch (event) {
+        .insert => generatedTokenMatchesKeyword(tokens, end, index, .insert),
+        .update => generatedTokenMatchesKeyword(tokens, end, index, .update),
+        .delete => generatedTokenMatchesKeyword(tokens, end, index, .delete),
+    };
+}
+
+fn generatedConsumeIfExistsForValidation(tokens: []const Token, end: usize, index: *usize) bool {
+    if (index.* + 1 >= end) return false;
+    if (!tokens[index.*].matchesKeywordTag(.@"if") or !tokens[index.* + 1].matchesKeywordTag(.exists)) return false;
+    index.* += 2;
+    return true;
 }
 
 fn generatedAlterRoutineUnsupportedPayloadIsValid(
@@ -1719,6 +3927,8 @@ fn generatedAlterTableUnsupportedPayloadIsValid(
     unsupported_ast: generated_parser.GeneratedSqlUnsupportedAst,
 ) bool {
     if (end <= 3 or !tokens[0].matchesKeywordTag(.alter) or !tokens[1].matchesKeywordTag(.table)) return false;
+    const operation_kind = unsupported_ast.alter_table_operation_kind orelse return false;
+    if (operation_kind != unsupported_ast.kind) return false;
     const subject = unsupported_ast.subject_tokens orelse return false;
     if (subject.start != 1 or subject.end != end) return false;
     var index: usize = 2;
@@ -1729,60 +3939,96 @@ fn generatedAlterTableUnsupportedPayloadIsValid(
     index = table.end;
     const operation = unsupported_ast.alter_table_operation_tokens orelse return false;
     if (operation.start != index or operation.end != end or operation.start >= operation.end) return false;
-    return generatedAlterTableUnsupportedOperationMatchesKind(tokens, operation, unsupported_ast.kind);
+    return generatedAlterTableUnsupportedOperationMatchesKind(tokens, operation, unsupported_ast);
+}
+
+fn generatedUnsupportedAlterTableOperationKind(kind: generated_parser.GeneratedSqlUnsupportedKind) bool {
+    return switch (kind) {
+        .alter_table_access_method,
+        .alter_table_cluster,
+        .alter_table_column_statistics,
+        .alter_table_column_storage,
+        .alter_table_inheritance,
+        .alter_table_owner,
+        .alter_table_persistence,
+        .alter_table_replica_identity,
+        .alter_table_set_schema,
+        .alter_table_storage_parameters,
+        .alter_table_tablespace,
+        .alter_table_trigger_state,
+        => true,
+        else => false,
+    };
 }
 
 fn generatedAlterTableUnsupportedOperationMatchesKind(
     tokens: []const Token,
     operation: generated_parser.GeneratedSqlTokenRange,
-    kind: generated_parser.GeneratedSqlUnsupportedKind,
+    unsupported_ast: generated_parser.GeneratedSqlUnsupportedAst,
 ) bool {
     const start = operation.start;
     const end = operation.end;
+    const kind = unsupported_ast.kind;
     if (end > tokens.len or start >= end) return false;
     return switch (kind) {
         .alter_table_access_method => end == start + 4 and
             tokens[start].matchesKeywordTag(.set) and
             tokens[start + 1].matchesKeywordTag(.access) and
             tokens[start + 2].matchesKeywordTag(.method) and
-            tokens[start + 3].kind == .identifier,
+            generatedAlterTableUnsupportedSubjectAt(tokens, unsupported_ast, start + 3),
         .alter_table_cluster => (end == start + 3 and
             tokens[start].matchesKeywordTag(.cluster) and
             tokens[start + 1].matchesKeywordTag(.on) and
-            tokens[start + 2].kind == .identifier) or
+            generatedAlterTableUnsupportedSubjectAt(tokens, unsupported_ast, start + 2)) or
             (end == start + 3 and
                 tokens[start].matchesKeywordTag(.set) and
                 tokens[start + 1].matchesKeywordTag(.without) and
-                tokens[start + 2].matchesKeywordTag(.cluster)),
-        .alter_table_column_statistics => generatedAlterTableUnsupportedColumnStatisticsIsValid(tokens, operation),
-        .alter_table_column_storage => generatedAlterTableUnsupportedColumnStorageIsValid(tokens, operation),
+                tokens[start + 2].matchesKeywordTag(.cluster) and
+                unsupported_ast.alter_table_operation_subject_tokens == null),
+        .alter_table_column_statistics => unsupported_ast.alter_table_operation_subject_tokens == null and
+            generatedAlterTableUnsupportedColumnStatisticsIsValid(tokens, operation),
+        .alter_table_column_storage => unsupported_ast.alter_table_operation_subject_tokens == null and
+            generatedAlterTableUnsupportedColumnStorageIsValid(tokens, operation),
         .alter_table_inheritance => (end == start + 2 and
             tokens[start].matchesKeyword("inherit") and
-            tokens[start + 1].kind == .identifier) or
+            generatedAlterTableUnsupportedSubjectAt(tokens, unsupported_ast, start + 1)) or
             (end == start + 3 and
                 tokens[start].matchesKeywordTag(.no) and
                 tokens[start + 1].matchesKeyword("inherit") and
-                tokens[start + 2].kind == .identifier),
+                generatedAlterTableUnsupportedSubjectAt(tokens, unsupported_ast, start + 2)),
         .alter_table_owner => end == start + 3 and
             tokens[start].matchesKeyword("owner") and
             tokens[start + 1].matchesKeywordTag(.to) and
-            tokens[start + 2].kind == .identifier,
+            generatedAlterTableUnsupportedSubjectAt(tokens, unsupported_ast, start + 2),
         .alter_table_persistence => end == start + 2 and
             tokens[start].matchesKeywordTag(.set) and
-            (tokens[start + 1].matchesKeyword("logged") or tokens[start + 1].matchesKeywordTag(.unlogged)),
-        .alter_table_replica_identity => generatedAlterTableUnsupportedReplicaIdentityIsValid(tokens, operation),
+            (tokens[start + 1].matchesKeyword("logged") or tokens[start + 1].matchesKeywordTag(.unlogged)) and
+            unsupported_ast.alter_table_operation_subject_tokens == null,
+        .alter_table_replica_identity => unsupported_ast.alter_table_operation_subject_tokens == null and
+            generatedAlterTableUnsupportedReplicaIdentityIsValid(tokens, operation),
         .alter_table_set_schema => end == start + 3 and
             tokens[start].matchesKeywordTag(.set) and
             tokens[start + 1].matchesKeywordTag(.schema) and
-            tokens[start + 2].kind == .identifier,
-        .alter_table_storage_parameters => generatedAlterTableUnsupportedStorageParametersAreValid(tokens, operation),
+            generatedAlterTableUnsupportedSubjectAt(tokens, unsupported_ast, start + 2),
+        .alter_table_storage_parameters => unsupported_ast.alter_table_operation_subject_tokens == null and
+            generatedAlterTableUnsupportedStorageParametersAreValid(tokens, operation),
         .alter_table_tablespace => end == start + 3 and
             tokens[start].matchesKeywordTag(.set) and
             tokens[start + 1].matchesKeywordTag(.tablespace) and
-            tokens[start + 2].kind == .identifier,
-        .alter_table_trigger_state => generatedAlterTableUnsupportedTriggerStateIsValid(tokens, operation),
+            generatedAlterTableUnsupportedSubjectAt(tokens, unsupported_ast, start + 2),
+        .alter_table_trigger_state => unsupported_ast.alter_table_operation_subject_tokens == null and
+            generatedAlterTableUnsupportedTriggerStateIsValid(tokens, operation),
         else => false,
     };
+}
+
+fn generatedAlterTableUnsupportedSubjectAt(
+    tokens: []const Token,
+    unsupported_ast: generated_parser.GeneratedSqlUnsupportedAst,
+    index: usize,
+) bool {
+    const subject = unsupported_ast.alter_table_operation_subject_tokens orelse return false;
+    return subject.start == index and subject.end == index + 1 and subject.end <= tokens.len and tokens[index].kind == .identifier;
 }
 
 fn generatedAlterTableUnsupportedStorageParametersAreValid(
@@ -6270,6 +8516,7 @@ fn generatedUnsupportedUsesDdlPlanBoundary(kind: generated_parser.GeneratedSqlUn
         .alter_trigger,
         .alter_transform,
         .alter_user_mapping,
+        .backup_database,
         .checkpoint,
         .discard,
         .create_access_method,
@@ -6334,25 +8581,11 @@ fn generatedUnsupportedUsesDdlPlanBoundary(kind: generated_parser.GeneratedSqlUn
         .import_foreign_schema,
         .load,
         .reassign_owned,
+        .restore_database,
         .role_session_control,
         .security_label,
         => false,
     };
-}
-
-fn classifyDdlLikeStatement(raw_statement: RawSqlStatement, tokens: []const Token) ParsedStatement {
-    if (tokens.len == 0 or tokens[0].kind != .identifier) return .{ .unknown = raw_statement };
-    if (tokens[0].isKeyword(.explain)) return .{ .explain = parseExplainStatement(raw_statement, tokens) catch .{ .raw = raw_statement } };
-    if (tokens[0].isKeyword(.begin) or tokens[0].isKeyword(.commit) or tokens[0].isKeyword(.end) or tokens[0].isKeyword(.rollback)) {
-        return .{ .transaction = .{ .raw = raw_statement } };
-    }
-    if (tokens[0].isKeyword(.set) or tokens[0].isKeyword(.reset) or tokens[0].isKeyword(.show) or tokens[0].isKeyword(.discard)) {
-        return .{ .session = .{ .raw = raw_statement } };
-    }
-    if (tokens[0].isKeyword(.prepare) or tokens[0].isKeyword(.execute) or tokens[0].isKeyword(.deallocate)) {
-        return .{ .prepared = .{ .raw = raw_statement } };
-    }
-    return .{ .ddl = .{ .raw = raw_statement } };
 }
 
 fn parseGeneratedExplainStatement(
@@ -6411,88 +8644,6 @@ fn generatedExplainTokenRangeIsValid(
         range.start >= raw_statement.token_start and
         range.end <= raw_statement.token_end and
         range.end <= tokens.len;
-}
-
-fn parseExplainStatement(raw_statement: RawSqlStatement, tokens: []const Token) !ParsedExplainStatement {
-    var index = raw_statement.token_start;
-    if (!matchKeywordTag(tokens, &index, raw_statement.token_end, .explain)) return error.UnsupportedSqlShape;
-    if (index >= raw_statement.token_end) return error.UnsupportedSqlShape;
-
-    var statement = ParsedExplainStatement{ .raw = raw_statement };
-    if (matchToken(tokens, &index, raw_statement.token_end, .lparen)) {
-        try parseExplainOptions(tokens, &index, raw_statement.token_end, &statement);
-        if (index >= raw_statement.token_end) return error.UnsupportedSqlShape;
-    }
-
-    if (matchKeywordTag(tokens, &index, raw_statement.token_end, .analyze)) {
-        statement.analyze = true;
-        if (index >= raw_statement.token_end) return error.UnsupportedSqlShape;
-    }
-
-    statement.inner_token_start = index;
-    statement.inner_token_end = raw_statement.token_end;
-    return statement;
-}
-
-fn parseExplainOptions(
-    tokens: []const Token,
-    index: *usize,
-    end: usize,
-    statement: *ParsedExplainStatement,
-) !void {
-    while (true) {
-        if (index.* >= end) return error.UnsupportedSqlShape;
-        if (matchKeywordTag(tokens, index, end, .format)) {
-            if (matchKeywordTag(tokens, index, end, .json)) {
-                statement.format = .json;
-            } else if (matchKeywordTag(tokens, index, end, .text)) {
-                statement.format = .text;
-            } else {
-                return error.UnsupportedSqlShape;
-            }
-        } else if (matchKeywordTag(tokens, index, end, .verbose)) {
-            statement.verbose = parseOptionalExplainBool(tokens, index, end, true);
-        } else if (matchKeywordTag(tokens, index, end, .costs)) {
-            statement.costs = parseOptionalExplainBool(tokens, index, end, true);
-        } else if (matchKeywordTag(tokens, index, end, .analyze)) {
-            statement.analyze = parseOptionalExplainBool(tokens, index, end, true);
-        } else if (matchKeywordTag(tokens, index, end, .buffers)) {
-            statement.buffers = parseOptionalExplainBool(tokens, index, end, true);
-        } else if (matchKeywordTag(tokens, index, end, .timing)) {
-            statement.timing = parseOptionalExplainBool(tokens, index, end, true);
-        } else if (matchKeywordTag(tokens, index, end, .summary)) {
-            statement.summary = parseOptionalExplainBool(tokens, index, end, true);
-        } else if (matchKeywordTag(tokens, index, end, .settings)) {
-            statement.settings = parseOptionalExplainBool(tokens, index, end, true);
-        } else if (matchKeywordTag(tokens, index, end, .wal)) {
-            statement.wal = parseOptionalExplainBool(tokens, index, end, true);
-        } else {
-            return error.UnsupportedSqlShape;
-        }
-
-        if (matchToken(tokens, index, end, .comma)) continue;
-        if (matchToken(tokens, index, end, .rparen)) return;
-        return error.UnsupportedSqlShape;
-    }
-}
-
-fn parseOptionalExplainBool(tokens: []const Token, index: *usize, end: usize, default_value: bool) bool {
-    const before = index.*;
-    if (matchKeywordTag(tokens, index, end, .true) or
-        matchKeywordTag(tokens, index, end, .on) or
-        matchKeywordTag(tokens, index, end, .yes))
-    {
-        return true;
-    }
-    index.* = before;
-    if (matchKeywordTag(tokens, index, end, .false) or
-        matchKeywordTag(tokens, index, end, .off) or
-        matchKeywordTag(tokens, index, end, .no))
-    {
-        return false;
-    }
-    index.* = before;
-    return default_value;
 }
 
 fn matchKeywordTag(tokens: []const Token, index: *usize, end: usize, keyword: TokenKeyword) bool {
@@ -6703,9 +8854,9 @@ fn rawStatementFamily(
     generated_statement: ?GeneratedRawSqlStatement,
 ) ?sql_statement_kind.SqlStatementFamily {
     if (generated_statement) |generated_raw| {
-        if (rawStatementFamilyFromGenerated(tokens, raw_statement, generated_raw)) |family| return family;
+        return rawStatementFamilyFromGenerated(tokens, raw_statement, generated_raw);
     }
-    return rawStatementFamilyFromHead(tokens);
+    return null;
 }
 
 fn rawStatementFamilyFromGenerated(
@@ -6740,23 +8891,6 @@ fn generatedDmlFamilyFromHead(first: Token) ?sql_statement_kind.SqlStatementFami
     if (tokenMatchesKeyword(first, .truncate)) return .truncate;
     if (tokenMatchesKeyword(first, .merge)) return .merge;
     return null;
-}
-
-fn rawStatementFamilyFromHead(tokens: []const Token) ?sql_statement_kind.SqlStatementFamily {
-    const first = firstStatementToken(tokens) orelse return null;
-    if (first.keyword) |keyword| {
-        return switch (keyword) {
-            .select => .select,
-            .with => .with,
-            else => .ddl,
-        };
-    }
-    return if (first.kind == .identifier) .ddl else null;
-}
-
-fn firstStatementToken(tokens: []const Token) ?Token {
-    if (tokens.len == 0 or tokens[0].kind != .identifier) return null;
-    return tokens[0];
 }
 
 fn rawStatementTokenEnd(tokens: []const Token) !usize {
@@ -6807,10 +8941,46 @@ test "sql adapter parsed sql derives raw family from generated statements first"
     try std.testing.expectEqual(sql_statement_kind.SqlWriteStatementKind.update, parsed_write.writeStatementKind().?);
 }
 
-test "sql adapter raw statement family does not classify DML heads without generated metadata" {
+test "sql adapter generated other statement does not recover through raw statement classification" {
     const alloc = std.testing.allocator;
 
     const cases = [_][]const u8{
+        "CREATE TABLE usage_records (id text)",
+        "SET search_path TO public",
+        "BEGIN",
+        "PREPARE read_stmt AS SELECT id FROM usage_records",
+        "EXPLAIN SELECT id FROM usage_records",
+    };
+
+    for (cases) |sql| {
+        var parsed = try ParsedSql.initAlloc(alloc, sql);
+        defer parsed.deinit(alloc);
+
+        var stale_generated = parsed.generated_statement orelse return error.TestUnexpectedResult;
+        stale_generated.statement = .{ .other = {} };
+        stale_generated.ast = null;
+
+        var raw_statement = parsed.raw_statement;
+        raw_statement.family = rawStatementFamily(parsed.items(), raw_statement, stale_generated);
+        try std.testing.expect(raw_statement.family == null);
+        try std.testing.expectEqual(
+            ParsedStatement.unknown,
+            std.meta.activeTag(parseStatement(raw_statement, stale_generated, &parsed.tokenized_sql)),
+        );
+    }
+}
+
+test "sql adapter raw statement family requires generated metadata" {
+    const alloc = std.testing.allocator;
+
+    const cases = [_][]const u8{
+        "SELECT id FROM usage_records",
+        "WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows",
+        "CREATE TABLE usage_records (id text)",
+        "SET search_path TO public",
+        "BEGIN",
+        "PREPARE read_stmt AS SELECT id FROM usage_records",
+        "EXPLAIN SELECT id FROM usage_records",
         "INSERT INTO usage_records (id) VALUES ('u1')",
         "UPDATE usage_records SET status = 'done' WHERE id = 'u1'",
         "DELETE FROM usage_records WHERE id = 'u1'",
@@ -6821,7 +8991,8 @@ test "sql adapter raw statement family does not classify DML heads without gener
     for (cases) |sql| {
         var tokenized_sql = try TokenizedSql.initAlloc(alloc, sql);
         defer tokenized_sql.deinit(alloc);
-        try std.testing.expect(rawStatementFamilyFromHead(tokenized_sql.items()) == null);
+        const raw_statement = try parseRawStatementBounds(tokenized_sql.items());
+        try std.testing.expect(rawStatementFamily(tokenized_sql.items(), raw_statement, null) == null);
     }
 }
 
@@ -6879,7 +9050,7 @@ fn expectGeneratedGateUnexpectedToken(alloc: std.mem.Allocator, sql: []const u8)
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, sql));
 }
 
-test "sql adapter parsed sql blocks generated-gated malformed statements from legacy recovery" {
+test "sql adapter parsed sql fails closed for generated-gated malformed statements" {
     const alloc = std.testing.allocator;
 
     try expectGeneratedGateUnexpectedToken(alloc, "SELECT id FROM usage_records WHERE");
@@ -6890,6 +9061,10 @@ test "sql adapter parsed sql blocks generated-gated malformed statements from le
     try expectGeneratedGateUnexpectedToken(alloc, "CREATE TABLE usage_records (");
     try expectGeneratedGateUnexpectedToken(alloc, "ALTER TABLE usage_records ADD");
     try expectGeneratedGateUnexpectedToken(alloc, "DROP TABLE IF EXISTS");
+    try expectGeneratedGateUnexpectedToken(alloc, "CREATE GRAPH INDEX docs_edge_graph ON");
+    try expectGeneratedGateUnexpectedToken(alloc, "ALTER GRAPH INDEX docs_edge_graph ADD");
+    try expectGeneratedGateUnexpectedToken(alloc, "MATCH (doc)-[:cites]->(target) WHERE target.status = 'published'");
+    try expectGeneratedGateUnexpectedToken(alloc, "MATCH (doc) RETURN");
 }
 
 test "sql adapter parsed sql requires generated grammar for first migrated control family" {
@@ -7387,6 +9562,28 @@ test "sql adapter parsed sql owns typed statement variants" {
     try std.testing.expect(generated_join_read.generatedReadStatementKind() == null);
     try std.testing.expect(generated_join_read.readStatementKindIncludingGeneratedAst() == null);
 
+    var generated_graph_read = try ParsedSql.initAlloc(alloc, "MATCH (doc)-[:cites]->(target) WITH GRAPH docs_edge_graph ON usage_records START 'doc:root' RETURN doc.key AS source_id, target.key AS target_id ORDER BY target.depth ASC LIMIT 5");
+    defer generated_graph_read.deinit(alloc);
+    try std.testing.expect(generated_graph_read.readStatementKind() == null);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.unsupported, generated_graph_read.generatedStatementKind().?);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlUnsupportedKind.graph_query, generated_graph_read.unsupportedStatementKindIncludingGeneratedAst().?);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, generated_graph_read.readStatementKindIncludingGeneratedAst().?);
+
+    var unsupported_graph_read = try ParsedSql.initAlloc(alloc, "MATCH (doc)-[:cites]->(target) RETURN target");
+    defer unsupported_graph_read.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.unsupported, unsupported_graph_read.generatedStatementKind().?);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlUnsupportedKind.graph_query, unsupported_graph_read.unsupportedStatementKindIncludingGeneratedAst().?);
+    try std.testing.expect(unsupported_graph_read.readStatementKindIncludingGeneratedAst() == null);
+
+    var stale_graph_read = generated_graph_read.generated_statement.?;
+    if (stale_graph_read.ast) |*generated_ast| switch (generated_ast.*) {
+        .unsupported => |*unsupported_ast| unsupported_ast.graph_source_binding_tokens = null,
+        else => return error.TestUnexpectedResult,
+    } else return error.TestUnexpectedResult;
+    generated_graph_read.statement = parseStatement(generated_graph_read.raw_statement, stale_graph_read, &generated_graph_read.tokenized_sql);
+    try std.testing.expect(generated_graph_read.unsupportedStatementKindIncludingGeneratedAst() == null);
+    try std.testing.expect(generated_graph_read.readStatementKindIncludingGeneratedAst() == null);
+
     var write = try ParsedSql.initAlloc(alloc, "UPDATE usage_records SET status = 'done' WHERE id = 'u1'");
     defer write.deinit(alloc);
     switch (write.statement) {
@@ -7806,6 +10003,11 @@ test "sql adapter parsed sql owns typed statement variants" {
             .reason = .alter_user_mapping_not_planned_by_generated_parser,
         },
         .{
+            .sql = "BACKUP DATABASE tenant_ops TO 's3://usage-backups/tenant_ops'",
+            .kind = .backup_database,
+            .reason = .backup_database_not_planned_by_generated_parser,
+        },
+        .{
             .sql = "CALL refresh_usage_records()",
             .kind = .call,
             .reason = .call_not_planned_by_generated_parser,
@@ -8214,6 +10416,11 @@ test "sql adapter parsed sql owns typed statement variants" {
             .sql = "RESET SESSION AUTHORIZATION",
             .kind = .role_session_control,
             .reason = .role_session_control_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "RESTORE DATABASE tenant_ops FROM 's3://usage-backups/tenant_ops'",
+            .kind = .restore_database,
+            .reason = .restore_database_not_planned_by_generated_parser,
         },
         .{
             .sql = "SECURITY LABEL ON SEQUENCE usage_records_id_seq IS 'unsupported'",
@@ -9887,6 +12094,32 @@ test "sql adapter parsed sql rejects malformed generated classification payloads
         std.meta.activeTag(parseStatement(cursor.raw_statement, missing_cursor_tail, &cursor.tokenized_sql)),
     );
 
+    var declare_cursor = try ParsedSql.initAlloc(alloc, "DECLARE usage_cursor CURSOR FOR SELECT id FROM usage_records");
+    defer declare_cursor.deinit(alloc);
+    var missing_declare_portal = declare_cursor.generated_statement.?;
+    if (missing_declare_portal.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .cursor => |*cursor_ast| cursor_ast.portal_name_tokens = null,
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(declare_cursor.raw_statement, missing_declare_portal, &declare_cursor.tokenized_sql)),
+    );
+
+    var missing_declare_subject_ast = declare_cursor.generated_statement.?;
+    if (missing_declare_subject_ast.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .cursor => |*cursor_ast| cursor_ast.subject_ast = null,
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(declare_cursor.raw_statement, missing_declare_subject_ast, &declare_cursor.tokenized_sql)),
+    );
+
     var publication = try ParsedSql.initAlloc(alloc, "CREATE PUBLICATION usage_pub FOR TABLE usage_records");
     defer publication.deinit(alloc);
     var missing_name = publication.generated_statement.?;
@@ -9981,6 +12214,92 @@ test "sql adapter parsed sql rejects malformed generated classification payloads
         std.meta.activeTag(parseStatement(covering_index.raw_statement, malformed_index_where, &covering_index.tokenized_sql)),
     );
 
+    var table_clone = try ParsedSql.initAlloc(alloc, "CREATE TABLE IF NOT EXISTS users_copy (LIKE users INCLUDING ALL EXCLUDING COMMENTS)");
+    defer table_clone.deinit(alloc);
+    var stale_table_clone_option_action = table_clone.generated_statement.?;
+    if (stale_table_clone_option_action.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .ddl => |*ddl_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl_ast.kind);
+                try std.testing.expectEqual(@as(usize, 2), ddl_ast.create_table_like_option_action_items.len);
+                ddl_ast.create_table_like_option_action_items[0].end += 1;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(table_clone.raw_statement, stale_table_clone_option_action, &table_clone.tokenized_sql)),
+    );
+
+    var stale_table_clone_option_name = table_clone.generated_statement.?;
+    if (stale_table_clone_option_name.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .ddl => |*ddl_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl_ast.kind);
+                try std.testing.expectEqual(@as(usize, 2), ddl_ast.create_table_like_option_name_items.len);
+                ddl_ast.create_table_like_option_name_items[1].start -= 1;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(table_clone.raw_statement, stale_table_clone_option_name, &table_clone.tokenized_sql)),
+    );
+
+    var document_table_storage_parameters = try ParsedSql.initAlloc(alloc, "CREATE TABLE docs () WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc') DOCUMENT SCHEMA doc AS JSON '{\"type\":\"object\"}'");
+    defer document_table_storage_parameters.deinit(alloc);
+    var stale_storage_parameter_name = document_table_storage_parameters.generated_statement.?;
+    if (stale_storage_parameter_name.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .ddl => |*ddl_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl_ast.kind);
+                try std.testing.expectEqual(@as(usize, 2), ddl_ast.create_table_storage_parameter_name_items.len);
+                ddl_ast.create_table_storage_parameter_name_items[0].end += 1;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(document_table_storage_parameters.raw_statement, stale_storage_parameter_name, &document_table_storage_parameters.tokenized_sql)),
+    );
+
+    var stale_storage_parameter_value = document_table_storage_parameters.generated_statement.?;
+    if (stale_storage_parameter_value.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .ddl => |*ddl_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl_ast.kind);
+                try std.testing.expectEqual(@as(usize, 2), ddl_ast.create_table_storage_parameter_value_items.len);
+                ddl_ast.create_table_storage_parameter_value_items[1].start -= 1;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(document_table_storage_parameters.raw_statement, stale_storage_parameter_value, &document_table_storage_parameters.tokenized_sql)),
+    );
+
+    var partitioned_table = try ParsedSql.initAlloc(alloc, "CREATE TABLE usage_events (tenant_id text, id uuid, created_at timestamptz, PRIMARY KEY (tenant_id, id)) PARTITION BY RANGE (created_at)");
+    defer partitioned_table.deinit(alloc);
+    var stale_partition_key_name = partitioned_table.generated_statement.?;
+    if (stale_partition_key_name.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .ddl => |*ddl_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl_ast.kind);
+                try std.testing.expectEqual(@as(usize, 1), ddl_ast.create_table_partition_key_name_items.len);
+                ddl_ast.create_table_partition_key_name_items[0].start -= 1;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(partitioned_table.raw_statement, stale_partition_key_name, &partitioned_table.tokenized_sql)),
+    );
+
     var publication_list = try ParsedSql.initAlloc(alloc, "CREATE PUBLICATION usage_pub FOR TABLE usage_records, usage_events");
     defer publication_list.deinit(alloc);
     var stale_publication_table_count = publication_list.generated_statement.?;
@@ -9997,6 +12316,498 @@ test "sql adapter parsed sql rejects malformed generated classification payloads
     try std.testing.expectEqual(
         ParsedStatement.unknown,
         std.meta.activeTag(parseStatement(publication_list.raw_statement, stale_publication_table_count, &publication_list.tokenized_sql)),
+    );
+
+    var create_domain_options = try ParsedSql.initAlloc(alloc, "CREATE DOMAIN generated_amount AS numeric DEFAULT 0 NOT NULL CONSTRAINT generated_amount_positive CHECK (VALUE >= 0)");
+    defer create_domain_options.deinit(alloc);
+    var missing_domain_default_payload = create_domain_options.generated_statement.?;
+    if (missing_domain_default_payload.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .ddl => |*ddl_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_domain, ddl_ast.kind);
+                try std.testing.expectEqual(@as(usize, 3), ddl_ast.domain_operation_default_value_items.len);
+                try std.testing.expect(ddl_ast.domain_operation_default_value_items[0] != null);
+                ddl_ast.domain_operation_default_value_items[0] = null;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(create_domain_options.raw_statement, missing_domain_default_payload, &create_domain_options.tokenized_sql)),
+    );
+
+    var stale_domain_option_kind = create_domain_options.generated_statement.?;
+    if (stale_domain_option_kind.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .ddl => |*ddl_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_domain, ddl_ast.kind);
+                try std.testing.expectEqual(@as(usize, 3), ddl_ast.domain_operation_kind_items.len);
+                ddl_ast.domain_operation_kind_items[2].start -= 1;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(create_domain_options.raw_statement, stale_domain_option_kind, &create_domain_options.tokenized_sql)),
+    );
+
+    var missing_domain_check_payload = create_domain_options.generated_statement.?;
+    if (missing_domain_check_payload.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .ddl => |*ddl_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_domain, ddl_ast.kind);
+                try std.testing.expectEqual(@as(usize, 3), ddl_ast.domain_operation_check_payload_items.len);
+                try std.testing.expect(ddl_ast.domain_operation_check_payload_items[2] != null);
+                ddl_ast.domain_operation_check_payload_items[2] = null;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(create_domain_options.raw_statement, missing_domain_check_payload, &create_domain_options.tokenized_sql)),
+    );
+
+    var generated_column_table = try ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text, status_key text GENERATED ALWAYS AS (lower(id)) STORED)");
+    defer generated_column_table.deinit(alloc);
+    var missing_generated_column_expression = generated_column_table.generated_statement.?;
+    if (missing_generated_column_expression.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .ddl => |*ddl_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl_ast.kind);
+                try std.testing.expect(ddl_ast.alter_table_operation_generated_expression_items.len > 1);
+                try std.testing.expect(ddl_ast.alter_table_operation_generated_expression_items[1] != null);
+                try std.testing.expect(!generatedDdlExpressionPayloadIsEmpty(ddl_ast.alter_table_operation_generated_expressions[1]));
+                ddl_ast.alter_table_operation_generated_expression_items[1] = null;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(generated_column_table.raw_statement, missing_generated_column_expression, &generated_column_table.tokenized_sql)),
+    );
+
+    var missing_generated_column_clause = generated_column_table.generated_statement.?;
+    if (missing_generated_column_clause.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .ddl => |*ddl_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl_ast.kind);
+                try std.testing.expect(ddl_ast.alter_table_operation_column_generated_clause_items.len > 1);
+                try std.testing.expect(ddl_ast.alter_table_operation_column_generated_clause_items[1] != null);
+                ddl_ast.alter_table_operation_column_generated_clause_items[1] = null;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(generated_column_table.raw_statement, missing_generated_column_clause, &generated_column_table.tokenized_sql)),
+    );
+
+    var missing_column_name = generated_column_table.generated_statement.?;
+    if (missing_column_name.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .ddl => |*ddl_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl_ast.kind);
+                try std.testing.expect(ddl_ast.alter_table_operation_column_name_items.len > 1);
+                try std.testing.expect(ddl_ast.alter_table_operation_column_type_items.len > 1);
+                try std.testing.expect(ddl_ast.alter_table_operation_column_name_items[1] != null);
+                try std.testing.expect(ddl_ast.alter_table_operation_column_type_items[1] != null);
+                ddl_ast.alter_table_operation_column_name_items[1] = null;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(generated_column_table.raw_statement, missing_column_name, &generated_column_table.tokenized_sql)),
+    );
+
+    var nullability_table = try ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text NOT NULL, status text)");
+    defer nullability_table.deinit(alloc);
+    var missing_nullability = nullability_table.generated_statement.?;
+    if (missing_nullability.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .ddl => |*ddl_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl_ast.kind);
+                try std.testing.expectEqual(@as(usize, 2), ddl_ast.alter_table_operation_column_nullability_items.len);
+                try std.testing.expect(ddl_ast.alter_table_operation_column_nullability_items[0] != null);
+                ddl_ast.alter_table_operation_column_nullability_items[0] = null;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(nullability_table.raw_statement, missing_nullability, &nullability_table.tokenized_sql)),
+    );
+
+    var collation_table = try ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text COLLATE \"C\", status text)");
+    defer collation_table.deinit(alloc);
+    var missing_collation = collation_table.generated_statement.?;
+    if (missing_collation.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .ddl => |*ddl_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl_ast.kind);
+                try std.testing.expectEqual(@as(usize, 2), ddl_ast.alter_table_operation_column_collation_items.len);
+                try std.testing.expect(ddl_ast.alter_table_operation_column_collation_items[0] != null);
+                ddl_ast.alter_table_operation_column_collation_items[0] = null;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(collation_table.raw_statement, missing_collation, &collation_table.tokenized_sql)),
+    );
+
+    var table_constraint = try ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text, CONSTRAINT generated_usage_status_key UNIQUE (status))");
+    defer table_constraint.deinit(alloc);
+    var missing_constraint_kind = table_constraint.generated_statement.?;
+    if (missing_constraint_kind.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .ddl => |*ddl_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl_ast.kind);
+                try std.testing.expectEqual(@as(usize, 2), ddl_ast.alter_table_operation_constraint_kind_items.len);
+                try std.testing.expect(ddl_ast.alter_table_operation_constraint_kind_items[1] != null);
+                ddl_ast.alter_table_operation_constraint_kind_items[1] = null;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(table_constraint.raw_statement, missing_constraint_kind, &table_constraint.tokenized_sql)),
+    );
+
+    var stale_constraint_name = table_constraint.generated_statement.?;
+    if (stale_constraint_name.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .ddl => |*ddl_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl_ast.kind);
+                try std.testing.expectEqual(@as(usize, 2), ddl_ast.alter_table_operation_constraint_name_items.len);
+                try std.testing.expect(ddl_ast.alter_table_operation_constraint_name_items[1] != null);
+                ddl_ast.alter_table_operation_constraint_name_items[1].?.start -= 1;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(table_constraint.raw_statement, stale_constraint_name, &table_constraint.tokenized_sql)),
+    );
+
+    var missing_constraint_column_list = table_constraint.generated_statement.?;
+    if (missing_constraint_column_list.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .ddl => |*ddl_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl_ast.kind);
+                try std.testing.expectEqual(@as(usize, 2), ddl_ast.alter_table_operation_constraint_column_list_items.len);
+                try std.testing.expect(ddl_ast.alter_table_operation_constraint_column_list_items[1] != null);
+                ddl_ast.alter_table_operation_constraint_column_list_items[1] = null;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(table_constraint.raw_statement, missing_constraint_column_list, &table_constraint.tokenized_sql)),
+    );
+
+    var stale_constraint_column_list = table_constraint.generated_statement.?;
+    if (stale_constraint_column_list.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .ddl => |*ddl_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl_ast.kind);
+                try std.testing.expectEqual(@as(usize, 2), ddl_ast.alter_table_operation_constraint_column_list_items.len);
+                try std.testing.expect(ddl_ast.alter_table_operation_constraint_column_list_items[1] != null);
+                ddl_ast.alter_table_operation_constraint_column_list_items[1].?.start += 1;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(table_constraint.raw_statement, stale_constraint_column_list, &table_constraint.tokenized_sql)),
+    );
+
+    var foreign_key_constraint = try ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD CONSTRAINT generated_usage_tenant_fk FOREIGN KEY (tenant_id) REFERENCES tenants (id) NOT VALID");
+    defer foreign_key_constraint.deinit(alloc);
+    var missing_foreign_key_payload = foreign_key_constraint.generated_statement.?;
+    if (missing_foreign_key_payload.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .ddl => |*ddl_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl_ast.kind);
+                try std.testing.expectEqual(@as(usize, 1), ddl_ast.alter_table_operation_foreign_key_payload_items.len);
+                try std.testing.expect(ddl_ast.alter_table_operation_foreign_key_payload_items[0] != null);
+                ddl_ast.alter_table_operation_foreign_key_payload_items[0] = null;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(foreign_key_constraint.raw_statement, missing_foreign_key_payload, &foreign_key_constraint.tokenized_sql)),
+    );
+
+    var stale_foreign_key_not_valid = foreign_key_constraint.generated_statement.?;
+    if (stale_foreign_key_not_valid.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .ddl => |*ddl_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl_ast.kind);
+                try std.testing.expectEqual(@as(usize, 1), ddl_ast.alter_table_operation_foreign_key_not_valid_items.len);
+                try std.testing.expect(ddl_ast.alter_table_operation_foreign_key_not_valid_items[0] != null);
+                ddl_ast.alter_table_operation_foreign_key_not_valid_items[0].?.start -= 1;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(foreign_key_constraint.raw_statement, stale_foreign_key_not_valid, &foreign_key_constraint.tokenized_sql)),
+    );
+
+    var check_constraint = try ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD CONSTRAINT generated_usage_amount_check CHECK (amount >= 0) NOT VALID");
+    defer check_constraint.deinit(alloc);
+    var missing_check_payload = check_constraint.generated_statement.?;
+    if (missing_check_payload.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .ddl => |*ddl_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl_ast.kind);
+                try std.testing.expectEqual(@as(usize, 1), ddl_ast.alter_table_operation_check_payload_items.len);
+                try std.testing.expect(ddl_ast.alter_table_operation_check_payload_items[0] != null);
+                ddl_ast.alter_table_operation_check_payload_items[0] = null;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(check_constraint.raw_statement, missing_check_payload, &check_constraint.tokenized_sql)),
+    );
+
+    var stale_check_not_valid = check_constraint.generated_statement.?;
+    if (stale_check_not_valid.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .ddl => |*ddl_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl_ast.kind);
+                try std.testing.expectEqual(@as(usize, 1), ddl_ast.alter_table_operation_check_not_valid_items.len);
+                try std.testing.expect(ddl_ast.alter_table_operation_check_not_valid_items[0] != null);
+                ddl_ast.alter_table_operation_check_not_valid_items[0].?.start -= 1;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(check_constraint.raw_statement, stale_check_not_valid, &check_constraint.tokenized_sql)),
+    );
+
+    var inline_constraint_table = try ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text CONSTRAINT generated_usage_id_pk PRIMARY KEY, status text UNIQUE)");
+    defer inline_constraint_table.deinit(alloc);
+    var missing_inline_constraint_kind = inline_constraint_table.generated_statement.?;
+    if (missing_inline_constraint_kind.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .ddl => |*ddl_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl_ast.kind);
+                try std.testing.expectEqual(@as(usize, 2), ddl_ast.alter_table_operation_inline_constraint_items.count);
+                try std.testing.expectEqual(@as(usize, 2), ddl_ast.alter_table_operation_inline_constraint_kind_items.len);
+                ddl_ast.alter_table_operation_inline_constraint_kind_items[0].end -= 1;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(inline_constraint_table.raw_statement, missing_inline_constraint_kind, &inline_constraint_table.tokenized_sql)),
+    );
+
+    var stale_inline_constraint_name = inline_constraint_table.generated_statement.?;
+    if (stale_inline_constraint_name.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .ddl => |*ddl_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl_ast.kind);
+                try std.testing.expectEqual(@as(usize, 2), ddl_ast.alter_table_operation_inline_constraint_name_items.len);
+                try std.testing.expect(ddl_ast.alter_table_operation_inline_constraint_name_items[0] != null);
+                ddl_ast.alter_table_operation_inline_constraint_name_items[0].?.start -= 1;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(inline_constraint_table.raw_statement, stale_inline_constraint_name, &inline_constraint_table.tokenized_sql)),
+    );
+
+    var inline_foreign_key_constraint = try ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD COLUMN tenant_id text REFERENCES tenants (id) NOT VALID");
+    defer inline_foreign_key_constraint.deinit(alloc);
+    var missing_inline_foreign_key_payload = inline_foreign_key_constraint.generated_statement.?;
+    if (missing_inline_foreign_key_payload.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .ddl => |*ddl_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl_ast.kind);
+                try std.testing.expectEqual(@as(usize, 1), ddl_ast.alter_table_operation_inline_foreign_key_payload_items.len);
+                try std.testing.expect(ddl_ast.alter_table_operation_inline_foreign_key_payload_items[0] != null);
+                ddl_ast.alter_table_operation_inline_foreign_key_payload_items[0] = null;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(inline_foreign_key_constraint.raw_statement, missing_inline_foreign_key_payload, &inline_foreign_key_constraint.tokenized_sql)),
+    );
+
+    var stale_inline_foreign_key_not_valid = inline_foreign_key_constraint.generated_statement.?;
+    if (stale_inline_foreign_key_not_valid.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .ddl => |*ddl_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl_ast.kind);
+                try std.testing.expectEqual(@as(usize, 1), ddl_ast.alter_table_operation_inline_foreign_key_not_valid_items.len);
+                try std.testing.expect(ddl_ast.alter_table_operation_inline_foreign_key_not_valid_items[0] != null);
+                ddl_ast.alter_table_operation_inline_foreign_key_not_valid_items[0].?.end -= 1;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(inline_foreign_key_constraint.raw_statement, stale_inline_foreign_key_not_valid, &inline_foreign_key_constraint.tokenized_sql)),
+    );
+
+    var inline_check_constraint = try ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD COLUMN amount int CHECK (amount >= 0) NOT VALID");
+    defer inline_check_constraint.deinit(alloc);
+    var missing_inline_check_payload = inline_check_constraint.generated_statement.?;
+    if (missing_inline_check_payload.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .ddl => |*ddl_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl_ast.kind);
+                try std.testing.expectEqual(@as(usize, 1), ddl_ast.alter_table_operation_inline_check_payload_items.len);
+                try std.testing.expect(ddl_ast.alter_table_operation_inline_check_payload_items[0] != null);
+                ddl_ast.alter_table_operation_inline_check_payload_items[0] = null;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(inline_check_constraint.raw_statement, missing_inline_check_payload, &inline_check_constraint.tokenized_sql)),
+    );
+
+    var stale_inline_check_not_valid = inline_check_constraint.generated_statement.?;
+    if (stale_inline_check_not_valid.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .ddl => |*ddl_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl_ast.kind);
+                try std.testing.expectEqual(@as(usize, 1), ddl_ast.alter_table_operation_inline_check_not_valid_items.len);
+                try std.testing.expect(ddl_ast.alter_table_operation_inline_check_not_valid_items[0] != null);
+                ddl_ast.alter_table_operation_inline_check_not_valid_items[0].?.end -= 1;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(inline_check_constraint.raw_statement, stale_inline_check_not_valid, &inline_check_constraint.tokenized_sql)),
+    );
+
+    var missing_inline_constraint_include = try ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (tenant_id text, email text UNIQUE INCLUDE (tenant_id))");
+    defer missing_inline_constraint_include.deinit(alloc);
+    var missing_inline_include_payload = missing_inline_constraint_include.generated_statement.?;
+    if (missing_inline_include_payload.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .ddl => |*ddl_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl_ast.kind);
+                try std.testing.expectEqual(@as(usize, 1), ddl_ast.alter_table_operation_inline_constraint_include_items.len);
+                try std.testing.expect(ddl_ast.alter_table_operation_inline_constraint_include_items[0] != null);
+                ddl_ast.alter_table_operation_inline_constraint_include_items[0] = null;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(missing_inline_constraint_include.raw_statement, missing_inline_include_payload, &missing_inline_constraint_include.tokenized_sql)),
+    );
+
+    var stale_inline_nulls_payload = try ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (tenant_id text, email text UNIQUE NULLS NOT DISTINCT INCLUDE (tenant_id))");
+    defer stale_inline_nulls_payload.deinit(alloc);
+    var stale_inline_nulls = stale_inline_nulls_payload.generated_statement.?;
+    if (stale_inline_nulls.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .ddl => |*ddl_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl_ast.kind);
+                try std.testing.expectEqual(@as(usize, 1), ddl_ast.alter_table_operation_inline_constraint_nulls_distinct_items.len);
+                try std.testing.expect(ddl_ast.alter_table_operation_inline_constraint_nulls_distinct_items[0] != null);
+                ddl_ast.alter_table_operation_inline_constraint_nulls_distinct_items[0].?.end -= 1;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(stale_inline_nulls_payload.raw_statement, stale_inline_nulls, &stale_inline_nulls_payload.tokenized_sql)),
+    );
+
+    var default_value_table = try ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text, status text DEFAULT 'pending')");
+    defer default_value_table.deinit(alloc);
+    var missing_default_value = default_value_table.generated_statement.?;
+    if (missing_default_value.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .ddl => |*ddl_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl_ast.kind);
+                try std.testing.expectEqual(@as(usize, 2), ddl_ast.alter_table_operation_default_value_items.len);
+                try std.testing.expect(ddl_ast.alter_table_operation_default_value_items[0] == null);
+                try std.testing.expect(ddl_ast.alter_table_operation_default_value_items[1] != null);
+                ddl_ast.alter_table_operation_default_value_items[1] = null;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(default_value_table.raw_statement, missing_default_value, &default_value_table.tokenized_sql)),
+    );
+
+    var missing_default_clause = default_value_table.generated_statement.?;
+    if (missing_default_clause.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .ddl => |*ddl_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl_ast.kind);
+                try std.testing.expectEqual(@as(usize, 2), ddl_ast.alter_table_operation_column_default_clause_items.len);
+                try std.testing.expect(ddl_ast.alter_table_operation_column_default_clause_items[0] == null);
+                try std.testing.expect(ddl_ast.alter_table_operation_column_default_clause_items[1] != null);
+                ddl_ast.alter_table_operation_column_default_clause_items[1] = null;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(default_value_table.raw_statement, missing_default_clause, &default_value_table.tokenized_sql)),
+    );
+
+    var alter_column_rewrite = try ParsedSql.initAlloc(alloc, "ALTER TABLE audit_log ALTER COLUMN amount TYPE numeric USING amount + 1");
+    defer alter_column_rewrite.deinit(alloc);
+    var missing_rewrite_expression = alter_column_rewrite.generated_statement.?;
+    if (missing_rewrite_expression.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .ddl => |*ddl_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl_ast.kind);
+                try std.testing.expectEqual(@as(usize, 1), ddl_ast.alter_table_operation_rewrite_expression_items.len);
+                try std.testing.expect(ddl_ast.alter_table_operation_rewrite_expression_items[0] != null);
+                try std.testing.expect(!generatedDdlExpressionPayloadIsEmpty(ddl_ast.alter_table_operation_rewrite_expressions[0]));
+                ddl_ast.alter_table_operation_rewrite_expression_items[0] = null;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(alter_column_rewrite.raw_statement, missing_rewrite_expression, &alter_column_rewrite.tokenized_sql)),
     );
 
     var generated_routine_metadata = try ParsedSql.initAlloc(alloc, "CREATE FUNCTION audit_usage() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$");
@@ -10016,6 +12827,27 @@ test "sql adapter parsed sql rejects malformed generated classification payloads
     try std.testing.expectEqual(
         ParsedStatement.unknown,
         std.meta.activeTag(parseStatement(generated_routine_metadata.raw_statement, malformed_routine_returns_range, &generated_routine_metadata.tokenized_sql)),
+    );
+
+    var generated_sql_routine_metadata = try ParsedSql.initAlloc(alloc, "CREATE FUNCTION audit_sql_body() RETURNS integer LANGUAGE sql AS $$SELECT 1$$");
+    defer generated_sql_routine_metadata.deinit(alloc);
+    var malformed_routine_body_expression = generated_sql_routine_metadata.generated_statement.?;
+    if (malformed_routine_body_expression.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .ddl => |*ddl_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_function, ddl_ast.kind);
+                const routine = ddl_ast.routine_metadata orelse return error.TestUnexpectedResult;
+                try std.testing.expectEqual(generated_parser.GeneratedSqlRoutineBodyKind.sql_expression, routine.body_kind.?);
+                _ = routine.body_expression_tokens orelse return error.TestUnexpectedResult;
+                _ = routine.body_expression.tokens orelse return error.TestUnexpectedResult;
+                routine.body_expression.tokens.?.end = routine.body_expression.tokens.?.start;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(generated_sql_routine_metadata.raw_statement, malformed_routine_body_expression, &generated_sql_routine_metadata.tokenized_sql)),
     );
 
     var graph_index = try ParsedSql.initAlloc(alloc, "CREATE GRAPH INDEX docs_edge_graph ON doc_edges");
@@ -10171,6 +13003,62 @@ test "sql adapter parsed sql rejects malformed generated classification payloads
         std.meta.activeTag(parseStatement(unsupported_copy.raw_statement, malformed_unsupported_subject, &unsupported_copy.tokenized_sql)),
     );
 
+    var unsupported_backup = try ParsedSql.initAlloc(alloc, "BACKUP DATABASE tenant_ops TO 's3://usage-backups/tenant_ops'");
+    defer unsupported_backup.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlUnsupportedKind.backup_database, unsupported_backup.unsupportedStatementKindIncludingGeneratedAst().?);
+
+    var mismatched_backup_reason = unsupported_backup.generated_statement.?;
+    if (mismatched_backup_reason.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| unsupported_ast.reason = .restore_database_not_planned_by_generated_parser,
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(unsupported_backup.raw_statement, mismatched_backup_reason, &unsupported_backup.tokenized_sql)),
+    );
+
+    var malformed_backup_subject = unsupported_backup.generated_statement.?;
+    if (malformed_backup_subject.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| unsupported_ast.subject_tokens = .{ .start = 2, .end = unsupported_backup.items().len },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(unsupported_backup.raw_statement, malformed_backup_subject, &unsupported_backup.tokenized_sql)),
+    );
+
+    var unsupported_restore = try ParsedSql.initAlloc(alloc, "RESTORE DATABASE tenant_ops FROM 's3://usage-backups/tenant_ops'");
+    defer unsupported_restore.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlUnsupportedKind.restore_database, unsupported_restore.unsupportedStatementKindIncludingGeneratedAst().?);
+
+    var mismatched_restore_reason = unsupported_restore.generated_statement.?;
+    if (mismatched_restore_reason.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| unsupported_ast.reason = .backup_database_not_planned_by_generated_parser,
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(unsupported_restore.raw_statement, mismatched_restore_reason, &unsupported_restore.tokenized_sql)),
+    );
+
+    var malformed_restore_subject = unsupported_restore.generated_statement.?;
+    if (malformed_restore_subject.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| unsupported_ast.subject_tokens = .{ .start = 2, .end = unsupported_restore.items().len },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(unsupported_restore.raw_statement, malformed_restore_subject, &unsupported_restore.tokenized_sql)),
+    );
+
     var unsupported_foreign_data_wrapper = try ParsedSql.initAlloc(alloc, "CREATE FOREIGN DATA WRAPPER usage_fdw HANDLER usage_fdw_handler");
     defer unsupported_foreign_data_wrapper.deinit(alloc);
     var malformed_foreign_data_command_span = unsupported_foreign_data_wrapper.generated_statement.?;
@@ -10302,6 +13190,36 @@ test "sql adapter parsed sql rejects malformed generated classification payloads
     try std.testing.expectEqual(
         ParsedStatement.unknown,
         std.meta.activeTag(parseStatement(unsupported_alter_table_owner.raw_statement, malformed_alter_table_owner_operation, &unsupported_alter_table_owner.tokenized_sql)),
+    );
+
+    var stale_alter_table_owner_operation_kind = unsupported_alter_table_owner.generated_statement.?;
+    if (stale_alter_table_owner_operation_kind.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlUnsupportedKind.alter_table_owner, unsupported_ast.alter_table_operation_kind.?);
+                unsupported_ast.alter_table_operation_kind = .alter_table_tablespace;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(unsupported_alter_table_owner.raw_statement, stale_alter_table_owner_operation_kind, &unsupported_alter_table_owner.tokenized_sql)),
+    );
+
+    var stale_alter_table_owner_operation_subject = unsupported_alter_table_owner.generated_statement.?;
+    if (stale_alter_table_owner_operation_subject.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 6 }, unsupported_ast.alter_table_operation_subject_tokens.?);
+                unsupported_ast.alter_table_operation_subject_tokens = unsupported_ast.alter_table_name_tokens;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(unsupported_alter_table_owner.raw_statement, stale_alter_table_owner_operation_subject, &unsupported_alter_table_owner.tokenized_sql)),
     );
 
     var unsupported_alter_table_storage = try ParsedSql.initAlloc(alloc, "ALTER TABLE usage_records SET (fillfactor = 70)");

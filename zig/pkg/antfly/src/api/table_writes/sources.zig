@@ -21052,7 +21052,7 @@ test "api.table_writes.docid provisioned secondary index rebuild worker pass rep
     defer alloc.free(db_path);
 
     const building_schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric","x-antfly-index-lifecycle":"building","x-antfly-index-generation":9,"x-antfly-index-where":{"all":[{"field":"status","op":"eq","value":"active"}]}},"status":{"type":"keyword"}},"required":["id","amount","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"},"status":{"type":"keyword"}},"required":["id","amount","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"amount","owner_kind":"relational_column","owner_name":"amount","access_method":"scalar_column","columns":["amount"],"lifecycle":"building","generation":9,"schema_fingerprint":"secondary-index-v1:amount","where":{"all":[{"field":"status","op":"eq","value":"active"}]}}]}
     ;
 
     const range: metadata_table_manager.RangeRecord = .{
@@ -21082,7 +21082,7 @@ test "api.table_writes.docid provisioned secondary index rebuild worker pass rep
 
     const Catalog = struct {
         const ready_schema_json =
-            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric","x-antfly-index-lifecycle":"ready","x-antfly-index-generation":9,"x-antfly-index-where":{"all":[{"field":"status","op":"eq","value":"active"}]}},"status":{"type":"keyword"}},"required":["id","amount","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"},"status":{"type":"keyword"}},"required":["id","amount","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"amount","owner_kind":"relational_column","owner_name":"amount","access_method":"scalar_column","columns":["amount"],"lifecycle":"ready","generation":9,"schema_fingerprint":"secondary-index-v1:amount","where":{"all":[{"field":"status","op":"eq","value":"active"}]}}]}
         ;
 
         table: metadata_table_manager.TableRecord = .{
@@ -21179,19 +21179,25 @@ test "api.table_writes.docid provisioned secondary index rebuild worker pass rep
             allocator: std.mem.Allocator,
             table_name: []const u8,
             index_name: []const u8,
-            expected_generation: u64,
+            expected: metadata_table_manager.SecondaryIndexReadyExpectation,
         ) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (!std.mem.eql(u8, table_name, self.table.name)) return false;
-            const updated = sql_schema_mutation.schemaWithSecondaryIndexReadyAlloc(
+            const updated = sql_schema_mutation.schemaWithSecondaryIndexReadyCheckedAlloc(
                 allocator,
                 self.table.schema_json,
                 index_name,
-                expected_generation,
+                .{
+                    .generation = expected.generation,
+                    .access_method = expected.access_method,
+                    .schema_fingerprint = expected.schema_fingerprint,
+                },
             ) catch |err| switch (err) {
                 error.SecondaryIndexNotBuilding,
                 error.SecondaryIndexGenerationMismatch,
                 error.SecondaryIndexNotFound,
+                error.SecondaryIndexAccessMethodMismatch,
+                error.SecondaryIndexSchemaFingerprintMismatch,
                 => return false,
                 else => return err,
             };
@@ -21215,7 +21221,7 @@ test "api.table_writes.docid provisioned secondary index rebuild worker pass rep
     try std.testing.expectEqual(@as(u64, 1), pass.report.indexed_rows);
     try std.testing.expectEqualStrings(metadata_table_manager.secondary_index_rebuild_ready, catalog.rebuild.state);
     try std.testing.expectEqual(@as(u64, 2), catalog.rebuild.completed_row_count);
-    try std.testing.expect(std.mem.indexOf(u8, catalog.table.schema_json, "\"x-antfly-index-lifecycle\":\"ready\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, catalog.table.schema_json, "\"lifecycle\":\"ready\"") != null);
 
     var reopened = try db_mod.DB.open(alloc, db_path, .{ .identity_namespace = namespace, .prefer_existing_identity_namespace = true });
     defer reopened.close();

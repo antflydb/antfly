@@ -30,11 +30,31 @@ const value_mod = @import("value.zig");
 const document_plan = @import("document_plan.zig");
 const expr_projection = @import("expr/projection.zig");
 
-pub const RelationLifetimeKind = grammar.RelationLifetimeKind;
-pub const RelationPopulationMode = grammar.RelationPopulationMode;
+pub const RelationLifetimeKind = ddl_plan.RelationLifetimeKind;
+pub const RelationPopulationMode = enum {
+    create_table_as,
+    select_into,
+};
 pub const SelectOutputRef = ast.SelectOutputRef;
 pub const SelectSetOperation = ast.SelectSetOperation;
 pub const Token = parser.Token;
+
+const RelationPopulationSyntax = struct {
+    mode: RelationPopulationMode,
+    target_identifier: []const u8,
+    target_lifetime: ?RelationLifetimeKind = null,
+    if_not_exists: bool = false,
+    populate: bool = true,
+    source_token_start: ?usize = null,
+    source_token_end: ?usize = null,
+    source_suffix_token_start: ?usize = null,
+    source_suffix_token_end: ?usize = null,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        _ = alloc;
+        self.* = undefined;
+    }
+};
 
 pub const NamedWindowSpec = struct {
     name: []const u8,
@@ -3482,7 +3502,7 @@ fn parseSetOperationPlanWithCtesAlloc(
     errdefer if (!left_columns_transferred) freeSetOperationOutputColumns(alloc, left_columns);
     if (parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
 
-    const op = try grammar.parseSelectSetOperation(tokens, pos);
+    const op = try parseSelectSetOperationForCurrentRead(tokens, pos, hooks.cte_hooks.generated_read_ast);
     var extra_ctes = std.ArrayListUnmanaged(db_mod.types.RelationalRowsCte).empty;
     errdefer {
         for (extra_ctes.items) |cte| {
@@ -3558,6 +3578,63 @@ fn parseSetOperationPlanWithCtesAlloc(
         .max_bytes = db_mod.types.default_relational_rows_cte_max_bytes,
         .spill_after_bytes = db_mod.types.default_relational_rows_cte_spill_after_bytes,
     };
+}
+
+fn parseGeneratedSelectSetOperation(
+    tokens: []const Token,
+    pos: *usize,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+) !?SelectSetOperation {
+    const read = generated_read_ast orelse return null;
+    const range = read.set_operation_tokens orelse return error.UnsupportedSqlShape;
+    if (range.start != pos.*) {
+        if (pos.* > range.start and pos.* < range.end) return null;
+        return error.UnsupportedSqlShape;
+    }
+    if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
+    const operator_tokens = read.set_operation.operator_tokens orelse return error.UnsupportedSqlShape;
+    if (operator_tokens.start != range.start or operator_tokens.end != operator_tokens.start + 1 or operator_tokens.end > range.end) return error.UnsupportedSqlShape;
+    const right_query = read.set_operation.right_query_tokens orelse return error.UnsupportedSqlShape;
+    if (right_query.start < operator_tokens.end or right_query.end > range.end) return error.UnsupportedSqlShape;
+    if (!tokens[right_query.start].matchesKeywordTag(.select)) return error.UnsupportedSqlShape;
+
+    const op: SelectSetOperation = switch (read.set_operation.kind orelse return error.UnsupportedSqlShape) {
+        .@"union" => blk: {
+            if (!tokens[operator_tokens.start].matchesKeywordTag(.@"union")) return error.UnsupportedSqlShape;
+            if (read.set_operation.all_tokens) |all_tokens| {
+                if (all_tokens.start != operator_tokens.end or all_tokens.end != all_tokens.start + 1 or all_tokens.end != right_query.start) return error.UnsupportedSqlShape;
+                if (!tokens[all_tokens.start].matchesKeywordTag(.all)) return error.UnsupportedSqlShape;
+                break :blk .union_all;
+            }
+            if (right_query.start == operator_tokens.end) break :blk .union_distinct;
+            if (right_query.start == operator_tokens.end + 1 and tokens[operator_tokens.end].matchesKeywordTag(.distinct)) break :blk .union_distinct;
+            return error.UnsupportedSqlShape;
+        },
+        .intersect => blk: {
+            if (!tokens[operator_tokens.start].matchesKeywordTag(.intersect) or read.set_operation.all_tokens != null) return error.UnsupportedSqlShape;
+            if (right_query.start == operator_tokens.end) break :blk .intersect;
+            if (right_query.start == operator_tokens.end + 1 and tokens[operator_tokens.end].matchesKeywordTag(.distinct)) break :blk .intersect;
+            return error.UnsupportedSqlShape;
+        },
+        .except => blk: {
+            if (!tokens[operator_tokens.start].matchesKeywordTag(.except) or read.set_operation.all_tokens != null) return error.UnsupportedSqlShape;
+            if (right_query.start == operator_tokens.end) break :blk .except;
+            if (right_query.start == operator_tokens.end + 1 and tokens[operator_tokens.end].matchesKeywordTag(.distinct)) break :blk .except;
+            return error.UnsupportedSqlShape;
+        },
+    };
+    pos.* = right_query.start;
+    return op;
+}
+
+fn parseSelectSetOperationForCurrentRead(
+    tokens: []const Token,
+    pos: *usize,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+) !SelectSetOperation {
+    if (try parseGeneratedSelectSetOperation(tokens, pos, generated_read_ast)) |op| return op;
+    if (generated_read_ast != null) return error.UnsupportedSqlShape;
+    return try grammar.parseSelectSetOperation(tokens, pos);
 }
 
 fn resolveSetOperationSelectSourceForPlanAlloc(
@@ -4629,9 +4706,9 @@ pub const LoweredRelationPopulationPlan = struct {
     }
 };
 
-pub fn relationPopulationPlanFromSyntaxAlloc(
+fn relationPopulationPlanFromSyntaxAlloc(
     alloc: std.mem.Allocator,
-    syntax: grammar.RelationPopulationSyntax,
+    syntax: RelationPopulationSyntax,
     source: *LoweredReadPlan,
 ) !LoweredRelationPopulationPlan {
     const target = try grammar.normalizeSqlObjectIdentifierAlloc(alloc, syntax.target_identifier);
@@ -4661,10 +4738,7 @@ pub fn lowerRelationPopulationPlanWithParsedSqlAlloc(
     parsed_sql: *const tokenized.ParsedSql,
     hooks: RelationPopulationLoweringHooks,
 ) !LoweredRelationPopulationPlan {
-    var parsed = if (try relationPopulationSyntaxFromGeneratedDdl(parsed_sql)) |generated|
-        generated
-    else
-        try grammar.parseRelationPopulationParsedSqlAlloc(alloc, parsed_sql);
+    var parsed = try relationPopulationSyntaxFromGeneratedDdl(parsed_sql);
     defer parsed.deinit(alloc);
     var parsed_source = try relationPopulationSourceParsedSqlAlloc(alloc, parsed_sql, parsed);
     defer parsed_source.deinit(alloc);
@@ -4675,8 +4749,8 @@ pub fn lowerRelationPopulationPlanWithParsedSqlAlloc(
 
 fn relationPopulationSyntaxFromGeneratedDdl(
     parsed_sql: *const tokenized.ParsedSql,
-) !?grammar.RelationPopulationSyntax {
-    if (parsed_sql.generatedStatementKind() != .ddl) return null;
+) !RelationPopulationSyntax {
+    if (parsed_sql.generatedStatementKind() != .ddl) return error.UnsupportedSqlShape;
     const generated_statement = parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     const generated_ast = generated_statement.ast orelse return error.UnsupportedSqlShape;
     const ddl_ast = switch (generated_ast) {
@@ -4703,7 +4777,7 @@ fn selectIntoRelationPopulationSyntaxFromGeneratedDdl(
     start: usize,
     end: usize,
     ddl_ast: generated_parser.GeneratedSqlDdlAst,
-) !grammar.RelationPopulationSyntax {
+) !RelationPopulationSyntax {
     const target_range = ddl_ast.object_name_tokens orelse return error.UnsupportedSqlShape;
     const target_identifier = try generatedSqlObjectIdentifierText(tokens, target_range);
     const into_index = findTopLevelRelationPopulationKeyword(tokens, start + 1, end, .into) orelse return error.UnsupportedSqlShape;
@@ -4732,7 +4806,7 @@ fn createTableAsRelationPopulationSyntaxFromGeneratedDdl(
     start: usize,
     end: usize,
     ddl_ast: generated_parser.GeneratedSqlDdlAst,
-) !grammar.RelationPopulationSyntax {
+) !RelationPopulationSyntax {
     const target_range = ddl_ast.object_name_tokens orelse return error.UnsupportedSqlShape;
     const target_identifier = try generatedSqlObjectIdentifierText(tokens, target_range);
     var target_index = start + 1;
@@ -4917,12 +4991,11 @@ test "sql adapter relation population validates retained generated metadata" {
 fn relationPopulationSourceParsedSqlAlloc(
     alloc: std.mem.Allocator,
     parent_sql: *const tokenized.ParsedSql,
-    parsed: grammar.RelationPopulationSyntax,
+    parsed: RelationPopulationSyntax,
 ) !tokenized.OwnedParsedSql {
     if (parsed.source_token_start) |start| {
         const end = parsed.source_token_end orelse return error.UnsupportedSqlShape;
         const generated_source_read = parent_sql.generatedRelationPopulationSourceReadAst();
-        const require_generated_source = parent_sql.generatedStatementKind() == .ddl;
         if (parsed.source_suffix_token_start) |suffix_start| {
             const suffix_end = parsed.source_suffix_token_end orelse return error.UnsupportedSqlShape;
             const ranges = [_]tokenized.TokenRange{
@@ -4932,14 +5005,12 @@ fn relationPopulationSourceParsedSqlAlloc(
             if (generated_source_read) |source_read| {
                 return try tokenized.OwnedParsedSql.initChildStatementFromTokenRangesWithGeneratedReadAstAlloc(alloc, parent_sql, &ranges, source_read);
             }
-            if (require_generated_source) return error.UnsupportedSqlShape;
-            return try tokenized.OwnedParsedSql.initChildStatementFromTokenRangesAlloc(alloc, parent_sql, &ranges);
+            return error.UnsupportedSqlShape;
         }
         if (generated_source_read) |source_read| {
             return try tokenized.OwnedParsedSql.initChildStatementWithGeneratedReadAstAlloc(alloc, parent_sql, start, end, source_read);
         }
-        if (require_generated_source) return error.UnsupportedSqlShape;
-        return try tokenized.OwnedParsedSql.initChildStatementAlloc(alloc, parent_sql, start, end);
+        return error.UnsupportedSqlShape;
     }
     return error.UnsupportedSqlShape;
 }
@@ -6254,7 +6325,7 @@ pub fn selectSourceAliasTailKeyword(token: Token) bool {
         token.matchesKeywordTag(.except);
 }
 
-pub fn parseDmlTargetAliasAlloc(
+fn parseDmlTargetAliasAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
     pos: *usize,

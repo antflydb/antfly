@@ -61,11 +61,29 @@ export interface DocumentSchema {
 
 export interface TableSchema {
   version?: number;
+  storage_mode?: "document" | "relational";
   enforce_types?: boolean;
   default_type?: string;
   document_schemas?: {
     [schemaName: string]: DocumentSchema;
   };
+  relational_indexes?: Array<{
+    name: string;
+    owner_kind: "relational_column" | "unique_constraint";
+    owner_name?: string;
+    access_method: "scalar_column" | "ordered_tuple" | "algebraic_filter" | "text_search";
+    unique?: boolean;
+    columns?: string[];
+    include_columns?: string[];
+    keys?: Array<{
+      column: string;
+      direction?: "asc" | "desc";
+      nulls?: "default" | "first" | "last";
+    }>;
+    lifecycle?: "ready" | "building" | "catching_up" | "stale" | "rebuild_required" | "failed" | "invalid" | "dropping";
+    generation?: number;
+    schema_fingerprint?: string;
+  }>;
 }
 
 export interface ChunkerConfig {

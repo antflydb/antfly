@@ -25,6 +25,7 @@ const generated_parser = @import("generated_parser.zig");
 const generated_read_validate = @import("generated_read_validate.zig");
 const expr_where_condition = @import("expr/where_condition.zig");
 const grammar = @import("grammar.zig");
+const lexer = @import("lexer.zig");
 const lower_expr = @import("lower_expr.zig");
 const expr_row_parse = @import("expr/row_parse.zig");
 const plan_mod = @import("plan.zig");
@@ -75,18 +76,6 @@ pub const SetSearchPathPlan = struct {
         self.* = undefined;
     }
 };
-
-pub fn parseSetSearchPathPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !SetSearchPathPlan {
-    var syntax = try grammar.parseSetSearchPathTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    const namespaces = syntax.namespaces;
-    syntax.namespaces = &.{};
-    return .{ .namespaces = namespaces, .local = syntax.local };
-}
 
 pub const SessionSettingKind = enum {
     app,
@@ -402,7 +391,10 @@ pub const RelationLifetimePlan = struct {
     }
 };
 
-pub const RelationLifetimeKind = grammar.RelationLifetimeKind;
+pub const RelationLifetimeKind = enum {
+    temporary,
+    unlogged,
+};
 
 pub const TablePartitionCatalogPlan = union(enum) {
     create_partitioned: CreatePartitionedTablePlan,
@@ -1335,23 +1327,6 @@ pub const ProcedureCallPlan = struct {
     }
 };
 
-pub fn parseProcedureCallPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !ProcedureCallPlan {
-    const cursor = parser.Cursor.init(tokens, pos);
-    const routine_name = try grammar.parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
-    var routine_transferred = false;
-    errdefer if (!routine_transferred) alloc.free(routine_name);
-    try cursor.expectToken(.lparen);
-    if (cursor.matchToken(.rparen) == null) return error.UnsupportedSqlShape;
-    if (cursor.matchToken(.semicolon) != null and !cursor.atEnd()) return error.UnsupportedSqlShape;
-    if (!cursor.atEnd()) return error.UnsupportedSqlShape;
-    routine_transferred = true;
-    return .{ .routine_name = routine_name };
-}
-
 pub const AuthorizationCatalogPlan = union(enum) {
     create_role: CreateRolePlan,
     alter_role: AlterRolePlan,
@@ -2148,7 +2123,18 @@ pub const PublicationAlterOperation = union(enum) {
     }
 };
 
-pub const PublicationTablePlan = grammar.PublicationTableSyntax;
+pub const PublicationTablePlan = struct {
+    table_name: []const u8,
+    column_names: []const []const u8 = &.{},
+    where_predicate_sql: ?[]const u8 = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.table_name);
+        freeStringSlice(alloc, self.column_names);
+        if (self.where_predicate_sql) |where_predicate_sql| alloc.free(@constCast(where_predicate_sql));
+        self.* = undefined;
+    }
+};
 
 pub const PublicationOptionsPlan = struct {
     publish_json: ?[]const u8 = null,
@@ -2914,62 +2900,6 @@ pub const AdvisoryLockAction = enum {
     unlock,
 };
 
-pub fn cursorScrollModeFromSyntax(syntax: grammar.CursorScrollSyntax) CursorScrollMode {
-    return switch (syntax) {
-        .default => .default,
-        .scroll => .scroll,
-        .no_scroll => .no_scroll,
-    };
-}
-
-pub fn cursorFetchDirectionFromSyntax(syntax: grammar.CursorFetchDirectionSyntax) CursorFetchDirection {
-    return switch (syntax) {
-        .next => .next,
-        .prior => .prior,
-        .first => .first,
-        .last => .last,
-        .absolute => .absolute,
-        .relative => .relative,
-        .forward => .forward,
-        .backward => .backward,
-        .all => .all,
-    };
-}
-
-pub fn preparedStatementSubjectKindFromSyntax(syntax: grammar.PreparedStatementSubjectSyntax) PreparedStatementSubjectKind {
-    return switch (syntax) {
-        .read => .read,
-        .write => .write,
-        .ddl => .ddl,
-    };
-}
-
-pub fn preparedStatementStatementKindFromSyntax(syntax: grammar.PreparedStatementStatementSyntax) PreparedStatementStatementKind {
-    return switch (syntax) {
-        .read => .read,
-        .insert => .insert,
-        .insert_source => .insert_source,
-        .update => .update,
-        .delete => .delete,
-        .truncate => .truncate,
-        .merge => .merge,
-        .ddl => .ddl,
-    };
-}
-
-pub fn savepointNamePlanFromSyntaxAlloc(alloc: std.mem.Allocator, syntax: grammar.SavepointNameSyntax) !SavepointNamePlan {
-    return .{ .savepoint_name = try alloc.dupe(u8, syntax.savepoint_name) };
-}
-
-pub fn deallocatePreparedStatementPlanFromSyntaxAlloc(
-    alloc: std.mem.Allocator,
-    syntax: grammar.NamedOrAllSyntax,
-) !DeallocatePreparedStatementPlan {
-    if (syntax.all) return .{ .all = true };
-    const statement_name = syntax.name orelse return error.UnsupportedSqlShape;
-    return .{ .statement_name = try alloc.dupe(u8, statement_name) };
-}
-
 pub fn preparedTransactionPlanFromGeneratedAstAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
@@ -2998,8 +2928,10 @@ pub fn preparedTransactionPlanFromGeneratedAstAlloc(
     const gid_tokens = ast.gid_tokens orelse return error.UnsupportedSqlShape;
     if (gid_tokens.start != 2 or gid_tokens.end != 3) return error.UnsupportedSqlShape;
     if (tokens[2].kind != .string or tokens[2].text.len == 0) return error.UnsupportedSqlShape;
-    var pos: usize = 0;
-    return try grammar.parsePreparedTransactionTailAlloc(alloc, tokens[1..end], &pos, action);
+    return .{
+        .action = action,
+        .gid = try alloc.dupe(u8, tokens[2].text),
+    };
 }
 
 pub fn preparedStatementPlanFromGeneratedAstAlloc(
@@ -3147,8 +3079,8 @@ fn generatedPreparedStatementPayloadFromAstAlloc(
             .subject_parsed_sql = try tokenized.ParsedSql.initFromOwnedTokenSliceWithGeneratedReadAstAlloc(alloc, owned_sql, subject_tokens, read_ast),
         },
         .dml => |dml_ast| try generatedPreparedDmlPayloadFromOwnedSubjectAlloc(alloc, owned_sql, subject_tokens, dml_ast),
-        .ddl => |ddl_ast| try generatedPreparedDdlPayloadFromOwnedSubjectAlloc(alloc, owned_sql, tokens, inner, subject_tokens, ddl_ast, .ddl),
-        .extension_index => |ddl_ast| try generatedPreparedDdlPayloadFromOwnedSubjectAlloc(alloc, owned_sql, tokens, inner, subject_tokens, ddl_ast, .extension_index),
+        .ddl => |ddl_ast| try generatedPreparedDdlPayloadFromOwnedSubjectAlloc(alloc, owned_sql, subject_tokens, ddl_ast, .ddl),
+        .extension_index => |ddl_ast| try generatedPreparedDdlPayloadFromOwnedSubjectAlloc(alloc, owned_sql, subject_tokens, ddl_ast, .extension_index),
         else => error.UnsupportedSqlShape,
     };
 }
@@ -3159,7 +3091,7 @@ fn generatedPreparedDmlPayloadFromOwnedSubjectAlloc(
     subject_tokens: []const grammar.Token,
     dml_ast: generated_parser.GeneratedSqlDmlAst,
 ) !GeneratedPreparedStatementPayload {
-    var subject = try tokenized.ParsedSql.initFromOwnedTokenSliceAlloc(alloc, owned_sql, subject_tokens);
+    var subject = try tokenized.ParsedSql.initFromOwnedTokenSliceWithGeneratedDmlAstAlloc(alloc, owned_sql, subject_tokens, &dml_ast);
     errdefer subject.deinit(alloc);
     const parsed_kind = subject.writeStatementKindIncludingGeneratedAst() orelse return error.UnsupportedSqlShape;
     const expected_family = generatedPreparedStatementFamilyFromDmlKind(dml_ast.kind);
@@ -3173,14 +3105,11 @@ fn generatedPreparedDmlPayloadFromOwnedSubjectAlloc(
 fn generatedPreparedDdlPayloadFromOwnedSubjectAlloc(
     alloc: std.mem.Allocator,
     owned_sql: []const u8,
-    parent_tokens: []const grammar.Token,
-    inner: generated_parser.GeneratedSqlTokenRange,
     subject_tokens: []const grammar.Token,
     ddl_ast: generated_parser.GeneratedSqlDdlAst,
     expected_statement_kind: generated_parser.GeneratedSqlStatementKind,
 ) !GeneratedPreparedStatementPayload {
-    try validateGeneratedPreparedDdlSubjectAst(parent_tokens, inner, ddl_ast, expected_statement_kind);
-    var subject = try tokenized.ParsedSql.initFromOwnedTokenSliceAlloc(alloc, owned_sql, subject_tokens);
+    var subject = try tokenized.ParsedSql.initFromOwnedTokenSliceWithGeneratedDdlAstAlloc(alloc, owned_sql, subject_tokens, &ddl_ast, expected_statement_kind);
     errdefer subject.deinit(alloc);
     if (subject.generatedStatementKind() != expected_statement_kind) return error.UnsupportedSqlShape;
     const generated_statement = subject.generated_statement orelse return error.UnsupportedSqlShape;
@@ -3195,48 +3124,6 @@ fn generatedPreparedDdlPayloadFromOwnedSubjectAlloc(
         .statement_family = .ddl,
         .subject_parsed_sql = subject,
     };
-}
-
-fn validateGeneratedPreparedDdlSubjectAst(
-    tokens: []const grammar.Token,
-    inner: generated_parser.GeneratedSqlTokenRange,
-    ddl_ast: generated_parser.GeneratedSqlDdlAst,
-    expected_statement_kind: generated_parser.GeneratedSqlStatementKind,
-) !void {
-    if (expected_statement_kind != .ddl and expected_statement_kind != .extension_index) return error.UnsupportedSqlShape;
-    if (inner.start >= inner.end or inner.end > tokens.len) return error.UnsupportedSqlShape;
-    if (ddl_ast.statement_span.start != tokens[inner.start].source_start or
-        ddl_ast.statement_span.end != tokens[inner.end - 1].source_end)
-    {
-        return error.UnsupportedSqlShape;
-    }
-    if (ddl_ast.command_span.start != tokens[inner.start].source_start or
-        ddl_ast.command_span.end != tokens[inner.start].source_end)
-    {
-        return error.UnsupportedSqlShape;
-    }
-    try validateGeneratedPreparedDdlSubjectRange(tokens, inner, ddl_ast.object_name_tokens);
-    try validateGeneratedPreparedDdlSubjectRange(tokens, inner, ddl_ast.schema_name_tokens);
-    try validateGeneratedPreparedDdlSubjectRange(tokens, inner, ddl_ast.version_tokens);
-    try validateGeneratedPreparedDdlSubjectRange(tokens, inner, ddl_ast.index_table_tokens);
-    try validateGeneratedPreparedDdlSubjectRange(tokens, inner, ddl_ast.index_method_tokens);
-    try validateGeneratedPreparedDdlSubjectRange(tokens, inner, ddl_ast.index_elements_tokens);
-    try validateGeneratedPreparedDdlSubjectRange(tokens, inner, ddl_ast.index_include_tokens);
-    try validateGeneratedPreparedDdlSubjectRange(tokens, inner, ddl_ast.index_options_tokens);
-    try validateGeneratedPreparedDdlSubjectRange(tokens, inner, ddl_ast.index_where_tokens);
-    try validateGeneratedPreparedDdlSubjectRange(tokens, inner, ddl_ast.alter_table_operation_tokens);
-    try validateGeneratedPreparedDdlSubjectRange(tokens, inner, ddl_ast.rename_target_tokens);
-}
-
-fn validateGeneratedPreparedDdlSubjectRange(
-    tokens: []const grammar.Token,
-    inner: generated_parser.GeneratedSqlTokenRange,
-    maybe_range: ?generated_parser.GeneratedSqlTokenRange,
-) !void {
-    const range = maybe_range orelse return;
-    if (range.start < inner.start or range.start >= range.end or range.end > inner.end or range.end > tokens.len) {
-        return error.UnsupportedSqlShape;
-    }
 }
 
 fn deinitOwnedParsedSql(alloc: std.mem.Allocator, parsed_sql: *tokenized.ParsedSql) void {
@@ -3358,15 +3245,13 @@ pub fn cursorPortalLogicalPlanFromGeneratedAstAlloc(
 ) !CursorPortalPlan {
     try validateGeneratedCursorAstSpans(tokens, ast);
     const tail = ast.tail_tokens orelse return error.UnsupportedSqlShape;
-    var pos: usize = 0;
     var plan: CursorPortalPlan = switch (ast.kind) {
-        .declare => .{ .declare = try declareCursorPortalPlanFromGeneratedAstAlloc(alloc, tokens, ast, tail, &pos) },
-        .fetch => .{ .fetch = try parseFetchCursorPortalPlanTailAlloc(alloc, tokens[tail.start..tail.end], &pos) },
-        .move => .{ .move = try parseFetchCursorPortalPlanTailAlloc(alloc, tokens[tail.start..tail.end], &pos) },
-        .close => .{ .close = try parseCloseCursorPortalPlanTailAlloc(alloc, tokens[tail.start..tail.end], &pos) },
+        .declare => .{ .declare = try declareCursorPortalPlanFromGeneratedAstAlloc(alloc, tokens, ast, tail) },
+        .fetch => .{ .fetch = try fetchCursorPortalPlanFromGeneratedAstAlloc(alloc, tokens, ast) },
+        .move => .{ .move = try fetchCursorPortalPlanFromGeneratedAstAlloc(alloc, tokens, ast) },
+        .close => .{ .close = try closeCursorPortalPlanFromGeneratedAstAlloc(alloc, tokens, ast) },
     };
     errdefer plan.deinit(alloc);
-    if (pos != tail.end - tail.start) return error.UnsupportedSqlShape;
     return plan;
 }
 
@@ -3375,24 +3260,10 @@ fn declareCursorPortalPlanFromGeneratedAstAlloc(
     tokens: []const grammar.Token,
     ast: generated_parser.GeneratedSqlCursorAst,
     tail: generated_parser.GeneratedSqlTokenRange,
-    pos: *usize,
 ) !DeclareCursorPortalPlan {
-    const tail_tokens = tokens[tail.start..tail.end];
-    const syntax = try grammar.parseDeclareCursorPortalTailAlloc(alloc, tail_tokens, pos);
-    if (pos.* != tail_tokens.len) return error.UnsupportedSqlShape;
-    var plan = try declareCursorPortalPlanFromSyntaxAlloc(alloc, syntax);
-    errdefer plan.deinit(alloc);
-    const subject_start = syntax.subject_token_start orelse return error.UnsupportedSqlShape;
-    const subject_end = syntax.subject_token_end orelse return error.UnsupportedSqlShape;
-    if (subject_start >= subject_end or subject_end > tail_tokens.len) return error.UnsupportedSqlShape;
-    const subject_range = generated_parser.GeneratedSqlTokenRange{
-        .start = tail.start + subject_start,
-        .end = tail.start + subject_end,
-    };
-    if (ast.subject_tokens == null or
-        ast.subject_tokens.?.start != subject_range.start or
-        ast.subject_tokens.?.end != subject_range.end)
-    {
+    const portal_name = try generatedSingleIdentifierText(tokens, ast.portal_name_tokens orelse return error.UnsupportedSqlShape);
+    const subject_range = ast.subject_tokens orelse return error.UnsupportedSqlShape;
+    if (subject_range.start < tail.start or subject_range.end > tail.end or subject_range.start >= subject_range.end) {
         return error.UnsupportedSqlShape;
     }
     var payload = try generatedPreparedStatementPayloadFromAstAlloc(
@@ -3402,11 +3273,62 @@ fn declareCursorPortalPlanFromGeneratedAstAlloc(
         ast.subject_ast orelse return error.UnsupportedSqlShape,
     );
     errdefer deinitOwnedParsedSql(alloc, &payload.subject_parsed_sql);
-    if (preparedStatementSubjectKindFromStatementKind(payload.statement_family) != plan.statement_kind) {
-        return error.UnsupportedSqlShape;
-    }
-    plan.subject_parsed_sql = payload.subject_parsed_sql;
+    var plan = DeclareCursorPortalPlan{
+        .portal_name = try alloc.dupe(u8, portal_name),
+        .scroll = cursorScrollModeFromGenerated(ast.scroll_mode),
+        .binary = ast.binary,
+        .hold = ast.hold,
+        .statement_kind = preparedStatementSubjectKindFromStatementKind(payload.statement_family),
+        .subject_parsed_sql = payload.subject_parsed_sql,
+    };
+    errdefer plan.deinit(alloc);
+    payload.subject_parsed_sql = undefined;
     return plan;
+}
+
+fn fetchCursorPortalPlanFromGeneratedAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlCursorAst,
+) !FetchCursorPortalPlan {
+    const portal_name = try generatedSingleIdentifierText(tokens, ast.portal_name_tokens orelse return error.UnsupportedSqlShape);
+    return .{
+        .portal_name = try alloc.dupe(u8, portal_name),
+        .direction = cursorFetchDirectionFromGenerated(ast.fetch_direction),
+        .count = ast.fetch_count,
+    };
+}
+
+fn closeCursorPortalPlanFromGeneratedAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlCursorAst,
+) !CloseCursorPortalPlan {
+    if (ast.close_all) return .{ .all = true };
+    const portal_name = try generatedSingleIdentifierText(tokens, ast.portal_name_tokens orelse return error.UnsupportedSqlShape);
+    return .{ .portal_name = try alloc.dupe(u8, portal_name) };
+}
+
+fn cursorScrollModeFromGenerated(mode: generated_parser.GeneratedSqlCursorScrollMode) CursorScrollMode {
+    return switch (mode) {
+        .default => .default,
+        .scroll => .scroll,
+        .no_scroll => .no_scroll,
+    };
+}
+
+fn cursorFetchDirectionFromGenerated(direction: generated_parser.GeneratedSqlCursorFetchDirection) CursorFetchDirection {
+    return switch (direction) {
+        .next => .next,
+        .prior => .prior,
+        .first => .first,
+        .last => .last,
+        .absolute => .absolute,
+        .relative => .relative,
+        .forward => .forward,
+        .backward => .backward,
+        .all => .all,
+    };
 }
 
 fn validateGeneratedCursorAstSpans(
@@ -3428,12 +3350,44 @@ fn validateGeneratedCursorAstSpans(
         return error.UnsupportedSqlShape;
     }
     if (ast.kind == .declare) {
+        const portal_name = ast.portal_name_tokens orelse return error.UnsupportedSqlShape;
+        if (portal_name.start != tail.start or portal_name.end != tail.start + 1 or portal_name.end > tail.end) {
+            return error.UnsupportedSqlShape;
+        }
+        if (tokens[portal_name.start].kind != .identifier) return error.UnsupportedSqlShape;
         const subject = ast.subject_tokens orelse return error.UnsupportedSqlShape;
         if (subject.start < tail.start or subject.end > tail.end or subject.start >= subject.end or ast.subject_ast == null) {
             return error.UnsupportedSqlShape;
         }
-    } else if (ast.subject_tokens != null or ast.subject_ast != null) {
-        return error.UnsupportedSqlShape;
+        if (subject.start <= portal_name.end) return error.UnsupportedSqlShape;
+    } else {
+        if (ast.subject_tokens != null or ast.subject_ast != null or ast.binary or ast.hold or ast.scroll_mode != .default) {
+            return error.UnsupportedSqlShape;
+        }
+        switch (ast.kind) {
+            .fetch, .move => {
+                const portal_name = ast.portal_name_tokens orelse return error.UnsupportedSqlShape;
+                if (portal_name.start < tail.start or portal_name.end != tail.end or portal_name.start + 1 != portal_name.end) {
+                    return error.UnsupportedSqlShape;
+                }
+                if (tokens[portal_name.start].kind != .identifier) return error.UnsupportedSqlShape;
+                if (ast.close_all) return error.UnsupportedSqlShape;
+            },
+            .close => {
+                if (ast.close_all) {
+                    if (ast.portal_name_tokens != null or tail.start + 1 != tail.end or !tokens[tail.start].matchesKeyword("all")) {
+                        return error.UnsupportedSqlShape;
+                    }
+                } else {
+                    const portal_name = ast.portal_name_tokens orelse return error.UnsupportedSqlShape;
+                    if (portal_name.start != tail.start or portal_name.end != tail.end or portal_name.start + 1 != portal_name.end) {
+                        return error.UnsupportedSqlShape;
+                    }
+                    if (tokens[portal_name.start].kind != .identifier) return error.UnsupportedSqlShape;
+                }
+            },
+            .declare => unreachable,
+        }
     }
 }
 
@@ -3519,24 +3473,20 @@ pub fn transactionLogicalPlanFromGeneratedAstAlloc(
     const end = generatedStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
     if (ast.name_tokens) |name_tokens| {
         if (name_tokens.end != end) return error.UnsupportedSqlShape;
-        var pos: usize = 0;
         var plan: binder.TransactionLogicalPlan = switch (ast.kind) {
-            .savepoint => .{ .savepoint = .{ .savepoint = try parseSavepointTransactionPlanTailAlloc(alloc, tokens[1..end], &pos) } },
-            .release_savepoint => .{ .savepoint = .{ .release = try parseReleaseSavepointPlanTailAlloc(alloc, tokens[1..end], &pos) } },
-            .rollback_to_savepoint => .{ .savepoint = .{ .rollback_to = try parseRollbackToSavepointPlanTailAlloc(alloc, tokens[1..end], &pos) } },
+            .savepoint => .{ .savepoint = .{ .savepoint = try savepointNamePlanFromGeneratedRangeAlloc(alloc, tokens, name_tokens) } },
+            .release_savepoint => .{ .savepoint = .{ .release = try savepointNamePlanFromGeneratedRangeAlloc(alloc, tokens, name_tokens) } },
+            .rollback_to_savepoint => .{ .savepoint = .{ .rollback_to = try savepointNamePlanFromGeneratedRangeAlloc(alloc, tokens, name_tokens) } },
             else => return error.UnsupportedSqlShape,
         };
         errdefer plan.deinit(alloc);
-        if (pos != end - 1) return error.UnsupportedSqlShape;
         return plan;
     }
     if (ast.mode_tokens) |mode_tokens| {
         if (mode_tokens.start != 1 or mode_tokens.end != end) return error.UnsupportedSqlShape;
-        var pos: usize = 0;
         if (ast.kind == .constraint_mode) {
-            var plan = try parseConstraintModePlanTailAlloc(alloc, tokens[mode_tokens.start..mode_tokens.end], &pos);
+            var plan = try constraintModePlanFromGeneratedAstAlloc(alloc, tokens, ast);
             errdefer plan.deinit(alloc);
-            if (pos != mode_tokens.end - mode_tokens.start) return error.UnsupportedSqlShape;
             return .{ .control = .{ .constraint_mode = plan } };
         }
         const starter: TransactionModeStarter = switch (ast.kind) {
@@ -3551,8 +3501,7 @@ pub fn transactionLogicalPlanFromGeneratedAstAlloc(
             .constraint_mode,
             => return error.UnsupportedSqlShape,
         };
-        const mode = try parseTransactionModePlanTail(tokens[mode_tokens.start..mode_tokens.end], &pos, starter);
-        if (pos != mode_tokens.end - mode_tokens.start) return error.UnsupportedSqlShape;
+        const mode = try transactionModePlanFromGeneratedRange(tokens, mode_tokens, starter);
         return .{ .control = .{ .transaction_mode = mode } };
     }
     const action: TransactionBoundaryAction = switch (ast.kind) {
@@ -3567,6 +3516,108 @@ pub fn transactionLogicalPlanFromGeneratedAstAlloc(
         => return error.UnsupportedSqlShape,
     };
     return .{ .boundary = .{ .action = action } };
+}
+
+fn transactionModePlanFromGeneratedRange(
+    tokens: []const grammar.Token,
+    mode_tokens: generated_parser.GeneratedSqlTokenRange,
+    starter: TransactionModeStarter,
+) !TransactionModePlan {
+    if (mode_tokens.start >= mode_tokens.end or mode_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+    var cursor = mode_tokens.start;
+    switch (starter) {
+        .set_transaction, .start_transaction => {
+            if (!tokens[cursor].matchesKeyword("transaction")) return error.UnsupportedSqlShape;
+            cursor += 1;
+        },
+        .begin => {
+            if (tokens[cursor].matchesKeyword("transaction")) cursor += 1;
+        },
+    }
+
+    var plan = TransactionModePlan{ .starter = starter };
+    var saw_mode = false;
+    while (cursor < mode_tokens.end) {
+        if (tokens[cursor].kind == .comma) {
+            cursor += 1;
+            if (cursor >= mode_tokens.end) return error.UnsupportedSqlShape;
+        }
+        if (tokens[cursor].matchesKeyword("isolation")) {
+            cursor += 1;
+            if (cursor >= mode_tokens.end or !tokens[cursor].matchesKeyword("level")) return error.UnsupportedSqlShape;
+            cursor += 1;
+            if (plan.isolation_level != null) return error.UnsupportedSqlShape;
+            plan.isolation_level = try generatedTransactionIsolationLevel(tokens, mode_tokens.end, &cursor);
+            saw_mode = true;
+        } else if (tokens[cursor].matchesKeyword("read")) {
+            cursor += 1;
+            if (plan.access_mode != null or cursor >= mode_tokens.end) return error.UnsupportedSqlShape;
+            if (tokens[cursor].matchesKeyword("only")) {
+                plan.access_mode = .read_only;
+            } else if (tokens[cursor].matchesKeyword("write")) {
+                plan.access_mode = .read_write;
+            } else {
+                return error.UnsupportedSqlShape;
+            }
+            cursor += 1;
+            saw_mode = true;
+        } else if (tokens[cursor].matchesKeyword("not")) {
+            cursor += 1;
+            if (plan.deferrable != null or cursor >= mode_tokens.end or !tokens[cursor].matchesKeyword("deferrable")) return error.UnsupportedSqlShape;
+            cursor += 1;
+            plan.deferrable = false;
+            saw_mode = true;
+        } else if (tokens[cursor].matchesKeyword("deferrable")) {
+            if (plan.deferrable != null) return error.UnsupportedSqlShape;
+            cursor += 1;
+            plan.deferrable = true;
+            saw_mode = true;
+        } else {
+            return error.UnsupportedSqlShape;
+        }
+    }
+    if (!saw_mode) return error.UnsupportedSqlShape;
+    return plan;
+}
+
+fn generatedTransactionIsolationLevel(
+    tokens: []const grammar.Token,
+    end: usize,
+    cursor: *usize,
+) !TransactionIsolationLevel {
+    if (cursor.* >= end) return error.UnsupportedSqlShape;
+    if (tokens[cursor.*].matchesKeyword("serializable")) {
+        cursor.* += 1;
+        return .serializable;
+    }
+    if (tokens[cursor.*].matchesKeyword("repeatable")) {
+        cursor.* += 1;
+        if (cursor.* >= end or !tokens[cursor.*].matchesKeyword("read")) return error.UnsupportedSqlShape;
+        cursor.* += 1;
+        return .repeatable_read;
+    }
+    if (tokens[cursor.*].matchesKeyword("read")) {
+        cursor.* += 1;
+        if (cursor.* >= end) return error.UnsupportedSqlShape;
+        if (tokens[cursor.*].matchesKeyword("committed")) {
+            cursor.* += 1;
+            return .read_committed;
+        }
+        if (tokens[cursor.*].matchesKeyword("uncommitted")) {
+            cursor.* += 1;
+            return .read_uncommitted;
+        }
+    }
+    return error.UnsupportedSqlShape;
+}
+
+fn savepointNamePlanFromGeneratedRangeAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+) !SavepointNamePlan {
+    const savepoint_name = try generatedSingleIdentifierText(tokens, range);
+    return .{ .savepoint_name = try alloc.dupe(u8, savepoint_name) };
 }
 
 pub fn transactionBoundaryPlanFromGeneratedAst(
@@ -3602,6 +3653,9 @@ fn validateGeneratedTransactionAstSpans(
     }
     if (ast.boundary_tail_tokens != null and ast.mode_tokens != null) return error.UnsupportedSqlShape;
     if (ast.name_tokens != null and (ast.boundary_tail_tokens != null or ast.mode_tokens != null)) return error.UnsupportedSqlShape;
+    if (ast.kind != .constraint_mode and (ast.constraint_all or ast.constraint_name_items.len != 0 or ast.constraint_mode != null)) {
+        return error.UnsupportedSqlShape;
+    }
     if (ast.name_tokens) |name| {
         try validateGeneratedSavepointNameRange(tokens, end, ast.kind, name);
         return;
@@ -3622,11 +3676,96 @@ fn validateGeneratedTransactionAstSpans(
                 }
             },
         }
+    } else if (ast.kind == .constraint_mode) {
+        try validateGeneratedConstraintModeAst(tokens, end, ast);
     } else if (ast.mode_tokens == null and (ast.kind == .set_transaction or ast.kind == .constraint_mode)) {
         return error.UnsupportedSqlShape;
     } else if (ast.mode_tokens == null and end > 1) {
         return error.UnsupportedSqlShape;
     }
+}
+
+fn validateGeneratedConstraintModeAst(
+    tokens: []const grammar.Token,
+    end: usize,
+    ast: generated_parser.GeneratedSqlTransactionAst,
+) !void {
+    const mode = ast.mode_tokens orelse return error.UnsupportedSqlShape;
+    if (mode.start != 1 or mode.end != end or end <= 3 or !tokens[mode.start].matchesKeyword("constraints")) {
+        return error.UnsupportedSqlShape;
+    }
+    if (ast.constraint_mode == null) return error.UnsupportedSqlShape;
+    if (ast.constraint_all) {
+        if (ast.constraint_name_items.len != 0) return error.UnsupportedSqlShape;
+        if (!tokens[2].matchesKeyword("all")) return error.UnsupportedSqlShape;
+        try validateGeneratedDdlRange(tokens, end, .{ .start = 2, .end = 3 });
+        if (!generatedConstraintCheckModeToken(tokens, 3, ast.constraint_mode.?)) return error.UnsupportedSqlShape;
+        return;
+    }
+    if (ast.constraint_name_items.len == 0) return error.UnsupportedSqlShape;
+    var expected_start: usize = 2;
+    for (ast.constraint_name_items, 0..) |item, item_index| {
+        if (item.start != expected_start or item.end != item.start + 1) return error.UnsupportedSqlShape;
+        try validateGeneratedDdlRange(tokens, end, item);
+        if (tokens[item.start].kind != .identifier) return error.UnsupportedSqlShape;
+        expected_start = item.end;
+        if (item_index + 1 < ast.constraint_name_items.len) {
+            if (expected_start >= end or tokens[expected_start].kind != .comma) return error.UnsupportedSqlShape;
+            expected_start += 1;
+        }
+    }
+    if (expected_start + 1 != end) return error.UnsupportedSqlShape;
+    if (!generatedConstraintCheckModeToken(tokens, expected_start, ast.constraint_mode.?)) return error.UnsupportedSqlShape;
+}
+
+fn generatedConstraintCheckModeToken(
+    tokens: []const grammar.Token,
+    index: usize,
+    mode: generated_parser.GeneratedSqlConstraintCheckMode,
+) bool {
+    if (index >= tokens.len) return false;
+    return switch (mode) {
+        .immediate => tokens[index].matchesKeyword("immediate"),
+        .deferred => tokens[index].matchesKeyword("deferred"),
+    };
+}
+
+fn constraintModePlanFromGeneratedAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlTransactionAst,
+) !ConstraintModePlan {
+    if (ast.kind != .constraint_mode) return error.UnsupportedSqlShape;
+    const mode = ast.constraint_mode orelse return error.UnsupportedSqlShape;
+    var constraint_names: []const []const u8 = &.{};
+    if (!ast.constraint_all) {
+        if (ast.constraint_name_items.len == 0) return error.UnsupportedSqlShape;
+        var names = try alloc.alloc([]const u8, ast.constraint_name_items.len);
+        var names_len: usize = 0;
+        errdefer {
+            for (names[0..names_len]) |name| alloc.free(name);
+            alloc.free(names);
+        }
+        for (ast.constraint_name_items, 0..) |item, index| {
+            names[index] = try generatedSqlObjectIdentifierAlloc(alloc, tokens, item);
+            names_len += 1;
+        }
+        constraint_names = names;
+    } else if (ast.constraint_name_items.len != 0) {
+        return error.UnsupportedSqlShape;
+    }
+    return .{
+        .all = ast.constraint_all,
+        .constraint_names = constraint_names,
+        .mode = constraintCheckModeFromGenerated(mode),
+    };
+}
+
+fn constraintCheckModeFromGenerated(mode: generated_parser.GeneratedSqlConstraintCheckMode) ConstraintCheckMode {
+    return switch (mode) {
+        .immediate => .immediate,
+        .deferred => .deferred,
+    };
 }
 
 fn validateGeneratedSavepointNameRange(
@@ -3886,7 +4025,6 @@ pub fn runtimeDdlPlanFromGeneratedAstAlloc(
     try validateGeneratedDdlAstSpans(tokens, ast);
     var generated_options = options;
     generated_options.column_definition_options.expression_options.generated_scalar_subquery_defaults = ast.scalar_subquery_default_items;
-    generated_options.column_definition_options.expression_options.require_generated_scalar_subquery_defaults = ast.scalar_subquery_default_count != 0;
     generated_options.column_definition_options.expression_options.generated_scalar_subquery_full_tokens = tokens;
     generated_options.column_definition_options.expression_options.generated_scalar_subquery_token_offset = 0;
     var pos: usize = 0;
@@ -3908,14 +4046,14 @@ pub fn runtimeDdlPlanFromGeneratedAstAlloc(
                 break :blk .{ .table_clone = try tableClonePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) };
             }
             var create_partition_pos: usize = 0;
-            if (parseGeneratedCreateTablePartitionTailPlanAlloc(alloc, tokens, ast, create_table_tail, &create_partition_pos)) |partition| {
+            if (createTablePartitionPlanValidatedFromGeneratedDdlAstAlloc(alloc, tokens, ast, create_table_tail, &create_partition_pos)) |partition| {
                 break :blk .{ .table_partition_catalog = .{ .create_partition = partition } };
             } else |err| switch (err) {
                 error.UnsupportedSqlShape => {},
                 else => return err,
             }
             var partitioned_pos: usize = 0;
-            if (parseGeneratedCreatePartitionedTableTailPlanAlloc(alloc, tokens, ast, create_table_tail, &partitioned_pos, create_table_tail_options)) |partitioned| {
+            if (createPartitionedTablePlanValidatedFromGeneratedDdlAstAlloc(alloc, tokens, ast, create_table_tail, &partitioned_pos, create_table_tail_options)) |partitioned| {
                 break :blk .{ .table_partition_catalog = .{ .create_partitioned = partitioned } };
             } else |err| switch (err) {
                 error.UnsupportedSqlShape => {},
@@ -3924,7 +4062,7 @@ pub fn runtimeDdlPlanFromGeneratedAstAlloc(
             if (generatedCreateTableAstHasDocumentTableMetadata(tokens, ast)) {
                 break :blk .{ .create_table = try createTablePlanFromGeneratedDocumentAstAlloc(alloc, tokens, ast) };
             }
-            var create_table = try parseGeneratedCreateTableTailPlanAlloc(alloc, create_table_tail, &pos, create_table_tail_options);
+            var create_table = try relationalCreateTablePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast, create_table_tail, &pos, create_table_tail_options);
             create_table.replace_existing = ast.replace_existing;
             break :blk .{ .create_table = create_table };
         },
@@ -4454,20 +4592,254 @@ fn generatedRoutineBodyPlanAlloc(
 ) !?RoutineBodyPlan {
     const body_range = metadata.body_tokens orelse return null;
     if (body_range.end != body_range.start + 1 or body_range.end > tokens.len or tokens[body_range.start].kind != .string) return error.UnsupportedSqlShape;
+    const body_kind = metadata.body_kind orelse return error.UnsupportedSqlShape;
+    const body_hook = metadata.body_hook orelse return error.UnsupportedSqlShape;
+    if (metadata.body_perform_call_count != metadata.body_perform_calls.len) return error.UnsupportedSqlShape;
+    switch (body_kind) {
+        .plpgsql_trigger, .plpgsql_procedure => return try generatedPlpgsqlRoutineBodyPlanAlloc(
+            alloc,
+            metadata,
+            kind,
+            language,
+            returns_type,
+            body_kind,
+            body_hook,
+        ),
+        .sql_expression => return try generatedSqlRoutineBodyPlanAlloc(
+            alloc,
+            metadata,
+            kind,
+            language,
+            returns_type,
+            body_kind,
+            body_hook,
+            tokens,
+        ),
+    }
+}
+
+fn generatedSqlRoutineBodyPlanAlloc(
+    alloc: std.mem.Allocator,
+    metadata: *const generated_parser.GeneratedSqlRoutineAst,
+    kind: RoutineKind,
+    language: ?[]const u8,
+    returns_type: ?[]const u8,
+    body_kind: generated_parser.GeneratedSqlRoutineBodyKind,
+    body_hook: generated_parser.GeneratedSqlRoutineExecutionHook,
+    tokens: []const grammar.Token,
+) !RoutineBodyPlan {
+    if (kind != .function) return error.UnsupportedSqlShape;
+    if (body_kind != .sql_expression or body_hook != .expression) return error.UnsupportedSqlShape;
+    const lang = language orelse return error.UnsupportedSqlShape;
+    if (!std.ascii.eqlIgnoreCase(lang, "sql")) return error.UnsupportedSqlShape;
+    if (returns_type == null) return error.UnsupportedSqlShape;
+    const expression_range = metadata.body_expression_tokens orelse return error.UnsupportedSqlShape;
+    const expression_tokens = metadata.body_expression.tokens orelse return error.UnsupportedSqlShape;
+    if (!generatedDdlTokenRangeEqual(expression_range, expression_tokens)) return error.UnsupportedSqlShape;
+    if (expression_range.start != 0 or expression_range.end != metadata.body_sql_tokens.len or expression_range.start >= expression_range.end) return error.UnsupportedSqlShape;
+
+    var expression = (try generatedCreateIndexRowExpressionAlloc(alloc, metadata.body_sql_tokens, metadata.body_expression)) orelse return error.UnsupportedSqlShape;
+    errdefer runtime_schema.freeRelationalRowsExpression(alloc, expression);
     const argument_names = try generatedRoutineArgumentNamesAlloc(alloc, tokens, &metadata.argument_items);
     defer freeGeneratedRoutineArgumentNames(alloc, argument_names);
-    return try grammar.parseRoutineBodyPlanAlloc(
-        alloc,
-        switch (kind) {
-            .function => .function,
-            .procedure => .procedure,
+    try generatedRewriteRoutineBodyExpressionArguments(alloc, &expression, metadata.argument_items.count, argument_names);
+    return .{
+        .kind = .sql_expression,
+        .hook = .expression,
+        .expression = expression,
+    };
+}
+
+fn generatedPlpgsqlRoutineBodyPlanAlloc(
+    alloc: std.mem.Allocator,
+    metadata: *const generated_parser.GeneratedSqlRoutineAst,
+    kind: RoutineKind,
+    language: ?[]const u8,
+    returns_type: ?[]const u8,
+    body_kind: generated_parser.GeneratedSqlRoutineBodyKind,
+    body_hook: generated_parser.GeneratedSqlRoutineExecutionHook,
+) !RoutineBodyPlan {
+    const lang = language orelse return error.UnsupportedSqlShape;
+    if (!std.ascii.eqlIgnoreCase(lang, "plpgsql")) return error.UnsupportedSqlShape;
+    const plan_kind: RoutineBodyKind = switch (body_kind) {
+        .plpgsql_trigger => blk: {
+            if (kind != .function or metadata.argument_items.count != 0) return error.UnsupportedSqlShape;
+            const returns = returns_type orelse return error.UnsupportedSqlShape;
+            if (!std.ascii.eqlIgnoreCase(returns, "trigger")) return error.UnsupportedSqlShape;
+            break :blk .plpgsql_trigger;
         },
-        language,
-        returns_type,
-        metadata.argument_items.count,
-        argument_names,
-        tokens[body_range.start].text,
-    );
+        .plpgsql_procedure => blk: {
+            if (kind != .procedure or returns_type != null or metadata.argument_items.count != 0) return error.UnsupportedSqlShape;
+            break :blk .plpgsql_procedure;
+        },
+        .sql_expression => return error.UnsupportedSqlShape,
+    };
+    const plan_hook = try generatedRoutineExecutionHook(body_hook);
+    switch (plan_kind) {
+        .plpgsql_trigger => switch (plan_hook) {
+            .trigger_return_new, .trigger_return_old, .trigger_return_null => {},
+            else => return error.UnsupportedSqlShape,
+        },
+        .plpgsql_procedure => if (plan_hook != .procedure_noop) return error.UnsupportedSqlShape,
+        .sql_expression => return error.UnsupportedSqlShape,
+    }
+    try validateGeneratedPlpgsqlRoutineBodyTokenPayload(metadata.body_sql_tokens, body_kind, body_hook, metadata.body_perform_call_count);
+    return .{
+        .kind = plan_kind,
+        .hook = plan_hook,
+        .perform_calls = try generatedRoutinePerformCallsAlloc(alloc, metadata.body_perform_calls),
+    };
+}
+
+fn validateGeneratedPlpgsqlRoutineBodyTokenPayload(
+    tokens: []const grammar.Token,
+    body_kind: generated_parser.GeneratedSqlRoutineBodyKind,
+    body_hook: generated_parser.GeneratedSqlRoutineExecutionHook,
+    perform_call_count: usize,
+) !void {
+    if (tokens.len == 0) return error.UnsupportedSqlShape;
+    var perform_count: usize = 0;
+    var return_hook: ?generated_parser.GeneratedSqlRoutineExecutionHook = null;
+    for (tokens, 0..) |token, index| {
+        if (token.matchesKeyword("perform")) perform_count += 1;
+        if (!token.matchesKeyword("return")) continue;
+        if (return_hook != null or index + 1 >= tokens.len) return error.UnsupportedSqlShape;
+        return_hook = if (tokens[index + 1].matchesKeyword("new"))
+            .trigger_return_new
+        else if (tokens[index + 1].matchesKeyword("old"))
+            .trigger_return_old
+        else if (tokens[index + 1].matchesKeyword("null"))
+            .trigger_return_null
+        else
+            return error.UnsupportedSqlShape;
+    }
+    if (perform_count != perform_call_count) return error.UnsupportedSqlShape;
+    switch (body_kind) {
+        .plpgsql_trigger => {
+            const hook = return_hook orelse return error.UnsupportedSqlShape;
+            if (hook != body_hook) return error.UnsupportedSqlShape;
+        },
+        .plpgsql_procedure => {
+            if (return_hook != null or body_hook != .procedure_noop) return error.UnsupportedSqlShape;
+        },
+        .sql_expression => return error.UnsupportedSqlShape,
+    }
+}
+
+fn generatedRoutineExecutionHook(generated: generated_parser.GeneratedSqlRoutineExecutionHook) !RoutineExecutionHook {
+    return switch (generated) {
+        .expression => .expression,
+        .trigger_return_new => .trigger_return_new,
+        .trigger_return_old => .trigger_return_old,
+        .trigger_return_null => .trigger_return_null,
+        .procedure_noop => .procedure_noop,
+    };
+}
+
+fn generatedRoutinePerformCallsAlloc(
+    alloc: std.mem.Allocator,
+    calls: []const generated_parser.GeneratedSqlRoutinePerformCallAst,
+) ![]const RoutinePerformCall {
+    if (calls.len == 0) return &.{};
+    const out = try alloc.alloc(RoutinePerformCall, calls.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*call| call.deinit(alloc);
+        alloc.free(out);
+    }
+    for (calls, out) |call, *target| {
+        target.* = .{
+            .routine_name = try alloc.dupe(u8, call.routine_name),
+            .argument_json = try cloneStringSlice(alloc, call.argument_json),
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn generatedRoutineNamedArgumentIndex(argument_names: []const []const u8, text: []const u8) ?usize {
+    for (argument_names, 0..) |name, i| {
+        if (name.len != 0 and std.ascii.eqlIgnoreCase(name, text)) return i + 1;
+    }
+    return null;
+}
+
+fn generatedRoutinePlaceholderCastType(text: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (!std.mem.startsWith(u8, trimmed, "$")) return null;
+    var end: usize = 1;
+    while (end < trimmed.len and trimmed[end] >= '0' and trimmed[end] <= '9') : (end += 1) {}
+    if (end == 1 or end == trimmed.len) return null;
+    if (!std.mem.startsWith(u8, trimmed[end..], "::")) return null;
+    const cast_type = trimmed[end + "::".len ..];
+    if (cast_type.len == 0) return null;
+    return cast_type;
+}
+
+fn generatedDdlRoutineCastType(text: []const u8) ?runtime_schema.RelationalRowsExpressionCastType {
+    if (std.ascii.eqlIgnoreCase(text, "text") or std.ascii.eqlIgnoreCase(text, "varchar") or std.ascii.eqlIgnoreCase(text, "uuid")) return .text;
+    if (std.ascii.eqlIgnoreCase(text, "numeric") or std.ascii.eqlIgnoreCase(text, "integer") or std.ascii.eqlIgnoreCase(text, "int") or std.ascii.eqlIgnoreCase(text, "bigint")) return .numeric;
+    if (std.ascii.eqlIgnoreCase(text, "boolean") or std.ascii.eqlIgnoreCase(text, "bool")) return .bool;
+    if (std.ascii.eqlIgnoreCase(text, "timestamp") or std.ascii.eqlIgnoreCase(text, "timestamptz") or std.ascii.eqlIgnoreCase(text, "datetime")) return .datetime;
+    return null;
+}
+
+fn generatedRewriteRoutineBodyExpressionArguments(
+    alloc: std.mem.Allocator,
+    expression: *runtime_schema.RelationalRowsExpression,
+    argument_count: usize,
+    argument_names: []const []const u8,
+) error{ OutOfMemory, UnsupportedSqlShape }!void {
+    if (expression.kind == .field) {
+        const argument_index = generatedRoutineBodyExpressionArgumentIndex(argument_names, expression.field) orelse return error.UnsupportedSqlShape;
+        if (argument_index > argument_count) return error.UnsupportedSqlShape;
+        const field = try std.fmt.allocPrint(alloc, "arg{d}", .{argument_index});
+        alloc.free(@constCast(expression.field));
+        expression.field = field;
+        expression.field_source = .source;
+    }
+    for (@constCast(expression.operands)) |*operand| try generatedRewriteRoutineBodyExpressionArguments(alloc, operand, argument_count, argument_names);
+    for (@constCast(expression.case_branches)) |*branch| {
+        try generatedRewriteRoutineBodyExpressionConditionArguments(alloc, &branch.when, argument_count, argument_names);
+        try generatedRewriteRoutineBodyExpressionArguments(alloc, &branch.then, argument_count, argument_names);
+    }
+    for (@constCast(expression.case_else)) |*fallback| try generatedRewriteRoutineBodyExpressionArguments(alloc, fallback, argument_count, argument_names);
+}
+
+fn generatedRewriteRoutineBodyExpressionConditionArguments(
+    alloc: std.mem.Allocator,
+    condition: *runtime_schema.RelationalRowsExpressionCondition,
+    argument_count: usize,
+    argument_names: []const []const u8,
+) error{ OutOfMemory, UnsupportedSqlShape }!void {
+    try generatedRewriteRoutineBodyExpressionArguments(alloc, &condition.lhs, argument_count, argument_names);
+    for (@constCast(condition.rhs)) |*rhs| try generatedRewriteRoutineBodyExpressionArguments(alloc, rhs, argument_count, argument_names);
+}
+
+fn generatedRoutineBodyExpressionArgumentIndex(argument_names: []const []const u8, text: []const u8) ?usize {
+    if (generatedRoutineArgumentIndex(text)) |index| return index;
+    return generatedRoutineNamedArgumentIndex(argument_names, text);
+}
+
+fn generatedRoutineArgumentIndex(text: []const u8) ?usize {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    const digits = if (std.mem.startsWith(u8, trimmed, "$")) blk: {
+        var end: usize = 1;
+        while (end < trimmed.len and trimmed[end] >= '0' and trimmed[end] <= '9') : (end += 1) {}
+        if (end == 1) return null;
+        if (end != trimmed.len and !std.mem.startsWith(u8, trimmed[end..], "::")) return null;
+        break :blk trimmed[1..end];
+    } else if (std.ascii.startsWithIgnoreCase(trimmed, "arg"))
+        trimmed["arg".len..]
+    else
+        return null;
+    if (digits.len == 0) return null;
+    for (digits) |byte| {
+        if (byte < '0' or byte > '9') return null;
+    }
+    const index = std.fmt.parseInt(usize, digits, 10) catch return null;
+    if (index == 0) return null;
+    return index;
 }
 
 fn generatedRoutineArgumentNamesAlloc(
@@ -4630,11 +5002,35 @@ fn validateGeneratedCreateRoutinePlan(
     if (operation.start >= operation.end or tokens[operation.start].kind != .lparen) return error.UnsupportedSqlShape;
     const signature_close = findGeneratedMatchingParen(tokens, operation.start, operation.end) orelse return error.UnsupportedSqlShape;
     const routine_metadata = ast.routine_metadata orelse return error.UnsupportedSqlShape;
+    try validateGeneratedRoutineUniqueScalarOptionTokens(tokens, .{ .start = signature_close + 1, .end = operation.end }, routine_metadata);
     try validateGeneratedPlainListCount(tokens, .{ .start = operation.start + 1, .end = signature_close }, &routine_metadata.argument_items, create.argument_count);
     try validateGeneratedRoutineOptionalIdentifier(alloc, tokens, routine_metadata.returns_type_tokens, create.returns_type, "returns");
     try validateGeneratedRoutineOptionalIdentifier(alloc, tokens, routine_metadata.language_tokens, create.language, "language");
     try validateGeneratedRoutineScalarOptions(alloc, tokens, routine_metadata, create);
     try validateGeneratedRoutineListOptions(alloc, tokens, routine_metadata, create);
+}
+
+fn validateGeneratedRoutineUniqueScalarOptionTokens(
+    tokens: []const grammar.Token,
+    tail: generated_parser.GeneratedSqlTokenRange,
+    routine_metadata: *const generated_parser.GeneratedSqlRoutineAst,
+) !void {
+    try validateGeneratedRoutineUniqueOptionToken(tokens, tail, "support", routine_metadata.support_function_tokens != null);
+}
+
+fn validateGeneratedRoutineUniqueOptionToken(
+    tokens: []const grammar.Token,
+    tail: generated_parser.GeneratedSqlTokenRange,
+    keyword: []const u8,
+    expected_present: bool,
+) !void {
+    if (tail.end > tokens.len or tail.start > tail.end) return error.UnsupportedSqlShape;
+    var count: usize = 0;
+    for (tokens[tail.start..tail.end]) |token| {
+        if (token.matchesKeyword(keyword)) count += 1;
+    }
+    const expected_count: usize = if (expected_present) 1 else 0;
+    if (count != expected_count) return error.UnsupportedSqlShape;
 }
 
 fn validateGeneratedRoutineScalarOptions(
@@ -6560,7 +6956,7 @@ fn createDomainPlanFromGeneratedDdlAstAlloc(
 ) !CreateDomainPlan {
     const type_range = ast.domain_type_tokens orelse return error.UnsupportedSqlShape;
     var type_pos = type_range.start;
-    const ddl_type = try grammar.parseDdlType(tokens, &type_pos);
+    const ddl_type = try parseDdlType(tokens, &type_pos);
     if (type_pos != type_range.end) return error.UnsupportedSqlShape;
 
     var plan = CreateDomainPlan{
@@ -6575,8 +6971,8 @@ fn createDomainPlanFromGeneratedDdlAstAlloc(
         clearDdlRelationalChecks(alloc, checks.items);
         checks.deinit(alloc);
     }
-    for (ast.domain_operation_items.items) |item| {
-        try applyGeneratedCreateDomainOptionAlloc(alloc, tokens, item, options, &plan, &checks);
+    for (ast.domain_operation_items.items, 0..) |item, index| {
+        try applyGeneratedCreateDomainOptionAlloc(alloc, tokens, ast, item, index, options, &plan, &checks);
     }
     plan.checks = try checks.toOwnedSlice(alloc);
     return plan;
@@ -6585,49 +6981,65 @@ fn createDomainPlanFromGeneratedDdlAstAlloc(
 fn applyGeneratedCreateDomainOptionAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
     item: generated_parser.GeneratedSqlTokenRange,
+    index: usize,
     options: DdlDomainOptions,
     plan: *CreateDomainPlan,
     checks: *std.ArrayListUnmanaged(runtime_schema.RelationalCheck),
 ) !void {
     if (item.start >= item.end or item.end > tokens.len) return error.UnsupportedSqlShape;
-    if (tokens[item.start].matchesKeyword("default")) {
-        if (plan.default_value != null or item.start + 1 >= item.end) return error.UnsupportedSqlShape;
-        var pos = item.start + 1;
-        const default_value = try parseDdlDefaultValueWithParamsAlloc(alloc, tokens, &pos, plan.field_type, options.params, options.realtime_ns, &.{}, false, null, 0);
+    if (ast.domain_operation_kind_items.len != ast.domain_operation_items.count or
+        ast.domain_operation_constraint_name_items.len != ast.domain_operation_items.count or
+        ast.domain_operation_default_value_items.len != ast.domain_operation_items.count or
+        ast.domain_operation_check_payload_items.len != ast.domain_operation_items.count)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    const kind = ast.domain_operation_kind_items[index];
+    if (kind.start < item.start or kind.end > item.end or kind.start >= kind.end or kind.end > tokens.len) return error.UnsupportedSqlShape;
+    const constraint_name = ast.domain_operation_constraint_name_items[index];
+    const default_payload = ast.domain_operation_default_value_items[index];
+    const check_payload = ast.domain_operation_check_payload_items[index];
+    if (tokens[kind.start].matchesKeyword("default")) {
+        const default_range = default_payload orelse return error.UnsupportedSqlShape;
+        if (plan.default_value != null or kind.start != item.start or kind.end != item.start + 1) return error.UnsupportedSqlShape;
+        if (default_range.start != kind.end or default_range.end != item.end or constraint_name != null or check_payload != null) return error.UnsupportedSqlShape;
+        var pos = default_range.start;
+        const default_value = try parseDdlDefaultValueWithParamsAlloc(alloc, tokens, &pos, plan.field_type, options.params, options.realtime_ns, &.{}, null, 0);
         errdefer alloc.free(default_value.value_json);
-        if (pos != item.end) return error.UnsupportedSqlShape;
+        if (pos != default_range.end) return error.UnsupportedSqlShape;
         plan.default_value = default_value;
         return;
     }
-    if (tokens[item.start].matchesKeyword("not")) {
+    if (tokens[kind.start].matchesKeyword("not")) {
+        if (!std.meta.eql(kind, item) or constraint_name != null or default_payload != null or check_payload != null) return error.UnsupportedSqlShape;
         if (item.start + 2 != item.end or !tokens[item.start + 1].matchesKeyword("null")) return error.UnsupportedSqlShape;
         plan.not_null = true;
         return;
     }
-    if (tokens[item.start].matchesKeyword("null")) {
+    if (tokens[kind.start].matchesKeyword("null")) {
+        if (!std.meta.eql(kind, item) or constraint_name != null or default_payload != null or check_payload != null) return error.UnsupportedSqlShape;
         if (item.start + 1 != item.end) return error.UnsupportedSqlShape;
         plan.not_null = false;
         return;
     }
-    if (tokens[item.start].matchesKeyword("constraint")) {
-        if (item.start + 4 > item.end or tokens[item.start + 1].kind != .identifier or !tokens[item.start + 2].matchesKeyword("check")) return error.UnsupportedSqlShape;
-        var pos = item.start + 3;
-        const check = try parseDomainCheckConstraintAlloc(alloc, tokens, &pos, tokens[item.start + 1].text, plan.field_type, options);
+    if (tokens[kind.start].matchesKeyword("check")) {
+        const payload = check_payload orelse return error.UnsupportedSqlShape;
+        if (default_payload != null) return error.UnsupportedSqlShape;
+        if (constraint_name) |name| {
+            if (item.start + 4 > item.end or !tokens[item.start].matchesKeyword("constraint")) return error.UnsupportedSqlShape;
+            if (name.start != item.start + 1 or name.end != item.start + 2 or tokens[name.start].kind != .identifier) return error.UnsupportedSqlShape;
+            if (kind.start != item.start + 2 or kind.end != item.start + 3) return error.UnsupportedSqlShape;
+        } else if (kind.start != item.start or kind.end != item.start + 1) {
+            return error.UnsupportedSqlShape;
+        }
+        if (payload.start != kind.end or payload.end != item.end) return error.UnsupportedSqlShape;
+        var pos = payload.start;
+        const check = try parseDomainCheckConstraintAlloc(alloc, tokens, &pos, if (constraint_name) |name| tokens[name.start].text else null, plan.field_type, options);
         var transferred = false;
         errdefer if (!transferred) freeDdlRelationalCheck(alloc, check);
-        if (pos != item.end) return error.UnsupportedSqlShape;
-        try checks.append(alloc, check);
-        transferred = true;
-        return;
-    }
-    if (tokens[item.start].matchesKeyword("check")) {
-        if (item.start + 2 > item.end) return error.UnsupportedSqlShape;
-        var pos = item.start + 1;
-        const check = try parseDomainCheckConstraintAlloc(alloc, tokens, &pos, null, plan.field_type, options);
-        var transferred = false;
-        errdefer if (!transferred) freeDdlRelationalCheck(alloc, check);
-        if (pos != item.end) return error.UnsupportedSqlShape;
+        if (pos != payload.end) return error.UnsupportedSqlShape;
         try checks.append(alloc, check);
         transferred = true;
         return;
@@ -6684,8 +7096,10 @@ fn validateGeneratedDomainDdlAst(tokens: []const grammar.Token, ast: generated_p
             const type_range = try requireGeneratedTokenRangeAt(ast.domain_type_tokens, operation.start + 1, operation.end);
             if (type_range.end < operation.end) {
                 try validateGeneratedCreateDomainOptionItems(tokens, .{ .start = type_range.end, .end = operation.end }, &ast.domain_operation_items);
+                try validateGeneratedCreateDomainOptionPayloadItems(tokens, &ast);
             } else {
                 try validateGeneratedEmptyListAst(&ast.domain_operation_items);
+                try validateGeneratedEmptyDomainCreateOptionPayloadItems(&ast);
             }
         },
         .alter_domain => {
@@ -6721,7 +7135,7 @@ fn validateGeneratedCreateDomainPlan(
     if (operation.start + 2 > operation.end or !tokens[operation.start].matchesKeyword("as")) return error.UnsupportedSqlShape;
     const type_range = try requireGeneratedTokenRangeAt(ast.domain_type_tokens, operation.start + 1, operation.end);
     var type_pos = type_range.start;
-    const generated_type = try grammar.parseDdlType(tokens, &type_pos);
+    const generated_type = try parseDdlType(tokens, &type_pos);
     if (type_pos != type_range.end or
         generated_type.field_type != create.field_type or
         generated_type.array_item_type != create.array_item_type)
@@ -6730,8 +7144,10 @@ fn validateGeneratedCreateDomainPlan(
     }
     if (type_range.end < operation.end) {
         try validateGeneratedCreateDomainOptionItems(tokens, .{ .start = type_range.end, .end = operation.end }, &ast.domain_operation_items);
+        try validateGeneratedCreateDomainOptionPayloadItems(tokens, &ast);
     } else {
         try validateGeneratedEmptyListAst(&ast.domain_operation_items);
+        try validateGeneratedEmptyDomainCreateOptionPayloadItems(&ast);
     }
 }
 
@@ -6826,6 +7242,105 @@ fn validateGeneratedCreateDomainOptionItems(
     if (expected_start != option_range.end) return error.UnsupportedSqlShape;
 }
 
+fn validateGeneratedEmptyDomainCreateOptionPayloadItems(ast: *const generated_parser.GeneratedSqlDdlAst) !void {
+    if (ast.domain_operation_kind_items.len != 0 or
+        ast.domain_operation_constraint_name_items.len != 0 or
+        ast.domain_operation_default_value_items.len != 0 or
+        ast.domain_operation_check_payload_items.len != 0)
+    {
+        return error.UnsupportedSqlShape;
+    }
+}
+
+fn validateGeneratedCreateDomainOptionPayloadItems(
+    tokens: []const grammar.Token,
+    ast: *const generated_parser.GeneratedSqlDdlAst,
+) !void {
+    const count = ast.domain_operation_items.count;
+    if (count == 0) return try validateGeneratedEmptyDomainCreateOptionPayloadItems(ast);
+    if (ast.domain_operation_items.items.len != count or
+        ast.domain_operation_kind_items.len != count or
+        ast.domain_operation_constraint_name_items.len != count or
+        ast.domain_operation_default_value_items.len != count or
+        ast.domain_operation_check_payload_items.len != count)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    for (ast.domain_operation_items.items, 0..) |item, index| {
+        const expected = generatedCreateDomainOptionPayloadRanges(tokens, item) orelse return error.UnsupportedSqlShape;
+        const kind = ast.domain_operation_kind_items[index];
+        if (kind.end > tokens.len or !std.meta.eql(kind, expected.kind)) return error.UnsupportedSqlShape;
+        if (!generatedOptionalRangeEqual(ast.domain_operation_constraint_name_items[index], expected.constraint_name)) return error.UnsupportedSqlShape;
+        if (!generatedOptionalRangeEqual(ast.domain_operation_default_value_items[index], expected.default_value)) return error.UnsupportedSqlShape;
+        if (!generatedOptionalRangeEqual(ast.domain_operation_check_payload_items[index], expected.check_payload)) return error.UnsupportedSqlShape;
+        if (ast.domain_operation_check_payload_items[index]) |payload| {
+            if (!generatedParenthesizedRangeIsValid(tokens, payload)) return error.UnsupportedSqlShape;
+        }
+    }
+}
+
+const GeneratedCreateDomainOptionPayloadRanges = struct {
+    kind: generated_parser.GeneratedSqlTokenRange,
+    constraint_name: ?generated_parser.GeneratedSqlTokenRange = null,
+    default_value: ?generated_parser.GeneratedSqlTokenRange = null,
+    check_payload: ?generated_parser.GeneratedSqlTokenRange = null,
+};
+
+fn generatedCreateDomainOptionPayloadRanges(
+    tokens: []const grammar.Token,
+    item: generated_parser.GeneratedSqlTokenRange,
+) ?GeneratedCreateDomainOptionPayloadRanges {
+    if (item.start >= item.end or item.end > tokens.len) return null;
+    if (tokens[item.start].matchesKeyword("default")) {
+        if (item.start + 1 >= item.end) return null;
+        return .{
+            .kind = .{ .start = item.start, .end = item.start + 1 },
+            .default_value = .{ .start = item.start + 1, .end = item.end },
+        };
+    }
+    if (tokens[item.start].matchesKeyword("not")) {
+        if (item.start + 2 != item.end or !tokens[item.start + 1].matchesKeyword("null")) return null;
+        return .{ .kind = item };
+    }
+    if (tokens[item.start].matchesKeyword("null")) {
+        if (item.start + 1 != item.end) return null;
+        return .{ .kind = item };
+    }
+    if (tokens[item.start].matchesKeyword("constraint")) {
+        if (item.start + 4 > item.end or tokens[item.start + 1].kind != .identifier or !tokens[item.start + 2].matchesKeyword("check")) return null;
+        return .{
+            .kind = .{ .start = item.start + 2, .end = item.start + 3 },
+            .constraint_name = .{ .start = item.start + 1, .end = item.start + 2 },
+            .check_payload = .{ .start = item.start + 3, .end = item.end },
+        };
+    }
+    if (tokens[item.start].matchesKeyword("check")) {
+        if (item.start + 2 > item.end) return null;
+        return .{
+            .kind = .{ .start = item.start, .end = item.start + 1 },
+            .check_payload = .{ .start = item.start + 1, .end = item.end },
+        };
+    }
+    return null;
+}
+
+fn generatedOptionalRangeEqual(
+    actual: ?generated_parser.GeneratedSqlTokenRange,
+    expected: ?generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (actual == null or expected == null) return actual == null and expected == null;
+    return std.meta.eql(actual.?, expected.?);
+}
+
+fn generatedParenthesizedRangeIsValid(
+    tokens: []const grammar.Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (range.end > tokens.len or range.start >= range.end or tokens[range.start].kind != .lparen) return false;
+    const close_index = findGeneratedMatchingParen(tokens, range.start, range.end) orelse return false;
+    return close_index + 1 == range.end;
+}
+
 fn validateGeneratedCreateDomainOptionItem(
     tokens: []const grammar.Token,
     item: generated_parser.GeneratedSqlTokenRange,
@@ -6882,7 +7397,7 @@ fn generatedDomainAlterOperationAlloc(
         if (item.start + 3 == item.end and tokens[item.start + 1].matchesKeyword("not") and tokens[item.start + 2].matchesKeyword("null")) return .set_not_null;
         if (item.start + 3 <= item.end and tokens[item.start + 1].matchesKeyword("default")) {
             var pos = item.start + 2;
-            const default_value = try grammar.parseDdlDefaultValueUntypedAlloc(alloc, tokens, &pos);
+            const default_value = try parseDdlDefaultValueUntypedLiteralAlloc(alloc, tokens, &pos);
             errdefer alloc.free(default_value.value_json);
             if (pos != item.end) return error.UnsupportedSqlShape;
             return .{ .set_default = default_value };
@@ -10550,6 +11065,22 @@ fn findTopLevelKeyword(tokens: []const grammar.Token, start: usize, end: usize, 
     return null;
 }
 
+fn findTopLevelKeywordText(tokens: []const grammar.Token, start: usize, end: usize, keyword: []const u8) ?usize {
+    var depth: usize = 0;
+    var i = start;
+    while (i < end and i < tokens.len) : (i += 1) {
+        switch (tokens[i].kind) {
+            .lparen, .lbracket => depth += 1,
+            .rparen, .rbracket => {
+                if (depth == 0) return null;
+                depth -= 1;
+            },
+            else => if (depth == 0 and tokens[i].matchesKeyword(keyword)) return i,
+        }
+    }
+    return null;
+}
+
 fn findMatchingParen(tokens: []const grammar.Token, open_index: usize, end: usize) ?usize {
     if (open_index >= end or open_index >= tokens.len or tokens[open_index].kind != .lparen) return null;
     var depth: usize = 1;
@@ -10581,6 +11112,16 @@ fn generatedAlterTableUsesRuntimeBoundary(tokens: []const grammar.Token, ast: ge
     const operation_range = ast.alter_table_operation_tokens orelse return false;
     if (!generatedRangeWithinStatement(operation_range, end) or operation_range.start >= operation_range.end) return false;
     validateGeneratedAlterTableOperationItems(tokens, operation_range, &ast.alter_table_operation_items) catch return false;
+    validateGeneratedAlterTableOperationConstraintPrefixItems(tokens, &ast) catch return false;
+    validateGeneratedAlterTableOperationPrimaryUniqueConstraintPayloadItems(tokens, &ast) catch return false;
+    validateGeneratedAlterTableOperationForeignKeyConstraintPayloadItems(tokens, &ast) catch return false;
+    validateGeneratedAlterTableOperationCheckConstraintPayloadItems(tokens, &ast) catch return false;
+    validateGeneratedAlterTableOperationPeriodPayloadItems(tokens, &ast) catch return false;
+    validateGeneratedAlterTableOperationColumnDefinitionItems(tokens, &ast) catch return false;
+    validateGeneratedAlterTableOperationInlineConstraintPrefixItems(tokens, &ast) catch return false;
+    validateGeneratedAlterTableOperationDefaultValueItems(tokens, &ast) catch return false;
+    validateGeneratedAlterTableOperationGeneratedExpressionItems(tokens, &ast) catch return false;
+    validateGeneratedAlterTableOperationRewriteExpressionItems(tokens, &ast) catch return false;
     return true;
 }
 
@@ -10591,15 +11132,13 @@ fn validateGeneratedAlterTableOperationItems(
 ) !void {
     if (operation_range.end > tokens.len or operation_range.start >= operation_range.end) return error.UnsupportedSqlShape;
     if (items.count == 0 or items.items.len != items.count) return error.UnsupportedSqlShape;
-    if (items.expression_items.len != 0 or
-        items.alias_items.len != 0 or
+    if (items.alias_items.len != 0 or
         items.alias_name_items.len != 0 or
         items.direction_items.len != 0 or
         items.directions.len != 0 or
         items.order_using_operator_items.len != 0 or
         items.nulls_order_items.len != 0 or
-        items.nulls_orders.len != 0 or
-        items.expressions.len != 0)
+        items.nulls_orders.len != 0)
     {
         return error.UnsupportedSqlShape;
     }
@@ -10619,6 +11158,1139 @@ fn validateGeneratedAlterTableOperationItems(
         }
     }
     if (expected_start != operation_range.end) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedAlterTableOperationConstraintPrefixItems(
+    tokens: []const grammar.Token,
+    ast: *const generated_parser.GeneratedSqlDdlAst,
+) !void {
+    const name_items = ast.alter_table_operation_constraint_name_items;
+    const kind_items = ast.alter_table_operation_constraint_kind_items;
+    if (name_items.len == 0 and kind_items.len == 0) {
+        for (ast.alter_table_operation_items.items) |item| {
+            if (generatedDdlItemLooksLikeTableConstraint(tokens, item)) return error.UnsupportedSqlShape;
+        }
+        return;
+    }
+    if (name_items.len != kind_items.len or
+        name_items.len != ast.alter_table_operation_items.items.len or
+        ast.alter_table_operation_items.items.len != ast.alter_table_operation_items.count)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    for (ast.alter_table_operation_items.items, 0..) |item, index| {
+        const name_range = name_items[index];
+        const kind_range = kind_items[index];
+        if (generatedDdlItemLooksLikeTableConstraint(tokens, item)) {
+            const kind = kind_range orelse return error.UnsupportedSqlShape;
+            if (kind.start < item.start or kind.end > item.end or kind.start >= kind.end or kind.end > tokens.len) return error.UnsupportedSqlShape;
+            if (!generatedDdlConstraintKindRangeIsValid(tokens, kind)) return error.UnsupportedSqlShape;
+            if (name_range) |name| {
+                if (name.start < item.start or name.end > kind.start or name.end != name.start + 1 or name.end > tokens.len) return error.UnsupportedSqlShape;
+                if (tokens[name.start].kind != .identifier) return error.UnsupportedSqlShape;
+                if (name.start == item.start or !tokens[name.start - 1].matchesKeywordTag(.constraint)) return error.UnsupportedSqlShape;
+            }
+        } else if (name_range != null or kind_range != null) {
+            return error.UnsupportedSqlShape;
+        }
+    }
+}
+
+fn generatedDdlItemLooksLikeTableConstraint(
+    tokens: []const grammar.Token,
+    item: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (item.end > tokens.len or item.start >= item.end) return false;
+    var cursor = item.start;
+    if (tokens[cursor].matchesKeywordTag(.add)) {
+        cursor += 1;
+        if (cursor >= item.end or tokens[cursor].matchesKeywordTag(.column)) return false;
+        if (tokens[cursor].matchesKeyword("period")) return true;
+    }
+    if (tokens[cursor].matchesKeywordTag(.constraint)) {
+        cursor += 2;
+        if (cursor > item.end) return false;
+    }
+    if (cursor >= item.end) return false;
+    return tokens[cursor].matchesKeyword("period") or
+        tokens[cursor].matchesKeyword("primary") or
+        tokens[cursor].matchesKeyword("unique") or
+        tokens[cursor].matchesKeyword("foreign") or
+        tokens[cursor].matchesKeyword("check");
+}
+
+fn generatedDdlConstraintKindRangeIsValid(
+    tokens: []const grammar.Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (range.end > tokens.len or range.start >= range.end) return false;
+    if (range.end == range.start + 1) {
+        return tokens[range.start].matchesKeyword("period") or
+            tokens[range.start].matchesKeyword("unique") or
+            tokens[range.start].matchesKeyword("check");
+    }
+    if (range.end == range.start + 2) {
+        return (tokens[range.start].matchesKeyword("primary") or tokens[range.start].matchesKeyword("foreign")) and
+            tokens[range.start + 1].matchesKeyword("key");
+    }
+    return false;
+}
+
+fn validateGeneratedAlterTableOperationGeneratedExpressionItems(
+    tokens: []const grammar.Token,
+    ast: *const generated_parser.GeneratedSqlDdlAst,
+) !void {
+    const clause_items = ast.alter_table_operation_column_generated_clause_items;
+    const expression_items = ast.alter_table_operation_generated_expression_items;
+    if (clause_items.len == 0 and expression_items.len == 0) {
+        for (ast.alter_table_operation_items.items) |item| {
+            if (generatedDdlColumnDefinitionStoredGeneratedClauseRange(tokens, item) != null) return error.UnsupportedSqlShape;
+        }
+    } else {
+        if (clause_items.len != ast.alter_table_operation_items.items.len or expression_items.len != ast.alter_table_operation_items.items.len) return error.UnsupportedSqlShape;
+        for (ast.alter_table_operation_items.items, 0..) |item, index| {
+            const maybe_clause = clause_items[index];
+            const maybe_expression = expression_items[index];
+            if ((maybe_clause == null) != (maybe_expression == null)) return error.UnsupportedSqlShape;
+            if (maybe_clause) |clause| {
+                const expression = maybe_expression orelse return error.UnsupportedSqlShape;
+                if (clause.start < item.start or clause.end > item.end or clause.start >= clause.end or clause.end > tokens.len) return error.UnsupportedSqlShape;
+                if (!generatedDdlColumnStoredGeneratedClauseRangeIsValid(tokens, item, clause)) return error.UnsupportedSqlShape;
+                if (expression.start <= clause.start or expression.end >= clause.end) return error.UnsupportedSqlShape;
+            } else if (generatedDdlColumnDefinitionStoredGeneratedClauseRange(tokens, item) != null) {
+                return error.UnsupportedSqlShape;
+            }
+        }
+    }
+    return try validateGeneratedAlterTableOperationExpressionItems(
+        tokens,
+        &ast.alter_table_operation_items,
+        ast.alter_table_operation_generated_expression_items,
+        ast.alter_table_operation_generated_expressions,
+    );
+}
+
+fn validateGeneratedAlterTableOperationPrimaryUniqueConstraintPayloadItems(
+    tokens: []const grammar.Token,
+    ast: *const generated_parser.GeneratedSqlDdlAst,
+) !void {
+    const nulls_items = ast.alter_table_operation_constraint_nulls_distinct_items;
+    const column_list_items = ast.alter_table_operation_constraint_column_list_items;
+    const include_items = ast.alter_table_operation_constraint_include_items;
+    const timing_items = ast.alter_table_operation_constraint_timing_items;
+    const not_valid_items = ast.alter_table_operation_constraint_not_valid_items;
+    if (nulls_items.len == 0 and column_list_items.len == 0 and include_items.len == 0 and timing_items.len == 0 and not_valid_items.len == 0) {
+        if (generatedDdlHasPrimaryUniqueTableConstraints(tokens, ast)) return error.UnsupportedSqlShape;
+        return;
+    }
+    if (nulls_items.len != column_list_items.len or
+        nulls_items.len != include_items.len or
+        nulls_items.len != timing_items.len or
+        nulls_items.len != not_valid_items.len or
+        nulls_items.len != ast.alter_table_operation_items.count or
+        ast.alter_table_operation_items.items.len != ast.alter_table_operation_items.count)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    if (ast.alter_table_operation_constraint_kind_items.len != ast.alter_table_operation_items.count) return error.UnsupportedSqlShape;
+
+    for (ast.alter_table_operation_items.items, 0..) |operation, index| {
+        const maybe_kind = ast.alter_table_operation_constraint_kind_items[index];
+        if (maybe_kind != null and generatedDdlConstraintKindIsPrimaryOrUnique(tokens, maybe_kind.?)) {
+            const kind = maybe_kind.?;
+            const column_list = column_list_items[index] orelse return error.UnsupportedSqlShape;
+            if (column_list.start < kind.end or column_list.end > operation.end or column_list.end > tokens.len) return error.UnsupportedSqlShape;
+            if (!generatedDdlParenthesizedRangeIsValid(tokens, column_list)) return error.UnsupportedSqlShape;
+            const expected_nulls = if (tokens[kind.start].matchesKeyword("unique"))
+                generatedDdlUniqueNullsDistinctRange(tokens, kind.end, operation.end)
+            else
+                null;
+            if (!generatedDdlOptionalRangeMatches(nulls_items[index], expected_nulls)) return error.UnsupportedSqlShape;
+            if (expected_nulls) |range| {
+                if (column_list.start != range.end) return error.UnsupportedSqlShape;
+            } else if (column_list.start != kind.end) {
+                return error.UnsupportedSqlShape;
+            }
+            const expected_include = generatedDdlConstraintIncludeRange(tokens, column_list.end, operation.end);
+            if (!generatedDdlOptionalRangeMatches(include_items[index], expected_include)) return error.UnsupportedSqlShape;
+            const timing_start = if (expected_include) |range| range.end else column_list.end;
+            const expected_timing = generatedDdlConstraintTimingRange(tokens, timing_start, operation.end);
+            if (!generatedDdlOptionalRangeMatches(timing_items[index], expected_timing)) return error.UnsupportedSqlShape;
+            const not_valid_start = if (expected_timing) |range| range.end else timing_start;
+            const expected_not_valid = generatedDdlConstraintNotValidRange(tokens, not_valid_start, operation.end);
+            if (!generatedDdlOptionalRangeMatches(not_valid_items[index], expected_not_valid)) return error.UnsupportedSqlShape;
+        } else if (nulls_items[index] != null or column_list_items[index] != null or include_items[index] != null or timing_items[index] != null or not_valid_items[index] != null) {
+            return error.UnsupportedSqlShape;
+        }
+    }
+}
+
+fn generatedDdlHasPrimaryUniqueTableConstraints(
+    tokens: []const grammar.Token,
+    ast: *const generated_parser.GeneratedSqlDdlAst,
+) bool {
+    if (ast.alter_table_operation_constraint_kind_items.len != ast.alter_table_operation_items.count) return false;
+    for (ast.alter_table_operation_constraint_kind_items) |kind| {
+        if (kind != null and generatedDdlConstraintKindIsPrimaryOrUnique(tokens, kind.?)) return true;
+    }
+    return false;
+}
+
+fn validateGeneratedAlterTableOperationForeignKeyConstraintPayloadItems(
+    tokens: []const grammar.Token,
+    ast: *const generated_parser.GeneratedSqlDdlAst,
+) !void {
+    const payload_items = ast.alter_table_operation_foreign_key_payload_items;
+    const not_valid_items = ast.alter_table_operation_foreign_key_not_valid_items;
+    if (payload_items.len == 0 and not_valid_items.len == 0) {
+        if (generatedDdlHasForeignKeyTableConstraints(tokens, ast)) return error.UnsupportedSqlShape;
+        return;
+    }
+    if (payload_items.len != not_valid_items.len or
+        payload_items.len != ast.alter_table_operation_items.count or
+        ast.alter_table_operation_items.items.len != ast.alter_table_operation_items.count)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    if (ast.alter_table_operation_constraint_kind_items.len != ast.alter_table_operation_items.count) return error.UnsupportedSqlShape;
+
+    for (ast.alter_table_operation_items.items, 0..) |operation, index| {
+        const maybe_kind = ast.alter_table_operation_constraint_kind_items[index];
+        if (maybe_kind != null and generatedDdlConstraintKindIsForeignKey(tokens, maybe_kind.?)) {
+            const kind = maybe_kind.?;
+            const payload = payload_items[index] orelse return error.UnsupportedSqlShape;
+            if (payload.end > tokens.len or payload.start != kind.start + 1 or payload.end > operation.end) return error.UnsupportedSqlShape;
+            if (payload.start >= payload.end or !tokens[payload.start].matchesKeyword("key")) return error.UnsupportedSqlShape;
+            const expected_not_valid = generatedDdlTrailingConstraintNotValidRange(tokens, payload.start, operation.end);
+            if (!generatedDdlOptionalRangeMatches(not_valid_items[index], expected_not_valid)) return error.UnsupportedSqlShape;
+            const expected_payload_end = if (expected_not_valid) |range| range.start else operation.end;
+            if (payload.end != expected_payload_end) return error.UnsupportedSqlShape;
+        } else if (payload_items[index] != null or not_valid_items[index] != null) {
+            return error.UnsupportedSqlShape;
+        }
+    }
+}
+
+fn generatedDdlHasForeignKeyTableConstraints(
+    tokens: []const grammar.Token,
+    ast: *const generated_parser.GeneratedSqlDdlAst,
+) bool {
+    if (ast.alter_table_operation_constraint_kind_items.len != ast.alter_table_operation_items.count) return false;
+    for (ast.alter_table_operation_constraint_kind_items) |kind| {
+        if (kind != null and generatedDdlConstraintKindIsForeignKey(tokens, kind.?)) return true;
+    }
+    return false;
+}
+
+fn validateGeneratedAlterTableOperationCheckConstraintPayloadItems(
+    tokens: []const grammar.Token,
+    ast: *const generated_parser.GeneratedSqlDdlAst,
+) !void {
+    const payload_items = ast.alter_table_operation_check_payload_items;
+    const not_valid_items = ast.alter_table_operation_check_not_valid_items;
+    if (payload_items.len == 0 and not_valid_items.len == 0) {
+        if (generatedDdlHasCheckTableConstraints(tokens, ast)) return error.UnsupportedSqlShape;
+        return;
+    }
+    if (payload_items.len != not_valid_items.len or
+        payload_items.len != ast.alter_table_operation_items.count or
+        ast.alter_table_operation_items.items.len != ast.alter_table_operation_items.count)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    if (ast.alter_table_operation_constraint_kind_items.len != ast.alter_table_operation_items.count) return error.UnsupportedSqlShape;
+
+    for (ast.alter_table_operation_items.items, 0..) |operation, index| {
+        const maybe_kind = ast.alter_table_operation_constraint_kind_items[index];
+        if (maybe_kind != null and generatedDdlConstraintKindIsCheck(tokens, maybe_kind.?)) {
+            const kind = maybe_kind.?;
+            const payload = payload_items[index] orelse return error.UnsupportedSqlShape;
+            if (payload.end > tokens.len or payload.start != kind.end or payload.end > operation.end) return error.UnsupportedSqlShape;
+            if (!generatedDdlParenthesizedRangeIsValid(tokens, payload)) return error.UnsupportedSqlShape;
+            const expected_not_valid = generatedDdlTrailingConstraintNotValidRange(tokens, payload.start, operation.end);
+            if (!generatedDdlOptionalRangeMatches(not_valid_items[index], expected_not_valid)) return error.UnsupportedSqlShape;
+            const expected_payload_end = if (expected_not_valid) |range| range.start else operation.end;
+            if (payload.end != expected_payload_end) return error.UnsupportedSqlShape;
+        } else if (payload_items[index] != null or not_valid_items[index] != null) {
+            return error.UnsupportedSqlShape;
+        }
+    }
+}
+
+fn generatedDdlHasCheckTableConstraints(
+    tokens: []const grammar.Token,
+    ast: *const generated_parser.GeneratedSqlDdlAst,
+) bool {
+    if (ast.alter_table_operation_constraint_kind_items.len != ast.alter_table_operation_items.count) return false;
+    for (ast.alter_table_operation_constraint_kind_items) |kind| {
+        if (kind != null and generatedDdlConstraintKindIsCheck(tokens, kind.?)) return true;
+    }
+    return false;
+}
+
+fn generatedDdlConstraintKindIsPrimaryOrUnique(
+    tokens: []const grammar.Token,
+    kind: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (kind.end > tokens.len or kind.start >= kind.end) return false;
+    return tokens[kind.start].matchesKeyword("primary") or tokens[kind.start].matchesKeyword("unique");
+}
+
+fn generatedDdlConstraintKindIsForeignKey(
+    tokens: []const grammar.Token,
+    kind: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    return kind.end == kind.start + 2 and
+        kind.end <= tokens.len and
+        tokens[kind.start].matchesKeyword("foreign") and
+        tokens[kind.start + 1].matchesKeyword("key");
+}
+
+fn generatedDdlConstraintKindIsCheck(
+    tokens: []const grammar.Token,
+    kind: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    return kind.end == kind.start + 1 and kind.end <= tokens.len and tokens[kind.start].matchesKeyword("check");
+}
+
+fn validateGeneratedAlterTableOperationPeriodPayloadItems(
+    tokens: []const grammar.Token,
+    ast: *const generated_parser.GeneratedSqlDdlAst,
+) !void {
+    const payload_items = ast.alter_table_operation_period_payload_items;
+    if (payload_items.len == 0) {
+        if (generatedDdlHasPeriodTableConstraints(tokens, ast)) return error.UnsupportedSqlShape;
+        return;
+    }
+    if (payload_items.len != ast.alter_table_operation_items.count or
+        ast.alter_table_operation_items.items.len != ast.alter_table_operation_items.count or
+        ast.alter_table_operation_constraint_kind_items.len != ast.alter_table_operation_items.count or
+        ast.alter_table_operation_constraint_name_items.len != ast.alter_table_operation_items.count)
+    {
+        return error.UnsupportedSqlShape;
+    }
+
+    for (ast.alter_table_operation_items.items, 0..) |operation, index| {
+        const maybe_kind = ast.alter_table_operation_constraint_kind_items[index];
+        if (maybe_kind != null and generatedDdlConstraintKindIsPeriod(tokens, maybe_kind.?)) {
+            if (ast.alter_table_operation_constraint_name_items[index] != null) return error.UnsupportedSqlShape;
+            const kind = maybe_kind.?;
+            const payload = payload_items[index] orelse return error.UnsupportedSqlShape;
+            if (payload.end > tokens.len or payload.start != kind.end or payload.end != operation.end or payload.start >= payload.end) return error.UnsupportedSqlShape;
+            if (!generatedDdlPeriodPayloadRangeIsValid(tokens, payload)) return error.UnsupportedSqlShape;
+        } else if (payload_items[index] != null) {
+            return error.UnsupportedSqlShape;
+        }
+    }
+}
+
+fn generatedDdlHasPeriodTableConstraints(
+    tokens: []const grammar.Token,
+    ast: *const generated_parser.GeneratedSqlDdlAst,
+) bool {
+    if (ast.alter_table_operation_constraint_kind_items.len != ast.alter_table_operation_items.count) return false;
+    for (ast.alter_table_operation_constraint_kind_items) |kind| {
+        if (kind != null and generatedDdlConstraintKindIsPeriod(tokens, kind.?)) return true;
+    }
+    return false;
+}
+
+fn generatedDdlConstraintKindIsPeriod(
+    tokens: []const grammar.Token,
+    kind: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    return kind.end == kind.start + 1 and kind.end <= tokens.len and tokens[kind.start].matchesKeyword("period");
+}
+
+fn generatedDdlPeriodPayloadRangeIsValid(
+    tokens: []const grammar.Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (range.end > tokens.len or range.start >= range.end) return false;
+    var cursor = range.start;
+    if (!tokens[cursor].matchesKeyword("for")) return false;
+    cursor += 1;
+    if (cursor >= range.end or tokens[cursor].kind != .identifier) return false;
+    cursor += 1;
+    if (cursor >= range.end or tokens[cursor].kind != .lparen) return false;
+    cursor += 1;
+    if (cursor >= range.end or tokens[cursor].kind != .identifier) return false;
+    cursor += 1;
+    if (cursor >= range.end or tokens[cursor].kind != .comma) return false;
+    cursor += 1;
+    if (cursor >= range.end or tokens[cursor].kind != .identifier) return false;
+    cursor += 1;
+    return cursor + 1 == range.end and tokens[cursor].kind == .rparen;
+}
+
+fn generatedDdlOptionalRangeMatches(
+    actual: ?generated_parser.GeneratedSqlTokenRange,
+    expected: ?generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (expected) |range| {
+        const actual_range = actual orelse return false;
+        return std.meta.eql(actual_range, range);
+    }
+    return actual == null;
+}
+
+fn generatedDdlParenthesizedRangeIsValid(
+    tokens: []const grammar.Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (range.end > tokens.len or range.start + 1 >= range.end) return false;
+    if (tokens[range.start].kind != .lparen or tokens[range.end - 1].kind != .rparen) return false;
+    return findMatchingParen(tokens, range.start, range.end) == range.end - 1;
+}
+
+fn generatedDdlUniqueNullsDistinctRange(
+    tokens: []const grammar.Token,
+    start: usize,
+    end: usize,
+) ?generated_parser.GeneratedSqlTokenRange {
+    if (start >= end or !tokens[start].matchesKeyword("nulls")) return null;
+    if (start + 1 < end and tokens[start + 1].matchesKeyword("distinct")) return .{ .start = start, .end = start + 2 };
+    if (start + 2 < end and tokens[start + 1].matchesKeyword("not") and tokens[start + 2].matchesKeyword("distinct")) {
+        return .{ .start = start, .end = start + 3 };
+    }
+    return null;
+}
+
+fn generatedDdlConstraintIncludeRange(
+    tokens: []const grammar.Token,
+    start: usize,
+    end: usize,
+) ?generated_parser.GeneratedSqlTokenRange {
+    if (start >= end or !tokens[start].matchesKeyword("include")) return null;
+    if (start + 1 >= end) return null;
+    const include_close = findMatchingParen(tokens, start + 1, end) orelse return null;
+    return .{ .start = start, .end = include_close + 1 };
+}
+
+fn generatedDdlConstraintTimingRange(
+    tokens: []const grammar.Token,
+    start: usize,
+    end: usize,
+) ?generated_parser.GeneratedSqlTokenRange {
+    var cursor = start;
+    var saw_timing = false;
+    while (cursor < end) {
+        if (tokens[cursor].matchesKeyword("deferrable")) {
+            cursor += 1;
+            saw_timing = true;
+        } else if (tokens[cursor].matchesKeyword("not")) {
+            if (cursor + 1 >= end or !tokens[cursor + 1].matchesKeyword("deferrable")) break;
+            cursor += 2;
+            saw_timing = true;
+        } else if (tokens[cursor].matchesKeyword("initially")) {
+            if (cursor + 1 >= end or
+                (!tokens[cursor + 1].matchesKeyword("deferred") and !tokens[cursor + 1].matchesKeyword("immediate")))
+            {
+                break;
+            }
+            cursor += 2;
+            saw_timing = true;
+        } else {
+            break;
+        }
+    }
+    if (!saw_timing) return null;
+    return .{ .start = start, .end = cursor };
+}
+
+fn generatedDdlConstraintNotValidRange(
+    tokens: []const grammar.Token,
+    start: usize,
+    end: usize,
+) ?generated_parser.GeneratedSqlTokenRange {
+    if (start + 1 >= end) return null;
+    if (tokens[start].matchesKeyword("not") and tokens[start + 1].matchesKeyword("valid")) {
+        return .{ .start = start, .end = start + 2 };
+    }
+    return null;
+}
+
+fn generatedDdlTrailingConstraintNotValidRange(
+    tokens: []const grammar.Token,
+    start: usize,
+    end: usize,
+) ?generated_parser.GeneratedSqlTokenRange {
+    if (end < start + 2 or end > tokens.len) return null;
+    if (tokens[end - 2].matchesKeyword("not") and tokens[end - 1].matchesKeyword("valid")) {
+        return .{ .start = end - 2, .end = end };
+    }
+    return null;
+}
+
+fn validateGeneratedAlterTableOperationInlineConstraintPrefixItems(
+    tokens: []const grammar.Token,
+    ast: *const generated_parser.GeneratedSqlDdlAst,
+) !void {
+    const inline_items = ast.alter_table_operation_inline_constraint_items;
+    const name_items = ast.alter_table_operation_inline_constraint_name_items;
+    const kind_items = ast.alter_table_operation_inline_constraint_kind_items;
+    const nulls_items = ast.alter_table_operation_inline_constraint_nulls_distinct_items;
+    const include_items = ast.alter_table_operation_inline_constraint_include_items;
+    const timing_items = ast.alter_table_operation_inline_constraint_timing_items;
+    const not_valid_items = ast.alter_table_operation_inline_constraint_not_valid_items;
+    const foreign_key_payload_items = ast.alter_table_operation_inline_foreign_key_payload_items;
+    const foreign_key_not_valid_items = ast.alter_table_operation_inline_foreign_key_not_valid_items;
+    const check_payload_items = ast.alter_table_operation_inline_check_payload_items;
+    const check_not_valid_items = ast.alter_table_operation_inline_check_not_valid_items;
+    if (inline_items.items.len != inline_items.count) return error.UnsupportedSqlShape;
+    if (name_items.len != inline_items.count or kind_items.len != inline_items.count) return error.UnsupportedSqlShape;
+    if (nulls_items.len != inline_items.count or include_items.len != inline_items.count or timing_items.len != inline_items.count or not_valid_items.len != inline_items.count) return error.UnsupportedSqlShape;
+    if (foreign_key_payload_items.len != inline_items.count or foreign_key_not_valid_items.len != inline_items.count) return error.UnsupportedSqlShape;
+    if (check_payload_items.len != inline_items.count or check_not_valid_items.len != inline_items.count) return error.UnsupportedSqlShape;
+    if (inline_items.count == 0) {
+        if (generatedDdlColumnDefinitionsHaveInlineConstraints(tokens, ast)) return error.UnsupportedSqlShape;
+        return;
+    }
+    if (inline_items.first_tokens == null or inline_items.last_tokens == null) return error.UnsupportedSqlShape;
+    if (!std.meta.eql(inline_items.first_tokens.?, inline_items.items[0])) return error.UnsupportedSqlShape;
+    if (!std.meta.eql(inline_items.last_tokens.?, inline_items.items[inline_items.items.len - 1])) return error.UnsupportedSqlShape;
+    for (inline_items.items, 0..) |prefix, index| {
+        const kind = kind_items[index];
+        if (prefix.end > tokens.len or prefix.start >= prefix.end) return error.UnsupportedSqlShape;
+        if (kind.end > tokens.len or kind.start < prefix.start or kind.end != prefix.end or kind.start >= kind.end) return error.UnsupportedSqlShape;
+        if (!generatedDdlInlineConstraintKindRangeIsValid(tokens, kind)) return error.UnsupportedSqlShape;
+        if (name_items[index]) |name| {
+            if (name.end > tokens.len or name.end != name.start + 1 or tokens[name.start].kind != .identifier) return error.UnsupportedSqlShape;
+            if (name.start != prefix.start + 1 or name.end != kind.start) return error.UnsupportedSqlShape;
+            if (!tokens[prefix.start].matchesKeywordTag(.constraint)) return error.UnsupportedSqlShape;
+        } else if (prefix.start != kind.start) {
+            return error.UnsupportedSqlShape;
+        }
+        if (!generatedDdlInlineConstraintPrefixBelongsToColumn(tokens, ast, prefix, kind, name_items[index])) return error.UnsupportedSqlShape;
+        if (!generatedDdlInlinePrimaryUniqueConstraintPayloadMatches(tokens, ast, index)) return error.UnsupportedSqlShape;
+        if (!generatedDdlInlineForeignKeyConstraintPayloadMatches(tokens, ast, index)) return error.UnsupportedSqlShape;
+        if (!generatedDdlInlineCheckConstraintPayloadMatches(tokens, ast, index)) return error.UnsupportedSqlShape;
+    }
+    var expected_count: usize = 0;
+    for (ast.alter_table_operation_items.items, 0..) |operation, index| {
+        if (!generatedDdlItemLooksLikeColumnDefinition(tokens, operation)) continue;
+        if (ast.alter_table_operation_column_type_items.len == 0) return error.UnsupportedSqlShape;
+        const type_range = ast.alter_table_operation_column_type_items[index] orelse return error.UnsupportedSqlShape;
+        var cursor = type_range.end;
+        while (generatedDdlNextColumnInlineConstraintPrefix(tokens, operation, &cursor)) |prefix| {
+            if (expected_count >= inline_items.count) return error.UnsupportedSqlShape;
+            if (!std.meta.eql(prefix.prefix, inline_items.items[expected_count])) return error.UnsupportedSqlShape;
+            if (!std.meta.eql(prefix.kind, kind_items[expected_count])) return error.UnsupportedSqlShape;
+            if (prefix.name == null) {
+                if (name_items[expected_count] != null) return error.UnsupportedSqlShape;
+            } else if (name_items[expected_count] == null or !std.meta.eql(prefix.name.?, name_items[expected_count].?)) {
+                return error.UnsupportedSqlShape;
+            }
+            expected_count += 1;
+            cursor = prefix.kind.end;
+        }
+    }
+    if (expected_count != inline_items.count) return error.UnsupportedSqlShape;
+}
+
+fn generatedDdlInlineCheckConstraintPayloadMatches(
+    tokens: []const grammar.Token,
+    ast: *const generated_parser.GeneratedSqlDdlAst,
+    index: usize,
+) bool {
+    const kind = ast.alter_table_operation_inline_constraint_kind_items[index];
+    const payload = ast.alter_table_operation_inline_check_payload_items[index];
+    const not_valid = ast.alter_table_operation_inline_check_not_valid_items[index];
+    if (!generatedDdlConstraintKindIsCheck(tokens, kind)) return payload == null and not_valid == null;
+
+    const operation = generatedDdlInlineConstraintContainingOperation(ast, kind) orelse return false;
+    const segment_end = generatedDdlNextInlineConstraintPrefixStart(tokens, operation, kind.end) orelse operation.end;
+    const expected_not_valid = generatedDdlTrailingConstraintNotValidRange(tokens, kind.end, segment_end);
+    if (!generatedDdlOptionalRangeMatches(not_valid, expected_not_valid)) return false;
+    const expected_payload_end = if (expected_not_valid) |range| range.start else segment_end;
+    const payload_range = payload orelse return false;
+    if (payload_range.end > tokens.len or payload_range.start != kind.end or payload_range.end != expected_payload_end) return false;
+    return generatedDdlParenthesizedRangeIsValid(tokens, payload_range);
+}
+
+fn generatedDdlInlineForeignKeyConstraintPayloadMatches(
+    tokens: []const grammar.Token,
+    ast: *const generated_parser.GeneratedSqlDdlAst,
+    index: usize,
+) bool {
+    const kind = ast.alter_table_operation_inline_constraint_kind_items[index];
+    const payload = ast.alter_table_operation_inline_foreign_key_payload_items[index];
+    const not_valid = ast.alter_table_operation_inline_foreign_key_not_valid_items[index];
+    if (!generatedDdlInlineConstraintKindIsReferences(tokens, kind)) return payload == null and not_valid == null;
+
+    const operation = generatedDdlInlineConstraintContainingOperation(ast, kind) orelse return false;
+    const segment_end = generatedDdlNextInlineConstraintPrefixStart(tokens, operation, kind.end) orelse operation.end;
+    const expected_not_valid = generatedDdlTrailingConstraintNotValidRange(tokens, kind.end, segment_end);
+    if (!generatedDdlOptionalRangeMatches(not_valid, expected_not_valid)) return false;
+    const expected_payload_end = if (expected_not_valid) |range| range.start else segment_end;
+    const payload_range = payload orelse return false;
+    return payload_range.end <= tokens.len and payload_range.start == kind.end and payload_range.end == expected_payload_end and payload_range.start < payload_range.end;
+}
+
+fn generatedDdlInlinePrimaryUniqueConstraintPayloadMatches(
+    tokens: []const grammar.Token,
+    ast: *const generated_parser.GeneratedSqlDdlAst,
+    index: usize,
+) bool {
+    const kind = ast.alter_table_operation_inline_constraint_kind_items[index];
+    const is_primary_unique = generatedDdlConstraintKindIsPrimaryOrUnique(tokens, kind);
+    const nulls = ast.alter_table_operation_inline_constraint_nulls_distinct_items[index];
+    const include = ast.alter_table_operation_inline_constraint_include_items[index];
+    const timing = ast.alter_table_operation_inline_constraint_timing_items[index];
+    const not_valid = ast.alter_table_operation_inline_constraint_not_valid_items[index];
+    if (!is_primary_unique) return nulls == null and include == null and timing == null and not_valid == null;
+
+    const operation_end = generatedDdlInlineConstraintContainingOperationEnd(ast, kind) orelse return false;
+    const expected_nulls = if (tokens[kind.start].matchesKeyword("unique"))
+        generatedDdlUniqueNullsDistinctRange(tokens, kind.end, operation_end)
+    else
+        null;
+    if (!generatedDdlOptionalRangeMatches(nulls, expected_nulls)) return false;
+    const include_start = if (expected_nulls) |range| range.end else kind.end;
+    const expected_include = generatedDdlConstraintIncludeRange(tokens, include_start, operation_end);
+    if (!generatedDdlOptionalRangeMatches(include, expected_include)) return false;
+    const timing_start = if (expected_include) |range| range.end else include_start;
+    const expected_timing = generatedDdlConstraintTimingRange(tokens, timing_start, operation_end);
+    if (!generatedDdlOptionalRangeMatches(timing, expected_timing)) return false;
+    const not_valid_start = if (expected_timing) |range| range.end else timing_start;
+    const expected_not_valid = generatedDdlConstraintNotValidRange(tokens, not_valid_start, operation_end);
+    return generatedDdlOptionalRangeMatches(not_valid, expected_not_valid);
+}
+
+fn generatedDdlInlineConstraintContainingOperationEnd(
+    ast: *const generated_parser.GeneratedSqlDdlAst,
+    kind: generated_parser.GeneratedSqlTokenRange,
+) ?usize {
+    return if (generatedDdlInlineConstraintContainingOperation(ast, kind)) |operation| operation.end else null;
+}
+
+fn generatedDdlInlineConstraintContainingOperation(
+    ast: *const generated_parser.GeneratedSqlDdlAst,
+    kind: generated_parser.GeneratedSqlTokenRange,
+) ?generated_parser.GeneratedSqlTokenRange {
+    for (ast.alter_table_operation_items.items) |operation| {
+        if (kind.start >= operation.start and kind.end <= operation.end) return operation;
+    }
+    return null;
+}
+
+fn generatedDdlColumnDefinitionsHaveInlineConstraints(
+    tokens: []const grammar.Token,
+    ast: *const generated_parser.GeneratedSqlDdlAst,
+) bool {
+    if (ast.alter_table_operation_column_type_items.len == 0) return false;
+    for (ast.alter_table_operation_items.items, 0..) |operation, index| {
+        if (!generatedDdlItemLooksLikeColumnDefinition(tokens, operation)) continue;
+        const type_range = ast.alter_table_operation_column_type_items[index] orelse continue;
+        var cursor = type_range.end;
+        if (generatedDdlNextColumnInlineConstraintPrefix(tokens, operation, &cursor) != null) return true;
+    }
+    return false;
+}
+
+const GeneratedDdlInlineConstraintPrefix = struct {
+    prefix: generated_parser.GeneratedSqlTokenRange,
+    name: ?generated_parser.GeneratedSqlTokenRange = null,
+    kind: generated_parser.GeneratedSqlTokenRange,
+};
+
+fn generatedDdlNextColumnInlineConstraintPrefix(
+    tokens: []const grammar.Token,
+    operation: generated_parser.GeneratedSqlTokenRange,
+    cursor: *usize,
+) ?GeneratedDdlInlineConstraintPrefix {
+    var index = cursor.*;
+    var depth: usize = 0;
+    while (index < operation.end and index < tokens.len) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen, .lbracket => depth += 1,
+            .rparen, .rbracket => {
+                if (depth == 0) return null;
+                depth -= 1;
+            },
+            else => if (depth == 0) {
+                const prefix = generatedDdlColumnInlineConstraintPrefixAt(tokens, operation, index) orelse continue;
+                cursor.* = index;
+                return prefix;
+            },
+        }
+    }
+    cursor.* = index;
+    return null;
+}
+
+fn generatedDdlColumnInlineConstraintPrefixAt(
+    tokens: []const grammar.Token,
+    operation: generated_parser.GeneratedSqlTokenRange,
+    index: usize,
+) ?GeneratedDdlInlineConstraintPrefix {
+    if (index >= operation.end or index >= tokens.len) return null;
+    var kind_start = index;
+    var name: ?generated_parser.GeneratedSqlTokenRange = null;
+    if (tokens[index].matchesKeywordTag(.constraint)) {
+        const name_start = index + 1;
+        if (name_start >= operation.end or tokens[name_start].kind != .identifier) return null;
+        name = .{ .start = name_start, .end = name_start + 1 };
+        kind_start = name_start + 1;
+    }
+    const kind_end = generatedDdlInlineConstraintKindEnd(tokens, kind_start, operation.end) orelse return null;
+    const prefix_start = if (name) |name_range| name_range.start - 1 else kind_start;
+    return .{
+        .prefix = .{ .start = prefix_start, .end = kind_end },
+        .name = name,
+        .kind = .{ .start = kind_start, .end = kind_end },
+    };
+}
+
+fn generatedDdlInlineConstraintKindEnd(
+    tokens: []const grammar.Token,
+    start: usize,
+    end: usize,
+) ?usize {
+    if (start >= end or start >= tokens.len) return null;
+    if (tokens[start].matchesKeyword("unique") or
+        tokens[start].matchesKeyword("check") or
+        tokens[start].matchesKeyword("references"))
+    {
+        return start + 1;
+    }
+    if (tokens[start].matchesKeyword("primary")) {
+        if (start + 1 >= end or !tokens[start + 1].matchesKeyword("key")) return null;
+        return start + 2;
+    }
+    return null;
+}
+
+fn generatedDdlInlineConstraintKindRangeIsValid(
+    tokens: []const grammar.Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    return generatedDdlInlineConstraintKindEnd(tokens, range.start, range.end) == range.end;
+}
+
+fn generatedDdlInlineConstraintKindIsReferences(
+    tokens: []const grammar.Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    return range.end == range.start + 1 and range.end <= tokens.len and tokens[range.start].matchesKeyword("references");
+}
+
+fn generatedDdlNextInlineConstraintPrefixStart(
+    tokens: []const grammar.Token,
+    operation: generated_parser.GeneratedSqlTokenRange,
+    start: usize,
+) ?usize {
+    var cursor = start;
+    if (generatedDdlNextColumnInlineConstraintPrefix(tokens, operation, &cursor)) |prefix| return prefix.prefix.start;
+    return null;
+}
+
+fn generatedDdlInlineConstraintPrefixBelongsToColumn(
+    tokens: []const grammar.Token,
+    ast: *const generated_parser.GeneratedSqlDdlAst,
+    prefix: generated_parser.GeneratedSqlTokenRange,
+    kind: generated_parser.GeneratedSqlTokenRange,
+    name: ?generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (ast.alter_table_operation_column_type_items.len == 0) return false;
+    for (ast.alter_table_operation_items.items, 0..) |operation, index| {
+        if (prefix.start < operation.start or prefix.end > operation.end) continue;
+        if (!generatedDdlItemLooksLikeColumnDefinition(tokens, operation)) return false;
+        const type_range = ast.alter_table_operation_column_type_items[index] orelse return false;
+        if (kind.start < type_range.end) return false;
+        var cursor = type_range.end;
+        while (generatedDdlNextColumnInlineConstraintPrefix(tokens, operation, &cursor)) |expected| {
+            if (std.meta.eql(expected.prefix, prefix)) {
+                if (!std.meta.eql(expected.kind, kind)) return false;
+                if (expected.name == null) return name == null;
+                return name != null and std.meta.eql(expected.name.?, name.?);
+            }
+            cursor = expected.kind.end;
+        }
+        return false;
+    }
+    return false;
+}
+
+fn validateGeneratedAlterTableOperationColumnDefinitionItems(
+    tokens: []const grammar.Token,
+    ast: *const generated_parser.GeneratedSqlDdlAst,
+) !void {
+    const name_items = ast.alter_table_operation_column_name_items;
+    const type_items = ast.alter_table_operation_column_type_items;
+    const nullability_items = ast.alter_table_operation_column_nullability_items;
+    const collation_items = ast.alter_table_operation_column_collation_items;
+    const default_clause_items = ast.alter_table_operation_column_default_clause_items;
+    const generated_clause_items = ast.alter_table_operation_column_generated_clause_items;
+    if (name_items.len == 0 and type_items.len == 0 and nullability_items.len == 0 and collation_items.len == 0 and default_clause_items.len == 0 and generated_clause_items.len == 0) return;
+    if (name_items.len != type_items.len or
+        name_items.len != nullability_items.len or
+        name_items.len != collation_items.len or
+        name_items.len != default_clause_items.len or
+        name_items.len != generated_clause_items.len or
+        name_items.len != ast.alter_table_operation_items.items.len or
+        ast.alter_table_operation_items.items.len != ast.alter_table_operation_items.count)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    for (ast.alter_table_operation_items.items, 0..) |item, index| {
+        const name_range = name_items[index];
+        const type_range = type_items[index];
+        const nullability_range = nullability_items[index];
+        const collation_range = collation_items[index];
+        const default_clause_range = default_clause_items[index];
+        const generated_clause_range = generated_clause_items[index];
+        if (generatedDdlItemLooksLikeColumnDefinition(tokens, item)) {
+            const name = name_range orelse return error.UnsupportedSqlShape;
+            const type_tokens = type_range orelse return error.UnsupportedSqlShape;
+            if (name.start < item.start or name.end > item.end or name.end != name.start + 1 or name.end > tokens.len) return error.UnsupportedSqlShape;
+            if (type_tokens.start != name.end or type_tokens.end > item.end or type_tokens.start >= type_tokens.end or type_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+            if (nullability_range) |range| {
+                if (range.start < type_tokens.end or range.end > item.end or range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
+                if (!generatedDdlColumnNullabilityRangeIsValid(tokens, range)) return error.UnsupportedSqlShape;
+            } else if (generatedDdlColumnDefinitionHasTopLevelNullability(tokens, item, type_tokens.end)) {
+                return error.UnsupportedSqlShape;
+            }
+            if (collation_range) |range| {
+                if (range.start < type_tokens.end or range.end > item.end or range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
+                if (!generatedDdlColumnCollationRangeIsValid(tokens, range)) return error.UnsupportedSqlShape;
+            } else if (findTopLevelKeywordText(tokens, type_tokens.end, item.end, "collate") != null) {
+                return error.UnsupportedSqlShape;
+            }
+            if (default_clause_range) |range| {
+                if (range.start < type_tokens.end or range.end > item.end or range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
+                if (!generatedDdlColumnDefaultClauseRangeIsValid(tokens, item, range)) return error.UnsupportedSqlShape;
+            } else if (generatedDdlColumnDefinitionDefaultClauseRange(tokens, item) != null) {
+                return error.UnsupportedSqlShape;
+            }
+            if (generated_clause_range) |range| {
+                if (range.start < type_tokens.end or range.end > item.end or range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
+                if (!generatedDdlColumnStoredGeneratedClauseRangeIsValid(tokens, item, range)) return error.UnsupportedSqlShape;
+            } else if (generatedDdlColumnDefinitionStoredGeneratedClauseRange(tokens, item) != null) {
+                return error.UnsupportedSqlShape;
+            }
+        } else if (name_range != null or type_range != null or nullability_range != null or collation_range != null or default_clause_range != null or generated_clause_range != null) {
+            return error.UnsupportedSqlShape;
+        }
+    }
+}
+
+fn generatedDdlItemLooksLikeColumnDefinition(
+    tokens: []const grammar.Token,
+    item: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (item.end > tokens.len or item.start >= item.end) return false;
+    const first = tokens[item.start];
+    if (first.matchesKeywordTag(.add)) {
+        return item.start + 1 < item.end and tokens[item.start + 1].matchesKeywordTag(.column);
+    }
+    if (first.matchesKeywordTag(.alter) or
+        first.matchesKeywordTag(.drop) or
+        first.matchesKeywordTag(.rename) or
+        first.matchesKeywordTag(.validate) or
+        first.matchesKeyword("attach") or
+        first.matchesKeyword("detach") or
+        first.matchesKeywordTag(.constraint) or
+        first.matchesKeyword("period") or
+        first.matchesKeyword("primary") or
+        first.matchesKeyword("unique") or
+        first.matchesKeyword("foreign") or
+        first.matchesKeyword("check"))
+    {
+        return false;
+    }
+    return first.kind == .identifier;
+}
+
+fn generatedDdlColumnDefinitionHasTopLevelNullability(
+    tokens: []const grammar.Token,
+    item: generated_parser.GeneratedSqlTokenRange,
+    start: usize,
+) bool {
+    var index = start;
+    var depth: usize = 0;
+    while (index < item.end and index < tokens.len) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen, .lbracket => depth += 1,
+            .rparen, .rbracket => {
+                if (depth == 0) return false;
+                depth -= 1;
+            },
+            else => if (depth == 0 and
+                (tokens[index].matchesKeywordTag(.null) or
+                    (tokens[index].matchesKeywordTag(.not) and index + 1 < item.end and tokens[index + 1].matchesKeywordTag(.null))))
+            {
+                return true;
+            },
+        }
+    }
+    return false;
+}
+
+fn generatedDdlColumnNullabilityRangeIsValid(
+    tokens: []const grammar.Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (range.end > tokens.len) return false;
+    if (range.end == range.start + 1) return tokens[range.start].matchesKeywordTag(.null);
+    if (range.end == range.start + 2) {
+        return tokens[range.start].matchesKeywordTag(.not) and tokens[range.start + 1].matchesKeywordTag(.null);
+    }
+    return false;
+}
+
+fn generatedDdlColumnCollationRangeIsValid(
+    tokens: []const grammar.Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (range.end > tokens.len or range.start >= range.end) return false;
+    if (!tokens[range.start].matchesKeyword("collate")) return false;
+    if (range.start + 1 >= range.end or tokens[range.start + 1].kind != .identifier) return false;
+    if (range.end == range.start + 2) return true;
+    if (range.end == range.start + 3) {
+        return std.mem.endsWith(u8, tokens[range.start + 1].text, ".") and tokens[range.start + 2].kind == .identifier;
+    }
+    return false;
+}
+
+fn generatedDdlColumnDefaultClauseRangeIsValid(
+    tokens: []const grammar.Token,
+    item: generated_parser.GeneratedSqlTokenRange,
+    range: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    const expected = generatedDdlColumnDefinitionDefaultClauseRange(tokens, item) orelse return false;
+    return std.meta.eql(expected, range);
+}
+
+fn generatedDdlColumnDefinitionDefaultClauseRange(
+    tokens: []const grammar.Token,
+    item: generated_parser.GeneratedSqlTokenRange,
+) ?generated_parser.GeneratedSqlTokenRange {
+    var search_start = item.start;
+    while (findTopLevelKeyword(tokens, search_start, item.end, .default)) |default_index| {
+        search_start = default_index + 1;
+        if (!generatedDdlDefaultKeywordIntroducesValue(tokens, item, default_index)) continue;
+        const value_range = generatedDdlColumnDefinitionDefaultValueRange(tokens, item, default_index + 1) orelse return null;
+        return .{ .start = default_index, .end = value_range.end };
+    }
+    return null;
+}
+
+fn generatedDdlColumnDefinitionDefaultValueRange(
+    tokens: []const grammar.Token,
+    item: generated_parser.GeneratedSqlTokenRange,
+    start: usize,
+) ?generated_parser.GeneratedSqlTokenRange {
+    if (start >= item.end or start >= tokens.len) return null;
+    const first = tokens[start];
+    if (first.kind == .lparen) {
+        const close_index = findGeneratedMatchingParen(tokens, start, item.end) orelse return null;
+        if (close_index <= start + 1) return null;
+        return .{ .start = start, .end = close_index + 1 };
+    }
+    if (first.kind == .plus or first.kind == .minus) {
+        if (start + 1 < item.end and tokens[start + 1].kind == .number) return .{ .start = start, .end = start + 2 };
+        return null;
+    }
+    if (first.kind == .number or first.kind == .string) return .{ .start = start, .end = start + 1 };
+    if (first.kind != .identifier) return null;
+    if (first.matchesKeywordTag(.true) or first.matchesKeywordTag(.false) or first.matchesKeywordTag(.null) or first.matchesKeyword("current_date")) {
+        return .{ .start = start, .end = start + 1 };
+    }
+    if (first.matchesKeyword("current_timestamp")) {
+        if (start + 1 < item.end and tokens[start + 1].kind == .lparen) {
+            const close_index = findGeneratedMatchingParen(tokens, start + 1, item.end) orelse return null;
+            return .{ .start = start, .end = close_index + 1 };
+        }
+        return .{ .start = start, .end = start + 1 };
+    }
+    if (first.matchesKeyword("gen_random_uuid") or first.matchesKeyword("uuid_generate_v4") or first.matchesKeyword("now")) {
+        if (start + 1 >= item.end or tokens[start + 1].kind != .lparen) return null;
+        const close_index = findGeneratedMatchingParen(tokens, start + 1, item.end) orelse return null;
+        return .{ .start = start, .end = close_index + 1 };
+    }
+    return null;
+}
+
+fn generatedDdlColumnStoredGeneratedClauseRangeIsValid(
+    tokens: []const grammar.Token,
+    item: generated_parser.GeneratedSqlTokenRange,
+    range: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    const expected = generatedDdlColumnDefinitionStoredGeneratedClauseRange(tokens, item) orelse return false;
+    return std.meta.eql(expected, range);
+}
+
+fn generatedDdlColumnDefinitionStoredGeneratedClauseRange(
+    tokens: []const grammar.Token,
+    item: generated_parser.GeneratedSqlTokenRange,
+) ?generated_parser.GeneratedSqlTokenRange {
+    const generated_index = findTopLevelKeyword(tokens, item.start, item.end, .generated) orelse return null;
+    var cursor = generated_index + 1;
+    if (cursor >= item.end or !tokens[cursor].matchesKeywordTag(.always)) return null;
+    cursor += 1;
+    if (cursor >= item.end or !tokens[cursor].matchesKeywordTag(.as)) return null;
+    cursor += 1;
+    if (cursor >= item.end or tokens[cursor].kind != .lparen) return null;
+    const close_index = findGeneratedMatchingParen(tokens, cursor, item.end) orelse return null;
+    if (close_index <= cursor + 1) return null;
+    if (close_index + 1 >= item.end or !tokens[close_index + 1].matchesKeywordTag(.stored)) return null;
+    return .{ .start = generated_index, .end = close_index + 2 };
+}
+
+fn validateGeneratedAlterTableOperationDefaultValueItems(
+    tokens: []const grammar.Token,
+    ast: *const generated_parser.GeneratedSqlDdlAst,
+) !void {
+    const default_items = ast.alter_table_operation_default_value_items;
+    const clause_items = ast.alter_table_operation_column_default_clause_items;
+    if (default_items.len == 0 and clause_items.len == 0) return;
+    if (default_items.len != ast.alter_table_operation_items.items.len or
+        clause_items.len != ast.alter_table_operation_items.items.len or
+        ast.alter_table_operation_items.items.len != ast.alter_table_operation_items.count)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    for (ast.alter_table_operation_items.items, 0..) |item, index| {
+        const maybe_default_range = default_items[index];
+        const maybe_clause_range = clause_items[index];
+        if (maybe_default_range) |default_range| {
+            if (default_range.start < item.start or default_range.end > item.end or default_range.start >= default_range.end or default_range.end > tokens.len) {
+                return error.UnsupportedSqlShape;
+            }
+            if (maybe_clause_range) |clause_range| {
+                if (clause_range.start < item.start or clause_range.end > item.end or clause_range.start >= clause_range.end or clause_range.end > tokens.len) {
+                    return error.UnsupportedSqlShape;
+                }
+                if (clause_range.start + 1 != default_range.start or clause_range.end != default_range.end) return error.UnsupportedSqlShape;
+                if (!generatedDdlColumnDefaultClauseRangeIsValid(tokens, item, clause_range)) return error.UnsupportedSqlShape;
+            } else if (!generatedAlterTableAlterColumnSetDefaultValueRangeIsValid(tokens, item, default_range)) {
+                return error.UnsupportedSqlShape;
+            }
+        } else if (generatedDdlItemRequiresDefaultValueRange(tokens, item)) {
+            return error.UnsupportedSqlShape;
+        } else if (maybe_clause_range != null) {
+            return error.UnsupportedSqlShape;
+        }
+        if (maybe_clause_range == null and
+            !generatedAlterTableAlterColumnSetDefaultItem(tokens, item) and
+            generatedDdlColumnDefinitionDefaultClauseRange(tokens, item) != null)
+        {
+            return error.UnsupportedSqlShape;
+        }
+    }
+}
+
+fn generatedAlterTableAlterColumnSetDefaultValueRangeIsValid(
+    tokens: []const grammar.Token,
+    item: generated_parser.GeneratedSqlTokenRange,
+    range: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    const expected = generatedAlterTableAlterColumnSetDefaultValueRange(tokens, item) orelse return false;
+    return std.meta.eql(expected, range);
+}
+
+fn generatedAlterTableAlterColumnSetDefaultValueRange(
+    tokens: []const grammar.Token,
+    item: generated_parser.GeneratedSqlTokenRange,
+) ?generated_parser.GeneratedSqlTokenRange {
+    const default_index = generatedAlterTableAlterColumnSetDefaultKeywordIndex(tokens, item) orelse return null;
+    return generatedDdlColumnDefinitionDefaultValueRange(tokens, item, default_index + 1);
+}
+
+fn generatedAlterTableAlterColumnSetDefaultItem(
+    tokens: []const grammar.Token,
+    item: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    return generatedAlterTableAlterColumnSetDefaultKeywordIndex(tokens, item) != null;
+}
+
+fn generatedAlterTableAlterColumnSetDefaultKeywordIndex(
+    tokens: []const grammar.Token,
+    item: generated_parser.GeneratedSqlTokenRange,
+) ?usize {
+    if (item.end > tokens.len or item.start >= item.end) return null;
+    const action_index = generatedAlterTableAlterColumnActionIndex(tokens, item) catch return null;
+    if (action_index + 1 >= item.end) return null;
+    if (!tokens[action_index].matchesKeywordTag(.set)) return null;
+    if (!tokens[action_index + 1].matchesKeywordTag(.default)) return null;
+    return action_index + 1;
+}
+
+fn generatedDdlItemRequiresDefaultValueRange(
+    tokens: []const grammar.Token,
+    item: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (item.end > tokens.len or item.start >= item.end) return false;
+    var depth: usize = 0;
+    var index = item.start;
+    while (index < item.end) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen, .lbracket => depth += 1,
+            .rparen, .rbracket => {
+                if (depth == 0) return false;
+                depth -= 1;
+            },
+            else => if (depth == 0 and
+                tokens[index].matchesKeywordTag(.default) and
+                generatedDdlDefaultKeywordIntroducesValue(tokens, item, index))
+            {
+                return true;
+            },
+        }
+    }
+    return false;
+}
+
+fn generatedDdlDefaultKeywordIntroducesValue(
+    tokens: []const grammar.Token,
+    item: generated_parser.GeneratedSqlTokenRange,
+    default_index: usize,
+) bool {
+    if (default_index <= item.start) return true;
+    const previous = tokens[default_index - 1];
+    if (previous.matchesKeywordTag(.by) or previous.matchesKeywordTag(.drop)) return false;
+    return true;
+}
+
+fn validateGeneratedAlterTableOperationRewriteExpressionItems(
+    tokens: []const grammar.Token,
+    ast: *const generated_parser.GeneratedSqlDdlAst,
+) !void {
+    return try validateGeneratedAlterTableOperationExpressionItems(
+        tokens,
+        &ast.alter_table_operation_items,
+        ast.alter_table_operation_rewrite_expression_items,
+        ast.alter_table_operation_rewrite_expressions,
+    );
+}
+
+fn validateGeneratedAlterTableOperationExpressionItems(
+    tokens: []const grammar.Token,
+    operation_items: *const generated_parser.GeneratedSqlListAst,
+    expression_items: []const ?generated_parser.GeneratedSqlTokenRange,
+    expressions: []const generated_parser.GeneratedSqlExpressionAst,
+) !void {
+    if (expression_items.len == 0 and expressions.len == 0) return;
+    if (expression_items.len != operation_items.items.len or
+        expressions.len != operation_items.items.len)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    for (operation_items.items, 0..) |item, index| {
+        const maybe_expression_range = expression_items[index];
+        if (maybe_expression_range) |expression_range| {
+            if (expression_range.start < item.start or expression_range.end > item.end or expression_range.start >= expression_range.end or expression_range.end > tokens.len) {
+                return error.UnsupportedSqlShape;
+            }
+            const expression = expressions[index];
+            if (!generatedDdlTokenRangeEqual(expression.tokens orelse return error.UnsupportedSqlShape, expression_range)) {
+                return error.UnsupportedSqlShape;
+            }
+        } else if (expressions[index].tokens != null) {
+            return error.UnsupportedSqlShape;
+        }
+    }
 }
 
 fn generatedAlterTableOperationSegmentUsesRuntimeBoundary(tokens: []const grammar.Token, start: usize, end: usize) bool {
@@ -11617,11 +13289,9 @@ fn createDatabasePlanFromGeneratedDdlAstAlloc(
     const end = try requireGeneratedDdlHeader(tokens, ast.statement_span, .create, .database);
     const name_range = try requireGeneratedTokenRangeAt(ast.object_name_tokens, 2, end);
     if (name_range.end != end) return error.UnsupportedSqlShape;
-    var syntax = grammar.CreateDatabaseSyntax{
+    return .{
         .database_name = try generatedIdentifierAlloc(alloc, tokens, name_range),
     };
-    errdefer syntax.deinit(alloc);
-    return createDatabasePlanFromSyntax(&syntax);
 }
 
 fn createSchemaNamespacePlanFromGeneratedDdlAstAlloc(
@@ -11634,12 +13304,10 @@ fn createSchemaNamespacePlanFromGeneratedDdlAstAlloc(
     if (ast.if_not_exists) try expectGeneratedIfNotExists(tokens, &index, end);
     const name_range = try requireGeneratedTokenRangeAt(ast.object_name_tokens, index, end);
     if (name_range.end != end) return error.UnsupportedSqlShape;
-    var syntax = grammar.CreateSchemaNamespaceSyntax{
+    return .{
         .schema_name = try generatedSqlSchemaIdentifierAlloc(alloc, tokens, name_range),
         .if_not_exists = ast.if_not_exists,
     };
-    errdefer syntax.deinit(alloc);
-    return createSchemaNamespacePlanFromSyntax(&syntax);
 }
 
 fn createSchemaNamespacePlanFromGeneratedDdlAstAsDdlPlanAlloc(
@@ -11671,8 +13339,7 @@ fn createExtensionPlanFromGeneratedDdlAstAlloc(
     index = extension_range.end;
 
     var schema_name: ?[]const u8 = null;
-    var schema_transferred = false;
-    errdefer if (!schema_transferred) if (schema_name) |owned| alloc.free(@constCast(owned));
+    defer if (schema_name) |owned| alloc.free(@constCast(owned));
     if (ast.schema_name_tokens) |schema_range| {
         if (index < end and tokens[index].matchesKeywordTag(.with)) index += 1;
         if (index >= end or !tokens[index].matchesKeywordTag(.schema)) return error.UnsupportedSqlShape;
@@ -11694,16 +13361,17 @@ fn createExtensionPlanFromGeneratedDdlAstAlloc(
     }
     if (index != end) return error.UnsupportedSqlShape;
 
-    var syntax = grammar.CreateExtensionSyntax{
-        .extension_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, extension_range),
-        .schema_name = schema_name,
+    if (schema_name) |owned| {
+        if (!std.ascii.eqlIgnoreCase(owned, default_namespace_name)) return error.UnsupportedSqlShape;
+    }
+    const extension_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, extension_range);
+    errdefer alloc.free(extension_name);
+    version_transferred = true;
+    return .{
+        .extension_name = extension_name,
         .version = version,
         .if_not_exists = ast.if_not_exists,
     };
-    schema_transferred = true;
-    version_transferred = true;
-    defer syntax.deinit(alloc);
-    return try createExtensionPlanFromSyntax(&syntax, default_namespace_name);
 }
 
 fn createExtensionPlanFromGeneratedDdlAstAsDdlPlanAlloc(
@@ -11751,21 +13419,22 @@ fn alterDatabasePlanFromGeneratedDdlAstAlloc(
         return error.UnsupportedSqlShape;
     }
 
-    var pos: usize = 1;
-    var plan = try parseAlterDatabasePlanTailAlloc(alloc, tokens, &pos);
-    errdefer plan.deinit(alloc);
-    if (!generatedStatementConsumedThrough(tokens, end, pos)) return error.UnsupportedSqlShape;
-
-    const generated_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, name_range);
-    defer alloc.free(@constCast(generated_name));
-    if (!std.ascii.eqlIgnoreCase(generated_name, plan.database_name)) return error.UnsupportedSqlShape;
-    const generated_setting_name = try generatedIdentifierAlloc(alloc, tokens, setting_name_range);
-    defer alloc.free(@constCast(generated_setting_name));
-    if (plan.operations.len != 1) return error.UnsupportedSqlShape;
-    switch (plan.operations[0]) {
-        .set_parameter => |operation| if (!std.ascii.eqlIgnoreCase(generated_setting_name, operation.name)) return error.UnsupportedSqlShape,
-    }
-    return plan;
+    const database_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, name_range);
+    errdefer alloc.free(database_name);
+    const setting_name = try generatedIdentifierAlloc(alloc, tokens, setting_name_range);
+    errdefer alloc.free(setting_name);
+    const value_json = try generatedSqlUntypedValueJsonAlloc(alloc, tokens, setting_value_range);
+    errdefer alloc.free(value_json);
+    const operations = try alloc.alloc(DatabaseAlterOperation, 1);
+    errdefer alloc.free(operations);
+    operations[0] = .{ .set_parameter = .{
+        .name = setting_name,
+        .value_json = value_json,
+    } };
+    return .{
+        .database_name = database_name,
+        .operations = operations,
+    };
 }
 
 fn updateExtensionPlanFromGeneratedDdlAstAlloc(
@@ -11779,32 +13448,25 @@ fn updateExtensionPlanFromGeneratedDdlAstAlloc(
     if (operation_range.start != name_range.end or operation_range.end != end or operation_range.start >= operation_range.end) return error.UnsupportedSqlShape;
     if (!tokens[operation_range.start].matchesKeywordTag(.update)) return error.UnsupportedSqlShape;
 
-    var generated_version: ?[]const u8 = null;
-    defer if (generated_version) |owned| alloc.free(@constCast(owned));
+    var target_version: ?[]const u8 = null;
+    var target_version_transferred = true;
+    errdefer if (!target_version_transferred) if (target_version) |owned| alloc.free(@constCast(owned));
     if (ast.version_tokens) |version_range| {
         if (operation_range.start + 3 != operation_range.end or !tokens[operation_range.start + 1].matchesKeywordTag(.to)) return error.UnsupportedSqlShape;
         _ = try requireGeneratedTokenRangeAt(ast.version_tokens, operation_range.start + 2, operation_range.end);
         if (tokens[version_range.start].kind != .string) return error.UnsupportedSqlShape;
-        generated_version = try generatedStringLiteralValueAlloc(alloc, tokens, version_range);
+        target_version = try generatedStringLiteralValueAlloc(alloc, tokens, version_range);
+        target_version_transferred = false;
     } else if (operation_range.start + 1 != operation_range.end) {
         return error.UnsupportedSqlShape;
     }
-
-    var pos: usize = 1;
-    var plan = try parseUpdateExtensionPlanTailAlloc(alloc, tokens, &pos);
-    errdefer plan.deinit(alloc);
-    if (!generatedStatementConsumedThrough(tokens, end, pos)) return error.UnsupportedSqlShape;
-
-    const generated_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, name_range);
-    defer alloc.free(@constCast(generated_name));
-    if (!std.ascii.eqlIgnoreCase(generated_name, plan.extension_name)) return error.UnsupportedSqlShape;
-    if (generated_version) |version| {
-        const target_version = plan.target_version orelse return error.UnsupportedSqlShape;
-        if (!std.mem.eql(u8, version, target_version)) return error.UnsupportedSqlShape;
-    } else if (plan.target_version != null) {
-        return error.UnsupportedSqlShape;
-    }
-    return plan;
+    const extension_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, name_range);
+    errdefer alloc.free(extension_name);
+    target_version_transferred = true;
+    return .{
+        .extension_name = extension_name,
+        .target_version = target_version,
+    };
 }
 
 fn renameSchemaNamespacePlanFromGeneratedDdlAstAlloc(
@@ -11824,12 +13486,14 @@ fn renameSchemaNamespacePlanFromGeneratedDdlAstAlloc(
     }
     const new_name_range = try requireGeneratedTokenRangeAt(ast.rename_target_tokens, operation_range.start + 2, end);
     if (new_name_range.end != end) return error.UnsupportedSqlShape;
-    var syntax = grammar.RenameSchemaNamespaceSyntax{
-        .schema_name = try generatedSqlSchemaIdentifierAlloc(alloc, tokens, name_range),
-        .new_schema_name = try generatedSqlSchemaIdentifierAlloc(alloc, tokens, new_name_range),
+    const schema_name = try generatedSqlSchemaIdentifierAlloc(alloc, tokens, name_range);
+    errdefer alloc.free(schema_name);
+    const new_schema_name = try generatedSqlSchemaIdentifierAlloc(alloc, tokens, new_name_range);
+    errdefer alloc.free(new_schema_name);
+    return .{
+        .schema_name = schema_name,
+        .new_schema_name = new_schema_name,
     };
-    errdefer syntax.deinit(alloc);
-    return renameSchemaNamespacePlanFromSyntax(&syntax);
 }
 
 fn dropDatabasePlanFromGeneratedDdlAstAlloc(
@@ -11854,13 +13518,11 @@ fn dropDatabasePlanFromGeneratedDdlAstAlloc(
         index += 4;
     }
     if (index != end) return error.UnsupportedSqlShape;
-    var syntax = grammar.DropDatabaseSyntax{
+    return .{
         .database_name = try generatedIdentifierAlloc(alloc, tokens, name_range),
         .if_exists = ast.if_exists,
         .force = ast.force,
     };
-    errdefer syntax.deinit(alloc);
-    return dropDatabasePlanFromSyntax(&syntax);
 }
 
 fn dropSchemaNamespacePlanFromGeneratedDdlAstAlloc(
@@ -11880,13 +13542,11 @@ fn dropSchemaNamespacePlanFromGeneratedDdlAstAlloc(
         index += 1;
     }
     if (index != end) return error.UnsupportedSqlShape;
-    var syntax = grammar.DropSchemaNamespaceSyntax{
+    return .{
         .schema_name = try generatedSqlSchemaIdentifierAlloc(alloc, tokens, name_range),
         .if_exists = ast.if_exists,
         .cascade = ast.cascade,
     };
-    errdefer syntax.deinit(alloc);
-    return dropSchemaNamespacePlanFromSyntax(&syntax);
 }
 
 fn dropExtensionPlanFromGeneratedDdlAstAlloc(
@@ -11906,13 +13566,11 @@ fn dropExtensionPlanFromGeneratedDdlAstAlloc(
         index += 1;
     }
     if (index != end) return error.UnsupportedSqlShape;
-    var syntax = grammar.DropExtensionSyntax{
+    return .{
         .extension_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, name_range),
         .if_exists = ast.if_exists,
         .cascade = ast.cascade,
     };
-    errdefer syntax.deinit(alloc);
-    return dropExtensionPlanFromSyntax(&syntax);
 }
 
 fn dropTablePlanFromGeneratedDdlAstAlloc(
@@ -11932,13 +13590,11 @@ fn dropTablePlanFromGeneratedDdlAstAlloc(
         index += 1;
     }
     if (index != end) return error.UnsupportedSqlShape;
-    var syntax = grammar.DropTableSyntax{
+    return .{
         .table_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, name_range),
         .if_exists = ast.if_exists,
         .cascade = ast.cascade,
     };
-    errdefer syntax.deinit(alloc);
-    return dropTablePlanFromSyntax(&syntax);
 }
 
 fn dropIndexPlanFromGeneratedDdlAstAlloc(
@@ -11959,12 +13615,10 @@ fn dropIndexPlanFromGeneratedDdlAstAlloc(
         index += 1;
     }
     if (index != end) return error.UnsupportedSqlShape;
-    var syntax = grammar.DropIndexSyntax{
+    return .{
         .index_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, name_range),
         .if_exists = ast.if_exists,
     };
-    errdefer syntax.deinit(alloc);
-    return dropIndexPlanFromSyntax(&syntax);
 }
 
 fn identityAllocatorPlanFromGeneratedDdlAstAlloc(
@@ -11976,10 +13630,144 @@ fn identityAllocatorPlanFromGeneratedDdlAstAlloc(
     const end = try requireGeneratedDdlHeader(tokens, ast.statement_span, .create, .table);
     if (ast.if_not_exists) return error.UnsupportedSqlShape;
 
-    var pos: usize = 1;
-    var plan = try parseIdentityAllocatorPlanAlloc(alloc, tokens, &pos, options);
+    const name_range = ast.object_name_tokens orelse return error.UnsupportedSqlShape;
+    if (!generatedRangeWithinStatement(name_range, end) or name_range.end >= end or tokens[name_range.end].kind != .lparen) return error.UnsupportedSqlShape;
+    const definition_close = findGeneratedMatchingParen(tokens, name_range.end, end) orelse return error.UnsupportedSqlShape;
+    const items_range = ast.alter_table_operation_tokens orelse return error.UnsupportedSqlShape;
+    if (items_range.start != name_range.end + 1 or items_range.end != definition_close) return error.UnsupportedSqlShape;
+    if (ast.alter_table_operation_items.count == 0 or ast.alter_table_operation_items.items.len != ast.alter_table_operation_items.count) return error.UnsupportedSqlShape;
+    if (ast.alter_table_operation_items.first_tokens == null or ast.alter_table_operation_items.last_tokens == null) return error.UnsupportedSqlShape;
+    if (!std.meta.eql(ast.alter_table_operation_items.first_tokens.?, ast.alter_table_operation_items.items[0])) return error.UnsupportedSqlShape;
+    if (!std.meta.eql(ast.alter_table_operation_items.last_tokens.?, ast.alter_table_operation_items.items[ast.alter_table_operation_items.items.len - 1])) return error.UnsupportedSqlShape;
+    try validateGeneratedAlterTableOperationConstraintPrefixItems(tokens, &ast);
+    try validateGeneratedAlterTableOperationPrimaryUniqueConstraintPayloadItems(tokens, &ast);
+    try validateGeneratedAlterTableOperationForeignKeyConstraintPayloadItems(tokens, &ast);
+    try validateGeneratedAlterTableOperationCheckConstraintPayloadItems(tokens, &ast);
+    try validateGeneratedAlterTableOperationPeriodPayloadItems(tokens, &ast);
+    try validateGeneratedAlterTableOperationColumnDefinitionItems(tokens, &ast);
+    try validateGeneratedAlterTableOperationInlineConstraintPrefixItems(tokens, &ast);
+    try validateGeneratedAlterTableOperationDefaultValueItems(tokens, &ast);
+    try validateGeneratedAlterTableOperationGeneratedExpressionItems(tokens, &ast);
+    try validateGeneratedAlterTableOperationRewriteExpressionItems(tokens, &ast);
+
+    const table_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, name_range);
+    var table_name_transferred = false;
+    errdefer if (!table_name_transferred) alloc.free(table_name);
+
+    const first_item = ast.alter_table_operation_items.items[0];
+    if (!generatedRangeWithinStatement(first_item, end) or first_item.start != items_range.start or first_item.start >= first_item.end or first_item.end > items_range.end) return error.UnsupportedSqlShape;
+    var first_pos: usize = 0;
+    const first_tokens = tokens[first_item.start..first_item.end];
+    const column_name = try grammar.parseIdentifierOwnedAlloc(alloc, first_tokens, &first_pos);
+    var column_name_transferred = false;
+    errdefer if (!column_name_transferred) alloc.free(column_name);
+    const path = try alloc.dupe(u8, column_name);
+    var path_transferred = false;
+    errdefer if (!path_transferred) alloc.free(path);
+    var identity = try parseIdentityAllocatorSpecAlloc(first_tokens, &first_pos);
+    var identity_transferred = false;
+    errdefer if (!identity_transferred) identity.deinit(alloc);
+    const first_cursor = parser.Cursor.init(first_tokens, &first_pos);
+    var primary_key = false;
+    if (first_cursor.matchKeyword("primary")) {
+        try first_cursor.expectKeyword("key");
+        primary_key = true;
+    }
+    if (first_pos != first_tokens.len) return error.UnsupportedSqlShape;
+
+    const column: runtime_schema.RelationalColumn = .{
+        .name = column_name,
+        .path = path,
+        .field_type = .numeric,
+        .nullable = !primary_key,
+    };
+    var column_transferred = false;
+    errdefer if (!column_transferred) freeDdlRelationalColumn(alloc, column);
+
+    var additional_columns = std.ArrayListUnmanaged(runtime_schema.RelationalColumn).empty;
+    errdefer {
+        clearDdlRelationalColumns(alloc, additional_columns.items);
+        additional_columns.deinit(alloc);
+    }
+
+    var expected_start = first_item.end;
+    for (ast.alter_table_operation_items.items[1..], 1..) |item, item_index| {
+        if (expected_start >= items_range.end or tokens[expected_start].kind != .comma) return error.UnsupportedSqlShape;
+        expected_start += 1;
+        if (!generatedRangeWithinStatement(item, end) or item.start != expected_start or item.start >= item.end or item.end > items_range.end) return error.UnsupportedSqlShape;
+        const item_tokens = tokens[item.start..item.end];
+        if (item_tokens.len == 0 or
+            item_tokens[0].matchesKeyword("constraint") or
+            item_tokens[0].matchesKeyword("primary") or
+            item_tokens[0].matchesKeyword("unique") or
+            item_tokens[0].matchesKeyword("foreign") or
+            item_tokens[0].matchesKeyword("check") or
+            item_tokens[0].matchesKeyword("period"))
+        {
+            return error.UnsupportedSqlShape;
+        }
+        var item_pos: usize = 0;
+        var item_hooks = options;
+        item_hooks.expression_options.generated_scalar_subquery_full_tokens = options.expression_options.generated_scalar_subquery_full_tokens orelse tokens;
+        item_hooks.expression_options.generated_scalar_subquery_token_offset = item.start;
+        item_hooks.expression_options.generated_default_value_full_tokens = tokens;
+        item_hooks.expression_options.generated_default_value_token_offset = item.start;
+        if (ast.alter_table_operation_default_value_items.len != 0) {
+            item_hooks.expression_options.generated_default_value_tokens = ast.alter_table_operation_default_value_items[item_index];
+        }
+        item_hooks.generated_column_name_full_tokens = tokens;
+        item_hooks.generated_column_header_token_offset = item.start;
+        if (ast.alter_table_operation_column_name_items.len != 0) {
+            item_hooks.generated_column_name_tokens = ast.alter_table_operation_column_name_items[item_index];
+            item_hooks.generated_column_type_tokens = ast.alter_table_operation_column_type_items[item_index];
+            item_hooks.generated_column_nullability_tokens = ast.alter_table_operation_column_nullability_items[item_index];
+            item_hooks.generated_column_collation_tokens = ast.alter_table_operation_column_collation_items[item_index];
+            item_hooks.generated_column_default_clause_tokens = ast.alter_table_operation_column_default_clause_items[item_index];
+            item_hooks.generated_column_generated_clause_tokens = ast.alter_table_operation_column_generated_clause_items[item_index];
+        }
+        item_hooks.generated_column_expression_full_tokens = tokens;
+        item_hooks.generated_column_expression_token_offset = item.start;
+        if (ast.alter_table_operation_generated_expression_items.len != 0) {
+            item_hooks.generated_column_expression_tokens = ast.alter_table_operation_generated_expression_items[item_index];
+            item_hooks.generated_column_expression_ast = if (ast.alter_table_operation_generated_expression_items[item_index] != null)
+                &ast.alter_table_operation_generated_expressions[item_index]
+            else
+                null;
+        }
+        const additional = try parseDdlColumnDefinitionStandaloneAlloc(alloc, item_tokens, &item_pos, item_hooks);
+        var additional_transferred = false;
+        errdefer if (!additional_transferred) freeDdlRelationalColumn(alloc, additional);
+        if (item_pos != item_tokens.len) return error.UnsupportedSqlShape;
+        try additional_columns.append(alloc, additional);
+        additional_transferred = true;
+        expected_start = item.end;
+        if (item_index + 1 == ast.alter_table_operation_items.items.len and expected_start != items_range.end) return error.UnsupportedSqlShape;
+    }
+    if (expected_start != items_range.end) return error.UnsupportedSqlShape;
+    if (items_range.end >= end or tokens[items_range.end].kind != .rparen or items_range.end + 1 != end) return error.UnsupportedSqlShape;
+
+    const owned_additional_columns = try additional_columns.toOwnedSlice(alloc);
+    var additional_columns_transferred = false;
+    errdefer if (!additional_columns_transferred) {
+        clearDdlRelationalColumns(alloc, owned_additional_columns);
+        alloc.free(owned_additional_columns);
+    };
+
+    table_name_transferred = true;
+    column_name_transferred = true;
+    path_transferred = true;
+    identity_transferred = true;
+    column_transferred = true;
+    additional_columns_transferred = true;
+    var plan = IdentityAllocatorPlan{
+        .table_name = table_name,
+        .column = column,
+        .kind = identity.kind,
+        .options = identity.options,
+        .primary_key = primary_key,
+        .additional_columns = owned_additional_columns,
+    };
     errdefer plan.deinit(alloc);
-    if (!generatedStatementConsumedThrough(tokens, end, pos)) return error.UnsupportedSqlShape;
     try validateGeneratedCreateTableDefinitionMetadataParts(
         alloc,
         tokens,
@@ -12045,6 +13833,7 @@ fn validateGeneratedCreateTableCloneMetadata(
     if (!std.ascii.eqlIgnoreCase(generated_source_name, plan.source_table_name)) return error.UnsupportedSqlShape;
 
     try validateGeneratedCreateTableLikeOptionItems(tokens, source_range.end, items_range.end, ast.create_table_like_option_items);
+    try validateGeneratedCreateTableLikeOptionPayloadItems(tokens, ast);
 }
 
 fn tableClonePlanFromGeneratedDdlAstAlloc(
@@ -12070,6 +13859,7 @@ fn tableClonePlanFromGeneratedDdlAstAlloc(
     const source_range = ast.create_table_like_source_tokens orelse return error.UnsupportedSqlShape;
     if (source_range.start != items_range.start + 1 or source_range.end <= source_range.start or source_range.end > items_range.end) return error.UnsupportedSqlShape;
     try validateGeneratedCreateTableLikeOptionItems(tokens, source_range.end, items_range.end, ast.create_table_like_option_items);
+    try validateGeneratedCreateTableLikeOptionPayloadItems(tokens, ast);
 
     const table_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, name_range);
     errdefer alloc.free(@constCast(table_name));
@@ -12079,24 +13869,33 @@ fn tableClonePlanFromGeneratedDdlAstAlloc(
         .table_name = table_name,
         .source_table_name = source_table_name,
         .if_not_exists = ast.if_not_exists,
-        .options = try generatedTableCloneOptions(tokens, ast.create_table_like_option_items),
+        .options = try generatedTableCloneOptions(tokens, ast),
     };
 }
 
 fn generatedTableCloneOptions(
     tokens: []const grammar.Token,
-    items: generated_parser.GeneratedSqlListAst,
+    ast: generated_parser.GeneratedSqlDdlAst,
 ) !TableCloneOptions {
     var options = TableCloneOptions{};
-    for (items.items) |item| {
+    if (ast.create_table_like_option_action_items.len != ast.create_table_like_option_items.count or
+        ast.create_table_like_option_name_items.len != ast.create_table_like_option_items.count)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    for (ast.create_table_like_option_items.items, 0..) |item, index| {
         if (item.start + 1 > item.end or item.end > tokens.len) return error.UnsupportedSqlShape;
-        const include = if (tokens[item.start].matchesKeyword("including"))
+        const action = ast.create_table_like_option_action_items[index];
+        const name = ast.create_table_like_option_name_items[index];
+        if (action.start != item.start or action.end != item.start + 1 or action.end > tokens.len) return error.UnsupportedSqlShape;
+        if (name.start != action.end or name.end != item.end or name.end > tokens.len) return error.UnsupportedSqlShape;
+        const include = if (tokens[action.start].matchesKeyword("including"))
             true
-        else if (tokens[item.start].matchesKeyword("excluding"))
+        else if (tokens[action.start].matchesKeyword("excluding"))
             false
         else
             return error.UnsupportedSqlShape;
-        try applyGeneratedTableCloneOption(tokens, item.start + 1, item.end, include, &options);
+        try applyGeneratedTableCloneOption(tokens, name.start, name.end, include, &options);
     }
     return options;
 }
@@ -12201,6 +14000,56 @@ fn validateGeneratedCreateTableLikeOptionItems(
     }
 }
 
+fn validateGeneratedCreateTableLikeOptionPayloadItems(
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+) !void {
+    const count = ast.create_table_like_option_items.count;
+    if (count == 0) {
+        if (ast.create_table_like_option_action_items.len != 0 or ast.create_table_like_option_name_items.len != 0) return error.UnsupportedSqlShape;
+        return;
+    }
+    if (ast.create_table_like_option_items.items.len != count or
+        ast.create_table_like_option_action_items.len != count or
+        ast.create_table_like_option_name_items.len != count)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    for (ast.create_table_like_option_items.items, 0..) |item, index| {
+        const expected = generatedCreateTableLikeOptionPayloadRanges(tokens, item) orelse return error.UnsupportedSqlShape;
+        const action = ast.create_table_like_option_action_items[index];
+        const name = ast.create_table_like_option_name_items[index];
+        if (action.end > tokens.len or name.end > tokens.len) return error.UnsupportedSqlShape;
+        if (!std.meta.eql(action, expected.action) or !std.meta.eql(name, expected.name)) return error.UnsupportedSqlShape;
+    }
+}
+
+const GeneratedCreateTableLikeOptionPayloadRanges = struct {
+    action: generated_parser.GeneratedSqlTokenRange,
+    name: generated_parser.GeneratedSqlTokenRange,
+};
+
+fn generatedCreateTableLikeOptionPayloadRanges(
+    tokens: []const grammar.Token,
+    item: generated_parser.GeneratedSqlTokenRange,
+) ?GeneratedCreateTableLikeOptionPayloadRanges {
+    if (item.start >= item.end or item.end > tokens.len) return null;
+    if (!(tokens[item.start].matchesKeyword("including") or tokens[item.start].matchesKeyword("excluding"))) return null;
+    const name_start = item.start + 1;
+    if (name_start >= item.end) return null;
+    const name_end = if (tokens[name_start].matchesKeyword("update")) blk: {
+        if (name_start + 2 != item.end or !tokens[name_start + 1].matchesKeyword("policies")) return null;
+        break :blk item.end;
+    } else blk: {
+        if (name_start + 1 != item.end) return null;
+        break :blk item.end;
+    };
+    return .{
+        .action = .{ .start = item.start, .end = item.start + 1 },
+        .name = .{ .start = name_start, .end = name_end },
+    };
+}
+
 fn validateGeneratedCreateTablePartitionOfMetadata(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
@@ -12286,6 +14135,7 @@ fn validateGeneratedCreatePartitionedTableMetadata(
     const key_range = ast.create_table_partition_key_tokens orelse return error.UnsupportedSqlShape;
     if (key_range.start != keys_open + 1 or key_range.end != keys_close) return error.UnsupportedSqlShape;
     if (ast.create_table_partition_key_items.count != plan.keys.len or ast.create_table_partition_key_items.items.len != plan.keys.len) return error.UnsupportedSqlShape;
+    if (ast.create_table_partition_key_name_items.len != plan.keys.len) return error.UnsupportedSqlShape;
     if (plan.keys.len == 0) return error.UnsupportedSqlShape;
     if (ast.create_table_partition_key_items.first_tokens == null or ast.create_table_partition_key_items.last_tokens == null) return error.UnsupportedSqlShape;
     if (ast.create_table_partition_key_items.first_tokens.?.start != ast.create_table_partition_key_items.items[0].start or
@@ -12296,9 +14146,10 @@ fn validateGeneratedCreatePartitionedTableMetadata(
     const last_key = ast.create_table_partition_key_items.items[plan.keys.len - 1];
     if (ast.create_table_partition_key_items.last_tokens.?.start != last_key.start or ast.create_table_partition_key_items.last_tokens.?.end != last_key.end) return error.UnsupportedSqlShape;
 
-    for (plan.keys, ast.create_table_partition_key_items.items) |expected_key, item| {
+    for (plan.keys, ast.create_table_partition_key_items.items, ast.create_table_partition_key_name_items) |expected_key, item, name| {
         if (item.start < key_range.start or item.end > key_range.end or item.start >= item.end) return error.UnsupportedSqlShape;
-        const generated_key = try generatedIdentifierAlloc(alloc, tokens, item);
+        if (name.start != item.start or name.end != item.end) return error.UnsupportedSqlShape;
+        const generated_key = try generatedIdentifierAlloc(alloc, tokens, name);
         defer alloc.free(@constCast(generated_key));
         if (!std.ascii.eqlIgnoreCase(generated_key, expected_key)) return error.UnsupportedSqlShape;
     }
@@ -12444,7 +14295,7 @@ fn createIndexPlanFromGeneratedAstAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
     ast: generated_parser.GeneratedSqlDdlAst,
-    options: CreateIndexOptions,
+    _: CreateIndexOptions,
 ) !CreateIndexPlan {
     const end = generatedStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
     if (end < 4 or !tokens[0].matchesKeywordTag(.create)) return error.UnsupportedSqlShape;
@@ -12481,21 +14332,9 @@ fn createIndexPlanFromGeneratedAstAlloc(
         }
         if (index != end) return error.UnsupportedSqlShape;
 
-        var state = parser_context.ParserState{
-            .alloc = alloc,
-            .tokens = tokens,
-            .pos = 1,
-            .schema = options.schema,
-            .params = options.params,
-            .function_bindings = options.function_bindings,
-            .field_expression_qualifiers = options.field_expression_qualifiers,
-            .returning_expression_qualifiers = options.returning_expression_qualifiers,
-            .defer_row_expression_field_validation = options.defer_row_expression_field_validation,
-        };
-        var plan = try parseCreateIndexPlanAlloc(alloc, tokens, &state.pos, false, parser_context.ParserState.ContextAccessors.createIndexOptions(&state));
+        var plan = try generatedDerivedCreateIndexPlanAlloc(alloc, tokens, ast, .antfly_full_text);
         errdefer plan.deinit(alloc);
         if (plan.unique or plan.method != .antfly_full_text or plan.index_keys.len != 0 or plan.include_columns.len != 0) return error.UnsupportedSqlShape;
-        if (!generatedStatementConsumedThrough(tokens, end, state.pos)) return error.UnsupportedSqlShape;
         return plan;
     }
 
@@ -12571,22 +14410,9 @@ fn createIndexPlanFromGeneratedAstAlloc(
     }
     if (index != end) return error.UnsupportedSqlShape;
 
-    var state = parser_context.ParserState{
-        .alloc = alloc,
-        .tokens = tokens,
-        .pos = index_keyword,
-        .schema = options.schema,
-        .params = options.params,
-        .function_bindings = options.function_bindings,
-        .field_expression_qualifiers = options.field_expression_qualifiers,
-        .returning_expression_qualifiers = options.returning_expression_qualifiers,
-        .defer_row_expression_field_validation = options.defer_row_expression_field_validation,
-    };
-    var plan = try parseCreateIndexPlanAlloc(alloc, tokens, &state.pos, ast.unique, parser_context.ParserState.ContextAccessors.createIndexOptions(&state));
-    errdefer plan.deinit(alloc);
-    if (plan.unique != ast.unique) return error.UnsupportedSqlShape;
-    if (!generatedStatementConsumedThrough(tokens, end, state.pos)) return error.UnsupportedSqlShape;
-    return plan;
+    if (try generatedCreateIndexPlanAlloc(alloc, tokens, end, ast)) |plan| return plan;
+    _ = index_keyword;
+    return error.UnsupportedSqlShape;
 }
 
 fn alterTablePlanFromGeneratedAstAlloc(
@@ -12609,33 +14435,120 @@ fn alterTablePlanFromGeneratedAstAlloc(
     const operation_range = ast.alter_table_operation_tokens orelse return error.UnsupportedSqlShape;
     if (operation_range.start != index or operation_range.end != end or operation_range.start >= operation_range.end) return error.UnsupportedSqlShape;
     try validateGeneratedAlterTableOperationItems(tokens, operation_range, &ast.alter_table_operation_items);
+    try validateGeneratedAlterTableOperationConstraintPrefixItems(tokens, &ast);
+    try validateGeneratedAlterTableOperationPrimaryUniqueConstraintPayloadItems(tokens, &ast);
+    try validateGeneratedAlterTableOperationForeignKeyConstraintPayloadItems(tokens, &ast);
+    try validateGeneratedAlterTableOperationCheckConstraintPayloadItems(tokens, &ast);
+    try validateGeneratedAlterTableOperationPeriodPayloadItems(tokens, &ast);
+    try validateGeneratedAlterTableOperationColumnDefinitionItems(tokens, &ast);
+    try validateGeneratedAlterTableOperationInlineConstraintPrefixItems(tokens, &ast);
+    try validateGeneratedAlterTableOperationDefaultValueItems(tokens, &ast);
+    try validateGeneratedAlterTableOperationGeneratedExpressionItems(tokens, &ast);
+    try validateGeneratedAlterTableOperationRewriteExpressionItems(tokens, &ast);
 
-    const alter_tokens = tokens[1..end];
-    var state = parser_context.ParserState{
-        .alloc = alloc,
-        .tokens = alter_tokens,
-        .schema = options.schema,
-        .params = options.params,
-        .function_bindings = options.function_bindings,
-        .field_expression_qualifiers = options.field_expression_qualifiers,
-        .returning_expression_qualifiers = options.returning_expression_qualifiers,
-        .defer_row_expression_field_validation = options.defer_row_expression_field_validation,
+    const table_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, table_range);
+    var table_name_transferred = false;
+    errdefer if (!table_name_transferred) alloc.free(table_name);
+
+    var operations = std.ArrayListUnmanaged(AlterTableOperation).empty;
+    errdefer {
+        for (operations.items) |operation| freeAlterTableOperation(alloc, operation);
+        operations.deinit(alloc);
+    }
+    for (ast.alter_table_operation_items.items, 0..) |item, item_index| {
+        const before_len = operations.items.len;
+        const item_tokens = tokens[item.start..item.end];
+        var pos: usize = 0;
+        var local_options = options;
+        local_options.expression_options.generated_scalar_subquery_full_tokens = options.expression_options.generated_scalar_subquery_full_tokens orelse tokens;
+        local_options.expression_options.generated_scalar_subquery_token_offset = if (local_options.expression_options.generated_scalar_subquery_full_tokens) |full_tokens|
+            generatedTokenSliceOffset(full_tokens, item_tokens) orelse return error.UnsupportedSqlShape
+        else
+            item.start;
+        local_options.expression_options.generated_default_value_full_tokens = tokens;
+        local_options.expression_options.generated_default_value_token_offset = item.start;
+        if (ast.alter_table_operation_default_value_items.len != 0) {
+            local_options.expression_options.generated_default_value_tokens = ast.alter_table_operation_default_value_items[item_index];
+        }
+        local_options.generated_constraint_name_full_tokens = tokens;
+        local_options.generated_constraint_token_offset = item.start;
+        if (ast.alter_table_operation_constraint_kind_items.len != 0) {
+            local_options.generated_constraint_name_tokens = ast.alter_table_operation_constraint_name_items[item_index];
+            local_options.generated_constraint_kind_tokens = ast.alter_table_operation_constraint_kind_items[item_index];
+            local_options.generated_constraint_nulls_distinct_tokens = ast.alter_table_operation_constraint_nulls_distinct_items[item_index];
+            local_options.generated_constraint_column_list_tokens = ast.alter_table_operation_constraint_column_list_items[item_index];
+            local_options.generated_constraint_include_tokens = ast.alter_table_operation_constraint_include_items[item_index];
+            local_options.generated_constraint_timing_tokens = ast.alter_table_operation_constraint_timing_items[item_index];
+            local_options.generated_constraint_not_valid_tokens = ast.alter_table_operation_constraint_not_valid_items[item_index];
+            local_options.generated_foreign_key_payload_tokens = ast.alter_table_operation_foreign_key_payload_items[item_index];
+            local_options.generated_foreign_key_not_valid_tokens = ast.alter_table_operation_foreign_key_not_valid_items[item_index];
+            local_options.generated_check_payload_tokens = ast.alter_table_operation_check_payload_items[item_index];
+            local_options.generated_check_not_valid_tokens = ast.alter_table_operation_check_not_valid_items[item_index];
+            local_options.generated_period_payload_tokens = ast.alter_table_operation_period_payload_items[item_index];
+        }
+        local_options.generated_inline_constraint_full_tokens = tokens;
+        local_options.generated_inline_constraint_token_offset = item.start;
+        local_options.generated_inline_constraint_prefix_items = ast.alter_table_operation_inline_constraint_items.items;
+        local_options.generated_inline_constraint_name_items = ast.alter_table_operation_inline_constraint_name_items;
+        local_options.generated_inline_constraint_kind_items = ast.alter_table_operation_inline_constraint_kind_items;
+        local_options.generated_inline_constraint_nulls_distinct_items = ast.alter_table_operation_inline_constraint_nulls_distinct_items;
+        local_options.generated_inline_constraint_include_items = ast.alter_table_operation_inline_constraint_include_items;
+        local_options.generated_inline_constraint_timing_items = ast.alter_table_operation_inline_constraint_timing_items;
+        local_options.generated_inline_constraint_not_valid_items = ast.alter_table_operation_inline_constraint_not_valid_items;
+        local_options.generated_inline_foreign_key_payload_items = ast.alter_table_operation_inline_foreign_key_payload_items;
+        local_options.generated_inline_foreign_key_not_valid_items = ast.alter_table_operation_inline_foreign_key_not_valid_items;
+        local_options.generated_inline_check_payload_items = ast.alter_table_operation_inline_check_payload_items;
+        local_options.generated_inline_check_not_valid_items = ast.alter_table_operation_inline_check_not_valid_items;
+        local_options.generated_column_name_full_tokens = tokens;
+        local_options.generated_column_header_token_offset = item.start;
+        if (ast.alter_table_operation_column_name_items.len != 0) {
+            local_options.generated_column_name_tokens = ast.alter_table_operation_column_name_items[item_index];
+            local_options.generated_column_type_tokens = ast.alter_table_operation_column_type_items[item_index];
+            local_options.generated_column_nullability_tokens = ast.alter_table_operation_column_nullability_items[item_index];
+            local_options.generated_column_collation_tokens = ast.alter_table_operation_column_collation_items[item_index];
+            local_options.generated_column_default_clause_tokens = ast.alter_table_operation_column_default_clause_items[item_index];
+            local_options.generated_column_generated_clause_tokens = ast.alter_table_operation_column_generated_clause_items[item_index];
+        }
+        local_options.generated_column_expression_full_tokens = tokens;
+        local_options.generated_column_expression_token_offset = item.start;
+        local_options.expression_options.generated_column_expression_full_tokens = tokens;
+        local_options.expression_options.generated_column_expression_token_offset = item.start;
+        if (ast.alter_table_operation_generated_expression_items.len != 0) {
+            local_options.generated_column_expression_tokens = ast.alter_table_operation_generated_expression_items[item_index];
+            local_options.expression_options.generated_column_expression_tokens = ast.alter_table_operation_generated_expression_items[item_index];
+            local_options.generated_column_expression_ast = if (ast.alter_table_operation_generated_expression_items[item_index] != null)
+                &ast.alter_table_operation_generated_expressions[item_index]
+            else
+                null;
+            local_options.expression_options.generated_column_expression_ast = local_options.generated_column_expression_ast;
+        }
+        local_options.rewrite_expression_full_tokens = tokens;
+        local_options.rewrite_expression_token_offset = item.start;
+        if (ast.alter_table_operation_rewrite_expression_items.len != 0) {
+            local_options.rewrite_expression_tokens = ast.alter_table_operation_rewrite_expression_items[item_index];
+            local_options.rewrite_expression_ast = if (ast.alter_table_operation_rewrite_expression_items[item_index] != null)
+                &ast.alter_table_operation_rewrite_expressions[item_index]
+            else
+                null;
+        }
+        try parseAlterTableOperationAlloc(alloc, item_tokens, &pos, local_options, &operations);
+        if (pos != item_tokens.len or operations.items.len != before_len + 1) return error.UnsupportedSqlShape;
+        try validateGeneratedAlterTableOperationItemMatchesPlan(tokens, item, operations.items[before_len]);
+    }
+
+    const owned_operations = try operations.toOwnedSlice(alloc);
+    var operations_transferred = false;
+    errdefer if (!operations_transferred) {
+        for (owned_operations) |operation| freeAlterTableOperation(alloc, operation);
+        alloc.free(owned_operations);
     };
-    var local_options = parser_context.ParserState.ContextAccessors.ddlColumnDefinitionOptions(&state);
-    local_options.parse_rewrite_expression = options.parse_rewrite_expression;
-    local_options.expression_options.generated_scalar_subquery_defaults = options.expression_options.generated_scalar_subquery_defaults;
-    local_options.expression_options.require_generated_scalar_subquery_defaults = options.expression_options.require_generated_scalar_subquery_defaults;
-    local_options.expression_options.generated_scalar_subquery_full_tokens = options.expression_options.generated_scalar_subquery_full_tokens;
-    local_options.expression_options.generated_scalar_subquery_token_offset = if (options.expression_options.generated_scalar_subquery_full_tokens) |full_tokens|
-        generatedTokenSliceOffset(full_tokens, alter_tokens) orelse options.expression_options.generated_scalar_subquery_token_offset
-    else
-        options.expression_options.generated_scalar_subquery_token_offset;
-    var plan = try parseAlterTablePlanAlloc(alloc, alter_tokens, &state.pos, local_options);
-    errdefer plan.deinit(alloc);
-    if (plan.if_exists != ast.if_exists) return error.UnsupportedSqlShape;
-    if (state.pos != alter_tokens.len) return error.UnsupportedSqlShape;
-    try validateGeneratedAlterTableOperationItemsMatchPlan(tokens, &ast.alter_table_operation_items, plan.operations);
-    return plan;
+    table_name_transferred = true;
+    operations_transferred = true;
+    return .{
+        .table_name = table_name,
+        .if_exists = ast.if_exists,
+        .operations = owned_operations,
+    };
 }
 
 fn advisoryLockPlanFromGeneratedReadAst(
@@ -12652,10 +14565,104 @@ fn advisoryLockPlanFromGeneratedReadAst(
     }
     const projection = ast.projection_tokens orelse return error.UnsupportedSqlShape;
     if (projection.start != 1 or projection.end != end) return error.UnsupportedSqlShape;
-    var pos: usize = 1;
-    const plan = try parseAdvisoryLockPlanTail(tokens, &pos);
-    if (!generatedStatementConsumedThrough(tokens, end, pos)) return error.UnsupportedSqlShape;
-    return plan;
+    return try advisoryLockPlanFromGeneratedProjectionExpression(tokens, end, ast);
+}
+
+fn advisoryLockPlanFromGeneratedProjectionExpression(
+    tokens: []const grammar.Token,
+    end: usize,
+    ast: *const generated_parser.GeneratedSqlReadAst,
+) !AdvisoryLockPlan {
+    if (ast.projection_items.count != 1 or
+        ast.projection_items.items.len != 1 or
+        ast.projection_items.expression_items.len != 1 or
+        ast.projection_items.expressions.len != 1 or
+        ast.projection_items.alias_items.len != 1 or
+        ast.projection_items.alias_items[0] != null)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    const projection_item = ast.projection_items.items[0];
+    const projection_expression_range = ast.projection_items.expression_items[0];
+    if (projection_item.start != 1 or projection_item.end != end or
+        projection_expression_range.start != projection_item.start or
+        projection_expression_range.end != projection_item.end)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    const expression = ast.projection_items.expressions[0];
+    if (expression.kind != .function_call or
+        expression.tokens == null or
+        expression.function_name_tokens == null or
+        expression.argument_tokens == null or
+        expression.argument_distinct_tokens != null or
+        expression.argument_value_tokens == null or
+        expression.argument_order_tokens != null or
+        expression.within_group_tokens != null or
+        expression.filter_tokens != null or
+        expression.over_tokens != null)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    if (expression.tokens.?.start != projection_expression_range.start or expression.tokens.?.end != projection_expression_range.end) return error.UnsupportedSqlShape;
+    const function_name = expression.function_name_tokens.?;
+    if (function_name.start != projection_expression_range.start or function_name.end != function_name.start + 1 or function_name.end > end) return error.UnsupportedSqlShape;
+    const action: AdvisoryLockAction = if (tokens[function_name.start].matchesKeyword("pg_advisory_lock"))
+        .lock
+    else if (tokens[function_name.start].matchesKeyword("pg_advisory_unlock"))
+        .unlock
+    else
+        return error.UnsupportedSqlShape;
+
+    const arguments = expression.argument_items;
+    if (arguments.count == 0 or arguments.count > 2 or
+        arguments.items.len != arguments.count or
+        arguments.expression_items.len != arguments.count or
+        arguments.expressions.len != arguments.count or
+        (arguments.alias_items.len != 0 and arguments.alias_items.len != arguments.count))
+    {
+        return error.UnsupportedSqlShape;
+    }
+    for (arguments.alias_items) |alias| if (alias != null) return error.UnsupportedSqlShape;
+    const key1 = try generatedAdvisoryLockIntegerArgument(tokens, end, arguments.items[0], arguments.expression_items[0], arguments.expressions[0]);
+    const key2 = if (arguments.count == 2)
+        try generatedAdvisoryLockIntegerArgument(tokens, end, arguments.items[1], arguments.expression_items[1], arguments.expressions[1])
+    else
+        null;
+    return .{
+        .action = action,
+        .key1 = key1,
+        .key2 = key2,
+    };
+}
+
+fn generatedAdvisoryLockIntegerArgument(
+    tokens: []const grammar.Token,
+    end: usize,
+    item_range: generated_parser.GeneratedSqlTokenRange,
+    expression_range: generated_parser.GeneratedSqlTokenRange,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) !i64 {
+    if (item_range.start >= item_range.end or item_range.end > end or
+        expression_range.start != item_range.start or expression_range.end != item_range.end or
+        expression.tokens == null or expression.tokens.?.start != expression_range.start or expression.tokens.?.end != expression_range.end)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    switch (expression.kind) {
+        .token_range, .unary_negative => {},
+        else => return error.UnsupportedSqlShape,
+    }
+    if (item_range.end == item_range.start + 1 and tokens[item_range.start].kind == .number) {
+        if (std.mem.indexOfAny(u8, tokens[item_range.start].text, ".eE") != null) return error.UnsupportedSqlShape;
+        return std.fmt.parseInt(i64, tokens[item_range.start].text, 10) catch return error.UnsupportedSqlShape;
+    }
+    if (item_range.end == item_range.start + 2 and tokens[item_range.start].kind == .minus and tokens[item_range.start + 1].kind == .number) {
+        if (std.mem.indexOfAny(u8, tokens[item_range.start + 1].text, ".eE") != null) return error.UnsupportedSqlShape;
+        const positive = std.fmt.parseInt(i64, tokens[item_range.start + 1].text, 10) catch return error.UnsupportedSqlShape;
+        return std.math.negate(positive) catch return error.UnsupportedSqlShape;
+    }
+    return error.UnsupportedSqlShape;
 }
 
 fn rowSecurityAlterTablePlanFromGeneratedDdlAstAlloc(
@@ -12671,16 +14678,10 @@ fn rowSecurityAlterTablePlanFromGeneratedDdlAstAlloc(
     if (operation_range.start != table_range.end or operation_range.end != end) return error.UnsupportedSqlShape;
     if (!generatedAlterTableUsesRowSecurityRuntimeBoundary(tokens, ast)) return error.UnsupportedSqlShape;
 
-    var pos: usize = 1;
-    var plan = try parseAlterRowSecurityPlanTailAlloc(alloc, tokens, &pos);
-    errdefer plan.deinit(alloc);
-    if (!generatedStatementConsumedThrough(tokens, end, pos)) return error.UnsupportedSqlShape;
-
-    const generated_table_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, table_range);
-    defer alloc.free(@constCast(generated_table_name));
-    if (!std.ascii.eqlIgnoreCase(generated_table_name, plan.table_name)) return error.UnsupportedSqlShape;
-    if (ast.alter_table_row_security_enabled != plan.enabled) return error.UnsupportedSqlShape;
-    return plan;
+    return .{
+        .table_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, table_range),
+        .enabled = ast.alter_table_row_security_enabled orelse return error.UnsupportedSqlShape,
+    };
 }
 
 fn requireGeneratedDdlHeader(
@@ -12868,6 +14869,9 @@ fn validateGeneratedDdlAstCommonPayload(
     try validateGeneratedDdlRangeItems(tokens, end, ast.create_table_document_schema_items.count, ast.create_table_document_schema_name_items);
     try validateGeneratedDdlRangeItems(tokens, end, ast.create_table_document_schema_items.count, ast.create_table_document_schema_format_items);
     try validateGeneratedDdlRangeItems(tokens, end, ast.create_table_document_schema_items.count, ast.create_table_document_schema_json_items);
+    try validateGeneratedDdlRangeItems(tokens, end, ast.create_table_storage_parameter_items.count, ast.create_table_storage_parameter_name_items);
+    try validateGeneratedDdlRangeItems(tokens, end, ast.create_table_storage_parameter_items.count, ast.create_table_storage_parameter_value_items);
+    try validateGeneratedDdlRangeItems(tokens, end, ast.create_table_partition_key_items.count, ast.create_table_partition_key_name_items);
     if (ast.scalar_subquery_default_items.len != ast.scalar_subquery_default_count) return error.UnsupportedSqlShape;
     for (ast.scalar_subquery_default_items) |item| {
         try validateGeneratedDdlRange(tokens, end, item.default_tokens);
@@ -13105,107 +15109,6 @@ fn generatedStatementConsumedThrough(tokens: []const grammar.Token, end: usize, 
         pos == tokens.len;
 }
 
-pub fn closeCursorPortalPlanFromSyntaxAlloc(
-    alloc: std.mem.Allocator,
-    syntax: grammar.NamedOrAllSyntax,
-) !CloseCursorPortalPlan {
-    if (syntax.all) return .{ .all = true };
-    const portal_name = syntax.name orelse return error.UnsupportedSqlShape;
-    return .{ .portal_name = try alloc.dupe(u8, portal_name) };
-}
-
-pub fn commentMetadataPlanFromSyntax(syntax: *grammar.CommentMetadataSyntax) CommentMetadataPlan {
-    const object_name = syntax.object_name;
-    const parent_table_name = syntax.parent_table_name;
-    const argument_count = syntax.argument_count;
-    const comment_json = syntax.comment_json;
-    syntax.object_name = "";
-    syntax.parent_table_name = null;
-    syntax.argument_count = null;
-    syntax.comment_json = null;
-    return .{
-        .target = syntax.target,
-        .object_name = object_name,
-        .parent_table_name = parent_table_name,
-        .argument_count = argument_count,
-        .comment_json = comment_json,
-    };
-}
-
-pub fn securityLabelPlanFromSyntax(syntax: *grammar.SecurityLabelSyntax) SecurityLabelPlan {
-    const object_name = syntax.object_name;
-    const provider_name = syntax.provider_name;
-    const argument_count = syntax.argument_count;
-    const label_json = syntax.label_json;
-    syntax.object_name = "";
-    syntax.provider_name = null;
-    syntax.argument_count = null;
-    syntax.label_json = null;
-    return .{
-        .target = syntax.target,
-        .object_name = object_name,
-        .provider_name = provider_name,
-        .argument_count = argument_count,
-        .label_json = label_json,
-    };
-}
-
-pub fn tableLockPlanFromSyntax(syntax: *grammar.TableLockSyntax) TableLockPlan {
-    const table_names = syntax.table_names;
-    syntax.table_names = &.{};
-    return .{
-        .table_names = table_names,
-        .mode = tableLockModeFromSyntax(syntax.mode),
-    };
-}
-
-pub fn constraintModePlanFromSyntax(syntax: *grammar.ConstraintModeSyntax) ConstraintModePlan {
-    const constraint_names = syntax.constraint_names;
-    syntax.constraint_names = &.{};
-    return .{
-        .all = syntax.all,
-        .constraint_names = constraint_names,
-        .mode = constraintCheckModeFromSyntax(syntax.mode),
-    };
-}
-
-pub fn transactionModePlanFromSyntax(syntax: grammar.TransactionModeSyntax) TransactionModePlan {
-    return .{
-        .starter = transactionModeStarterFromSyntax(syntax.starter),
-        .isolation_level = transactionIsolationLevelFromSyntax(syntax.isolation_level),
-        .access_mode = transactionAccessModeFromSyntax(syntax.access_mode),
-        .deferrable = syntax.deferrable,
-    };
-}
-
-pub fn advisoryLockPlanFromSyntax(syntax: grammar.AdvisoryLockSyntax) AdvisoryLockPlan {
-    return .{
-        .action = advisoryLockActionFromSyntax(syntax.action),
-        .key1 = syntax.key1,
-        .key2 = syntax.key2,
-    };
-}
-
-pub fn tableLockModeFromSyntax(syntax: grammar.TableLockModeSyntax) TableLockMode {
-    return switch (syntax) {
-        .access_share => .access_share,
-        .row_share => .row_share,
-        .row_exclusive => .row_exclusive,
-        .share_update_exclusive => .share_update_exclusive,
-        .share => .share,
-        .share_row_exclusive => .share_row_exclusive,
-        .exclusive => .exclusive,
-        .access_exclusive => .access_exclusive,
-    };
-}
-
-pub fn constraintCheckModeFromSyntax(syntax: grammar.ConstraintCheckModeSyntax) ConstraintCheckMode {
-    return switch (syntax) {
-        .immediate => .immediate,
-        .deferred => .deferred,
-    };
-}
-
 pub const DdlForeignKeyOptions = struct {
     on_delete: runtime_schema.ForeignKeyAction = .restrict,
     on_update: runtime_schema.ForeignKeyAction = .restrict,
@@ -13214,1308 +15117,9 @@ pub const DdlForeignKeyOptions = struct {
     match: runtime_schema.ForeignKeyMatch = .simple,
 };
 
-pub fn ddlForeignKeyOptionsFromSyntax(options: grammar.DdlForeignKeyOptionsSyntax) DdlForeignKeyOptions {
-    return .{
-        .on_delete = ddlForeignKeyActionFromSyntax(options.on_delete),
-        .on_update = ddlForeignKeyActionFromSyntax(options.on_update),
-        .deferrable = options.deferrable,
-        .timing = ddlForeignKeyTimingFromSyntax(options.timing),
-        .match = ddlForeignKeyMatchFromSyntax(options.match),
-    };
-}
-
-pub fn ddlForeignKeyActionFromSyntax(action: grammar.DdlForeignKeyActionSyntax) runtime_schema.ForeignKeyAction {
-    return switch (action) {
-        .restrict => .restrict,
-        .cascade => .cascade,
-        .no_action => .no_action,
-        .set_null => .set_null,
-    };
-}
-
-pub fn ddlForeignKeyTimingFromSyntax(timing: grammar.DdlForeignKeyTimingSyntax) runtime_schema.ForeignKeyTiming {
-    return switch (timing) {
-        .immediate => .immediate,
-        .deferred => .deferred,
-    };
-}
-
-pub fn ddlForeignKeyMatchFromSyntax(match_syntax: grammar.DdlForeignKeyMatchSyntax) runtime_schema.ForeignKeyMatch {
-    return switch (match_syntax) {
-        .simple => .simple,
-        .full => .full,
-    };
-}
-
-pub fn transactionModeStarterToSyntax(starter: TransactionModeStarter) grammar.TransactionModeStarterSyntax {
-    return switch (starter) {
-        .set_transaction => .set_transaction,
-        .start_transaction => .start_transaction,
-        .begin => .begin,
-    };
-}
-
-pub fn transactionModeStarterFromSyntax(syntax: grammar.TransactionModeStarterSyntax) TransactionModeStarter {
-    return switch (syntax) {
-        .set_transaction => .set_transaction,
-        .start_transaction => .start_transaction,
-        .begin => .begin,
-    };
-}
-
-pub fn transactionIsolationLevelFromSyntax(syntax: ?grammar.TransactionIsolationLevelSyntax) ?TransactionIsolationLevel {
-    return switch (syntax orelse return null) {
-        .serializable => .serializable,
-        .repeatable_read => .repeatable_read,
-        .read_committed => .read_committed,
-        .read_uncommitted => .read_uncommitted,
-    };
-}
-
-pub fn transactionAccessModeFromSyntax(syntax: ?grammar.TransactionAccessModeSyntax) ?TransactionAccessMode {
-    return switch (syntax orelse return null) {
-        .read_only => .read_only,
-        .read_write => .read_write,
-    };
-}
-
-pub fn advisoryLockActionFromSyntax(syntax: grammar.AdvisoryLockActionSyntax) AdvisoryLockAction {
-    return switch (syntax) {
-        .lock => .lock,
-        .unlock => .unlock,
-    };
-}
-
-pub fn reindexMaintenanceTargetFromSyntax(syntax: grammar.ReindexMaintenanceTargetSyntax) ReindexMaintenanceTarget {
-    return switch (syntax) {
-        .index => .index,
-        .table => .table,
-        .schema => .schema,
-        .database => .database,
-        .system => .system,
-    };
-}
-
-pub fn bulkIoDirectionFromSyntax(syntax: grammar.BulkIoDirectionSyntax) BulkIoDirection {
-    return switch (syntax) {
-        .from => .from,
-        .to => .to,
-    };
-}
-
-pub fn parseBulkIoPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-    schema: runtime_schema.TableSchema,
-    field_expression_qualifiers: []const []const u8,
-    returning_expression_qualifiers: []const []const u8,
-    defer_row_expression_field_validation: bool,
-) !BulkIoPlan {
-    var syntax = try grammar.parseBulkIoTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    const table_name = syntax.table_name;
-    const columns = syntax.columns;
-    const endpoint_kind = syntax.endpoint_kind;
-    const endpoint = syntax.endpoint;
-    const format = syntax.format;
-    const header = syntax.header;
-    const freeze = syntax.freeze;
-    const on_error = syntax.on_error;
-    const reject_limit = syntax.reject_limit;
-    const log_verbosity = syntax.log_verbosity;
-    const force_quote_all = syntax.force_quote_all;
-    const force_quote_columns = syntax.force_quote_columns;
-    const force_not_null_columns = syntax.force_not_null_columns;
-    const force_null_columns = syntax.force_null_columns;
-    const delimiter = syntax.delimiter;
-    const quote = syntax.quote;
-    const escape = syntax.escape;
-    const null_marker = syntax.null_marker;
-    const default_marker = syntax.default_marker;
-    const encoding = syntax.encoding;
-    const where_expressions = try lower_expr.parseBulkIoWhereExpressionsAlloc(
-        alloc,
-        tokens,
-        pos,
-        schema,
-        field_expression_qualifiers,
-        returning_expression_qualifiers,
-        defer_row_expression_field_validation,
-    );
-    var where_expressions_transferred = false;
-    errdefer if (!where_expressions_transferred) {
-        freeExpressionConditions(alloc, where_expressions);
-        if (where_expressions.len > 0) alloc.free(where_expressions);
-    };
-    syntax.table_name = "";
-    syntax.columns = &.{};
-    syntax.endpoint = "";
-    syntax.format = null;
-    syntax.force_quote_columns = &.{};
-    syntax.force_not_null_columns = &.{};
-    syntax.force_null_columns = &.{};
-    syntax.delimiter = null;
-    syntax.quote = null;
-    syntax.escape = null;
-    syntax.null_marker = null;
-    syntax.default_marker = null;
-    syntax.encoding = null;
-    where_expressions_transferred = true;
-    return .{
-        .direction = bulkIoDirectionFromSyntax(syntax.direction),
-        .table_name = table_name,
-        .columns = columns,
-        .endpoint_kind = endpoint_kind,
-        .endpoint = endpoint,
-        .format = format,
-        .header = header,
-        .freeze = freeze,
-        .on_error = on_error,
-        .reject_limit = reject_limit,
-        .log_verbosity = log_verbosity,
-        .force_quote_all = force_quote_all,
-        .force_quote_columns = force_quote_columns,
-        .force_not_null_columns = force_not_null_columns,
-        .force_null_columns = force_null_columns,
-        .delimiter = delimiter,
-        .quote = quote,
-        .escape = escape,
-        .null_marker = null_marker,
-        .default_marker = default_marker,
-        .encoding = encoding,
-        .where_expressions = where_expressions,
-    };
-}
-
-pub fn privilegeChangeActionToSyntax(action: PrivilegeChangeAction) grammar.PrivilegeChangeActionSyntax {
-    return switch (action) {
-        .grant => .grant,
-        .revoke => .revoke,
-    };
-}
-
-pub fn createRoutinePlanFromSyntax(syntax: *grammar.CreateRoutineSyntax, replace_existing: bool) CreateRoutinePlan {
-    const routine_name = syntax.routine_name;
-    const returns_type = syntax.returns_type;
-    const language = syntax.language;
-    const volatility = syntax.volatility;
-    const security = syntax.security;
-    const null_input = syntax.null_input;
-    const parallel_safety = syntax.parallel_safety;
-    const leakproof = syntax.leakproof;
-    const window = syntax.window;
-    const support_function = syntax.support_function;
-    const transform_types = syntax.transform_types;
-    const settings = syntax.settings;
-    const cost = syntax.cost;
-    const rows = syntax.rows;
-    const body = syntax.body;
-    syntax.routine_name = "";
-    syntax.returns_type = null;
-    syntax.language = null;
-    syntax.support_function = null;
-    syntax.transform_types = &.{};
-    syntax.settings = &.{};
-    syntax.cost = null;
-    syntax.rows = null;
-    syntax.body = null;
-    return .{
-        .kind = routineKindFromSyntax(syntax.kind),
-        .routine_name = routine_name,
-        .replace_existing = replace_existing,
-        .argument_count = syntax.argument_count,
-        .returns_type = returns_type,
-        .language = language,
-        .volatility = volatility,
-        .security = security,
-        .null_input = null_input,
-        .parallel_safety = parallel_safety,
-        .leakproof = leakproof,
-        .window = window,
-        .support_function = support_function,
-        .transform_types = transform_types,
-        .settings = settings,
-        .cost = cost,
-        .rows = rows,
-        .body = body,
-    };
-}
-
-pub fn dropRoutinePlanFromSyntax(syntax: *grammar.DropRoutineSyntax) DropRoutinePlan {
-    const routine_name = syntax.routine_name;
-    syntax.routine_name = "";
-    return .{
-        .kind = routineKindFromSyntax(syntax.kind),
-        .routine_name = routine_name,
-        .if_exists = syntax.if_exists,
-        .argument_count = syntax.argument_count,
-        .cascade = syntax.cascade,
-    };
-}
-
-pub fn createRolePlanFromSyntax(syntax: *grammar.CreateRoleSyntax) CreateRolePlan {
-    const role_name = syntax.role_name;
-    syntax.role_name = "";
-    return .{ .role_name = role_name };
-}
-
-pub fn alterRolePlanFromSyntax(syntax: *grammar.AlterRoleSyntax) AlterRolePlan {
-    const role_name = syntax.role_name;
-    const database_name = syntax.database_name;
-    const operation = syntax.operation;
-    const setting_kind = syntax.setting_kind;
-    const setting_name = syntax.setting_name;
-    const setting_value = syntax.setting_value;
-    syntax.role_name = "";
-    syntax.database_name = null;
-    syntax.setting_name = "";
-    syntax.setting_value = null;
-    return .{
-        .role_name = role_name,
-        .database_name = database_name,
-        .operation = operation,
-        .setting_kind = setting_kind,
-        .setting_name = setting_name,
-        .setting_value = setting_value,
-    };
-}
-
-pub fn dropRolePlanFromSyntax(syntax: *grammar.DropRoleSyntax) DropRolePlan {
-    const role_name = syntax.role_name;
-    syntax.role_name = "";
-    return .{ .role_name = role_name, .if_exists = syntax.if_exists };
-}
-
-pub fn privilegeChangePlanFromSyntax(syntax: *grammar.PrivilegeChangeSyntax) PrivilegeChangePlan {
-    const privileges = syntax.privileges;
-    const object_kind = syntax.object_kind;
-    const object_name = syntax.object_name;
-    const principal_name = syntax.principal_name;
-    const principal_names = syntax.principal_names;
-    syntax.privileges = &.{};
-    syntax.object_kind = "";
-    syntax.object_name = "";
-    syntax.principal_name = "";
-    syntax.principal_names = &.{};
-    return .{
-        .privileges = privileges,
-        .object_kind = object_kind,
-        .object_name = object_name,
-        .principal_name = principal_name,
-        .principal_names = principal_names,
-        .with_grant_option = syntax.with_grant_option,
-        .revoke_grant_option_for = syntax.revoke_grant_option_for,
-        .revoke_cascade = syntax.revoke_cascade,
-    };
-}
-
-pub fn rolePrivilegeChangePlanFromSyntax(syntax: *grammar.RolePrivilegeChangeSyntax) RolePrivilegeChangePlan {
-    const role_names = syntax.role_names;
-    const principal_name = syntax.principal_name;
-    const principal_names = syntax.principal_names;
-    syntax.role_names = &.{};
-    syntax.principal_name = "";
-    syntax.principal_names = &.{};
-    return .{
-        .role_names = role_names,
-        .principal_name = principal_name,
-        .principal_names = principal_names,
-        .with_admin_option = syntax.with_admin_option,
-        .revoke_admin_option_for = syntax.revoke_admin_option_for,
-        .revoke_cascade = syntax.revoke_cascade,
-    };
-}
-
-pub fn defaultPrivilegeChangePlanFromSyntax(syntax: *grammar.DefaultPrivilegeChangeSyntax) DefaultPrivilegeChangePlan {
-    const target_roles = syntax.target_roles;
-    const schema_names = syntax.schema_names;
-    const privileges = syntax.privileges;
-    const object_kind = syntax.object_kind;
-    const principal_name = syntax.principal_name;
-    const principal_names = syntax.principal_names;
-    syntax.target_roles = &.{};
-    syntax.schema_names = &.{};
-    syntax.privileges = &.{};
-    syntax.object_kind = "";
-    syntax.principal_name = "";
-    syntax.principal_names = &.{};
-    return .{
-        .action = switch (syntax.action) {
-            .grant => .grant,
-            .revoke => .revoke,
-        },
-        .target_roles = target_roles,
-        .schema_names = schema_names,
-        .privileges = privileges,
-        .object_kind = object_kind,
-        .principal_name = principal_name,
-        .principal_names = principal_names,
-        .with_grant_option = syntax.with_grant_option,
-        .revoke_grant_option_for = syntax.revoke_grant_option_for,
-        .revoke_cascade = syntax.revoke_cascade,
-    };
-}
-
-pub fn parseCreateRoutinePlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-    replace_existing: bool,
-) !CreateRoutinePlan {
-    var syntax = try grammar.parseCreateRoutineCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return createRoutinePlanFromSyntax(&syntax, replace_existing);
-}
-
-pub fn parseDropRoutinePlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !DropRoutinePlan {
-    var syntax = try grammar.parseDropRoutineCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return dropRoutinePlanFromSyntax(&syntax);
-}
-
-pub fn parseCreateRolePlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !CreateRolePlan {
-    var syntax = try grammar.parseCreateRoleCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return createRolePlanFromSyntax(&syntax);
-}
-
-pub fn parseAlterRolePlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !AlterRolePlan {
-    var syntax = try grammar.parseAlterRoleCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return alterRolePlanFromSyntax(&syntax);
-}
-
-pub fn parseDropRolePlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !DropRolePlan {
-    var syntax = try grammar.parseDropRoleCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return dropRolePlanFromSyntax(&syntax);
-}
-
-pub fn parsePrivilegeChangePlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-    action: PrivilegeChangeAction,
-) !PrivilegeChangePlan {
-    var syntax = try grammar.parsePrivilegeChangeTailAlloc(alloc, tokens, pos, privilegeChangeActionToSyntax(action));
-    errdefer syntax.deinit(alloc);
-    return privilegeChangePlanFromSyntax(&syntax);
-}
-
-pub fn parseRolePrivilegeChangePlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-    action: PrivilegeChangeAction,
-) !RolePrivilegeChangePlan {
-    var syntax = try grammar.parseRolePrivilegeChangeTailAlloc(alloc, tokens, pos, privilegeChangeActionToSyntax(action));
-    errdefer syntax.deinit(alloc);
-    return rolePrivilegeChangePlanFromSyntax(&syntax);
-}
-
-pub fn parseDefaultPrivilegeChangePlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !DefaultPrivilegeChangePlan {
-    var syntax = try grammar.parseDefaultPrivilegeChangeTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return defaultPrivilegeChangePlanFromSyntax(&syntax);
-}
-
-pub fn parseAuthorizationCatalogPrivilegeGrantTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !AuthorizationCatalogPlan {
-    const checkpoint = pos.*;
-    if (parsePrivilegeChangePlanTailAlloc(alloc, tokens, pos, .grant)) |plan| {
-        return .{ .grant_privilege = plan };
-    } else |err| switch (err) {
-        error.UnsupportedSqlShape => pos.* = checkpoint,
-        else => return err,
-    }
-    return .{ .grant_role = try parseRolePrivilegeChangePlanTailAlloc(alloc, tokens, pos, .grant) };
-}
-
-pub fn parseAuthorizationCatalogPrivilegeRevokeTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !AuthorizationCatalogPlan {
-    const checkpoint = pos.*;
-    if (parsePrivilegeChangePlanTailAlloc(alloc, tokens, pos, .revoke)) |plan| {
-        return .{ .revoke_privilege = plan };
-    } else |err| switch (err) {
-        error.UnsupportedSqlShape => pos.* = checkpoint,
-        else => return err,
-    }
-    return .{ .revoke_role = try parseRolePrivilegeChangePlanTailAlloc(alloc, tokens, pos, .revoke) };
-}
-
-pub fn parseCreateSchemaNamespacePlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !CreateSchemaNamespacePlan {
-    var syntax = try grammar.parseCreateSchemaNamespaceCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return createSchemaNamespacePlanFromSyntax(&syntax);
-}
-
-pub fn parseRenameSchemaNamespacePlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !RenameSchemaNamespacePlan {
-    var syntax = try grammar.parseRenameSchemaNamespaceCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return renameSchemaNamespacePlanFromSyntax(&syntax);
-}
-
-pub fn parseDropSchemaNamespacePlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !DropSchemaNamespacePlan {
-    var syntax = try grammar.parseDropSchemaNamespaceCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return dropSchemaNamespacePlanFromSyntax(&syntax);
-}
-
-pub fn parseCreateExtensionPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-    default_namespace_name: []const u8,
-) !CreateExtensionPlan {
-    var syntax = try grammar.parseCreateExtensionCatalogTailAlloc(alloc, tokens, pos);
-    defer syntax.deinit(alloc);
-    return try createExtensionPlanFromSyntax(&syntax, default_namespace_name);
-}
-
-pub fn parseUpdateExtensionPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !UpdateExtensionPlan {
-    var syntax = try grammar.parseUpdateExtensionCatalogTailAlloc(alloc, tokens, pos);
-    defer syntax.deinit(alloc);
-    return updateExtensionPlanFromSyntax(&syntax);
-}
-
-pub fn parseDropExtensionPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !DropExtensionPlan {
-    var syntax = try grammar.parseDropExtensionCatalogTailAlloc(alloc, tokens, pos);
-    defer syntax.deinit(alloc);
-    return dropExtensionPlanFromSyntax(&syntax);
-}
-
-pub fn parseCreateDatabasePlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !CreateDatabasePlan {
-    var syntax = try grammar.parseCreateDatabaseCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return createDatabasePlanFromSyntax(&syntax);
-}
-
-pub fn parseAlterDatabasePlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !AlterDatabasePlan {
-    var syntax = try grammar.parseAlterDatabaseCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return try alterDatabasePlanFromSyntaxAlloc(alloc, &syntax);
-}
-
-pub fn parseDropDatabasePlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !DropDatabasePlan {
-    var syntax = try grammar.parseDropDatabaseCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return dropDatabasePlanFromSyntax(&syntax);
-}
-
-pub fn parseCreateTablespacePlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !CreateTablespacePlan {
-    var syntax = try grammar.parseCreateTablespaceCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return createTablespacePlanFromSyntax(&syntax);
-}
-
-pub fn parseRenameTablespacePlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !RenameTablespacePlan {
-    var syntax = try grammar.parseRenameTablespaceCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return renameTablespacePlanFromSyntax(&syntax);
-}
-
-pub fn parseDropTablespacePlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !DropTablespacePlan {
-    var syntax = try grammar.parseDropTablespaceCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return dropTablespacePlanFromSyntax(&syntax);
-}
-
-pub fn parseListenNotificationPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !ListenNotificationPlan {
-    var syntax = try grammar.parseListenNotificationTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return listenNotificationPlanFromSyntax(&syntax);
-}
-
-pub fn parseNotifyNotificationPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !NotifyNotificationPlan {
-    var syntax = try grammar.parseNotifyNotificationTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return notifyNotificationPlanFromSyntax(&syntax);
-}
-
-pub fn parseUnlistenNotificationPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !UnlistenNotificationPlan {
-    var syntax = try grammar.parseUnlistenNotificationTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return unlistenNotificationPlanFromSyntax(&syntax);
-}
-
-pub fn parseCreatePublicationPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !CreatePublicationPlan {
-    var syntax = try grammar.parseCreatePublicationCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return createPublicationPlanFromSyntax(&syntax);
-}
-
-pub fn parseAlterPublicationPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !AlterPublicationPlan {
-    var syntax = try grammar.parseAlterPublicationCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return alterPublicationPlanFromSyntax(&syntax);
-}
-
-pub fn parseDropPublicationPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !DropPublicationPlan {
-    var syntax = try grammar.parseDropPublicationCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return dropPublicationPlanFromSyntax(&syntax);
-}
-
-pub fn parseCreateSubscriptionPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !CreateSubscriptionPlan {
-    var syntax = try grammar.parseCreateSubscriptionCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return createSubscriptionPlanFromSyntax(&syntax);
-}
-
-pub fn parseAlterSubscriptionPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !AlterSubscriptionPlan {
-    var syntax = try grammar.parseAlterSubscriptionCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return alterSubscriptionPlanFromSyntax(&syntax);
-}
-
-pub fn parseDropSubscriptionPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !DropSubscriptionPlan {
-    var syntax = try grammar.parseDropSubscriptionCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return dropSubscriptionPlanFromSyntax(&syntax);
-}
-
-pub fn parseReindexMaintenancePlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !ReindexMaintenancePlan {
-    var syntax = try grammar.parseReindexMaintenanceTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return reindexMaintenancePlanFromSyntax(&syntax);
-}
-
-pub fn parseClusterMaintenancePlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !ClusterMaintenancePlan {
-    var syntax = try grammar.parseClusterMaintenanceTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return clusterMaintenancePlanFromSyntax(&syntax);
-}
-
-pub fn parsePrepareStatementPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !PrepareStatementPlan {
-    const syntax = try grammar.parsePrepareStatementTailAlloc(alloc, tokens, pos);
-    var plan = try prepareStatementPlanFromSyntaxAlloc(alloc, syntax);
-    errdefer plan.deinit(alloc);
-    if (syntax.subject_token_start != null) return error.UnsupportedSqlShape;
-    return plan;
-}
-
-pub fn parseExecutePreparedStatementPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !ExecutePreparedStatementPlan {
-    const syntax = try grammar.parseExecutePreparedStatementTail(tokens, pos);
-    var plan = try executePreparedStatementPlanFromSyntaxAlloc(alloc, syntax);
-    errdefer plan.deinit(alloc);
-    if (syntax.argument_token_start) |argument_start| {
-        const argument_end = syntax.argument_token_end orelse return error.UnsupportedSqlShape;
-        if (argument_start >= argument_end or argument_end > tokens.len) return error.UnsupportedSqlShape;
-        plan.arguments = try parseExecutePreparedStatementArgumentsAlloc(alloc, tokens[argument_start..argument_end]);
-    }
-    return plan;
-}
-
-pub fn parseDeallocatePreparedStatementPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !DeallocatePreparedStatementPlan {
-    const syntax = try grammar.parseDeallocatePreparedStatementTail(tokens, pos);
-    return try deallocatePreparedStatementPlanFromSyntaxAlloc(alloc, syntax);
-}
-
-pub fn parseDeclareCursorPortalPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !DeclareCursorPortalPlan {
-    const syntax = try grammar.parseDeclareCursorPortalTailAlloc(alloc, tokens, pos);
-    var plan = try declareCursorPortalPlanFromSyntaxAlloc(alloc, syntax);
-    errdefer plan.deinit(alloc);
-    if (syntax.subject_token_start != null) return error.UnsupportedSqlShape;
-    return plan;
-}
-
-pub fn parseFetchCursorPortalPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !FetchCursorPortalPlan {
-    const syntax = try grammar.parseFetchCursorPortalTail(tokens, pos);
-    return try fetchCursorPortalPlanFromSyntaxAlloc(alloc, syntax);
-}
-
-pub fn parseCloseCursorPortalPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !CloseCursorPortalPlan {
-    const syntax = try grammar.parseCloseCursorPortalTail(tokens, pos);
-    return try closeCursorPortalPlanFromSyntaxAlloc(alloc, syntax);
-}
-
-pub fn parseSavepointTransactionPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !SavepointNamePlan {
-    const syntax = try grammar.parseSavepointTransactionTail(tokens, pos);
-    return try savepointNamePlanFromSyntaxAlloc(alloc, syntax);
-}
-
-pub fn parseReleaseSavepointPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !SavepointNamePlan {
-    const syntax = try grammar.parseReleaseSavepointTail(tokens, pos);
-    return try savepointNamePlanFromSyntaxAlloc(alloc, syntax);
-}
-
-pub fn parseRollbackToSavepointPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !SavepointNamePlan {
-    const syntax = try grammar.parseRollbackToSavepointTail(tokens, pos);
-    return try savepointNamePlanFromSyntaxAlloc(alloc, syntax);
-}
-
-pub fn parseCommentMetadataPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !CommentMetadataPlan {
-    var syntax = try grammar.parseCommentMetadataCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return commentMetadataPlanFromSyntax(&syntax);
-}
-
-pub fn parseSecurityLabelPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !SecurityLabelPlan {
-    var syntax = try grammar.parseSecurityLabelCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return securityLabelPlanFromSyntax(&syntax);
-}
-
-pub fn parseTableLockPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !TableLockPlan {
-    var syntax = try grammar.parseTableLockTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return tableLockPlanFromSyntax(&syntax);
-}
-
-pub fn parseConstraintModePlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !ConstraintModePlan {
-    var syntax = try grammar.parseConstraintModeTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return constraintModePlanFromSyntax(&syntax);
-}
-
-pub fn parseTransactionModePlanTail(
-    tokens: []const grammar.Token,
-    pos: *usize,
-    starter: TransactionModeStarter,
-) !TransactionModePlan {
-    const syntax = try grammar.parseTransactionModeTail(tokens, pos, transactionModeStarterToSyntax(starter));
-    return transactionModePlanFromSyntax(syntax);
-}
-
-pub fn parseSetSessionCharacteristicsPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !SetSessionSettingPlan {
-    var cursor = parser.Cursor.init(tokens, pos);
-    try cursor.expectKeyword("session");
-    try cursor.expectKeyword("characteristics");
-    try cursor.expectKeyword("as");
-    const transaction = try parseTransactionModePlanTail(tokens, pos, .begin);
-    if (transaction.isolation_level != null or transaction.deferrable != null) return error.UnsupportedSqlShape;
-    const access_mode = transaction.access_mode orelse return error.UnsupportedSqlShape;
-    const value = switch (access_mode) {
-        .read_only => "on",
-        .read_write => "off",
-    };
-    const name_owned = try alloc.dupe(u8, "default_transaction_read_only");
-    errdefer alloc.free(name_owned);
-    const value_owned = try alloc.dupe(u8, value);
-    errdefer alloc.free(value_owned);
-    return .{
-        .name = name_owned,
-        .value = value_owned,
-        .kind = .runtime,
-        .local = false,
-    };
-}
-
-pub fn parseAdvisoryLockPlanTail(
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !AdvisoryLockPlan {
-    const syntax = try grammar.parseAdvisoryLockTail(tokens, pos);
-    return advisoryLockPlanFromSyntax(syntax);
-}
-
-pub fn parseCreateCollationPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !CreateCollationPlan {
-    var syntax = try grammar.parseCreateCollationCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return createCollationPlanFromSyntax(&syntax);
-}
-
-pub fn parseRenameCollationPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !RenameCollationPlan {
-    var syntax = try grammar.parseRenameCollationCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return renameCollationPlanFromSyntax(&syntax);
-}
-
-pub fn parseDropCollationPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !DropCollationPlan {
-    var syntax = try grammar.parseDropCollationCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return dropCollationPlanFromSyntax(&syntax);
-}
-
-pub fn parseCreateOperatorPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !CreateOperatorPlan {
-    var syntax = try grammar.parseCreateOperatorCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return createOperatorPlanFromSyntax(&syntax);
-}
-
-pub fn parseDropOperatorPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !DropOperatorPlan {
-    var syntax = try grammar.parseDropOperatorCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return dropOperatorPlanFromSyntax(&syntax);
-}
-
-pub fn parseCreateAggregatePlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !CreateAggregatePlan {
-    var syntax = try grammar.parseCreateAggregateCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return createAggregatePlanFromSyntax(&syntax);
-}
-
-pub fn parseDropAggregatePlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !DropAggregatePlan {
-    var syntax = try grammar.parseDropAggregateCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return dropAggregatePlanFromSyntax(&syntax);
-}
-
-pub fn parseCreateCastPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !CreateCastPlan {
-    var syntax = try grammar.parseCreateCastCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return createCastPlanFromSyntax(&syntax);
-}
-
-pub fn parseDropCastPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !DropCastPlan {
-    var syntax = try grammar.parseDropCastCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return dropCastPlanFromSyntax(&syntax);
-}
-
-pub fn parseDropDomainPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !DropDomainPlan {
-    var syntax = try grammar.parseDropDomainCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return dropDomainPlanFromSyntax(&syntax);
-}
-
-pub fn parseAlterDomainPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !AlterDomainPlan {
-    return try grammar.parseAlterDomainCatalogTailAlloc(alloc, tokens, pos);
-}
-
-pub fn parseCreateSequencePlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !CreateSequencePlan {
-    var syntax = try grammar.parseCreateSequenceCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return createSequencePlanFromSyntax(&syntax);
-}
-
-pub fn parseAlterSequencePlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !AlterSequencePlan {
-    var syntax = try grammar.parseAlterSequenceCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return alterSequencePlanFromSyntax(&syntax);
-}
-
-pub fn parseDropSequencePlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !DropSequencePlan {
-    var syntax = try grammar.parseDropSequenceCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return dropSequencePlanFromSyntax(&syntax);
-}
-
-pub fn parseCreateEnumTypePlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !CreateEnumTypePlan {
-    var syntax = try grammar.parseCreateEnumTypeCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return createEnumTypePlanFromSyntax(&syntax);
-}
-
-pub fn parseAlterEnumTypePlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !AddEnumValuePlan {
-    var syntax = try grammar.parseAlterEnumTypeCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return addEnumValuePlanFromSyntax(&syntax);
-}
-
-pub fn parseDropEnumTypePlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !DropEnumTypePlan {
-    var syntax = try grammar.parseDropEnumTypeCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return dropEnumTypePlanFromSyntax(&syntax);
-}
-
-pub fn parseCreateMaterializedViewPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-    replace_existing: bool,
-) !CreateMaterializedViewPlan {
-    var syntax = try grammar.parseCreateMaterializedViewCatalogTailAlloc(alloc, tokens, pos, replace_existing);
-    errdefer syntax.deinit(alloc);
-    return createMaterializedViewPlanFromSyntax(&syntax);
-}
-
-pub fn parseRefreshMaterializedViewPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !RefreshMaterializedViewPlan {
-    var syntax = try grammar.parseRefreshMaterializedViewCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return refreshMaterializedViewPlanFromSyntax(&syntax);
-}
-
-pub fn parseDropMaterializedViewPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !DropMaterializedViewPlan {
-    var syntax = try grammar.parseDropMaterializedViewCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return dropMaterializedViewPlanFromSyntax(&syntax);
-}
-
-pub fn parseCreateViewPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-    replace_existing: bool,
-) !CreateViewPlan {
-    var syntax = try grammar.parseCreateViewCatalogTailAlloc(alloc, tokens, pos, replace_existing);
-    errdefer syntax.deinit(alloc);
-    return createViewPlanFromSyntax(&syntax);
-}
-
-pub fn parseRenameViewPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !RenameViewPlan {
-    var syntax = try grammar.parseRenameViewCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return renameViewPlanFromSyntax(&syntax);
-}
-
-pub fn parseDropViewPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !DropViewPlan {
-    var syntax = try grammar.parseDropViewCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return dropViewPlanFromSyntax(&syntax);
-}
-
-pub fn parseDropTablePlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !DropTablePlan {
-    var syntax = try grammar.parseDropTableCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return dropTablePlanFromSyntax(&syntax);
-}
-
-pub fn parseDropIndexPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !DropIndexPlan {
-    var syntax = try grammar.parseDropIndexCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return dropIndexPlanFromSyntax(&syntax);
-}
-
-pub fn parseDropUpdatePolicyTriggerPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !AlterTablePlan {
-    var syntax = try grammar.parseDropUpdatePolicyTriggerCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return try dropUpdatePolicyTriggerPlanFromSyntaxAlloc(alloc, &syntax);
-}
-
-pub fn parseCreateUpdatePolicyTriggerPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !CreateUpdatePolicyPlan {
-    var syntax = try grammar.parseCreateUpdatePolicyTriggerCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return try createUpdatePolicyTriggerPlanFromSyntaxAlloc(alloc, &syntax);
-}
-
-pub fn parseAlterRowSecurityPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !AlterRowSecurityPlan {
-    const syntax = (try grammar.parseAlterRowSecurity(tokens, pos)) orelse return error.UnsupportedSqlShape;
-    return try alterRowSecurityPlanFromSyntaxAlloc(alloc, syntax);
-}
-
-pub fn parseCreateRowSecurityPolicyPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !CreateRowSecurityPolicyPlan {
-    var syntax = try grammar.parseCreateRowSecurityPolicyCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return createRowSecurityPolicyPlanFromSyntax(&syntax);
-}
-
 pub const RowSecurityPolicyOptions = struct {
     function_bindings: expr_row_parse.SqlFunctionBindings = .{},
 };
-
-pub fn parseCreateRowSecurityPolicyPlanTailAllocWithOptions(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-    options: RowSecurityPolicyOptions,
-) !CreateRowSecurityPolicyPlan {
-    const start = pos.*;
-    return parseCreateRowSecurityPolicyPlanTailAlloc(alloc, tokens, pos) catch |err| {
-        if (err == error.OutOfMemory) return err;
-        pos.* = start;
-        return try parseCreateRowSecurityPolicyExpressionBindingPlanTailAlloc(alloc, tokens, pos, options);
-    };
-}
-
-pub fn parseAlterRowSecurityPolicyPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !AlterRowSecurityPolicyPlan {
-    var syntax = try grammar.parseAlterRowSecurityPolicyCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return alterRowSecurityPolicyPlanFromSyntax(&syntax);
-}
-
-pub fn parseAlterRowSecurityPolicyPlanTailAllocWithOptions(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-    options: RowSecurityPolicyOptions,
-) !AlterRowSecurityPolicyPlan {
-    const start = pos.*;
-    return parseAlterRowSecurityPolicyPlanTailAlloc(alloc, tokens, pos) catch |err| {
-        if (err == error.OutOfMemory) return err;
-        pos.* = start;
-        return try parseAlterRowSecurityPolicyExpressionBindingPlanTailAlloc(alloc, tokens, pos, options);
-    };
-}
-
-fn parseCreateRowSecurityPolicyExpressionBindingPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-    options: RowSecurityPolicyOptions,
-) !CreateRowSecurityPolicyPlan {
-    const cursor = parser.Cursor.init(tokens, pos);
-    try cursor.expectKeyword("policy");
-    const policy_name = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
-    var policy_transferred = false;
-    errdefer if (!policy_transferred) alloc.free(policy_name);
-    try cursor.expectKeyword("on");
-    const table_name = try grammar.parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
-    var table_transferred = false;
-    errdefer if (!table_transferred) alloc.free(table_name);
-    const mode = try grammar.parseOptionalRowSecurityPolicyMode(tokens, pos);
-    const command = try grammar.parseOptionalRowSecurityPolicyCommand(tokens, pos);
-    const role_targets = try grammar.parseOptionalRowSecurityPolicyRoleTargetsAlloc(alloc, tokens, pos);
-    var role_targets_transferred = false;
-    errdefer if (!role_targets_transferred) freeStringSlice(alloc, role_targets);
-    try cursor.expectKeyword("using");
-    var predicate = try parseRowSecurityPolicyExpressionBindingPredicateAlloc(alloc, tokens, pos, options);
-    var predicate_transferred = false;
-    errdefer if (!predicate_transferred) predicate.deinit(alloc);
-    var check_predicate: ?RowSecurityPolicyPredicate = null;
-    var check_predicate_transferred = true;
-    if (cursor.matchKeyword("with")) {
-        try cursor.expectKeyword("check");
-        check_predicate = try parseRowSecurityPolicyExpressionBindingPredicateAlloc(alloc, tokens, pos, options);
-        check_predicate_transferred = false;
-        errdefer if (!check_predicate_transferred) if (check_predicate) |*value| value.deinit(alloc);
-    }
-    try grammar.parseAdapterNoopStatementEnd(tokens, pos);
-
-    policy_transferred = true;
-    table_transferred = true;
-    role_targets_transferred = true;
-    predicate_transferred = true;
-    check_predicate_transferred = true;
-    return .{
-        .policy_name = policy_name,
-        .table_name = table_name,
-        .mode = mode,
-        .command = command,
-        .role_targets = role_targets,
-        .predicate = predicate,
-        .check_predicate = check_predicate,
-    };
-}
-
-fn parseAlterRowSecurityPolicyExpressionBindingPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-    options: RowSecurityPolicyOptions,
-) !AlterRowSecurityPolicyPlan {
-    const cursor = parser.Cursor.init(tokens, pos);
-    try cursor.expectKeyword("policy");
-    const policy_name = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
-    var policy_transferred = false;
-    errdefer if (!policy_transferred) alloc.free(policy_name);
-    try cursor.expectKeyword("on");
-    const table_name = try grammar.parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
-    var table_transferred = false;
-    errdefer if (!table_transferred) alloc.free(table_name);
-    var role_targets_present = false;
-    var role_targets: []const []const u8 = &.{};
-    if (cursor.matchKeyword("to")) {
-        role_targets_present = true;
-        role_targets = try grammar.parseRowSecurityPolicyRoleTargetsAfterToAlloc(alloc, tokens, pos);
-    }
-    var role_targets_transferred = false;
-    errdefer if (!role_targets_transferred) freeStringSlice(alloc, role_targets);
-    var predicate: ?RowSecurityPolicyPredicate = null;
-    var predicate_transferred = true;
-    if (cursor.matchKeyword("using")) {
-        predicate = try parseRowSecurityPolicyExpressionBindingPredicateAlloc(alloc, tokens, pos, options);
-        predicate_transferred = false;
-        errdefer if (!predicate_transferred) if (predicate) |*value| value.deinit(alloc);
-    }
-    var check_predicate: ?RowSecurityPolicyPredicate = null;
-    var check_predicate_transferred = true;
-    if (cursor.matchKeyword("with")) {
-        try cursor.expectKeyword("check");
-        check_predicate = try parseRowSecurityPolicyExpressionBindingPredicateAlloc(alloc, tokens, pos, options);
-        check_predicate_transferred = false;
-        errdefer if (!check_predicate_transferred) if (check_predicate) |*value| value.deinit(alloc);
-    }
-    if (!role_targets_present and predicate == null and check_predicate == null) return error.UnsupportedSqlShape;
-    try grammar.parseAdapterNoopStatementEnd(tokens, pos);
-
-    policy_transferred = true;
-    table_transferred = true;
-    role_targets_transferred = true;
-    predicate_transferred = true;
-    check_predicate_transferred = true;
-    return .{
-        .policy_name = policy_name,
-        .table_name = table_name,
-        .role_targets_present = role_targets_present,
-        .role_targets = role_targets,
-        .predicate = predicate,
-        .check_predicate = check_predicate,
-    };
-}
 
 pub fn parseRowSecurityPolicyExpressionBindingPredicateAlloc(
     alloc: std.mem.Allocator,
@@ -14622,121 +15226,62 @@ fn parseRowSecurityPolicyRoutineCallOperandOrNullAlloc(
     return try expr_row_parse.cloneExpressionSubstitutingRoutineArgsAlloc(alloc, binding.expression, operands.items);
 }
 
-pub fn parseDropRowSecurityPolicyPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !DropRowSecurityPolicyPlan {
-    var syntax = try grammar.parseDropRowSecurityPolicyCatalogTailAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return dropRowSecurityPolicyPlanFromSyntax(&syntax);
-}
-
-pub fn parseCreateTableClonePlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !TableClonePlan {
-    return try grammar.parseCreateTableCloneCatalogTailAlloc(alloc, tokens, pos);
-}
-
-pub fn parseCreateTablePartitionPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !CreateTablePartitionPlan {
-    return try grammar.parseCreateTablePartitionCatalogTailAlloc(alloc, tokens, pos);
-}
-
-pub fn parseCreatePartitionedTablePlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-    create_table: CreateTablePlan,
-) !CreatePartitionedTablePlan {
-    var tail = try grammar.parseCreatePartitionedTableCatalogTailAlloc(alloc, tokens, pos);
-    var tail_transferred = false;
-    errdefer if (!tail_transferred) tail.deinit(alloc);
-    const keys = tail.keys;
-    var keys_transferred = false;
-    errdefer if (!keys_transferred) freeStringSlice(alloc, keys);
-
-    tail.keys = &.{};
-    tail_transferred = true;
-    keys_transferred = true;
-    return .{
-        .create_table = create_table,
-        .method = tail.method,
-        .keys = keys,
-    };
-}
-
-pub fn parseCreatePartitionedTablePlanAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-    hooks: DdlColumnDefinitionOptions,
-) !CreatePartitionedTablePlan {
-    var create_table = try parseCreateTableDefinitionAlloc(alloc, tokens, pos, hooks);
-    var create_table_transferred = false;
-    errdefer if (!create_table_transferred) create_table.deinit(alloc);
-
-    const plan = try parseCreatePartitionedTablePlanTailAlloc(alloc, tokens, pos, create_table);
-    create_table_transferred = true;
-    return plan;
-}
-
-pub fn parseAlterTablePartitionPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !TablePartitionCatalogPlan {
-    return try grammar.parseAlterTablePartitionCatalogTailAlloc(alloc, tokens, pos);
-}
-
-pub fn parseAlterTablePrefixOperationAlloc(
+fn generatedAlterTableSimpleOperationAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
     pos: *usize,
     hooks: DdlColumnDefinitionOptions,
 ) !?AlterTableOperation {
     const cursor = parser.Cursor.init(tokens, pos);
-    if (cursor.peekKeyword("validate")) {
-        var syntax = try grammar.parseAlterTableValidateConstraintOperationAlloc(alloc, tokens, pos);
-        var syntax_transferred = false;
-        errdefer if (!syntax_transferred) syntax.deinit(alloc);
-        const operation = alterTableValidateConstraintOperationFromSyntax(&syntax);
-        syntax_transferred = true;
-        return operation;
+    if (cursor.matchKeyword("validate")) {
+        try cursor.expectKeyword("constraint");
+        return .{ .validate_constraint = try parseGeneratedAlterTableOwnedNameAlloc(alloc, tokens, pos) };
     }
 
-    if (cursor.peekKeyword("rename")) {
-        var syntax = try grammar.parseAlterTableRenameOperationAlloc(alloc, tokens, pos);
-        var syntax_transferred = false;
-        errdefer if (!syntax_transferred) syntax.deinit(alloc);
-        const operation = alterTableRenameOperationFromSyntax(&syntax);
-        syntax_transferred = true;
-        return operation;
+    if (cursor.matchKeyword("rename")) {
+        const target: enum { column, constraint } = if (cursor.matchKeyword("column"))
+            .column
+        else if (cursor.matchKeyword("constraint"))
+            .constraint
+        else
+            .column;
+        const old_name = try parseGeneratedAlterTableOwnedNameAlloc(alloc, tokens, pos);
+        var old_transferred = false;
+        errdefer if (!old_transferred) alloc.free(old_name);
+        try cursor.expectKeyword("to");
+        const new_name = try parseGeneratedAlterTableOwnedNameAlloc(alloc, tokens, pos);
+        errdefer alloc.free(new_name);
+        old_transferred = true;
+        return switch (target) {
+            .column => .{ .rename_column = .{ .old_name = old_name, .new_name = new_name } },
+            .constraint => .{ .rename_constraint = .{ .old_name = old_name, .new_name = new_name } },
+        };
     }
 
-    if (cursor.peekKeyword("drop")) {
-        var syntax = try grammar.parseAlterTableDropOperationAlloc(alloc, tokens, pos);
-        var syntax_transferred = false;
-        errdefer if (!syntax_transferred) syntax.deinit(alloc);
-        const operation = alterTableDropOperationFromSyntax(&syntax);
-        syntax_transferred = true;
-        return operation;
+    if (cursor.matchKeyword("drop")) {
+        const target: enum { column, constraint } = if (cursor.matchKeyword("column"))
+            .column
+        else if (cursor.matchKeyword("constraint"))
+            .constraint
+        else
+            .column;
+        const if_exists = generatedConsumeIfExists(tokens, pos);
+        const name = try parseGeneratedAlterTableOwnedNameAlloc(alloc, tokens, pos);
+        errdefer alloc.free(name);
+        const dependency_mode = generatedDropDependencyMode(tokens, pos, switch (target) {
+            .column => .cascade,
+            .constraint => .restrict,
+        });
+        return switch (target) {
+            .column => .{ .drop_column = .{ .name = name, .if_exists = if_exists, .dependency_mode = dependency_mode } },
+            .constraint => .{ .drop_constraint = .{ .name = name, .if_exists = if_exists, .dependency_mode = dependency_mode } },
+        };
     }
 
     if (!cursor.peekKeyword("alter")) return null;
 
     const nullability_start = pos.*;
-    if (grammar.parseAlterTableColumnNullabilityOperationAlloc(alloc, tokens, pos)) |syntax_value| {
-        var syntax = syntax_value;
-        var syntax_transferred = false;
-        errdefer if (!syntax_transferred) syntax.deinit(alloc);
-        const operation = alterTableColumnNullabilityOperationFromSyntax(&syntax);
-        syntax_transferred = true;
+    if (generatedAlterTableColumnNullabilityOperationAlloc(alloc, tokens, pos)) |operation| {
         return operation;
     } else |err| switch (err) {
         error.UnsupportedSqlShape => pos.* = nullability_start,
@@ -14744,41 +15289,133 @@ pub fn parseAlterTablePrefixOperationAlloc(
     }
 
     const default_start = pos.*;
-    if (grammar.parseAlterTableColumnDefaultOperationAlloc(alloc, tokens, pos)) |syntax_value| {
-        var syntax = syntax_value;
-        var syntax_transferred = false;
-        errdefer if (!syntax_transferred) syntax.deinit(alloc);
-        const default_value: ?runtime_schema.RelationalDefaultValue = if (syntax.action == .set) blk: {
-            const value = try parseDdlDefaultValueUntypedAlloc(alloc, tokens, pos, hooks.expression_options);
-            errdefer alloc.free(value.value_json);
-            break :blk value;
-        } else null;
-        const operation = alterTableColumnDefaultOperationFromSyntax(&syntax, default_value);
-        syntax_transferred = true;
+    if (generatedAlterTableColumnDefaultOperationAlloc(alloc, tokens, pos, hooks.expression_options)) |operation| {
         return operation;
     } else |err| switch (err) {
         error.UnsupportedSqlShape => pos.* = default_start,
         else => return err,
     }
 
-    var type_header = try grammar.parseAlterTableColumnTypeHeaderAlloc(alloc, tokens, pos);
-    var type_header_transferred = false;
-    errdefer if (!type_header_transferred) type_header.deinit(alloc);
-    const ddl_type = try grammar.parseDdlType(tokens, pos);
+    return try generatedAlterTableColumnTypeOperationAlloc(alloc, tokens, pos, hooks);
+}
+
+fn parseGeneratedAlterTableOwnedNameAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) ![]const u8 {
+    const token = parser.matchToken(tokens, pos, .identifier) orelse return error.UnsupportedSqlShape;
+    return try alloc.dupe(u8, token.text);
+}
+
+fn generatedConsumeIfExists(tokens: []const grammar.Token, pos: *usize) bool {
+    const start = pos.*;
+    if (parser.matchKeywordTag(tokens, pos, .@"if") and parser.matchKeywordTag(tokens, pos, .exists)) return true;
+    pos.* = start;
+    return false;
+}
+
+fn generatedDropDependencyMode(tokens: []const grammar.Token, pos: *usize, default_mode: DropDependencyMode) DropDependencyMode {
+    if (parser.matchKeyword(tokens, pos, "cascade")) return .cascade;
+    if (parser.matchKeyword(tokens, pos, "restrict")) return .restrict;
+    return default_mode;
+}
+
+fn generatedAlterTableColumnNameAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) ![]const u8 {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("alter");
+    _ = cursor.matchKeyword("column");
+    return try parseGeneratedAlterTableOwnedNameAlloc(alloc, tokens, pos);
+}
+
+fn generatedAlterTableColumnNullabilityOperationAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !AlterTableOperation {
+    const cursor = parser.Cursor.init(tokens, pos);
+    const column_name = try generatedAlterTableColumnNameAlloc(alloc, tokens, pos);
+    errdefer alloc.free(column_name);
+    if (cursor.matchKeyword("set")) {
+        try cursor.expectKeyword("not");
+        try cursor.expectKeyword("null");
+        return .{ .alter_column_nullability = .{ .column_name = column_name, .nullable = false } };
+    }
+    if (cursor.matchKeyword("drop")) {
+        try cursor.expectKeyword("not");
+        try cursor.expectKeyword("null");
+        return .{ .alter_column_nullability = .{ .column_name = column_name, .nullable = true } };
+    }
+    return error.UnsupportedSqlShape;
+}
+
+fn generatedAlterTableColumnDefaultOperationAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    options: DdlExpressionOptions,
+) !AlterTableOperation {
+    const cursor = parser.Cursor.init(tokens, pos);
+    const column_name = try generatedAlterTableColumnNameAlloc(alloc, tokens, pos);
+    var column_transferred = false;
+    errdefer if (!column_transferred) alloc.free(column_name);
+    if (cursor.matchKeyword("set")) {
+        try cursor.expectKeyword("default");
+        const value = try parseDdlDefaultValueUntypedAlloc(alloc, tokens, pos, options);
+        errdefer alloc.free(value.value_json);
+        column_transferred = true;
+        return .{ .alter_column_default = .{ .column_name = column_name, .default_value = value } };
+    }
+    if (cursor.matchKeyword("drop")) {
+        try cursor.expectKeyword("default");
+        column_transferred = true;
+        return .{ .alter_column_default = .{ .column_name = column_name, .default_value = null } };
+    }
+    return error.UnsupportedSqlShape;
+}
+
+fn generatedAlterTableColumnTypeOperationAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    hooks: DdlColumnDefinitionOptions,
+) !AlterTableOperation {
+    const cursor = parser.Cursor.init(tokens, pos);
+    const column_name = try generatedAlterTableColumnNameAlloc(alloc, tokens, pos);
+    var column_transferred = false;
+    errdefer if (!column_transferred) alloc.free(column_name);
+    if (cursor.matchKeyword("type")) {
+        // Type starts at the current token.
+    } else if (cursor.matchKeyword("set")) {
+        try cursor.expectKeyword("data");
+        try cursor.expectKeyword("type");
+    } else {
+        return error.UnsupportedSqlShape;
+    }
+    const ddl_type = try parseDdlType(tokens, pos);
     const collation = try parseOptionalSupportedDdlCollationAlloc(alloc, tokens, pos, ddl_type.field_type, ddl_type.array_item_type);
     var collation_transferred = false;
     errdefer if (!collation_transferred) if (collation) |value| alloc.free(value);
     var rewrite_expression = try parseOptionalDdlAlterColumnRewriteExpressionAlloc(alloc, tokens, pos, hooks);
     var rewrite_transferred = false;
     errdefer if (!rewrite_transferred) if (rewrite_expression) |*rewrite| rewrite.deinit(alloc);
-    const operation = alterTableColumnTypeOperationFromSyntax(&type_header, ddl_type, collation, rewrite_expression);
-    type_header_transferred = true;
+    column_transferred = true;
     collation_transferred = true;
     rewrite_transferred = true;
-    return operation;
+    return .{ .alter_column_type = .{
+        .column_name = column_name,
+        .field_type = ddl_type.field_type,
+        .array_item_type = ddl_type.array_item_type,
+        .collation = collation,
+        .rewrite_expression = rewrite_expression,
+    } };
 }
 
-pub fn parseAlterTableAddColumnOperationAlloc(
+fn parseAlterTableAddColumnOperationAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
     pos: *usize,
@@ -14808,35 +15445,35 @@ pub fn parseAlterTableAddColumnOperationAlloc(
     }
 
     while (!cursor.atEnd() and !cursor.peekKind(.comma) and !cursor.peekKind(.semicolon)) {
-        var constraint_prefix = try grammar.parseCreateTableColumnConstraintPrefixAlloc(alloc, tokens, pos);
+        var constraint_prefix = try generatedCreateTableColumnConstraintPrefixAlloc(alloc, tokens, pos, hooks);
         defer constraint_prefix.deinit(alloc);
         const constraint_name = constraint_prefix.constraint_name;
         if (constraint_prefix.kind == .primary_key) {
             return error.UnsupportedSqlShape;
         } else if (constraint_prefix.kind == .unique and cursor.matchKeyword("unique")) {
-            const nulls_not_distinct = (try grammar.parseOptionalDdlUniqueNullsDistinct(tokens, pos)) orelse false;
-            const include_columns = try grammar.parseOptionalDdlConstraintIncludeUniqueAlloc(alloc, tokens, pos, &.{column.name});
+            const nulls_not_distinct = (try parseGeneratedInlineOptionalDdlUniqueNullsDistinct(tokens, pos, hooks, constraint_prefix.retained_inline_index)) orelse false;
+            const include_columns = try parseGeneratedInlineOptionalDdlConstraintIncludeUniqueAlloc(alloc, tokens, pos, &.{column.name}, hooks, constraint_prefix.retained_inline_index);
             defer freeStringSlice(alloc, include_columns);
-            const timing = try grammar.parseOptionalDdlConstraintTiming(tokens, pos);
+            const timing = try parseGeneratedInlineOptionalDdlConstraintTiming(tokens, pos, hooks, constraint_prefix.retained_inline_index);
             var constraint = try makeDdlUniqueConstraintAlloc(alloc, constraint_name, &.{column.name}, include_columns, null, nulls_not_distinct, timing);
             var constraint_transferred = false;
             errdefer if (!constraint_transferred) freeDdlUniqueConstraint(alloc, constraint);
-            constraint.validation_state = alterTableAddedUniqueValidationState(tokens, pos, timing);
+            constraint.validation_state = try alterTableAddedUniqueValidationState(tokens, pos, timing, hooks, constraint_prefix.retained_inline_index);
             try unique_constraints.append(alloc, constraint);
             constraint_transferred = true;
         } else if (constraint_prefix.kind == .check and cursor.matchKeyword("check")) {
-            var check = try parseDdlCheckConstraintAlloc(alloc, tokens, pos, constraint_name, hooks.expression_options);
+            var check = try parseGeneratedDdlCheckConstraintAlloc(alloc, tokens, pos, constraint_name, hooks.expression_options, hooks, constraint_prefix.retained_inline_index);
             var check_transferred = false;
             errdefer if (!check_transferred) freeDdlRelationalCheck(alloc, check);
-            _ = grammar.consumeOptionalDdlNotValid(tokens, pos);
+            _ = try parseGeneratedOptionalDdlCheckNotValid(tokens, pos, hooks, constraint_prefix.retained_inline_index);
             check.validation_state = .unvalidated;
             try checks.append(alloc, check);
             check_transferred = true;
         } else if (constraint_prefix.kind == .references and cursor.matchKeyword("references")) {
-            var foreign_key = try parseDdlInlineForeignKeyConstraintAlloc(alloc, tokens, pos, column.name, constraint_name);
+            var foreign_key = try parseGeneratedDdlInlineForeignKeyConstraintAlloc(alloc, tokens, pos, column.name, constraint_name, hooks, constraint_prefix.retained_inline_index);
             var foreign_key_transferred = false;
             errdefer if (!foreign_key_transferred) freeDdlForeignKey(alloc, foreign_key);
-            _ = grammar.consumeOptionalDdlNotValid(tokens, pos);
+            _ = try parseGeneratedOptionalDdlInlineForeignKeyNotValid(tokens, pos, hooks, constraint_prefix.retained_inline_index);
             foreign_key.validation_state = .unvalidated;
             try foreign_keys.append(alloc, foreign_key);
             foreign_key_transferred = true;
@@ -14868,7 +15505,111 @@ pub fn parseAlterTableAddColumnOperationAlloc(
     checks_transferred = true;
 }
 
-pub fn parseAlterTableOperationAlloc(
+const GeneratedAlterTableAddOperationKind = enum {
+    period,
+    primary_key,
+    unique,
+    foreign_key,
+    check,
+};
+
+const GeneratedAlterTableAddOperationPrefix = struct {
+    kind: GeneratedAlterTableAddOperationKind,
+    constraint_name: ?[]const u8 = null,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.constraint_name) |name| alloc.free(name);
+        self.* = undefined;
+    }
+};
+
+fn generatedAlterTableAddColumnHeader(tokens: []const grammar.Token, pos: *usize) !bool {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("add");
+    try cursor.expectKeyword("column");
+    return try generatedOptionalIfNotExists(cursor);
+}
+
+fn generatedOptionalIfNotExists(cursor: parser.Cursor) !bool {
+    if (!cursor.matchKeyword("if")) return false;
+    try cursor.expectKeyword("not");
+    try cursor.expectKeyword("exists");
+    return true;
+}
+
+fn generatedAlterTableAddOperationPrefixAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    hooks: DdlColumnDefinitionOptions,
+) !GeneratedAlterTableAddOperationPrefix {
+    if (hooks.generated_constraint_name_full_tokens) |full_tokens| {
+        const kind_range = hooks.generated_constraint_kind_tokens orelse return error.UnsupportedSqlShape;
+        if (kind_range.start < hooks.generated_constraint_token_offset or kind_range.end > full_tokens.len) return error.UnsupportedSqlShape;
+        const local_kind_start = kind_range.start - hooks.generated_constraint_token_offset;
+        const local_kind_end = kind_range.end - hooks.generated_constraint_token_offset;
+        if (local_kind_end > tokens.len or local_kind_start <= pos.*) return error.UnsupportedSqlShape;
+        if (!tokens[pos.*].matchesKeyword("add")) return error.UnsupportedSqlShape;
+        if (local_kind_start == pos.* + 1) {
+            if (hooks.generated_constraint_name_tokens != null) return error.UnsupportedSqlShape;
+        } else {
+            const name_range = hooks.generated_constraint_name_tokens orelse return error.UnsupportedSqlShape;
+            if (name_range.start < hooks.generated_constraint_token_offset or name_range.end > full_tokens.len) return error.UnsupportedSqlShape;
+            const local_name_start = name_range.start - hooks.generated_constraint_token_offset;
+            const local_name_end = name_range.end - hooks.generated_constraint_token_offset;
+            if (local_name_end > tokens.len or local_name_end != local_name_start + 1) return error.UnsupportedSqlShape;
+            if (local_name_start != pos.* + 2 or !tokens[pos.* + 1].matchesKeywordTag(.constraint)) return error.UnsupportedSqlShape;
+            if (local_kind_start != local_name_end) return error.UnsupportedSqlShape;
+        }
+        const kind = try generatedAlterTableAddOperationKindFromRange(tokens[local_kind_start..local_kind_end]);
+        const constraint_name = if (hooks.generated_constraint_name_tokens) |name_range|
+            try generatedIdentifierAlloc(alloc, full_tokens, name_range)
+        else
+            null;
+        pos.* = local_kind_start;
+        return .{ .kind = kind, .constraint_name = constraint_name };
+    }
+
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("add");
+    if (cursor.matchKeyword("period")) return .{ .kind = .period };
+
+    const constraint_name: ?[]const u8 = if (cursor.matchKeyword("constraint"))
+        try parseGeneratedAlterTableOwnedNameAlloc(alloc, tokens, pos)
+    else
+        null;
+    var constraint_name_transferred = false;
+    errdefer if (!constraint_name_transferred) if (constraint_name) |name| alloc.free(name);
+
+    const kind: GeneratedAlterTableAddOperationKind = if (cursor.peekKeyword("primary")) blk: {
+        break :blk .primary_key;
+    } else if (cursor.peekKeyword("unique")) blk: {
+        break :blk .unique;
+    } else if (cursor.peekKeyword("foreign")) blk: {
+        break :blk .foreign_key;
+    } else if (cursor.peekKeyword("check")) blk: {
+        break :blk .check;
+    } else {
+        return error.UnsupportedSqlShape;
+    };
+
+    constraint_name_transferred = true;
+    return .{ .kind = kind, .constraint_name = constraint_name };
+}
+
+fn generatedAlterTableAddOperationKindFromRange(tokens: []const grammar.Token) !GeneratedAlterTableAddOperationKind {
+    if (tokens.len == 1) {
+        if (tokens[0].matchesKeyword("period")) return .period;
+        if (tokens[0].matchesKeyword("unique")) return .unique;
+        if (tokens[0].matchesKeyword("check")) return .check;
+    } else if (tokens.len == 2 and tokens[1].matchesKeyword("key")) {
+        if (tokens[0].matchesKeyword("primary")) return .primary_key;
+        if (tokens[0].matchesKeyword("foreign")) return .foreign_key;
+    }
+    return error.UnsupportedSqlShape;
+}
+
+fn parseAlterTableOperationAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
     pos: *usize,
@@ -14876,59 +15617,60 @@ pub fn parseAlterTableOperationAlloc(
     operations: *std.ArrayListUnmanaged(AlterTableOperation),
 ) !void {
     const cursor = parser.Cursor.init(tokens, pos);
-    if (try parseAlterTablePrefixOperationAlloc(alloc, tokens, pos, hooks)) |operation| {
+    if (try generatedAlterTableSimpleOperationAlloc(alloc, tokens, pos, hooks)) |operation| {
         try appendAlterTableOperation(alloc, operations, operation);
         return;
     }
 
     const add_column_start = pos.*;
-    if (grammar.parseAlterTableAddColumnHeader(tokens, pos)) |syntax| {
-        try parseAlterTableAddColumnOperationAlloc(alloc, tokens, pos, hooks, operations, syntax.if_not_exists);
+    if (generatedAlterTableAddColumnHeader(tokens, pos)) |if_not_exists| {
+        try parseAlterTableAddColumnOperationAlloc(alloc, tokens, pos, hooks, operations, if_not_exists);
         return;
     } else |err| switch (err) {
         error.UnsupportedSqlShape => pos.* = add_column_start,
     }
 
-    var add_prefix = try grammar.parseAlterTableAddOperationPrefixAlloc(alloc, tokens, pos);
+    var add_prefix = try generatedAlterTableAddOperationPrefixAlloc(alloc, tokens, pos, hooks);
     defer add_prefix.deinit(alloc);
     const constraint_name = add_prefix.constraint_name;
     if (add_prefix.kind == .period) {
-        const period = try parseDdlPeriodConstraintPlanAlloc(alloc, tokens, pos);
+        _ = cursor.matchKeyword("period");
+        const period = try parseGeneratedDdlPeriodConstraintPlanAlloc(alloc, tokens, pos, hooks);
         try appendAlterTableOperation(alloc, operations, alterTableAddPeriodOperation(period));
         return;
     }
     if (add_prefix.kind == .primary_key and cursor.matchKeyword("primary")) {
         try cursor.expectKeyword("key");
-        const columns = try grammar.parseDdlUniqueTemporalColumnListAlloc(alloc, tokens, pos);
+        const columns = try parseGeneratedDdlUniqueTemporalColumnListAlloc(alloc, tokens, pos, hooks);
         defer columns.deinit(alloc);
-        const include_columns = try grammar.parseOptionalDdlConstraintIncludeUniqueAlloc(alloc, tokens, pos, columns.columns);
+        const include_columns = try parseGeneratedOptionalDdlConstraintIncludeUniqueAlloc(alloc, tokens, pos, columns.columns, hooks);
         defer freeStringSlice(alloc, include_columns);
-        const timing = try grammar.parseOptionalDdlConstraintTiming(tokens, pos);
+        const timing = try parseGeneratedOptionalDdlConstraintTiming(tokens, pos, hooks);
         const primary_key = try makeDdlPrimaryKeyAlloc(alloc, constraint_name, columns.columns, include_columns, columns.without_overlaps_period, timing);
         try appendAlterTableOperation(alloc, operations, alterTableAddPrimaryKeyOperation(primary_key));
         return;
     }
     if (add_prefix.kind == .unique and cursor.matchKeyword("unique")) {
-        const nulls_not_distinct = (try grammar.parseOptionalDdlUniqueNullsDistinct(tokens, pos)) orelse false;
-        const columns = try grammar.parseDdlUniqueTemporalColumnListAlloc(alloc, tokens, pos);
+        const nulls_not_distinct = (try parseGeneratedOptionalDdlUniqueNullsDistinct(tokens, pos, hooks)) orelse false;
+        const columns = try parseGeneratedDdlUniqueTemporalColumnListAlloc(alloc, tokens, pos, hooks);
         defer columns.deinit(alloc);
-        const include_columns = try grammar.parseOptionalDdlConstraintIncludeUniqueAlloc(alloc, tokens, pos, columns.columns);
+        const include_columns = try parseGeneratedOptionalDdlConstraintIncludeUniqueAlloc(alloc, tokens, pos, columns.columns, hooks);
         defer freeStringSlice(alloc, include_columns);
-        const timing = try grammar.parseOptionalDdlConstraintTiming(tokens, pos);
+        const timing = try parseGeneratedOptionalDdlConstraintTiming(tokens, pos, hooks);
         var constraint = try makeDdlUniqueConstraintAlloc(alloc, constraint_name, columns.columns, include_columns, columns.without_overlaps_period, nulls_not_distinct, timing);
-        constraint.validation_state = alterTableAddedUniqueValidationState(tokens, pos, timing);
+        constraint.validation_state = try alterTableAddedUniqueValidationState(tokens, pos, timing, hooks, null);
         try appendAlterTableOperation(alloc, operations, alterTableAddUniqueConstraintOperation(constraint));
         return;
     }
     if (add_prefix.kind == .foreign_key and cursor.matchKeyword("foreign")) {
-        var foreign_key = try parseDdlForeignKeyConstraintAlloc(alloc, tokens, pos, constraint_name);
-        foreign_key.validation_state = if (grammar.consumeOptionalDdlNotValid(tokens, pos)) .unvalidated else .unvalidated;
+        var foreign_key = try parseGeneratedDdlForeignKeyConstraintAlloc(alloc, tokens, pos, constraint_name, hooks);
+        foreign_key.validation_state = if (try parseGeneratedOptionalDdlForeignKeyNotValid(tokens, pos, hooks)) .unvalidated else .unvalidated;
         try appendAlterTableOperation(alloc, operations, alterTableAddForeignKeyOperation(foreign_key));
         return;
     }
     if (add_prefix.kind == .check and cursor.matchKeyword("check")) {
-        var check = try parseDdlCheckConstraintAlloc(alloc, tokens, pos, constraint_name, hooks.expression_options);
-        _ = grammar.consumeOptionalDdlNotValid(tokens, pos);
+        var check = try parseGeneratedDdlCheckConstraintAlloc(alloc, tokens, pos, constraint_name, hooks.expression_options, hooks, null);
+        _ = try parseGeneratedOptionalDdlCheckNotValid(tokens, pos, hooks, null);
         check.validation_state = .unvalidated;
         try appendAlterTableOperation(alloc, operations, alterTableAddCheckOperation(check));
         return;
@@ -14937,389 +15679,1147 @@ pub fn parseAlterTableOperationAlloc(
     return error.UnsupportedSqlShape;
 }
 
-pub fn parseAlterTablePlanAlloc(
-    alloc: std.mem.Allocator,
+fn parseIdentityAllocatorSpecAlloc(
     tokens: []const grammar.Token,
     pos: *usize,
-    hooks: DdlColumnDefinitionOptions,
-) !AlterTablePlan {
+) !IdentityAllocatorSpec {
     const cursor = parser.Cursor.init(tokens, pos);
-    var header = try grammar.parseAlterTableHeaderAlloc(alloc, tokens, pos);
-    var header_transferred = false;
-    errdefer if (!header_transferred) header.deinit(alloc);
+    if (cursor.matchKeyword("serial")) return .{ .kind = .serial };
+    if (cursor.matchKeyword("bigserial")) return .{ .kind = .bigserial };
 
-    var operations = std.ArrayListUnmanaged(AlterTableOperation).empty;
-    errdefer {
-        for (operations.items) |operation| freeAlterTableOperation(alloc, operation);
-        operations.deinit(alloc);
-    }
-    while (true) {
-        try parseAlterTableOperationAlloc(alloc, tokens, pos, hooks, &operations);
-        if (cursor.matchToken(.comma) == null) break;
-    }
-    try grammar.parseAdapterNoopStatementEnd(tokens, pos);
-
-    const owned_operations = try operations.toOwnedSlice(alloc);
-    var operations_transferred = false;
-    errdefer if (!operations_transferred) {
-        for (owned_operations) |operation| freeAlterTableOperation(alloc, operation);
-        alloc.free(owned_operations);
+    const ddl_type = try parseDdlType(tokens, pos);
+    if (ddl_type.field_type != .numeric) return error.UnsupportedSqlShape;
+    try cursor.expectKeyword("generated");
+    const kind: IdentityAllocatorKind = if (cursor.matchKeyword("always"))
+        .generated_always
+    else blk: {
+        try cursor.expectKeyword("by");
+        try cursor.expectKeyword("default");
+        break :blk .generated_by_default;
     };
-    header_transferred = true;
-    operations_transferred = true;
-    return .{
-        .table_name = header.table_name,
-        .if_exists = header.if_exists,
-        .operations = owned_operations,
-    };
-}
+    try cursor.expectKeyword("as");
+    try cursor.expectKeyword("identity");
 
-pub fn parseIdentityAllocatorPlanAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-    hooks: DdlColumnDefinitionOptions,
-) !IdentityAllocatorPlan {
-    const cursor = parser.Cursor.init(tokens, pos);
-    if (cursor.matchKeyword("temporary") or cursor.matchKeyword("temp") or cursor.matchKeyword("unlogged")) return error.UnsupportedSqlShape;
-    var header = try grammar.parseIdentityAllocatorTableHeaderAlloc(alloc, tokens, pos);
-    var header_transferred = false;
-    errdefer if (!header_transferred) header.deinit(alloc);
-    const column_name = header.column_name;
-    const path = try alloc.dupe(u8, column_name);
-    var path_transferred = false;
-    errdefer if (!path_transferred) alloc.free(path);
-
-    var identity = try grammar.parseIdentityAllocatorSpecAlloc(alloc, tokens, pos);
-    var identity_transferred = false;
-    errdefer if (!identity_transferred) identity.deinit(alloc);
-    var primary_key = false;
-    if (cursor.matchKeyword("primary")) {
-        try cursor.expectKeyword("key");
-        primary_key = true;
-    }
-
-    const column: runtime_schema.RelationalColumn = .{
-        .name = column_name,
-        .path = path,
-        .field_type = .numeric,
-        .nullable = !primary_key,
-    };
-    var column_transferred = false;
-    errdefer if (!column_transferred) freeDdlRelationalColumn(alloc, column);
-
-    var additional_columns = std.ArrayListUnmanaged(runtime_schema.RelationalColumn).empty;
-    errdefer {
-        clearDdlRelationalColumns(alloc, additional_columns.items);
-        additional_columns.deinit(alloc);
-    }
-    while (cursor.matchToken(.comma) != null) {
-        if (cursor.peekKeyword("constraint") or cursor.peekKeyword("primary") or cursor.peekKeyword("unique") or cursor.peekKeyword("foreign") or cursor.peekKeyword("check") or cursor.peekKeyword("period")) return error.UnsupportedSqlShape;
-        const additional = try parseDdlColumnDefinitionStandaloneAlloc(alloc, tokens, pos, hooks);
-        var additional_transferred = false;
-        errdefer if (!additional_transferred) freeDdlRelationalColumn(alloc, additional);
-        try additional_columns.append(alloc, additional);
-        additional_transferred = true;
-    }
-    try cursor.expectToken(.rparen);
-    try grammar.parseAdapterNoopStatementEnd(tokens, pos);
-
-    const owned_additional_columns = try additional_columns.toOwnedSlice(alloc);
-    var additional_columns_transferred = false;
-    errdefer if (!additional_columns_transferred) {
-        clearDdlRelationalColumns(alloc, owned_additional_columns);
-        alloc.free(owned_additional_columns);
-    };
-
-    header_transferred = true;
-    path_transferred = true;
-    column_transferred = true;
-    identity_transferred = true;
-    additional_columns_transferred = true;
-    return .{
-        .table_name = header.table_name,
-        .column = column,
-        .kind = identity.kind,
-        .options = identity.options,
-        .primary_key = primary_key,
-        .additional_columns = owned_additional_columns,
-    };
-}
-
-pub fn parseCreateGraphIndexPlanAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !CreateIndexPlan {
-    const cursor = parser.Cursor.init(tokens, pos);
-    try cursor.expectKeyword("graph");
-    try cursor.expectKeyword("index");
-    const if_not_exists = if (cursor.matchKeyword("if")) blk: {
-        try cursor.expectKeyword("not");
-        try cursor.expectKeyword("exists");
-        break :blk true;
-    } else false;
-    const index_name = try grammar.parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
-    var index_transferred = false;
-    errdefer if (!index_transferred) alloc.free(index_name);
-    try cursor.expectKeyword("on");
-    const table_name = try grammar.parseSqlTableReferenceIdentifierOwnedAlloc(alloc, tokens, pos);
-    var table_transferred = false;
-    errdefer if (!table_transferred) alloc.free(table_name);
-    if (cursor.peekKeyword("source")) {
-        return try parseCreateGraphExtractionIndexPlanTailAlloc(alloc, tokens, pos, index_name, &index_transferred, table_name, &table_transferred, if_not_exists);
-    }
-    try cursor.expectKeyword("edge");
-    try cursor.expectToken(.lparen);
-    const source_field = try parseDerivedIndexFieldPathAlloc(alloc, tokens, pos);
-    var source_transferred = false;
-    errdefer if (!source_transferred) alloc.free(source_field);
-    _ = cursor.matchToken(.arrow_json) orelse return error.UnsupportedSqlShape;
-    const target_field = try parseDerivedIndexFieldPathAlloc(alloc, tokens, pos);
-    var target_transferred = false;
-    errdefer if (!target_transferred) alloc.free(target_field);
-    try cursor.expectToken(.rparen);
-
-    var type_field: ?[]const u8 = null;
-    defer if (type_field) |field| alloc.free(field);
-    var weight_field: ?[]const u8 = null;
-    defer if (weight_field) |field| alloc.free(field);
-    while (true) {
-        if (cursor.matchKeyword("type")) {
-            if (type_field != null) return error.UnsupportedSqlShape;
-            type_field = try parseDerivedIndexFieldPathAlloc(alloc, tokens, pos);
-            continue;
+    var options: SequenceOptions = .{};
+    if (cursor.matchToken(.lparen) != null) {
+        while (!cursor.peekKind(.rparen)) {
+            try parseIdentitySequenceOption(cursor, &options);
         }
-        if (cursor.matchKeyword("weight")) {
-            if (weight_field != null) return error.UnsupportedSqlShape;
-            weight_field = try parseDerivedIndexFieldPathAlloc(alloc, tokens, pos);
-            continue;
-        }
-        break;
+        try cursor.expectToken(.rparen);
     }
-
-    const config_json = try graphIndexConfigJsonAlloc(alloc, tokens, pos, source_field, target_field, type_field, weight_field);
-    var config_transferred = false;
-    errdefer if (!config_transferred) alloc.free(config_json);
-    try grammar.parseAdapterNoopStatementEnd(tokens, pos);
-
-    const columns = try alloc.alloc([]const u8, 2);
-    var columns_transferred = false;
-    errdefer if (!columns_transferred) {
-        alloc.free(columns);
-    };
-    columns[0] = source_field;
-    columns[1] = target_field;
-
-    index_transferred = true;
-    table_transferred = true;
-    source_transferred = true;
-    target_transferred = true;
-    config_transferred = true;
-    columns_transferred = true;
-    return .{
-        .index_name = index_name,
-        .table_name = table_name,
-        .if_not_exists = if_not_exists,
-        .unique = false,
-        .method = .antfly_graph,
-        .columns = columns,
-        .derived_index_config_json = config_json,
-    };
+    return .{ .kind = kind, .options = options };
 }
 
-fn parseCreateGraphExtractionIndexPlanTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-    index_name: []const u8,
-    index_transferred: *bool,
-    table_name: []const u8,
-    table_transferred: *bool,
-    if_not_exists: bool,
-) !CreateIndexPlan {
-    const cursor = parser.Cursor.init(tokens, pos);
-    try cursor.expectKeyword("source");
-    try cursor.expectKeyword("enrichment");
-    const enrichment_name = try grammar.parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
-    defer alloc.free(enrichment_name);
-    try cursor.expectKeyword("from");
-    const input_field = try parseDerivedIndexFieldPathAlloc(alloc, tokens, pos);
-    var input_transferred = false;
-    errdefer if (!input_transferred) alloc.free(input_field);
-    try cursor.expectKeyword("using");
-    const extractor_token = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
-    if (!std.ascii.eqlIgnoreCase(extractor_token.text, "extractor")) return error.UnsupportedSqlShape;
-    try cursor.expectKeyword("model");
-    const model_token = cursor.matchToken(.string) orelse cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
-    try cursor.expectKeyword("edges");
-    try cursor.expectKeyword("json_path");
-    const path_token = cursor.matchToken(.string) orelse return error.UnsupportedSqlShape;
-    try cursor.expectKeyword("source");
-    const source_path = try parseDerivedIndexFieldPathAlloc(alloc, tokens, pos);
-    defer alloc.free(source_path);
-    if (!std.mem.eql(u8, source_path, "_id")) return error.UnsupportedSqlShape;
-    try cursor.expectKeyword("target");
-    const target_path = try parseDerivedIndexFieldPathAlloc(alloc, tokens, pos);
-    defer alloc.free(target_path);
-
-    var type_path: ?[]const u8 = null;
-    defer if (type_path) |path| alloc.free(path);
-    var weight_path: ?[]const u8 = null;
-    defer if (weight_path) |path| alloc.free(path);
-    while (true) {
-        if (cursor.matchKeyword("type")) {
-            if (type_path != null) return error.UnsupportedSqlShape;
-            type_path = try parseDerivedIndexFieldPathAlloc(alloc, tokens, pos);
-            continue;
+fn parseIdentitySequenceOption(cursor: parser.Cursor, options: *SequenceOptions) !void {
+    if (cursor.peekKeyword("as") or cursor.peekKeyword("owned")) return error.UnsupportedSqlShape;
+    if (cursor.matchKeyword("start")) {
+        _ = cursor.matchKeyword("with");
+        if (options.start_with != null) return error.UnsupportedSqlShape;
+        options.start_with = try parseIdentitySequenceInteger(cursor);
+    } else if (cursor.matchKeyword("increment")) {
+        _ = cursor.matchKeyword("by");
+        if (options.increment_by != null) return error.UnsupportedSqlShape;
+        options.increment_by = try parseIdentitySequenceInteger(cursor);
+    } else if (cursor.matchKeyword("minvalue")) {
+        if (options.min_value_specified) return error.UnsupportedSqlShape;
+        options.min_value_specified = true;
+        options.min_value = try parseIdentitySequenceInteger(cursor);
+    } else if (cursor.matchKeyword("maxvalue")) {
+        if (options.max_value_specified) return error.UnsupportedSqlShape;
+        options.max_value_specified = true;
+        options.max_value = try parseIdentitySequenceInteger(cursor);
+    } else if (cursor.matchKeyword("cache")) {
+        if (options.cache != null) return error.UnsupportedSqlShape;
+        options.cache = try parseIdentitySequenceInteger(cursor);
+    } else if (cursor.matchKeyword("cycle")) {
+        if (options.cycle != null) return error.UnsupportedSqlShape;
+        options.cycle = true;
+    } else if (cursor.matchKeyword("no")) {
+        if (cursor.matchKeyword("minvalue")) {
+            if (options.min_value_specified) return error.UnsupportedSqlShape;
+            options.min_value_specified = true;
+            options.min_value = null;
+        } else if (cursor.matchKeyword("maxvalue")) {
+            if (options.max_value_specified) return error.UnsupportedSqlShape;
+            options.max_value_specified = true;
+            options.max_value = null;
+        } else if (cursor.matchKeyword("cycle")) {
+            if (options.cycle != null) return error.UnsupportedSqlShape;
+            options.cycle = false;
+        } else {
+            return error.UnsupportedSqlShape;
         }
-        if (cursor.matchKeyword("weight")) {
-            if (weight_path != null) return error.UnsupportedSqlShape;
-            weight_path = try parseDerivedIndexFieldPathAlloc(alloc, tokens, pos);
-            continue;
-        }
-        break;
+    } else {
+        return error.UnsupportedSqlShape;
     }
-
-    const config_json = try graphExtractionIndexConfigJsonAlloc(alloc, tokens, pos, enrichment_name, input_field, model_token.text, path_token.text, target_path, type_path, weight_path);
-    var config_transferred = false;
-    errdefer if (!config_transferred) alloc.free(config_json);
-    try grammar.parseAdapterNoopStatementEnd(tokens, pos);
-
-    const columns = try alloc.alloc([]const u8, 1);
-    var columns_transferred = false;
-    errdefer if (!columns_transferred) alloc.free(columns);
-    columns[0] = input_field;
-
-    index_transferred.* = true;
-    table_transferred.* = true;
-    input_transferred = true;
-    config_transferred = true;
-    columns_transferred = true;
-    return .{
-        .index_name = index_name,
-        .table_name = table_name,
-        .if_not_exists = if_not_exists,
-        .unique = false,
-        .method = .antfly_graph,
-        .columns = columns,
-        .derived_index_config_json = config_json,
-    };
 }
 
-pub fn parseAlterGraphIndexAddMetricPlanAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !CreateIndexPlan {
-    const cursor = parser.Cursor.init(tokens, pos);
-    try cursor.expectKeyword("graph");
-    try cursor.expectKeyword("index");
-    const graph_index = try grammar.parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
-    defer alloc.free(graph_index);
-    try cursor.expectKeyword("add");
-    try cursor.expectKeyword("metric");
-    const metric_name = try grammar.parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
-    var metric_transferred = false;
-    errdefer if (!metric_transferred) alloc.free(metric_name);
-    try cursor.expectKeyword("using");
-    const algorithm_token = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
-
-    const config_json = try graphMetricIndexConfigJsonAlloc(alloc, tokens, pos, graph_index, metric_name, algorithm_token.text);
-    var config_transferred = false;
-    errdefer if (!config_transferred) alloc.free(config_json);
-    try grammar.parseAdapterNoopStatementEnd(tokens, pos);
-
-    const table_name = try alloc.dupe(u8, "");
-    var table_transferred = false;
-    errdefer if (!table_transferred) alloc.free(table_name);
-
-    metric_transferred = true;
-    config_transferred = true;
-    table_transferred = true;
-    return .{
-        .index_name = metric_name,
-        .table_name = table_name,
-        .if_not_exists = false,
-        .unique = false,
-        .method = .antfly_graph_metric,
-        .columns = &.{},
-        .derived_index_config_json = config_json,
-    };
+fn parseIdentitySequenceInteger(cursor: parser.Cursor) !i64 {
+    const negative = cursor.matchToken(.minus) != null;
+    const token = cursor.matchToken(.number) orelse return error.UnsupportedSqlShape;
+    if (std.mem.indexOfScalar(u8, token.text, '.') != null) return error.UnsupportedSqlShape;
+    const value = std.fmt.parseInt(i64, token.text, 10) catch return error.UnsupportedSqlShape;
+    return if (negative) -value else value;
 }
 
-pub fn parseCreateGraphMetricPlanAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !CreateIndexPlan {
-    const cursor = parser.Cursor.init(tokens, pos);
-    try cursor.expectKeyword("graph");
-    try cursor.expectKeyword("metric");
-    const metric_name = try grammar.parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
-    var metric_transferred = false;
-    errdefer if (!metric_transferred) alloc.free(metric_name);
-    try cursor.expectKeyword("on");
-    const graph_index = try grammar.parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
-    defer alloc.free(graph_index);
-
-    const config_json = try createGraphMetricIndexConfigJsonAlloc(alloc, tokens, pos, graph_index, metric_name);
-    var config_transferred = false;
-    errdefer if (!config_transferred) alloc.free(config_json);
-    try grammar.parseAdapterNoopStatementEnd(tokens, pos);
-
-    const table_name = try alloc.dupe(u8, "");
-    var table_transferred = false;
-    errdefer if (!table_transferred) alloc.free(table_name);
-
-    metric_transferred = true;
-    config_transferred = true;
-    table_transferred = true;
-    return .{
-        .index_name = metric_name,
-        .table_name = table_name,
-        .if_not_exists = false,
-        .unique = false,
-        .method = .antfly_graph_metric,
-        .columns = &.{},
-        .derived_index_config_json = config_json,
-    };
+fn generatedCreateIndexMethod(tokens: []const grammar.Token, ast: generated_parser.GeneratedSqlDdlAst) !DdlIndexMethod {
+    const range = ast.index_method_tokens orelse return .btree;
+    const method = try generatedSingleIdentifierText(tokens, range);
+    if (std.ascii.eqlIgnoreCase(method, "btree")) return .btree;
+    if (std.ascii.eqlIgnoreCase(method, "gin")) return .gin;
+    if (std.ascii.eqlIgnoreCase(method, "antfly_full_text")) return .antfly_full_text;
+    if (std.ascii.eqlIgnoreCase(method, "hnsw")) return .hnsw;
+    if (std.ascii.eqlIgnoreCase(method, "antfly_aknn")) return .antfly_aknn;
+    if (std.ascii.eqlIgnoreCase(method, "antfly_graph")) return .antfly_graph;
+    if (std.ascii.eqlIgnoreCase(method, "antfly_graph_metric")) return .antfly_graph_metric;
+    if (std.ascii.eqlIgnoreCase(method, "antfly_hybrid")) return .antfly_hybrid;
+    if (std.ascii.eqlIgnoreCase(method, "antfly_algebraic")) return .antfly_algebraic;
+    return error.UnsupportedSqlShape;
 }
 
-fn createIndexElementSuffixHasOrderingMetadata(suffix: grammar.CreateIndexElementSuffixSyntax) bool {
-    return suffix.order_direction != .default or suffix.nulls_order != .default;
+fn generatedCreateIndexOpClass(tokens: []const grammar.Token, method: DdlIndexMethod, range: generated_parser.GeneratedSqlTokenRange) !DdlIndexOpClass {
+    if (range.end <= range.start or range.end > tokens.len) return error.UnsupportedSqlShape;
+    if (range.end == range.start + 1) return .default;
+    if (method == .btree) {
+        var pos = range.start + 1;
+        if (pos < range.end and (tokens[pos].matchesKeywordTag(.asc) or tokens[pos].matchesKeywordTag(.desc))) pos += 1;
+        if (pos < range.end and tokens[pos].matchesKeywordTag(.nulls)) {
+            pos += 1;
+            if (pos >= range.end or (!tokens[pos].matchesKeywordTag(.first) and !tokens[pos].matchesKeywordTag(.last))) return error.UnsupportedSqlShape;
+            pos += 1;
+        }
+        if (pos == range.end) return .default;
+        return error.UnsupportedSqlShape;
+    }
+    if (range.end != range.start + 2 or tokens[range.start + 1].kind != .identifier) return error.UnsupportedSqlShape;
+    const opclass = tokens[range.start + 1].text;
+    switch (method) {
+        .gin => {
+            if (std.ascii.eqlIgnoreCase(opclass, "jsonb_path_ops")) return .jsonb_path_ops;
+            if (std.ascii.eqlIgnoreCase(opclass, "array_ops")) return .array_ops;
+        },
+        .hnsw => {
+            if (std.ascii.eqlIgnoreCase(opclass, "vector_l2_ops")) return .vector_l2_ops;
+            if (std.ascii.eqlIgnoreCase(opclass, "vector_ip_ops")) return .vector_ip_ops;
+            if (std.ascii.eqlIgnoreCase(opclass, "vector_cosine_ops")) return .vector_cosine_ops;
+        },
+        else => {},
+    }
+    return error.UnsupportedSqlShape;
 }
 
-fn relationalIndexKeyDirectionFromSyntax(direction: grammar.CreateIndexElementOrderDirectionSyntax) runtime_schema.RelationalIndexKeyDirection {
-    return switch (direction) {
-        .default, .asc => .asc,
+fn generatedRelationalIndexKeyDirection(direction: ?generated_parser.GeneratedSqlOrderDirection) runtime_schema.RelationalIndexKeyDirection {
+    return switch (direction orelse .asc) {
+        .asc => .asc,
         .desc => .desc,
     };
 }
 
-fn relationalIndexKeyNullsFromSyntax(nulls: grammar.CreateIndexElementNullsOrderSyntax) runtime_schema.RelationalIndexKeyNulls {
-    return switch (nulls) {
-        .default => .default,
+fn generatedRelationalIndexKeyNulls(nulls: ?generated_parser.GeneratedSqlNullsOrder) runtime_schema.RelationalIndexKeyNulls {
+    return switch (nulls orelse return .default) {
         .first => .first,
         .last => .last,
     };
 }
 
-pub fn parseCreateIndexPlanAlloc(
+fn generatedIndexListCoversRange(list: generated_parser.GeneratedSqlListAst, range: generated_parser.GeneratedSqlTokenRange) bool {
+    if (list.count == 0 or list.items.len != list.count) return false;
+    return list.items[0].start == range.start and list.items[list.items.len - 1].end == range.end;
+}
+
+fn generatedCreateIndexNullsNotDistinct(tokens: []const grammar.Token, ast: generated_parser.GeneratedSqlDdlAst, end: usize) !?bool {
+    const elements = ast.index_elements_tokens orelse return error.UnsupportedSqlShape;
+    var index = elements.end + 1;
+    if (index >= end or !tokens[index].matchesKeywordTag(.nulls)) return null;
+    index += 1;
+    if (index < end and tokens[index].matchesKeywordTag(.not)) {
+        index += 1;
+        if (index >= end or !tokens[index].matchesKeywordTag(.distinct)) return error.UnsupportedSqlShape;
+        return true;
+    }
+    if (index >= end or !tokens[index].matchesKeywordTag(.distinct)) return error.UnsupportedSqlShape;
+    return false;
+}
+
+fn generatedIdentifierListAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
-    pos: *usize,
-    unique: bool,
-    options: CreateIndexOptions,
+    range: generated_parser.GeneratedSqlTokenRange,
+    list: generated_parser.GeneratedSqlListAst,
+) ![]const []const u8 {
+    if (!generatedIndexListCoversRange(list, range)) return error.UnsupportedSqlShape;
+    const owned = try alloc.alloc([]const u8, list.count);
+    var initialized: usize = 0;
+    errdefer {
+        for (owned[0..initialized]) |item| alloc.free(item);
+        alloc.free(owned);
+    }
+    for (list.items, 0..) |item, index| {
+        owned[index] = try generatedIdentifierAlloc(alloc, tokens, item);
+        initialized += 1;
+    }
+    return owned;
+}
+
+fn generatedCreateIndexLiteralRangeSupported(tokens: []const grammar.Token, range: generated_parser.GeneratedSqlTokenRange) bool {
+    if (range.end <= range.start or range.end > tokens.len) return false;
+    if (range.end == range.start + 1) {
+        return switch (tokens[range.start].kind) {
+            .string, .number => true,
+            .identifier => tokens[range.start].matchesKeywordTag(.true) or tokens[range.start].matchesKeywordTag(.false) or tokens[range.start].matchesKeywordTag(.null),
+            else => false,
+        };
+    }
+    return range.end == range.start + 2 and tokens[range.start].kind == .minus and tokens[range.start + 1].kind == .number;
+}
+
+fn generatedCreateIndexPredicateSupported(tokens: []const grammar.Token, expression: generated_parser.GeneratedSqlExpressionAst) bool {
+    switch (expression.kind) {
+        .grouped => return if (expression.inner_expression) |inner| generatedCreateIndexPredicateSupported(tokens, inner.*) else false,
+        .logical_and => return if (expression.left_expression) |left| if (expression.right_expression) |right|
+            generatedCreateIndexPredicateSupported(tokens, left.*) and generatedCreateIndexPredicateSupported(tokens, right.*)
+        else
+            false else false,
+        .comparison => {
+            const operator = expression.operator_tokens orelse return false;
+            if (operator.end != operator.start + 1 or operator.end > tokens.len) return false;
+            if (tokens[operator.start].kind != .eq and tokens[operator.start].kind != .neq) return false;
+            if (generatedDdlExpressionFieldName(tokens, expression.left_expression, expression.left_tokens orelse return false).len == 0) return false;
+            return generatedCreateIndexLiteralRangeSupported(tokens, expression.right_tokens orelse return false);
+        },
+        .is_null, .is_not_null, .is_true, .is_false => {
+            return generatedDdlExpressionFieldName(tokens, expression.left_expression, expression.left_tokens orelse return false).len != 0;
+        },
+        else => return false,
+    }
+}
+
+fn generatedCreateIndexPredicateCount(expression: generated_parser.GeneratedSqlExpressionAst) usize {
+    return switch (expression.kind) {
+        .grouped => if (expression.inner_expression) |inner| generatedCreateIndexPredicateCount(inner.*) else 0,
+        .logical_and => blk: {
+            const left = expression.left_expression orelse break :blk 0;
+            const right = expression.right_expression orelse break :blk 0;
+            break :blk generatedCreateIndexPredicateCount(left.*) + generatedCreateIndexPredicateCount(right.*);
+        },
+        else => 1,
+    };
+}
+
+fn generatedCreateIndexLiteralJsonAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+) ![]const u8 {
+    if (!generatedCreateIndexLiteralRangeSupported(tokens, range)) return error.UnsupportedSqlShape;
+    var pos = range.start;
+    const value_json = try value_mod.parseSqlUntypedValueJsonAlloc(alloc, tokens, &pos);
+    errdefer alloc.free(value_json);
+    if (pos != range.end) return error.UnsupportedSqlShape;
+    return value_json;
+}
+
+fn generatedCreateIndexAppendPredicateAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+    out: *std.ArrayListUnmanaged(runtime_schema.UniquePredicate),
+) !void {
+    switch (expression.kind) {
+        .grouped => return try generatedCreateIndexAppendPredicateAlloc(alloc, tokens, (expression.inner_expression orelse return error.UnsupportedSqlShape).*, out),
+        .logical_and => {
+            try generatedCreateIndexAppendPredicateAlloc(alloc, tokens, (expression.left_expression orelse return error.UnsupportedSqlShape).*, out);
+            try generatedCreateIndexAppendPredicateAlloc(alloc, tokens, (expression.right_expression orelse return error.UnsupportedSqlShape).*, out);
+        },
+        .comparison => {
+            const field_text = generatedDdlExpressionFieldName(tokens, expression.left_expression, expression.left_tokens orelse return error.UnsupportedSqlShape);
+            if (field_text.len == 0) return error.UnsupportedSqlShape;
+            const field = try alloc.dupe(u8, field_text);
+            var field_transferred = false;
+            errdefer if (!field_transferred) alloc.free(field);
+            const operator = expression.operator_tokens orelse return error.UnsupportedSqlShape;
+            if (operator.end != operator.start + 1 or operator.end > tokens.len) return error.UnsupportedSqlShape;
+            const op: runtime_schema.UniquePredicateOp = switch (tokens[operator.start].kind) {
+                .eq => .eq,
+                .neq => .ne,
+                else => return error.UnsupportedSqlShape,
+            };
+            const value_json = try generatedCreateIndexLiteralJsonAlloc(alloc, tokens, expression.right_tokens orelse return error.UnsupportedSqlShape);
+            var value_transferred = false;
+            errdefer if (!value_transferred) alloc.free(value_json);
+            try out.append(alloc, .{ .field = field, .op = op, .value_json = value_json });
+            field_transferred = true;
+            value_transferred = true;
+        },
+        .is_null, .is_not_null, .is_true, .is_false => {
+            const field_text = generatedDdlExpressionFieldName(tokens, expression.left_expression, expression.left_tokens orelse return error.UnsupportedSqlShape);
+            if (field_text.len == 0) return error.UnsupportedSqlShape;
+            const field = try alloc.dupe(u8, field_text);
+            var field_transferred = false;
+            errdefer if (!field_transferred) alloc.free(field);
+            const predicate: runtime_schema.UniquePredicate = switch (expression.kind) {
+                .is_null => .{ .field = field, .op = .is_null },
+                .is_not_null => .{ .field = field, .op = .is_not_null },
+                .is_true => .{ .field = field, .op = .eq, .value_json = try alloc.dupe(u8, "true") },
+                .is_false => .{ .field = field, .op = .eq, .value_json = try alloc.dupe(u8, "false") },
+                else => unreachable,
+            };
+            var value_transferred = false;
+            errdefer if (!value_transferred) if (predicate.value_json) |value_json| alloc.free(value_json);
+            try out.append(alloc, predicate);
+            field_transferred = true;
+            value_transferred = true;
+        },
+        else => return error.UnsupportedSqlShape,
+    }
+}
+
+fn generatedCreateIndexWherePredicatesAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+) !?[]const runtime_schema.UniquePredicate {
+    const where = ast.index_where_tokens orelse {
+        if (ast.index_where_expression.tokens != null) return error.UnsupportedSqlShape;
+        return &.{};
+    };
+    const expression_tokens = ast.index_where_expression.tokens orelse return error.UnsupportedSqlShape;
+    if (!generatedDdlTokenRangeEqual(expression_tokens, where)) return error.UnsupportedSqlShape;
+    if (!generatedCreateIndexPredicateSupported(tokens, ast.index_where_expression)) return null;
+    const expected_count = generatedCreateIndexPredicateCount(ast.index_where_expression);
+    if (expected_count == 0) return error.UnsupportedSqlShape;
+    var predicates = std.ArrayListUnmanaged(runtime_schema.UniquePredicate).empty;
+    errdefer {
+        for (predicates.items) |predicate| freeDdlUniquePredicate(alloc, predicate);
+        predicates.deinit(alloc);
+    }
+    try predicates.ensureTotalCapacity(alloc, expected_count);
+    try generatedCreateIndexAppendPredicateAlloc(alloc, tokens, ast.index_where_expression, &predicates);
+    if (predicates.items.len != expected_count) return error.UnsupportedSqlShape;
+    return try predicates.toOwnedSlice(alloc);
+}
+
+fn generatedCreateIndexWhereExpressionConditionSupported(tokens: []const grammar.Token, expression: generated_parser.GeneratedSqlExpressionAst) bool {
+    switch (expression.kind) {
+        .grouped => return if (expression.inner_expression) |inner| generatedCreateIndexWhereExpressionConditionSupported(tokens, inner.*) else false,
+        .logical_and => return if (expression.left_expression) |left| if (expression.right_expression) |right|
+            generatedCreateIndexWhereExpressionConditionSupported(tokens, left.*) and generatedCreateIndexWhereExpressionConditionSupported(tokens, right.*)
+        else
+            false else false,
+        .comparison => {
+            const operator = expression.operator_tokens orelse return false;
+            _ = generatedCreateIndexWhereComparisonOp(tokens, operator) catch return false;
+            const left = expression.left_expression orelse return false;
+            const right = expression.right_expression orelse return false;
+            return generatedDdlTokenRangeEqual(left.tokens orelse return false, expression.left_tokens orelse return false) and
+                generatedDdlTokenRangeEqual(right.tokens orelse return false, expression.right_tokens orelse return false);
+        },
+        else => return false,
+    }
+}
+
+fn generatedCreateIndexWhereExpressionConditionCount(expression: generated_parser.GeneratedSqlExpressionAst) usize {
+    return switch (expression.kind) {
+        .grouped => if (expression.inner_expression) |inner| generatedCreateIndexWhereExpressionConditionCount(inner.*) else 0,
+        .logical_and => blk: {
+            const left = expression.left_expression orelse break :blk 0;
+            const right = expression.right_expression orelse break :blk 0;
+            break :blk generatedCreateIndexWhereExpressionConditionCount(left.*) + generatedCreateIndexWhereExpressionConditionCount(right.*);
+        },
+        else => 1,
+    };
+}
+
+fn generatedCreateIndexWhereComparisonOp(tokens: []const grammar.Token, range: generated_parser.GeneratedSqlTokenRange) !runtime_schema.RelationalCheckOp {
+    if (range.end != range.start + 1 or range.end > tokens.len) return error.UnsupportedSqlShape;
+    return switch (tokens[range.start].kind) {
+        .eq => .eq,
+        .neq => .ne,
+        .gt => .gt,
+        .gte => .gte,
+        .lt => .lt,
+        .lte => .lte,
+        else => error.UnsupportedSqlShape,
+    };
+}
+
+fn generatedCreateIndexAppendWhereExpressionConditionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+    out: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition),
+) !void {
+    switch (expression.kind) {
+        .grouped => return try generatedCreateIndexAppendWhereExpressionConditionAlloc(alloc, tokens, (expression.inner_expression orelse return error.UnsupportedSqlShape).*, out),
+        .logical_and => {
+            try generatedCreateIndexAppendWhereExpressionConditionAlloc(alloc, tokens, (expression.left_expression orelse return error.UnsupportedSqlShape).*, out);
+            try generatedCreateIndexAppendWhereExpressionConditionAlloc(alloc, tokens, (expression.right_expression orelse return error.UnsupportedSqlShape).*, out);
+        },
+        .comparison => {
+            const left = expression.left_expression orelse return error.UnsupportedSqlShape;
+            const right = expression.right_expression orelse return error.UnsupportedSqlShape;
+            if (!generatedCreateIndexWhereExpressionConditionSupported(tokens, expression)) return error.UnsupportedSqlShape;
+            if (!generatedDdlTokenRangeEqual(left.tokens orelse return error.UnsupportedSqlShape, expression.left_tokens orelse return error.UnsupportedSqlShape)) return error.UnsupportedSqlShape;
+            if (!generatedDdlTokenRangeEqual(right.tokens orelse return error.UnsupportedSqlShape, expression.right_tokens orelse return error.UnsupportedSqlShape)) return error.UnsupportedSqlShape;
+            const lhs = (try generatedCreateIndexRowExpressionAlloc(alloc, tokens, left.*)) orelse return error.UnsupportedSqlShape;
+            var lhs_transferred = false;
+            errdefer if (!lhs_transferred) runtime_schema.freeRelationalRowsExpression(alloc, lhs);
+            const rhs_expression = (try generatedCreateIndexRowExpressionAlloc(alloc, tokens, right.*)) orelse return error.UnsupportedSqlShape;
+            var rhs_expression_transferred = false;
+            errdefer if (!rhs_expression_transferred) runtime_schema.freeRelationalRowsExpression(alloc, rhs_expression);
+            const rhs = try alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
+            rhs[0] = rhs_expression;
+            rhs_expression_transferred = true;
+            var rhs_transferred = false;
+            errdefer if (!rhs_transferred) alloc.free(rhs);
+            try out.append(alloc, .{
+                .lhs = lhs,
+                .op = try generatedCreateIndexWhereComparisonOp(tokens, expression.operator_tokens orelse return error.UnsupportedSqlShape),
+                .rhs = rhs,
+            });
+            lhs_transferred = true;
+            rhs_transferred = true;
+        },
+        else => return error.UnsupportedSqlShape,
+    }
+}
+
+fn generatedCreateIndexWhereExpressionConditionsAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+) !?[]const db_mod.types.RelationalRowsExpressionCondition {
+    const where = ast.index_where_tokens orelse return &.{};
+    const expression_tokens = ast.index_where_expression.tokens orelse return error.UnsupportedSqlShape;
+    if (!generatedDdlTokenRangeEqual(expression_tokens, where)) return error.UnsupportedSqlShape;
+    if (!generatedCreateIndexWhereExpressionConditionSupported(tokens, ast.index_where_expression)) return null;
+    const expected_count = generatedCreateIndexWhereExpressionConditionCount(ast.index_where_expression);
+    if (expected_count == 0) return error.UnsupportedSqlShape;
+    var conditions = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition).empty;
+    errdefer {
+        for (conditions.items) |condition| plan_mod.freeExpressionCondition(alloc, condition);
+        conditions.deinit(alloc);
+    }
+    try conditions.ensureTotalCapacity(alloc, expected_count);
+    try generatedCreateIndexAppendWhereExpressionConditionAlloc(alloc, tokens, ast.index_where_expression, &conditions);
+    if (conditions.items.len != expected_count) return error.UnsupportedSqlShape;
+    return try conditions.toOwnedSlice(alloc);
+}
+
+fn generatedCreateIndexUnwrappedExpression(expression: *const generated_parser.GeneratedSqlExpressionAst) *const generated_parser.GeneratedSqlExpressionAst {
+    if (expression.kind == .grouped) {
+        if (expression.inner_expression) |inner| return generatedCreateIndexUnwrappedExpression(inner);
+    }
+    return expression;
+}
+
+fn generatedCreateIndexExpressionItemSuffixSupported(
+    tokens: []const grammar.Token,
+    item: generated_parser.GeneratedSqlTokenRange,
+    expression_range: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (expression_range.start < item.start or expression_range.end > item.end or item.end > tokens.len) return false;
+    var pos = expression_range.end;
+    if (pos < item.end and (tokens[pos].matchesKeywordTag(.asc) or tokens[pos].matchesKeywordTag(.desc))) pos += 1;
+    if (pos < item.end and tokens[pos].matchesKeywordTag(.nulls)) {
+        pos += 1;
+        if (pos >= item.end or (!tokens[pos].matchesKeywordTag(.first) and !tokens[pos].matchesKeywordTag(.last))) return false;
+        pos += 1;
+    }
+    return pos == item.end;
+}
+
+fn generatedCreateIndexElementHasWithoutOverlaps(
+    tokens: []const grammar.Token,
+    item: generated_parser.GeneratedSqlTokenRange,
+    expression_range: generated_parser.GeneratedSqlTokenRange,
+) !bool {
+    if (expression_range.start < item.start or expression_range.end > item.end or item.end > tokens.len) return error.UnsupportedSqlShape;
+    var pos = expression_range.end;
+    if (pos >= item.end or !tokens[pos].matchesKeywordTag(.without)) return false;
+    pos += 1;
+    if (pos >= item.end or !tokens[pos].matchesKeywordTag(.overlaps)) return error.UnsupportedSqlShape;
+    pos += 1;
+    if (pos != item.end) return error.UnsupportedSqlShape;
+    return true;
+}
+
+fn generatedCreateIndexWithoutOverlapsPeriodAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    item: generated_parser.GeneratedSqlTokenRange,
+) !?[]const u8 {
+    if (item.start + 3 != item.end or item.end > tokens.len) return null;
+    if (tokens[item.start].kind != .identifier) return null;
+    if (!tokens[item.start + 1].matchesKeywordTag(.without)) return null;
+    if (!tokens[item.start + 2].matchesKeywordTag(.overlaps)) return error.UnsupportedSqlShape;
+    return try alloc.dupe(u8, tokens[item.start].text);
+}
+
+fn generatedCreateIndexSimpleFunctionOp(function_name: []const u8) ?runtime_schema.UniqueExpressionOp {
+    if (std.ascii.eqlIgnoreCase(function_name, "lower")) return .lower;
+    if (std.ascii.eqlIgnoreCase(function_name, "upper")) return .upper;
+    if (std.ascii.eqlIgnoreCase(function_name, "md5")) return .md5;
+    return null;
+}
+
+const GeneratedCreateIndexSimpleExpression = struct {
+    op: runtime_schema.UniqueExpressionOp,
+    field: []const u8,
+};
+
+fn generatedCreateIndexSimpleExpression(
+    tokens: []const grammar.Token,
+    item: generated_parser.GeneratedSqlTokenRange,
+    expression_range: generated_parser.GeneratedSqlTokenRange,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) !?GeneratedCreateIndexSimpleExpression {
+    if (!generatedDdlTokenRangeEqual(expression.tokens orelse return error.UnsupportedSqlShape, expression_range)) return error.UnsupportedSqlShape;
+    if (!generatedCreateIndexExpressionItemSuffixSupported(tokens, item, expression_range)) return null;
+    const unwrapped = generatedCreateIndexUnwrappedExpression(&expression);
+    if (unwrapped.kind != .function_call) return null;
+    if (unwrapped.argument_distinct_tokens != null or
+        unwrapped.argument_order_tokens != null or
+        unwrapped.within_group_tokens != null or
+        unwrapped.filter_tokens != null or
+        unwrapped.over_tokens != null)
+    {
+        return null;
+    }
+    const function_name = generatedDdlSingleTokenText(tokens, unwrapped.function_name_tokens orelse return error.UnsupportedSqlShape);
+    const op = generatedCreateIndexSimpleFunctionOp(function_name) orelse return null;
+    const arguments = unwrapped.argument_items;
+    if (arguments.count != 1 or
+        arguments.items.len != 1 or
+        arguments.expression_items.len != 1 or
+        arguments.expressions.len != 1 or
+        (arguments.alias_items.len != 0 and arguments.alias_items.len != 1))
+    {
+        return error.UnsupportedSqlShape;
+    }
+    if (arguments.alias_items.len == 1 and arguments.alias_items[0] != null) return error.UnsupportedSqlShape;
+    if (!generatedDdlTokenRangeEqual(arguments.items[0], arguments.expression_items[0])) return error.UnsupportedSqlShape;
+    const field_expression = arguments.expressions[0];
+    if (!generatedDdlTokenRangeEqual(field_expression.tokens orelse return error.UnsupportedSqlShape, arguments.expression_items[0])) return error.UnsupportedSqlShape;
+    if (field_expression.kind != .token_range) return null;
+    const field_range = arguments.expression_items[0];
+    if (field_range.end != field_range.start + 1 or field_range.end > tokens.len or tokens[field_range.start].kind != .identifier) return null;
+    return .{
+        .op = op,
+        .field = tokens[field_range.start].text,
+    };
+}
+
+fn generatedCreateIndexGeneratedOp(op: runtime_schema.UniqueExpressionOp) runtime_schema.RelationalGeneratedOp {
+    return switch (op) {
+        .lower => .lower,
+        .upper => .upper,
+        .md5 => .md5,
+        .expression => unreachable,
+    };
+}
+
+fn generatedCreateIndexRowExpressionFunctionKind(name: []const u8) ?runtime_schema.RelationalRowsExpressionKind {
+    if (std.ascii.eqlIgnoreCase(name, "lower")) return .lower;
+    if (std.ascii.eqlIgnoreCase(name, "upper")) return .upper;
+    if (std.ascii.eqlIgnoreCase(name, "initcap")) return .initcap;
+    if (std.ascii.eqlIgnoreCase(name, "trim") or std.ascii.eqlIgnoreCase(name, "btrim")) return .trim;
+    if (std.ascii.eqlIgnoreCase(name, "ltrim")) return .ltrim;
+    if (std.ascii.eqlIgnoreCase(name, "rtrim")) return .rtrim;
+    if (std.ascii.eqlIgnoreCase(name, "replace")) return .replace;
+    if (std.ascii.eqlIgnoreCase(name, "regexp_replace")) return .regexp_replace;
+    if (std.ascii.eqlIgnoreCase(name, "translate")) return .translate;
+    if (std.ascii.eqlIgnoreCase(name, "substring") or std.ascii.eqlIgnoreCase(name, "substr")) return .substring;
+    if (std.ascii.eqlIgnoreCase(name, "overlay")) return .overlay;
+    if (std.ascii.eqlIgnoreCase(name, "split_part")) return .split_part;
+    if (std.ascii.eqlIgnoreCase(name, "strpos")) return .strpos;
+    if (std.ascii.eqlIgnoreCase(name, "left")) return .left;
+    if (std.ascii.eqlIgnoreCase(name, "right")) return .right;
+    if (std.ascii.eqlIgnoreCase(name, "lpad")) return .lpad;
+    if (std.ascii.eqlIgnoreCase(name, "rpad")) return .rpad;
+    if (std.ascii.eqlIgnoreCase(name, "repeat")) return .repeat;
+    if (std.ascii.eqlIgnoreCase(name, "reverse")) return .reverse;
+    if (std.ascii.eqlIgnoreCase(name, "starts_with")) return .starts_with;
+    if (std.ascii.eqlIgnoreCase(name, "ends_with")) return .ends_with;
+    if (std.ascii.eqlIgnoreCase(name, "ascii")) return .ascii;
+    if (std.ascii.eqlIgnoreCase(name, "chr")) return .chr;
+    if (std.ascii.eqlIgnoreCase(name, "md5")) return .md5;
+    if (std.ascii.eqlIgnoreCase(name, "soundex")) return .soundex;
+    if (std.ascii.eqlIgnoreCase(name, "concat")) return .concat;
+    if (std.ascii.eqlIgnoreCase(name, "concat_ws")) return .concat_ws;
+    if (std.ascii.eqlIgnoreCase(name, "length") or std.ascii.eqlIgnoreCase(name, "char_length") or std.ascii.eqlIgnoreCase(name, "character_length")) return .length;
+    if (std.ascii.eqlIgnoreCase(name, "octet_length")) return .octet_length;
+    if (std.ascii.eqlIgnoreCase(name, "bit_length")) return .bit_length;
+    if (std.ascii.eqlIgnoreCase(name, "coalesce")) return .coalesce;
+    if (std.ascii.eqlIgnoreCase(name, "nullif")) return .nullif;
+    if (std.ascii.eqlIgnoreCase(name, "greatest")) return .greatest;
+    if (std.ascii.eqlIgnoreCase(name, "least")) return .least;
+    if (std.ascii.eqlIgnoreCase(name, "abs")) return .abs;
+    if (std.ascii.eqlIgnoreCase(name, "round")) return .round;
+    if (std.ascii.eqlIgnoreCase(name, "trunc")) return .trunc;
+    if (std.ascii.eqlIgnoreCase(name, "floor")) return .floor;
+    if (std.ascii.eqlIgnoreCase(name, "ceil")) return .ceil;
+    if (std.ascii.eqlIgnoreCase(name, "sqrt")) return .sqrt;
+    if (std.ascii.eqlIgnoreCase(name, "sign")) return .sign;
+    if (std.ascii.eqlIgnoreCase(name, "power")) return .power;
+    if (std.ascii.eqlIgnoreCase(name, "mod")) return .mod;
+    if (std.ascii.eqlIgnoreCase(name, "date_trunc")) return .date_trunc;
+    if (std.ascii.eqlIgnoreCase(name, "date_bin")) return .date_bin;
+    if (std.ascii.eqlIgnoreCase(name, "date_part")) return .date_part;
+    if (std.ascii.eqlIgnoreCase(name, "json_typeof") or std.ascii.eqlIgnoreCase(name, "jsonb_typeof")) return .json_typeof;
+    if (std.ascii.eqlIgnoreCase(name, "json_array_length") or std.ascii.eqlIgnoreCase(name, "jsonb_array_length")) return .json_array_length;
+    if (std.ascii.eqlIgnoreCase(name, "json_build_object") or std.ascii.eqlIgnoreCase(name, "jsonb_build_object")) return .json_build_object;
+    if (std.ascii.eqlIgnoreCase(name, "to_jsonb")) return .to_jsonb;
+    if (std.ascii.eqlIgnoreCase(name, "array_length") or std.ascii.eqlIgnoreCase(name, "cardinality")) return .array_length;
+    if (std.ascii.eqlIgnoreCase(name, "array_position")) return .array_position;
+    if (std.ascii.eqlIgnoreCase(name, "array_positions")) return .array_positions;
+    if (std.ascii.eqlIgnoreCase(name, "array_append")) return .array_append;
+    if (std.ascii.eqlIgnoreCase(name, "array_prepend")) return .array_prepend;
+    if (std.ascii.eqlIgnoreCase(name, "array_cat")) return .array_cat;
+    if (std.ascii.eqlIgnoreCase(name, "array_remove")) return .array_remove;
+    if (std.ascii.eqlIgnoreCase(name, "array_replace")) return .array_replace;
+    if (std.ascii.eqlIgnoreCase(name, "array_to_string")) return .array_to_string;
+    if (std.ascii.eqlIgnoreCase(name, "string_to_array")) return .string_to_array;
+    return null;
+}
+
+fn generatedCreateIndexRowExpressionCastType(name: []const u8) ?runtime_schema.RelationalRowsExpressionCastType {
+    if (std.ascii.eqlIgnoreCase(name, "text") or std.ascii.eqlIgnoreCase(name, "varchar") or std.ascii.eqlIgnoreCase(name, "uuid")) return .text;
+    if (std.ascii.eqlIgnoreCase(name, "numeric") or std.ascii.eqlIgnoreCase(name, "integer") or std.ascii.eqlIgnoreCase(name, "int") or std.ascii.eqlIgnoreCase(name, "bigint")) return .numeric;
+    if (std.ascii.eqlIgnoreCase(name, "boolean") or std.ascii.eqlIgnoreCase(name, "bool")) return .bool;
+    if (std.ascii.eqlIgnoreCase(name, "timestamp") or std.ascii.eqlIgnoreCase(name, "timestamptz") or std.ascii.eqlIgnoreCase(name, "datetime")) return .datetime;
+    return null;
+}
+
+fn generatedTokenPostfixCastType(cast_type: token_mod.TokenPostfixCastType) runtime_schema.RelationalRowsExpressionCastType {
+    return switch (cast_type) {
+        .text => .text,
+        .numeric => .numeric,
+        .bool => .bool,
+        .datetime => .datetime,
+    };
+}
+
+fn generatedPlaceholderBaseText(text: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (!std.mem.startsWith(u8, trimmed, "$")) return trimmed;
+    var end: usize = 1;
+    while (end < trimmed.len and trimmed[end] >= '0' and trimmed[end] <= '9') : (end += 1) {}
+    if (end == 1) return trimmed;
+    return trimmed[0..end];
+}
+
+fn generatedCreateIndexFieldTokenExpressionAlloc(
+    alloc: std.mem.Allocator,
+    token: grammar.Token,
+) !runtime_schema.RelationalRowsExpression {
+    const field_text = if (token.kind == .placeholder) generatedPlaceholderBaseText(token.text) else token.text;
+    const expression = try generatedCreateIndexFieldExpressionAlloc(alloc, field_text);
+    var expression_transferred = false;
+    errdefer if (!expression_transferred) runtime_schema.freeRelationalRowsExpression(alloc, expression);
+
+    const maybe_cast_type: ?runtime_schema.RelationalRowsExpressionCastType = if (token.kind == .placeholder) blk: {
+        const cast_type = generatedRoutinePlaceholderCastType(token.text) orelse break :blk null;
+        break :blk generatedDdlRoutineCastType(cast_type) orelse return error.UnsupportedSqlShape;
+    } else if (token.postfix_cast_type) |cast_type|
+        generatedTokenPostfixCastType(cast_type)
+    else
+        null;
+    const cast_type = maybe_cast_type orelse return expression;
+
+    const operands = try alloc.alloc(runtime_schema.RelationalRowsExpression, 1);
+    operands[0] = expression;
+    expression_transferred = true;
+    return try generatedCreateIndexCastExpressionAlloc(alloc, operands, cast_type);
+}
+
+fn generatedCreateIndexFieldExpressionAlloc(alloc: std.mem.Allocator, field: []const u8) !runtime_schema.RelationalRowsExpression {
+    return .{
+        .kind = .field,
+        .field = try alloc.dupe(u8, field),
+        .value_json = try alloc.dupe(u8, ""),
+        .json_path = try alloc.dupe(u8, ""),
+    };
+}
+
+fn generatedCreateIndexValueExpressionAlloc(
+    alloc: std.mem.Allocator,
+    value_json: []const u8,
+) !runtime_schema.RelationalRowsExpression {
+    errdefer alloc.free(value_json);
+    return .{
+        .kind = .value,
+        .field = try alloc.dupe(u8, ""),
+        .value_json = value_json,
+        .json_path = try alloc.dupe(u8, ""),
+    };
+}
+
+fn generatedCreateIndexOperationExpressionAlloc(
+    alloc: std.mem.Allocator,
+    kind: runtime_schema.RelationalRowsExpressionKind,
+    operands: []const runtime_schema.RelationalRowsExpression,
+) !runtime_schema.RelationalRowsExpression {
+    errdefer {
+        for (operands) |operand| runtime_schema.freeRelationalRowsExpression(alloc, operand);
+        alloc.free(operands);
+    }
+    return .{
+        .kind = kind,
+        .field = try alloc.dupe(u8, ""),
+        .value_json = try alloc.dupe(u8, ""),
+        .json_path = try alloc.dupe(u8, ""),
+        .operands = operands,
+    };
+}
+
+fn generatedCreateIndexCastExpressionAlloc(
+    alloc: std.mem.Allocator,
+    operands: []const runtime_schema.RelationalRowsExpression,
+    cast_type: runtime_schema.RelationalRowsExpressionCastType,
+) !runtime_schema.RelationalRowsExpression {
+    var expression = try generatedCreateIndexOperationExpressionAlloc(alloc, .cast, operands);
+    expression.cast_type = cast_type;
+    return expression;
+}
+
+fn generatedCreateIndexRowExpressionBinaryKind(kind: generated_parser.GeneratedSqlExpressionKind) ?runtime_schema.RelationalRowsExpressionKind {
+    return switch (kind) {
+        .additive => .add,
+        .subtractive => .sub,
+        .multiplicative => .mul,
+        .divisive => .div,
+        .modulo => .mod,
+        .string_concat => .concat,
+        else => null,
+    };
+}
+
+fn generatedCreateIndexJsonExtractPathExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    function_name: []const u8,
+    arguments: generated_parser.GeneratedSqlListAst,
+) !?runtime_schema.RelationalRowsExpression {
+    const as_text = if (std.ascii.eqlIgnoreCase(function_name, "json_extract_path_text") or
+        std.ascii.eqlIgnoreCase(function_name, "jsonb_extract_path_text"))
+        true
+    else if (std.ascii.eqlIgnoreCase(function_name, "json_extract_path") or
+        std.ascii.eqlIgnoreCase(function_name, "jsonb_extract_path"))
+        false
+    else
+        return null;
+
+    if (arguments.count < 2) return null;
+    if (!generatedCreateIndexExpressionArgumentsValid(arguments)) return error.UnsupportedSqlShape;
+    const operand = (try generatedCreateIndexRowExpressionAlloc(alloc, tokens, arguments.expressions[0])) orelse return null;
+    var operand_transferred = false;
+    errdefer if (!operand_transferred) runtime_schema.freeRelationalRowsExpression(alloc, operand);
+
+    var path = std.ArrayListUnmanaged(u8).empty;
+    var path_transferred = false;
+    defer if (!path_transferred) path.deinit(alloc);
+    for (arguments.expressions[1..arguments.count], 0..) |argument, index| {
+        const segment = (try generatedCreateIndexJsonPathSegmentAlloc(alloc, tokens, argument)) orelse {
+            runtime_schema.freeRelationalRowsExpression(alloc, operand);
+            return null;
+        };
+        defer alloc.free(segment);
+        if (segment.len == 0) {
+            runtime_schema.freeRelationalRowsExpression(alloc, operand);
+            return null;
+        }
+        if (index > 0) try path.append(alloc, '.');
+        try path.appendSlice(alloc, segment);
+    }
+    const owned_path = try path.toOwnedSlice(alloc);
+    path_transferred = true;
+    var path_owned_transferred = false;
+    errdefer if (!path_owned_transferred) alloc.free(owned_path);
+
+    const operands = try alloc.alloc(runtime_schema.RelationalRowsExpression, 1);
+    var operands_transferred = false;
+    errdefer if (!operands_transferred) alloc.free(operands);
+    operands[0] = operand;
+
+    operand_transferred = true;
+    path_owned_transferred = true;
+    operands_transferred = true;
+    return .{
+        .kind = .json_extract,
+        .json_path = owned_path,
+        .json_as_text = as_text,
+        .operands = operands,
+    };
+}
+
+fn generatedCreateIndexJsonPathSegmentAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) !?[]const u8 {
+    if (expression.kind != .token_range) return null;
+    const range = expression.tokens orelse return error.UnsupportedSqlShape;
+    var pos = range.start;
+    const value_json = value_mod.parseJsonValueAlloc(alloc, tokens, &pos, &.{}) catch |err| switch (err) {
+        error.UnsupportedSqlShape => return null,
+        else => return err,
+    };
+    defer alloc.free(value_json);
+    if (pos != range.end) return null;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.UnsupportedSqlShape;
+    defer parsed.deinit();
+    if (parsed.value != .string) return null;
+    return try alloc.dupe(u8, parsed.value.string);
+}
+
+fn generatedDdlSimpleGeneratedValueAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) !?runtime_schema.RelationalGeneratedValue {
+    const expression_range = expression.tokens orelse return error.UnsupportedSqlShape;
+    const unwrapped = generatedCreateIndexUnwrappedExpression(&expression);
+    if (unwrapped.kind != .function_call) return null;
+    if (unwrapped.argument_distinct_tokens != null or
+        unwrapped.argument_order_tokens != null or
+        unwrapped.within_group_tokens != null or
+        unwrapped.filter_tokens != null or
+        unwrapped.over_tokens != null)
+    {
+        return null;
+    }
+    const function_name = generatedDdlSingleTokenText(tokens, unwrapped.function_name_tokens orelse return error.UnsupportedSqlShape);
+    const op = generatedCreateIndexGeneratedOp(generatedCreateIndexSimpleFunctionOp(function_name) orelse return null);
+    const arguments = unwrapped.argument_items;
+    if (arguments.count != 1 or
+        arguments.items.len != 1 or
+        arguments.expression_items.len != 1 or
+        arguments.expressions.len != 1 or
+        (arguments.alias_items.len != 0 and arguments.alias_items.len != 1))
+    {
+        return error.UnsupportedSqlShape;
+    }
+    if (arguments.alias_items.len == 1 and arguments.alias_items[0] != null) return error.UnsupportedSqlShape;
+    if (!generatedDdlTokenRangeEqual(arguments.items[0], arguments.expression_items[0])) return error.UnsupportedSqlShape;
+    const field_expression = arguments.expressions[0];
+    if (!generatedDdlTokenRangeEqual(field_expression.tokens orelse return error.UnsupportedSqlShape, arguments.expression_items[0])) return error.UnsupportedSqlShape;
+    if (field_expression.kind != .token_range) return null;
+    const field_range = arguments.expression_items[0];
+    if (field_range.start < expression_range.start or field_range.end > expression_range.end) return error.UnsupportedSqlShape;
+    if (field_range.end != field_range.start + 1 or field_range.end > tokens.len or tokens[field_range.start].kind != .identifier) return null;
+    return .{
+        .op = op,
+        .field = try alloc.dupe(u8, tokens[field_range.start].text),
+    };
+}
+
+fn generatedCreateIndexExpressionArgumentsValid(arguments: generated_parser.GeneratedSqlListAst) bool {
+    if (arguments.items.len != arguments.count or arguments.expression_items.len != arguments.count or arguments.expressions.len != arguments.count) return false;
+    if (arguments.alias_items.len != 0 and arguments.alias_items.len != arguments.count) return false;
+    for (arguments.alias_items) |alias| if (alias != null) return false;
+    for (arguments.items, 0..) |item, index| {
+        if (!generatedDdlTokenRangeEqual(item, arguments.expression_items[index])) return false;
+        if (!generatedDdlTokenRangeEqual(arguments.expressions[index].tokens orelse return false, arguments.expression_items[index])) return false;
+    }
+    return true;
+}
+
+fn generatedCreateIndexRowExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) anyerror!?runtime_schema.RelationalRowsExpression {
+    switch (expression.kind) {
+        .grouped => return try generatedCreateIndexRowExpressionAlloc(alloc, tokens, (expression.inner_expression orelse return error.UnsupportedSqlShape).*),
+        .token_range => {
+            const range = expression.tokens orelse return error.UnsupportedSqlShape;
+            if (range.end != range.start + 1 or range.end > tokens.len) return null;
+            if ((tokens[range.start].kind == .identifier or tokens[range.start].kind == .placeholder) and
+                !tokens[range.start].matchesKeywordTag(.true) and
+                !tokens[range.start].matchesKeywordTag(.false) and
+                !tokens[range.start].matchesKeywordTag(.null))
+            {
+                return try generatedCreateIndexFieldTokenExpressionAlloc(alloc, tokens[range.start]);
+            }
+            if (!generatedCreateIndexLiteralRangeSupported(tokens, range)) return null;
+            return try generatedCreateIndexValueExpressionAlloc(alloc, try generatedCreateIndexLiteralJsonAlloc(alloc, tokens, range));
+        },
+        .unary_positive => return try generatedCreateIndexRowExpressionAlloc(alloc, tokens, (expression.right_expression orelse return error.UnsupportedSqlShape).*),
+        .unary_negative => {
+            const range = expression.tokens orelse return error.UnsupportedSqlShape;
+            if (!generatedCreateIndexLiteralRangeSupported(tokens, range)) return null;
+            return try generatedCreateIndexValueExpressionAlloc(alloc, try generatedCreateIndexLiteralJsonAlloc(alloc, tokens, range));
+        },
+        .additive, .subtractive, .multiplicative, .divisive, .modulo, .string_concat => {
+            const kind = generatedCreateIndexRowExpressionBinaryKind(expression.kind) orelse unreachable;
+            const left = (try generatedCreateIndexRowExpressionAlloc(alloc, tokens, (expression.left_expression orelse return error.UnsupportedSqlShape).*)) orelse return null;
+            var left_transferred = false;
+            errdefer if (!left_transferred) runtime_schema.freeRelationalRowsExpression(alloc, left);
+            const right = (try generatedCreateIndexRowExpressionAlloc(alloc, tokens, (expression.right_expression orelse return error.UnsupportedSqlShape).*)) orelse return null;
+            var right_transferred = false;
+            errdefer if (!right_transferred) runtime_schema.freeRelationalRowsExpression(alloc, right);
+            const operands = try alloc.alloc(runtime_schema.RelationalRowsExpression, 2);
+            operands[0] = left;
+            operands[1] = right;
+            left_transferred = true;
+            right_transferred = true;
+            return try generatedCreateIndexOperationExpressionAlloc(alloc, kind, operands);
+        },
+        .function_call => {
+            if (expression.argument_distinct_tokens != null or
+                expression.argument_order_tokens != null or
+                expression.within_group_tokens != null or
+                expression.filter_tokens != null or
+                expression.over_tokens != null)
+            {
+                return null;
+            }
+            const function_name = generatedDdlSingleTokenText(tokens, expression.function_name_tokens orelse return error.UnsupportedSqlShape);
+            const arguments = expression.argument_items;
+            if (try generatedCreateIndexJsonExtractPathExpressionAlloc(alloc, tokens, function_name, arguments)) |json_extract| return json_extract;
+            const kind = generatedCreateIndexRowExpressionFunctionKind(function_name) orelse return null;
+            if (arguments.count == 0) return null;
+            if (!generatedCreateIndexExpressionArgumentsValid(arguments)) return error.UnsupportedSqlShape;
+            const operands = try alloc.alloc(runtime_schema.RelationalRowsExpression, arguments.count);
+            var initialized: usize = 0;
+            errdefer {
+                for (operands[0..initialized]) |operand| runtime_schema.freeRelationalRowsExpression(alloc, operand);
+                alloc.free(operands);
+            }
+            for (arguments.expressions, 0..) |argument, index| {
+                operands[index] = (try generatedCreateIndexRowExpressionAlloc(alloc, tokens, argument)) orelse return null;
+                initialized += 1;
+            }
+            return try generatedCreateIndexOperationExpressionAlloc(alloc, kind, operands);
+        },
+        .cast => {
+            const cast_expression = (try generatedCreateIndexRowExpressionAlloc(alloc, tokens, (expression.cast_expression orelse return error.UnsupportedSqlShape).*)) orelse return null;
+            var cast_expression_transferred = false;
+            errdefer if (!cast_expression_transferred) runtime_schema.freeRelationalRowsExpression(alloc, cast_expression);
+            const cast_type_name = generatedDdlSingleTokenText(tokens, expression.cast_type_tokens orelse return error.UnsupportedSqlShape);
+            const cast_type = generatedCreateIndexRowExpressionCastType(cast_type_name) orelse return null;
+            const operands = try alloc.alloc(runtime_schema.RelationalRowsExpression, 1);
+            operands[0] = cast_expression;
+            cast_expression_transferred = true;
+            return try generatedCreateIndexCastExpressionAlloc(alloc, operands, cast_type);
+        },
+        else => return null,
+    }
+}
+
+fn generatedCreateIndexArgumentField(
+    tokens: []const grammar.Token,
+    argument: generated_parser.GeneratedSqlExpressionAst,
+) ?[]const u8 {
+    if (argument.kind != .token_range) return null;
+    const range = argument.tokens orelse return null;
+    if (range.end != range.start + 1 or range.end > tokens.len or tokens[range.start].kind != .identifier) return null;
+    return tokens[range.start].text;
+}
+
+fn generatedCreateIndexStructuredGeneratedValueAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) !?runtime_schema.RelationalGeneratedValue {
+    const unwrapped = generatedCreateIndexUnwrappedExpression(&expression);
+    if (unwrapped.kind != .function_call) return null;
+    if (unwrapped.argument_distinct_tokens != null or
+        unwrapped.argument_order_tokens != null or
+        unwrapped.within_group_tokens != null or
+        unwrapped.filter_tokens != null or
+        unwrapped.over_tokens != null)
+    {
+        return null;
+    }
+    const function_name = generatedDdlSingleTokenText(tokens, unwrapped.function_name_tokens orelse return error.UnsupportedSqlShape);
+    const op: runtime_schema.RelationalGeneratedOp = if (std.ascii.eqlIgnoreCase(function_name, "concat"))
+        .concat
+    else if (std.ascii.eqlIgnoreCase(function_name, "concat_ws"))
+        .concat_ws
+    else
+        return null;
+    const arguments = unwrapped.argument_items;
+    if (!generatedCreateIndexExpressionArgumentsValid(arguments)) return error.UnsupportedSqlShape;
+    const first_field_index: usize = if (op == .concat_ws) 1 else 0;
+    if (arguments.count < first_field_index + 2) return null;
+    var separator: []const u8 = "";
+    if (op == .concat_ws) {
+        const separator_range = arguments.expression_items[0];
+        if (separator_range.end != separator_range.start + 1 or separator_range.end > tokens.len or tokens[separator_range.start].kind != .string) return null;
+        separator = tokens[separator_range.start].text;
+    }
+    var fields = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (fields.items) |field| alloc.free(field);
+        fields.deinit(alloc);
+    }
+    var index = first_field_index;
+    while (index < arguments.count) : (index += 1) {
+        if (op == .concat and index > 0 and index + 1 < arguments.count) {
+            const maybe_separator_range = arguments.expression_items[index];
+            if (maybe_separator_range.end == maybe_separator_range.start + 1 and maybe_separator_range.end <= tokens.len and tokens[maybe_separator_range.start].kind == .string) {
+                if (separator.len != 0 and !std.mem.eql(u8, separator, tokens[maybe_separator_range.start].text)) return null;
+                separator = tokens[maybe_separator_range.start].text;
+                index += 1;
+            }
+        }
+        const field_text = generatedCreateIndexArgumentField(tokens, arguments.expressions[index]) orelse return null;
+        try fields.append(alloc, try alloc.dupe(u8, field_text));
+    }
+    if (fields.items.len < 2) return null;
+    const owned_fields = try fields.toOwnedSlice(alloc);
+    var fields_transferred = false;
+    errdefer if (!fields_transferred) freeStringSlice(alloc, owned_fields);
+    const owned_separator = try alloc.dupe(u8, separator);
+    fields_transferred = true;
+    return .{
+        .op = op,
+        .fields = owned_fields,
+        .separator = owned_separator,
+    };
+}
+
+fn generatedDerivedIndexFieldPathAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+) ![]const u8 {
+    if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
+    var pos = range.start;
+    const field = try parseDerivedIndexFieldPathAlloc(alloc, tokens, &pos);
+    errdefer alloc.free(field);
+    if (pos != range.end) return error.UnsupportedSqlShape;
+    return field;
+}
+
+fn generatedDerivedIndexExpectedColumnCount(method: DdlIndexMethod) usize {
+    return switch (method) {
+        .antfly_full_text, .hnsw, .antfly_aknn => 1,
+        .antfly_graph => 2,
+        .antfly_graph_metric, .antfly_hybrid, .antfly_algebraic => 0,
+        .btree, .gin => unreachable,
+    };
+}
+
+fn generatedDerivedIndexColumnsAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    method: DdlIndexMethod,
+    elements_range: generated_parser.GeneratedSqlTokenRange,
+    elements: generated_parser.GeneratedSqlListAst,
+    opclass: *DdlIndexOpClass,
+) ![]const []const u8 {
+    const expected_count = generatedDerivedIndexExpectedColumnCount(method);
+    if (expected_count == 0) {
+        if (elements_range.start != elements_range.end or elements.count != 0 or elements.items.len != 0) return error.UnsupportedSqlShape;
+        return &.{};
+    }
+    if (!generatedIndexListCoversRange(elements, elements_range)) return error.UnsupportedSqlShape;
+    if (elements.count != expected_count or elements.expression_items.len != elements.count) return error.UnsupportedSqlShape;
+    const columns = try alloc.alloc([]const u8, elements.count);
+    var initialized: usize = 0;
+    errdefer {
+        for (columns[0..initialized]) |column| alloc.free(column);
+        alloc.free(columns);
+    }
+    for (elements.items, 0..) |item, index| {
+        if (item.start >= item.end or item.end > tokens.len) return error.UnsupportedSqlShape;
+        const expression_range = elements.expression_items[index];
+        if (expression_range.start < item.start or expression_range.end > item.end or expression_range.end > tokens.len) return error.UnsupportedSqlShape;
+        const suffix_range = generated_parser.GeneratedSqlTokenRange{ .start = expression_range.start, .end = item.end };
+        const item_opclass = try generatedCreateIndexOpClass(tokens, method, suffix_range);
+        if (item_opclass != .default) opclass.* = item_opclass;
+        columns[index] = try generatedDerivedIndexFieldPathAlloc(alloc, tokens, expression_range);
+        initialized += 1;
+    }
+    return columns;
+}
+
+fn generatedDerivedCreateIndexPlanAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+    method: DdlIndexMethod,
 ) !CreateIndexPlan {
-    const cursor = parser.Cursor.init(tokens, pos);
-    var header = try grammar.parseCreateIndexHeaderAlloc(alloc, tokens, pos);
-    var header_transferred = false;
-    errdefer if (!header_transferred) header.deinit(alloc);
-    const method = header.method;
+    if (ast.unique or ast.index_include_tokens != null or ast.index_include_items.count != 0 or ast.index_where_tokens != null or ast.index_where_expression.tokens != null) return error.UnsupportedSqlShape;
+    const elements_range = ast.index_elements_tokens orelse return error.UnsupportedSqlShape;
+    const elements = ast.index_element_items;
+
+    var opclass: DdlIndexOpClass = .default;
+    const columns = try generatedDerivedIndexColumnsAlloc(alloc, tokens, method, elements_range, elements, &opclass);
+    var columns_transferred = false;
+    errdefer if (!columns_transferred) freeStringSlice(alloc, columns);
+
+    const options = try parseGeneratedDerivedIndexOptionsAlloc(alloc, tokens, ast.index_options_tokens);
+    defer freeDerivedIndexOptions(alloc, options);
+    const derived_index_config_json = try derivedIndexConfigJsonFromOptionsAlloc(alloc, method, opclass, columns, options);
+    var config_transferred = false;
+    errdefer if (!config_transferred) alloc.free(derived_index_config_json);
+
+    const index_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, ast.object_name_tokens orelse return error.UnsupportedSqlShape);
+    var index_name_transferred = false;
+    errdefer if (!index_name_transferred) alloc.free(index_name);
+    const table_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, ast.index_table_tokens orelse return error.UnsupportedSqlShape);
+    var table_name_transferred = false;
+    errdefer if (!table_name_transferred) alloc.free(table_name);
+
+    index_name_transferred = true;
+    table_name_transferred = true;
+    columns_transferred = true;
+    config_transferred = true;
+    return .{
+        .index_name = index_name,
+        .table_name = table_name,
+        .if_not_exists = ast.if_not_exists,
+        .unique = false,
+        .method = method,
+        .opclass = opclass,
+        .columns = columns,
+        .derived_index_config_json = derived_index_config_json,
+    };
+}
+
+fn generatedCreateIndexPlanAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    end: usize,
+    ast: generated_parser.GeneratedSqlDdlAst,
+) !?CreateIndexPlan {
+    const method = try generatedCreateIndexMethod(tokens, ast);
+    if (ddlIndexMethodIsDerived(method)) return try generatedDerivedCreateIndexPlanAlloc(alloc, tokens, ast, method);
+    if (ast.index_options_tokens != null) return null;
+    const elements_range = ast.index_elements_tokens orelse return error.UnsupportedSqlShape;
+    const elements = ast.index_element_items;
+    if (!generatedIndexListCoversRange(elements, elements_range)) return error.UnsupportedSqlShape;
+    if (elements.expression_items.len != elements.count or elements.directions.len != elements.count or elements.nulls_orders.len != elements.count) return error.UnsupportedSqlShape;
+
+    var where: []const runtime_schema.UniquePredicate = &.{};
+    var where_transferred = false;
+    errdefer if (!where_transferred) freeDdlUniquePredicates(alloc, where);
+    var where_expressions: []const db_mod.types.RelationalRowsExpressionCondition = &.{};
+    var where_expressions_transferred = false;
+    errdefer if (!where_expressions_transferred) {
+        freeExpressionConditions(alloc, where_expressions);
+        if (where_expressions.len > 0) alloc.free(where_expressions);
+    };
+    if (try generatedCreateIndexWherePredicatesAlloc(alloc, tokens, ast)) |predicates| {
+        where = predicates;
+    } else if (try generatedCreateIndexWhereExpressionConditionsAlloc(alloc, tokens, ast)) |conditions| {
+        where_expressions = conditions;
+    } else {
+        return null;
+    }
+
+    const index_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, ast.object_name_tokens orelse return error.UnsupportedSqlShape);
+    var index_name_transferred = false;
+    errdefer if (!index_name_transferred) alloc.free(index_name);
+    const table_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, ast.index_table_tokens orelse return error.UnsupportedSqlShape);
+    var table_name_transferred = false;
+    errdefer if (!table_name_transferred) alloc.free(table_name);
 
     var columns = std.ArrayListUnmanaged([]const u8).empty;
-    var opclass: DdlIndexOpClass = .default;
     errdefer {
         for (columns.items) |column| alloc.free(column);
         columns.deinit(alloc);
@@ -15339,161 +16839,120 @@ pub fn parseCreateIndexPlanAlloc(
     errdefer if (generated_expression) |generated| freeDdlGeneratedValue(alloc, generated);
     var without_overlaps_period: ?[]const u8 = null;
     errdefer if (without_overlaps_period) |period| alloc.free(period);
-    try cursor.expectToken(.lparen);
-    const empty_derived_index = switch (method) {
-        .antfly_algebraic, .antfly_graph_metric, .antfly_hybrid => cursor.matchToken(.rparen) != null,
-        else => false,
-    };
-    const derived_index = ddlIndexMethodIsDerived(method);
-    while (!empty_derived_index) {
-        if (derived_index) {
-            const column = try parseDerivedIndexFieldPathAlloc(alloc, tokens, pos);
-            var column_transferred = false;
-            errdefer if (!column_transferred) alloc.free(column);
-            const suffix = try grammar.parseCreateIndexElementSuffix(tokens, pos, method, true);
-            if (suffix.opclass != .default) opclass = suffix.opclass;
-            try columns.append(alloc, column);
-            column_transferred = true;
-        } else if (grammar.peekDdlIndexElementExpression(tokens, pos.*, true)) {
-            const wrapper_count = grammar.consumeDdlIndexExpressionWrappers(tokens, pos);
-            if (unique) {
-                const expression = try grammar.parseDdlUniqueExpressionAlloc(alloc, tokens, pos);
-                var expression_transferred = false;
-                errdefer if (!expression_transferred) freeDdlUniqueExpression(alloc, expression);
-                try expressions.append(alloc, expression);
-                expression_transferred = true;
-            } else {
-                if (generated_expression != null) return error.UnsupportedSqlShape;
-                const generated = try grammar.parseDdlGeneratedExpressionAlloc(alloc, tokens, pos);
-                var generated_transferred = false;
-                errdefer if (!generated_transferred) freeDdlGeneratedValue(alloc, generated);
-                generated_expression = generated;
-                generated_transferred = true;
-            }
-            try grammar.closeDdlIndexExpressionWrappers(tokens, pos, wrapper_count);
-            const suffix = try grammar.parseCreateIndexElementSuffix(tokens, pos, method, false);
-            if (!unique) {
-                const index_key_column = try alloc.dupe(u8, header.index_name);
-                var index_key_transferred = false;
-                errdefer if (!index_key_transferred) alloc.free(index_key_column);
-                try index_keys.append(alloc, .{
-                    .column = index_key_column,
-                    .direction = relationalIndexKeyDirectionFromSyntax(suffix.order_direction),
-                    .nulls = relationalIndexKeyNullsFromSyntax(suffix.nulls_order),
-                });
-                index_key_transferred = true;
-                if (createIndexElementSuffixHasOrderingMetadata(suffix)) has_ordered_index_key_metadata = true;
-            }
-        } else {
-            const column = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
-            var column_transferred = false;
-            errdefer if (!column_transferred) alloc.free(column);
-            if (cursor.matchKeyword("without")) {
-                try cursor.expectKeyword("overlaps");
-                if (!unique or without_overlaps_period != null) return error.UnsupportedSqlShape;
-                without_overlaps_period = column;
-                column_transferred = true;
-                if (cursor.matchToken(.comma) == null) break;
+    var opclass: DdlIndexOpClass = .default;
+    for (elements.items, 0..) |item, item_index| {
+        if (item.start >= item.end or item.end > tokens.len) return error.UnsupportedSqlShape;
+        if (try generatedCreateIndexWithoutOverlapsPeriodAlloc(alloc, tokens, item)) |period| {
+            var period_transferred = false;
+            errdefer if (!period_transferred) alloc.free(period);
+            if (!ast.unique or without_overlaps_period != null) return error.UnsupportedSqlShape;
+            without_overlaps_period = period;
+            period_transferred = true;
+            continue;
+        }
+        const expression_range = elements.expression_items[item_index];
+        if (expression_range.start >= expression_range.end or expression_range.end > tokens.len) return error.UnsupportedSqlShape;
+        const generated_gin_column_opclass = method == .gin and item.end == item.start + 2 and tokens[item.start + 1].kind == .identifier;
+        if (tokens[item.start].kind == .identifier and
+            expression_range.start == item.start and
+            (expression_range.end == item.start + 1 or generated_gin_column_opclass))
+        {
+            if (try generatedCreateIndexElementHasWithoutOverlaps(tokens, item, expression_range)) {
+                if (!ast.unique or without_overlaps_period != null) return error.UnsupportedSqlShape;
+                without_overlaps_period = try generatedIdentifierAlloc(alloc, tokens, expression_range);
                 continue;
             }
-            const suffix = try grammar.parseCreateIndexElementSuffix(tokens, pos, method, true);
-            if (suffix.opclass != .default) opclass = suffix.opclass;
-            const index_key_column = try alloc.dupe(u8, column);
-            var index_key_transferred = false;
-            errdefer if (!index_key_transferred) alloc.free(index_key_column);
-            try index_keys.append(alloc, .{
-                .column = index_key_column,
-                .direction = relationalIndexKeyDirectionFromSyntax(suffix.order_direction),
-                .nulls = relationalIndexKeyNullsFromSyntax(suffix.nulls_order),
-            });
-            index_key_transferred = true;
-            if (createIndexElementSuffixHasOrderingMetadata(suffix)) has_ordered_index_key_metadata = true;
+            const item_opclass = try generatedCreateIndexOpClass(tokens, method, item);
+            if (item_opclass != .default) opclass = item_opclass;
+            const column_range = if (generated_gin_column_opclass)
+                generated_parser.GeneratedSqlTokenRange{ .start = item.start, .end = item.start + 1 }
+            else
+                expression_range;
+            const column = try generatedIdentifierAlloc(alloc, tokens, column_range);
+            var column_transferred = false;
+            errdefer if (!column_transferred) alloc.free(column);
+            const key_column = try alloc.dupe(u8, column);
+            var key_column_transferred = false;
+            errdefer if (!key_column_transferred) alloc.free(key_column);
             try columns.append(alloc, column);
             column_transferred = true;
+            try index_keys.append(alloc, .{
+                .column = key_column,
+                .direction = generatedRelationalIndexKeyDirection(elements.directions[item_index]),
+                .nulls = generatedRelationalIndexKeyNulls(elements.nulls_orders[item_index]),
+            });
+            key_column_transferred = true;
+            if (elements.directions[item_index] != null or elements.nulls_orders[item_index] != null) has_ordered_index_key_metadata = true;
+            continue;
         }
-        if (cursor.matchToken(.comma) == null) break;
+        const simple_expression = try generatedCreateIndexSimpleExpression(tokens, item, expression_range, elements.expressions[item_index]);
+        if (ast.unique) {
+            if (simple_expression) |simple| {
+                const field = try alloc.dupe(u8, simple.field);
+                var field_transferred = false;
+                errdefer if (!field_transferred) alloc.free(field);
+                try expressions.append(alloc, .{
+                    .op = simple.op,
+                    .field = field,
+                });
+                field_transferred = true;
+            } else {
+                if (!generatedCreateIndexExpressionItemSuffixSupported(tokens, item, expression_range)) return error.UnsupportedSqlShape;
+                const row_expression = (try generatedCreateIndexRowExpressionAlloc(alloc, tokens, elements.expressions[item_index])) orelse return error.UnsupportedSqlShape;
+                var row_expression_transferred = false;
+                errdefer if (!row_expression_transferred) runtime_schema.freeRelationalRowsExpression(alloc, row_expression);
+                try expressions.append(alloc, .{
+                    .op = .expression,
+                    .expression = row_expression,
+                });
+                row_expression_transferred = true;
+            }
+        } else {
+            if (generated_expression != null) return error.UnsupportedSqlShape;
+            if (!generatedCreateIndexExpressionItemSuffixSupported(tokens, item, expression_range)) return error.UnsupportedSqlShape;
+            const row_expression = (try generatedCreateIndexRowExpressionAlloc(alloc, tokens, elements.expressions[item_index])) orelse return error.UnsupportedSqlShape;
+            var row_expression_transferred = false;
+            errdefer if (!row_expression_transferred) runtime_schema.freeRelationalRowsExpression(alloc, row_expression);
+            row_expression_transferred = true;
+            generated_expression = .{ .op = .expression, .expression = row_expression };
+            const key_column = try alloc.dupe(u8, index_name);
+            var key_column_transferred = false;
+            errdefer if (!key_column_transferred) alloc.free(key_column);
+            try index_keys.append(alloc, .{
+                .column = key_column,
+                .direction = generatedRelationalIndexKeyDirection(elements.directions[item_index]),
+                .nulls = generatedRelationalIndexKeyNulls(elements.nulls_orders[item_index]),
+            });
+            key_column_transferred = true;
+            if (elements.directions[item_index] != null or elements.nulls_orders[item_index] != null) has_ordered_index_key_metadata = true;
+        }
     }
-    if (!empty_derived_index) try cursor.expectToken(.rparen);
-    if (columns.items.len == 0 and expressions.items.len == 0 and generated_expression == null and
-        method != .antfly_algebraic and method != .antfly_graph_metric and method != .antfly_hybrid) return error.UnsupportedSqlShape;
+    if (columns.items.len == 0 and expressions.items.len == 0 and generated_expression == null) return error.UnsupportedSqlShape;
     try grammar.validateSqlIdentifierListUnique(columns.items);
     try expr_type.validateSqlUniqueExpressionListUnique(expressions.items);
 
-    if (ddlIndexMethodIsDerived(method)) {
-        if (unique or expressions.items.len != 0 or generated_expression != null or without_overlaps_period != null) return error.UnsupportedSqlShape;
-        switch (method) {
-            .antfly_full_text, .hnsw, .antfly_aknn => if (columns.items.len != 1) return error.UnsupportedSqlShape,
-            .antfly_graph => if (columns.items.len != 2) return error.UnsupportedSqlShape,
-            .antfly_graph_metric, .antfly_hybrid, .antfly_algebraic => if (columns.items.len != 0) return error.UnsupportedSqlShape,
-            .btree, .gin => unreachable,
-        }
-        const derived_index_config_json = try derivedIndexConfigJsonAlloc(alloc, tokens, pos, method, opclass, columns.items);
-        var derived_transferred = false;
-        errdefer if (!derived_transferred) alloc.free(derived_index_config_json);
-        try grammar.parseAdapterNoopStatementEnd(tokens, pos);
-
-        const owned_columns = try columns.toOwnedSlice(alloc);
-        var columns_transferred = false;
-        errdefer if (!columns_transferred) freeStringSlice(alloc, owned_columns);
-
-        header_transferred = true;
-        columns_transferred = true;
-        derived_transferred = true;
-        return .{
-            .index_name = header.index_name,
-            .table_name = header.table_name,
-            .if_not_exists = header.if_not_exists,
-            .unique = false,
-            .method = method,
-            .opclass = opclass,
-            .columns = owned_columns,
-            .derived_index_config_json = derived_index_config_json,
-        };
-    }
-
-    const nulls_policy = try grammar.parseOptionalDdlUniqueNullsDistinct(tokens, pos);
-    if (nulls_policy != null and !unique) return error.UnsupportedSqlShape;
+    const nulls_policy = try generatedCreateIndexNullsNotDistinct(tokens, ast, end);
+    if (nulls_policy != null and !ast.unique) return error.UnsupportedSqlShape;
     const nulls_not_distinct = nulls_policy orelse false;
     if (nulls_not_distinct and without_overlaps_period != null) return error.UnsupportedSqlShape;
 
     var include_columns: []const []const u8 = &.{};
     var include_columns_owned = false;
     errdefer if (include_columns_owned) freeStringSlice(alloc, include_columns);
-    if (cursor.matchKeyword("include")) {
-        include_columns = try grammar.parseDdlUniqueColumnListAlloc(alloc, tokens, pos);
+    if (ast.index_include_tokens) |include_range| {
+        include_columns = try generatedIdentifierListAlloc(alloc, tokens, include_range, ast.index_include_items);
         include_columns_owned = true;
         try grammar.validateSqlIdentifierListsDisjoint(columns.items, include_columns);
+    } else if (ast.index_include_items.count != 0) {
+        return error.UnsupportedSqlShape;
     }
-
-    var predicates: []const runtime_schema.UniquePredicate = &.{};
-    errdefer freeDdlUniquePredicates(alloc, predicates);
-    var where_expressions: []const db_mod.types.RelationalRowsExpressionCondition = &.{};
-    errdefer {
-        freeExpressionConditions(alloc, where_expressions);
-        if (where_expressions.len > 0) alloc.free(where_expressions);
-    }
-    if (cursor.matchKeyword("where")) {
-        const predicate_start = pos.*;
-        predicates = grammar.parseDdlUniquePredicatesAlloc(alloc, tokens, pos) catch |err| switch (err) {
-            error.UnsupportedSqlShape => blk: {
-                pos.* = predicate_start;
-                break :blk &.{};
-            },
-            else => return err,
-        };
-        if (predicates.len == 0) {
-            pos.* = predicate_start;
-            where_expressions = try expr_where_condition.parseUniquePredicateWhereExpressionConditionsWithDeferredFieldValidationAlloc(alloc, tokens, pos, .{
-                .context_hooks = options.context_hooks,
-                .case_expression_hooks = options.case_expression_hooks,
-            });
-        }
-    }
-    try grammar.parseAdapterNoopStatementEnd(tokens, pos);
 
     const owned_columns = try columns.toOwnedSlice(alloc);
     var columns_transferred = false;
     errdefer if (!columns_transferred) freeStringSlice(alloc, owned_columns);
+    const owned_expressions = try expressions.toOwnedSlice(alloc);
+    var expressions_transferred = false;
+    errdefer if (!expressions_transferred) freeDdlUniqueExpressions(alloc, owned_expressions);
     const preserve_index_keys = method == .btree or has_ordered_index_key_metadata or index_keys.items.len >= 2;
     const owned_index_keys = if (preserve_index_keys) try index_keys.toOwnedSlice(alloc) else empty_keys: {
         for (index_keys.items) |key| freeDdlRelationalIndexKey(alloc, key);
@@ -15504,33 +16963,32 @@ pub fn parseCreateIndexPlanAlloc(
     };
     var index_keys_transferred = false;
     errdefer if (!index_keys_transferred) freeDdlRelationalIndexKeys(alloc, owned_index_keys);
-    const owned_include_columns = include_columns;
-    const owned_expressions = try expressions.toOwnedSlice(alloc);
-    var expressions_transferred = false;
-    errdefer if (!expressions_transferred) freeDdlUniqueExpressions(alloc, owned_expressions);
-    const period = without_overlaps_period;
-    without_overlaps_period = null;
 
-    header_transferred = true;
+    index_name_transferred = true;
+    table_name_transferred = true;
     columns_transferred = true;
+    expressions_transferred = true;
     index_keys_transferred = true;
     include_columns_owned = false;
-    expressions_transferred = true;
+    where_transferred = true;
+    where_expressions_transferred = true;
+    const period = without_overlaps_period;
+    without_overlaps_period = null;
     return .{
-        .index_name = header.index_name,
-        .table_name = header.table_name,
-        .if_not_exists = header.if_not_exists,
-        .unique = unique,
+        .index_name = index_name,
+        .table_name = table_name,
+        .if_not_exists = ast.if_not_exists,
+        .unique = ast.unique,
         .method = method,
         .opclass = opclass,
         .columns = owned_columns,
+        .include_columns = include_columns,
         .index_keys = owned_index_keys,
-        .include_columns = owned_include_columns,
         .expressions = owned_expressions,
         .generated_expression = generated_expression,
         .without_overlaps_period = period,
         .nulls_not_distinct = nulls_not_distinct,
-        .where = predicates,
+        .where = where,
         .where_expressions = where_expressions,
     };
 }
@@ -15706,6 +17164,20 @@ fn parseDerivedIndexOptionsAlloc(
     }
     try cursor.expectToken(.rparen);
     return try options.toOwnedSlice(alloc);
+}
+
+fn parseGeneratedDerivedIndexOptionsAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    range: ?generated_parser.GeneratedSqlTokenRange,
+) ![]DerivedIndexOption {
+    const options_range = range orelse return &.{};
+    if (options_range.start >= options_range.end or options_range.end > tokens.len) return error.UnsupportedSqlShape;
+    var pos = options_range.start;
+    const options = try parseDerivedIndexOptionsAlloc(alloc, tokens, &pos);
+    errdefer freeDerivedIndexOptions(alloc, options);
+    if (pos != options_range.end) return error.UnsupportedSqlShape;
+    return options;
 }
 
 fn freeDerivedIndexOptions(alloc: std.mem.Allocator, options: []DerivedIndexOption) void {
@@ -16088,7 +17560,16 @@ fn derivedIndexConfigJsonAlloc(
 ) ![]const u8 {
     const options = try parseDerivedIndexOptionsAlloc(alloc, tokens, pos);
     defer freeDerivedIndexOptions(alloc, options);
+    return try derivedIndexConfigJsonFromOptionsAlloc(alloc, method, opclass, columns, options);
+}
 
+fn derivedIndexConfigJsonFromOptionsAlloc(
+    alloc: std.mem.Allocator,
+    method: DdlIndexMethod,
+    opclass: DdlIndexOpClass,
+    columns: []const []const u8,
+    options: []const DerivedIndexOption,
+) ![]const u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
     try out.append(alloc, '{');
@@ -16191,878 +17672,7 @@ fn derivedIndexConfigJsonAlloc(
     return try out.toOwnedSlice(alloc);
 }
 
-pub fn createExtensionPlanFromSyntax(
-    syntax: *grammar.CreateExtensionSyntax,
-    default_namespace_name: []const u8,
-) !CreateExtensionPlan {
-    if (syntax.schema_name) |schema_name| {
-        if (!std.ascii.eqlIgnoreCase(schema_name, default_namespace_name)) return error.UnsupportedSqlShape;
-    }
-    const extension_name = syntax.extension_name;
-    const version = syntax.version;
-    syntax.extension_name = "";
-    syntax.version = null;
-    return .{
-        .extension_name = extension_name,
-        .version = version,
-        .if_not_exists = syntax.if_not_exists,
-    };
-}
-
-pub fn updateExtensionPlanFromSyntax(syntax: *grammar.UpdateExtensionSyntax) UpdateExtensionPlan {
-    const extension_name = syntax.extension_name;
-    const target_version = syntax.target_version;
-    syntax.extension_name = "";
-    syntax.target_version = null;
-    return .{
-        .extension_name = extension_name,
-        .target_version = target_version,
-    };
-}
-
-pub fn dropExtensionPlanFromSyntax(syntax: *grammar.DropExtensionSyntax) DropExtensionPlan {
-    const extension_name = syntax.extension_name;
-    syntax.extension_name = "";
-    return .{
-        .extension_name = extension_name,
-        .if_exists = syntax.if_exists,
-        .cascade = syntax.cascade,
-    };
-}
-
-pub fn createSchemaNamespacePlanFromSyntax(syntax: *grammar.CreateSchemaNamespaceSyntax) CreateSchemaNamespacePlan {
-    const schema_name = syntax.schema_name;
-    syntax.schema_name = "";
-    return .{
-        .schema_name = schema_name,
-        .if_not_exists = syntax.if_not_exists,
-    };
-}
-
-pub fn renameSchemaNamespacePlanFromSyntax(syntax: *grammar.RenameSchemaNamespaceSyntax) RenameSchemaNamespacePlan {
-    const schema_name = syntax.schema_name;
-    const new_schema_name = syntax.new_schema_name;
-    syntax.schema_name = "";
-    syntax.new_schema_name = "";
-    return .{
-        .schema_name = schema_name,
-        .new_schema_name = new_schema_name,
-    };
-}
-
-pub fn dropSchemaNamespacePlanFromSyntax(syntax: *grammar.DropSchemaNamespaceSyntax) DropSchemaNamespacePlan {
-    const schema_name = syntax.schema_name;
-    syntax.schema_name = "";
-    return .{
-        .schema_name = schema_name,
-        .if_exists = syntax.if_exists,
-        .cascade = syntax.cascade,
-    };
-}
-
-pub fn createDatabasePlanFromSyntax(syntax: *grammar.CreateDatabaseSyntax) CreateDatabasePlan {
-    const database_name = syntax.database_name;
-    syntax.database_name = "";
-    return .{ .database_name = database_name };
-}
-
-pub fn alterDatabasePlanFromSyntaxAlloc(
-    alloc: std.mem.Allocator,
-    syntax: *grammar.AlterDatabaseSyntax,
-) !AlterDatabasePlan {
-    const operations = try alloc.alloc(DatabaseAlterOperation, 1);
-    errdefer alloc.free(operations);
-    operations[0] = .{ .set_parameter = .{
-        .name = syntax.setting_name,
-        .value_json = syntax.value_json,
-    } };
-    const database_name = syntax.database_name;
-    syntax.database_name = "";
-    syntax.setting_name = "";
-    syntax.value_json = "";
-    return .{
-        .database_name = database_name,
-        .operations = operations,
-    };
-}
-
-pub fn dropDatabasePlanFromSyntax(syntax: *grammar.DropDatabaseSyntax) DropDatabasePlan {
-    const database_name = syntax.database_name;
-    syntax.database_name = "";
-    return .{
-        .database_name = database_name,
-        .if_exists = syntax.if_exists,
-        .force = syntax.force,
-    };
-}
-
-pub fn createTablespacePlanFromSyntax(syntax: *grammar.CreateTablespaceSyntax) CreateTablespacePlan {
-    const tablespace_name = syntax.tablespace_name;
-    const location_json = syntax.location_json;
-    const placement_policy_json = syntax.placement_policy_json;
-    syntax.tablespace_name = "";
-    syntax.location_json = "";
-    syntax.placement_policy_json = "";
-    return .{
-        .tablespace_name = tablespace_name,
-        .location_json = location_json,
-        .placement_policy_json = placement_policy_json,
-    };
-}
-
-pub fn renameTablespacePlanFromSyntax(syntax: *grammar.RenameTablespaceSyntax) RenameTablespacePlan {
-    const tablespace_name = syntax.tablespace_name;
-    const new_tablespace_name = syntax.new_tablespace_name;
-    syntax.tablespace_name = "";
-    syntax.new_tablespace_name = "";
-    return .{
-        .tablespace_name = tablespace_name,
-        .new_tablespace_name = new_tablespace_name,
-    };
-}
-
-pub fn dropTablespacePlanFromSyntax(syntax: *grammar.DropTablespaceSyntax) DropTablespacePlan {
-    const tablespace_name = syntax.tablespace_name;
-    syntax.tablespace_name = "";
-    return .{
-        .tablespace_name = tablespace_name,
-        .if_exists = syntax.if_exists,
-    };
-}
-
-pub fn listenNotificationPlanFromSyntax(syntax: *grammar.ListenNotificationSyntax) ListenNotificationPlan {
-    const channel_name = syntax.channel_name;
-    syntax.channel_name = "";
-    return .{ .channel_name = channel_name };
-}
-
-pub fn notifyNotificationPlanFromSyntax(syntax: *grammar.NotifyNotificationSyntax) NotifyNotificationPlan {
-    const channel_name = syntax.channel_name;
-    const payload_json = syntax.payload_json;
-    syntax.channel_name = "";
-    syntax.payload_json = null;
-    return .{
-        .channel_name = channel_name,
-        .payload_json = payload_json,
-    };
-}
-
-pub fn unlistenNotificationPlanFromSyntax(syntax: *grammar.UnlistenNotificationSyntax) UnlistenNotificationPlan {
-    const channel_name = syntax.channel_name;
-    syntax.channel_name = null;
-    return .{
-        .channel_name = channel_name,
-        .all = syntax.all,
-    };
-}
-
-pub fn createPublicationPlanFromSyntax(syntax: *grammar.CreatePublicationSyntax) CreatePublicationPlan {
-    const publication_name = syntax.publication_name;
-    const tables = syntax.tables;
-    const publish_json = syntax.publish_json;
-    syntax.publication_name = "";
-    syntax.tables = &.{};
-    syntax.publish_json = null;
-    return .{
-        .publication_name = publication_name,
-        .tables = tables,
-        .all_tables = syntax.all_tables,
-        .publish_json = publish_json,
-        .publish_via_partition_root = syntax.publish_via_partition_root,
-    };
-}
-
-pub fn alterPublicationPlanFromSyntax(syntax: *grammar.AlterPublicationSyntax) AlterPublicationPlan {
-    const publication_name = syntax.publication_name;
-    const tables = syntax.tables;
-    const rename_to = syntax.rename_to;
-    const owner_to = syntax.owner_to;
-    const publish_json = syntax.publish_json;
-    syntax.publication_name = "";
-    syntax.tables = &.{};
-    syntax.rename_to = null;
-    syntax.owner_to = null;
-    syntax.publish_json = null;
-    return .{
-        .publication_name = publication_name,
-        .operation = switch (syntax.operation) {
-            .add_tables => .{ .add_tables = tables },
-            .drop_tables => .{ .drop_tables = tables },
-            .set_tables => .{ .set_tables = tables },
-            .set_options => .{ .set_options = .{
-                .publish_json = publish_json,
-                .publish_via_partition_root = syntax.publish_via_partition_root,
-            } },
-            .rename => .{ .rename_to = rename_to orelse unreachable },
-            .owner => .{ .owner_to = owner_to orelse unreachable },
-        },
-    };
-}
-
-pub fn dropPublicationPlanFromSyntax(syntax: *grammar.DropPublicationSyntax) DropPublicationPlan {
-    const publication_name = syntax.publication_name;
-    syntax.publication_name = "";
-    return .{
-        .publication_name = publication_name,
-        .if_exists = syntax.if_exists,
-    };
-}
-
-pub fn createSubscriptionPlanFromSyntax(syntax: *grammar.CreateSubscriptionSyntax) CreateSubscriptionPlan {
-    const subscription_name = syntax.subscription_name;
-    const connection_json = syntax.connection_json;
-    const publication_names = syntax.publication_names;
-    const copy_data = syntax.copy_data;
-    const connect = syntax.connect;
-    const binary = syntax.binary;
-    const create_slot = syntax.create_slot;
-    const enabled = syntax.enabled;
-    const two_phase = syntax.two_phase;
-    const disable_on_error = syntax.disable_on_error;
-    const synchronous_commit_json = syntax.synchronous_commit_json;
-    const streaming_json = syntax.streaming_json;
-    const password_required = syntax.password_required;
-    const run_as_owner = syntax.run_as_owner;
-    const failover = syntax.failover;
-    const origin_json = syntax.origin_json;
-    const slot_name_json = syntax.slot_name_json;
-    syntax.subscription_name = "";
-    syntax.connection_json = "";
-    syntax.publication_names = &.{};
-    syntax.synchronous_commit_json = null;
-    syntax.streaming_json = null;
-    syntax.origin_json = null;
-    syntax.slot_name_json = null;
-    return .{
-        .subscription_name = subscription_name,
-        .connection_json = connection_json,
-        .publication_names = publication_names,
-        .copy_data = copy_data,
-        .connect = connect,
-        .binary = binary,
-        .create_slot = create_slot,
-        .enabled = enabled,
-        .two_phase = two_phase,
-        .disable_on_error = disable_on_error,
-        .synchronous_commit_json = synchronous_commit_json,
-        .streaming_json = streaming_json,
-        .password_required = password_required,
-        .run_as_owner = run_as_owner,
-        .failover = failover,
-        .origin_json = origin_json,
-        .slot_name_json = slot_name_json,
-    };
-}
-
-pub fn alterSubscriptionPlanFromSyntax(syntax: *grammar.AlterSubscriptionSyntax) AlterSubscriptionPlan {
-    const subscription_name = syntax.subscription_name;
-    const connection_json = syntax.connection_json;
-    const rename_to = syntax.rename_to;
-    const owner_to = syntax.owner_to;
-    const skip_lsn_json = syntax.skip_lsn_json;
-    const publication_names = syntax.publication_names;
-    const synchronous_commit_json = syntax.synchronous_commit_json;
-    const streaming_json = syntax.streaming_json;
-    const origin_json = syntax.origin_json;
-    const slot_name_json = syntax.slot_name_json;
-    syntax.subscription_name = "";
-    syntax.connection_json = null;
-    syntax.rename_to = null;
-    syntax.owner_to = null;
-    syntax.skip_lsn_json = null;
-    syntax.publication_names = &.{};
-    syntax.synchronous_commit_json = null;
-    syntax.streaming_json = null;
-    syntax.origin_json = null;
-    syntax.slot_name_json = null;
-    return .{
-        .subscription_name = subscription_name,
-        .enabled = syntax.enabled,
-        .connection_json = connection_json,
-        .rename_to = rename_to,
-        .owner_to = owner_to,
-        .skip_lsn_json = skip_lsn_json,
-        .refresh_publication = syntax.refresh_publication,
-        .publication_action = alterSubscriptionPublicationActionFromSyntax(syntax.publication_action),
-        .publication_names = publication_names,
-        .copy_data = syntax.copy_data,
-        .connect = syntax.connect,
-        .binary = syntax.binary,
-        .create_slot = syntax.create_slot,
-        .enabled_option = syntax.enabled_option,
-        .two_phase = syntax.two_phase,
-        .disable_on_error = syntax.disable_on_error,
-        .synchronous_commit_json = synchronous_commit_json,
-        .streaming_json = streaming_json,
-        .password_required = syntax.password_required,
-        .run_as_owner = syntax.run_as_owner,
-        .failover = syntax.failover,
-        .origin_json = origin_json,
-        .slot_name_json = slot_name_json,
-    };
-}
-
-fn alterSubscriptionPublicationActionFromSyntax(action: ?grammar.AlterSubscriptionPublicationActionSyntax) ?AlterSubscriptionPublicationAction {
-    return switch (action orelse return null) {
-        .set => .set,
-        .add => .add,
-        .drop => .drop,
-    };
-}
-
-pub fn dropSubscriptionPlanFromSyntax(syntax: *grammar.DropSubscriptionSyntax) DropSubscriptionPlan {
-    const subscription_name = syntax.subscription_name;
-    syntax.subscription_name = "";
-    return .{
-        .subscription_name = subscription_name,
-        .if_exists = syntax.if_exists,
-    };
-}
-
-pub fn reindexMaintenancePlanFromSyntax(syntax: *grammar.ReindexMaintenanceSyntax) ReindexMaintenancePlan {
-    const name = syntax.name;
-    syntax.name = "";
-    return .{
-        .target = reindexMaintenanceTargetFromSyntax(syntax.target),
-        .name = name,
-        .concurrently = syntax.concurrently,
-    };
-}
-
-pub fn clusterMaintenancePlanFromSyntax(syntax: *grammar.ClusterMaintenanceSyntax) ClusterMaintenancePlan {
-    const table_name = syntax.table_name;
-    const index_name = syntax.index_name;
-    syntax.table_name = "";
-    syntax.index_name = null;
-    return .{
-        .table_name = table_name,
-        .index_name = index_name,
-        .verbose = syntax.verbose,
-    };
-}
-
-pub fn prepareStatementPlanFromSyntaxAlloc(
-    alloc: std.mem.Allocator,
-    syntax: grammar.PrepareStatementSyntax,
-) !PrepareStatementPlan {
-    return .{
-        .statement_name = try alloc.dupe(u8, syntax.statement_name),
-        .parameter_count = syntax.parameter_count,
-        .statement_kind = preparedStatementSubjectKindFromSyntax(syntax.statement_kind),
-        .statement_family = preparedStatementStatementKindFromSyntax(syntax.statement_family),
-    };
-}
-
-pub fn executePreparedStatementPlanFromSyntaxAlloc(
-    alloc: std.mem.Allocator,
-    syntax: grammar.ExecutePreparedStatementSyntax,
-) !ExecutePreparedStatementPlan {
-    return .{
-        .statement_name = try alloc.dupe(u8, syntax.statement_name),
-        .argument_count = syntax.argument_count,
-    };
-}
-
-pub fn declareCursorPortalPlanFromSyntaxAlloc(
-    alloc: std.mem.Allocator,
-    syntax: grammar.DeclareCursorPortalSyntax,
-) !DeclareCursorPortalPlan {
-    return .{
-        .portal_name = try alloc.dupe(u8, syntax.portal_name),
-        .scroll = cursorScrollModeFromSyntax(syntax.scroll),
-        .binary = syntax.binary,
-        .hold = syntax.hold,
-        .statement_kind = preparedStatementSubjectKindFromSyntax(syntax.statement_kind orelse return error.UnsupportedSqlShape),
-    };
-}
-
-pub fn fetchCursorPortalPlanFromSyntaxAlloc(
-    alloc: std.mem.Allocator,
-    syntax: grammar.FetchCursorPortalSyntax,
-) !FetchCursorPortalPlan {
-    return .{
-        .portal_name = try alloc.dupe(u8, syntax.portal_name),
-        .direction = cursorFetchDirectionFromSyntax(syntax.direction),
-        .count = syntax.count,
-    };
-}
-
-pub fn dropDomainPlanFromSyntax(syntax: *grammar.DropDomainSyntax) DropDomainPlan {
-    const domain_name = syntax.domain_name;
-    syntax.domain_name = "";
-    return .{
-        .domain_name = domain_name,
-        .if_exists = syntax.if_exists,
-        .cascade = syntax.cascade,
-    };
-}
-
-pub fn createSequencePlanFromSyntax(syntax: *grammar.CreateSequenceSyntax) CreateSequencePlan {
-    const sequence_name = syntax.sequence_name;
-    const options = syntax.options;
-    syntax.sequence_name = "";
-    syntax.options = .{};
-    return .{
-        .sequence_name = sequence_name,
-        .if_not_exists = syntax.if_not_exists,
-        .options = options,
-    };
-}
-
-pub fn alterSequencePlanFromSyntax(syntax: *grammar.AlterSequenceSyntax) AlterSequencePlan {
-    const sequence_name = syntax.sequence_name;
-    const operations = syntax.operations;
-    syntax.sequence_name = "";
-    syntax.operations = &.{};
-    return .{
-        .sequence_name = sequence_name,
-        .if_exists = syntax.if_exists,
-        .operations = operations,
-    };
-}
-
-pub fn dropSequencePlanFromSyntax(syntax: *grammar.DropSequenceSyntax) DropSequencePlan {
-    const sequence_name = syntax.sequence_name;
-    syntax.sequence_name = "";
-    return .{
-        .sequence_name = sequence_name,
-        .if_exists = syntax.if_exists,
-        .cascade = syntax.cascade,
-    };
-}
-
-pub fn createEnumTypePlanFromSyntax(syntax: *grammar.CreateEnumTypeSyntax) CreateEnumTypePlan {
-    const type_name = syntax.type_name;
-    const values = syntax.values;
-    syntax.type_name = "";
-    syntax.values = &.{};
-    return .{
-        .type_name = type_name,
-        .values = values,
-    };
-}
-
-pub fn addEnumValuePlanFromSyntax(syntax: *grammar.AddEnumValueSyntax) AddEnumValuePlan {
-    const type_name = syntax.type_name;
-    const value = syntax.value;
-    const neighbor_value = syntax.neighbor_value;
-    syntax.type_name = "";
-    syntax.value = "";
-    syntax.neighbor_value = null;
-    return .{
-        .type_name = type_name,
-        .value = value,
-        .if_not_exists = syntax.if_not_exists,
-        .position = syntax.position,
-        .neighbor_value = neighbor_value,
-    };
-}
-
-pub fn dropEnumTypePlanFromSyntax(syntax: *grammar.DropEnumTypeSyntax) DropEnumTypePlan {
-    const type_name = syntax.type_name;
-    syntax.type_name = "";
-    return .{
-        .type_name = type_name,
-        .if_exists = syntax.if_exists,
-        .cascade = syntax.cascade,
-    };
-}
-
-pub fn createCollationPlanFromSyntax(syntax: *grammar.CreateCollationSyntax) CreateCollationPlan {
-    const collation_name = syntax.collation_name;
-    syntax.collation_name = "";
-    return .{
-        .collation_name = collation_name,
-        .option_count = syntax.option_count,
-    };
-}
-
-pub fn renameCollationPlanFromSyntax(syntax: *grammar.RenameCollationSyntax) RenameCollationPlan {
-    const collation_name = syntax.collation_name;
-    const new_collation_name = syntax.new_collation_name;
-    syntax.collation_name = "";
-    syntax.new_collation_name = "";
-    return .{
-        .collation_name = collation_name,
-        .new_collation_name = new_collation_name,
-    };
-}
-
-pub fn dropCollationPlanFromSyntax(syntax: *grammar.DropCollationSyntax) DropCollationPlan {
-    const collation_name = syntax.collation_name;
-    syntax.collation_name = "";
-    return .{
-        .collation_name = collation_name,
-        .if_exists = syntax.if_exists,
-    };
-}
-
-pub fn createOperatorPlanFromSyntax(syntax: *grammar.CreateOperatorSyntax) CreateOperatorPlan {
-    const operator_name = syntax.operator_name;
-    syntax.operator_name = "";
-    return .{
-        .operator_name = operator_name,
-        .option_count = syntax.option_count,
-    };
-}
-
-pub fn dropOperatorPlanFromSyntax(syntax: *grammar.DropOperatorSyntax) DropOperatorPlan {
-    const operator_name = syntax.operator_name;
-    syntax.operator_name = "";
-    return .{
-        .operator_name = operator_name,
-        .argument_count = syntax.argument_count,
-        .if_exists = syntax.if_exists,
-    };
-}
-
-pub fn createAggregatePlanFromSyntax(syntax: *grammar.CreateAggregateSyntax) CreateAggregatePlan {
-    const aggregate_name = syntax.aggregate_name;
-    syntax.aggregate_name = "";
-    return .{
-        .aggregate_name = aggregate_name,
-        .argument_count = syntax.argument_count,
-        .option_count = syntax.option_count,
-    };
-}
-
-pub fn dropAggregatePlanFromSyntax(syntax: *grammar.DropAggregateSyntax) DropAggregatePlan {
-    const aggregate_name = syntax.aggregate_name;
-    syntax.aggregate_name = "";
-    return .{
-        .aggregate_name = aggregate_name,
-        .argument_count = syntax.argument_count,
-        .if_exists = syntax.if_exists,
-    };
-}
-
-pub fn createCastPlanFromSyntax(syntax: *grammar.CreateCastSyntax) CreateCastPlan {
-    const source_type = syntax.source_type;
-    const target_type = syntax.target_type;
-    const function_name = syntax.function_name;
-    syntax.source_type = "";
-    syntax.target_type = "";
-    syntax.function_name = "";
-    return .{
-        .source_type = source_type,
-        .target_type = target_type,
-        .function_name = function_name,
-        .assignment = syntax.assignment,
-    };
-}
-
-pub fn dropCastPlanFromSyntax(syntax: *grammar.DropCastSyntax) DropCastPlan {
-    const source_type = syntax.source_type;
-    const target_type = syntax.target_type;
-    syntax.source_type = "";
-    syntax.target_type = "";
-    return .{
-        .source_type = source_type,
-        .target_type = target_type,
-        .if_exists = syntax.if_exists,
-    };
-}
-
-pub fn createMaterializedViewPlanFromSyntax(syntax: *grammar.CreateMaterializedViewSyntax) CreateMaterializedViewPlan {
-    const view_name = syntax.view_name;
-    const source_table_name = syntax.source_table_name;
-    const source_fields = syntax.source_fields;
-    const output_fields = syntax.output_fields;
-    syntax.view_name = "";
-    syntax.source_table_name = "";
-    syntax.source_fields = &.{};
-    syntax.output_fields = &.{};
-    return .{
-        .view_name = view_name,
-        .source_table_name = source_table_name,
-        .source_fields = source_fields,
-        .output_fields = output_fields,
-        .replace_existing = syntax.replace_existing,
-        .if_not_exists = syntax.if_not_exists,
-        .populate_on_create = syntax.populate_on_create,
-    };
-}
-
-pub fn refreshMaterializedViewPlanFromSyntax(syntax: *grammar.RefreshMaterializedViewSyntax) RefreshMaterializedViewPlan {
-    const view_name = syntax.view_name;
-    syntax.view_name = "";
-    return .{
-        .view_name = view_name,
-        .concurrently = syntax.concurrently,
-        .populate = syntax.populate,
-    };
-}
-
-pub fn dropMaterializedViewPlanFromSyntax(syntax: *grammar.DropMaterializedViewSyntax) DropMaterializedViewPlan {
-    const view_name = syntax.view_name;
-    syntax.view_name = "";
-    return .{
-        .view_name = view_name,
-        .if_exists = syntax.if_exists,
-        .cascade = syntax.cascade,
-    };
-}
-
-pub fn createViewPlanFromSyntax(syntax: *grammar.CreateViewSyntax) CreateViewPlan {
-    const view_name = syntax.view_name;
-    const source_table_name = syntax.source_table_name;
-    const source_fields = syntax.source_fields;
-    const output_fields = syntax.output_fields;
-    syntax.view_name = "";
-    syntax.source_table_name = "";
-    syntax.source_fields = &.{};
-    syntax.output_fields = &.{};
-    return .{
-        .view_name = view_name,
-        .source_table_name = source_table_name,
-        .source_fields = source_fields,
-        .output_fields = output_fields,
-        .replace_existing = syntax.replace_existing,
-        .if_not_exists = syntax.if_not_exists,
-    };
-}
-
-pub fn renameViewPlanFromSyntax(syntax: *grammar.RenameViewSyntax) RenameViewPlan {
-    const view_name = syntax.view_name;
-    const new_view_name = syntax.new_view_name;
-    syntax.view_name = "";
-    syntax.new_view_name = "";
-    return .{
-        .view_name = view_name,
-        .new_view_name = new_view_name,
-    };
-}
-
-pub fn dropViewPlanFromSyntax(syntax: *grammar.DropViewSyntax) DropViewPlan {
-    const view_name = syntax.view_name;
-    syntax.view_name = "";
-    return .{
-        .view_name = view_name,
-        .if_exists = syntax.if_exists,
-        .cascade = syntax.cascade,
-    };
-}
-
-pub fn dropTablePlanFromSyntax(syntax: *grammar.DropTableSyntax) DropTablePlan {
-    const table_name = syntax.table_name;
-    syntax.table_name = "";
-    return .{
-        .table_name = table_name,
-        .if_exists = syntax.if_exists,
-        .cascade = syntax.cascade,
-    };
-}
-
-pub fn dropIndexPlanFromSyntax(syntax: *grammar.DropIndexSyntax) DropIndexPlan {
-    const index_name = syntax.index_name;
-    syntax.index_name = "";
-    return .{
-        .index_name = index_name,
-        .if_exists = syntax.if_exists,
-    };
-}
-
-pub fn dropUpdatePolicyTriggerPlanFromSyntaxAlloc(
-    alloc: std.mem.Allocator,
-    syntax: *grammar.DropUpdatePolicySyntax,
-) !AlterTablePlan {
-    const operations = try alloc.alloc(AlterTableOperation, 1);
-    var operations_transferred = false;
-    errdefer if (!operations_transferred) alloc.free(operations);
-
-    const table_name = syntax.table_name;
-    const trigger_name = syntax.trigger_name;
-    syntax.table_name = "";
-    syntax.trigger_name = "";
-    operations[0] = .{ .drop_update_policy = .{
-        .trigger_name = trigger_name,
-        .if_exists = syntax.if_exists,
-    } };
-
-    operations_transferred = true;
-    return .{
-        .table_name = table_name,
-        .operations = operations,
-    };
-}
-
-pub fn createUpdatePolicyTriggerPlanFromSyntaxAlloc(
-    alloc: std.mem.Allocator,
-    syntax: *grammar.CreateUpdatePolicySyntax,
-) !CreateUpdatePolicyPlan {
-    const value_json = try alloc.dupe(u8, "");
-    var value_transferred = false;
-    errdefer if (!value_transferred) alloc.free(value_json);
-
-    const trigger_name = syntax.trigger_name;
-    const table_name = syntax.table_name;
-    const column_name = syntax.column_name;
-    syntax.trigger_name = "";
-    syntax.table_name = "";
-    syntax.column_name = "";
-
-    value_transferred = true;
-    return .{
-        .trigger_name = trigger_name,
-        .table_name = table_name,
-        .column_name = column_name,
-        .on_update_value = .{ .kind = .now_ns, .value_json = value_json },
-    };
-}
-
-pub fn alterRowSecurityPlanFromSyntaxAlloc(
-    alloc: std.mem.Allocator,
-    syntax: grammar.RowSecurityAlterSyntax,
-) !AlterRowSecurityPlan {
-    return .{
-        .table_name = try grammar.normalizeSqlObjectIdentifierAlloc(alloc, syntax.table_identifier),
-        .enabled = syntax.enabled,
-    };
-}
-
-pub fn createRowSecurityPolicyPlanFromSyntax(syntax: *grammar.CreateRowSecurityPolicySyntax) CreateRowSecurityPolicyPlan {
-    const policy_name = syntax.policy_name;
-    const table_name = syntax.table_name;
-    const mode = syntax.mode;
-    const command = syntax.command;
-    const role_targets = syntax.role_targets;
-    const predicate = syntax.predicate;
-    const check_predicate = syntax.check_predicate;
-    syntax.policy_name = "";
-    syntax.table_name = "";
-    syntax.role_targets = &.{};
-    syntax.check_predicate = null;
-    return .{
-        .policy_name = policy_name,
-        .table_name = table_name,
-        .mode = mode,
-        .command = command,
-        .role_targets = role_targets,
-        .predicate = predicate,
-        .check_predicate = check_predicate,
-    };
-}
-
-pub fn alterRowSecurityPolicyPlanFromSyntax(syntax: *grammar.AlterRowSecurityPolicySyntax) AlterRowSecurityPolicyPlan {
-    const policy_name = syntax.policy_name;
-    const table_name = syntax.table_name;
-    const role_targets = syntax.role_targets;
-    const role_targets_present = syntax.role_targets_present;
-    const predicate = syntax.predicate;
-    const check_predicate = syntax.check_predicate;
-    syntax.policy_name = "";
-    syntax.table_name = "";
-    syntax.role_targets = &.{};
-    syntax.check_predicate = null;
-    return .{
-        .policy_name = policy_name,
-        .table_name = table_name,
-        .role_targets_present = role_targets_present,
-        .role_targets = role_targets,
-        .predicate = predicate,
-        .check_predicate = check_predicate,
-    };
-}
-
-pub fn dropRowSecurityPolicyPlanFromSyntax(syntax: *grammar.DropRowSecurityPolicySyntax) DropRowSecurityPolicyPlan {
-    const policy_name = syntax.policy_name;
-    const table_name = syntax.table_name;
-    syntax.policy_name = "";
-    syntax.table_name = "";
-    return .{
-        .policy_name = policy_name,
-        .table_name = table_name,
-        .if_exists = syntax.if_exists,
-    };
-}
-
-pub fn alterTableValidateConstraintOperationFromSyntax(
-    syntax: *grammar.AlterTableValidateConstraintSyntax,
-) AlterTableOperation {
-    const constraint_name = syntax.constraint_name;
-    syntax.constraint_name = "";
-    return .{ .validate_constraint = constraint_name };
-}
-
-pub fn alterTableRenameOperationFromSyntax(
-    syntax: *grammar.AlterTableRenameOperationSyntax,
-) AlterTableOperation {
-    const old_name = syntax.old_name;
-    const new_name = syntax.new_name;
-    syntax.old_name = "";
-    syntax.new_name = "";
-    return switch (syntax.target) {
-        .column => .{ .rename_column = .{
-            .old_name = old_name,
-            .new_name = new_name,
-        } },
-        .constraint => .{ .rename_constraint = .{
-            .old_name = old_name,
-            .new_name = new_name,
-        } },
-    };
-}
-
-pub fn alterTableDropOperationFromSyntax(
-    syntax: *grammar.AlterTableDropOperationSyntax,
-) AlterTableOperation {
-    const name = syntax.name;
-    syntax.name = "";
-    return switch (syntax.target) {
-        .column => .{ .drop_column = .{
-            .name = name,
-            .if_exists = syntax.if_exists,
-            .dependency_mode = syntax.dependency_mode,
-        } },
-        .constraint => .{ .drop_constraint = .{
-            .name = name,
-            .if_exists = syntax.if_exists,
-            .dependency_mode = syntax.dependency_mode,
-        } },
-    };
-}
-
-pub fn alterTableColumnNullabilityOperationFromSyntax(
-    syntax: *grammar.AlterTableColumnNullabilitySyntax,
-) AlterTableOperation {
-    const column_name = syntax.column_name;
-    syntax.column_name = "";
-    return .{ .alter_column_nullability = .{
-        .column_name = column_name,
-        .nullable = syntax.nullable,
-    } };
-}
-
-pub fn alterTableColumnDefaultOperationFromSyntax(
-    syntax: *grammar.AlterTableColumnDefaultSyntax,
-    default_value: ?runtime_schema.RelationalDefaultValue,
-) AlterTableOperation {
-    const column_name = syntax.column_name;
-    syntax.column_name = "";
-    return .{ .alter_column_default = .{
-        .column_name = column_name,
-        .default_value = default_value,
-    } };
-}
-
-pub fn alterTableColumnTypeOperationFromSyntax(
-    syntax: *grammar.AlterTableColumnTypeHeaderSyntax,
-    ddl_type: grammar.DdlTypeSyntax,
-    collation: ?[]const u8,
-    rewrite_expression: ?AlterColumnRewriteExpression,
-) AlterTableOperation {
-    const column_name = syntax.column_name;
-    syntax.column_name = "";
-    return .{ .alter_column_type = .{
-        .column_name = column_name,
-        .field_type = ddl_type.field_type,
-        .array_item_type = ddl_type.array_item_type,
-        .collation = collation,
-        .rewrite_expression = rewrite_expression,
-    } };
-}
-
-pub fn parseOptionalDdlAlterColumnRewriteExpressionAlloc(
+fn parseOptionalDdlAlterColumnRewriteExpressionAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
     pos: *usize,
@@ -17071,19 +17681,23 @@ pub fn parseOptionalDdlAlterColumnRewriteExpressionAlloc(
     const cursor = parser.Cursor.init(tokens, pos);
     if (!cursor.matchKeyword("using")) return null;
     const expression_start = pos.*;
-    const expression = if (hooks.parse_rewrite_expression) blk: {
-        const expression = parseDdlRowExpressionAlloc(alloc, tokens, pos, hooks.expression_options, false) catch |err| {
-            pos.* = expression_start;
-            if (err == error.OutOfMemory) return err;
-            break :blk try grammar.parseDdlGeneratedRowExpressionAlloc(alloc, cursor);
-        };
-        break :blk expression;
-    } else try grammar.parseDdlGeneratedRowExpressionAlloc(alloc, cursor);
+    const expression_range = generated_parser.GeneratedSqlTokenRange{ .start = expression_start, .end = tokens.len };
+    const expression_ast = hooks.rewrite_expression_ast orelse return error.UnsupportedSqlShape;
+    const full_tokens = hooks.rewrite_expression_full_tokens orelse return error.UnsupportedSqlShape;
+    const expected_range = hooks.rewrite_expression_tokens orelse return error.UnsupportedSqlShape;
+    const full_range = generated_parser.GeneratedSqlTokenRange{
+        .start = hooks.rewrite_expression_token_offset + expression_range.start,
+        .end = hooks.rewrite_expression_token_offset + expression_range.end,
+    };
+    if (!generatedDdlTokenRangeEqual(full_range, expected_range)) return error.UnsupportedSqlShape;
+    if (!generatedDdlTokenRangeEqual(expression_ast.tokens orelse return error.UnsupportedSqlShape, expected_range)) return error.UnsupportedSqlShape;
+    const expression = (try generatedCreateIndexRowExpressionAlloc(alloc, full_tokens, expression_ast.*)) orelse return error.UnsupportedSqlShape;
+    pos.* = tokens.len;
     errdefer runtime_schema.freeRelationalRowsExpression(alloc, expression);
     return .{ .expression = expression };
 }
 
-pub fn alterTableAddColumnOperationFromParts(
+fn alterTableAddColumnOperationFromParts(
     column: runtime_schema.RelationalColumn,
     if_not_exists: bool,
     unique_constraints: []const runtime_schema.UniqueConstraint,
@@ -17099,43 +17713,408 @@ pub fn alterTableAddColumnOperationFromParts(
     } };
 }
 
-pub fn alterTableAddPeriodOperation(period: runtime_schema.RelationalPeriod) AlterTableOperation {
+fn alterTableAddPeriodOperation(period: runtime_schema.RelationalPeriod) AlterTableOperation {
     return .{ .add_period = period };
 }
 
-pub fn alterTableAddPrimaryKeyOperation(primary_key: runtime_schema.PrimaryKey) AlterTableOperation {
+fn alterTableAddPrimaryKeyOperation(primary_key: runtime_schema.PrimaryKey) AlterTableOperation {
     return .{ .add_primary_key = primary_key };
 }
 
-pub fn alterTableAddUniqueConstraintOperation(constraint: runtime_schema.UniqueConstraint) AlterTableOperation {
+fn alterTableAddUniqueConstraintOperation(constraint: runtime_schema.UniqueConstraint) AlterTableOperation {
     return .{ .add_unique_constraint = constraint };
 }
 
-pub fn alterTableAddForeignKeyOperation(foreign_key: runtime_schema.ForeignKey) AlterTableOperation {
+fn alterTableAddForeignKeyOperation(foreign_key: runtime_schema.ForeignKey) AlterTableOperation {
     return .{ .add_foreign_key = foreign_key };
 }
 
-pub fn alterTableAddCheckOperation(check: runtime_schema.RelationalCheck) AlterTableOperation {
+fn alterTableAddCheckOperation(check: runtime_schema.RelationalCheck) AlterTableOperation {
     return .{ .add_check = check };
+}
+
+const DdlConstraintTiming = struct {
+    deferrable: bool = false,
+    timing: runtime_schema.ForeignKeyTiming = .immediate,
+};
+
+const DdlTemporalColumnList = struct {
+    columns: []const []const u8,
+    without_overlaps_period: ?[]const u8 = null,
+
+    fn deinit(self: @This(), alloc: std.mem.Allocator) void {
+        freeStringSlice(alloc, self.columns);
+        if (self.without_overlaps_period) |period| alloc.free(@constCast(period));
+    }
+};
+
+fn parseOptionalDdlConstraintTiming(tokens: []const grammar.Token, pos: *usize) !DdlConstraintTiming {
+    const cursor = parser.Cursor.init(tokens, pos);
+    var timing: DdlConstraintTiming = .{};
+    var saw_deferrability = false;
+    var saw_initially = false;
+    while (true) {
+        if (cursor.matchKeyword("deferrable")) {
+            if (saw_deferrability) return error.UnsupportedSqlShape;
+            saw_deferrability = true;
+            timing.deferrable = true;
+            continue;
+        }
+        if (cursor.peekKeyword("not")) {
+            const checkpoint = cursor.checkpoint();
+            _ = cursor.matchKeyword("not");
+            if (!cursor.matchKeyword("deferrable")) {
+                cursor.restore(checkpoint);
+                break;
+            }
+            if (saw_deferrability) return error.UnsupportedSqlShape;
+            if (timing.timing == .deferred) return error.UnsupportedSqlShape;
+            saw_deferrability = true;
+            timing.deferrable = false;
+            continue;
+        }
+        if (!cursor.matchKeyword("initially")) break;
+        {
+            if (saw_initially) return error.UnsupportedSqlShape;
+            saw_initially = true;
+            if (cursor.matchKeyword("deferred")) {
+                if (saw_deferrability and !timing.deferrable) return error.UnsupportedSqlShape;
+                timing.deferrable = true;
+                timing.timing = .deferred;
+            } else {
+                try cursor.expectKeyword("immediate");
+                timing.timing = .immediate;
+            }
+            continue;
+        }
+    }
+    return timing;
+}
+
+fn parseDdlColumnListAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) ![]const []const u8 {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectToken(.lparen);
+    var columns = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer freeStringList(alloc, &columns);
+    while (true) {
+        const column = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+        var transferred = false;
+        errdefer if (!transferred) alloc.free(column);
+        try columns.append(alloc, column);
+        transferred = true;
+        if (cursor.matchToken(.comma) == null) break;
+    }
+    try cursor.expectToken(.rparen);
+    if (columns.items.len == 0) return error.UnsupportedSqlShape;
+    return try columns.toOwnedSlice(alloc);
+}
+
+fn parseDdlUniqueColumnListAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) ![]const []const u8 {
+    const columns = try parseDdlColumnListAlloc(alloc, tokens, pos);
+    errdefer freeStringSlice(alloc, columns);
+    try grammar.validateSqlIdentifierListUnique(columns);
+    return columns;
+}
+
+fn parseOptionalDdlConstraintIncludeAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) ![]const []const u8 {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (!cursor.matchKeyword("include")) return &.{};
+    return try parseDdlColumnListAlloc(alloc, tokens, pos);
+}
+
+fn parseOptionalDdlConstraintIncludeUniqueAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    key_columns: []const []const u8,
+) ![]const []const u8 {
+    const include_columns = try parseOptionalDdlConstraintIncludeAlloc(alloc, tokens, pos);
+    errdefer freeStringSlice(alloc, include_columns);
+    try grammar.validateSqlIdentifierListUnique(include_columns);
+    try grammar.validateSqlIdentifierListsDisjoint(key_columns, include_columns);
+    return include_columns;
+}
+
+fn parseDdlTemporalColumnListAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !DdlTemporalColumnList {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectToken(.lparen);
+    var columns = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer freeStringList(alloc, &columns);
+    var without_overlaps_period: ?[]const u8 = null;
+    errdefer if (without_overlaps_period) |period| alloc.free(period);
+    while (true) {
+        const column = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+        var column_transferred = false;
+        errdefer if (!column_transferred) alloc.free(column);
+        if (cursor.matchKeyword("without")) {
+            try cursor.expectKeyword("overlaps");
+            if (without_overlaps_period != null) return error.UnsupportedSqlShape;
+            without_overlaps_period = column;
+            column_transferred = true;
+        } else {
+            try columns.append(alloc, column);
+            column_transferred = true;
+        }
+        if (cursor.matchToken(.comma) == null) break;
+    }
+    try cursor.expectToken(.rparen);
+    if (columns.items.len == 0) return error.UnsupportedSqlShape;
+    const owned_columns = try columns.toOwnedSlice(alloc);
+    errdefer freeStringSlice(alloc, owned_columns);
+    const period = without_overlaps_period;
+    without_overlaps_period = null;
+    return .{ .columns = owned_columns, .without_overlaps_period = period };
+}
+
+fn parseDdlUniqueTemporalColumnListAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !DdlTemporalColumnList {
+    const columns = try parseDdlTemporalColumnListAlloc(alloc, tokens, pos);
+    errdefer columns.deinit(alloc);
+    try grammar.validateSqlIdentifierListUnique(columns.columns);
+    return columns;
+}
+
+fn parseGeneratedOptionalDdlUniqueNullsDistinct(
+    tokens: []const grammar.Token,
+    pos: *usize,
+    hooks: DdlColumnDefinitionOptions,
+) !?bool {
+    const full_tokens = hooks.generated_constraint_name_full_tokens orelse return error.UnsupportedSqlShape;
+    const range = hooks.generated_constraint_nulls_distinct_tokens orelse {
+        if (pos.* < tokens.len and tokens[pos.*].matchesKeyword("nulls")) return error.UnsupportedSqlShape;
+        return null;
+    };
+    const local = try generatedConstraintLocalRange(full_tokens, tokens, hooks.generated_constraint_token_offset, range, pos.*);
+    var local_pos: usize = 0;
+    const parsed = try grammar.parseOptionalDdlUniqueNullsDistinct(tokens[local.start..local.end], &local_pos) orelse return error.UnsupportedSqlShape;
+    if (local_pos != local.end - local.start) return error.UnsupportedSqlShape;
+    pos.* = local.end;
+    return parsed;
+}
+
+fn parseGeneratedDdlUniqueTemporalColumnListAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    hooks: DdlColumnDefinitionOptions,
+) !DdlTemporalColumnList {
+    const full_tokens = hooks.generated_constraint_name_full_tokens orelse return error.UnsupportedSqlShape;
+    const range = hooks.generated_constraint_column_list_tokens orelse return error.UnsupportedSqlShape;
+    const local = try generatedConstraintLocalRange(full_tokens, tokens, hooks.generated_constraint_token_offset, range, pos.*);
+    var local_pos: usize = 0;
+    const columns = try parseDdlUniqueTemporalColumnListAlloc(alloc, tokens[local.start..local.end], &local_pos);
+    errdefer columns.deinit(alloc);
+    if (local_pos != local.end - local.start) return error.UnsupportedSqlShape;
+    pos.* = local.end;
+    return columns;
+}
+
+fn parseGeneratedOptionalDdlConstraintIncludeUniqueAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    key_columns: []const []const u8,
+    hooks: DdlColumnDefinitionOptions,
+) ![]const []const u8 {
+    const full_tokens = hooks.generated_constraint_name_full_tokens orelse return error.UnsupportedSqlShape;
+    const range = hooks.generated_constraint_include_tokens orelse {
+        if (pos.* < tokens.len and tokens[pos.*].matchesKeyword("include")) return error.UnsupportedSqlShape;
+        return &.{};
+    };
+    const local = try generatedConstraintLocalRange(full_tokens, tokens, hooks.generated_constraint_token_offset, range, pos.*);
+    var local_pos: usize = 0;
+    const include_columns = try parseOptionalDdlConstraintIncludeUniqueAlloc(alloc, tokens[local.start..local.end], &local_pos, key_columns);
+    errdefer freeStringSlice(alloc, include_columns);
+    if (local_pos != local.end - local.start) return error.UnsupportedSqlShape;
+    pos.* = local.end;
+    return include_columns;
+}
+
+fn parseGeneratedOptionalDdlConstraintTiming(
+    tokens: []const grammar.Token,
+    pos: *usize,
+    hooks: DdlColumnDefinitionOptions,
+) !DdlConstraintTiming {
+    const full_tokens = hooks.generated_constraint_name_full_tokens orelse return error.UnsupportedSqlShape;
+    const range = hooks.generated_constraint_timing_tokens orelse {
+        if (generatedConstraintTimingStartsAt(tokens, pos.*)) return error.UnsupportedSqlShape;
+        return .{};
+    };
+    const local = try generatedConstraintLocalRange(full_tokens, tokens, hooks.generated_constraint_token_offset, range, pos.*);
+    var local_pos: usize = 0;
+    const timing = try parseOptionalDdlConstraintTiming(tokens[local.start..local.end], &local_pos);
+    if (local_pos != local.end - local.start) return error.UnsupportedSqlShape;
+    pos.* = local.end;
+    return timing;
+}
+
+fn parseGeneratedOptionalDdlNotValid(
+    tokens: []const grammar.Token,
+    pos: *usize,
+    hooks: DdlColumnDefinitionOptions,
+    retained_inline_index: ?usize,
+) !bool {
+    if (retained_inline_index) |index| {
+        const range = try generatedInlinePayloadRangeAt(hooks.generated_inline_constraint_not_valid_items, index);
+        if (range == null) {
+            if (pos.* + 1 < tokens.len and tokens[pos.*].matchesKeyword("not") and tokens[pos.* + 1].matchesKeyword("valid")) return error.UnsupportedSqlShape;
+            return false;
+        }
+        const full_tokens = hooks.generated_inline_constraint_full_tokens orelse return error.UnsupportedSqlShape;
+        const local = try generatedConstraintLocalRange(full_tokens, tokens, hooks.generated_inline_constraint_token_offset, range.?, pos.*);
+        if (local.end != local.start + 2 or !tokens[local.start].matchesKeyword("not") or !tokens[local.start + 1].matchesKeyword("valid")) {
+            return error.UnsupportedSqlShape;
+        }
+        pos.* = local.end;
+        return true;
+    }
+    const full_tokens = hooks.generated_constraint_name_full_tokens orelse return error.UnsupportedSqlShape;
+    const range = hooks.generated_constraint_not_valid_tokens orelse {
+        if (pos.* + 1 < tokens.len and tokens[pos.*].matchesKeyword("not") and tokens[pos.* + 1].matchesKeyword("valid")) {
+            return error.UnsupportedSqlShape;
+        }
+        return false;
+    };
+    const local = try generatedConstraintLocalRange(full_tokens, tokens, hooks.generated_constraint_token_offset, range, pos.*);
+    if (local.end != local.start + 2 or !tokens[local.start].matchesKeyword("not") or !tokens[local.start + 1].matchesKeyword("valid")) {
+        return error.UnsupportedSqlShape;
+    }
+    pos.* = local.end;
+    return true;
+}
+
+fn parseGeneratedInlineOptionalDdlUniqueNullsDistinct(
+    tokens: []const grammar.Token,
+    pos: *usize,
+    hooks: DdlColumnDefinitionOptions,
+    retained_inline_index: ?usize,
+) !?bool {
+    const index = retained_inline_index orelse return error.UnsupportedSqlShape;
+    const range = try generatedInlinePayloadRangeAt(hooks.generated_inline_constraint_nulls_distinct_items, index);
+    if (range == null) {
+        if (pos.* < tokens.len and tokens[pos.*].matchesKeyword("nulls")) return error.UnsupportedSqlShape;
+        return null;
+    }
+    const full_tokens = hooks.generated_inline_constraint_full_tokens orelse return error.UnsupportedSqlShape;
+    const local = try generatedConstraintLocalRange(full_tokens, tokens, hooks.generated_inline_constraint_token_offset, range.?, pos.*);
+    var local_pos: usize = 0;
+    const parsed = try grammar.parseOptionalDdlUniqueNullsDistinct(tokens[local.start..local.end], &local_pos) orelse return error.UnsupportedSqlShape;
+    if (local_pos != local.end - local.start) return error.UnsupportedSqlShape;
+    pos.* = local.end;
+    return parsed;
+}
+
+fn parseGeneratedInlineOptionalDdlConstraintIncludeUniqueAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    key_columns: []const []const u8,
+    hooks: DdlColumnDefinitionOptions,
+    retained_inline_index: ?usize,
+) ![]const []const u8 {
+    const index = retained_inline_index orelse return error.UnsupportedSqlShape;
+    const range = try generatedInlinePayloadRangeAt(hooks.generated_inline_constraint_include_items, index);
+    if (range == null) {
+        if (pos.* < tokens.len and tokens[pos.*].matchesKeyword("include")) return error.UnsupportedSqlShape;
+        return &.{};
+    }
+    const full_tokens = hooks.generated_inline_constraint_full_tokens orelse return error.UnsupportedSqlShape;
+    const local = try generatedConstraintLocalRange(full_tokens, tokens, hooks.generated_inline_constraint_token_offset, range.?, pos.*);
+    var local_pos: usize = 0;
+    const include_columns = try parseOptionalDdlConstraintIncludeUniqueAlloc(alloc, tokens[local.start..local.end], &local_pos, key_columns);
+    errdefer freeStringSlice(alloc, include_columns);
+    if (local_pos != local.end - local.start) return error.UnsupportedSqlShape;
+    pos.* = local.end;
+    return include_columns;
+}
+
+fn parseGeneratedInlineOptionalDdlConstraintTiming(
+    tokens: []const grammar.Token,
+    pos: *usize,
+    hooks: DdlColumnDefinitionOptions,
+    retained_inline_index: ?usize,
+) !DdlConstraintTiming {
+    const index = retained_inline_index orelse return error.UnsupportedSqlShape;
+    const range = try generatedInlinePayloadRangeAt(hooks.generated_inline_constraint_timing_items, index);
+    if (range == null) {
+        if (generatedConstraintTimingStartsAt(tokens, pos.*)) return error.UnsupportedSqlShape;
+        return .{};
+    }
+    const full_tokens = hooks.generated_inline_constraint_full_tokens orelse return error.UnsupportedSqlShape;
+    const local = try generatedConstraintLocalRange(full_tokens, tokens, hooks.generated_inline_constraint_token_offset, range.?, pos.*);
+    var local_pos: usize = 0;
+    const timing = try parseOptionalDdlConstraintTiming(tokens[local.start..local.end], &local_pos);
+    if (local_pos != local.end - local.start) return error.UnsupportedSqlShape;
+    pos.* = local.end;
+    return timing;
+}
+
+fn generatedInlinePayloadRangeAt(
+    ranges: []const ?generated_parser.GeneratedSqlTokenRange,
+    index: usize,
+) !?generated_parser.GeneratedSqlTokenRange {
+    if (index >= ranges.len) return error.UnsupportedSqlShape;
+    return ranges[index];
+}
+
+fn generatedConstraintLocalRange(
+    full_tokens: []const grammar.Token,
+    tokens: []const grammar.Token,
+    token_offset: usize,
+    range: generated_parser.GeneratedSqlTokenRange,
+    expected_start: usize,
+) !generated_parser.GeneratedSqlTokenRange {
+    if (range.start < token_offset or range.end > full_tokens.len or range.start >= range.end) return error.UnsupportedSqlShape;
+    const local_start = range.start - token_offset;
+    const local_end = range.end - token_offset;
+    if (local_end > tokens.len or local_start != expected_start) return error.UnsupportedSqlShape;
+    return .{ .start = local_start, .end = local_end };
+}
+
+fn generatedConstraintTimingStartsAt(tokens: []const grammar.Token, pos: usize) bool {
+    if (pos >= tokens.len) return false;
+    return tokens[pos].matchesKeyword("deferrable") or tokens[pos].matchesKeyword("initially") or
+        (tokens[pos].matchesKeyword("not") and pos + 1 < tokens.len and tokens[pos + 1].matchesKeyword("deferrable"));
 }
 
 fn alterTableAddedUniqueValidationState(
     tokens: []const grammar.Token,
     pos: *usize,
-    timing: grammar.DdlConstraintTimingSyntax,
-) runtime_schema.UniqueConstraintValidationState {
-    const not_valid = grammar.consumeOptionalDdlNotValid(tokens, pos);
+    timing: DdlConstraintTiming,
+    hooks: DdlColumnDefinitionOptions,
+    retained_inline_index: ?usize,
+) !runtime_schema.UniqueConstraintValidationState {
+    const not_valid = try parseGeneratedOptionalDdlNotValid(tokens, pos, hooks, retained_inline_index);
     if (not_valid or timing.deferrable or timing.timing == .deferred) return .unvalidated;
     return .enforced;
 }
 
-pub fn makeDdlPrimaryKeyAlloc(
+fn makeDdlPrimaryKeyAlloc(
     alloc: std.mem.Allocator,
     constraint_name: ?[]const u8,
     columns: []const []const u8,
     include_columns: []const []const u8,
     without_overlaps_period: ?[]const u8,
-    timing: grammar.DdlConstraintTimingSyntax,
+    timing: DdlConstraintTiming,
 ) !runtime_schema.PrimaryKey {
     const name = if (constraint_name) |value| try alloc.dupe(u8, value) else null;
     errdefer if (name) |value| alloc.free(value);
@@ -17155,27 +18134,27 @@ pub fn makeDdlPrimaryKeyAlloc(
     };
 }
 
-pub fn installDdlPrimaryKeyAlloc(
+fn installDdlPrimaryKeyAlloc(
     alloc: std.mem.Allocator,
     primary_key: *?runtime_schema.PrimaryKey,
     constraint_name: ?[]const u8,
     columns: []const []const u8,
     include_columns: []const []const u8,
     without_overlaps_period: ?[]const u8,
-    timing: grammar.DdlConstraintTimingSyntax,
+    timing: DdlConstraintTiming,
 ) !void {
     if (primary_key.* != null) return error.UnsupportedSqlShape;
     primary_key.* = try makeDdlPrimaryKeyAlloc(alloc, constraint_name, columns, include_columns, without_overlaps_period, timing);
 }
 
-pub fn makeDdlUniqueConstraintAlloc(
+fn makeDdlUniqueConstraintAlloc(
     alloc: std.mem.Allocator,
     constraint_name: ?[]const u8,
     columns: []const []const u8,
     include_columns: []const []const u8,
     without_overlaps_period: ?[]const u8,
     nulls_not_distinct: bool,
-    timing: grammar.DdlConstraintTimingSyntax,
+    timing: DdlConstraintTiming,
 ) !runtime_schema.UniqueConstraint {
     if (nulls_not_distinct and without_overlaps_period != null) return error.UnsupportedSqlShape;
     const owned_columns = try cloneStringSlice(alloc, columns);
@@ -17208,7 +18187,7 @@ pub fn makeDdlUniqueConstraintAlloc(
     };
 }
 
-pub fn appendDdlUniqueConstraintBuilderAlloc(
+fn appendDdlUniqueConstraintBuilderAlloc(
     alloc: std.mem.Allocator,
     unique_constraints: *std.ArrayListUnmanaged(runtime_schema.UniqueConstraint),
     constraint_name: ?[]const u8,
@@ -17216,7 +18195,7 @@ pub fn appendDdlUniqueConstraintBuilderAlloc(
     include_columns: []const []const u8,
     without_overlaps_period: ?[]const u8,
     nulls_not_distinct: bool,
-    timing: grammar.DdlConstraintTimingSyntax,
+    timing: DdlConstraintTiming,
 ) !void {
     const constraint = try makeDdlUniqueConstraintAlloc(alloc, constraint_name, columns, include_columns, without_overlaps_period, nulls_not_distinct, timing);
     var transferred = false;
@@ -17225,13 +18204,29 @@ pub fn appendDdlUniqueConstraintBuilderAlloc(
     transferred = true;
 }
 
-pub fn ddlPeriodFromSyntax(syntax: *grammar.DdlPeriodSyntax) runtime_schema.RelationalPeriod {
-    const name = syntax.name;
-    const start_column = syntax.start_column;
-    const end_column = syntax.end_column;
-    syntax.name = "";
-    syntax.start_column = "";
-    syntax.end_column = "";
+fn parseDdlPeriodConstraintPlanAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !runtime_schema.RelationalPeriod {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("for");
+    const name = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var name_transferred = false;
+    errdefer if (!name_transferred) alloc.free(name);
+    try cursor.expectToken(.lparen);
+    const start_column = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var start_transferred = false;
+    errdefer if (!start_transferred) alloc.free(start_column);
+    try cursor.expectToken(.comma);
+    const end_column = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var end_transferred = false;
+    errdefer if (!end_transferred) alloc.free(end_column);
+    try cursor.expectToken(.rparen);
+
+    name_transferred = true;
+    start_transferred = true;
+    end_transferred = true;
     return .{
         .name = name,
         .start_column = start_column,
@@ -17239,28 +18234,138 @@ pub fn ddlPeriodFromSyntax(syntax: *grammar.DdlPeriodSyntax) runtime_schema.Rela
     };
 }
 
-pub fn parseDdlPeriodConstraintPlanAlloc(
+fn parseGeneratedDdlPeriodConstraintPlanAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
     pos: *usize,
+    hooks: DdlColumnDefinitionOptions,
 ) !runtime_schema.RelationalPeriod {
-    var syntax = try grammar.parseDdlPeriodConstraintAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
-    return ddlPeriodFromSyntax(&syntax);
+    const full_tokens = hooks.generated_constraint_name_full_tokens orelse return error.UnsupportedSqlShape;
+    const range = hooks.generated_period_payload_tokens orelse return error.UnsupportedSqlShape;
+    const local = try generatedConstraintLocalRange(full_tokens, tokens, hooks.generated_constraint_token_offset, range, pos.*);
+    var local_pos = local.start;
+    const period = try parseDdlPeriodConstraintPlanAlloc(alloc, tokens, &local_pos);
+    errdefer freeDdlPeriod(alloc, period);
+    if (local_pos != local.end) return error.UnsupportedSqlShape;
+    pos.* = local.end;
+    return period;
 }
 
-pub fn parseValidatedDdlForeignKeyColumnListAlloc(
+const DdlForeignKeyColumnList = struct {
+    columns: []const []const u8,
+    period: ?[]const u8 = null,
+
+    fn deinit(self: @This(), alloc: std.mem.Allocator) void {
+        freeStringSlice(alloc, self.columns);
+        if (self.period) |period| alloc.free(period);
+    }
+};
+
+fn parseDdlForeignKeyColumnListAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
     pos: *usize,
-) !grammar.DdlForeignKeyColumnListSyntax {
-    const columns = try grammar.parseDdlForeignKeyColumnListAlloc(alloc, tokens, pos);
+) !DdlForeignKeyColumnList {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectToken(.lparen);
+    var columns = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer freeStringList(alloc, &columns);
+    var period: ?[]const u8 = null;
+    errdefer if (period) |value| alloc.free(value);
+    while (true) {
+        if (cursor.matchKeyword("period")) {
+            if (period != null) return error.UnsupportedSqlShape;
+            period = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+        } else {
+            const column = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+            var transferred = false;
+            errdefer if (!transferred) alloc.free(column);
+            try columns.append(alloc, column);
+            transferred = true;
+        }
+        if (cursor.matchToken(.comma) == null) break;
+    }
+    try cursor.expectToken(.rparen);
+    if (columns.items.len == 0) return error.UnsupportedSqlShape;
+    const owned_columns = try columns.toOwnedSlice(alloc);
+    errdefer freeStringSlice(alloc, owned_columns);
+    const owned_period = period;
+    period = null;
+    return .{ .columns = owned_columns, .period = owned_period };
+}
+
+fn parseValidatedDdlForeignKeyColumnListAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !DdlForeignKeyColumnList {
+    const columns = try parseDdlForeignKeyColumnListAlloc(alloc, tokens, pos);
     errdefer columns.deinit(alloc);
     try grammar.validateSqlIdentifierListUnique(columns.columns);
     return columns;
 }
 
-pub fn parseDdlForeignKeyConstraintAlloc(
+fn parseDdlForeignKeyOptions(tokens: []const grammar.Token, pos: *usize) !DdlForeignKeyOptions {
+    const cursor = parser.Cursor.init(tokens, pos);
+    var options: DdlForeignKeyOptions = .{};
+    var match_seen = false;
+    while (!cursor.atEnd() and !cursor.peekKind(.comma) and !cursor.peekKind(.rparen) and !cursor.peekKind(.semicolon)) {
+        if (grammar.peekDdlNotValid(tokens, pos.*)) break;
+        if (cursor.matchKeyword("on")) {
+            if (cursor.matchKeyword("delete")) {
+                options.on_delete = try parseDdlForeignKeyAction(cursor);
+            } else if (cursor.matchKeyword("update")) {
+                options.on_update = try parseDdlForeignKeyAction(cursor);
+            } else {
+                return error.UnsupportedSqlShape;
+            }
+        } else if (cursor.matchKeyword("deferrable")) {
+            options.deferrable = true;
+        } else if (cursor.matchKeyword("not")) {
+            try cursor.expectKeyword("deferrable");
+            options.deferrable = false;
+        } else if (cursor.matchKeyword("initially")) {
+            if (cursor.matchKeyword("deferred")) {
+                options.timing = .deferred;
+                options.deferrable = true;
+            } else {
+                try cursor.expectKeyword("immediate");
+                options.timing = .immediate;
+            }
+        } else if (cursor.matchKeyword("match")) {
+            if (match_seen) return error.UnsupportedSqlShape;
+            match_seen = true;
+            if (cursor.matchKeyword("simple")) {
+                options.match = .simple;
+            } else if (cursor.matchKeyword("full")) {
+                options.match = .full;
+            } else if (cursor.matchKeyword("partial")) {
+                return error.UnsupportedSqlShape;
+            } else {
+                return error.UnsupportedSqlShape;
+            }
+        } else {
+            return error.UnsupportedSqlShape;
+        }
+    }
+    return options;
+}
+
+fn parseDdlForeignKeyAction(cursor: parser.Cursor) !runtime_schema.ForeignKeyAction {
+    if (cursor.matchKeyword("cascade")) return .cascade;
+    if (cursor.matchKeyword("restrict")) return .restrict;
+    if (cursor.matchKeyword("no")) {
+        try cursor.expectKeyword("action");
+        return .no_action;
+    }
+    if (cursor.matchKeyword("set")) {
+        try cursor.expectKeyword("null");
+        return .set_null;
+    }
+    return error.UnsupportedSqlShape;
+}
+
+fn parseDdlForeignKeyConstraintAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
     pos: *usize,
@@ -17280,8 +18385,8 @@ pub fn parseDdlForeignKeyConstraintAlloc(
     var parent_transferred = false;
     errdefer if (!parent_transferred) parent.deinit(alloc);
 
-    const options = ddlForeignKeyOptionsFromSyntax(try grammar.parseDdlForeignKeyOptions(tokens, pos));
-    const foreign_key = try makeDdlForeignKeyAlloc(alloc, constraint_name, child, parent_table, parent, options);
+    const options = try parseDdlForeignKeyOptions(tokens, pos);
+    const foreign_key = try makeDdlForeignKeyAlloc(alloc, constraint_name, child.columns, child.period, parent_table, parent.columns, parent.period, options);
 
     child_transferred = true;
     parent_table_transferred = true;
@@ -17289,7 +18394,45 @@ pub fn parseDdlForeignKeyConstraintAlloc(
     return foreign_key;
 }
 
-pub fn parseDdlInlineForeignKeyConstraintAlloc(
+fn parseGeneratedDdlForeignKeyConstraintAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    constraint_name: ?[]const u8,
+    hooks: DdlColumnDefinitionOptions,
+) !runtime_schema.ForeignKey {
+    const full_tokens = hooks.generated_constraint_name_full_tokens orelse return error.UnsupportedSqlShape;
+    const range = hooks.generated_foreign_key_payload_tokens orelse return error.UnsupportedSqlShape;
+    const local = try generatedConstraintLocalRange(full_tokens, tokens, hooks.generated_constraint_token_offset, range, pos.*);
+    var local_pos: usize = 0;
+    const foreign_key = try parseDdlForeignKeyConstraintAlloc(alloc, tokens[local.start..local.end], &local_pos, constraint_name);
+    errdefer freeDdlForeignKey(alloc, foreign_key);
+    if (local_pos != local.end - local.start) return error.UnsupportedSqlShape;
+    pos.* = local.end;
+    return foreign_key;
+}
+
+fn parseGeneratedOptionalDdlForeignKeyNotValid(
+    tokens: []const grammar.Token,
+    pos: *usize,
+    hooks: DdlColumnDefinitionOptions,
+) !bool {
+    const full_tokens = hooks.generated_constraint_name_full_tokens orelse return error.UnsupportedSqlShape;
+    const range = hooks.generated_foreign_key_not_valid_tokens orelse {
+        if (pos.* + 1 < tokens.len and tokens[pos.*].matchesKeyword("not") and tokens[pos.* + 1].matchesKeyword("valid")) {
+            return error.UnsupportedSqlShape;
+        }
+        return false;
+    };
+    const local = try generatedConstraintLocalRange(full_tokens, tokens, hooks.generated_constraint_token_offset, range, pos.*);
+    if (local.end != local.start + 2 or !tokens[local.start].matchesKeyword("not") or !tokens[local.start + 1].matchesKeyword("valid")) {
+        return error.UnsupportedSqlShape;
+    }
+    pos.* = local.end;
+    return true;
+}
+
+fn parseDdlInlineForeignKeyConstraintAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
     pos: *usize,
@@ -17305,19 +18448,62 @@ pub fn parseDdlInlineForeignKeyConstraintAlloc(
     errdefer if (!parent_table_transferred) alloc.free(parent_table);
 
     const parent_columns = if (parser.peekKind(tokens, pos.*, .lparen))
-        try grammar.parseDdlUniqueColumnListAlloc(alloc, tokens, pos)
+        try parseDdlUniqueColumnListAlloc(alloc, tokens, pos)
     else
         try cloneStringSlice(alloc, &.{"id"});
     var parent_transferred = false;
     errdefer if (!parent_transferred) freeStringSlice(alloc, parent_columns);
 
-    const options = ddlForeignKeyOptionsFromSyntax(try grammar.parseDdlForeignKeyOptions(tokens, pos));
+    const options = try parseDdlForeignKeyOptions(tokens, pos);
     const foreign_key = try makeDdlInlineForeignKeyAlloc(alloc, constraint_name, child_columns, parent_table, parent_columns, options);
 
     child_transferred = true;
     parent_table_transferred = true;
     parent_transferred = true;
     return foreign_key;
+}
+
+fn parseGeneratedDdlInlineForeignKeyConstraintAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    column_name: []const u8,
+    constraint_name: ?[]const u8,
+    hooks: DdlColumnDefinitionOptions,
+    retained_inline_index: ?usize,
+) !runtime_schema.ForeignKey {
+    const index = retained_inline_index orelse return error.UnsupportedSqlShape;
+    const range = try generatedInlinePayloadRangeAt(hooks.generated_inline_foreign_key_payload_items, index);
+    const payload = range orelse return error.UnsupportedSqlShape;
+    const full_tokens = hooks.generated_inline_constraint_full_tokens orelse return error.UnsupportedSqlShape;
+    const local = try generatedConstraintLocalRange(full_tokens, tokens, hooks.generated_inline_constraint_token_offset, payload, pos.*);
+    var local_pos: usize = 0;
+    const foreign_key = try parseDdlInlineForeignKeyConstraintAlloc(alloc, tokens[local.start..local.end], &local_pos, column_name, constraint_name);
+    errdefer freeDdlForeignKey(alloc, foreign_key);
+    if (local_pos != local.end - local.start) return error.UnsupportedSqlShape;
+    pos.* = local.end;
+    return foreign_key;
+}
+
+fn parseGeneratedOptionalDdlInlineForeignKeyNotValid(
+    tokens: []const grammar.Token,
+    pos: *usize,
+    hooks: DdlColumnDefinitionOptions,
+    retained_inline_index: ?usize,
+) !bool {
+    const index = retained_inline_index orelse return error.UnsupportedSqlShape;
+    const range = try generatedInlinePayloadRangeAt(hooks.generated_inline_foreign_key_not_valid_items, index);
+    if (range == null) {
+        if (pos.* + 1 < tokens.len and tokens[pos.*].matchesKeyword("not") and tokens[pos.* + 1].matchesKeyword("valid")) return error.UnsupportedSqlShape;
+        return false;
+    }
+    const full_tokens = hooks.generated_inline_constraint_full_tokens orelse return error.UnsupportedSqlShape;
+    const local = try generatedConstraintLocalRange(full_tokens, tokens, hooks.generated_inline_constraint_token_offset, range.?, pos.*);
+    if (local.end != local.start + 2 or !tokens[local.start].matchesKeyword("not") or !tokens[local.start + 1].matchesKeyword("valid")) {
+        return error.UnsupportedSqlShape;
+    }
+    pos.* = local.end;
+    return true;
 }
 
 pub const DdlRangeColumnDefinition = struct {
@@ -17340,7 +18526,7 @@ pub fn findDdlColumn(columns: []const runtime_schema.RelationalColumn, name: []c
     return null;
 }
 
-pub fn parseDdlRangeColumnDefinitionAlloc(
+fn parseDdlRangeColumnDefinitionAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
     pos: *usize,
@@ -17449,7 +18635,7 @@ pub fn appendDdlRangeColumnDefinitionAlloc(
     period_transferred = true;
 }
 
-pub fn parseOptionalSupportedDdlCollationAlloc(
+fn parseOptionalSupportedDdlCollationAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
     pos: *usize,
@@ -17470,7 +18656,49 @@ pub const DdlColumnDefinitionOptions = struct {
     returning_expression_qualifiers: []const []const u8 = &.{},
     defer_row_expression_field_validation: bool = false,
     expression_options: DdlExpressionOptions,
-    parse_rewrite_expression: bool = true,
+    generated_constraint_name_full_tokens: ?[]const grammar.Token = null,
+    generated_constraint_name_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
+    generated_constraint_kind_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
+    generated_constraint_nulls_distinct_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
+    generated_constraint_column_list_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
+    generated_constraint_include_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
+    generated_constraint_timing_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
+    generated_constraint_not_valid_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
+    generated_foreign_key_payload_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
+    generated_foreign_key_not_valid_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
+    generated_check_payload_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
+    generated_check_not_valid_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
+    generated_period_payload_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
+    generated_constraint_token_offset: usize = 0,
+    generated_inline_constraint_full_tokens: ?[]const grammar.Token = null,
+    generated_inline_constraint_prefix_items: []const generated_parser.GeneratedSqlTokenRange = &.{},
+    generated_inline_constraint_name_items: []const ?generated_parser.GeneratedSqlTokenRange = &.{},
+    generated_inline_constraint_kind_items: []const generated_parser.GeneratedSqlTokenRange = &.{},
+    generated_inline_constraint_nulls_distinct_items: []const ?generated_parser.GeneratedSqlTokenRange = &.{},
+    generated_inline_constraint_include_items: []const ?generated_parser.GeneratedSqlTokenRange = &.{},
+    generated_inline_constraint_timing_items: []const ?generated_parser.GeneratedSqlTokenRange = &.{},
+    generated_inline_constraint_not_valid_items: []const ?generated_parser.GeneratedSqlTokenRange = &.{},
+    generated_inline_foreign_key_payload_items: []const ?generated_parser.GeneratedSqlTokenRange = &.{},
+    generated_inline_foreign_key_not_valid_items: []const ?generated_parser.GeneratedSqlTokenRange = &.{},
+    generated_inline_check_payload_items: []const ?generated_parser.GeneratedSqlTokenRange = &.{},
+    generated_inline_check_not_valid_items: []const ?generated_parser.GeneratedSqlTokenRange = &.{},
+    generated_inline_constraint_token_offset: usize = 0,
+    generated_column_name_full_tokens: ?[]const grammar.Token = null,
+    generated_column_name_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
+    generated_column_type_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
+    generated_column_nullability_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
+    generated_column_collation_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
+    generated_column_default_clause_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
+    generated_column_generated_clause_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
+    generated_column_header_token_offset: usize = 0,
+    generated_column_expression_full_tokens: ?[]const grammar.Token = null,
+    generated_column_expression_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
+    generated_column_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst = null,
+    generated_column_expression_token_offset: usize = 0,
+    rewrite_expression_full_tokens: ?[]const grammar.Token = null,
+    rewrite_expression_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
+    rewrite_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst = null,
+    rewrite_expression_token_offset: usize = 0,
 };
 
 pub const DdlDomainOptions = struct {
@@ -17482,9 +18710,15 @@ pub const DdlExpressionOptions = struct {
     params: []const value_mod.SqlValue = &.{},
     realtime_ns: u64,
     generated_scalar_subquery_defaults: []const generated_parser.GeneratedSqlDdlScalarSubqueryDefaultAst = &.{},
-    require_generated_scalar_subquery_defaults: bool = false,
     generated_scalar_subquery_full_tokens: ?[]const grammar.Token = null,
     generated_scalar_subquery_token_offset: usize = 0,
+    generated_default_value_full_tokens: ?[]const grammar.Token = null,
+    generated_default_value_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
+    generated_default_value_token_offset: usize = 0,
+    generated_column_expression_full_tokens: ?[]const grammar.Token = null,
+    generated_column_expression_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
+    generated_column_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst = null,
+    generated_column_expression_token_offset: usize = 0,
     function_bindings: expr_row_parse.SqlFunctionBindings = .{},
     context_hooks: expr_row_parse.SelectParserContextHooks,
     row_expression_hooks: expr_row_parse.RowExpressionParserHooks,
@@ -17494,6 +18728,164 @@ pub const DdlExpressionOptions = struct {
     condition_alternatives: expr_where_condition.ExpressionWhereConditionAlternativesParserOptions,
 };
 
+const DdlKnownDefault = enum {
+    null_literal,
+    uuid_v4,
+    now_ns,
+    current_date_ns,
+};
+
+const DdlType = struct {
+    field_type: runtime_schema.AntflyType,
+    array_item_type: ?runtime_schema.AntflyType = null,
+};
+
+fn parseOptionalDdlKnownDefault(tokens: []const grammar.Token, pos: *usize) !?DdlKnownDefault {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (cursor.matchKeyword("null")) return .null_literal;
+    if (cursor.matchKeyword("gen_random_uuid") or cursor.matchKeyword("uuid_generate_v4")) {
+        try cursor.expectToken(.lparen);
+        try cursor.expectToken(.rparen);
+        return .uuid_v4;
+    }
+    if (cursor.matchKeyword("now")) {
+        try cursor.expectToken(.lparen);
+        try cursor.expectToken(.rparen);
+        return .now_ns;
+    }
+    if (cursor.matchKeyword("current_timestamp")) {
+        try parseOptionalCurrentTimestampPrecision(tokens, pos);
+        return .now_ns;
+    }
+    if (cursor.matchKeyword("current_date")) return .current_date_ns;
+    return null;
+}
+
+fn parseOptionalCurrentTimestampPrecision(tokens: []const grammar.Token, pos: *usize) !void {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (cursor.matchToken(.lparen) == null) return;
+    const token = cursor.matchToken(.number) orelse return error.UnsupportedSqlShape;
+    const precision = std.fmt.parseUnsigned(u8, token.text, 10) catch return error.UnsupportedSqlShape;
+    if (precision > 6) return error.UnsupportedSqlShape;
+    try cursor.expectToken(.rparen);
+}
+
+fn ddlDefaultValueFromKnownAlloc(
+    alloc: std.mem.Allocator,
+    known: DdlKnownDefault,
+    field_type: ?runtime_schema.AntflyType,
+) !runtime_schema.RelationalDefaultValue {
+    return switch (known) {
+        .null_literal => .{ .kind = .literal, .value_json = try alloc.dupe(u8, "null") },
+        .uuid_v4 => blk: {
+            if (field_type) |ty| {
+                if (ty != .keyword and ty != .text and ty != .link) return error.UnsupportedSqlShape;
+            }
+            break :blk .{ .kind = .uuid_v4, .value_json = try alloc.dupe(u8, "") };
+        },
+        .now_ns => blk: {
+            if (field_type) |ty| {
+                if (ty != .numeric and ty != .datetime) return error.UnsupportedSqlShape;
+            }
+            break :blk .{ .kind = .now_ns, .value_json = try alloc.dupe(u8, "") };
+        },
+        .current_date_ns => blk: {
+            if (field_type) |ty| {
+                if (ty != .numeric and ty != .datetime) return error.UnsupportedSqlShape;
+            }
+            break :blk .{ .kind = .current_date_ns, .value_json = try alloc.dupe(u8, "") };
+        },
+    };
+}
+
+fn parseDdlDefaultValueUntypedLiteralAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !runtime_schema.RelationalDefaultValue {
+    if (try parseOptionalDdlKnownDefault(tokens, pos)) |known| {
+        return try ddlDefaultValueFromKnownAlloc(alloc, known, null);
+    }
+    if (pos.* + 2 < tokens.len and tokens[pos.*].kind == .lparen and tokens[pos.* + 1].matchesKeywordTag(.select)) return error.UnsupportedSqlShape;
+    return .{ .kind = .literal, .value_json = try value_mod.parseSqlUntypedValueJsonAlloc(alloc, tokens, pos) };
+}
+
+fn parseDdlType(tokens: []const grammar.Token, pos: *usize) !DdlType {
+    const cursor = parser.Cursor.init(tokens, pos);
+    const first = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
+    const base = ddlBaseTypeForName(first.text) orelse blk: {
+        if (std.ascii.eqlIgnoreCase(first.text, "character")) {
+            try cursor.expectKeyword("varying");
+            break :blk runtime_schema.AntflyType.keyword;
+        }
+        if (std.ascii.eqlIgnoreCase(first.text, "double")) {
+            try cursor.expectKeyword("precision");
+            break :blk runtime_schema.AntflyType.numeric;
+        }
+        if (std.ascii.eqlIgnoreCase(first.text, "timestamp")) {
+            if (cursor.matchKeyword("with")) {
+                try cursor.expectKeyword("time");
+                try cursor.expectKeyword("zone");
+            } else if (cursor.matchKeyword("without")) {
+                try cursor.expectKeyword("time");
+                try cursor.expectKeyword("zone");
+            }
+            break :blk runtime_schema.AntflyType.datetime;
+        }
+        return error.UnsupportedSqlShape;
+    };
+
+    if (cursor.peekKind(.lparen)) try skipParenthesizedTokens(cursor);
+    const is_array = if (cursor.matchToken(.lbracket) != null) blk: {
+        try cursor.expectToken(.rbracket);
+        break :blk true;
+    } else false;
+    if (!is_array) return .{ .field_type = base };
+    if (base == .json or base == .array or base == .blob) return error.UnsupportedSqlShape;
+    return .{ .field_type = .array, .array_item_type = base };
+}
+
+fn ddlBaseTypeForName(name: []const u8) ?runtime_schema.AntflyType {
+    if (std.ascii.eqlIgnoreCase(name, "uuid")) return .keyword;
+    if (std.ascii.eqlIgnoreCase(name, "text")) return .keyword;
+    if (std.ascii.eqlIgnoreCase(name, "varchar")) return .keyword;
+    if (std.ascii.eqlIgnoreCase(name, "citext")) return .keyword;
+    if (std.ascii.eqlIgnoreCase(name, "integer")) return .numeric;
+    if (std.ascii.eqlIgnoreCase(name, "int")) return .numeric;
+    if (std.ascii.eqlIgnoreCase(name, "int4")) return .numeric;
+    if (std.ascii.eqlIgnoreCase(name, "bigint")) return .numeric;
+    if (std.ascii.eqlIgnoreCase(name, "int8")) return .numeric;
+    if (std.ascii.eqlIgnoreCase(name, "smallint")) return .numeric;
+    if (std.ascii.eqlIgnoreCase(name, "numeric")) return .numeric;
+    if (std.ascii.eqlIgnoreCase(name, "decimal")) return .numeric;
+    if (std.ascii.eqlIgnoreCase(name, "real")) return .numeric;
+    if (std.ascii.eqlIgnoreCase(name, "float4")) return .numeric;
+    if (std.ascii.eqlIgnoreCase(name, "float8")) return .numeric;
+    if (std.ascii.eqlIgnoreCase(name, "boolean")) return .boolean;
+    if (std.ascii.eqlIgnoreCase(name, "bool")) return .boolean;
+    if (std.ascii.eqlIgnoreCase(name, "date")) return .datetime;
+    if (std.ascii.eqlIgnoreCase(name, "timestamptz")) return .datetime;
+    if (std.ascii.eqlIgnoreCase(name, "json")) return .json;
+    if (std.ascii.eqlIgnoreCase(name, "jsonb")) return .json;
+    if (std.ascii.eqlIgnoreCase(name, "bytea")) return .blob;
+    return null;
+}
+
+fn skipParenthesizedTokens(cursor: parser.Cursor) !void {
+    try cursor.expectToken(.lparen);
+    var depth: usize = 1;
+    while (depth > 0) {
+        if (cursor.atEnd()) return error.UnsupportedSqlShape;
+        if (cursor.matchToken(.lparen) != null) {
+            depth += 1;
+        } else if (cursor.matchToken(.rparen) != null) {
+            depth -= 1;
+        } else {
+            try cursor.advance(1);
+        }
+    }
+}
+
 fn parseDdlDefaultValueWithParamsAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
@@ -17502,19 +18894,17 @@ fn parseDdlDefaultValueWithParamsAlloc(
     params: []const value_mod.SqlValue,
     realtime_ns: u64,
     generated_scalar_subquery_defaults: []const generated_parser.GeneratedSqlDdlScalarSubqueryDefaultAst,
-    require_generated_scalar_subquery_defaults: bool,
     generated_scalar_subquery_full_tokens: ?[]const grammar.Token,
     generated_scalar_subquery_token_offset: usize,
 ) !runtime_schema.RelationalDefaultValue {
-    if (try grammar.parseOptionalDdlKnownDefault(tokens, pos)) |known| {
-        return try grammar.ddlDefaultValueFromKnownSyntaxAlloc(alloc, known, field_type);
+    if (try parseOptionalDdlKnownDefault(tokens, pos)) |known| {
+        return try ddlDefaultValueFromKnownAlloc(alloc, known, field_type);
     }
-    if (try parseOptionalDdlScalarSubqueryDefaultAlloc(
+    if (try generatedDdlScalarSubqueryDefaultForCurrentRangeAlloc(
         alloc,
         tokens,
         pos,
         generated_scalar_subquery_defaults,
-        require_generated_scalar_subquery_defaults,
         generated_scalar_subquery_full_tokens,
         generated_scalar_subquery_token_offset,
     )) |value| return value;
@@ -17528,27 +18918,58 @@ fn parseDdlDefaultValueUntypedAlloc(
     pos: *usize,
     options: DdlExpressionOptions,
 ) !runtime_schema.RelationalDefaultValue {
-    if (try grammar.parseOptionalDdlKnownDefault(tokens, pos)) |known| {
-        return try grammar.ddlDefaultValueFromKnownSyntaxAlloc(alloc, known, null);
+    const full_tokens = options.generated_default_value_full_tokens orelse return error.UnsupportedSqlShape;
+    const default_range = options.generated_default_value_tokens orelse return error.UnsupportedSqlShape;
+    const expected_start = options.generated_default_value_token_offset + pos.*;
+    if (default_range.start != expected_start or default_range.end > full_tokens.len or default_range.end <= default_range.start) return error.UnsupportedSqlShape;
+    if (default_range.start < options.generated_default_value_token_offset) return error.UnsupportedSqlShape;
+    const local_end = default_range.end - options.generated_default_value_token_offset;
+    if (local_end > tokens.len or local_end <= pos.*) return error.UnsupportedSqlShape;
+    const value_tokens = tokens[pos.*..local_end];
+    var value_pos: usize = 0;
+    const value = try parseDdlDefaultValueUntypedPayloadAlloc(
+        alloc,
+        value_tokens,
+        &value_pos,
+        options,
+        options.generated_scalar_subquery_full_tokens orelse full_tokens,
+        default_range.start,
+    );
+    if (value_pos != value_tokens.len) {
+        alloc.free(value.value_json);
+        return error.UnsupportedSqlShape;
     }
-    if (try parseOptionalDdlScalarSubqueryDefaultAlloc(
+    pos.* = local_end;
+    return value;
+}
+
+fn parseDdlDefaultValueUntypedPayloadAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    options: DdlExpressionOptions,
+    generated_scalar_subquery_full_tokens: ?[]const grammar.Token,
+    generated_scalar_subquery_token_offset: usize,
+) !runtime_schema.RelationalDefaultValue {
+    if (try parseOptionalDdlKnownDefault(tokens, pos)) |known| {
+        return try ddlDefaultValueFromKnownAlloc(alloc, known, null);
+    }
+    if (try generatedDdlScalarSubqueryDefaultForCurrentRangeAlloc(
         alloc,
         tokens,
         pos,
         options.generated_scalar_subquery_defaults,
-        options.require_generated_scalar_subquery_defaults,
-        options.generated_scalar_subquery_full_tokens,
-        options.generated_scalar_subquery_token_offset,
+        generated_scalar_subquery_full_tokens,
+        generated_scalar_subquery_token_offset,
     )) |value| return value;
-    return try grammar.parseDdlDefaultValueUntypedAlloc(alloc, tokens, pos);
+    return try parseDdlDefaultValueUntypedLiteralAlloc(alloc, tokens, pos);
 }
 
-fn parseOptionalDdlScalarSubqueryDefaultAlloc(
+fn generatedDdlScalarSubqueryDefaultForCurrentRangeAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
     pos: *usize,
     generated_scalar_subquery_defaults: []const generated_parser.GeneratedSqlDdlScalarSubqueryDefaultAst,
-    require_generated_scalar_subquery_defaults: bool,
     generated_scalar_subquery_full_tokens: ?[]const grammar.Token,
     generated_scalar_subquery_token_offset: usize,
 ) !?runtime_schema.RelationalDefaultValue {
@@ -17564,7 +18985,6 @@ fn parseOptionalDdlScalarSubqueryDefaultAlloc(
     };
     const planning_tokens = generated_scalar_subquery_full_tokens orelse tokens;
     const generated_default = generatedScalarSubqueryDefaultForRange(generated_scalar_subquery_defaults, default_tokens);
-    if (generated_default == null and (require_generated_scalar_subquery_defaults or generated_scalar_subquery_full_tokens != null)) return error.UnsupportedSqlShape;
     if (generated_default) |item| {
         if (item.query_tokens.start != default_tokens.start + 1 or item.query_tokens.end + 1 != default_tokens.end) return error.UnsupportedSqlShape;
         if (item.query_tokens.end > planning_tokens.len) return error.UnsupportedSqlShape;
@@ -17575,12 +18995,7 @@ fn parseOptionalDdlScalarSubqueryDefaultAlloc(
         pos.* = close_index + 1;
         return default_value;
     }
-    var default_value = try grammar.parseOptionalDdlScalarSubqueryDefaultAlloc(alloc, tokens, pos) orelse return null;
-    errdefer alloc.free(default_value.value_json);
-    const normalized = try relational_rows.normalizeScalarSubqueryDefaultValueJsonAlloc(alloc, default_value.value_json);
-    alloc.free(default_value.value_json);
-    default_value.value_json = normalized;
-    return default_value;
+    return error.UnsupportedSqlShape;
 }
 
 fn validateGeneratedDdlScalarSubqueryDefaultReadForPlanning(read_ast: generated_parser.GeneratedSqlReadAst) !void {
@@ -18244,25 +19659,39 @@ fn generatedScalarSubqueryDefaultForRange(
     return null;
 }
 
-pub fn parseDdlDefaultValueAlloc(
+fn parseDdlDefaultValueAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
     pos: *usize,
     field_type: runtime_schema.AntflyType,
     options: DdlExpressionOptions,
 ) !runtime_schema.RelationalDefaultValue {
-    return try parseDdlDefaultValueWithParamsAlloc(
+    const full_tokens = options.generated_default_value_full_tokens orelse return error.UnsupportedSqlShape;
+    const default_range = options.generated_default_value_tokens orelse return error.UnsupportedSqlShape;
+    const expected_start = options.generated_default_value_token_offset + pos.*;
+    if (default_range.start != expected_start or default_range.end > full_tokens.len or default_range.end <= default_range.start) return error.UnsupportedSqlShape;
+    if (default_range.start < options.generated_default_value_token_offset) return error.UnsupportedSqlShape;
+    const local_end = default_range.end - options.generated_default_value_token_offset;
+    if (local_end > tokens.len or local_end <= pos.*) return error.UnsupportedSqlShape;
+    const value_tokens = tokens[pos.*..local_end];
+    var value_pos: usize = 0;
+    const value = try parseDdlDefaultValueWithParamsAlloc(
         alloc,
-        tokens,
-        pos,
+        value_tokens,
+        &value_pos,
         field_type,
         options.params,
         options.realtime_ns,
         options.generated_scalar_subquery_defaults,
-        options.require_generated_scalar_subquery_defaults,
-        options.generated_scalar_subquery_full_tokens,
-        options.generated_scalar_subquery_token_offset,
+        options.generated_scalar_subquery_full_tokens orelse full_tokens,
+        default_range.start,
     );
+    if (value_pos != value_tokens.len) {
+        alloc.free(value.value_json);
+        return error.UnsupportedSqlShape;
+    }
+    pos.* = local_end;
+    return value;
 }
 
 fn parseDdlRowExpressionAlloc(
@@ -18401,7 +19830,24 @@ fn parseDdlConditionAlternativesAlloc(
     );
 }
 
-pub fn parseDdlGeneratedValueAlloc(
+fn generatedDdlGeneratedValueFromAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    expression_range: generated_parser.GeneratedSqlTokenRange,
+    expression_ast: generated_parser.GeneratedSqlExpressionAst,
+) !runtime_schema.RelationalGeneratedValue {
+    if (!generatedDdlTokenRangeEqual(expression_ast.tokens orelse return error.UnsupportedSqlShape, expression_range)) return error.UnsupportedSqlShape;
+    const expression = (try generatedCreateIndexRowExpressionAlloc(alloc, tokens, expression_ast)) orelse return error.UnsupportedSqlShape;
+    var expression_transferred = false;
+    errdefer if (!expression_transferred) runtime_schema.freeRelationalRowsExpression(alloc, expression);
+    expression_transferred = true;
+    return .{
+        .op = .expression,
+        .expression = expression,
+    };
+}
+
+fn parseDdlGeneratedValueAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
     pos: *usize,
@@ -18411,30 +19857,46 @@ pub fn parseDdlGeneratedValueAlloc(
     const start = pos.*;
     if (cursor.matchKeyword("always")) {
         try cursor.expectKeyword("as");
+        const open_index = pos.*;
         try cursor.expectToken(.lparen);
-        const expression = (if (expr_row_parse.peekRoutineExpressionCall(tokens, pos.*, options.function_bindings.routine_expressions))
-            parseDdlRoutineRowExpressionAlloc(alloc, tokens, pos, options)
-        else
-            parseDdlRowExpressionAlloc(alloc, tokens, pos, options, true)) catch |err| {
-            pos.* = start;
-            if (err == error.OutOfMemory) return err;
-            return try grammar.parseDdlStoredGeneratedValueAlloc(alloc, tokens, pos);
+        const expression_start = pos.*;
+        const close_index = findGeneratedMatchingParen(tokens, open_index, tokens.len) orelse return error.UnsupportedSqlShape;
+        const expression_range = generated_parser.GeneratedSqlTokenRange{ .start = expression_start, .end = close_index };
+        const generated = if (expr_row_parse.peekRoutineExpressionCall(tokens, pos.*, options.function_bindings.routine_expressions)) blk: {
+            const expression = try parseDdlRoutineRowExpressionAlloc(alloc, tokens, pos, options);
+            var expression_transferred = false;
+            errdefer if (!expression_transferred) runtime_schema.freeRelationalRowsExpression(alloc, expression);
+            if (pos.* != close_index) return error.UnsupportedSqlShape;
+            expression_transferred = true;
+            break :blk runtime_schema.RelationalGeneratedValue{
+                .op = .expression,
+                .expression = expression,
+            };
+        } else blk: {
+            const expression_ast = options.generated_column_expression_ast orelse return error.UnsupportedSqlShape;
+            const full_tokens = options.generated_column_expression_full_tokens orelse return error.UnsupportedSqlShape;
+            const expected_range = options.generated_column_expression_tokens orelse return error.UnsupportedSqlShape;
+            const full_range = generated_parser.GeneratedSqlTokenRange{
+                .start = options.generated_column_expression_token_offset + expression_range.start,
+                .end = options.generated_column_expression_token_offset + expression_range.end,
+            };
+            if (!generatedDdlTokenRangeEqual(full_range, expected_range)) return error.UnsupportedSqlShape;
+            const value = try generatedDdlGeneratedValueFromAstAlloc(alloc, full_tokens, expected_range, expression_ast.*);
+            pos.* = close_index;
+            break :blk value;
         };
-        var expression_transferred = false;
-        errdefer if (!expression_transferred) runtime_schema.freeRelationalRowsExpression(alloc, expression);
+        var generated_transferred = false;
+        errdefer if (!generated_transferred) freeDdlGeneratedValue(alloc, generated);
         try cursor.expectToken(.rparen);
         try cursor.expectKeyword("stored");
-        expression_transferred = true;
-        return .{
-            .op = .expression,
-            .expression = expression,
-        };
+        generated_transferred = true;
+        return generated;
     }
     pos.* = start;
-    return try grammar.parseDdlStoredGeneratedValueAlloc(alloc, tokens, pos);
+    return error.UnsupportedSqlShape;
 }
 
-pub fn parseDdlCheckConstraintAlloc(
+fn parseDdlCheckConstraintAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
     pos: *usize,
@@ -18449,13 +19911,93 @@ pub fn parseDdlCheckConstraintAlloc(
     return try makeDdlRelationalCheckFromExpressionConditionAlloc(alloc, constraint_name, condition);
 }
 
-pub fn parseDdlCheckExpressionConditionAlloc(
+fn parseGeneratedDdlCheckConstraintAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    constraint_name: ?[]const u8,
+    options: DdlExpressionOptions,
+    hooks: DdlColumnDefinitionOptions,
+    retained_inline_index: ?usize,
+) !runtime_schema.RelationalCheck {
+    if (retained_inline_index) |index| {
+        const range = try generatedInlinePayloadRangeAt(hooks.generated_inline_check_payload_items, index);
+        const payload = range orelse return error.UnsupportedSqlShape;
+        const full_tokens = hooks.generated_inline_constraint_full_tokens orelse return error.UnsupportedSqlShape;
+        const local = try generatedConstraintLocalRange(full_tokens, tokens, hooks.generated_inline_constraint_token_offset, payload, pos.*);
+        return try parseGeneratedDdlCheckConstraintLocalAlloc(alloc, tokens, pos, local, constraint_name, options);
+    }
+    const full_tokens = hooks.generated_constraint_name_full_tokens orelse return error.UnsupportedSqlShape;
+    const range = hooks.generated_check_payload_tokens orelse return error.UnsupportedSqlShape;
+    const local = try generatedConstraintLocalRange(full_tokens, tokens, hooks.generated_constraint_token_offset, range, pos.*);
+    return try parseGeneratedDdlCheckConstraintLocalAlloc(alloc, tokens, pos, local, constraint_name, options);
+}
+
+fn parseGeneratedDdlCheckConstraintLocalAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    local: generated_parser.GeneratedSqlTokenRange,
+    constraint_name: ?[]const u8,
+    options: DdlExpressionOptions,
+) !runtime_schema.RelationalCheck {
+    var local_pos: usize = 0;
+    const check = try parseDdlCheckConstraintAlloc(alloc, tokens[local.start..local.end], &local_pos, constraint_name, options);
+    errdefer freeDdlRelationalCheck(alloc, check);
+    if (local_pos != local.end - local.start) return error.UnsupportedSqlShape;
+    pos.* = local.end;
+    return check;
+}
+
+fn parseGeneratedOptionalDdlCheckNotValid(
+    tokens: []const grammar.Token,
+    pos: *usize,
+    hooks: DdlColumnDefinitionOptions,
+    retained_inline_index: ?usize,
+) !bool {
+    if (retained_inline_index) |index| {
+        const range = try generatedInlinePayloadRangeAt(hooks.generated_inline_check_not_valid_items, index);
+        if (range == null) {
+            if (pos.* + 1 < tokens.len and tokens[pos.*].matchesKeyword("not") and tokens[pos.* + 1].matchesKeyword("valid")) return error.UnsupportedSqlShape;
+            return false;
+        }
+        const full_tokens = hooks.generated_inline_constraint_full_tokens orelse return error.UnsupportedSqlShape;
+        const local = try generatedConstraintLocalRange(full_tokens, tokens, hooks.generated_inline_constraint_token_offset, range.?, pos.*);
+        if (local.end != local.start + 2 or !tokens[local.start].matchesKeyword("not") or !tokens[local.start + 1].matchesKeyword("valid")) {
+            return error.UnsupportedSqlShape;
+        }
+        pos.* = local.end;
+        return true;
+    }
+    const full_tokens = hooks.generated_constraint_name_full_tokens orelse return error.UnsupportedSqlShape;
+    const range = hooks.generated_check_not_valid_tokens orelse {
+        if (pos.* + 1 < tokens.len and tokens[pos.*].matchesKeyword("not") and tokens[pos.* + 1].matchesKeyword("valid")) {
+            return error.UnsupportedSqlShape;
+        }
+        return false;
+    };
+    const local = try generatedConstraintLocalRange(full_tokens, tokens, hooks.generated_constraint_token_offset, range, pos.*);
+    if (local.end != local.start + 2 or !tokens[local.start].matchesKeyword("not") or !tokens[local.start + 1].matchesKeyword("valid")) {
+        return error.UnsupportedSqlShape;
+    }
+    pos.* = local.end;
+    return true;
+}
+
+fn parseDdlCheckExpressionConditionAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
     pos: *usize,
     options: DdlExpressionOptions,
 ) !db_mod.types.RelationalRowsExpressionCondition {
-    var groups = try parseDdlCheckExpressionPredicateGroupsAlloc(alloc, tokens, pos, options);
+    const start = pos.*;
+    var groups = parseDdlCheckExpressionPredicateGroupsAlloc(alloc, tokens, pos, options) catch |err| switch (err) {
+        error.UnsupportedSqlShape => {
+            pos.* = start;
+            return try parseDdlCheckBooleanRowExpressionConditionAlloc(alloc, tokens, pos, options);
+        },
+        else => return err,
+    };
     defer alloc.free(groups);
     errdefer plan_mod.freeExpressionPredicateGroups(alloc, groups);
 
@@ -18488,7 +20030,185 @@ pub fn parseDdlCheckExpressionConditionAlloc(
     };
 }
 
-pub fn parseDdlCheckExpressionPredicateGroupsAlloc(
+fn parseDdlCheckBooleanRowExpressionConditionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    options: DdlExpressionOptions,
+) !db_mod.types.RelationalRowsExpressionCondition {
+    const expression_end = ddlCheckExpressionEnd(tokens, pos.*) orelse return error.UnsupportedSqlShape;
+    if (try parseDdlCheckSimpleFieldLiteralComparisonConditionAlloc(alloc, tokens[pos.*..expression_end], options)) |condition| {
+        pos.* = expression_end;
+        return condition;
+    }
+    if (try parseDdlCheckComparisonConditionAlloc(alloc, tokens[pos.*..expression_end], options)) |condition| {
+        pos.* = expression_end;
+        return condition;
+    }
+    var expression_pos: usize = 0;
+    const expression_tokens = tokens[pos.*..expression_end];
+    const expression = try parseDdlRowExpressionAlloc(alloc, expression_tokens, &expression_pos, options, false);
+    var expression_transferred = false;
+    errdefer if (!expression_transferred) runtime_schema.freeRelationalRowsExpression(alloc, expression);
+    if (expression_pos != expression_tokens.len) return error.UnsupportedSqlShape;
+
+    const rhs = try alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
+    var rhs_transferred = false;
+    errdefer if (!rhs_transferred) alloc.free(rhs);
+    rhs[0] = try expr_condition.booleanLiteralExpressionAlloc(alloc, true);
+    var rhs_expression_transferred = false;
+    errdefer if (!rhs_expression_transferred) runtime_schema.freeRelationalRowsExpression(alloc, rhs[0]);
+
+    pos.* = expression_end;
+    expression_transferred = true;
+    rhs_expression_transferred = true;
+    rhs_transferred = true;
+    return .{
+        .lhs = expression,
+        .op = .eq,
+        .rhs = rhs,
+    };
+}
+
+fn parseDdlCheckSimpleFieldLiteralComparisonConditionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    options: DdlExpressionOptions,
+) !?db_mod.types.RelationalRowsExpressionCondition {
+    const op_index = ddlCheckTopLevelComparisonOperatorIndex(tokens) orelse return null;
+    if (op_index != 1 or tokens.len <= op_index + 1 or tokens[0].kind != .identifier) return null;
+    const op = ddlCheckComparisonOp(tokens[op_index].kind) orelse return null;
+
+    const field = try alloc.dupe(u8, tokens[0].text);
+    var field_transferred = false;
+    errdefer if (!field_transferred) alloc.free(field);
+
+    var rhs_pos: usize = op_index + 1;
+    const value_json = value_mod.parseJsonValueAlloc(alloc, tokens, &rhs_pos, options.params) catch |err| switch (err) {
+        error.UnsupportedSqlShape => {
+            alloc.free(field);
+            return null;
+        },
+        else => return err,
+    };
+    var value_transferred = false;
+    errdefer if (!value_transferred) alloc.free(value_json);
+    if (rhs_pos != tokens.len) {
+        alloc.free(field);
+        alloc.free(value_json);
+        return null;
+    }
+
+    const rhs = try alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
+    var rhs_transferred = false;
+    errdefer if (!rhs_transferred) alloc.free(rhs);
+    rhs[0] = .{
+        .kind = .value,
+        .value_json = value_json,
+    };
+
+    field_transferred = true;
+    value_transferred = true;
+    rhs_transferred = true;
+    return .{
+        .lhs = .{
+            .kind = .field,
+            .field = field,
+        },
+        .op = op,
+        .rhs = rhs,
+    };
+}
+
+fn parseDdlCheckComparisonConditionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    options: DdlExpressionOptions,
+) !?db_mod.types.RelationalRowsExpressionCondition {
+    const op_index = ddlCheckTopLevelComparisonOperatorIndex(tokens) orelse return null;
+    if (op_index == 0 or op_index + 1 >= tokens.len) return error.UnsupportedSqlShape;
+    const op = ddlCheckComparisonOp(tokens[op_index].kind) orelse return null;
+
+    var lhs_pos: usize = 0;
+    const lhs = try parseDdlRowExpressionAlloc(alloc, tokens[0..op_index], &lhs_pos, options, false);
+    var lhs_transferred = false;
+    errdefer if (!lhs_transferred) runtime_schema.freeRelationalRowsExpression(alloc, lhs);
+    if (lhs_pos != op_index) {
+        runtime_schema.freeRelationalRowsExpression(alloc, lhs);
+        return null;
+    }
+
+    const rhs_tokens = tokens[op_index + 1 ..];
+    var rhs_pos: usize = 0;
+    const rhs_expression = try parseDdlRowExpressionAlloc(alloc, rhs_tokens, &rhs_pos, options, false);
+    var rhs_expression_transferred = false;
+    errdefer if (!rhs_expression_transferred) runtime_schema.freeRelationalRowsExpression(alloc, rhs_expression);
+    if (rhs_pos != rhs_tokens.len) {
+        runtime_schema.freeRelationalRowsExpression(alloc, lhs);
+        runtime_schema.freeRelationalRowsExpression(alloc, rhs_expression);
+        return null;
+    }
+
+    const rhs = try alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
+    var rhs_transferred = false;
+    errdefer if (!rhs_transferred) alloc.free(rhs);
+    rhs[0] = rhs_expression;
+
+    lhs_transferred = true;
+    rhs_expression_transferred = true;
+    rhs_transferred = true;
+    return .{
+        .lhs = lhs,
+        .op = op,
+        .rhs = rhs,
+    };
+}
+
+fn ddlCheckTopLevelComparisonOperatorIndex(tokens: []const grammar.Token) ?usize {
+    var depth: usize = 0;
+    for (tokens, 0..) |item, index| {
+        switch (item.kind) {
+            .lparen => depth += 1,
+            .rparen => {
+                if (depth == 0) return null;
+                depth -= 1;
+            },
+            .eq, .neq, .gt, .gte, .lt, .lte => if (depth == 0) return index,
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn ddlCheckComparisonOp(kind: token_mod.TokenKind) ?runtime_schema.RelationalCheckOp {
+    return switch (kind) {
+        .eq => .eq,
+        .neq => .ne,
+        .gt => .gt,
+        .gte => .gte,
+        .lt => .lt,
+        .lte => .lte,
+        else => null,
+    };
+}
+
+fn ddlCheckExpressionEnd(tokens: []const grammar.Token, start: usize) ?usize {
+    var depth: usize = 0;
+    var index = start;
+    while (index < tokens.len) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen => depth += 1,
+            .rparen => {
+                if (depth == 0) return index;
+                depth -= 1;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn parseDdlCheckExpressionPredicateGroupsAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
     pos: *usize,
@@ -18656,7 +20376,7 @@ fn parseDdlCheckNegatedPredicateGroupsAlloc(
     return try groups.toOwnedSlice(alloc);
 }
 
-pub fn parseDomainCheckConstraintAlloc(
+fn parseDomainCheckConstraintAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
     pos: *usize,
@@ -18691,82 +20411,36 @@ pub fn parseDomainCheckConstraintAlloc(
     return .{ .name = name, .field = field, .op = op, .value_json = value_json };
 }
 
-pub fn parseCreateDomainPlanAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-    options: DdlDomainOptions,
-) !CreateDomainPlan {
-    const cursor = parser.Cursor.init(tokens, pos);
-    var header = try grammar.parseCreateDomainHeaderAlloc(alloc, tokens, pos);
-    var header_transferred = false;
-    errdefer if (!header_transferred) header.deinit(alloc);
-    const ddl_type = try grammar.parseDdlType(tokens, pos);
-    var not_null = false;
-    var default_value: ?runtime_schema.RelationalDefaultValue = null;
-    errdefer if (default_value) |default| alloc.free(default.value_json);
-    var checks = std.ArrayListUnmanaged(runtime_schema.RelationalCheck).empty;
-    errdefer {
-        clearDdlRelationalChecks(alloc, checks.items);
-        checks.deinit(alloc);
-    }
-    while (!cursor.atEnd() and !cursor.peekKind(.semicolon)) {
-        if (cursor.matchKeyword("default")) {
-            if (default_value != null) return error.UnsupportedSqlShape;
-            default_value = try parseDdlDefaultValueWithParamsAlloc(alloc, tokens, pos, ddl_type.field_type, options.params, options.realtime_ns, &.{}, false, null, 0);
-        } else if (cursor.matchKeyword("not")) {
-            try cursor.expectKeyword("null");
-            not_null = true;
-        } else if (cursor.matchKeyword("null")) {
-            not_null = false;
-        } else if (cursor.matchKeyword("constraint")) {
-            const constraint_name = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
-            defer alloc.free(constraint_name);
-            const check = try parseDomainCheckConstraintAlloc(alloc, tokens, pos, constraint_name, ddl_type.field_type, options);
-            var check_transferred = false;
-            errdefer if (!check_transferred) freeDdlRelationalCheck(alloc, check);
-            try checks.append(alloc, check);
-            check_transferred = true;
-        } else if (cursor.matchKeyword("check")) {
-            const check = try parseDomainCheckConstraintAlloc(alloc, tokens, pos, null, ddl_type.field_type, options);
-            var check_transferred = false;
-            errdefer if (!check_transferred) freeDdlRelationalCheck(alloc, check);
-            try checks.append(alloc, check);
-            check_transferred = true;
-        } else {
-            return error.UnsupportedSqlShape;
-        }
-    }
-    try grammar.parseAdapterNoopStatementEnd(tokens, pos);
-    const owned_checks = try checks.toOwnedSlice(alloc);
-    var checks_transferred = false;
-    errdefer if (!checks_transferred) freeDdlRelationalChecks(alloc, owned_checks);
-    const out_default = default_value;
-    default_value = null;
-    header_transferred = true;
-    checks_transferred = true;
-    return .{
-        .domain_name = header.domain_name,
-        .field_type = ddl_type.field_type,
-        .array_item_type = ddl_type.array_item_type,
-        .not_null = not_null,
-        .default_value = out_default,
-        .checks = owned_checks,
-    };
-}
-
-pub fn parseDdlColumnDefinitionStandaloneAlloc(
+fn parseDdlColumnDefinitionStandaloneAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
     pos: *usize,
     hooks: DdlColumnDefinitionOptions,
 ) !runtime_schema.RelationalColumn {
     const cursor = parser.Cursor.init(tokens, pos);
-    const name = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    const full_tokens = hooks.generated_column_name_full_tokens orelse return error.UnsupportedSqlShape;
+    const name_range = hooks.generated_column_name_tokens orelse return error.UnsupportedSqlShape;
+    const expected_start = hooks.generated_column_header_token_offset + pos.*;
+    if (name_range.start != expected_start or name_range.end != name_range.start + 1 or name_range.end > full_tokens.len) return error.UnsupportedSqlShape;
+    if (name_range.start < hooks.generated_column_header_token_offset) return error.UnsupportedSqlShape;
+    const local_name_end = name_range.end - hooks.generated_column_header_token_offset;
+    if (local_name_end > tokens.len or local_name_end <= pos.*) return error.UnsupportedSqlShape;
+    if (full_tokens[name_range.start].kind != .identifier) return error.UnsupportedSqlShape;
+    pos.* = local_name_end;
+    const name = try alloc.dupe(u8, full_tokens[name_range.start].text);
     var name_transferred = false;
     errdefer if (!name_transferred) alloc.free(name);
 
-    const ddl_type = try grammar.parseDdlType(tokens, pos);
+    const type_range = hooks.generated_column_type_tokens orelse return error.UnsupportedSqlShape;
+    const expected_type_start = hooks.generated_column_header_token_offset + pos.*;
+    if (type_range.start != expected_type_start or type_range.end > full_tokens.len or type_range.end <= type_range.start) return error.UnsupportedSqlShape;
+    if (type_range.start < hooks.generated_column_header_token_offset) return error.UnsupportedSqlShape;
+    const local_type_end = type_range.end - hooks.generated_column_header_token_offset;
+    if (local_type_end > tokens.len or local_type_end <= pos.*) return error.UnsupportedSqlShape;
+    var type_pos: usize = 0;
+    const ddl_type = try parseDdlType(tokens[pos.*..local_type_end], &type_pos);
+    if (type_pos != local_type_end - pos.*) return error.UnsupportedSqlShape;
+    pos.* = local_type_end;
     const path = try alloc.dupe(u8, name);
     var path_transferred = false;
     errdefer if (!path_transferred) alloc.free(path);
@@ -18783,25 +20457,22 @@ pub fn parseDdlColumnDefinitionStandaloneAlloc(
     path_transferred = true;
 
     while (!cursor.atEnd() and !cursor.peekKind(.comma) and !cursor.peekKind(.rparen) and !cursor.peekKind(.semicolon) and !cursor.peekKeyword("primary") and !cursor.peekKeyword("unique") and !cursor.peekKeyword("check") and !cursor.peekKeyword("references") and !cursor.peekKeyword("constraint")) {
-        if (try parseOptionalSupportedDdlCollationAlloc(alloc, tokens, pos, column.field_type, column.array_item_type)) |collation| {
+        if (try parseOptionalGeneratedDdlColumnCollationAlloc(alloc, tokens, pos, column.field_type, column.array_item_type, hooks)) |collation| {
             if (column.collation != null) {
                 alloc.free(collation);
                 return error.UnsupportedSqlShape;
             }
             column.collation = collation;
             continue;
-        } else if (cursor.matchKeyword("not")) {
-            try cursor.expectKeyword("null");
-            column.nullable = false;
-        } else if (cursor.matchKeyword("null")) {
-            column.nullable = true;
-        } else if (cursor.matchKeyword("default")) {
+        } else if (try parseOptionalGeneratedDdlColumnNullability(tokens, pos, hooks)) |nullable| {
+            column.nullable = nullable;
+        } else if (try parseOptionalGeneratedDdlColumnDefaultValueAlloc(alloc, tokens, pos, column.field_type, hooks)) |default_value| {
             if (column.default_value != null) return error.UnsupportedSqlShape;
             if (column.generated != null) return error.UnsupportedSqlShape;
-            column.default_value = try parseDdlDefaultValueAlloc(alloc, tokens, pos, column.field_type, hooks.expression_options);
-        } else if (cursor.matchKeyword("generated")) {
+            column.default_value = default_value;
+        } else if (try parseOptionalGeneratedDdlColumnGeneratedValueAlloc(alloc, tokens, pos, hooks)) |generated| {
             if (column.default_value != null or column.generated != null) return error.UnsupportedSqlShape;
-            column.generated = try parseDdlGeneratedValueAlloc(alloc, tokens, pos, hooks.expression_options);
+            column.generated = generated;
         } else {
             return error.UnsupportedSqlShape;
         }
@@ -18811,7 +20482,104 @@ pub fn parseDdlColumnDefinitionStandaloneAlloc(
     return column;
 }
 
-pub fn parseDdlColumnDefinitionAlloc(
+fn parseOptionalGeneratedDdlColumnNullability(
+    tokens: []const grammar.Token,
+    pos: *usize,
+    hooks: DdlColumnDefinitionOptions,
+) !?bool {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (!cursor.peekKeyword("not") and !cursor.peekKeyword("null")) return null;
+    _ = hooks.generated_column_name_full_tokens orelse return error.UnsupportedSqlShape;
+    const range = hooks.generated_column_nullability_tokens orelse return error.UnsupportedSqlShape;
+    const expected_start = hooks.generated_column_header_token_offset + pos.*;
+    if (range.start != expected_start) return error.UnsupportedSqlShape;
+    if (range.start < hooks.generated_column_header_token_offset) return error.UnsupportedSqlShape;
+    const local_end = range.end - hooks.generated_column_header_token_offset;
+    if (local_end > tokens.len or local_end <= pos.*) return error.UnsupportedSqlShape;
+    if (range.end == range.start + 1 and tokens[pos.*].matchesKeywordTag(.null)) {
+        pos.* = local_end;
+        return true;
+    }
+    if (range.end == range.start + 2 and tokens[pos.*].matchesKeywordTag(.not) and pos.* + 1 < tokens.len and tokens[pos.* + 1].matchesKeywordTag(.null)) {
+        pos.* = local_end;
+        return false;
+    }
+    return error.UnsupportedSqlShape;
+}
+
+fn parseOptionalGeneratedDdlColumnCollationAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    field_type: runtime_schema.AntflyType,
+    array_item_type: ?runtime_schema.AntflyType,
+    hooks: DdlColumnDefinitionOptions,
+) !?[]const u8 {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (!cursor.peekKeyword("collate")) return null;
+    _ = hooks.generated_column_name_full_tokens orelse return error.UnsupportedSqlShape;
+    const range = hooks.generated_column_collation_tokens orelse return error.UnsupportedSqlShape;
+    const expected_start = hooks.generated_column_header_token_offset + pos.*;
+    if (range.start != expected_start) return error.UnsupportedSqlShape;
+    if (range.start < hooks.generated_column_header_token_offset) return error.UnsupportedSqlShape;
+    const local_end = range.end - hooks.generated_column_header_token_offset;
+    if (local_end > tokens.len or local_end <= pos.*) return error.UnsupportedSqlShape;
+    var collation_pos: usize = 0;
+    const collation = try parseOptionalSupportedDdlCollationAlloc(alloc, tokens[pos.*..local_end], &collation_pos, field_type, array_item_type) orelse return error.UnsupportedSqlShape;
+    if (collation_pos != local_end - pos.*) {
+        alloc.free(collation);
+        return error.UnsupportedSqlShape;
+    }
+    pos.* = local_end;
+    return collation;
+}
+
+fn parseOptionalGeneratedDdlColumnDefaultValueAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    field_type: runtime_schema.AntflyType,
+    hooks: DdlColumnDefinitionOptions,
+) !?runtime_schema.RelationalDefaultValue {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (!cursor.peekKeyword("default")) return null;
+    const full_tokens = hooks.generated_column_name_full_tokens orelse return error.UnsupportedSqlShape;
+    const range = hooks.generated_column_default_clause_tokens orelse return error.UnsupportedSqlShape;
+    const expected_start = hooks.generated_column_header_token_offset + pos.*;
+    if (range.start != expected_start or range.end > full_tokens.len or range.end <= range.start) return error.UnsupportedSqlShape;
+    if (range.start < hooks.generated_column_header_token_offset) return error.UnsupportedSqlShape;
+    const local_end = range.end - hooks.generated_column_header_token_offset;
+    if (local_end > tokens.len or local_end <= pos.*) return error.UnsupportedSqlShape;
+    try cursor.expectKeyword("default");
+    const value = try parseDdlDefaultValueAlloc(alloc, tokens, pos, field_type, hooks.expression_options);
+    errdefer alloc.free(value.value_json);
+    if (pos.* != local_end) return error.UnsupportedSqlShape;
+    return value;
+}
+
+fn parseOptionalGeneratedDdlColumnGeneratedValueAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    hooks: DdlColumnDefinitionOptions,
+) !?runtime_schema.RelationalGeneratedValue {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (!cursor.peekKeyword("generated")) return null;
+    const full_tokens = hooks.generated_column_name_full_tokens orelse return error.UnsupportedSqlShape;
+    const range = hooks.generated_column_generated_clause_tokens orelse return error.UnsupportedSqlShape;
+    const expected_start = hooks.generated_column_header_token_offset + pos.*;
+    if (range.start != expected_start or range.end > full_tokens.len or range.end <= range.start) return error.UnsupportedSqlShape;
+    if (range.start < hooks.generated_column_header_token_offset) return error.UnsupportedSqlShape;
+    const local_end = range.end - hooks.generated_column_header_token_offset;
+    if (local_end > tokens.len or local_end <= pos.*) return error.UnsupportedSqlShape;
+    try cursor.expectKeyword("generated");
+    const generated = try parseDdlGeneratedValueAlloc(alloc, tokens, pos, hooks.expression_options);
+    errdefer freeDdlGeneratedValue(alloc, generated);
+    if (pos.* != local_end) return error.UnsupportedSqlShape;
+    return generated;
+}
+
+fn parseDdlColumnDefinitionAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
     pos: *usize,
@@ -18834,50 +20602,49 @@ pub fn parseDdlColumnDefinitionAlloc(
     errdefer if (!column_transferred) freeDdlRelationalColumn(alloc, column);
     if (findDdlColumn(columns.items, column.name) != null) return error.UnsupportedSqlShape;
     while (!cursor.atEnd() and !cursor.peekKind(.comma) and !cursor.peekKind(.rparen) and !cursor.peekKind(.semicolon)) {
-        if (try parseOptionalSupportedDdlCollationAlloc(alloc, tokens, pos, column.field_type, column.array_item_type)) |collation| {
+        if (try parseOptionalGeneratedDdlColumnCollationAlloc(alloc, tokens, pos, column.field_type, column.array_item_type, hooks)) |collation| {
             if (column.collation != null) {
                 alloc.free(collation);
                 return error.UnsupportedSqlShape;
             }
             column.collation = collation;
             continue;
-        } else if (cursor.matchKeyword("not")) {
-            try cursor.expectKeyword("null");
-            column.nullable = false;
-        } else if (cursor.matchKeyword("null")) {
-            column.nullable = true;
-        } else if (cursor.matchKeyword("default")) {
+        } else if (try parseOptionalGeneratedDdlColumnNullability(tokens, pos, hooks)) |nullable| {
+            column.nullable = nullable;
+        } else if (try parseOptionalGeneratedDdlColumnDefaultValueAlloc(alloc, tokens, pos, column.field_type, hooks)) |default_value| {
             if (column.default_value != null) return error.UnsupportedSqlShape;
             if (column.generated != null) return error.UnsupportedSqlShape;
-            column.default_value = try parseDdlDefaultValueAlloc(alloc, tokens, pos, column.field_type, hooks.expression_options);
-        } else if (cursor.matchKeyword("generated")) {
+            column.default_value = default_value;
+        } else if (try parseOptionalGeneratedDdlColumnGeneratedValueAlloc(alloc, tokens, pos, hooks)) |generated| {
             if (column.default_value != null or column.generated != null) return error.UnsupportedSqlShape;
-            column.generated = try parseDdlGeneratedValueAlloc(alloc, tokens, pos, hooks.expression_options);
+            column.generated = generated;
         } else {
-            var constraint_prefix = try grammar.parseCreateTableColumnConstraintPrefixAlloc(alloc, tokens, pos);
+            var constraint_prefix = try generatedCreateTableColumnConstraintPrefixAlloc(alloc, tokens, pos, hooks);
             defer constraint_prefix.deinit(alloc);
             const constraint_name = constraint_prefix.constraint_name;
             if (constraint_prefix.kind == .primary_key and cursor.matchKeyword("primary")) {
                 try cursor.expectKeyword("key");
                 column.nullable = false;
-                const include_columns = try grammar.parseOptionalDdlConstraintIncludeUniqueAlloc(alloc, tokens, pos, &.{column.name});
+                const include_columns = try parseGeneratedInlineOptionalDdlConstraintIncludeUniqueAlloc(alloc, tokens, pos, &.{column.name}, hooks, constraint_prefix.retained_inline_index);
                 defer freeStringSlice(alloc, include_columns);
-                const timing = try grammar.parseOptionalDdlConstraintTiming(tokens, pos);
+                const timing = try parseGeneratedInlineOptionalDdlConstraintTiming(tokens, pos, hooks, constraint_prefix.retained_inline_index);
                 try installDdlPrimaryKeyAlloc(alloc, primary_key, constraint_name, &.{column.name}, include_columns, null, timing);
             } else if (constraint_prefix.kind == .unique and cursor.matchKeyword("unique")) {
-                const nulls_not_distinct = (try grammar.parseOptionalDdlUniqueNullsDistinct(tokens, pos)) orelse false;
-                const include_columns = try grammar.parseOptionalDdlConstraintIncludeUniqueAlloc(alloc, tokens, pos, &.{column.name});
+                const nulls_not_distinct = (try parseGeneratedInlineOptionalDdlUniqueNullsDistinct(tokens, pos, hooks, constraint_prefix.retained_inline_index)) orelse false;
+                const include_columns = try parseGeneratedInlineOptionalDdlConstraintIncludeUniqueAlloc(alloc, tokens, pos, &.{column.name}, hooks, constraint_prefix.retained_inline_index);
                 defer freeStringSlice(alloc, include_columns);
-                const timing = try grammar.parseOptionalDdlConstraintTiming(tokens, pos);
+                const timing = try parseGeneratedInlineOptionalDdlConstraintTiming(tokens, pos, hooks, constraint_prefix.retained_inline_index);
                 try appendDdlUniqueConstraintBuilderAlloc(alloc, unique_constraints, constraint_name, &.{column.name}, include_columns, null, nulls_not_distinct, timing);
             } else if (constraint_prefix.kind == .check and cursor.matchKeyword("check")) {
-                const check = try parseDdlCheckConstraintAlloc(alloc, tokens, pos, constraint_name, hooks.expression_options);
+                var check = try parseGeneratedDdlCheckConstraintAlloc(alloc, tokens, pos, constraint_name, hooks.expression_options, hooks, constraint_prefix.retained_inline_index);
+                check.validation_state = if (try parseGeneratedOptionalDdlCheckNotValid(tokens, pos, hooks, constraint_prefix.retained_inline_index)) .unvalidated else .enforced;
                 var check_transferred = false;
                 errdefer if (!check_transferred) freeDdlRelationalCheck(alloc, check);
                 try checks.append(alloc, check);
                 check_transferred = true;
             } else if (constraint_prefix.kind == .references and cursor.matchKeyword("references")) {
-                const foreign_key = try parseDdlInlineForeignKeyConstraintAlloc(alloc, tokens, pos, column.name, constraint_name);
+                var foreign_key = try parseGeneratedDdlInlineForeignKeyConstraintAlloc(alloc, tokens, pos, column.name, constraint_name, hooks, constraint_prefix.retained_inline_index);
+                foreign_key.validation_state = if (try parseGeneratedOptionalDdlInlineForeignKeyNotValid(tokens, pos, hooks, constraint_prefix.retained_inline_index)) .unvalidated else .enforced;
                 var foreign_key_transferred = false;
                 errdefer if (!foreign_key_transferred) freeDdlForeignKey(alloc, foreign_key);
                 try foreign_keys.append(alloc, foreign_key);
@@ -18892,7 +20659,102 @@ pub fn parseDdlColumnDefinitionAlloc(
     column_transferred = true;
 }
 
-pub fn parseDdlTableConstraintAlloc(
+const GeneratedCreateTableColumnConstraintKind = enum {
+    primary_key,
+    unique,
+    check,
+    references,
+};
+
+const GeneratedCreateTableColumnConstraintPrefix = struct {
+    kind: GeneratedCreateTableColumnConstraintKind,
+    constraint_name: ?[]const u8 = null,
+    retained_inline_index: ?usize = null,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.constraint_name) |name| alloc.free(name);
+        self.* = undefined;
+    }
+};
+
+fn generatedCreateTableColumnConstraintPrefixAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    hooks: DdlColumnDefinitionOptions,
+) !GeneratedCreateTableColumnConstraintPrefix {
+    if (hooks.generated_inline_constraint_full_tokens) |full_tokens| {
+        const absolute_pos = hooks.generated_inline_constraint_token_offset + pos.*;
+        if (hooks.generated_inline_constraint_prefix_items.len != hooks.generated_inline_constraint_name_items.len or
+            hooks.generated_inline_constraint_prefix_items.len != hooks.generated_inline_constraint_kind_items.len)
+        {
+            return error.UnsupportedSqlShape;
+        }
+        for (hooks.generated_inline_constraint_prefix_items, 0..) |prefix, index| {
+            if (prefix.start != absolute_pos) continue;
+            const kind_range = hooks.generated_inline_constraint_kind_items[index];
+            if (prefix.end > full_tokens.len or kind_range.end > full_tokens.len) return error.UnsupportedSqlShape;
+            if (kind_range.start < prefix.start or kind_range.end != prefix.end or kind_range.start >= kind_range.end) return error.UnsupportedSqlShape;
+            const local_kind_start = kind_range.start - hooks.generated_inline_constraint_token_offset;
+            const local_kind_end = kind_range.end - hooks.generated_inline_constraint_token_offset;
+            if (local_kind_end > tokens.len or local_kind_start < pos.*) return error.UnsupportedSqlShape;
+            if (hooks.generated_inline_constraint_name_items[index]) |name_range| {
+                if (name_range.start < hooks.generated_inline_constraint_token_offset or name_range.end > full_tokens.len) return error.UnsupportedSqlShape;
+                const local_name_start = name_range.start - hooks.generated_inline_constraint_token_offset;
+                const local_name_end = name_range.end - hooks.generated_inline_constraint_token_offset;
+                if (local_name_end > tokens.len or local_name_end != local_name_start + 1) return error.UnsupportedSqlShape;
+                if (local_name_start != pos.* + 1 or !tokens[pos.*].matchesKeywordTag(.constraint)) return error.UnsupportedSqlShape;
+                if (local_kind_start != local_name_end) return error.UnsupportedSqlShape;
+            } else if (local_kind_start != pos.*) {
+                return error.UnsupportedSqlShape;
+            }
+            const kind = try generatedCreateTableColumnConstraintKindFromRange(tokens[local_kind_start..local_kind_end]);
+            const constraint_name = if (hooks.generated_inline_constraint_name_items[index]) |name_range|
+                try generatedIdentifierAlloc(alloc, full_tokens, name_range)
+            else
+                null;
+            pos.* = local_kind_start;
+            return .{ .kind = kind, .constraint_name = constraint_name, .retained_inline_index = index };
+        }
+        return error.UnsupportedSqlShape;
+    }
+
+    const cursor = parser.Cursor.init(tokens, pos);
+    const constraint_name: ?[]const u8 = if (cursor.matchKeyword("constraint"))
+        try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos)
+    else
+        null;
+    var constraint_name_transferred = false;
+    errdefer if (!constraint_name_transferred) if (constraint_name) |name| alloc.free(name);
+
+    const kind: GeneratedCreateTableColumnConstraintKind = if (cursor.peekKeyword("primary")) blk: {
+        break :blk .primary_key;
+    } else if (cursor.peekKeyword("unique")) blk: {
+        break :blk .unique;
+    } else if (cursor.peekKeyword("check")) blk: {
+        break :blk .check;
+    } else if (cursor.peekKeyword("references")) blk: {
+        break :blk .references;
+    } else {
+        return error.UnsupportedSqlShape;
+    };
+
+    constraint_name_transferred = true;
+    return .{ .kind = kind, .constraint_name = constraint_name };
+}
+
+fn generatedCreateTableColumnConstraintKindFromRange(tokens: []const grammar.Token) !GeneratedCreateTableColumnConstraintKind {
+    if (tokens.len == 1) {
+        if (tokens[0].matchesKeyword("unique")) return .unique;
+        if (tokens[0].matchesKeyword("check")) return .check;
+        if (tokens[0].matchesKeyword("references")) return .references;
+    } else if (tokens.len == 2 and tokens[0].matchesKeyword("primary") and tokens[1].matchesKeyword("key")) {
+        return .primary_key;
+    }
+    return error.UnsupportedSqlShape;
+}
+
+fn parseDdlTableConstraintAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
     pos: *usize,
@@ -18907,35 +20769,37 @@ pub fn parseDdlTableConstraintAlloc(
     const cursor = parser.Cursor.init(tokens, pos);
     if (cursor.matchKeyword("primary")) {
         try cursor.expectKeyword("key");
-        const columns = try grammar.parseDdlUniqueTemporalColumnListAlloc(alloc, tokens, pos);
+        const columns = try parseGeneratedDdlUniqueTemporalColumnListAlloc(alloc, tokens, pos, hooks);
         defer columns.deinit(alloc);
-        const include_columns = try grammar.parseOptionalDdlConstraintIncludeUniqueAlloc(alloc, tokens, pos, columns.columns);
+        const include_columns = try parseGeneratedOptionalDdlConstraintIncludeUniqueAlloc(alloc, tokens, pos, columns.columns, hooks);
         defer freeStringSlice(alloc, include_columns);
-        const timing = try grammar.parseOptionalDdlConstraintTiming(tokens, pos);
+        const timing = try parseGeneratedOptionalDdlConstraintTiming(tokens, pos, hooks);
         try installDdlPrimaryKeyAlloc(alloc, primary_key, constraint_name, columns.columns, include_columns, columns.without_overlaps_period, timing);
     } else if (cursor.matchKeyword("unique")) {
-        const nulls_not_distinct = (try grammar.parseOptionalDdlUniqueNullsDistinct(tokens, pos)) orelse false;
-        const columns = try grammar.parseDdlUniqueTemporalColumnListAlloc(alloc, tokens, pos);
+        const nulls_not_distinct = (try parseGeneratedOptionalDdlUniqueNullsDistinct(tokens, pos, hooks)) orelse false;
+        const columns = try parseGeneratedDdlUniqueTemporalColumnListAlloc(alloc, tokens, pos, hooks);
         defer columns.deinit(alloc);
-        const include_columns = try grammar.parseOptionalDdlConstraintIncludeUniqueAlloc(alloc, tokens, pos, columns.columns);
+        const include_columns = try parseGeneratedOptionalDdlConstraintIncludeUniqueAlloc(alloc, tokens, pos, columns.columns, hooks);
         defer freeStringSlice(alloc, include_columns);
-        const timing = try grammar.parseOptionalDdlConstraintTiming(tokens, pos);
+        const timing = try parseGeneratedOptionalDdlConstraintTiming(tokens, pos, hooks);
         try appendDdlUniqueConstraintBuilderAlloc(alloc, unique_constraints, constraint_name, columns.columns, include_columns, columns.without_overlaps_period, nulls_not_distinct, timing);
     } else if (cursor.matchKeyword("foreign")) {
-        const foreign_key = try parseDdlForeignKeyConstraintAlloc(alloc, tokens, pos, constraint_name);
+        var foreign_key = try parseGeneratedDdlForeignKeyConstraintAlloc(alloc, tokens, pos, constraint_name, hooks);
+        foreign_key.validation_state = if (try parseGeneratedOptionalDdlForeignKeyNotValid(tokens, pos, hooks)) .unvalidated else .enforced;
         var transferred = false;
         errdefer if (!transferred) freeDdlForeignKey(alloc, foreign_key);
         try foreign_keys.append(alloc, foreign_key);
         transferred = true;
     } else if (cursor.matchKeyword("check")) {
-        const check = try parseDdlCheckConstraintAlloc(alloc, tokens, pos, constraint_name, hooks.expression_options);
+        var check = try parseGeneratedDdlCheckConstraintAlloc(alloc, tokens, pos, constraint_name, hooks.expression_options, hooks, null);
+        check.validation_state = if (try parseGeneratedOptionalDdlCheckNotValid(tokens, pos, hooks, null)) .unvalidated else .enforced;
         var transferred = false;
         errdefer if (!transferred) freeDdlRelationalCheck(alloc, check);
         try checks.append(alloc, check);
         transferred = true;
     } else if (cursor.matchKeyword("period")) {
         if (constraint_name != null) return error.UnsupportedSqlShape;
-        const period = try parseDdlPeriodConstraintPlanAlloc(alloc, tokens, pos);
+        const period = try parseGeneratedDdlPeriodConstraintPlanAlloc(alloc, tokens, pos, hooks);
         var transferred = false;
         errdefer if (!transferred) freeDdlPeriod(alloc, period);
         try periods.append(alloc, period);
@@ -18945,16 +20809,179 @@ pub fn parseDdlTableConstraintAlloc(
     }
 }
 
-pub fn parseCreateTableDefinitionAlloc(
+const GeneratedCreateTableElementKind = enum {
+    column,
+    period,
+    primary_key,
+    unique,
+    foreign_key,
+    check,
+};
+
+const GeneratedCreateTableElementPrefix = struct {
+    kind: GeneratedCreateTableElementKind,
+    constraint_name: ?[]const u8 = null,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.constraint_name) |name| alloc.free(name);
+        self.* = undefined;
+    }
+};
+
+fn generatedCreateTableElementPrefixAlloc(
     alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    hooks: DdlColumnDefinitionOptions,
+) !GeneratedCreateTableElementPrefix {
+    if (hooks.generated_constraint_name_full_tokens) |full_tokens| {
+        const kind_range = hooks.generated_constraint_kind_tokens orelse return .{ .kind = .column };
+        if (kind_range.start < hooks.generated_constraint_token_offset or kind_range.end > full_tokens.len) return error.UnsupportedSqlShape;
+        const local_kind_start = kind_range.start - hooks.generated_constraint_token_offset;
+        const local_kind_end = kind_range.end - hooks.generated_constraint_token_offset;
+        if (local_kind_end > tokens.len or local_kind_start < pos.* or local_kind_start >= local_kind_end) return error.UnsupportedSqlShape;
+        if (local_kind_start == pos.*) {
+            if (hooks.generated_constraint_name_tokens != null) return error.UnsupportedSqlShape;
+        } else {
+            const name_range = hooks.generated_constraint_name_tokens orelse return error.UnsupportedSqlShape;
+            if (name_range.start < hooks.generated_constraint_token_offset or name_range.end > full_tokens.len) return error.UnsupportedSqlShape;
+            const local_name_start = name_range.start - hooks.generated_constraint_token_offset;
+            const local_name_end = name_range.end - hooks.generated_constraint_token_offset;
+            if (local_name_end > tokens.len or local_name_end != local_name_start + 1) return error.UnsupportedSqlShape;
+            if (local_name_start != pos.* + 1 or !tokens[pos.*].matchesKeywordTag(.constraint)) return error.UnsupportedSqlShape;
+            if (local_kind_start != local_name_end) return error.UnsupportedSqlShape;
+        }
+        const kind = try generatedCreateTableElementKindFromRange(tokens[local_kind_start..local_kind_end]);
+        const constraint_name = if (hooks.generated_constraint_name_tokens) |name_range|
+            try generatedIdentifierAlloc(alloc, full_tokens, name_range)
+        else
+            null;
+        pos.* = local_kind_start;
+        return .{ .kind = kind, .constraint_name = constraint_name };
+    }
+
+    const cursor = parser.Cursor.init(tokens, pos);
+    const start = pos.*;
+    const constraint_name: ?[]const u8 = if (cursor.matchKeyword("constraint"))
+        try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos)
+    else
+        null;
+    var constraint_name_transferred = false;
+    errdefer if (!constraint_name_transferred) if (constraint_name) |name| alloc.free(name);
+
+    const kind: GeneratedCreateTableElementKind = if (cursor.peekKeyword("period")) blk: {
+        break :blk .period;
+    } else if (cursor.peekKeyword("primary")) blk: {
+        break :blk .primary_key;
+    } else if (cursor.peekKeyword("unique")) blk: {
+        break :blk .unique;
+    } else if (cursor.peekKeyword("foreign")) blk: {
+        break :blk .foreign_key;
+    } else if (cursor.peekKeyword("check")) blk: {
+        break :blk .check;
+    } else if (constraint_name == null) blk: {
+        pos.* = start;
+        break :blk .column;
+    } else {
+        return error.UnsupportedSqlShape;
+    };
+
+    constraint_name_transferred = true;
+    return .{ .kind = kind, .constraint_name = constraint_name };
+}
+
+fn generatedCreateTableElementKindFromRange(tokens: []const grammar.Token) !GeneratedCreateTableElementKind {
+    if (tokens.len == 1) {
+        if (tokens[0].matchesKeyword("period")) return .period;
+        if (tokens[0].matchesKeyword("unique")) return .unique;
+        if (tokens[0].matchesKeyword("check")) return .check;
+    } else if (tokens.len == 2 and tokens[1].matchesKeyword("key")) {
+        if (tokens[0].matchesKeyword("primary")) return .primary_key;
+        if (tokens[0].matchesKeyword("foreign")) return .foreign_key;
+    }
+    return error.UnsupportedSqlShape;
+}
+
+const GeneratedCreateTableDefinitionHeader = struct {
+    table_name: []const u8,
+    if_not_exists: bool = false,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.table_name);
+        self.* = undefined;
+    }
+};
+
+fn generatedCreateTableDefinitionHeaderAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !GeneratedCreateTableDefinitionHeader {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("table");
+    const if_not_exists = try generatedOptionalIfNotExists(cursor);
+    const table_name = try grammar.parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var table_transferred = false;
+    errdefer if (!table_transferred) alloc.free(table_name);
+    try cursor.expectToken(.lparen);
+
+    table_transferred = true;
+    return .{ .table_name = table_name, .if_not_exists = if_not_exists };
+}
+
+fn parseCreateTableDefinitionItemAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    hooks: DdlColumnDefinitionOptions,
+    columns: *std.ArrayListUnmanaged(runtime_schema.RelationalColumn),
+    periods: *std.ArrayListUnmanaged(runtime_schema.RelationalPeriod),
+    primary_key: *?runtime_schema.PrimaryKey,
+    unique_constraints: *std.ArrayListUnmanaged(runtime_schema.UniqueConstraint),
+    foreign_keys: *std.ArrayListUnmanaged(runtime_schema.ForeignKey),
+    checks: *std.ArrayListUnmanaged(runtime_schema.RelationalCheck),
+) !void {
+    var element_prefix = try generatedCreateTableElementPrefixAlloc(alloc, tokens, pos, hooks);
+    defer element_prefix.deinit(alloc);
+
+    if (element_prefix.kind == .column) {
+        try parseDdlColumnDefinitionAlloc(alloc, tokens, pos, hooks, columns, periods, primary_key, unique_constraints, foreign_keys, checks);
+    } else {
+        try parseDdlTableConstraintAlloc(alloc, tokens, pos, hooks, element_prefix.constraint_name, primary_key, periods, unique_constraints, foreign_keys, checks);
+    }
+}
+
+fn parseGeneratedCreateTableDefinitionAlloc(
+    alloc: std.mem.Allocator,
+    full_tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
     tokens: []const grammar.Token,
     pos: *usize,
     hooks: DdlColumnDefinitionOptions,
 ) !CreateTablePlan {
     const cursor = parser.Cursor.init(tokens, pos);
-    var header = try grammar.parseCreateTableDefinitionHeaderAlloc(alloc, tokens, pos);
+    const end = generatedStatementEnd(full_tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    const offset = generatedTokenSliceOffset(full_tokens, tokens) orelse return error.UnsupportedSqlShape;
+    var header = try generatedCreateTableDefinitionHeaderAlloc(alloc, tokens, pos);
     var header_transferred = false;
     errdefer if (!header_transferred) header.deinit(alloc);
+
+    const items_range = ast.alter_table_operation_tokens orelse return error.UnsupportedSqlShape;
+    if (!generatedRangeWithinStatement(items_range, end) or items_range.start != offset + pos.*) return error.UnsupportedSqlShape;
+    if (ast.alter_table_operation_items.count == 0 or ast.alter_table_operation_items.items.len != ast.alter_table_operation_items.count) return error.UnsupportedSqlShape;
+    if (ast.alter_table_operation_items.first_tokens == null or ast.alter_table_operation_items.last_tokens == null) return error.UnsupportedSqlShape;
+    if (!std.meta.eql(ast.alter_table_operation_items.first_tokens.?, ast.alter_table_operation_items.items[0])) return error.UnsupportedSqlShape;
+    if (!std.meta.eql(ast.alter_table_operation_items.last_tokens.?, ast.alter_table_operation_items.items[ast.alter_table_operation_items.items.len - 1])) return error.UnsupportedSqlShape;
+    try validateGeneratedAlterTableOperationConstraintPrefixItems(full_tokens, &ast);
+    try validateGeneratedAlterTableOperationPrimaryUniqueConstraintPayloadItems(full_tokens, &ast);
+    try validateGeneratedAlterTableOperationForeignKeyConstraintPayloadItems(full_tokens, &ast);
+    try validateGeneratedAlterTableOperationCheckConstraintPayloadItems(full_tokens, &ast);
+    try validateGeneratedAlterTableOperationPeriodPayloadItems(full_tokens, &ast);
+    try validateGeneratedAlterTableOperationColumnDefinitionItems(full_tokens, &ast);
+    try validateGeneratedAlterTableOperationInlineConstraintPrefixItems(full_tokens, &ast);
+    try validateGeneratedAlterTableOperationDefaultValueItems(full_tokens, &ast);
+    try validateGeneratedAlterTableOperationGeneratedExpressionItems(full_tokens, &ast);
+    try validateGeneratedAlterTableOperationRewriteExpressionItems(full_tokens, &ast);
 
     var columns = std.ArrayListUnmanaged(runtime_schema.RelationalColumn).empty;
     errdefer {
@@ -18984,23 +21011,88 @@ pub fn parseCreateTableDefinitionAlloc(
         checks.deinit(alloc);
     }
 
-    if (!cursor.peekKind(.rparen)) {
-        while (true) {
-            var element_prefix = try grammar.parseCreateTableElementPrefixAlloc(alloc, tokens, pos);
-            defer element_prefix.deinit(alloc);
+    var expected_start = items_range.start;
+    for (ast.alter_table_operation_items.items, 0..) |item, item_index| {
+        if (!generatedRangeWithinStatement(item, end) or item.start != expected_start or item.start >= item.end or item.end > items_range.end) return error.UnsupportedSqlShape;
+        if (item.start < offset or item.end > offset + tokens.len) return error.UnsupportedSqlShape;
+        if (pos.* != item.start - offset) return error.UnsupportedSqlShape;
 
-            if (element_prefix.kind == .column) {
-                try parseDdlColumnDefinitionAlloc(alloc, tokens, pos, hooks, &columns, &periods, &primary_key, &unique_constraints, &foreign_keys, &checks);
-            } else {
-                try parseDdlTableConstraintAlloc(alloc, tokens, pos, hooks, element_prefix.constraint_name, &primary_key, &periods, &unique_constraints, &foreign_keys, &checks);
-            }
+        const item_tokens = full_tokens[item.start..item.end];
+        var item_pos: usize = 0;
+        var item_hooks = hooks;
+        item_hooks.expression_options.generated_scalar_subquery_full_tokens = hooks.expression_options.generated_scalar_subquery_full_tokens orelse full_tokens;
+        item_hooks.expression_options.generated_scalar_subquery_token_offset = item.start;
+        item_hooks.expression_options.generated_default_value_full_tokens = full_tokens;
+        item_hooks.expression_options.generated_default_value_token_offset = item.start;
+        if (ast.alter_table_operation_default_value_items.len != 0) {
+            item_hooks.expression_options.generated_default_value_tokens = ast.alter_table_operation_default_value_items[item_index];
+        }
+        item_hooks.generated_constraint_name_full_tokens = full_tokens;
+        item_hooks.generated_constraint_token_offset = item.start;
+        if (ast.alter_table_operation_constraint_kind_items.len != 0) {
+            item_hooks.generated_constraint_name_tokens = ast.alter_table_operation_constraint_name_items[item_index];
+            item_hooks.generated_constraint_kind_tokens = ast.alter_table_operation_constraint_kind_items[item_index];
+            item_hooks.generated_constraint_nulls_distinct_tokens = ast.alter_table_operation_constraint_nulls_distinct_items[item_index];
+            item_hooks.generated_constraint_column_list_tokens = ast.alter_table_operation_constraint_column_list_items[item_index];
+            item_hooks.generated_constraint_include_tokens = ast.alter_table_operation_constraint_include_items[item_index];
+            item_hooks.generated_constraint_timing_tokens = ast.alter_table_operation_constraint_timing_items[item_index];
+            item_hooks.generated_constraint_not_valid_tokens = ast.alter_table_operation_constraint_not_valid_items[item_index];
+            item_hooks.generated_foreign_key_payload_tokens = ast.alter_table_operation_foreign_key_payload_items[item_index];
+            item_hooks.generated_foreign_key_not_valid_tokens = ast.alter_table_operation_foreign_key_not_valid_items[item_index];
+            item_hooks.generated_check_payload_tokens = ast.alter_table_operation_check_payload_items[item_index];
+            item_hooks.generated_check_not_valid_tokens = ast.alter_table_operation_check_not_valid_items[item_index];
+            item_hooks.generated_period_payload_tokens = ast.alter_table_operation_period_payload_items[item_index];
+        }
+        item_hooks.generated_inline_constraint_full_tokens = full_tokens;
+        item_hooks.generated_inline_constraint_token_offset = item.start;
+        item_hooks.generated_inline_constraint_prefix_items = ast.alter_table_operation_inline_constraint_items.items;
+        item_hooks.generated_inline_constraint_name_items = ast.alter_table_operation_inline_constraint_name_items;
+        item_hooks.generated_inline_constraint_kind_items = ast.alter_table_operation_inline_constraint_kind_items;
+        item_hooks.generated_inline_constraint_nulls_distinct_items = ast.alter_table_operation_inline_constraint_nulls_distinct_items;
+        item_hooks.generated_inline_constraint_include_items = ast.alter_table_operation_inline_constraint_include_items;
+        item_hooks.generated_inline_constraint_timing_items = ast.alter_table_operation_inline_constraint_timing_items;
+        item_hooks.generated_inline_constraint_not_valid_items = ast.alter_table_operation_inline_constraint_not_valid_items;
+        item_hooks.generated_inline_foreign_key_payload_items = ast.alter_table_operation_inline_foreign_key_payload_items;
+        item_hooks.generated_inline_foreign_key_not_valid_items = ast.alter_table_operation_inline_foreign_key_not_valid_items;
+        item_hooks.generated_inline_check_payload_items = ast.alter_table_operation_inline_check_payload_items;
+        item_hooks.generated_inline_check_not_valid_items = ast.alter_table_operation_inline_check_not_valid_items;
+        item_hooks.generated_column_name_full_tokens = full_tokens;
+        item_hooks.generated_column_header_token_offset = item.start;
+        if (ast.alter_table_operation_column_name_items.len != 0) {
+            item_hooks.generated_column_name_tokens = ast.alter_table_operation_column_name_items[item_index];
+            item_hooks.generated_column_type_tokens = ast.alter_table_operation_column_type_items[item_index];
+            item_hooks.generated_column_nullability_tokens = ast.alter_table_operation_column_nullability_items[item_index];
+            item_hooks.generated_column_collation_tokens = ast.alter_table_operation_column_collation_items[item_index];
+            item_hooks.generated_column_default_clause_tokens = ast.alter_table_operation_column_default_clause_items[item_index];
+            item_hooks.generated_column_generated_clause_tokens = ast.alter_table_operation_column_generated_clause_items[item_index];
+        }
+        item_hooks.generated_column_expression_full_tokens = full_tokens;
+        item_hooks.generated_column_expression_token_offset = item.start;
+        item_hooks.expression_options.generated_column_expression_full_tokens = full_tokens;
+        item_hooks.expression_options.generated_column_expression_token_offset = item.start;
+        if (ast.alter_table_operation_generated_expression_items.len != 0) {
+            item_hooks.generated_column_expression_tokens = ast.alter_table_operation_generated_expression_items[item_index];
+            item_hooks.expression_options.generated_column_expression_tokens = ast.alter_table_operation_generated_expression_items[item_index];
+            item_hooks.generated_column_expression_ast = if (ast.alter_table_operation_generated_expression_items[item_index] != null)
+                &ast.alter_table_operation_generated_expressions[item_index]
+            else
+                null;
+            item_hooks.expression_options.generated_column_expression_ast = item_hooks.generated_column_expression_ast;
+        }
+        try parseCreateTableDefinitionItemAlloc(alloc, item_tokens, &item_pos, item_hooks, &columns, &periods, &primary_key, &unique_constraints, &foreign_keys, &checks);
+        if (item_pos != item_tokens.len) return error.UnsupportedSqlShape;
 
-            if (cursor.matchToken(.comma) == null) break;
+        pos.* = item.end - offset;
+        expected_start = item.end;
+        if (item_index + 1 < ast.alter_table_operation_items.items.len) {
+            if (expected_start >= items_range.end or expected_start >= full_tokens.len or full_tokens[expected_start].kind != .comma) return error.UnsupportedSqlShape;
+            if (pos.* >= tokens.len or tokens[pos.*].kind != .comma) return error.UnsupportedSqlShape;
+            expected_start += 1;
+            pos.* += 1;
         }
     }
+    if (expected_start != items_range.end or pos.* != items_range.end - offset) return error.UnsupportedSqlShape;
     try cursor.expectToken(.rparen);
-    var tail = try parseOptionalCreateTableTailAlloc(alloc, tokens, pos);
-    errdefer tail.deinit(alloc);
 
     const owned_columns = try columns.toOwnedSlice(alloc);
     var columns_transferred = false;
@@ -19024,132 +21116,16 @@ pub fn parseCreateTableDefinitionAlloc(
     unique_transferred = true;
     foreign_transferred = true;
     checks_transferred = true;
-    tail.transferred = true;
     return .{
         .table_name = header.table_name,
         .if_not_exists = header.if_not_exists,
-        .storage_mode = tail.storage_mode,
-        .default_type = tail.default_type,
-        .document_schemas = tail.document_schemas,
         .columns = owned_columns,
         .primary_key = primary_key,
         .periods = owned_periods,
         .unique_constraints = owned_unique_constraints,
         .foreign_keys = owned_foreign_keys,
         .checks = owned_checks,
-        .system_versioned = tail.system_versioned,
     };
-}
-
-const CreateTableTail = struct {
-    storage_mode: runtime_schema.StorageMode = .relational,
-    default_type: ?[]const u8 = null,
-    document_schemas: []const DocumentSchemaPlan = &.{},
-    system_versioned: bool = false,
-    transferred: bool = false,
-
-    fn deinit(self: @This(), alloc: std.mem.Allocator) void {
-        if (self.transferred) return;
-        if (self.default_type) |default_type| alloc.free(default_type);
-        freeDocumentSchemaPlans(alloc, self.document_schemas);
-    }
-};
-
-fn parseOptionalCreateTableTailAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !CreateTableTail {
-    const cursor = parser.Cursor.init(tokens, pos);
-    if (!cursor.matchKeyword("with")) return .{};
-    if (cursor.matchKeyword("system")) {
-        if (!cursor.matchKeyword("versioning")) return error.UnsupportedSqlShape;
-        return .{ .system_versioned = true };
-    }
-    if (cursor.matchToken(.lparen) == null) return error.UnsupportedSqlShape;
-
-    var storage_mode: runtime_schema.StorageMode = .relational;
-    var explicit_storage_mode = false;
-    var default_type: ?[]const u8 = null;
-    errdefer if (default_type) |value| alloc.free(value);
-
-    while (true) {
-        const key = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
-        try cursor.expectToken(.eq);
-        if (std.ascii.eqlIgnoreCase(key.text, "antfly.storage_mode") or std.ascii.eqlIgnoreCase(key.text, "storage_mode")) {
-            const value = try value_mod.parseSqlStringValueAlloc(alloc, tokens, pos, &.{});
-            defer alloc.free(value);
-            if (std.mem.eql(u8, value, "document")) {
-                storage_mode = .document;
-                explicit_storage_mode = true;
-            } else if (std.mem.eql(u8, value, "relational")) {
-                storage_mode = .relational;
-                explicit_storage_mode = true;
-            } else {
-                return error.UnsupportedSqlShape;
-            }
-        } else if (std.ascii.eqlIgnoreCase(key.text, "antfly.default_type") or std.ascii.eqlIgnoreCase(key.text, "default_type")) {
-            if (default_type != null) return error.UnsupportedSqlShape;
-            default_type = try value_mod.parseSqlStringValueAlloc(alloc, tokens, pos, &.{});
-        } else {
-            return error.UnsupportedSqlShape;
-        }
-        if (cursor.matchToken(.comma) == null) break;
-    }
-    try cursor.expectToken(.rparen);
-
-    if (storage_mode != .document) {
-        if (default_type != null) return error.UnsupportedSqlShape;
-        if (!explicit_storage_mode) return error.UnsupportedSqlShape;
-        return .{};
-    }
-
-    var document_schemas = std.ArrayListUnmanaged(DocumentSchemaPlan).empty;
-    errdefer {
-        for (document_schemas.items) |document_schema| {
-            alloc.free(document_schema.name);
-            alloc.free(document_schema.schema_json);
-        }
-        document_schemas.deinit(alloc);
-    }
-    while (cursor.matchKeyword("document")) {
-        try cursor.expectKeyword("schema");
-        const name = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
-        const owned_name = try alloc.dupe(u8, name.text);
-        var name_transferred = false;
-        errdefer if (!name_transferred) alloc.free(owned_name);
-        try cursor.expectKeyword("as");
-        try cursor.expectKeyword("json");
-        const schema_json = try value_mod.parseSqlStringValueAlloc(alloc, tokens, pos, &.{});
-        var json_transferred = false;
-        errdefer if (!json_transferred) alloc.free(schema_json);
-        try document_schemas.append(alloc, .{
-            .name = owned_name,
-            .schema_json = schema_json,
-        });
-        name_transferred = true;
-        json_transferred = true;
-        _ = cursor.matchToken(.comma);
-    }
-    if (default_type == null or document_schemas.items.len == 0) return error.UnsupportedSqlShape;
-    const owned_document_schemas = try document_schemas.toOwnedSlice(alloc);
-    return .{
-        .storage_mode = .document,
-        .default_type = default_type,
-        .document_schemas = owned_document_schemas,
-    };
-}
-
-pub fn parseCreateTablePlanAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-    hooks: DdlColumnDefinitionOptions,
-) !CreateTablePlan {
-    var plan = try parseCreateTableDefinitionAlloc(alloc, tokens, pos, hooks);
-    errdefer plan.deinit(alloc);
-    try grammar.parseAdapterNoopStatementEnd(tokens, pos);
-    return plan;
 }
 
 fn generatedCreateTableAstHasDocumentTableMetadata(
@@ -19157,18 +21133,46 @@ fn generatedCreateTableAstHasDocumentTableMetadata(
     ast: generated_parser.GeneratedSqlDdlAst,
 ) bool {
     if (ast.create_table_document_schema_items.count > 0) return true;
-    for (ast.create_table_storage_parameter_items.items) |item| {
-        if (item.start >= item.end or item.end > tokens.len) continue;
-        const key = tokens[item.start].text;
-        if (std.ascii.eqlIgnoreCase(key, "antfly.storage_mode") or
-            std.ascii.eqlIgnoreCase(key, "storage_mode") or
-            std.ascii.eqlIgnoreCase(key, "antfly.default_type") or
-            std.ascii.eqlIgnoreCase(key, "default_type"))
-        {
-            return true;
+    if (ast.create_table_storage_parameter_name_items.len != ast.create_table_storage_parameter_items.count or
+        ast.create_table_storage_parameter_value_items.len != ast.create_table_storage_parameter_items.count)
+    {
+        return false;
+    }
+    for (ast.create_table_storage_parameter_items.items, 0..) |item, index| {
+        const ranges = generatedCreateTableStorageParameterRanges(tokens, ast, item, index) orelse continue;
+        const key = tokens[ranges.name.start].text;
+        if (std.ascii.eqlIgnoreCase(key, "antfly.default_type") or std.ascii.eqlIgnoreCase(key, "default_type")) return true;
+        if (std.ascii.eqlIgnoreCase(key, "antfly.storage_mode") or std.ascii.eqlIgnoreCase(key, "storage_mode")) {
+            if (tokens[ranges.value.start].kind == .string and std.mem.eql(u8, tokens[ranges.value.start].text, "document")) return true;
         }
     }
     return false;
+}
+
+const GeneratedCreateTableStorageParameterRanges = struct {
+    name: generated_parser.GeneratedSqlTokenRange,
+    value: generated_parser.GeneratedSqlTokenRange,
+};
+
+fn generatedCreateTableStorageParameterRanges(
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+    item: generated_parser.GeneratedSqlTokenRange,
+    index: usize,
+) ?GeneratedCreateTableStorageParameterRanges {
+    if (item.end > tokens.len or item.end != item.start + 3) return null;
+    if (index >= ast.create_table_storage_parameter_name_items.len or
+        index >= ast.create_table_storage_parameter_value_items.len)
+    {
+        return null;
+    }
+    if (tokens[item.start].kind != .identifier or tokens[item.start + 1].kind != .eq) return null;
+    const name = ast.create_table_storage_parameter_name_items[index];
+    const value = ast.create_table_storage_parameter_value_items[index];
+    if (name.start != item.start or name.end != item.start + 1) return null;
+    if (value.start != item.start + 2 or value.end != item.end) return null;
+    if (value.end > tokens.len) return null;
+    return .{ .name = name, .value = value };
 }
 
 fn createTablePlanFromGeneratedDocumentAstAlloc(
@@ -19199,13 +21203,14 @@ fn createTablePlanFromGeneratedDocumentAstAlloc(
     var default_type_transferred = false;
     errdefer if (!default_type_transferred) if (default_type) |value| alloc.free(value);
 
-    for (ast.create_table_storage_parameter_items.items) |item| {
+    try validateGeneratedCreateTableStorageParameterItems(tokens, storage_range, ast);
+    for (ast.create_table_storage_parameter_items.items, 0..) |item, index| {
         if (!generatedRangeWithinStatement(item, end) or item.start < storage_range.start or item.end > storage_range.end) return error.UnsupportedSqlShape;
-        if (item.end != item.start + 3 or tokens[item.start].kind != .identifier or tokens[item.start + 1].kind != .eq) return error.UnsupportedSqlShape;
-        const value = try generatedStringLiteralValueAlloc(alloc, tokens, .{ .start = item.start + 2, .end = item.start + 3 });
+        const ranges = generatedCreateTableStorageParameterRanges(tokens, ast, item, index) orelse return error.UnsupportedSqlShape;
+        const value = try generatedStringLiteralValueAlloc(alloc, tokens, ranges.value);
         defer alloc.free(value);
 
-        const key = tokens[item.start].text;
+        const key = tokens[ranges.name.start].text;
         if (std.ascii.eqlIgnoreCase(key, "antfly.storage_mode") or std.ascii.eqlIgnoreCase(key, "storage_mode")) {
             if (std.mem.eql(u8, value, "document")) {
                 storage_mode = .document;
@@ -19288,8 +21293,125 @@ fn createTablePlanFromGeneratedDocumentAstAlloc(
     return plan;
 }
 
-fn parseGeneratedCreateTableTailPlanAlloc(
+fn applyGeneratedRelationalCreateTableTailAlloc(
     alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+    definition_end: usize,
+    plan: *CreateTablePlan,
+) !void {
+    const end = generatedStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    if (ast.kind != .create_table or definition_end > end) return error.UnsupportedSqlShape;
+    if (ast.create_table_document_schema_items.count != 0 or
+        ast.create_table_document_schema_items.items.len != 0 or
+        ast.create_table_document_schema_name_items.len != 0 or
+        ast.create_table_document_schema_format_items.len != 0 or
+        ast.create_table_document_schema_json_items.len != 0)
+    {
+        return error.UnsupportedSqlShape;
+    }
+
+    var cursor = definition_end;
+    if (ast.create_table_storage_parameter_tokens) |storage_range| {
+        if (cursor + 2 > end or !tokens[cursor].matchesKeywordTag(.with) or tokens[cursor + 1].kind != .lparen) return error.UnsupportedSqlShape;
+        const storage_close = findGeneratedMatchingParen(tokens, cursor + 1, end) orelse return error.UnsupportedSqlShape;
+        if (storage_range.start != cursor + 2 or storage_range.end != storage_close) return error.UnsupportedSqlShape;
+        try applyGeneratedRelationalCreateTableStorageParametersAlloc(alloc, tokens, storage_range, ast);
+        cursor = storage_close + 1;
+    } else if (ast.create_table_storage_parameter_items.count != 0 or
+        ast.create_table_storage_parameter_items.items.len != 0 or
+        ast.create_table_storage_parameter_name_items.len != 0 or
+        ast.create_table_storage_parameter_value_items.len != 0)
+    {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (ast.create_table_system_versioned_tokens) |system_versioned| {
+        if (system_versioned.start != cursor or system_versioned.end != cursor + 3 or system_versioned.end > end) return error.UnsupportedSqlShape;
+        if (!generatedRangeMatchesKeywords(tokens, system_versioned, &.{ "with", "system", "versioning" })) return error.UnsupportedSqlShape;
+        plan.system_versioned = true;
+        cursor = system_versioned.end;
+    }
+
+    if (cursor != end) return error.UnsupportedSqlShape;
+}
+
+fn applyGeneratedRelationalCreateTableStorageParametersAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    storage_range: generated_parser.GeneratedSqlTokenRange,
+    ast: generated_parser.GeneratedSqlDdlAst,
+) !void {
+    try validateGeneratedCreateTableStorageParameterItems(tokens, storage_range, ast);
+    var explicit_storage_mode = false;
+    for (ast.create_table_storage_parameter_items.items, 0..) |item, index| {
+        const ranges = generatedCreateTableStorageParameterRanges(tokens, ast, item, index) orelse return error.UnsupportedSqlShape;
+        const value = try generatedStringLiteralValueAlloc(alloc, tokens, ranges.value);
+        defer alloc.free(value);
+        const key = tokens[ranges.name.start].text;
+        if (std.ascii.eqlIgnoreCase(key, "antfly.storage_mode") or std.ascii.eqlIgnoreCase(key, "storage_mode")) {
+            if (std.mem.eql(u8, value, "relational")) {
+                explicit_storage_mode = true;
+            } else {
+                return error.UnsupportedSqlShape;
+            }
+        } else if (std.ascii.eqlIgnoreCase(key, "antfly.default_type") or std.ascii.eqlIgnoreCase(key, "default_type")) {
+            return error.UnsupportedSqlShape;
+        } else {
+            return error.UnsupportedSqlShape;
+        }
+    }
+    if (!explicit_storage_mode) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedCreateTableStorageParameterItems(
+    tokens: []const grammar.Token,
+    storage_range: generated_parser.GeneratedSqlTokenRange,
+    ast: generated_parser.GeneratedSqlDdlAst,
+) !void {
+    const items = ast.create_table_storage_parameter_items;
+    if (!generatedRangeWithinStatement(storage_range, tokens.len) or storage_range.start >= storage_range.end) return error.UnsupportedSqlShape;
+    if (items.count == 0 or items.items.len != items.count) return error.UnsupportedSqlShape;
+    if (ast.create_table_storage_parameter_name_items.len != items.count or
+        ast.create_table_storage_parameter_value_items.len != items.count)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    if (items.first_tokens == null or items.last_tokens == null) return error.UnsupportedSqlShape;
+    if (items.expression_items.len != 0 or
+        items.alias_items.len != 0 or
+        items.alias_name_items.len != 0 or
+        items.direction_items.len != 0 or
+        items.directions.len != 0 or
+        items.order_using_operator_items.len != 0 or
+        items.nulls_order_items.len != 0 or
+        items.nulls_orders.len != 0 or
+        items.expressions.len != 0)
+    {
+        return error.UnsupportedSqlShape;
+    }
+
+    var index = storage_range.start;
+    for (items.items, 0..) |item, item_index| {
+        if (item.start != index or item.start >= item.end or item.end > storage_range.end) return error.UnsupportedSqlShape;
+        if (item_index == 0 and (items.first_tokens.?.start != item.start or items.first_tokens.?.end != item.end)) return error.UnsupportedSqlShape;
+        if (item.end != item.start + 3) return error.UnsupportedSqlShape;
+        _ = generatedCreateTableStorageParameterRanges(tokens, ast, item, item_index) orelse return error.UnsupportedSqlShape;
+        index = item.end;
+        if (item_index + 1 < items.items.len) {
+            if (index >= storage_range.end or tokens[index].kind != .comma) return error.UnsupportedSqlShape;
+            index += 1;
+        }
+    }
+    if (index != storage_range.end) return error.UnsupportedSqlShape;
+    const last = items.items[items.items.len - 1];
+    if (items.last_tokens.?.start != last.start or items.last_tokens.?.end != last.end) return error.UnsupportedSqlShape;
+}
+
+fn relationalCreateTablePlanFromGeneratedDdlAstAlloc(
+    alloc: std.mem.Allocator,
+    full_tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
     tokens: []const grammar.Token,
     pos: *usize,
     hooks: DdlColumnDefinitionOptions,
@@ -19306,37 +21428,39 @@ fn parseGeneratedCreateTableTailPlanAlloc(
         .defer_row_expression_field_validation = hooks.defer_row_expression_field_validation,
     };
     var local_hooks = parser_context.ParserState.ContextAccessors.ddlColumnDefinitionOptions(&state);
-    local_hooks.parse_rewrite_expression = hooks.parse_rewrite_expression;
     local_hooks.expression_options.generated_scalar_subquery_defaults = hooks.expression_options.generated_scalar_subquery_defaults;
-    local_hooks.expression_options.require_generated_scalar_subquery_defaults = hooks.expression_options.require_generated_scalar_subquery_defaults;
     local_hooks.expression_options.generated_scalar_subquery_full_tokens = hooks.expression_options.generated_scalar_subquery_full_tokens;
-    local_hooks.expression_options.generated_scalar_subquery_token_offset = if (hooks.expression_options.generated_scalar_subquery_full_tokens) |full_tokens|
-        generatedTokenSliceOffset(full_tokens, tokens) orelse hooks.expression_options.generated_scalar_subquery_token_offset
+    local_hooks.expression_options.generated_scalar_subquery_token_offset = if (hooks.expression_options.generated_scalar_subquery_full_tokens) |scalar_full_tokens|
+        generatedTokenSliceOffset(scalar_full_tokens, tokens) orelse hooks.expression_options.generated_scalar_subquery_token_offset
     else
         hooks.expression_options.generated_scalar_subquery_token_offset;
 
-    var plan = try parseCreateTablePlanAlloc(alloc, tokens, &state.pos, local_hooks);
+    var plan = try parseGeneratedCreateTableDefinitionAlloc(alloc, full_tokens, ast, tokens, &state.pos, local_hooks);
     errdefer plan.deinit(alloc);
-    pos.* = state.pos;
-    if (pos.* != tokens.len) return error.UnsupportedSqlShape;
+    const offset = generatedTokenSliceOffset(full_tokens, tokens) orelse return error.UnsupportedSqlShape;
+    try applyGeneratedRelationalCreateTableTailAlloc(alloc, full_tokens, ast, offset + state.pos, &plan);
+    const end = generatedStatementEnd(full_tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    try validateGeneratedCreateTableDefinitionMetadata(alloc, full_tokens, end, ast, plan);
+    pos.* = tokens.len;
     return plan;
 }
 
-fn parseGeneratedCreateTablePartitionTailPlanAlloc(
+fn createTablePartitionPlanValidatedFromGeneratedDdlAstAlloc(
     alloc: std.mem.Allocator,
     full_tokens: []const grammar.Token,
     ast: generated_parser.GeneratedSqlDdlAst,
     tokens: []const grammar.Token,
     pos: *usize,
 ) !CreateTablePartitionPlan {
-    var plan = try parseCreateTablePartitionPlanTailAlloc(alloc, tokens, pos);
+    _ = tokens;
+    _ = pos;
+    var plan = try createTablePartitionPlanFromGeneratedDdlAstAlloc(alloc, full_tokens, ast);
     errdefer plan.deinit(alloc);
-    if (pos.* != tokens.len) return error.UnsupportedSqlShape;
     try validateGeneratedCreateTablePartitionOfMetadata(alloc, full_tokens, ast, plan);
     return plan;
 }
 
-fn parseGeneratedCreatePartitionedTableTailPlanAlloc(
+fn createPartitionedTablePlanValidatedFromGeneratedDdlAstAlloc(
     alloc: std.mem.Allocator,
     full_tokens: []const grammar.Token,
     ast: generated_parser.GeneratedSqlDdlAst,
@@ -19344,13 +21468,88 @@ fn parseGeneratedCreatePartitionedTableTailPlanAlloc(
     pos: *usize,
     hooks: DdlColumnDefinitionOptions,
 ) !CreatePartitionedTablePlan {
-    var plan = try parseCreatePartitionedTablePlanAlloc(alloc, tokens, pos, hooks);
+    var plan = try createPartitionedTablePlanFromGeneratedDdlAstAlloc(alloc, full_tokens, ast, tokens, pos, hooks);
     errdefer plan.deinit(alloc);
-    if (pos.* != tokens.len) return error.UnsupportedSqlShape;
     const end = generatedStatementEnd(full_tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
     try validateGeneratedCreateTableDefinitionMetadata(alloc, full_tokens, end, ast, plan.create_table);
     try validateGeneratedCreatePartitionedTableMetadata(alloc, full_tokens, ast, plan);
     return plan;
+}
+
+fn createTablePartitionPlanFromGeneratedDdlAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+) !CreateTablePartitionPlan {
+    const end = generatedStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    if (ast.kind != .create_table or ast.if_not_exists) return error.UnsupportedSqlShape;
+    const name_range = ast.object_name_tokens orelse return error.UnsupportedSqlShape;
+    if (name_range.end > end or name_range.start >= name_range.end) return error.UnsupportedSqlShape;
+    const parent_range = ast.create_table_partition_of_parent_tokens orelse return error.UnsupportedSqlShape;
+    const lower_range = ast.create_table_partition_lower_bound_tokens orelse return error.UnsupportedSqlShape;
+    const upper_range = ast.create_table_partition_upper_bound_tokens orelse return error.UnsupportedSqlShape;
+
+    const table_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, name_range);
+    errdefer alloc.free(table_name);
+    const parent_table_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, parent_range);
+    errdefer alloc.free(parent_table_name);
+    const lower_json = try generatedSqlUntypedValueJsonAlloc(alloc, tokens, lower_range);
+    errdefer alloc.free(lower_json);
+    const upper_json = try generatedSqlUntypedValueJsonAlloc(alloc, tokens, upper_range);
+    errdefer alloc.free(upper_json);
+    return .{
+        .table_name = table_name,
+        .parent_table_name = parent_table_name,
+        .bounds = .{ .lower_json = lower_json, .upper_json = upper_json },
+    };
+}
+
+fn createPartitionedTablePlanFromGeneratedDdlAstAlloc(
+    alloc: std.mem.Allocator,
+    full_tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    hooks: DdlColumnDefinitionOptions,
+) !CreatePartitionedTablePlan {
+    var create_table = try parseGeneratedCreateTableDefinitionAlloc(alloc, full_tokens, ast, tokens, pos, hooks);
+    var create_table_transferred = false;
+    errdefer if (!create_table_transferred) create_table.deinit(alloc);
+    const tail_offset = generatedTokenSliceOffset(full_tokens, tokens) orelse return error.UnsupportedSqlShape;
+    const partition_range = ast.create_table_partition_tokens orelse return error.UnsupportedSqlShape;
+    if (tail_offset + pos.* != partition_range.start) return error.UnsupportedSqlShape;
+
+    const method_range = ast.create_table_partition_method_tokens orelse return error.UnsupportedSqlShape;
+    const method: TablePartitionMethod = if (method_range.end == method_range.start + 1 and
+        method_range.end <= full_tokens.len and
+        full_tokens[method_range.start].matchesKeyword("range"))
+        .range
+    else
+        return error.UnsupportedSqlShape;
+
+    if (ast.create_table_partition_key_name_items.len != ast.create_table_partition_key_items.count) return error.UnsupportedSqlShape;
+    const keys = try alloc.alloc([]const u8, ast.create_table_partition_key_name_items.len);
+    var key_count: usize = 0;
+    var keys_ready = false;
+    errdefer if (!keys_ready) {
+        for (keys[0..key_count]) |key| alloc.free(key);
+        alloc.free(keys);
+    };
+    for (ast.create_table_partition_key_items.items, ast.create_table_partition_key_name_items) |item, name| {
+        if (name.start != item.start or name.end != item.end) return error.UnsupportedSqlShape;
+        keys[key_count] = try generatedIdentifierAlloc(alloc, full_tokens, name);
+        key_count += 1;
+    }
+    keys_ready = true;
+    errdefer freeStringSlice(alloc, keys);
+    if (keys.len == 0) return error.UnsupportedSqlShape;
+    pos.* = partition_range.end - tail_offset;
+    create_table_transferred = true;
+    return .{
+        .create_table = create_table,
+        .method = method,
+        .keys = keys,
+    };
 }
 
 fn tablePartitionPlanFromGeneratedAlterTableAstAlloc(
@@ -19412,18 +21611,6 @@ fn alterTablePartitionPlanFromGeneratedDdlAstAlloc(
     }
 }
 
-pub fn parseRelationLifetimePlanAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-    hooks: DdlColumnDefinitionOptions,
-) !RelationLifetimePlan {
-    const prefix = try grammar.parseRelationLifetimePrefix(tokens, pos);
-    var create_table = try parseCreateTablePlanAlloc(alloc, tokens, pos, hooks);
-    errdefer create_table.deinit(alloc);
-    return .{ .kind = prefix.kind, .create_table = create_table };
-}
-
 fn parseGeneratedRelationLifetimePlanAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
@@ -19443,35 +21630,50 @@ fn parseGeneratedRelationLifetimePlanAlloc(
         .returning_expression_qualifiers = hooks.returning_expression_qualifiers,
         .defer_row_expression_field_validation = hooks.defer_row_expression_field_validation,
     };
-    var local_hooks = parser_context.ParserState.ContextAccessors.ddlColumnDefinitionOptions(&state);
-    local_hooks.parse_rewrite_expression = hooks.parse_rewrite_expression;
+    const local_hooks = parser_context.ParserState.ContextAccessors.ddlColumnDefinitionOptions(&state);
 
-    var plan = try parseRelationLifetimePlanAlloc(alloc, tokens, &state.pos, local_hooks);
-    errdefer plan.deinit(alloc);
+    const lifetime_kind = try parseGeneratedRelationLifetimeKind(tokens, &state.pos);
+    var create_table = try parseGeneratedCreateTableDefinitionAlloc(alloc, tokens, ast, tokens, &state.pos, local_hooks);
+    var create_table_transferred = false;
+    errdefer if (!create_table_transferred) create_table.deinit(alloc);
+    try applyGeneratedRelationalCreateTableTailAlloc(alloc, tokens, ast, state.pos, &create_table);
+    state.pos = end;
     pos.* = state.pos;
     if (!generatedStatementConsumedThrough(tokens, end, pos.*)) return error.UnsupportedSqlShape;
-    try validateGeneratedCreateTableDefinitionMetadata(alloc, tokens, end, ast, plan.create_table);
+    try validateGeneratedCreateTableDefinitionMetadata(alloc, tokens, end, ast, create_table);
+    create_table_transferred = true;
+    var plan = RelationLifetimePlan{ .kind = lifetime_kind, .create_table = create_table };
+    errdefer plan.deinit(alloc);
     return plan;
+}
+
+fn parseGeneratedRelationLifetimeKind(tokens: []const grammar.Token, pos: *usize) !RelationLifetimeKind {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (cursor.matchKeyword("temporary") or cursor.matchKeyword("temp")) return .temporary;
+    if (cursor.matchKeyword("unlogged")) return .unlogged;
+    return error.UnsupportedSqlShape;
 }
 
 pub fn makeDdlForeignKeyAlloc(
     alloc: std.mem.Allocator,
     constraint_name: ?[]const u8,
-    child: grammar.DdlForeignKeyColumnListSyntax,
+    child_columns: []const []const u8,
+    child_period: ?[]const u8,
     parent_table: []const u8,
-    parent: grammar.DdlForeignKeyColumnListSyntax,
+    parent_columns: []const []const u8,
+    parent_period: ?[]const u8,
     options: DdlForeignKeyOptions,
 ) !runtime_schema.ForeignKey {
-    if ((child.period == null) != (parent.period == null)) return error.UnsupportedSqlShape;
-    if (child.period != null and !binder.foreignKeyActionSupportsTemporalUpdate(options.on_update)) return error.UnsupportedSqlShape;
+    if ((child_period == null) != (parent_period == null)) return error.UnsupportedSqlShape;
+    if (child_period != null and !binder.foreignKeyActionSupportsTemporalUpdate(options.on_update)) return error.UnsupportedSqlShape;
     return try makeDdlForeignKeyFromPartsAlloc(
         alloc,
         constraint_name,
-        child.columns,
-        child.period,
+        child_columns,
+        child_period,
         parent_table,
-        parent.columns,
-        parent.period,
+        parent_columns,
+        parent_period,
         options,
     );
 }
@@ -19607,13 +21809,6 @@ fn defaultUniqueConstraintNameAlloc(alloc: std.mem.Allocator, columns: []const [
     }
     try buf.appendSlice(alloc, "_key");
     return try buf.toOwnedSlice(alloc);
-}
-
-pub fn routineKindFromSyntax(syntax: grammar.RoutineKindSyntax) RoutineKind {
-    return switch (syntax) {
-        .function => .function,
-        .procedure => .procedure,
-    };
 }
 
 pub fn ddlRangeBoundTypeForName(name: []const u8) ?runtime_schema.AntflyType {
@@ -19783,6 +21978,7 @@ fn generatedUnsupportedCatalogBoundary(
 fn generatedUnsupportedExpectedReason(kind: generated_parser.GeneratedSqlUnsupportedKind) generated_parser.GeneratedSqlUnsupportedReason {
     return switch (kind) {
         .analyze => .analyze_not_planned_by_generated_parser,
+        .backup_database => .backup_database_not_planned_by_generated_parser,
         .call => .call_not_planned_by_generated_parser,
         .checkpoint => .checkpoint_not_planned_by_generated_parser,
         .cluster => .cluster_not_planned_by_generated_parser,
@@ -19898,6 +22094,7 @@ fn generatedUnsupportedExpectedReason(kind: generated_parser.GeneratedSqlUnsuppo
         .notify => .notify_not_planned_by_generated_parser,
         .reassign_owned => .reassign_owned_not_planned_by_generated_parser,
         .reindex => .reindex_not_planned_by_generated_parser,
+        .restore_database => .restore_database_not_planned_by_generated_parser,
         .revoke => .revoke_not_planned_by_generated_parser,
         .role_session_control => .role_session_control_not_planned_by_generated_parser,
         .security_label => .security_label_not_planned_by_generated_parser,
@@ -19941,6 +22138,11 @@ fn validateGeneratedUnsupportedCatalogAst(
     if (ast.explain_options_tokens != null or ast.explain_subject_read_ast != null or ast.explain_subject_dml_ast != null) {
         return error.UnsupportedSqlShape;
     }
+    if (boundary.family != .notification and generatedUnsupportedNotificationPayloadPresent(ast)) return error.UnsupportedSqlShape;
+    if (boundary.family != .unsupported_alter_table and generatedUnsupportedAlterTablePayloadPresent(ast)) return error.UnsupportedSqlShape;
+    if (boundary.family != .transaction_control and generatedUnsupportedTableLockPayloadPresent(ast)) return error.UnsupportedSqlShape;
+    if (boundary.family != .maintenance and generatedUnsupportedMaintenancePayloadPresent(ast)) return error.UnsupportedSqlShape;
+    if (boundary.family != .bulk_io and generatedUnsupportedBulkIoPayloadPresent(ast)) return error.UnsupportedSqlShape;
     switch (boundary.family) {
         .authorization => switch (boundary.kind) {
             .grant => {
@@ -19957,6 +22159,7 @@ fn validateGeneratedUnsupportedCatalogAst(
         },
         .bulk_io => switch (boundary.kind) {
             .copy => {
+                try validateGeneratedUnsupportedBulkIoAstPayload(tokens, end, ast);
                 if (end < 1 or !tokens[0].matchesKeyword("copy")) {
                     return error.UnsupportedSqlShape;
                 }
@@ -19973,21 +22176,25 @@ fn validateGeneratedUnsupportedCatalogAst(
         },
         .maintenance => switch (boundary.kind) {
             .analyze => {
+                try validateGeneratedUnsupportedMaintenanceAstPayload(tokens, end, ast);
                 if (end < 1 or !tokens[0].matchesKeyword("analyze")) {
                     return error.UnsupportedSqlShape;
                 }
             },
             .cluster => {
+                try validateGeneratedUnsupportedMaintenanceAstPayload(tokens, end, ast);
                 if (end < 1 or !tokens[0].matchesKeyword("cluster")) {
                     return error.UnsupportedSqlShape;
                 }
             },
             .reindex => {
+                try validateGeneratedUnsupportedMaintenanceAstPayload(tokens, end, ast);
                 if (end < 1 or !tokens[0].matchesKeyword("reindex")) {
                     return error.UnsupportedSqlShape;
                 }
             },
             .vacuum => {
+                try validateGeneratedUnsupportedMaintenanceAstPayload(tokens, end, ast);
                 if (end < 1 or !tokens[0].matchesKeyword("vacuum")) {
                     return error.UnsupportedSqlShape;
                 }
@@ -19996,16 +22203,19 @@ fn validateGeneratedUnsupportedCatalogAst(
         },
         .notification => switch (boundary.kind) {
             .listen => {
+                try validateGeneratedUnsupportedNotificationAstPayload(tokens, end, ast);
                 if (end < 1 or !tokens[0].matchesKeyword("listen")) {
                     return error.UnsupportedSqlShape;
                 }
             },
             .notify => {
+                try validateGeneratedUnsupportedNotificationAstPayload(tokens, end, ast);
                 if (end < 1 or !tokens[0].matchesKeyword("notify")) {
                     return error.UnsupportedSqlShape;
                 }
             },
             .unlisten => {
+                try validateGeneratedUnsupportedNotificationAstPayload(tokens, end, ast);
                 if (end < 1 or !tokens[0].matchesKeyword("unlisten")) {
                     return error.UnsupportedSqlShape;
                 }
@@ -20014,6 +22224,7 @@ fn validateGeneratedUnsupportedCatalogAst(
         },
         .procedure_call => switch (boundary.kind) {
             .call => {
+                try validateGeneratedUnsupportedProcedureCallAstPayload(tokens, end, ast);
                 if (end < 1 or !tokens[0].matchesKeyword("call")) {
                     return error.UnsupportedSqlShape;
                 }
@@ -20022,6 +22233,7 @@ fn validateGeneratedUnsupportedCatalogAst(
         },
         .transaction_control => switch (boundary.kind) {
             .lock => {
+                try validateGeneratedUnsupportedTableLockAstPayload(tokens, end, ast);
                 if (end < 1 or !tokens[0].matchesKeyword("lock")) {
                     return error.UnsupportedSqlShape;
                 }
@@ -20032,13 +22244,13 @@ fn validateGeneratedUnsupportedCatalogAst(
         .unsupported_routine => try validateGeneratedUnsupportedRoutineAstPayload(tokens, end, ast),
         .update_policy_trigger => switch (boundary.kind) {
             .alter_trigger => {
-                try validateGeneratedUnsupportedTriggerAstPayload(ast);
+                try validateGeneratedUnsupportedTriggerAstPayload(tokens, end, ast);
                 if (end < 2 or !tokens[0].matchesKeyword("alter") or !tokens[1].matchesKeyword("trigger")) {
                     return error.UnsupportedSqlShape;
                 }
             },
             .create_trigger => {
-                try validateGeneratedUnsupportedTriggerAstPayload(ast);
+                try validateGeneratedUnsupportedTriggerAstPayload(tokens, end, ast);
                 if (end >= 4 and
                     tokens[0].matchesKeyword("create") and
                     tokens[1].matchesKeyword("or") and
@@ -20052,7 +22264,7 @@ fn validateGeneratedUnsupportedCatalogAst(
                 }
             },
             .drop_trigger => {
-                try validateGeneratedUnsupportedTriggerAstPayload(ast);
+                try validateGeneratedUnsupportedTriggerAstPayload(tokens, end, ast);
                 if (end < 2 or !tokens[0].matchesKeyword("drop") or !tokens[1].matchesKeyword("trigger")) {
                     return error.UnsupportedSqlShape;
                 }
@@ -20075,13 +22287,13 @@ fn validateGeneratedUnsupportedRoutineAstPayload(
     if (end < 6 or !tokens[0].matchesKeywordTag(.alter) or !tokens[1].matchesKeywordTag(expected)) {
         return error.UnsupportedSqlShape;
     }
-    if (ast.alter_table_name_tokens != null or ast.alter_table_operation_tokens != null) return error.UnsupportedSqlShape;
+    if (generatedUnsupportedAlterTablePayloadPresent(ast)) return error.UnsupportedSqlShape;
 
     const routine_name = try requireGeneratedTokenRangeAt(ast.routine_name_tokens, 2, end);
     if (routine_name.end >= end or tokens[routine_name.end].kind != .lparen) return error.UnsupportedSqlShape;
     const signature_close = findMatchingParen(tokens, routine_name.end, end) orelse return error.UnsupportedSqlShape;
-    const operation = try requireGeneratedTokenRangeAt(ast.routine_operation_tokens, signature_close + 1, end);
-    if (operation.end != end or operation.start >= operation.end) return error.UnsupportedSqlShape;
+    const operation = ast.routine_operation_tokens orelse return error.UnsupportedSqlShape;
+    if (operation.start != signature_close + 1 or operation.end != end or operation.start >= operation.end) return error.UnsupportedSqlShape;
 
     const routine_metadata = ast.routine_metadata orelse return error.UnsupportedSqlShape;
     try validateGeneratedPlainListCount(tokens, .{ .start = routine_name.end + 1, .end = signature_close }, &routine_metadata.argument_items, routine_metadata.argument_items.count);
@@ -20107,14 +22319,849 @@ fn validateGeneratedUnsupportedRoutineAstPayload(
     }
 }
 
-fn validateGeneratedUnsupportedTriggerAstPayload(ast: generated_parser.GeneratedSqlUnsupportedAst) !void {
+fn validateGeneratedUnsupportedProcedureCallAstPayload(
+    tokens: []const grammar.Token,
+    end: usize,
+    ast: generated_parser.GeneratedSqlUnsupportedAst,
+) !void {
+    if (ast.kind != .call or
+        ast.routine_operation_tokens != null or
+        ast.routine_metadata != null or
+        ast.alter_table_name_tokens != null or
+        ast.alter_table_operation_tokens != null or
+        ast.alter_table_operation_kind != null or
+        ast.alter_table_operation_subject_tokens != null or
+        generatedUnsupportedTriggerPayloadPresent(ast) or
+        generatedUnsupportedNotificationPayloadPresent(ast))
+    {
+        return error.UnsupportedSqlShape;
+    }
+    if (ast.routine_name_tokens == null) return;
+    const subject = ast.subject_tokens orelse return error.UnsupportedSqlShape;
+    const routine_name = ast.routine_name_tokens.?;
+    try validateGeneratedSingleIdentifierRangeAt(tokens, end, routine_name, subject.start);
+    const lparen = routine_name.end;
+    if (lparen + 1 >= end or tokens[lparen].kind != .lparen or tokens[lparen + 1].kind != .rparen) return error.UnsupportedSqlShape;
+    if (lparen + 2 != subject.end or subject.end != end) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedUnsupportedMaintenanceAstPayload(
+    tokens: []const grammar.Token,
+    end: usize,
+    ast: generated_parser.GeneratedSqlUnsupportedAst,
+) !void {
     if (ast.routine_name_tokens != null or
         ast.routine_operation_tokens != null or
         ast.routine_metadata != null or
         ast.alter_table_name_tokens != null or
-        ast.alter_table_operation_tokens != null)
+        ast.alter_table_operation_tokens != null or
+        ast.alter_table_operation_kind != null or
+        ast.alter_table_operation_subject_tokens != null or
+        generatedUnsupportedTriggerPayloadPresent(ast) or
+        generatedUnsupportedNotificationPayloadPresent(ast) or
+        generatedUnsupportedTableLockPayloadPresent(ast))
     {
         return error.UnsupportedSqlShape;
+    }
+    if (!generatedUnsupportedMaintenancePayloadPresent(ast)) return;
+    switch (ast.kind) {
+        .vacuum => try validateGeneratedUnsupportedVacuumMetadata(tokens, end, ast),
+        .analyze => try validateGeneratedUnsupportedAnalyzeMetadata(tokens, end, ast),
+        .reindex => try validateGeneratedUnsupportedReindexMetadata(tokens, end, ast),
+        .cluster => try validateGeneratedUnsupportedClusterMetadata(tokens, end, ast),
+        else => return error.UnsupportedSqlShape,
+    }
+}
+
+fn generatedUnsupportedMaintenancePayloadPresent(ast: generated_parser.GeneratedSqlUnsupportedAst) bool {
+    return ast.maintenance_name_tokens != null or
+        ast.maintenance_secondary_name_tokens != null or
+        ast.maintenance_reindex_target != null or
+        ast.maintenance_concurrently or
+        ast.maintenance_verbose or
+        ast.maintenance_vacuum_full or
+        ast.maintenance_vacuum_freeze or
+        ast.maintenance_vacuum_analyze or
+        ast.maintenance_column_items.count != 0 or
+        ast.maintenance_column_items.items.len != 0;
+}
+
+fn generatedUnsupportedAlterTablePayloadPresent(ast: generated_parser.GeneratedSqlUnsupportedAst) bool {
+    return ast.alter_table_name_tokens != null or
+        ast.alter_table_operation_tokens != null or
+        ast.alter_table_operation_kind != null or
+        ast.alter_table_operation_subject_tokens != null;
+}
+
+fn generatedUnsupportedBulkIoPayloadPresent(ast: generated_parser.GeneratedSqlUnsupportedAst) bool {
+    return ast.bulk_table_tokens != null or
+        ast.bulk_column_items.count != 0 or
+        ast.bulk_column_items.items.len != 0 or
+        ast.bulk_direction != null or
+        ast.bulk_endpoint_kind != null or
+        ast.bulk_endpoint_tokens != null or
+        ast.bulk_option_items.count != 0 or
+        ast.bulk_option_items.items.len != 0 or
+        ast.bulk_format_tokens != null or
+        ast.bulk_header or
+        ast.bulk_freeze or
+        ast.bulk_on_error != .stop or
+        ast.bulk_reject_limit_tokens != null or
+        ast.bulk_log_verbosity != .default or
+        ast.bulk_force_quote_all or
+        ast.bulk_force_quote_column_items.count != 0 or
+        ast.bulk_force_quote_column_items.items.len != 0 or
+        ast.bulk_force_not_null_column_items.count != 0 or
+        ast.bulk_force_not_null_column_items.items.len != 0 or
+        ast.bulk_force_null_column_items.count != 0 or
+        ast.bulk_force_null_column_items.items.len != 0 or
+        ast.bulk_delimiter_tokens != null or
+        ast.bulk_quote_tokens != null or
+        ast.bulk_escape_tokens != null or
+        ast.bulk_null_tokens != null or
+        ast.bulk_default_tokens != null or
+        ast.bulk_encoding_tokens != null or
+        ast.bulk_where_tokens != null;
+}
+
+fn validateGeneratedUnsupportedBulkIoAstPayload(
+    tokens: []const grammar.Token,
+    end: usize,
+    ast: generated_parser.GeneratedSqlUnsupportedAst,
+) !void {
+    if (ast.kind != .copy) return error.UnsupportedSqlShape;
+    if (!generatedUnsupportedBulkIoPayloadPresent(ast)) return error.UnsupportedSqlShape;
+    const subject = ast.subject_tokens orelse return error.UnsupportedSqlShape;
+    var index = subject.start;
+    const table_name = ast.bulk_table_tokens orelse return error.UnsupportedSqlShape;
+    try validateGeneratedSingleIdentifierRangeAt(tokens, end, table_name, index);
+    index = table_name.end;
+    if (ast.bulk_column_items.count != 0 or ast.bulk_column_items.items.len != 0) {
+        if (index >= end or tokens[index].kind != .lparen) return error.UnsupportedSqlShape;
+        const close = findMatchingParen(tokens, index, end) orelse return error.UnsupportedSqlShape;
+        try validateGeneratedIdentifierListItems(tokens, end, ast.bulk_column_items, .{ .start = index + 1, .end = close });
+        index = close + 1;
+    }
+    const direction = ast.bulk_direction orelse return error.UnsupportedSqlShape;
+    switch (direction) {
+        .from => if (!consumeGeneratedPlanKeywordText(tokens, &index, end, "from")) return error.UnsupportedSqlShape,
+        .to => if (!consumeGeneratedPlanKeywordText(tokens, &index, end, "to")) return error.UnsupportedSqlShape,
+    }
+    const endpoint_kind = ast.bulk_endpoint_kind orelse return error.UnsupportedSqlShape;
+    if (endpoint_kind == .program and !consumeGeneratedPlanKeywordText(tokens, &index, end, "program")) return error.UnsupportedSqlShape;
+    const endpoint = ast.bulk_endpoint_tokens orelse return error.UnsupportedSqlShape;
+    if (endpoint.start != index or endpoint.end != index + 1 or endpoint.end > end) return error.UnsupportedSqlShape;
+    switch (endpoint_kind) {
+        .stream => {
+            if (tokens[endpoint.start].kind != .identifier) return error.UnsupportedSqlShape;
+            switch (direction) {
+                .from => if (!std.ascii.eqlIgnoreCase(tokens[endpoint.start].text, "STDIN")) return error.UnsupportedSqlShape,
+                .to => if (!std.ascii.eqlIgnoreCase(tokens[endpoint.start].text, "STDOUT")) return error.UnsupportedSqlShape,
+            }
+        },
+        .file, .program => if (tokens[endpoint.start].kind != .string) return error.UnsupportedSqlShape,
+    }
+    index = endpoint.end;
+    if (ast.bulk_option_items.count != 0 or ast.bulk_option_items.items.len != 0) {
+        if (!consumeGeneratedPlanKeywordText(tokens, &index, end, "with")) return error.UnsupportedSqlShape;
+        if (index >= end or tokens[index].kind != .lparen) return error.UnsupportedSqlShape;
+        const close = findMatchingParen(tokens, index, end) orelse return error.UnsupportedSqlShape;
+        try validateGeneratedListRange(tokens, end, ast.bulk_option_items, .{ .start = index + 1, .end = close });
+        try validateGeneratedBulkIoOptionMetadata(tokens, end, ast);
+        index = close + 1;
+    }
+    if (ast.bulk_freeze and direction != .from) return error.UnsupportedSqlShape;
+    if (ast.bulk_on_error != .stop and direction != .from) return error.UnsupportedSqlShape;
+    if (ast.bulk_reject_limit_tokens != null and direction != .from) return error.UnsupportedSqlShape;
+    if (ast.bulk_reject_limit_tokens != null and ast.bulk_on_error != .ignore) return error.UnsupportedSqlShape;
+    if (ast.bulk_log_verbosity != .default and direction != .from) return error.UnsupportedSqlShape;
+    if (ast.bulk_log_verbosity != .default and ast.bulk_on_error != .ignore) return error.UnsupportedSqlShape;
+    if (ast.bulk_default_tokens != null and direction != .from) return error.UnsupportedSqlShape;
+    if ((ast.bulk_force_quote_all or ast.bulk_force_quote_column_items.count != 0) and direction != .to) return error.UnsupportedSqlShape;
+    if (ast.bulk_force_not_null_column_items.count != 0 and direction != .from) return error.UnsupportedSqlShape;
+    if (ast.bulk_force_null_column_items.count != 0 and direction != .from) return error.UnsupportedSqlShape;
+    if (ast.bulk_where_tokens) |where_tokens| {
+        if (where_tokens.start != index or where_tokens.end != subject.end or where_tokens.end != end) return error.UnsupportedSqlShape;
+        if (where_tokens.start + 1 >= where_tokens.end or !tokens[where_tokens.start].matchesKeyword("where")) return error.UnsupportedSqlShape;
+        index = where_tokens.end;
+    }
+    if (index != subject.end or subject.end != end) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedBulkIoOptionMetadata(
+    tokens: []const grammar.Token,
+    end: usize,
+    ast: generated_parser.GeneratedSqlUnsupportedAst,
+) !void {
+    var saw_header = false;
+    var saw_freeze = false;
+    var saw_on_error = false;
+    var saw_log_verbosity = false;
+    for (ast.bulk_option_items.items) |item| {
+        var index = item.start;
+        if (consumeGeneratedPlanKeywordText(tokens, &index, item.end, "format")) {
+            try validateGeneratedSingleTokenRangeAt(tokens, end, ast.bulk_format_tokens orelse return error.UnsupportedSqlShape, index, .identifier);
+            if (ast.bulk_format_tokens.?.end != item.end) return error.UnsupportedSqlShape;
+        } else if (consumeGeneratedPlanKeywordText(tokens, &index, item.end, "header")) {
+            saw_header = true;
+            try validateGeneratedBulkIoBool(tokens, &index, item.end, ast.bulk_header);
+        } else if (consumeGeneratedPlanKeywordText(tokens, &index, item.end, "freeze")) {
+            saw_freeze = true;
+            try validateGeneratedBulkIoBool(tokens, &index, item.end, ast.bulk_freeze);
+        } else if (consumeGeneratedPlanKeywordText(tokens, &index, item.end, "on_error")) {
+            saw_on_error = true;
+            const value = try validateGeneratedSingleTokenRangeValue(tokens, end, index, item.end, .identifier);
+            const expected: []const u8 = switch (ast.bulk_on_error) {
+                .stop => "stop",
+                .ignore => "ignore",
+            };
+            if (!std.ascii.eqlIgnoreCase(value, expected)) return error.UnsupportedSqlShape;
+        } else if (consumeGeneratedPlanKeywordText(tokens, &index, item.end, "reject_limit")) {
+            const reject_limit = ast.bulk_reject_limit_tokens orelse return error.UnsupportedSqlShape;
+            try validateGeneratedSingleTokenRangeAt(tokens, end, reject_limit, index, .number);
+            if (reject_limit.end != item.end) return error.UnsupportedSqlShape;
+            _ = try generatedBulkIoPositiveIntegerFromRange(tokens, reject_limit);
+        } else if (consumeGeneratedPlanKeywordText(tokens, &index, item.end, "log_verbosity")) {
+            saw_log_verbosity = true;
+            const value = try validateGeneratedSingleTokenRangeValue(tokens, end, index, item.end, .identifier);
+            const expected: []const u8 = switch (ast.bulk_log_verbosity) {
+                .default => "default",
+                .verbose => "verbose",
+                .terse => "terse",
+            };
+            if (!std.ascii.eqlIgnoreCase(value, expected)) return error.UnsupportedSqlShape;
+        } else if (consumeGeneratedPlanKeywordText(tokens, &index, item.end, "force_quote")) {
+            if (ast.bulk_force_quote_all) {
+                if (index + 1 != item.end or tokens[index].kind != .star) return error.UnsupportedSqlShape;
+            } else {
+                try validateGeneratedParenthesizedIdentifierList(tokens, end, ast.bulk_force_quote_column_items, index, item.end);
+            }
+        } else if (consumeGeneratedPlanKeywordText(tokens, &index, item.end, "force_not_null")) {
+            try validateGeneratedParenthesizedIdentifierList(tokens, end, ast.bulk_force_not_null_column_items, index, item.end);
+        } else if (consumeGeneratedPlanKeywordText(tokens, &index, item.end, "force_null")) {
+            try validateGeneratedParenthesizedIdentifierList(tokens, end, ast.bulk_force_null_column_items, index, item.end);
+        } else if (consumeGeneratedPlanKeywordText(tokens, &index, item.end, "delimiter")) {
+            try validateGeneratedOneByteStringRange(tokens, end, ast.bulk_delimiter_tokens orelse return error.UnsupportedSqlShape, index, item.end);
+        } else if (consumeGeneratedPlanKeywordText(tokens, &index, item.end, "quote")) {
+            try validateGeneratedOneByteStringRange(tokens, end, ast.bulk_quote_tokens orelse return error.UnsupportedSqlShape, index, item.end);
+        } else if (consumeGeneratedPlanKeywordText(tokens, &index, item.end, "escape")) {
+            try validateGeneratedOneByteStringRange(tokens, end, ast.bulk_escape_tokens orelse return error.UnsupportedSqlShape, index, item.end);
+        } else if (consumeGeneratedPlanKeywordText(tokens, &index, item.end, "null")) {
+            try validateGeneratedSingleTokenRangeAt(tokens, end, ast.bulk_null_tokens orelse return error.UnsupportedSqlShape, index, .string);
+            if (ast.bulk_null_tokens.?.end != item.end) return error.UnsupportedSqlShape;
+        } else if (consumeGeneratedPlanKeywordText(tokens, &index, item.end, "default")) {
+            try validateGeneratedSingleTokenRangeAt(tokens, end, ast.bulk_default_tokens orelse return error.UnsupportedSqlShape, index, .string);
+            if (ast.bulk_default_tokens.?.end != item.end) return error.UnsupportedSqlShape;
+        } else if (consumeGeneratedPlanKeywordText(tokens, &index, item.end, "encoding")) {
+            const encoding = ast.bulk_encoding_tokens orelse return error.UnsupportedSqlShape;
+            try validateGeneratedSingleTokenRangeAt(tokens, end, encoding, index, .string);
+            if (encoding.end != item.end or tokens[encoding.start].text.len == 0) return error.UnsupportedSqlShape;
+        } else if (consumeGeneratedPlanKeywordText(tokens, &index, item.end, "oids")) {
+            try validateGeneratedBulkIoBool(tokens, &index, item.end, false);
+        } else return error.UnsupportedSqlShape;
+    }
+    if (!saw_header and ast.bulk_header) return error.UnsupportedSqlShape;
+    if (!saw_freeze and ast.bulk_freeze) return error.UnsupportedSqlShape;
+    if (!saw_on_error and ast.bulk_on_error != .stop) return error.UnsupportedSqlShape;
+    if (!saw_log_verbosity and ast.bulk_log_verbosity != .default) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedParenthesizedIdentifierList(
+    tokens: []const grammar.Token,
+    end: usize,
+    items: generated_parser.GeneratedSqlListAst,
+    start: usize,
+    item_end: usize,
+) !void {
+    if (start >= item_end or tokens[start].kind != .lparen) return error.UnsupportedSqlShape;
+    const close = findMatchingParen(tokens, start, item_end) orelse return error.UnsupportedSqlShape;
+    if (close + 1 != item_end) return error.UnsupportedSqlShape;
+    try validateGeneratedIdentifierListItems(tokens, end, items, .{ .start = start + 1, .end = close });
+}
+
+fn validateGeneratedOneByteStringRange(
+    tokens: []const grammar.Token,
+    end: usize,
+    range: generated_parser.GeneratedSqlTokenRange,
+    start: usize,
+    item_end: usize,
+) !void {
+    try validateGeneratedSingleTokenRangeAt(tokens, end, range, start, .string);
+    if (range.end != item_end or tokens[range.start].text.len != 1) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedBulkIoBool(
+    tokens: []const grammar.Token,
+    index: *usize,
+    item_end: usize,
+    expected: bool,
+) !void {
+    const value = try validateGeneratedSingleTokenRangeValue(tokens, item_end, index.*, item_end, .identifier);
+    index.* = item_end;
+    if (expected) {
+        if (!std.ascii.eqlIgnoreCase(value, "true")) return error.UnsupportedSqlShape;
+    } else if (!std.ascii.eqlIgnoreCase(value, "false")) {
+        return error.UnsupportedSqlShape;
+    }
+}
+
+fn validateGeneratedSingleTokenRangeValue(
+    tokens: []const grammar.Token,
+    end: usize,
+    start: usize,
+    item_end: usize,
+    kind: token_mod.TokenKind,
+) ![]const u8 {
+    if (start + 1 != item_end) return error.UnsupportedSqlShape;
+    if (item_end > end or tokens[start].kind != kind) return error.UnsupportedSqlShape;
+    return tokens[start].text;
+}
+
+fn validateGeneratedSingleTokenRangeAt(
+    tokens: []const grammar.Token,
+    end: usize,
+    range: generated_parser.GeneratedSqlTokenRange,
+    start: usize,
+    kind: token_mod.TokenKind,
+) !void {
+    if (range.start != start or range.end != start + 1 or range.end > end or tokens[range.start].kind != kind) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedIdentifierListItems(
+    tokens: []const grammar.Token,
+    end: usize,
+    items: generated_parser.GeneratedSqlListAst,
+    range: generated_parser.GeneratedSqlTokenRange,
+) !void {
+    try validateGeneratedListRange(tokens, end, items, range);
+    for (items.items) |item| {
+        if (item.end != item.start + 1 or item.end > end or tokens[item.start].kind != .identifier) return error.UnsupportedSqlShape;
+    }
+}
+
+fn validateGeneratedListRange(
+    tokens: []const grammar.Token,
+    end: usize,
+    items: generated_parser.GeneratedSqlListAst,
+    range: generated_parser.GeneratedSqlTokenRange,
+) !void {
+    if (range.end > end or range.start >= range.end) return error.UnsupportedSqlShape;
+    if (items.count == 0 or items.items.len != items.count or items.first_tokens == null or items.last_tokens == null) return error.UnsupportedSqlShape;
+    var item_index: usize = 0;
+    var item_start = range.start;
+    var depth: usize = 0;
+    var index = range.start;
+    while (index < range.end) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen, .lbracket => depth += 1,
+            .rparen, .rbracket => {
+                if (depth == 0) return error.UnsupportedSqlShape;
+                depth -= 1;
+            },
+            .comma => if (depth == 0) {
+                if (item_index >= items.items.len or !std.meta.eql(items.items[item_index], generated_parser.GeneratedSqlTokenRange{ .start = item_start, .end = index })) {
+                    return error.UnsupportedSqlShape;
+                }
+                item_index += 1;
+                item_start = index + 1;
+            },
+            else => {},
+        }
+    }
+    if (depth != 0 or item_index >= items.items.len) return error.UnsupportedSqlShape;
+    if (!std.meta.eql(items.items[item_index], generated_parser.GeneratedSqlTokenRange{ .start = item_start, .end = range.end })) return error.UnsupportedSqlShape;
+    item_index += 1;
+    if (item_index != items.items.len or item_index != items.count) return error.UnsupportedSqlShape;
+    if (!std.meta.eql(items.first_tokens.?, items.items[0]) or !std.meta.eql(items.last_tokens.?, items.items[items.items.len - 1])) {
+        return error.UnsupportedSqlShape;
+    }
+}
+
+fn validateGeneratedUnsupportedVacuumMetadata(
+    tokens: []const grammar.Token,
+    end: usize,
+    ast: generated_parser.GeneratedSqlUnsupportedAst,
+) !void {
+    if (ast.maintenance_secondary_name_tokens != null or
+        ast.maintenance_reindex_target != null or
+        ast.maintenance_concurrently or
+        ast.maintenance_column_items.count != 0 or
+        ast.maintenance_column_items.items.len != 0)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    const subject = ast.subject_tokens orelse return error.UnsupportedSqlShape;
+    var index = subject.start;
+    var full = false;
+    var freeze = false;
+    var verbose = false;
+    var analyze = false;
+    if (index < end and tokens[index].kind == .lparen) {
+        index += 1;
+        while (true) {
+            if (!consumeGeneratedVacuumOptionForPlanValidation(tokens, end, &index, &full, &freeze, &verbose, &analyze)) return error.UnsupportedSqlShape;
+            if (index < end and tokens[index].kind == .comma) {
+                index += 1;
+                continue;
+            }
+            break;
+        }
+        if (index >= end or tokens[index].kind != .rparen) return error.UnsupportedSqlShape;
+        index += 1;
+    } else {
+        while (consumeGeneratedVacuumOptionForPlanValidation(tokens, end, &index, &full, &freeze, &verbose, &analyze)) {}
+    }
+    if (full != ast.maintenance_vacuum_full or
+        freeze != ast.maintenance_vacuum_freeze or
+        verbose != ast.maintenance_verbose or
+        analyze != ast.maintenance_vacuum_analyze)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    const table_name = ast.maintenance_name_tokens orelse return error.UnsupportedSqlShape;
+    try validateGeneratedSingleIdentifierRangeAt(tokens, end, table_name, index);
+    index = table_name.end;
+    if (index != subject.end or subject.end != end) return error.UnsupportedSqlShape;
+}
+
+fn consumeGeneratedVacuumOptionForPlanValidation(
+    tokens: []const grammar.Token,
+    end: usize,
+    index: *usize,
+    full: *bool,
+    freeze: *bool,
+    verbose: *bool,
+    analyze: *bool,
+) bool {
+    if (consumeGeneratedPlanKeyword(tokens, index, end, .full)) {
+        full.* = true;
+        return true;
+    }
+    if (consumeGeneratedPlanKeyword(tokens, index, end, .freeze)) {
+        freeze.* = true;
+        return true;
+    }
+    if (consumeGeneratedPlanKeyword(tokens, index, end, .verbose)) {
+        verbose.* = true;
+        return true;
+    }
+    if (consumeGeneratedPlanKeyword(tokens, index, end, .analyze)) {
+        analyze.* = true;
+        return true;
+    }
+    return false;
+}
+
+fn validateGeneratedUnsupportedAnalyzeMetadata(
+    tokens: []const grammar.Token,
+    end: usize,
+    ast: generated_parser.GeneratedSqlUnsupportedAst,
+) !void {
+    if (ast.maintenance_secondary_name_tokens != null or
+        ast.maintenance_reindex_target != null or
+        ast.maintenance_concurrently or
+        ast.maintenance_vacuum_full or
+        ast.maintenance_vacuum_freeze or
+        ast.maintenance_vacuum_analyze)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    const subject = ast.subject_tokens orelse return error.UnsupportedSqlShape;
+    var index = subject.start;
+    const verbose = consumeGeneratedPlanKeyword(tokens, &index, end, .verbose);
+    if (verbose != ast.maintenance_verbose) return error.UnsupportedSqlShape;
+    const table_name = ast.maintenance_name_tokens orelse return error.UnsupportedSqlShape;
+    try validateGeneratedSingleIdentifierRangeAt(tokens, end, table_name, index);
+    index = table_name.end;
+    const column_items = ast.maintenance_column_items;
+    if (column_items.count == 0 and column_items.items.len == 0) {
+        if (index != subject.end or subject.end != end) return error.UnsupportedSqlShape;
+        return;
+    }
+    if (column_items.count == 0 or column_items.count != column_items.items.len or column_items.first_tokens == null or column_items.last_tokens == null) return error.UnsupportedSqlShape;
+    if (index >= end or tokens[index].kind != .lparen) return error.UnsupportedSqlShape;
+    index += 1;
+    for (column_items.items, 0..) |item, item_index| {
+        if (item_index > 0) {
+            if (index >= end or tokens[index].kind != .comma) return error.UnsupportedSqlShape;
+            index += 1;
+        }
+        try validateGeneratedSingleIdentifierRangeAt(tokens, end, item, index);
+        index = item.end;
+    }
+    if (!std.meta.eql(column_items.first_tokens.?, column_items.items[0])) return error.UnsupportedSqlShape;
+    if (!std.meta.eql(column_items.last_tokens.?, column_items.items[column_items.items.len - 1])) return error.UnsupportedSqlShape;
+    if (index >= end or tokens[index].kind != .rparen) return error.UnsupportedSqlShape;
+    index += 1;
+    if (index != subject.end or subject.end != end) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedUnsupportedReindexMetadata(
+    tokens: []const grammar.Token,
+    end: usize,
+    ast: generated_parser.GeneratedSqlUnsupportedAst,
+) !void {
+    if (ast.maintenance_secondary_name_tokens != null or ast.maintenance_verbose) return error.UnsupportedSqlShape;
+    const subject = ast.subject_tokens orelse return error.UnsupportedSqlShape;
+    var index = subject.start;
+    try validateGeneratedReindexTargetAt(tokens, end, &index, ast.maintenance_reindex_target orelse return error.UnsupportedSqlShape);
+    if (ast.maintenance_concurrently) {
+        if (index >= end or !tokens[index].matchesKeyword("concurrently")) return error.UnsupportedSqlShape;
+        index += 1;
+    }
+    const name = ast.maintenance_name_tokens orelse return error.UnsupportedSqlShape;
+    try validateGeneratedSingleIdentifierRangeAt(tokens, end, name, index);
+    index = name.end;
+    if (index != subject.end or subject.end != end) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedReindexTargetAt(
+    tokens: []const grammar.Token,
+    end: usize,
+    index: *usize,
+    target: generated_parser.GeneratedSqlReindexTarget,
+) !void {
+    const keyword: token_mod.TokenKeyword = switch (target) {
+        .index => .index,
+        .table => .table,
+        .schema => .schema,
+        .database => .database,
+        .system => .system,
+    };
+    try validateGeneratedKeywordAt(tokens, end, index.*, keyword);
+    index.* += 1;
+}
+
+fn validateGeneratedUnsupportedClusterMetadata(
+    tokens: []const grammar.Token,
+    end: usize,
+    ast: generated_parser.GeneratedSqlUnsupportedAst,
+) !void {
+    if (ast.maintenance_reindex_target != null or ast.maintenance_concurrently) return error.UnsupportedSqlShape;
+    const subject = ast.subject_tokens orelse return error.UnsupportedSqlShape;
+    var index = subject.start;
+    if (ast.maintenance_verbose) {
+        try validateGeneratedKeywordAt(tokens, end, index, .verbose);
+        index += 1;
+    }
+    const table_name = ast.maintenance_name_tokens orelse return error.UnsupportedSqlShape;
+    try validateGeneratedSingleIdentifierRangeAt(tokens, end, table_name, index);
+    index = table_name.end;
+    if (ast.maintenance_secondary_name_tokens) |index_name| {
+        try validateGeneratedKeywordAt(tokens, end, index, .using);
+        index += 1;
+        try validateGeneratedSingleIdentifierRangeAt(tokens, end, index_name, index);
+        index = index_name.end;
+    }
+    if (index != subject.end or subject.end != end) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedUnsupportedTableLockAstPayload(
+    tokens: []const grammar.Token,
+    end: usize,
+    ast: generated_parser.GeneratedSqlUnsupportedAst,
+) !void {
+    if (ast.kind != .lock or
+        ast.routine_name_tokens != null or
+        ast.routine_operation_tokens != null or
+        ast.routine_metadata != null or
+        ast.alter_table_name_tokens != null or
+        ast.alter_table_operation_tokens != null or
+        ast.alter_table_operation_kind != null or
+        ast.alter_table_operation_subject_tokens != null or
+        generatedUnsupportedTriggerPayloadPresent(ast) or
+        generatedUnsupportedNotificationPayloadPresent(ast))
+    {
+        return error.UnsupportedSqlShape;
+    }
+    if (!generatedUnsupportedTableLockPayloadPresent(ast)) return;
+    const subject = ast.subject_tokens orelse return error.UnsupportedSqlShape;
+    var index = subject.start;
+    if (index < end and tokens[index].matchesKeywordTag(.table)) index += 1;
+    const items = ast.table_lock_table_items;
+    if (items.count == 0 or items.count != items.items.len or ast.table_lock_mode == null) return error.UnsupportedSqlShape;
+    if (items.first_tokens == null or items.last_tokens == null) return error.UnsupportedSqlShape;
+    for (items.items, 0..) |item, item_index| {
+        if (item_index > 0) {
+            if (index >= end or tokens[index].kind != .comma) return error.UnsupportedSqlShape;
+            index += 1;
+        }
+        try validateGeneratedSingleIdentifierRangeAt(tokens, end, item, index);
+        index = item.end;
+    }
+    if (!std.meta.eql(items.first_tokens.?, items.items[0])) return error.UnsupportedSqlShape;
+    if (!std.meta.eql(items.last_tokens.?, items.items[items.items.len - 1])) return error.UnsupportedSqlShape;
+    try validateGeneratedKeywordAt(tokens, end, index, .in);
+    index += 1;
+    try validateGeneratedTableLockModeAt(tokens, end, &index, ast.table_lock_mode.?);
+    if (index >= end or !tokens[index].matchesKeyword("mode")) return error.UnsupportedSqlShape;
+    index += 1;
+    if (index != subject.end or subject.end != end) return error.UnsupportedSqlShape;
+}
+
+fn generatedUnsupportedTableLockPayloadPresent(ast: generated_parser.GeneratedSqlUnsupportedAst) bool {
+    return ast.table_lock_table_items.count != 0 or
+        ast.table_lock_table_items.items.len != 0 or
+        ast.table_lock_mode != null;
+}
+
+fn validateGeneratedTableLockModeAt(
+    tokens: []const grammar.Token,
+    end: usize,
+    index: *usize,
+    mode: generated_parser.GeneratedSqlTableLockMode,
+) !void {
+    const valid = switch (mode) {
+        .access_share => consumeGeneratedPlanKeyword(tokens, index, end, .access) and consumeGeneratedPlanKeyword(tokens, index, end, .share),
+        .row_share => consumeGeneratedPlanKeyword(tokens, index, end, .row) and consumeGeneratedPlanKeyword(tokens, index, end, .share),
+        .row_exclusive => consumeGeneratedPlanKeyword(tokens, index, end, .row) and consumeGeneratedPlanKeywordText(tokens, index, end, "exclusive"),
+        .share_update_exclusive => consumeGeneratedPlanKeyword(tokens, index, end, .share) and consumeGeneratedPlanKeyword(tokens, index, end, .update) and consumeGeneratedPlanKeywordText(tokens, index, end, "exclusive"),
+        .share => consumeGeneratedPlanKeyword(tokens, index, end, .share),
+        .share_row_exclusive => consumeGeneratedPlanKeyword(tokens, index, end, .share) and consumeGeneratedPlanKeyword(tokens, index, end, .row) and consumeGeneratedPlanKeywordText(tokens, index, end, "exclusive"),
+        .exclusive => consumeGeneratedPlanKeywordText(tokens, index, end, "exclusive"),
+        .access_exclusive => consumeGeneratedPlanKeyword(tokens, index, end, .access) and consumeGeneratedPlanKeywordText(tokens, index, end, "exclusive"),
+    };
+    if (!valid) return error.UnsupportedSqlShape;
+}
+
+fn consumeGeneratedPlanKeyword(
+    tokens: []const grammar.Token,
+    index: *usize,
+    end: usize,
+    keyword: token_mod.TokenKeyword,
+) bool {
+    if (index.* >= end or !tokens[index.*].matchesKeywordTag(keyword)) return false;
+    index.* += 1;
+    return true;
+}
+
+fn consumeGeneratedPlanKeywordText(
+    tokens: []const grammar.Token,
+    index: *usize,
+    end: usize,
+    keyword: []const u8,
+) bool {
+    if (index.* >= end or !tokens[index.*].matchesKeyword(keyword)) return false;
+    index.* += 1;
+    return true;
+}
+
+fn validateGeneratedUnsupportedTriggerAstPayload(
+    tokens: []const grammar.Token,
+    end: usize,
+    ast: generated_parser.GeneratedSqlUnsupportedAst,
+) !void {
+    if (ast.routine_name_tokens != null or
+        ast.routine_operation_tokens != null or
+        ast.routine_metadata != null or
+        ast.alter_table_name_tokens != null or
+        ast.alter_table_operation_tokens != null or
+        ast.alter_table_operation_kind != null or
+        ast.alter_table_operation_subject_tokens != null)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    if (!generatedUnsupportedTriggerPayloadPresent(ast)) return;
+    switch (ast.kind) {
+        .create_trigger => try validateGeneratedUnsupportedCreateTriggerMetadata(tokens, end, ast),
+        .drop_trigger => try validateGeneratedUnsupportedDropTriggerMetadata(tokens, end, ast),
+        else => return error.UnsupportedSqlShape,
+    }
+}
+
+fn generatedUnsupportedTriggerPayloadPresent(ast: generated_parser.GeneratedSqlUnsupportedAst) bool {
+    return ast.trigger_name_tokens != null or
+        ast.trigger_table_tokens != null or
+        ast.trigger_function_tokens != null or
+        ast.trigger_argument_tokens != null or
+        ast.trigger_event != null or
+        ast.trigger_if_exists or
+        ast.trigger_cascade;
+}
+
+fn validateGeneratedUnsupportedNotificationAstPayload(
+    tokens: []const grammar.Token,
+    end: usize,
+    ast: generated_parser.GeneratedSqlUnsupportedAst,
+) !void {
+    if (ast.routine_name_tokens != null or
+        ast.routine_operation_tokens != null or
+        ast.routine_metadata != null or
+        ast.alter_table_name_tokens != null or
+        ast.alter_table_operation_tokens != null or
+        ast.alter_table_operation_kind != null or
+        ast.alter_table_operation_subject_tokens != null or
+        generatedUnsupportedTriggerPayloadPresent(ast))
+    {
+        return error.UnsupportedSqlShape;
+    }
+    if (!generatedUnsupportedNotificationPayloadPresent(ast)) return;
+    switch (ast.kind) {
+        .listen => try validateGeneratedUnsupportedListenNotificationMetadata(tokens, end, ast),
+        .notify => try validateGeneratedUnsupportedNotifyNotificationMetadata(tokens, end, ast),
+        .unlisten => try validateGeneratedUnsupportedUnlistenNotificationMetadata(tokens, end, ast),
+        else => return error.UnsupportedSqlShape,
+    }
+}
+
+fn generatedUnsupportedNotificationPayloadPresent(ast: generated_parser.GeneratedSqlUnsupportedAst) bool {
+    return ast.notification_channel_tokens != null or
+        ast.notification_payload_tokens != null or
+        ast.notification_unlisten_all;
+}
+
+fn validateGeneratedUnsupportedListenNotificationMetadata(
+    tokens: []const grammar.Token,
+    end: usize,
+    ast: generated_parser.GeneratedSqlUnsupportedAst,
+) !void {
+    if (ast.notification_payload_tokens != null or ast.notification_unlisten_all) return error.UnsupportedSqlShape;
+    const subject = ast.subject_tokens orelse return error.UnsupportedSqlShape;
+    const channel = ast.notification_channel_tokens orelse return error.UnsupportedSqlShape;
+    try validateGeneratedSingleIdentifierRangeAt(tokens, end, channel, subject.start);
+    if (channel.end != subject.end or subject.end != end) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedUnsupportedNotifyNotificationMetadata(
+    tokens: []const grammar.Token,
+    end: usize,
+    ast: generated_parser.GeneratedSqlUnsupportedAst,
+) !void {
+    if (ast.notification_unlisten_all) return error.UnsupportedSqlShape;
+    const subject = ast.subject_tokens orelse return error.UnsupportedSqlShape;
+    const channel = ast.notification_channel_tokens orelse return error.UnsupportedSqlShape;
+    try validateGeneratedSingleIdentifierRangeAt(tokens, end, channel, subject.start);
+    if (ast.notification_payload_tokens) |payload| {
+        if (channel.end >= end or tokens[channel.end].kind != .comma) return error.UnsupportedSqlShape;
+        if (payload.start != channel.end + 1 or payload.end != subject.end or payload.start >= payload.end or subject.end != end) {
+            return error.UnsupportedSqlShape;
+        }
+        return;
+    }
+    if (channel.end != subject.end or subject.end != end) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedUnsupportedUnlistenNotificationMetadata(
+    tokens: []const grammar.Token,
+    end: usize,
+    ast: generated_parser.GeneratedSqlUnsupportedAst,
+) !void {
+    if (ast.notification_payload_tokens != null) return error.UnsupportedSqlShape;
+    const subject = ast.subject_tokens orelse return error.UnsupportedSqlShape;
+    if (ast.notification_unlisten_all) {
+        if (ast.notification_channel_tokens != null or subject.start + 1 != subject.end or subject.end != end or tokens[subject.start].kind != .star) {
+            return error.UnsupportedSqlShape;
+        }
+        return;
+    }
+    const channel = ast.notification_channel_tokens orelse return error.UnsupportedSqlShape;
+    try validateGeneratedSingleIdentifierRangeAt(tokens, end, channel, subject.start);
+    if (channel.end != subject.end or subject.end != end) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedUnsupportedCreateTriggerMetadata(
+    tokens: []const grammar.Token,
+    end: usize,
+    ast: generated_parser.GeneratedSqlUnsupportedAst,
+) !void {
+    const subject = ast.subject_tokens orelse return error.UnsupportedSqlShape;
+    var index = subject.start;
+    const trigger_name = ast.trigger_name_tokens orelse return error.UnsupportedSqlShape;
+    try validateGeneratedSingleIdentifierRangeAt(tokens, end, trigger_name, index);
+    index = trigger_name.end;
+    try validateGeneratedKeywordAt(tokens, end, index, .before);
+    index += 1;
+    const event = ast.trigger_event orelse return error.UnsupportedSqlShape;
+    try validateGeneratedTriggerEventAt(tokens, end, index, event);
+    index += 1;
+    if (event == .update and index < end and tokens[index].matchesKeywordTag(.of)) return error.UnsupportedSqlShape;
+    try validateGeneratedKeywordAt(tokens, end, index, .on);
+    index += 1;
+    const table = ast.trigger_table_tokens orelse return error.UnsupportedSqlShape;
+    try validateGeneratedSingleIdentifierRangeAt(tokens, end, table, index);
+    index = table.end;
+    if (index < end and tokens[index].matchesKeywordTag(.@"for")) {
+        if (index + 2 >= end or
+            !tokens[index + 1].matchesKeywordTag(.each) or
+            !tokens[index + 2].matchesKeywordTag(.row))
+        {
+            return error.UnsupportedSqlShape;
+        }
+        index += 3;
+    }
+    try validateGeneratedKeywordAt(tokens, end, index, .execute);
+    index += 1;
+    if (index >= end or !(tokens[index].matchesKeywordTag(.function) or tokens[index].matchesKeywordTag(.procedure))) return error.UnsupportedSqlShape;
+    index += 1;
+    const function_name = ast.trigger_function_tokens orelse return error.UnsupportedSqlShape;
+    try validateGeneratedSingleIdentifierRangeAt(tokens, end, function_name, index);
+    index = function_name.end;
+    if (index >= end or tokens[index].kind != .lparen) return error.UnsupportedSqlShape;
+    index += 1;
+    if (ast.trigger_argument_tokens) |argument| {
+        if (argument.start != index or argument.end != index + 1 or argument.end > end) return error.UnsupportedSqlShape;
+        const token = tokens[argument.start];
+        if (token.kind != .identifier and token.kind != .string) return error.UnsupportedSqlShape;
+        index = argument.end;
+    }
+    if (index >= end or tokens[index].kind != .rparen) return error.UnsupportedSqlShape;
+    index += 1;
+    if (index != subject.end or subject.end != end) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedUnsupportedDropTriggerMetadata(
+    tokens: []const grammar.Token,
+    end: usize,
+    ast: generated_parser.GeneratedSqlUnsupportedAst,
+) !void {
+    if (ast.trigger_function_tokens != null or ast.trigger_argument_tokens != null or ast.trigger_event != null) return error.UnsupportedSqlShape;
+    const subject = ast.subject_tokens orelse return error.UnsupportedSqlShape;
+    var index = subject.start;
+    const if_exists = consumeGeneratedPlanIfExists(tokens, &index, end);
+    if (if_exists != ast.trigger_if_exists) return error.UnsupportedSqlShape;
+    const trigger_name = ast.trigger_name_tokens orelse return error.UnsupportedSqlShape;
+    try validateGeneratedSingleIdentifierRangeAt(tokens, end, trigger_name, index);
+    index = trigger_name.end;
+    try validateGeneratedKeywordAt(tokens, end, index, .on);
+    index += 1;
+    if (index < end and tokens[index].matchesKeywordTag(.only)) index += 1;
+    const table = ast.trigger_table_tokens orelse return error.UnsupportedSqlShape;
+    try validateGeneratedSingleIdentifierRangeAt(tokens, end, table, index);
+    index = table.end;
+    var cascade = false;
+    if (index < end and tokens[index].matchesKeywordTag(.cascade)) {
+        cascade = true;
+        index += 1;
+    } else if (index < end and tokens[index].matchesKeywordTag(.restrict)) {
+        index += 1;
+    }
+    if (cascade != ast.trigger_cascade) return error.UnsupportedSqlShape;
+    if (index != subject.end or subject.end != end) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedSingleIdentifierRangeAt(
+    tokens: []const grammar.Token,
+    end: usize,
+    range: generated_parser.GeneratedSqlTokenRange,
+    index: usize,
+) !void {
+    if (range.start != index or range.end != index + 1 or range.end > end or tokens[index].kind != .identifier) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedKeywordAt(tokens: []const grammar.Token, end: usize, index: usize, keyword: token_mod.TokenKeyword) !void {
+    if (index >= end or !tokens[index].matchesKeywordTag(keyword)) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedTriggerEventAt(
+    tokens: []const grammar.Token,
+    end: usize,
+    index: usize,
+    event: generated_parser.GeneratedSqlTriggerEvent,
+) !void {
+    switch (event) {
+        .insert => try validateGeneratedKeywordAt(tokens, end, index, .insert),
+        .update => try validateGeneratedKeywordAt(tokens, end, index, .update),
+        .delete => try validateGeneratedKeywordAt(tokens, end, index, .delete),
     }
 }
 
@@ -20124,6 +23171,8 @@ fn validateGeneratedUnsupportedAlterTableAstPayload(
     ast: generated_parser.GeneratedSqlUnsupportedAst,
 ) !void {
     if (!generatedUnsupportedCatalogAlterTableOperationKind(ast.kind)) return error.UnsupportedSqlShape;
+    const operation_kind = ast.alter_table_operation_kind orelse return error.UnsupportedSqlShape;
+    if (operation_kind != ast.kind) return error.UnsupportedSqlShape;
     if (end < 5 or !tokens[0].matchesKeywordTag(.alter) or !tokens[1].matchesKeywordTag(.table)) {
         return error.UnsupportedSqlShape;
     }
@@ -20136,8 +23185,86 @@ fn validateGeneratedUnsupportedAlterTableAstPayload(
     if (index < end and tokens[index].matchesKeywordTag(.only)) index += 1;
     const table_name = try requireGeneratedTokenRangeAt(ast.alter_table_name_tokens, index, end);
     if (table_name.end >= end) return error.UnsupportedSqlShape;
-    const operation = try requireGeneratedTokenRangeAt(ast.alter_table_operation_tokens, table_name.end, end);
-    if (operation.end != end or operation.start >= operation.end) return error.UnsupportedSqlShape;
+    const operation = ast.alter_table_operation_tokens orelse return error.UnsupportedSqlShape;
+    if (operation.start != table_name.end or operation.end != end or operation.start >= operation.end) return error.UnsupportedSqlShape;
+    try validateGeneratedUnsupportedAlterTableOperationSubject(tokens, end, ast, operation);
+}
+
+fn validateGeneratedUnsupportedAlterTableOperationSubject(
+    tokens: []const grammar.Token,
+    end: usize,
+    ast: generated_parser.GeneratedSqlUnsupportedAst,
+    operation: generated_parser.GeneratedSqlTokenRange,
+) !void {
+    const start = operation.start;
+    const operation_end = operation.end;
+    if (operation_end > end or start >= operation_end) return error.UnsupportedSqlShape;
+    switch (ast.kind) {
+        .alter_table_access_method => {
+            if (operation_end != start + 4 or
+                !tokens[start].matchesKeywordTag(.set) or
+                !tokens[start + 1].matchesKeywordTag(.access) or
+                !tokens[start + 2].matchesKeywordTag(.method))
+            {
+                return error.UnsupportedSqlShape;
+            }
+            try validateGeneratedUnsupportedAlterTableSubjectAt(tokens, end, ast, start + 3);
+        },
+        .alter_table_cluster => {
+            if (operation_end == start + 3 and
+                tokens[start].matchesKeywordTag(.cluster) and
+                tokens[start + 1].matchesKeywordTag(.on))
+            {
+                try validateGeneratedUnsupportedAlterTableSubjectAt(tokens, end, ast, start + 2);
+                return;
+            }
+            if (operation_end == start + 3 and
+                tokens[start].matchesKeywordTag(.set) and
+                tokens[start + 1].matchesKeywordTag(.without) and
+                tokens[start + 2].matchesKeywordTag(.cluster) and
+                ast.alter_table_operation_subject_tokens == null)
+            {
+                return;
+            }
+            return error.UnsupportedSqlShape;
+        },
+        .alter_table_inheritance => {
+            if (operation_end == start + 2 and tokens[start].matchesKeyword("inherit")) {
+                try validateGeneratedUnsupportedAlterTableSubjectAt(tokens, end, ast, start + 1);
+                return;
+            }
+            if (operation_end == start + 3 and tokens[start].matchesKeywordTag(.no) and tokens[start + 1].matchesKeyword("inherit")) {
+                try validateGeneratedUnsupportedAlterTableSubjectAt(tokens, end, ast, start + 2);
+                return;
+            }
+            return error.UnsupportedSqlShape;
+        },
+        .alter_table_owner => {
+            if (operation_end != start + 3 or !tokens[start].matchesKeyword("owner") or !tokens[start + 1].matchesKeywordTag(.to)) return error.UnsupportedSqlShape;
+            try validateGeneratedUnsupportedAlterTableSubjectAt(tokens, end, ast, start + 2);
+        },
+        .alter_table_set_schema => {
+            if (operation_end != start + 3 or !tokens[start].matchesKeywordTag(.set) or !tokens[start + 1].matchesKeywordTag(.schema)) return error.UnsupportedSqlShape;
+            try validateGeneratedUnsupportedAlterTableSubjectAt(tokens, end, ast, start + 2);
+        },
+        .alter_table_tablespace => {
+            if (operation_end != start + 3 or !tokens[start].matchesKeywordTag(.set) or !tokens[start + 1].matchesKeywordTag(.tablespace)) return error.UnsupportedSqlShape;
+            try validateGeneratedUnsupportedAlterTableSubjectAt(tokens, end, ast, start + 2);
+        },
+        else => {
+            if (ast.alter_table_operation_subject_tokens != null) return error.UnsupportedSqlShape;
+        },
+    }
+}
+
+fn validateGeneratedUnsupportedAlterTableSubjectAt(
+    tokens: []const grammar.Token,
+    end: usize,
+    ast: generated_parser.GeneratedSqlUnsupportedAst,
+    index: usize,
+) !void {
+    const subject = ast.alter_table_operation_subject_tokens orelse return error.UnsupportedSqlShape;
+    try validateGeneratedSingleIdentifierRangeAt(tokens, end, subject, index);
 }
 
 fn generatedUnsupportedCatalogAlterTableOperationKind(kind: generated_parser.GeneratedSqlUnsupportedKind) bool {
@@ -20252,21 +23379,19 @@ fn procedureCallPlanFromGeneratedUnsupportedAstAlloc(
     ast: generated_parser.GeneratedSqlUnsupportedAst,
 ) !ProcedureCallPlan {
     if (ast.kind != .call) return error.UnsupportedSqlShape;
-    const subject = try unsupportedAstSubjectTokens(tokens, ast);
-    return try generatedProcedureCallPlanFromSubjectAlloc(alloc, subject);
+    if (ast.routine_operation_tokens != null or ast.routine_metadata != null) return error.UnsupportedSqlShape;
+    const routine_name = try generatedProcedureCallRoutineNameFromRangeAlloc(alloc, tokens, ast.routine_name_tokens orelse return error.UnsupportedSqlShape);
+    errdefer alloc.free(routine_name);
+    return .{ .routine_name = routine_name };
 }
 
-fn generatedProcedureCallPlanFromSubjectAlloc(
+fn generatedProcedureCallRoutineNameFromRangeAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
-) !ProcedureCallPlan {
-    var index: usize = 0;
-    const routine_name = try generatedSubjectSqlObjectIdentifierAlloc(alloc, tokens, &index);
-    errdefer alloc.free(routine_name);
-    try generatedSubjectExpectKind(tokens, &index, .lparen);
-    try generatedSubjectExpectKind(tokens, &index, .rparen);
-    try generatedSubjectExpectEnd(tokens, index);
-    return .{ .routine_name = routine_name };
+    range: generated_parser.GeneratedSqlTokenRange,
+) ![]const u8 {
+    if (range.end != range.start + 1 or range.end > tokens.len or tokens[range.start].kind != .identifier) return error.UnsupportedSqlShape;
+    return try grammar.normalizeSqlObjectIdentifierAlloc(alloc, tokens[range.start].text);
 }
 
 fn authorizationCatalogPlanFromGeneratedUnsupportedAstAlloc(
@@ -20276,9 +23401,10 @@ fn authorizationCatalogPlanFromGeneratedUnsupportedAstAlloc(
     boundary: GeneratedUnsupportedCatalogBoundary,
 ) !AuthorizationCatalogPlan {
     _ = alloc;
+    _ = tokens;
     if (ast.kind != boundary.kind) return error.UnsupportedSqlShape;
     switch (boundary.kind) {
-        .grant, .revoke => _ = try unsupportedAstSubjectTokens(tokens, ast),
+        .grant, .revoke => {},
         else => return error.UnsupportedSqlShape,
     }
     return error.UnsupportedSqlShape;
@@ -20291,47 +23417,15 @@ fn bulkIoPlanFromGeneratedUnsupportedAstAlloc(
     options: DdlPlanParserOptions,
 ) !BulkIoPlan {
     if (ast.kind != .copy) return error.UnsupportedSqlShape;
-    const subject = try unsupportedAstSubjectTokens(tokens, ast);
-    return try generatedBulkIoPlanFromSubjectAlloc(alloc, subject, options);
-}
-
-fn generatedBulkIoPlanFromSubjectAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    options: DdlPlanParserOptions,
-) !BulkIoPlan {
-    var index: usize = 0;
-    const table_name = try generatedSubjectSqlObjectIdentifierAlloc(alloc, tokens, &index);
+    const table_name = try generatedBulkIoObjectIdentifierFromRangeAlloc(alloc, tokens, ast.bulk_table_tokens orelse return error.UnsupportedSqlShape);
     var table_name_transferred = false;
     errdefer if (!table_name_transferred) alloc.free(table_name);
-
-    var columns: []const []const u8 = &.{};
+    const columns = try generatedBulkIoIdentifierSliceFromListAlloc(alloc, tokens, ast.bulk_column_items);
     var columns_transferred = false;
     errdefer if (!columns_transferred) freeStringSlice(alloc, columns);
-    if (generatedSubjectMatchKind(tokens, &index, .lparen)) {
-        columns = try generatedSubjectIdentifierListAlloc(alloc, tokens, &index);
-        try generatedSubjectExpectKind(tokens, &index, .rparen);
-    }
-
-    const direction: BulkIoDirection = if (generatedSubjectMatchKeywordText(tokens, &index, "from"))
-        .from
-    else if (generatedSubjectMatchKeywordText(tokens, &index, "to"))
-        .to
-    else
-        return error.UnsupportedSqlShape;
-
-    var endpoint_kind: BulkIoEndpointKind = .stream;
-    const endpoint = blk: {
-        if (generatedSubjectMatchKeywordText(tokens, &index, "program")) {
-            endpoint_kind = .program;
-            break :blk try generatedSubjectStringLiteralValueAlloc(alloc, tokens, &index);
-        }
-        if (index < tokens.len and tokens[index].kind == .string) {
-            endpoint_kind = .file;
-            break :blk try generatedSubjectStringLiteralValueAlloc(alloc, tokens, &index);
-        }
-        break :blk try generatedSubjectIdentifierAlloc(alloc, tokens, &index);
-    };
+    const direction = generatedBulkIoDirectionFromGenerated(ast.bulk_direction orelse return error.UnsupportedSqlShape);
+    const endpoint_kind = generatedBulkIoEndpointKindFromGenerated(ast.bulk_endpoint_kind orelse return error.UnsupportedSqlShape);
+    const endpoint = try generatedBulkIoEndpointFromRangeAlloc(alloc, tokens, ast.bulk_endpoint_tokens orelse return error.UnsupportedSqlShape, endpoint_kind);
     var endpoint_transferred = false;
     errdefer if (!endpoint_transferred) alloc.free(endpoint);
     if (endpoint_kind == .stream) {
@@ -20378,79 +23472,24 @@ fn generatedBulkIoPlanFromSubjectAlloc(
     errdefer if (!default_marker_transferred) if (default_marker) |value| alloc.free(value);
     errdefer if (!encoding_transferred) if (encoding) |value| alloc.free(value);
 
-    if (generatedSubjectMatchKeywordText(tokens, &index, "with")) {
-        try generatedSubjectExpectKind(tokens, &index, .lparen);
-        while (true) {
-            if (generatedSubjectMatchKeywordText(tokens, &index, "format")) {
-                if (format != null) return error.UnsupportedSqlShape;
-                format = try generatedSubjectIdentifierAlloc(alloc, tokens, &index);
-            } else if (generatedSubjectMatchKeywordText(tokens, &index, "header")) {
-                header = try generatedSubjectBool(tokens, &index);
-            } else if (generatedSubjectMatchKeywordText(tokens, &index, "freeze")) {
-                freeze = try generatedSubjectBool(tokens, &index);
-            } else if (generatedSubjectMatchKeywordText(tokens, &index, "on_error")) {
-                const value = try generatedSubjectIdentifierText(tokens, &index);
-                if (std.ascii.eqlIgnoreCase(value, "stop")) {
-                    on_error = .stop;
-                } else if (std.ascii.eqlIgnoreCase(value, "ignore")) {
-                    on_error = .ignore;
-                } else return error.UnsupportedSqlShape;
-            } else if (generatedSubjectMatchKeywordText(tokens, &index, "reject_limit")) {
-                if (reject_limit != null) return error.UnsupportedSqlShape;
-                reject_limit = try generatedSubjectPositiveInteger(tokens, &index);
-            } else if (generatedSubjectMatchKeywordText(tokens, &index, "log_verbosity")) {
-                const value = try generatedSubjectIdentifierText(tokens, &index);
-                if (std.ascii.eqlIgnoreCase(value, "default")) {
-                    log_verbosity = .default;
-                } else if (std.ascii.eqlIgnoreCase(value, "verbose")) {
-                    log_verbosity = .verbose;
-                } else if (std.ascii.eqlIgnoreCase(value, "terse")) {
-                    log_verbosity = .terse;
-                } else return error.UnsupportedSqlShape;
-            } else if (generatedSubjectMatchKeywordText(tokens, &index, "force_quote")) {
-                if (force_quote_all or force_quote_columns.len != 0) return error.UnsupportedSqlShape;
-                if (generatedSubjectMatchKind(tokens, &index, .star)) {
-                    force_quote_all = true;
-                } else if (generatedSubjectMatchKind(tokens, &index, .lparen)) {
-                    force_quote_columns = try generatedSubjectIdentifierListAlloc(alloc, tokens, &index);
-                    try generatedSubjectExpectKind(tokens, &index, .rparen);
-                } else return error.UnsupportedSqlShape;
-            } else if (generatedSubjectMatchKeywordText(tokens, &index, "force_not_null")) {
-                if (force_not_null_columns.len != 0) return error.UnsupportedSqlShape;
-                try generatedSubjectExpectKind(tokens, &index, .lparen);
-                force_not_null_columns = try generatedSubjectIdentifierListAlloc(alloc, tokens, &index);
-                try generatedSubjectExpectKind(tokens, &index, .rparen);
-            } else if (generatedSubjectMatchKeywordText(tokens, &index, "force_null")) {
-                if (force_null_columns.len != 0) return error.UnsupportedSqlShape;
-                try generatedSubjectExpectKind(tokens, &index, .lparen);
-                force_null_columns = try generatedSubjectIdentifierListAlloc(alloc, tokens, &index);
-                try generatedSubjectExpectKind(tokens, &index, .rparen);
-            } else if (generatedSubjectMatchKeywordText(tokens, &index, "delimiter")) {
-                if (delimiter != null) return error.UnsupportedSqlShape;
-                delimiter = try generatedSubjectOneByteStringLiteralValueAlloc(alloc, tokens, &index);
-            } else if (generatedSubjectMatchKeywordText(tokens, &index, "quote")) {
-                if (quote != null) return error.UnsupportedSqlShape;
-                quote = try generatedSubjectOneByteStringLiteralValueAlloc(alloc, tokens, &index);
-            } else if (generatedSubjectMatchKeywordText(tokens, &index, "escape")) {
-                if (escape != null) return error.UnsupportedSqlShape;
-                escape = try generatedSubjectOneByteStringLiteralValueAlloc(alloc, tokens, &index);
-            } else if (generatedSubjectMatchKeywordText(tokens, &index, "null")) {
-                if (null_marker != null) return error.UnsupportedSqlShape;
-                null_marker = try generatedSubjectStringLiteralValueAlloc(alloc, tokens, &index);
-            } else if (generatedSubjectMatchKeywordText(tokens, &index, "default")) {
-                if (default_marker != null) return error.UnsupportedSqlShape;
-                default_marker = try generatedSubjectStringLiteralValueAlloc(alloc, tokens, &index);
-            } else if (generatedSubjectMatchKeywordText(tokens, &index, "encoding")) {
-                if (encoding != null) return error.UnsupportedSqlShape;
-                encoding = try generatedSubjectStringLiteralValueAlloc(alloc, tokens, &index);
-                if (encoding.?.len == 0) return error.UnsupportedSqlShape;
-            } else if (generatedSubjectMatchKeywordText(tokens, &index, "oids")) {
-                if (try generatedSubjectBool(tokens, &index)) return error.UnsupportedSqlShape;
-            } else return error.UnsupportedSqlShape;
-            if (generatedSubjectMatchKind(tokens, &index, .comma)) continue;
-            break;
-        }
-        try generatedSubjectExpectKind(tokens, &index, .rparen);
+    if (ast.bulk_format_tokens) |range| format = try generatedBulkIoIdentifierFromRangeAlloc(alloc, tokens, range);
+    header = ast.bulk_header;
+    freeze = ast.bulk_freeze;
+    on_error = generatedBulkIoOnErrorFromGenerated(ast.bulk_on_error);
+    if (ast.bulk_reject_limit_tokens) |range| reject_limit = try generatedBulkIoPositiveIntegerFromRange(tokens, range);
+    log_verbosity = generatedBulkIoLogVerbosityFromGenerated(ast.bulk_log_verbosity);
+    force_quote_all = ast.bulk_force_quote_all;
+    force_quote_columns = try generatedBulkIoIdentifierSliceFromListAlloc(alloc, tokens, ast.bulk_force_quote_column_items);
+    force_not_null_columns = try generatedBulkIoIdentifierSliceFromListAlloc(alloc, tokens, ast.bulk_force_not_null_column_items);
+    force_null_columns = try generatedBulkIoIdentifierSliceFromListAlloc(alloc, tokens, ast.bulk_force_null_column_items);
+    if (ast.bulk_delimiter_tokens) |range| delimiter = try generatedBulkIoOneByteStringFromRangeAlloc(alloc, tokens, range);
+    if (ast.bulk_quote_tokens) |range| quote = try generatedBulkIoOneByteStringFromRangeAlloc(alloc, tokens, range);
+    if (ast.bulk_escape_tokens) |range| escape = try generatedBulkIoOneByteStringFromRangeAlloc(alloc, tokens, range);
+    if (ast.bulk_null_tokens) |range| null_marker = try generatedBulkIoStringFromRangeAlloc(alloc, tokens, range);
+    if (ast.bulk_default_tokens) |range| default_marker = try generatedBulkIoStringFromRangeAlloc(alloc, tokens, range);
+    if (ast.bulk_encoding_tokens) |range| {
+        encoding = try generatedBulkIoStringFromRangeAlloc(alloc, tokens, range);
+        if (encoding.?.len == 0) return error.UnsupportedSqlShape;
     }
     if (freeze and direction != .from) return error.UnsupportedSqlShape;
     if (on_error != .stop and direction != .from) return error.UnsupportedSqlShape;
@@ -20463,8 +23502,9 @@ fn generatedBulkIoPlanFromSubjectAlloc(
     if (force_not_null_columns.len != 0 and direction != .from) return error.UnsupportedSqlShape;
     if (force_null_columns.len != 0 and direction != .from) return error.UnsupportedSqlShape;
 
-    const where_expressions = if (generatedSubjectPeekKeywordText(tokens, index, "where"))
-        try lower_expr.parseBulkIoWhereExpressionsAlloc(
+    const where_expressions = if (ast.bulk_where_tokens) |where_tokens| blk: {
+        var index = where_tokens.start;
+        const where_expressions = try lower_expr.parseBulkIoWhereExpressionsAlloc(
             alloc,
             tokens,
             &index,
@@ -20472,11 +23512,10 @@ fn generatedBulkIoPlanFromSubjectAlloc(
             options.field_expression_qualifiers,
             options.returning_expression_qualifiers,
             options.defer_row_expression_field_validation,
-        )
-    else blk: {
-        try generatedSubjectExpectEnd(tokens, index);
-        break :blk &.{};
-    };
+        );
+        if (index != where_tokens.end) return error.UnsupportedSqlShape;
+        break :blk where_expressions;
+    } else &.{};
     var where_expressions_transferred = false;
     errdefer if (!where_expressions_transferred) {
         freeExpressionConditions(alloc, where_expressions);
@@ -20523,14 +23562,124 @@ fn generatedBulkIoPlanFromSubjectAlloc(
     };
 }
 
+fn generatedBulkIoObjectIdentifierFromRangeAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+) ![]const u8 {
+    if (range.end != range.start + 1 or range.end > tokens.len or tokens[range.start].kind != .identifier) return error.UnsupportedSqlShape;
+    return try grammar.normalizeSqlObjectIdentifierAlloc(alloc, tokens[range.start].text);
+}
+
+fn generatedBulkIoIdentifierFromRangeAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+) ![]const u8 {
+    if (range.end != range.start + 1 or range.end > tokens.len or tokens[range.start].kind != .identifier) return error.UnsupportedSqlShape;
+    return try alloc.dupe(u8, tokens[range.start].text);
+}
+
+fn generatedBulkIoStringFromRangeAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+) ![]const u8 {
+    if (range.end != range.start + 1 or range.end > tokens.len or tokens[range.start].kind != .string) return error.UnsupportedSqlShape;
+    return try alloc.dupe(u8, tokens[range.start].text);
+}
+
+fn generatedBulkIoOneByteStringFromRangeAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+) ![]const u8 {
+    const value = try generatedBulkIoStringFromRangeAlloc(alloc, tokens, range);
+    errdefer alloc.free(value);
+    if (value.len != 1) return error.UnsupportedSqlShape;
+    return value;
+}
+
+fn generatedBulkIoEndpointFromRangeAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+    kind: BulkIoEndpointKind,
+) ![]const u8 {
+    return switch (kind) {
+        .stream => try generatedBulkIoIdentifierFromRangeAlloc(alloc, tokens, range),
+        .file, .program => try generatedBulkIoStringFromRangeAlloc(alloc, tokens, range),
+    };
+}
+
+fn generatedBulkIoIdentifierSliceFromListAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    items: generated_parser.GeneratedSqlListAst,
+) ![]const []const u8 {
+    if (items.count == 0 and items.items.len == 0) return &.{};
+    if (items.count == 0 or items.count != items.items.len) return error.UnsupportedSqlShape;
+    var out = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (out.items) |item| alloc.free(item);
+        out.deinit(alloc);
+    }
+    for (items.items) |item| {
+        const value = try generatedBulkIoIdentifierFromRangeAlloc(alloc, tokens, item);
+        var transferred = false;
+        errdefer if (!transferred) alloc.free(value);
+        try out.append(alloc, value);
+        transferred = true;
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn generatedBulkIoPositiveIntegerFromRange(tokens: []const grammar.Token, range: generated_parser.GeneratedSqlTokenRange) !usize {
+    if (range.end != range.start + 1 or range.end > tokens.len or tokens[range.start].kind != .number) return error.UnsupportedSqlShape;
+    const text = tokens[range.start].text;
+    if (std.mem.indexOfScalar(u8, text, '.') != null) return error.UnsupportedSqlShape;
+    const value = std.fmt.parseInt(usize, text, 10) catch return error.UnsupportedSqlShape;
+    return if (value == 0) error.UnsupportedSqlShape else value;
+}
+
+fn generatedBulkIoDirectionFromGenerated(direction: generated_parser.GeneratedSqlBulkIoDirection) BulkIoDirection {
+    return switch (direction) {
+        .from => .from,
+        .to => .to,
+    };
+}
+
+fn generatedBulkIoEndpointKindFromGenerated(kind: generated_parser.GeneratedSqlBulkIoEndpointKind) BulkIoEndpointKind {
+    return switch (kind) {
+        .stream => .stream,
+        .file => .file,
+        .program => .program,
+    };
+}
+
+fn generatedBulkIoOnErrorFromGenerated(policy: generated_parser.GeneratedSqlBulkIoOnErrorPolicy) BulkIoOnErrorPolicy {
+    return switch (policy) {
+        .stop => .stop,
+        .ignore => .ignore,
+    };
+}
+
+fn generatedBulkIoLogVerbosityFromGenerated(verbosity: generated_parser.GeneratedSqlBulkIoLogVerbosity) BulkIoLogVerbosity {
+    return switch (verbosity) {
+        .default => .default,
+        .verbose => .verbose,
+        .terse => .terse,
+    };
+}
+
 fn commentMetadataPlanFromGeneratedUnsupportedAstAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
     ast: generated_parser.GeneratedSqlUnsupportedAst,
 ) !CommentMetadataPlan {
     _ = alloc;
+    _ = tokens;
     if (ast.kind != .comment) return error.UnsupportedSqlShape;
-    _ = try unsupportedAstSubjectTokens(tokens, ast);
     return error.UnsupportedSqlShape;
 }
 
@@ -20541,66 +23690,57 @@ fn transactionControlPlanFromGeneratedUnsupportedAstAlloc(
     boundary: GeneratedUnsupportedCatalogBoundary,
 ) !TransactionControlPlan {
     if (boundary.kind != .lock or ast.kind != .lock) return error.UnsupportedSqlShape;
-    const subject = try unsupportedAstSubjectTokens(tokens, ast);
-    var plan: TransactionControlPlan = .{ .table_lock = try generatedTableLockPlanFromSubjectAlloc(alloc, subject) };
+    var plan: TransactionControlPlan = .{ .table_lock = try generatedTableLockPlanFromUnsupportedAstAlloc(alloc, tokens, ast) };
     errdefer plan.deinit(alloc);
     return plan;
 }
 
-fn generatedTableLockPlanFromSubjectAlloc(
+fn generatedTableLockPlanFromUnsupportedAstAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlUnsupportedAst,
 ) !TableLockPlan {
-    var index: usize = 0;
-    _ = generatedSubjectMatchKeyword(tokens, &index, .table);
+    if (ast.kind != .lock or ast.table_lock_mode == null) return error.UnsupportedSqlShape;
+    const items = ast.table_lock_table_items;
+    if (items.count == 0 or items.count != items.items.len) return error.UnsupportedSqlShape;
     var table_names = std.ArrayListUnmanaged([]const u8).empty;
     errdefer {
         for (table_names.items) |table_name| alloc.free(table_name);
         table_names.deinit(alloc);
     }
-    while (true) {
-        const table_name = try generatedSubjectSqlObjectIdentifierAlloc(alloc, tokens, &index);
+    for (items.items) |item| {
+        const table_name = try generatedTableLockNameFromRangeAlloc(alloc, tokens, item);
         var table_name_transferred = false;
         errdefer if (!table_name_transferred) alloc.free(table_name);
         try table_names.append(alloc, table_name);
         table_name_transferred = true;
-        if (!generatedSubjectMatchKind(tokens, &index, .comma)) break;
     }
-    if (table_names.items.len == 0) return error.UnsupportedSqlShape;
-    if (!generatedSubjectMatchKeyword(tokens, &index, .in)) return error.UnsupportedSqlShape;
-    const mode = try generatedTableLockModeFromSubject(tokens, &index);
-    if (!generatedSubjectMatchKeywordText(tokens, &index, "mode")) return error.UnsupportedSqlShape;
-    try generatedSubjectExpectEnd(tokens, index);
     return .{
         .table_names = try table_names.toOwnedSlice(alloc),
-        .mode = mode,
+        .mode = generatedTableLockModeFromGenerated(ast.table_lock_mode.?),
     };
 }
 
-fn generatedTableLockModeFromSubject(tokens: []const grammar.Token, index: *usize) !TableLockMode {
-    if (generatedSubjectMatchKeyword(tokens, index, .access)) {
-        if (generatedSubjectMatchKeyword(tokens, index, .share)) return .access_share;
-        if (generatedSubjectMatchKeywordText(tokens, index, "exclusive")) return .access_exclusive;
-        return error.UnsupportedSqlShape;
-    }
-    if (generatedSubjectMatchKeyword(tokens, index, .row)) {
-        if (generatedSubjectMatchKeyword(tokens, index, .share)) return .row_share;
-        if (generatedSubjectMatchKeywordText(tokens, index, "exclusive")) return .row_exclusive;
-        return error.UnsupportedSqlShape;
-    }
-    if (generatedSubjectMatchKeyword(tokens, index, .share)) {
-        if (generatedSubjectMatchKeyword(tokens, index, .update)) {
-            if (!generatedSubjectMatchKeywordText(tokens, index, "exclusive")) return error.UnsupportedSqlShape;
-            return .share_update_exclusive;
-        }
-        if (generatedSubjectMatchKeyword(tokens, index, .row)) {
-            if (!generatedSubjectMatchKeywordText(tokens, index, "exclusive")) return error.UnsupportedSqlShape;
-            return .share_row_exclusive;
-        }
-        return .share;
-    }
-    if (generatedSubjectMatchKeywordText(tokens, index, "exclusive")) return .exclusive;
-    return error.UnsupportedSqlShape;
+fn generatedTableLockNameFromRangeAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+) ![]const u8 {
+    if (range.end != range.start + 1 or range.end > tokens.len or tokens[range.start].kind != .identifier) return error.UnsupportedSqlShape;
+    return try grammar.normalizeSqlObjectIdentifierAlloc(alloc, tokens[range.start].text);
+}
+
+fn generatedTableLockModeFromGenerated(mode: generated_parser.GeneratedSqlTableLockMode) TableLockMode {
+    return switch (mode) {
+        .access_share => .access_share,
+        .row_share => .row_share,
+        .row_exclusive => .row_exclusive,
+        .share_update_exclusive => .share_update_exclusive,
+        .share => .share,
+        .share_row_exclusive => .share_row_exclusive,
+        .exclusive => .exclusive,
+        .access_exclusive => .access_exclusive,
+    };
 }
 
 fn triggerPlanFromGeneratedUnsupportedAstAlloc(
@@ -20623,12 +23763,11 @@ fn createTriggerPlanFromGeneratedUnsupportedAstAlloc(
     ast: generated_parser.GeneratedSqlUnsupportedAst,
 ) !DdlPlan {
     if (ast.kind != .create_trigger) return error.UnsupportedSqlShape;
-    const subject = try unsupportedAstSubjectTokens(tokens, ast);
     const replace_existing = tokens.len > 3 and
         tokens[1].matchesKeywordTag(.@"or") and
         tokens[2].matchesKeywordTag(.replace) and
         tokens[3].matchesKeywordTag(.trigger);
-    var fields = try generatedCreateTriggerSubjectFieldsAlloc(alloc, subject);
+    var fields = try generatedCreateTriggerFieldsFromUnsupportedAstAlloc(alloc, tokens, ast);
     defer fields.deinit(alloc);
 
     if (fields.event == .update and isSupportedUpdatedAtTriggerFunction(fields.function_name)) {
@@ -20648,8 +23787,7 @@ fn dropTriggerPlanFromGeneratedUnsupportedAstAlloc(
     ast: generated_parser.GeneratedSqlUnsupportedAst,
 ) !DdlPlan {
     if (ast.kind != .drop_trigger) return error.UnsupportedSqlShape;
-    const subject = try unsupportedAstSubjectTokens(tokens, ast);
-    var fields = try generatedDropTriggerSubjectFieldsAlloc(alloc, subject);
+    var fields = try generatedDropTriggerFieldsFromUnsupportedAstAlloc(alloc, tokens, ast);
     defer fields.deinit(alloc);
     var alter_table = try dropUpdatePolicyPlanFromGeneratedTriggerFieldsAlloc(alloc, fields);
     errdefer alter_table.deinit(alloc);
@@ -20685,73 +23823,63 @@ const GeneratedDropTriggerSubjectFields = struct {
     }
 };
 
-fn generatedCreateTriggerSubjectFieldsAlloc(
+fn generatedCreateTriggerFieldsFromUnsupportedAstAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlUnsupportedAst,
 ) !GeneratedCreateTriggerSubjectFields {
-    var index: usize = 0;
+    if (ast.kind != .create_trigger) return error.UnsupportedSqlShape;
     var fields = GeneratedCreateTriggerSubjectFields{
-        .trigger_name = try generatedTriggerIdentifierAlloc(alloc, tokens, &index),
+        .trigger_name = try generatedTriggerIdentifierFromRangeAlloc(alloc, tokens, ast.trigger_name_tokens orelse return error.UnsupportedSqlShape),
         .table_name = "",
         .function_name = "",
-        .event = undefined,
+        .event = try routineTriggerEventFromGenerated(ast.trigger_event orelse return error.UnsupportedSqlShape),
     };
     errdefer fields.deinit(alloc);
-
-    try generatedTriggerExpectKeyword(tokens, &index, .before);
-    fields.event = try generatedTriggerEvent(tokens, &index);
-    if (fields.event == .update and generatedTriggerMatchKeyword(tokens, &index, .of)) {
-        return error.UnsupportedSqlShape;
+    fields.table_name = try generatedTriggerIdentifierFromRangeAlloc(alloc, tokens, ast.trigger_table_tokens orelse return error.UnsupportedSqlShape);
+    fields.function_name = try generatedTriggerIdentifierFromRangeAlloc(alloc, tokens, ast.trigger_function_tokens orelse return error.UnsupportedSqlShape);
+    if (ast.trigger_argument_tokens) |argument_tokens| {
+        if (argument_tokens.end != argument_tokens.start + 1 or argument_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+        const token = tokens[argument_tokens.start];
+        if (token.kind != .identifier and token.kind != .string) return error.UnsupportedSqlShape;
+        fields.argument_value = try alloc.dupe(u8, token.text);
     }
-    try generatedTriggerExpectKeyword(tokens, &index, .on);
-    fields.table_name = try generatedTriggerIdentifierAlloc(alloc, tokens, &index);
-    if (generatedTriggerMatchKeyword(tokens, &index, .@"for")) {
-        try generatedTriggerExpectKeyword(tokens, &index, .each);
-        try generatedTriggerExpectKeyword(tokens, &index, .row);
-    }
-    try generatedTriggerExpectKeyword(tokens, &index, .execute);
-    if (!(generatedTriggerMatchKeyword(tokens, &index, .function) or generatedTriggerMatchKeyword(tokens, &index, .procedure))) {
-        return error.UnsupportedSqlShape;
-    }
-    fields.function_name = try generatedTriggerIdentifierAlloc(alloc, tokens, &index);
-    try generatedTriggerExpectKind(tokens, &index, .lparen);
-    if (generatedTriggerMatchKind(tokens, &index, .rparen)) {
-        try generatedTriggerExpectEnd(tokens, index);
-        return fields;
-    }
-    fields.argument_value = try generatedTriggerArgumentValueAlloc(alloc, tokens, &index);
-    if (generatedTriggerMatchKind(tokens, &index, .comma)) return error.UnsupportedSqlShape;
-    try generatedTriggerExpectKind(tokens, &index, .rparen);
-    try generatedTriggerExpectEnd(tokens, index);
     return fields;
 }
 
-fn generatedDropTriggerSubjectFieldsAlloc(
+fn generatedDropTriggerFieldsFromUnsupportedAstAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlUnsupportedAst,
 ) !GeneratedDropTriggerSubjectFields {
-    var index: usize = 0;
-    var if_exists = false;
-    if (generatedTriggerMatchKeyword(tokens, &index, .@"if")) {
-        try generatedTriggerExpectKeyword(tokens, &index, .exists);
-        if_exists = true;
-    }
+    if (ast.kind != .drop_trigger) return error.UnsupportedSqlShape;
+    if (ast.trigger_function_tokens != null or ast.trigger_argument_tokens != null or ast.trigger_event != null) return error.UnsupportedSqlShape;
     var fields = GeneratedDropTriggerSubjectFields{
-        .trigger_name = try generatedTriggerIdentifierAlloc(alloc, tokens, &index),
+        .trigger_name = try generatedTriggerIdentifierFromRangeAlloc(alloc, tokens, ast.trigger_name_tokens orelse return error.UnsupportedSqlShape),
         .table_name = "",
-        .if_exists = if_exists,
+        .if_exists = ast.trigger_if_exists,
+        .cascade = ast.trigger_cascade,
     };
     errdefer fields.deinit(alloc);
-    try generatedTriggerExpectKeyword(tokens, &index, .on);
-    _ = generatedTriggerMatchKeyword(tokens, &index, .only);
-    fields.table_name = try generatedTriggerIdentifierAlloc(alloc, tokens, &index);
-    if (generatedTriggerMatchKeyword(tokens, &index, .cascade)) {
-        fields.cascade = true;
-    } else {
-        _ = generatedTriggerMatchKeyword(tokens, &index, .restrict);
-    }
-    try generatedTriggerExpectEnd(tokens, index);
+    fields.table_name = try generatedTriggerIdentifierFromRangeAlloc(alloc, tokens, ast.trigger_table_tokens orelse return error.UnsupportedSqlShape);
     return fields;
+}
+
+fn generatedTriggerIdentifierFromRangeAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+) ![]const u8 {
+    if (range.end != range.start + 1 or range.end > tokens.len or tokens[range.start].kind != .identifier) return error.UnsupportedSqlShape;
+    return try alloc.dupe(u8, tokens[range.start].text);
+}
+
+fn routineTriggerEventFromGenerated(event: generated_parser.GeneratedSqlTriggerEvent) !RoutineTriggerEvent {
+    return switch (event) {
+        .insert => .insert,
+        .update => .update,
+        .delete => .delete,
+    };
 }
 
 fn createUpdatePolicyPlanFromGeneratedTriggerFieldsAlloc(
@@ -20830,137 +23958,6 @@ fn dropUpdatePolicyPlanFromGeneratedTriggerFieldsAlloc(
     };
 }
 
-fn generatedTriggerEvent(tokens: []const grammar.Token, index: *usize) !RoutineTriggerEvent {
-    if (generatedTriggerMatchKeyword(tokens, index, .insert)) return .insert;
-    if (generatedTriggerMatchKeyword(tokens, index, .update)) return .update;
-    if (generatedTriggerMatchKeyword(tokens, index, .delete)) return .delete;
-    return error.UnsupportedSqlShape;
-}
-
-fn generatedTriggerIdentifierAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    index: *usize,
-) ![]const u8 {
-    if (index.* >= tokens.len or tokens[index.*].kind != .identifier) return error.UnsupportedSqlShape;
-    const value = try alloc.dupe(u8, tokens[index.*].text);
-    index.* += 1;
-    return value;
-}
-
-fn generatedTriggerArgumentValueAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    index: *usize,
-) ![]const u8 {
-    if (index.* >= tokens.len) return error.UnsupportedSqlShape;
-    const token = tokens[index.*];
-    switch (token.kind) {
-        .identifier, .string => {},
-        else => return error.UnsupportedSqlShape,
-    }
-    const value = try alloc.dupe(u8, token.text);
-    index.* += 1;
-    return value;
-}
-
-fn generatedTriggerMatchKeyword(tokens: []const grammar.Token, index: *usize, keyword: token_mod.TokenKeyword) bool {
-    if (index.* >= tokens.len or !tokens[index.*].matchesKeywordTag(keyword)) return false;
-    index.* += 1;
-    return true;
-}
-
-fn generatedTriggerExpectKeyword(tokens: []const grammar.Token, index: *usize, keyword: token_mod.TokenKeyword) !void {
-    if (!generatedTriggerMatchKeyword(tokens, index, keyword)) return error.UnsupportedSqlShape;
-}
-
-fn generatedTriggerMatchKind(tokens: []const grammar.Token, index: *usize, kind: token_mod.TokenKind) bool {
-    if (index.* >= tokens.len or tokens[index.*].kind != kind) return false;
-    index.* += 1;
-    return true;
-}
-
-fn generatedTriggerExpectKind(tokens: []const grammar.Token, index: *usize, kind: token_mod.TokenKind) !void {
-    if (!generatedTriggerMatchKind(tokens, index, kind)) return error.UnsupportedSqlShape;
-}
-
-fn generatedTriggerExpectEnd(tokens: []const grammar.Token, index: usize) !void {
-    if (index != tokens.len) return error.UnsupportedSqlShape;
-}
-
-fn parseCreateUpdatePolicyTriggerSubjectAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !CreateUpdatePolicyPlan {
-    const cursor = parser.Cursor.init(tokens, pos);
-    var syntax = grammar.CreateUpdatePolicySyntax{
-        .trigger_name = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos),
-        .table_name = "",
-        .column_name = "",
-    };
-    errdefer syntax.deinit(alloc);
-    try cursor.expectKeyword("before");
-    try cursor.expectKeyword("update");
-    if (cursor.matchKeyword("of")) {
-        while (!cursor.peekKeyword("on")) {
-            const column = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
-            alloc.free(@constCast(column));
-            if (cursor.matchToken(.comma) == null) break;
-        }
-    }
-    try cursor.expectKeyword("on");
-    syntax.table_name = try grammar.parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
-    if (cursor.matchKeyword("for")) {
-        try cursor.expectKeyword("each");
-        try cursor.expectKeyword("row");
-    }
-    try cursor.expectKeyword("execute");
-    if (cursor.matchKeyword("function") or cursor.matchKeyword("procedure")) {} else return error.UnsupportedSqlShape;
-    const function_name = try grammar.parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
-    defer alloc.free(@constCast(function_name));
-    if (!isSupportedUpdatedAtTriggerFunction(function_name)) return error.UnsupportedSqlShape;
-    try cursor.expectToken(.lparen);
-    if (cursor.matchToken(.rparen) != null) {
-        syntax.column_name = try alloc.dupe(u8, "updated_at");
-    } else {
-        syntax.column_name = if (cursor.matchToken(.string)) |token|
-            try alloc.dupe(u8, token.text)
-        else
-            try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
-        if (cursor.matchToken(.comma) != null) return error.UnsupportedSqlShape;
-        try cursor.expectToken(.rparen);
-    }
-    var plan = try createUpdatePolicyTriggerPlanFromSyntaxAlloc(alloc, &syntax);
-    errdefer plan.deinit(alloc);
-    return plan;
-}
-
-fn parseDropUpdatePolicyTriggerSubjectAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-) !AlterTablePlan {
-    const cursor = parser.Cursor.init(tokens, pos);
-    var syntax = grammar.DropUpdatePolicySyntax{
-        .trigger_name = "",
-        .table_name = "",
-    };
-    errdefer syntax.deinit(alloc);
-    if (cursor.matchKeyword("if")) {
-        try cursor.expectKeyword("exists");
-        syntax.if_exists = true;
-    }
-    syntax.trigger_name = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
-    try cursor.expectKeyword("on");
-    _ = cursor.matchKeyword("only");
-    syntax.table_name = try grammar.parseSqlTableReferenceIdentifierOwnedAlloc(alloc, tokens, pos);
-    _ = cursor.matchKeyword("cascade") or cursor.matchKeyword("restrict");
-    var plan = try dropUpdatePolicyTriggerPlanFromSyntaxAlloc(alloc, &syntax);
-    errdefer plan.deinit(alloc);
-    return plan;
-}
-
 fn isSupportedUpdatedAtTriggerFunction(name: []const u8) bool {
     const dot = std.mem.lastIndexOfScalar(u8, name, '.');
     const base = if (dot) |idx| name[idx + 1 ..] else name;
@@ -20977,41 +23974,40 @@ fn notificationChannelPlanFromGeneratedUnsupportedAstAlloc(
     ast: generated_parser.GeneratedSqlUnsupportedAst,
     boundary: GeneratedUnsupportedCatalogBoundary,
 ) !NotificationChannelPlan {
-    const subject = try unsupportedAstSubjectTokens(tokens, ast);
     return switch (boundary.kind) {
-        .listen => .{ .listen = try generatedListenNotificationPlanFromSubjectAlloc(alloc, subject) },
-        .notify => .{ .notify = try generatedNotifyNotificationPlanFromSubjectAlloc(alloc, subject) },
-        .unlisten => .{ .unlisten = try generatedUnlistenNotificationPlanFromSubjectAlloc(alloc, subject) },
+        .listen => .{ .listen = try generatedListenNotificationPlanFromUnsupportedAstAlloc(alloc, tokens, ast) },
+        .notify => .{ .notify = try generatedNotifyNotificationPlanFromUnsupportedAstAlloc(alloc, tokens, ast) },
+        .unlisten => .{ .unlisten = try generatedUnlistenNotificationPlanFromUnsupportedAstAlloc(alloc, tokens, ast) },
         else => return error.UnsupportedSqlShape,
     };
 }
 
-fn generatedListenNotificationPlanFromSubjectAlloc(
+fn generatedListenNotificationPlanFromUnsupportedAstAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlUnsupportedAst,
 ) !ListenNotificationPlan {
-    var index: usize = 0;
-    const channel_name = try generatedSubjectIdentifierAlloc(alloc, tokens, &index);
+    if (ast.kind != .listen or ast.notification_payload_tokens != null or ast.notification_unlisten_all) return error.UnsupportedSqlShape;
+    const channel_name = try generatedNotificationChannelFromRangeAlloc(alloc, tokens, ast.notification_channel_tokens orelse return error.UnsupportedSqlShape);
     errdefer alloc.free(channel_name);
-    try generatedSubjectExpectEnd(tokens, index);
     return .{ .channel_name = channel_name };
 }
 
-fn generatedNotifyNotificationPlanFromSubjectAlloc(
+fn generatedNotifyNotificationPlanFromUnsupportedAstAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlUnsupportedAst,
 ) !NotifyNotificationPlan {
-    var index: usize = 0;
-    const channel_name = try generatedSubjectIdentifierAlloc(alloc, tokens, &index);
+    if (ast.kind != .notify or ast.notification_unlisten_all) return error.UnsupportedSqlShape;
+    const channel_name = try generatedNotificationChannelFromRangeAlloc(alloc, tokens, ast.notification_channel_tokens orelse return error.UnsupportedSqlShape);
     errdefer alloc.free(channel_name);
     var payload_json: ?[]const u8 = null;
     errdefer if (payload_json) |payload| alloc.free(payload);
-    if (generatedSubjectMatchKind(tokens, &index, .comma)) {
-        const payload_start = index;
-        payload_json = try generatedSubjectSqlUntypedValueJsonAlloc(alloc, tokens, &index);
-        if (index == payload_start) return error.UnsupportedSqlShape;
+    if (ast.notification_payload_tokens) |payload| {
+        var payload_pos = payload.start;
+        payload_json = try value_mod.parseSqlUntypedValueJsonAlloc(alloc, tokens, &payload_pos);
+        if (payload_pos != payload.end) return error.UnsupportedSqlShape;
     }
-    try generatedSubjectExpectEnd(tokens, index);
     const plan = NotifyNotificationPlan{
         .channel_name = channel_name,
         .payload_json = payload_json,
@@ -21020,165 +24016,28 @@ fn generatedNotifyNotificationPlanFromSubjectAlloc(
     return plan;
 }
 
-fn generatedUnlistenNotificationPlanFromSubjectAlloc(
+fn generatedUnlistenNotificationPlanFromUnsupportedAstAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlUnsupportedAst,
 ) !UnlistenNotificationPlan {
-    var index: usize = 0;
-    if (generatedSubjectMatchKind(tokens, &index, .star)) {
-        try generatedSubjectExpectEnd(tokens, index);
+    if (ast.kind != .unlisten or ast.notification_payload_tokens != null) return error.UnsupportedSqlShape;
+    if (ast.notification_unlisten_all) {
+        if (ast.notification_channel_tokens != null) return error.UnsupportedSqlShape;
         return .{ .all = true };
     }
-    const channel_name = try generatedSubjectIdentifierAlloc(alloc, tokens, &index);
+    const channel_name = try generatedNotificationChannelFromRangeAlloc(alloc, tokens, ast.notification_channel_tokens orelse return error.UnsupportedSqlShape);
     errdefer alloc.free(channel_name);
-    try generatedSubjectExpectEnd(tokens, index);
     return .{ .channel_name = channel_name };
 }
 
-fn unsupportedAstSubjectTokens(
-    tokens: []const grammar.Token,
-    ast: generated_parser.GeneratedSqlUnsupportedAst,
-) ![]const grammar.Token {
-    const range = ast.subject_tokens orelse return error.UnsupportedSqlShape;
-    if (range.start >= range.end or range.end > generatedStatementTokenEnd(tokens)) return error.UnsupportedSqlShape;
-    return tokens[range.start..range.end];
-}
-
-fn generatedSubjectSqlObjectIdentifierAlloc(
+fn generatedNotificationChannelFromRangeAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
-    index: *usize,
+    range: generated_parser.GeneratedSqlTokenRange,
 ) ![]const u8 {
-    if (index.* >= tokens.len or tokens[index.*].kind != .identifier) return error.UnsupportedSqlShape;
-    const value = try grammar.normalizeSqlObjectIdentifierAlloc(alloc, tokens[index.*].text);
-    index.* += 1;
-    return value;
-}
-
-fn generatedSubjectIdentifierAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    index: *usize,
-) ![]const u8 {
-    return try alloc.dupe(u8, try generatedSubjectIdentifierText(tokens, index));
-}
-
-fn generatedSubjectIdentifierText(
-    tokens: []const grammar.Token,
-    index: *usize,
-) ![]const u8 {
-    if (index.* >= tokens.len or tokens[index.*].kind != .identifier) return error.UnsupportedSqlShape;
-    const value = tokens[index.*].text;
-    index.* += 1;
-    return value;
-}
-
-fn generatedSubjectStringLiteralValueAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    index: *usize,
-) ![]const u8 {
-    if (index.* >= tokens.len or tokens[index.*].kind != .string) return error.UnsupportedSqlShape;
-    const value = try alloc.dupe(u8, tokens[index.*].text);
-    index.* += 1;
-    return value;
-}
-
-fn generatedSubjectOneByteStringLiteralValueAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    index: *usize,
-) ![]const u8 {
-    const value = try generatedSubjectStringLiteralValueAlloc(alloc, tokens, index);
-    errdefer alloc.free(value);
-    if (value.len != 1) return error.UnsupportedSqlShape;
-    return value;
-}
-
-fn generatedSubjectBool(
-    tokens: []const grammar.Token,
-    index: *usize,
-) !bool {
-    const value = try generatedSubjectIdentifierText(tokens, index);
-    if (std.ascii.eqlIgnoreCase(value, "true")) return true;
-    if (std.ascii.eqlIgnoreCase(value, "false")) return false;
-    return error.UnsupportedSqlShape;
-}
-
-fn generatedSubjectPositiveInteger(
-    tokens: []const grammar.Token,
-    index: *usize,
-) !usize {
-    if (index.* >= tokens.len or tokens[index.*].kind != .number) return error.UnsupportedSqlShape;
-    const value_text = tokens[index.*].text;
-    if (std.mem.indexOfScalar(u8, value_text, '.') != null) return error.UnsupportedSqlShape;
-    const value = std.fmt.parseInt(usize, value_text, 10) catch return error.UnsupportedSqlShape;
-    if (value == 0) return error.UnsupportedSqlShape;
-    index.* += 1;
-    return value;
-}
-
-fn generatedSubjectIdentifierListAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    index: *usize,
-) ![]const []const u8 {
-    var out = std.ArrayListUnmanaged([]const u8).empty;
-    errdefer {
-        for (out.items) |item| alloc.free(item);
-        out.deinit(alloc);
-    }
-    while (true) {
-        const value = try generatedSubjectIdentifierAlloc(alloc, tokens, index);
-        var value_transferred = false;
-        errdefer if (!value_transferred) alloc.free(value);
-        try out.append(alloc, value);
-        value_transferred = true;
-        if (!generatedSubjectMatchKind(tokens, index, .comma)) break;
-    }
-    if (out.items.len == 0) return error.UnsupportedSqlShape;
-    return try out.toOwnedSlice(alloc);
-}
-
-fn generatedSubjectSqlUntypedValueJsonAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    index: *usize,
-) ![]const u8 {
-    const value_json = try value_mod.parseSqlUntypedValueJsonAlloc(alloc, tokens, index);
-    errdefer alloc.free(value_json);
-    return value_json;
-}
-
-fn generatedSubjectMatchKind(tokens: []const grammar.Token, index: *usize, kind: token_mod.TokenKind) bool {
-    if (index.* >= tokens.len or tokens[index.*].kind != kind) return false;
-    index.* += 1;
-    return true;
-}
-
-fn generatedSubjectMatchKeyword(tokens: []const grammar.Token, index: *usize, keyword: token_mod.TokenKeyword) bool {
-    if (index.* >= tokens.len or !tokens[index.*].matchesKeywordTag(keyword)) return false;
-    index.* += 1;
-    return true;
-}
-
-fn generatedSubjectMatchKeywordText(tokens: []const grammar.Token, index: *usize, keyword: []const u8) bool {
-    if (index.* >= tokens.len or !tokens[index.*].matchesKeyword(keyword)) return false;
-    index.* += 1;
-    return true;
-}
-
-fn generatedSubjectPeekKeywordText(tokens: []const grammar.Token, index: usize, keyword: []const u8) bool {
-    return index < tokens.len and tokens[index].matchesKeyword(keyword);
-}
-
-fn generatedSubjectExpectKind(tokens: []const grammar.Token, index: *usize, kind: token_mod.TokenKind) !void {
-    if (index.* >= tokens.len or tokens[index.*].kind != kind) return error.UnsupportedSqlShape;
-    index.* += 1;
-}
-
-fn generatedSubjectExpectEnd(tokens: []const grammar.Token, index: usize) !void {
-    if (index != tokens.len) return error.UnsupportedSqlShape;
+    if (range.end != range.start + 1 or range.end > tokens.len or tokens[range.start].kind != .identifier) return error.UnsupportedSqlShape;
+    return try alloc.dupe(u8, tokens[range.start].text);
 }
 
 fn vacuumMaintenancePlanFromGeneratedUnsupportedAstAlloc(
@@ -21187,26 +24046,16 @@ fn vacuumMaintenancePlanFromGeneratedUnsupportedAstAlloc(
     ast: generated_parser.GeneratedSqlUnsupportedAst,
 ) !VacuumMaintenancePlan {
     if (ast.kind != .vacuum) return error.UnsupportedSqlShape;
-    const subject = try unsupportedAstSubjectTokens(tokens, ast);
-    var pos: usize = 0;
-    const cursor = parser.Cursor.init(subject, &pos);
-    var full = false;
-    var freeze = false;
-    var verbose = false;
-    var analyze = false;
-    if (cursor.matchToken(.lparen) != null) {
-        while (true) {
-            try parseGeneratedVacuumMaintenanceOption(cursor, &full, &freeze, &verbose, &analyze);
-            if (cursor.matchToken(.comma) == null) break;
-        }
-        try cursor.expectToken(.rparen);
-    } else {
-        while (parseOptionalGeneratedVacuumMaintenanceOption(cursor, &full, &freeze, &verbose, &analyze)) {}
-    }
-    const table_name = try grammar.parseSqlObjectIdentifierOwnedAlloc(alloc, subject, &pos);
+    if (ast.maintenance_secondary_name_tokens != null or ast.maintenance_reindex_target != null or ast.maintenance_concurrently) return error.UnsupportedSqlShape;
+    const table_name = try generatedMaintenanceObjectNameFromRangeAlloc(alloc, tokens, ast.maintenance_name_tokens orelse return error.UnsupportedSqlShape);
     errdefer alloc.free(table_name);
-    if (cursor.matchToken(.lparen) != null or !cursor.atEnd()) return error.UnsupportedSqlShape;
-    return .{ .table_name = table_name, .full = full, .freeze = freeze, .verbose = verbose, .analyze = analyze };
+    return .{
+        .table_name = table_name,
+        .full = ast.maintenance_vacuum_full,
+        .freeze = ast.maintenance_vacuum_freeze,
+        .verbose = ast.maintenance_verbose,
+        .analyze = ast.maintenance_vacuum_analyze,
+    };
 }
 
 fn analyzeMaintenancePlanFromGeneratedUnsupportedAstAlloc(
@@ -21215,23 +24064,22 @@ fn analyzeMaintenancePlanFromGeneratedUnsupportedAstAlloc(
     ast: generated_parser.GeneratedSqlUnsupportedAst,
 ) !AnalyzeMaintenancePlan {
     if (ast.kind != .analyze) return error.UnsupportedSqlShape;
-    const subject = try unsupportedAstSubjectTokens(tokens, ast);
-    var pos: usize = 0;
-    const cursor = parser.Cursor.init(subject, &pos);
-    const verbose = cursor.matchKeyword("verbose");
-    const table_name = try grammar.parseSqlObjectIdentifierOwnedAlloc(alloc, subject, &pos);
-    errdefer alloc.free(table_name);
-    var column_count: usize = 0;
-    if (cursor.matchToken(.lparen) != null) {
-        while (true) {
-            _ = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
-            column_count += 1;
-            if (cursor.matchToken(.comma) == null) break;
-        }
-        try cursor.expectToken(.rparen);
+    if (ast.maintenance_secondary_name_tokens != null or
+        ast.maintenance_reindex_target != null or
+        ast.maintenance_concurrently or
+        ast.maintenance_vacuum_full or
+        ast.maintenance_vacuum_freeze or
+        ast.maintenance_vacuum_analyze)
+    {
+        return error.UnsupportedSqlShape;
     }
-    if (!cursor.atEnd()) return error.UnsupportedSqlShape;
-    return .{ .table_name = table_name, .verbose = verbose, .column_count = column_count };
+    const table_name = try generatedMaintenanceObjectNameFromRangeAlloc(alloc, tokens, ast.maintenance_name_tokens orelse return error.UnsupportedSqlShape);
+    errdefer alloc.free(table_name);
+    return .{
+        .table_name = table_name,
+        .verbose = ast.maintenance_verbose,
+        .column_count = ast.maintenance_column_items.count,
+    };
 }
 
 fn reindexMaintenancePlanFromGeneratedUnsupportedAstAlloc(
@@ -21240,8 +24088,14 @@ fn reindexMaintenancePlanFromGeneratedUnsupportedAstAlloc(
     ast: generated_parser.GeneratedSqlUnsupportedAst,
 ) !ReindexMaintenancePlan {
     if (ast.kind != .reindex) return error.UnsupportedSqlShape;
-    const subject = try unsupportedAstSubjectTokens(tokens, ast);
-    return try generatedReindexMaintenancePlanFromSubjectAlloc(alloc, subject);
+    if (ast.maintenance_secondary_name_tokens != null or ast.maintenance_verbose) return error.UnsupportedSqlShape;
+    const name = try generatedMaintenanceObjectNameFromRangeAlloc(alloc, tokens, ast.maintenance_name_tokens orelse return error.UnsupportedSqlShape);
+    errdefer alloc.free(name);
+    return .{
+        .target = try reindexMaintenanceTargetFromGenerated(ast.maintenance_reindex_target orelse return error.UnsupportedSqlShape),
+        .name = name,
+        .concurrently = ast.maintenance_concurrently,
+    };
 }
 
 fn clusterMaintenancePlanFromGeneratedUnsupportedAstAlloc(
@@ -21250,86 +24104,40 @@ fn clusterMaintenancePlanFromGeneratedUnsupportedAstAlloc(
     ast: generated_parser.GeneratedSqlUnsupportedAst,
 ) !ClusterMaintenancePlan {
     if (ast.kind != .cluster) return error.UnsupportedSqlShape;
-    const subject = try unsupportedAstSubjectTokens(tokens, ast);
-    return try generatedClusterMaintenancePlanFromSubjectAlloc(alloc, subject);
-}
-
-fn generatedReindexMaintenancePlanFromSubjectAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-) !ReindexMaintenancePlan {
-    var index: usize = 0;
-    const target: ReindexMaintenanceTarget = if (generatedSubjectMatchKeyword(tokens, &index, .index))
-        .index
-    else if (generatedSubjectMatchKeyword(tokens, &index, .table))
-        .table
-    else if (generatedSubjectMatchKeyword(tokens, &index, .schema))
-        .schema
-    else if (generatedSubjectMatchKeyword(tokens, &index, .database))
-        .database
-    else if (generatedSubjectMatchKeyword(tokens, &index, .system))
-        .system
-    else
-        return error.UnsupportedSqlShape;
-    const concurrently = generatedSubjectMatchKeywordText(tokens, &index, "concurrently");
-    const name = try generatedSubjectSqlObjectIdentifierAlloc(alloc, tokens, &index);
-    errdefer alloc.free(name);
-    try generatedSubjectExpectEnd(tokens, index);
-    return .{ .target = target, .name = name, .concurrently = concurrently };
-}
-
-fn generatedClusterMaintenancePlanFromSubjectAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-) !ClusterMaintenancePlan {
-    var index: usize = 0;
-    const verbose = generatedSubjectMatchKeyword(tokens, &index, .verbose);
-    const table_name = try generatedSubjectSqlObjectIdentifierAlloc(alloc, tokens, &index);
+    if (ast.maintenance_reindex_target != null or ast.maintenance_concurrently) return error.UnsupportedSqlShape;
+    const table_name = try generatedMaintenanceObjectNameFromRangeAlloc(alloc, tokens, ast.maintenance_name_tokens orelse return error.UnsupportedSqlShape);
     errdefer alloc.free(table_name);
     var index_name: ?[]const u8 = null;
     errdefer if (index_name) |name| alloc.free(name);
-    if (generatedSubjectMatchKeyword(tokens, &index, .using)) {
-        index_name = try generatedSubjectSqlObjectIdentifierAlloc(alloc, tokens, &index);
+    if (ast.maintenance_secondary_name_tokens) |range| {
+        index_name = try generatedMaintenanceObjectNameFromRangeAlloc(alloc, tokens, range);
     }
-    try generatedSubjectExpectEnd(tokens, index);
     const plan = ClusterMaintenancePlan{
         .table_name = table_name,
         .index_name = index_name,
-        .verbose = verbose,
+        .verbose = ast.maintenance_verbose,
     };
     index_name = null;
     return plan;
 }
 
-fn parseOptionalGeneratedVacuumMaintenanceOption(
-    cursor: parser.Cursor,
-    full: *bool,
-    freeze: *bool,
-    verbose: *bool,
-    analyze: *bool,
-) bool {
-    parseGeneratedVacuumMaintenanceOption(cursor, full, freeze, verbose, analyze) catch return false;
-    return true;
+fn generatedMaintenanceObjectNameFromRangeAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+) ![]const u8 {
+    if (range.end != range.start + 1 or range.end > tokens.len or tokens[range.start].kind != .identifier) return error.UnsupportedSqlShape;
+    return try grammar.normalizeSqlObjectIdentifierAlloc(alloc, tokens[range.start].text);
 }
 
-fn parseGeneratedVacuumMaintenanceOption(
-    cursor: parser.Cursor,
-    full: *bool,
-    freeze: *bool,
-    verbose: *bool,
-    analyze: *bool,
-) !void {
-    if (cursor.matchKeyword("full")) {
-        full.* = true;
-    } else if (cursor.matchKeyword("freeze")) {
-        freeze.* = true;
-    } else if (cursor.matchKeyword("verbose")) {
-        verbose.* = true;
-    } else if (cursor.matchKeyword("analyze")) {
-        analyze.* = true;
-    } else {
-        return error.UnsupportedSqlShape;
-    }
+fn reindexMaintenanceTargetFromGenerated(target: generated_parser.GeneratedSqlReindexTarget) !ReindexMaintenanceTarget {
+    return switch (target) {
+        .index => .index,
+        .table => .table,
+        .schema => .schema,
+        .database => .database,
+        .system => .system,
+    };
 }
 
 fn runtimeDdlPlanAlloc(
@@ -21452,7 +24260,6 @@ pub fn lowerRoutineTriggerCatalogPlanParsedSqlAlloc(
     const boundary = generatedUnsupportedCatalogBoundary(generated_statement.statement) orelse return error.NotTriggerDdl;
     if (boundary.family != .update_policy_trigger) return error.NotTriggerDdl;
     try validateGeneratedUnsupportedCatalogAst(parsed_sql.items(), unsupported, boundary);
-    const subject = try unsupportedAstSubjectTokens(parsed_sql.items(), unsupported);
     switch (boundary.kind) {
         .create_trigger => {
             const tokens = parsed_sql.items();
@@ -21460,13 +24267,13 @@ pub fn lowerRoutineTriggerCatalogPlanParsedSqlAlloc(
                 tokens[1].matchesKeywordTag(.@"or") and
                 tokens[2].matchesKeywordTag(.replace) and
                 tokens[3].matchesKeywordTag(.trigger);
-            var fields = try generatedCreateTriggerSubjectFieldsAlloc(alloc, subject);
+            var fields = try generatedCreateTriggerFieldsFromUnsupportedAstAlloc(alloc, tokens, unsupported);
             defer fields.deinit(alloc);
             if (fields.argument_value != null) return error.UnsupportedSqlShape;
             return .{ .create = try createRoutineTriggerPlanFromGeneratedFieldsAlloc(alloc, fields, replace_existing) };
         },
         .drop_trigger => {
-            var fields = try generatedDropTriggerSubjectFieldsAlloc(alloc, subject);
+            var fields = try generatedDropTriggerFieldsFromUnsupportedAstAlloc(alloc, parsed_sql.items(), unsupported);
             defer fields.deinit(alloc);
             return .{ .drop = try dropRoutineTriggerPlanFromGeneratedFieldsAlloc(alloc, fields) };
         },
@@ -21592,8 +24399,7 @@ test "sql adapter ddl plan lowers create table ddl into typed schema plan" {
             try std.testing.expectEqual(runtime_schema.RelationalDefaultKind.now_ns, plan.columns[5].default_value.?.kind);
             try std.testing.expectEqualStrings("email_key", plan.columns[6].name);
             try std.testing.expect(plan.columns[6].generated != null);
-            try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.lower, plan.columns[6].generated.?.op);
-            try std.testing.expectEqualStrings("tenant_id", plan.columns[6].generated.?.field.?);
+            try expectGeneratedUnaryExpressionForTest(plan.columns[6].generated.?, .lower, "tenant_id");
             try std.testing.expect(plan.primary_key != null);
             try std.testing.expectEqual(@as(usize, 1), plan.primary_key.?.columns.len);
             try std.testing.expectEqualStrings("id", plan.primary_key.?.columns[0]);
@@ -22041,6 +24847,23 @@ test "sql adapter ddl plan lowers create index ddl" {
         },
         else => return error.TestUnexpectedResult,
     }
+    var derived_full_text_english = try runtimeDdlPlanForTestAlloc(
+        alloc,
+        "CREATE INDEX docs_body_fts ON docs USING antfly_full_text (body) WITH (analyzer = 'english');",
+    );
+    defer derived_full_text_english.deinit(alloc);
+    switch (derived_full_text) {
+        .create_index => |standard_plan| switch (derived_full_text_english) {
+            .create_index => |english_plan| {
+                try std.testing.expect(standard_plan.derived_index_config_json != null);
+                try std.testing.expect(english_plan.derived_index_config_json != null);
+                try std.testing.expect(!std.mem.eql(u8, standard_plan.derived_index_config_json.?, english_plan.derived_index_config_json.?));
+                try std.testing.expect(stableSecondaryIndexGeneration(standard_plan) != stableSecondaryIndexGeneration(english_plan));
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
 
     var antfly_text_search = try runtimeDdlPlanForTestAlloc(
         alloc,
@@ -22059,6 +24882,21 @@ test "sql adapter ddl plan lowers create index ddl" {
             try std.testing.expect(std.mem.indexOf(u8, config, "\"type\":\"full_text\"") != null);
             try std.testing.expect(std.mem.indexOf(u8, config, "\"field\":\"body\"") != null);
             try std.testing.expect(std.mem.indexOf(u8, config, "\"analyzer\":\"standard\"") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    var create_text_search_equivalent = try runtimeDdlPlanForTestAlloc(
+        alloc,
+        "CREATE TEXT SEARCH docs_body_fts ON docs (body) WITH (analyzer = 'standard');",
+    );
+    defer create_text_search_equivalent.deinit(alloc);
+    switch (derived_full_text) {
+        .create_index => |using_plan| switch (create_text_search_equivalent) {
+            .create_index => |text_search_plan| {
+                try std.testing.expectEqual(stableSecondaryIndexGeneration(using_plan), stableSecondaryIndexGeneration(text_search_plan));
+                try std.testing.expectEqualStrings(using_plan.derived_index_config_json.?, text_search_plan.derived_index_config_json.?);
+            },
+            else => return error.TestUnexpectedResult,
         },
         else => return error.TestUnexpectedResult,
     }
@@ -22651,8 +25489,7 @@ test "sql adapter ddl plan lowers create index ddl" {
             try std.testing.expectEqual(runtime_schema.RelationalIndexKeyDirection.desc, plan.index_keys[0].direction);
             try std.testing.expectEqual(runtime_schema.RelationalIndexKeyNulls.last, plan.index_keys[0].nulls);
             try std.testing.expect(plan.generated_expression != null);
-            try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.lower, plan.generated_expression.?.op);
-            try std.testing.expectEqualStrings("email", plan.generated_expression.?.field.?);
+            try expectGeneratedUnaryExpressionForTest(plan.generated_expression.?, .lower, "email");
         },
         .create_table => return error.TestUnexpectedResult,
         .drop_index => return error.TestUnexpectedResult,
@@ -22677,11 +25514,7 @@ test "sql adapter ddl plan lowers create index ddl" {
             try std.testing.expectEqual(runtime_schema.RelationalIndexKeyDirection.asc, plan.index_keys[0].direction);
             try std.testing.expectEqual(runtime_schema.RelationalIndexKeyNulls.default, plan.index_keys[0].nulls);
             try std.testing.expect(plan.generated_expression != null);
-            try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.concat_ws, plan.generated_expression.?.op);
-            try std.testing.expectEqual(@as(usize, 2), plan.generated_expression.?.fields.len);
-            try std.testing.expectEqualStrings("status", plan.generated_expression.?.fields[0]);
-            try std.testing.expectEqualStrings("id", plan.generated_expression.?.fields[1]);
-            try std.testing.expectEqualStrings(":", plan.generated_expression.?.separator);
+            try expectGeneratedConcatExpressionForTest(plan.generated_expression.?, .concat_ws, &.{ "status", "id" }, "\":\"");
         },
         .create_table => return error.TestUnexpectedResult,
         .drop_index => return error.TestUnexpectedResult,
@@ -22971,8 +25804,7 @@ test "sql adapter ddl plan lowers create index ddl" {
             try std.testing.expectEqualStrings("usage_records_lower_email_cover", plan.index_name);
             try std.testing.expectEqual(@as(usize, 0), plan.columns.len);
             try std.testing.expect(plan.generated_expression != null);
-            try std.testing.expectEqualStrings("email", plan.generated_expression.?.field.?);
-            try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.lower, plan.generated_expression.?.op);
+            try expectGeneratedUnaryExpressionForTest(plan.generated_expression.?, .lower, "email");
             try std.testing.expectEqual(@as(usize, 1), plan.include_columns.len);
             try std.testing.expectEqualStrings("tenant_id", plan.include_columns[0]);
         },
@@ -23101,11 +25933,7 @@ test "sql adapter ddl plan lowers alter table ddl" {
                 .add_column => |add_column| {
                     try std.testing.expectEqualStrings("tenant_status_key", add_column.column.name);
                     try std.testing.expect(add_column.column.generated != null);
-                    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.concat, add_column.column.generated.?.op);
-                    try std.testing.expectEqual(@as(usize, 2), add_column.column.generated.?.fields.len);
-                    try std.testing.expectEqualStrings("tenant_id", add_column.column.generated.?.fields[0]);
-                    try std.testing.expectEqualStrings("status", add_column.column.generated.?.fields[1]);
-                    try std.testing.expectEqualStrings(":", add_column.column.generated.?.separator);
+                    try expectGeneratedConcatExpressionForTest(add_column.column.generated.?, .concat, &.{ "tenant_id", "status" }, "\":\"");
                 },
                 else => return error.TestUnexpectedResult,
             }
@@ -23640,8 +26468,7 @@ test "sql adapter ddl plan lowers alter table ddl" {
             .add_column => |operation| {
                 try std.testing.expectEqualStrings("email_upper_key", operation.column.name);
                 try std.testing.expect(operation.column.generated != null);
-                try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.upper, operation.column.generated.?.op);
-                try std.testing.expectEqualStrings("tenant_id", operation.column.generated.?.field.?);
+                try expectGeneratedUnaryExpressionForTest(operation.column.generated.?, .upper, "tenant_id");
             },
             else => return error.TestUnexpectedResult,
         },
@@ -23947,6 +26774,38 @@ test "sql adapter ddl plan lowers catalog-only ddl plans" {
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
     try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &corrupt_generated_table_clone_option));
+
+    var corrupt_generated_table_clone_action = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE IF NOT EXISTS users_copy (LIKE users INCLUDING ALL EXCLUDING COMMENTS);");
+    defer corrupt_generated_table_clone_action.deinit(alloc);
+    if (corrupt_generated_table_clone_action.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    if (ddl.create_table_like_option_action_items.len == 0) return error.TestUnexpectedResult;
+                    ddl.create_table_like_option_action_items[0].end += 1;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &corrupt_generated_table_clone_action));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &corrupt_generated_table_clone_action, .{}));
+
+    var corrupt_generated_table_clone_option_name = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE IF NOT EXISTS users_copy (LIKE users INCLUDING ALL EXCLUDING COMMENTS);");
+    defer corrupt_generated_table_clone_option_name.deinit(alloc);
+    if (corrupt_generated_table_clone_option_name.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    if (ddl.create_table_like_option_name_items.len < 2) return error.TestUnexpectedResult;
+                    ddl.create_table_like_option_name_items[1].start -= 1;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &corrupt_generated_table_clone_option_name));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &corrupt_generated_table_clone_option_name, .{}));
 
     var create_view = try runtimeDdlPlanForTestAlloc(alloc, "CREATE VIEW users_v(user_id, contact_email) AS SELECT id, email FROM users;");
     defer create_view.deinit(alloc);
@@ -24580,7 +27439,7 @@ test "sql adapter ddl plan lowers routine catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var create_procedure = try runtimeDdlPlanForTestAlloc(alloc, "CREATE PROCEDURE rotate_usage_perform() LANGUAGE plpgsql AS $$BEGIN PERFORM rotate_usage_now(); END$$;");
+    var create_procedure = try runtimeDdlPlanForTestAlloc(alloc, "CREATE PROCEDURE rotate_usage_perform() LANGUAGE plpgsql AS $$BEGIN PERFORM rotate_usage_now(1); END$$;");
     defer create_procedure.deinit(alloc);
     switch (create_procedure) {
         .function_catalog => |plan| switch (plan) {
@@ -24593,7 +27452,8 @@ test "sql adapter ddl plan lowers routine catalog ddl plans" {
                 try std.testing.expectEqual(RoutineExecutionHook.procedure_noop, body.hook);
                 try std.testing.expectEqual(@as(usize, 1), body.perform_calls.len);
                 try std.testing.expectEqualStrings("rotate_usage_now", body.perform_calls[0].routine_name);
-                try std.testing.expectEqual(@as(usize, 0), body.perform_calls[0].argument_json.len);
+                try std.testing.expectEqual(@as(usize, 1), body.perform_calls[0].argument_json.len);
+                try std.testing.expectEqualStrings("1", body.perform_calls[0].argument_json[0]);
             },
             else => return error.TestUnexpectedResult,
         },
@@ -24853,6 +27713,25 @@ test "sql adapter ddl plan lowers routine catalog ddl plans" {
     } else return error.TestUnexpectedResult;
     try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &corrupt_create_routine_body_kind));
 
+    var corrupt_create_routine_body_expression = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "CREATE FUNCTION audit_sql_body() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;",
+    );
+    defer corrupt_create_routine_body_expression.deinit(alloc);
+    if (corrupt_create_routine_body_expression.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    const routine_metadata = ddl.routine_metadata orelse return error.TestUnexpectedResult;
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 0, .end = 1 }, routine_metadata.body_expression.tokens.?);
+                    routine_metadata.body_expression.tokens = .{ .start = 0, .end = 0 };
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &corrupt_create_routine_body_expression));
+
     var corrupt_create_routine_body_hook = try tokenized.ParsedSql.initAlloc(
         alloc,
         "CREATE FUNCTION audit_perform_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN PERFORM audit_log(); RETURN NEW; END$$;",
@@ -24974,8 +27853,7 @@ test "sql adapter ddl plan lowers routine catalog ddl plans" {
     } else return error.TestUnexpectedResult;
     try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_drop_routine_cascade));
 
-    var duplicate_support_function = try runtimeDdlPlanForTestAlloc(alloc, "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql SUPPORT audit_support SUPPORT audit_support;");
-    defer duplicate_support_function.deinit(alloc);
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanForTestAlloc(alloc, "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql SUPPORT audit_support SUPPORT audit_support;"));
     var create_procedure_arg = try runtimeDdlPlanForTestAlloc(alloc, "CREATE PROCEDURE rotate_usage_perform_arg() LANGUAGE plpgsql AS $$BEGIN PERFORM rotate_usage_now(1); END$$;");
     defer create_procedure_arg.deinit(alloc);
     switch (create_procedure_arg) {
@@ -25344,6 +28222,21 @@ test "sql adapter ddl plan lowers partition and row security catalog ddl plans" 
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
     try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &corrupt_partition_key));
+
+    var corrupt_partition_key_name = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE usage_events (tenant_id text, id uuid, created_at timestamptz, PRIMARY KEY (tenant_id, id)) PARTITION BY RANGE (created_at);");
+    defer corrupt_partition_key_name.deinit(alloc);
+    if (corrupt_partition_key_name.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    if (ddl.create_table_partition_key_name_items.len == 0) return error.TestUnexpectedResult;
+                    ddl.create_table_partition_key_name_items[0].start -= 1;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &corrupt_partition_key_name));
 
     var create_table_partition = try runtimeDdlPlanForTestAlloc(alloc, "CREATE TABLE usage_events_2026 PARTITION OF usage_events FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');");
     defer create_table_partition.deinit(alloc);
@@ -27278,39 +30171,23 @@ test "sql adapter generated session AST lowers to session catalog plans" {
 
     var generated_search_path = try generatedSessionCatalogPlanForTestAlloc(alloc, "SET search_path TO public;");
     defer generated_search_path.deinit(alloc);
-    var legacy_search_path = try runtimeDdlPlanForTestAlloc(alloc, "SET search_path TO public;");
-    defer legacy_search_path.deinit(alloc);
     switch (generated_search_path) {
-        .set_search_path => |generated| switch (legacy_search_path) {
-            .session_catalog => |legacy_plan| switch (legacy_plan) {
-                .set_search_path => |legacy| {
-                    try std.testing.expectEqual(legacy.local, generated.local);
-                    try std.testing.expectEqual(legacy.namespaces.len, generated.namespaces.len);
-                    try std.testing.expectEqualStrings(legacy.namespaces[0], generated.namespaces[0]);
-                },
-                else => return error.TestUnexpectedResult,
-            },
-            else => return error.TestUnexpectedResult,
+        .set_search_path => |generated| {
+            try std.testing.expect(!generated.local);
+            try std.testing.expectEqual(@as(usize, 1), generated.namespaces.len);
+            try std.testing.expectEqualStrings("public", generated.namespaces[0]);
         },
         else => return error.TestUnexpectedResult,
     }
 
     var generated_setting = try generatedSessionCatalogPlanForTestAlloc(alloc, "SET app.tenant_id = 'tenant-a';");
     defer generated_setting.deinit(alloc);
-    var legacy_setting = try runtimeDdlPlanForTestAlloc(alloc, "SET app.tenant_id = 'tenant-a';");
-    defer legacy_setting.deinit(alloc);
     switch (generated_setting) {
-        .set_setting => |generated| switch (legacy_setting) {
-            .session_catalog => |legacy_plan| switch (legacy_plan) {
-                .set_setting => |legacy| {
-                    try std.testing.expectEqualStrings(legacy.name, generated.name);
-                    try std.testing.expectEqualStrings(legacy.value, generated.value);
-                    try std.testing.expectEqual(legacy.kind, generated.kind);
-                    try std.testing.expectEqual(legacy.local, generated.local);
-                },
-                else => return error.TestUnexpectedResult,
-            },
-            else => return error.TestUnexpectedResult,
+        .set_setting => |generated| {
+            try std.testing.expectEqualStrings("app.tenant_id", generated.name);
+            try std.testing.expectEqualStrings("tenant-a", generated.value);
+            try std.testing.expectEqual(SessionSettingKind.app, generated.kind);
+            try std.testing.expect(!generated.local);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -27354,18 +30231,10 @@ test "sql adapter generated session AST lowers to session catalog plans" {
 
     var generated_reset = try generatedSessionCatalogPlanForTestAlloc(alloc, "RESET app.tenant_id;");
     defer generated_reset.deinit(alloc);
-    var legacy_reset = try runtimeDdlPlanForTestAlloc(alloc, "RESET app.tenant_id;");
-    defer legacy_reset.deinit(alloc);
     switch (generated_reset) {
-        .reset_setting => |generated| switch (legacy_reset) {
-            .session_catalog => |legacy_plan| switch (legacy_plan) {
-                .reset_setting => |legacy| {
-                    try std.testing.expectEqualStrings(legacy.name, generated.name);
-                    try std.testing.expectEqual(legacy.kind, generated.kind);
-                },
-                else => return error.TestUnexpectedResult,
-            },
-            else => return error.TestUnexpectedResult,
+        .reset_setting => |generated| {
+            try std.testing.expectEqualStrings("app.tenant_id", generated.name);
+            try std.testing.expectEqual(SessionSettingKind.app, generated.kind);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -27394,13 +30263,7 @@ test "sql adapter generated session AST lowers to session catalog plans" {
     for (tag_cases) |case| {
         var generated = try generatedSessionCatalogPlanForTestAlloc(alloc, case.sql);
         defer generated.deinit(alloc);
-        var legacy = try runtimeDdlPlanForTestAlloc(alloc, case.sql);
-        defer legacy.deinit(alloc);
         try std.testing.expectEqual(case.tag, std.meta.activeTag(generated));
-        switch (legacy) {
-            .session_catalog => |legacy_plan| try std.testing.expectEqual(std.meta.activeTag(legacy_plan), std.meta.activeTag(generated)),
-            else => return error.TestUnexpectedResult,
-        }
     }
 }
 
@@ -27529,6 +30392,55 @@ test "sql adapter ddl plan lowers transaction control and protocol ddl plans" {
         },
         else => return error.TestUnexpectedResult,
     }
+
+    var two_key_advisory_lock = try runtimeDdlPlanForTestAlloc(alloc, "SELECT pg_advisory_lock(-42, 7);");
+    defer two_key_advisory_lock.deinit(alloc);
+    switch (two_key_advisory_lock) {
+        .transaction_control => |plan| switch (plan) {
+            .advisory_lock => |lock| {
+                try std.testing.expectEqual(AdvisoryLockAction.lock, lock.action);
+                try std.testing.expectEqual(@as(i64, -42), lock.key1);
+                try std.testing.expectEqual(@as(i64, 7), lock.key2.?);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+const GeneratedAdvisoryLockAstMutation = enum {
+    stale_projection_expression,
+    missing_function_name,
+    missing_argument_expression,
+    non_integer_argument,
+};
+
+fn expectGeneratedAdvisoryLockAstMutationFails(
+    alloc: std.mem.Allocator,
+    mutation: GeneratedAdvisoryLockAstMutation,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, "SELECT pg_advisory_lock(-42, 7);");
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| switch (mutation) {
+                .stale_projection_expression => read.projection_items.expression_items[0].start += 1,
+                .missing_function_name => read.projection_items.expressions[0].function_name_tokens = null,
+                .missing_argument_expression => read.projection_items.expressions[0].argument_items.expression_items = &.{},
+                .non_integer_argument => read.projection_items.expressions[0].argument_items.expressions[0].kind = .function_call,
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed, .{}));
+}
+
+test "sql adapter generated advisory lock AST fails closed at public boundary" {
+    const alloc = std.testing.allocator;
+    try expectGeneratedAdvisoryLockAstMutationFails(alloc, .stale_projection_expression);
+    try expectGeneratedAdvisoryLockAstMutationFails(alloc, .missing_function_name);
+    try expectGeneratedAdvisoryLockAstMutationFails(alloc, .missing_argument_expression);
+    try expectGeneratedAdvisoryLockAstMutationFails(alloc, .non_integer_argument);
 }
 
 test "sql adapter generated transaction AST lowers to transaction boundary plans" {
@@ -27553,16 +30465,8 @@ test "sql adapter generated transaction AST lowers to transaction boundary plans
     };
     for (cases) |case| {
         const generated = try generatedTransactionBoundaryPlanForTestAlloc(alloc, case.sql);
-        var legacy = try runtimeDdlPlanForTestAlloc(alloc, case.sql);
-        defer legacy.deinit(alloc);
         switch (generated) {
-            .transaction_boundary => |generated_boundary| switch (legacy) {
-                .transaction_boundary => |legacy_boundary| {
-                    try std.testing.expectEqual(case.action, generated_boundary.action);
-                    try std.testing.expectEqual(legacy_boundary.action, generated_boundary.action);
-                },
-                else => return error.TestUnexpectedResult,
-            },
+            .transaction_boundary => |generated_boundary| try std.testing.expectEqual(case.action, generated_boundary.action),
             else => return error.TestUnexpectedResult,
         }
     }
@@ -27664,31 +30568,24 @@ test "sql adapter generated transaction AST lowers to transaction mode plans" {
 
     for (cases) |case| {
         const generated = try generatedTransactionControlPlanForTestAlloc(alloc, case.sql);
-        var legacy = try runtimeDdlPlanForTestAlloc(alloc, case.sql);
-        defer legacy.deinit(alloc);
         switch (generated) {
             .transaction_control => |generated_control| switch (generated_control) {
-                .transaction_mode => |generated_mode| switch (legacy) {
-                    .transaction_control => |legacy_control| switch (legacy_control) {
-                        .transaction_mode => |legacy_mode| {
-                            try std.testing.expectEqual(legacy_mode.starter, generated_mode.starter);
-                            try std.testing.expectEqual(legacy_mode.isolation_level, generated_mode.isolation_level);
-                            try std.testing.expectEqual(legacy_mode.access_mode, generated_mode.access_mode);
-                            try std.testing.expectEqual(legacy_mode.deferrable, generated_mode.deferrable);
-                            try std.testing.expectEqual(case.starter, generated_mode.starter);
-                            try std.testing.expectEqual(case.isolation_level, generated_mode.isolation_level);
-                            try std.testing.expectEqual(case.access_mode, generated_mode.access_mode);
-                            try std.testing.expectEqual(case.deferrable, generated_mode.deferrable);
-                        },
-                        else => return error.TestUnexpectedResult,
-                    },
-                    else => return error.TestUnexpectedResult,
+                .transaction_mode => |generated_mode| {
+                    try std.testing.expectEqual(case.starter, generated_mode.starter);
+                    try std.testing.expectEqual(case.isolation_level, generated_mode.isolation_level);
+                    try std.testing.expectEqual(case.access_mode, generated_mode.access_mode);
+                    try std.testing.expectEqual(case.deferrable, generated_mode.deferrable);
                 },
                 else => return error.TestUnexpectedResult,
             },
             else => return error.TestUnexpectedResult,
         }
     }
+
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        runtimeDdlPlanForTestAlloc(alloc, "SET TRANSACTION READ ONLY READ WRITE;"),
+    );
 
     var missing_mode = try tokenized.ParsedSql.initAlloc(alloc, "SET TRANSACTION READ ONLY;");
     defer missing_mode.deinit(alloc);
@@ -27703,6 +30600,19 @@ test "sql adapter generated transaction AST lowers to transaction mode plans" {
         transactionControlPlanFromGeneratedAstAlloc(alloc, missing_mode.items(), missing_mode_ast),
     );
 
+    var stale_mode_end = try tokenized.ParsedSql.initAlloc(alloc, "SET TRANSACTION READ ONLY;");
+    defer stale_mode_end.deinit(alloc);
+    const stale_mode_end_raw = stale_mode_end.generated_statement orelse return error.TestUnexpectedResult;
+    var stale_mode_end_ast = switch (stale_mode_end_raw.ast orelse return error.TestUnexpectedResult) {
+        .transaction => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    stale_mode_end_ast.mode_tokens.?.end += 1;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        transactionControlPlanFromGeneratedAstAlloc(alloc, stale_mode_end.items(), stale_mode_end_ast),
+    );
+
     var malformed_mode = try tokenized.ParsedSql.initAlloc(alloc, "BEGIN READ ONLY;");
     defer malformed_mode.deinit(alloc);
     const malformed_mode_raw = malformed_mode.generated_statement orelse return error.TestUnexpectedResult;
@@ -27714,6 +30624,66 @@ test "sql adapter generated transaction AST lowers to transaction mode plans" {
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         transactionControlPlanFromGeneratedAstAlloc(alloc, malformed_mode.items(), malformed_mode_ast),
+    );
+}
+
+test "sql adapter generated transaction AST lowers to constraint mode plans" {
+    const alloc = std.testing.allocator;
+
+    var generated_named = try generatedTransactionControlPlanForTestAlloc(alloc, "SET CONSTRAINTS public.fk_usage_account, fk_usage_org DEFERRED;");
+    defer generated_named.deinit(alloc);
+    switch (generated_named) {
+        .transaction_control => |control| switch (control) {
+            .constraint_mode => |constraints| {
+                try std.testing.expect(!constraints.all);
+                try std.testing.expectEqual(@as(usize, 2), constraints.constraint_names.len);
+                try std.testing.expectEqualStrings("fk_usage_account", constraints.constraint_names[0]);
+                try std.testing.expectEqualStrings("fk_usage_org", constraints.constraint_names[1]);
+                try std.testing.expectEqual(ConstraintCheckMode.deferred, constraints.mode);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var generated_all = try generatedTransactionControlPlanForTestAlloc(alloc, "SET CONSTRAINTS ALL IMMEDIATE;");
+    defer generated_all.deinit(alloc);
+    switch (generated_all) {
+        .transaction_control => |control| switch (control) {
+            .constraint_mode => |constraints| {
+                try std.testing.expect(constraints.all);
+                try std.testing.expectEqual(@as(usize, 0), constraints.constraint_names.len);
+                try std.testing.expectEqual(ConstraintCheckMode.immediate, constraints.mode);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var missing_metadata = try tokenized.ParsedSql.initAlloc(alloc, "SET CONSTRAINTS ALL DEFERRED;");
+    defer missing_metadata.deinit(alloc);
+    const missing_metadata_raw = missing_metadata.generated_statement orelse return error.TestUnexpectedResult;
+    var missing_metadata_ast = switch (missing_metadata_raw.ast orelse return error.TestUnexpectedResult) {
+        .transaction => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    missing_metadata_ast.constraint_mode = null;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        transactionControlPlanFromGeneratedAstAlloc(alloc, missing_metadata.items(), missing_metadata_ast),
+    );
+
+    var malformed_name = try tokenized.ParsedSql.initAlloc(alloc, "SET CONSTRAINTS usage_fk DEFERRED;");
+    defer malformed_name.deinit(alloc);
+    const malformed_name_raw = malformed_name.generated_statement orelse return error.TestUnexpectedResult;
+    var malformed_name_ast = switch (malformed_name_raw.ast orelse return error.TestUnexpectedResult) {
+        .transaction => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    malformed_name_ast.constraint_name_items[0].start = 1;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        transactionControlPlanFromGeneratedAstAlloc(alloc, malformed_name.items(), malformed_name_ast),
     );
 }
 
@@ -27734,27 +30704,15 @@ test "sql adapter generated savepoint transaction AST lowers to savepoint plans"
     for (cases) |case| {
         var generated = try generatedTransactionControlPlanForTestAlloc(alloc, case.sql);
         defer generated.deinit(alloc);
-        var legacy = try runtimeDdlPlanForTestAlloc(alloc, case.sql);
-        defer legacy.deinit(alloc);
         switch (generated) {
-            .savepoint_transaction => |generated_savepoint| switch (legacy) {
-                .savepoint_transaction => |legacy_savepoint| {
-                    try std.testing.expectEqual(case.tag, std.meta.activeTag(generated_savepoint));
-                    try std.testing.expectEqual(std.meta.activeTag(legacy_savepoint), std.meta.activeTag(generated_savepoint));
-                    const generated_name = switch (generated_savepoint) {
-                        .savepoint => |savepoint| savepoint.savepoint_name,
-                        .release => |release| release.savepoint_name,
-                        .rollback_to => |rollback| rollback.savepoint_name,
-                    };
-                    const legacy_name = switch (legacy_savepoint) {
-                        .savepoint => |savepoint| savepoint.savepoint_name,
-                        .release => |release| release.savepoint_name,
-                        .rollback_to => |rollback| rollback.savepoint_name,
-                    };
-                    try std.testing.expectEqualStrings(legacy_name, generated_name);
-                    try std.testing.expectEqualStrings("before_retry", generated_name);
-                },
-                else => return error.TestUnexpectedResult,
+            .savepoint_transaction => |generated_savepoint| {
+                try std.testing.expectEqual(case.tag, std.meta.activeTag(generated_savepoint));
+                const generated_name = switch (generated_savepoint) {
+                    .savepoint => |savepoint| savepoint.savepoint_name,
+                    .release => |release| release.savepoint_name,
+                    .rollback_to => |rollback| rollback.savepoint_name,
+                };
+                try std.testing.expectEqualStrings("before_retry", generated_name);
             },
             else => return error.TestUnexpectedResult,
         }
@@ -27803,22 +30761,10 @@ test "sql adapter generated simple DDL AST lowers to catalog plans" {
     for (cases) |sql| {
         var generated = try generatedSimpleDdlPlanForTestAlloc(alloc, sql);
         defer generated.deinit(alloc);
-        var legacy = try runtimeDdlPlanForTestAlloc(alloc, sql);
-        defer legacy.deinit(alloc);
-        try std.testing.expectEqual(std.meta.activeTag(legacy), std.meta.activeTag(generated));
         switch (generated) {
-            .database_catalog => |generated_plan| switch (legacy) {
-                .database_catalog => |legacy_plan| try std.testing.expectEqual(std.meta.activeTag(legacy_plan), std.meta.activeTag(generated_plan)),
-                else => return error.TestUnexpectedResult,
-            },
-            .schema_namespace_catalog => |generated_plan| switch (legacy) {
-                .schema_namespace_catalog => |legacy_plan| try std.testing.expectEqual(std.meta.activeTag(legacy_plan), std.meta.activeTag(generated_plan)),
-                else => return error.TestUnexpectedResult,
-            },
-            .extension_catalog => |generated_plan| switch (legacy) {
-                .extension_catalog => |legacy_plan| try std.testing.expectEqual(std.meta.activeTag(legacy_plan), std.meta.activeTag(generated_plan)),
-                else => return error.TestUnexpectedResult,
-            },
+            .database_catalog => {},
+            .schema_namespace_catalog => {},
+            .extension_catalog => {},
             else => return error.TestUnexpectedResult,
         }
     }
@@ -28245,6 +31191,215 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
         else => return error.TestUnexpectedResult,
     }
 
+    var missing_generated_create_table_items = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text PRIMARY KEY, status text NOT NULL);");
+    defer missing_generated_create_table_items.deinit(alloc);
+    if (missing_generated_create_table_items.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    ddl.alter_table_operation_items = .{};
+                    ddl.alter_table_operation_tokens = null;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_generated_create_table_items));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_generated_create_table_items, .{}));
+
+    var corrupt_generated_create_table_item = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text PRIMARY KEY, status text NOT NULL);");
+    defer corrupt_generated_create_table_item.deinit(alloc);
+    if (corrupt_generated_create_table_item.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    if (ddl.alter_table_operation_items.first_tokens) |*first_item| {
+                        first_item.start += 1;
+                    } else return error.TestUnexpectedResult;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &corrupt_generated_create_table_item));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &corrupt_generated_create_table_item, .{}));
+
+    var stale_generated_create_table_count = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text PRIMARY KEY, status text NOT NULL);");
+    defer stale_generated_create_table_count.deinit(alloc);
+    if (stale_generated_create_table_count.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| ddl.alter_table_operation_items.count -= 1,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_generated_create_table_count));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &stale_generated_create_table_count, .{}));
+
+    var stale_generated_create_table_second_item = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text PRIMARY KEY, status text NOT NULL);");
+    defer stale_generated_create_table_second_item.deinit(alloc);
+    if (stale_generated_create_table_second_item.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| ddl.alter_table_operation_items.items[1].start += 1,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_generated_create_table_second_item));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &stale_generated_create_table_second_item, .{}));
+
+    var runtime_generated_column_table = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text, status_key text GENERATED ALWAYS AS (lower(id)) STORED);");
+    defer runtime_generated_column_table.deinit(alloc);
+    var runtime_generated_column_table_plan = try runtimeDdlPlanParsedSqlAlloc(alloc, &runtime_generated_column_table);
+    defer runtime_generated_column_table_plan.deinit(alloc);
+    switch (runtime_generated_column_table_plan) {
+        .create_table => |plan| {
+            try std.testing.expectEqual(@as(usize, 2), plan.columns.len);
+            try std.testing.expectEqualStrings("status_key", plan.columns[1].name);
+            try std.testing.expect(plan.columns[1].generated != null);
+            try expectGeneratedUnaryExpressionForTest(plan.columns[1].generated.?, .lower, "id");
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var missing_generated_column_expression = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text, status_key text GENERATED ALWAYS AS (lower(id)) STORED);");
+    defer missing_generated_column_expression.deinit(alloc);
+    if (missing_generated_column_expression.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    if (ddl.alter_table_operation_generated_expression_items.len < 2) return error.TestUnexpectedResult;
+                    ddl.alter_table_operation_generated_expression_items[1] = null;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_generated_column_expression));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_generated_column_expression, .{}));
+
+    var missing_generated_column_clause = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text, status_key text GENERATED ALWAYS AS (lower(id)) STORED);");
+    defer missing_generated_column_clause.deinit(alloc);
+    if (missing_generated_column_clause.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    if (ddl.alter_table_operation_column_generated_clause_items.len < 2) return error.TestUnexpectedResult;
+                    ddl.alter_table_operation_column_generated_clause_items[1] = null;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_generated_column_clause));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_generated_column_clause, .{}));
+
+    var stale_generated_column_expression = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text, status_key text GENERATED ALWAYS AS (lower(id)) STORED);");
+    defer stale_generated_column_expression.deinit(alloc);
+    if (stale_generated_column_expression.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    if (ddl.alter_table_operation_generated_expression_items.len < 2) return error.TestUnexpectedResult;
+                    ddl.alter_table_operation_generated_expression_items[1].?.start += 1;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_generated_column_expression));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &stale_generated_column_expression, .{}));
+
+    var runtime_create_table_relational_tail = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records_tail (id text PRIMARY KEY) WITH (antfly.storage_mode = 'relational') WITH SYSTEM VERSIONING;");
+    defer runtime_create_table_relational_tail.deinit(alloc);
+    var runtime_create_table_relational_tail_plan = try runtimeDdlPlanParsedSqlAlloc(alloc, &runtime_create_table_relational_tail);
+    defer runtime_create_table_relational_tail_plan.deinit(alloc);
+    switch (runtime_create_table_relational_tail_plan) {
+        .create_table => |plan| {
+            try std.testing.expectEqualStrings("generated_usage_records_tail", plan.table_name);
+            try std.testing.expectEqual(runtime_schema.StorageMode.relational, plan.storage_mode);
+            try std.testing.expect(plan.system_versioned);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var missing_generated_create_table_storage_tail = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records_tail (id text PRIMARY KEY) WITH (antfly.storage_mode = 'relational');");
+    defer missing_generated_create_table_storage_tail.deinit(alloc);
+    if (missing_generated_create_table_storage_tail.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| ddl.create_table_storage_parameter_tokens = null,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_generated_create_table_storage_tail));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_generated_create_table_storage_tail, .{}));
+
+    var corrupt_generated_create_table_storage_item = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records_tail (id text PRIMARY KEY) WITH (antfly.storage_mode = 'relational');");
+    defer corrupt_generated_create_table_storage_item.deinit(alloc);
+    if (corrupt_generated_create_table_storage_item.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    if (ddl.create_table_storage_parameter_items.first_tokens) |*first_item| {
+                        first_item.start += 1;
+                    } else return error.TestUnexpectedResult;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &corrupt_generated_create_table_storage_item));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &corrupt_generated_create_table_storage_item, .{}));
+
+    var corrupt_generated_create_table_storage_name = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records_tail (id text PRIMARY KEY) WITH (antfly.storage_mode = 'relational');");
+    defer corrupt_generated_create_table_storage_name.deinit(alloc);
+    if (corrupt_generated_create_table_storage_name.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    if (ddl.create_table_storage_parameter_name_items.len == 0) return error.TestUnexpectedResult;
+                    ddl.create_table_storage_parameter_name_items[0].end += 1;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &corrupt_generated_create_table_storage_name));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &corrupt_generated_create_table_storage_name, .{}));
+
+    var corrupt_generated_create_table_storage_value = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records_tail (id text PRIMARY KEY) WITH (antfly.storage_mode = 'relational');");
+    defer corrupt_generated_create_table_storage_value.deinit(alloc);
+    if (corrupt_generated_create_table_storage_value.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    if (ddl.create_table_storage_parameter_value_items.len == 0) return error.TestUnexpectedResult;
+                    ddl.create_table_storage_parameter_value_items[0].start -= 1;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &corrupt_generated_create_table_storage_value));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &corrupt_generated_create_table_storage_value, .{}));
+
+    var missing_generated_create_table_system_tail = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records_tail (id text PRIMARY KEY) WITH SYSTEM VERSIONING;");
+    defer missing_generated_create_table_system_tail.deinit(alloc);
+    if (missing_generated_create_table_system_tail.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| ddl.create_table_system_versioned_tokens = null,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_generated_create_table_system_tail));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_generated_create_table_system_tail, .{}));
+
     var runtime_create_table_check = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text PRIMARY KEY, status text, CONSTRAINT generated_usage_records_status_check CHECK (status != 'deleted'));");
     defer runtime_create_table_check.deinit(alloc);
     var runtime_create_table_check_plan = try runtimeDdlPlanParsedSqlAlloc(alloc, &runtime_create_table_check);
@@ -28269,6 +31424,19 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
             try std.testing.expectEqual(RelationLifetimeKind.temporary, plan.kind);
             try std.testing.expectEqualStrings("generated_usage_session_records", plan.create_table.table_name);
             try std.testing.expectEqual(@as(usize, 2), plan.create_table.columns.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var runtime_temp_table_relational_tail = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TEMP TABLE generated_usage_session_records_tail (id text PRIMARY KEY) WITH (antfly.storage_mode = 'relational') WITH SYSTEM VERSIONING;");
+    defer runtime_temp_table_relational_tail.deinit(alloc);
+    var runtime_temp_table_relational_tail_plan = try runtimeDdlPlanParsedSqlAlloc(alloc, &runtime_temp_table_relational_tail);
+    defer runtime_temp_table_relational_tail_plan.deinit(alloc);
+    switch (runtime_temp_table_relational_tail_plan) {
+        .relation_lifetime => |plan| {
+            try std.testing.expectEqual(RelationLifetimeKind.temporary, plan.kind);
+            try std.testing.expectEqual(runtime_schema.StorageMode.relational, plan.create_table.storage_mode);
+            try std.testing.expect(plan.create_table.system_versioned);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -28569,13 +31737,22 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
     try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &corrupt_create_index_elements, .{}));
 
     try expectGeneratedIndexAstMutationFails(alloc, "CREATE UNIQUE INDEX generated_usage_status_idx ON generated_usage_records (status) INCLUDE (tenant_id);", .missing_include);
+    try expectGeneratedIndexAstMutationFails(alloc, "CREATE UNIQUE INDEX generated_usage_status_idx ON generated_usage_records (status) INCLUDE (tenant_id);", .missing_element_items);
+    try expectGeneratedIndexAstMutationFails(alloc, "CREATE UNIQUE INDEX generated_usage_status_idx ON generated_usage_records (status) INCLUDE (tenant_id);", .corrupt_element_expression);
+    try expectGeneratedIndexAstMutationFails(alloc, "CREATE UNIQUE INDEX generated_usage_lower_email_key ON generated_usage_records (lower(email));", .corrupt_element_expression);
+    try expectGeneratedIndexAstMutationFails(alloc, "CREATE INDEX generated_usage_status_replace_idx ON generated_usage_records (replace(status, 'old', 'new'));", .corrupt_element_expression);
+    try expectGeneratedIndexAstMutationFails(alloc, "CREATE UNIQUE INDEX generated_prices_sku_valid_time_key ON generated_prices (sku, valid_time WITHOUT OVERLAPS);", .corrupt_element_expression);
+    try expectGeneratedIndexAstMutationFails(alloc, "CREATE UNIQUE INDEX generated_usage_status_idx ON generated_usage_records (status) INCLUDE (tenant_id);", .missing_include_items);
     try expectGeneratedIndexAstMutationFails(alloc, "CREATE UNIQUE INDEX generated_usage_status_idx ON generated_usage_records (status) INCLUDE (tenant_id);", .corrupt_include);
     try expectGeneratedIndexAstMutationFails(alloc, "CREATE INDEX generated_usage_status_idx ON generated_usage_records (status);", .stale_include);
     try expectGeneratedIndexAstMutationFails(alloc, "CREATE INDEX docs_body_fts ON docs USING antfly_full_text (body) WITH (analyzer = 'standard');", .missing_options);
     try expectGeneratedIndexAstMutationFails(alloc, "CREATE INDEX docs_body_fts ON docs USING antfly_full_text (body) WITH (analyzer = 'standard');", .corrupt_options);
+    try expectGeneratedIndexAstMutationFails(alloc, "CREATE INDEX docs_body_fts ON docs USING antfly_full_text (body) WITH (analyzer = 'standard');", .corrupt_element_expression);
     try expectGeneratedIndexAstMutationFails(alloc, "CREATE INDEX generated_usage_status_idx ON generated_usage_records (status);", .stale_options);
     try expectGeneratedIndexAstMutationFails(alloc, "CREATE UNIQUE INDEX generated_usage_active_status_idx ON generated_usage_records (status) WHERE status = 'active';", .missing_where);
     try expectGeneratedIndexAstMutationFails(alloc, "CREATE UNIQUE INDEX generated_usage_active_status_idx ON generated_usage_records (status) WHERE status = 'active';", .corrupt_where);
+    try expectGeneratedIndexAstMutationFails(alloc, "CREATE UNIQUE INDEX generated_usage_active_status_idx ON generated_usage_records (status) WHERE status = 'active';", .corrupt_where_expression);
+    try expectGeneratedIndexAstMutationFails(alloc, "CREATE UNIQUE INDEX generated_usage_lower_status_idx ON generated_usage_records (status) WHERE lower(status) = 'active';", .corrupt_where_expression);
     try expectGeneratedIndexAstMutationFails(alloc, "CREATE INDEX generated_usage_status_idx ON generated_usage_records (status);", .stale_where);
     try expectGeneratedIndexAstMutationFails(alloc, "CREATE UNIQUE INDEX generated_usage_status_idx ON generated_usage_records (status);", .stale_unique);
     try expectGeneratedIndexAstMutationFails(alloc, "CREATE INDEX IF NOT EXISTS generated_usage_status_idx ON generated_usage_records (status);", .stale_if_not_exists);
@@ -28617,6 +31794,26 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
         else => return error.TestUnexpectedResult,
     }
 
+    var runtime_range_expression_partial_index = try tokenized.ParsedSql.initAlloc(alloc, "CREATE UNIQUE INDEX generated_usage_positive_email_key ON generated_usage_records (email) WHERE amount > 0;");
+    defer runtime_range_expression_partial_index.deinit(alloc);
+    var runtime_range_expression_partial_index_plan = try runtimeDdlPlanParsedSqlAlloc(alloc, &runtime_range_expression_partial_index);
+    defer runtime_range_expression_partial_index_plan.deinit(alloc);
+    switch (runtime_range_expression_partial_index_plan) {
+        .create_index => |plan| {
+            try std.testing.expectEqualStrings("generated_usage_positive_email_key", plan.index_name);
+            try std.testing.expectEqualStrings("generated_usage_records", plan.table_name);
+            try std.testing.expect(plan.unique);
+            try std.testing.expectEqual(@as(usize, 1), plan.columns.len);
+            try std.testing.expectEqual(@as(usize, 0), plan.where.len);
+            try std.testing.expectEqual(@as(usize, 1), plan.where_expressions.len);
+            try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.field, plan.where_expressions[0].lhs.kind);
+            try std.testing.expectEqualStrings("amount", plan.where_expressions[0].lhs.field);
+            try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, plan.where_expressions[0].op);
+            try std.testing.expectEqualStrings("0", plan.where_expressions[0].rhs[0].value_json);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     var runtime_drop_index = try tokenized.ParsedSql.initAlloc(alloc, "DROP INDEX IF EXISTS generated_usage_status_idx RESTRICT;");
     defer runtime_drop_index.deinit(alloc);
     var runtime_drop_index_plan = try runtimeDdlPlanParsedSqlAlloc(alloc, &runtime_drop_index);
@@ -28649,6 +31846,529 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
         },
         else => return error.TestUnexpectedResult,
     }
+
+    var runtime_alter_rewrite = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ALTER COLUMN amount TYPE numeric USING amount + 1;");
+    defer runtime_alter_rewrite.deinit(alloc);
+    var runtime_alter_rewrite_plan = try runtimeDdlPlanParsedSqlAlloc(alloc, &runtime_alter_rewrite);
+    defer runtime_alter_rewrite_plan.deinit(alloc);
+    switch (runtime_alter_rewrite_plan) {
+        .alter_table => |plan| {
+            try std.testing.expectEqualStrings("generated_usage_records", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.operations.len);
+            switch (plan.operations[0]) {
+                .alter_column_type => |operation| {
+                    const rewrite = operation.rewrite_expression orelse return error.TestUnexpectedResult;
+                    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.add, rewrite.expression.kind);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var missing_alter_rewrite_expression = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ALTER COLUMN amount TYPE numeric USING amount + 1;");
+    defer missing_alter_rewrite_expression.deinit(alloc);
+    if (missing_alter_rewrite_expression.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+                    if (ddl.alter_table_operation_rewrite_expression_items.len == 0) return error.TestUnexpectedResult;
+                    ddl.alter_table_operation_rewrite_expression_items[0] = null;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_alter_rewrite_expression));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_alter_rewrite_expression, .{}));
+
+    var stale_alter_rewrite_expression = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ALTER COLUMN amount TYPE numeric USING amount + 1;");
+    defer stale_alter_rewrite_expression.deinit(alloc);
+    if (stale_alter_rewrite_expression.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+                    if (ddl.alter_table_operation_rewrite_expression_items.len == 0) return error.TestUnexpectedResult;
+                    ddl.alter_table_operation_rewrite_expression_items[0].?.start += 1;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_alter_rewrite_expression));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &stale_alter_rewrite_expression, .{}));
+
+    var missing_create_table_column_name = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text, status text DEFAULT 'pending');");
+    defer missing_create_table_column_name.deinit(alloc);
+    if (missing_create_table_column_name.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl.kind);
+                    if (ddl.alter_table_operation_column_name_items.len != 2) return error.TestUnexpectedResult;
+                    if (ddl.alter_table_operation_column_type_items.len != 2) return error.TestUnexpectedResult;
+                    try std.testing.expect(ddl.alter_table_operation_column_name_items[1] != null);
+                    try std.testing.expect(ddl.alter_table_operation_column_type_items[1] != null);
+                    ddl.alter_table_operation_column_name_items[1] = null;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_create_table_column_name));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_create_table_column_name, .{}));
+
+    var stale_add_column_type = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD COLUMN status text DEFAULT 'pending';");
+    defer stale_add_column_type.deinit(alloc);
+    if (stale_add_column_type.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+                    if (ddl.alter_table_operation_column_type_items.len != 1) return error.TestUnexpectedResult;
+                    try std.testing.expect(ddl.alter_table_operation_column_type_items[0] != null);
+                    ddl.alter_table_operation_column_type_items[0].?.end += 1;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_add_column_type));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &stale_add_column_type, .{}));
+
+    var missing_create_table_nullability = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text NOT NULL, status text);");
+    defer missing_create_table_nullability.deinit(alloc);
+    if (missing_create_table_nullability.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl.kind);
+                    if (ddl.alter_table_operation_column_nullability_items.len != 2) return error.TestUnexpectedResult;
+                    try std.testing.expect(ddl.alter_table_operation_column_nullability_items[0] != null);
+                    ddl.alter_table_operation_column_nullability_items[0] = null;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_create_table_nullability));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_create_table_nullability, .{}));
+
+    var stale_add_column_nullability = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD COLUMN status text NOT NULL;");
+    defer stale_add_column_nullability.deinit(alloc);
+    if (stale_add_column_nullability.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+                    if (ddl.alter_table_operation_column_nullability_items.len != 1) return error.TestUnexpectedResult;
+                    try std.testing.expect(ddl.alter_table_operation_column_nullability_items[0] != null);
+                    ddl.alter_table_operation_column_nullability_items[0].?.end -= 1;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_add_column_nullability));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &stale_add_column_nullability, .{}));
+
+    var missing_create_table_collation = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text COLLATE \"C\", status text);");
+    defer missing_create_table_collation.deinit(alloc);
+    if (missing_create_table_collation.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl.kind);
+                    if (ddl.alter_table_operation_column_collation_items.len != 2) return error.TestUnexpectedResult;
+                    try std.testing.expect(ddl.alter_table_operation_column_collation_items[0] != null);
+                    ddl.alter_table_operation_column_collation_items[0] = null;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_create_table_collation));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_create_table_collation, .{}));
+
+    var stale_add_column_collation = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD COLUMN status text COLLATE \"C\";");
+    defer stale_add_column_collation.deinit(alloc);
+    if (stale_add_column_collation.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+                    if (ddl.alter_table_operation_column_collation_items.len != 1) return error.TestUnexpectedResult;
+                    try std.testing.expect(ddl.alter_table_operation_column_collation_items[0] != null);
+                    ddl.alter_table_operation_column_collation_items[0].?.end -= 1;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_add_column_collation));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &stale_add_column_collation, .{}));
+
+    var missing_create_table_constraint_kind = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text, CONSTRAINT generated_usage_status_key UNIQUE (status));");
+    defer missing_create_table_constraint_kind.deinit(alloc);
+    if (missing_create_table_constraint_kind.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl.kind);
+                    if (ddl.alter_table_operation_constraint_kind_items.len != 2) return error.TestUnexpectedResult;
+                    try std.testing.expect(ddl.alter_table_operation_constraint_kind_items[1] != null);
+                    ddl.alter_table_operation_constraint_kind_items[1] = null;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_create_table_constraint_kind));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_create_table_constraint_kind, .{}));
+
+    var stale_alter_table_constraint_name = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD CONSTRAINT generated_usage_status_key UNIQUE (status);");
+    defer stale_alter_table_constraint_name.deinit(alloc);
+    if (stale_alter_table_constraint_name.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+                    if (ddl.alter_table_operation_constraint_name_items.len != 1) return error.TestUnexpectedResult;
+                    try std.testing.expect(ddl.alter_table_operation_constraint_name_items[0] != null);
+                    ddl.alter_table_operation_constraint_name_items[0].?.start -= 1;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_alter_table_constraint_name));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &stale_alter_table_constraint_name, .{}));
+
+    var stale_alter_table_unique_include = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD CONSTRAINT generated_usage_status_key UNIQUE (tenant_id) INCLUDE (status) NOT VALID;");
+    defer stale_alter_table_unique_include.deinit(alloc);
+    if (stale_alter_table_unique_include.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+                    if (ddl.alter_table_operation_constraint_include_items.len != 1) return error.TestUnexpectedResult;
+                    try std.testing.expect(ddl.alter_table_operation_constraint_include_items[0] != null);
+                    ddl.alter_table_operation_constraint_include_items[0].?.end -= 1;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_alter_table_unique_include));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &stale_alter_table_unique_include, .{}));
+
+    var missing_alter_table_unique_not_valid = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD CONSTRAINT generated_usage_status_key UNIQUE (tenant_id) INCLUDE (status) NOT VALID;");
+    defer missing_alter_table_unique_not_valid.deinit(alloc);
+    if (missing_alter_table_unique_not_valid.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+                    if (ddl.alter_table_operation_constraint_not_valid_items.len != 1) return error.TestUnexpectedResult;
+                    try std.testing.expect(ddl.alter_table_operation_constraint_not_valid_items[0] != null);
+                    ddl.alter_table_operation_constraint_not_valid_items[0] = null;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_alter_table_unique_not_valid));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_alter_table_unique_not_valid, .{}));
+
+    var missing_alter_table_foreign_key_payload = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD CONSTRAINT generated_usage_tenant_fk FOREIGN KEY (tenant_id) REFERENCES tenants (id) NOT VALID;");
+    defer missing_alter_table_foreign_key_payload.deinit(alloc);
+    if (missing_alter_table_foreign_key_payload.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+                    if (ddl.alter_table_operation_foreign_key_payload_items.len != 1) return error.TestUnexpectedResult;
+                    try std.testing.expect(ddl.alter_table_operation_foreign_key_payload_items[0] != null);
+                    ddl.alter_table_operation_foreign_key_payload_items[0] = null;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_alter_table_foreign_key_payload));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_alter_table_foreign_key_payload, .{}));
+
+    var stale_alter_table_foreign_key_not_valid = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD CONSTRAINT generated_usage_tenant_fk FOREIGN KEY (tenant_id) REFERENCES tenants (id) NOT VALID;");
+    defer stale_alter_table_foreign_key_not_valid.deinit(alloc);
+    if (stale_alter_table_foreign_key_not_valid.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+                    if (ddl.alter_table_operation_foreign_key_not_valid_items.len != 1) return error.TestUnexpectedResult;
+                    try std.testing.expect(ddl.alter_table_operation_foreign_key_not_valid_items[0] != null);
+                    ddl.alter_table_operation_foreign_key_not_valid_items[0].?.end -= 1;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_alter_table_foreign_key_not_valid));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &stale_alter_table_foreign_key_not_valid, .{}));
+
+    var missing_alter_table_check_payload = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD CONSTRAINT generated_usage_amount_check CHECK (amount >= 0) NOT VALID;");
+    defer missing_alter_table_check_payload.deinit(alloc);
+    if (missing_alter_table_check_payload.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+                    if (ddl.alter_table_operation_check_payload_items.len != 1) return error.TestUnexpectedResult;
+                    try std.testing.expect(ddl.alter_table_operation_check_payload_items[0] != null);
+                    ddl.alter_table_operation_check_payload_items[0] = null;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_alter_table_check_payload));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_alter_table_check_payload, .{}));
+
+    var stale_alter_table_check_not_valid = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD CONSTRAINT generated_usage_amount_check CHECK (amount >= 0) NOT VALID;");
+    defer stale_alter_table_check_not_valid.deinit(alloc);
+    if (stale_alter_table_check_not_valid.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+                    if (ddl.alter_table_operation_check_not_valid_items.len != 1) return error.TestUnexpectedResult;
+                    try std.testing.expect(ddl.alter_table_operation_check_not_valid_items[0] != null);
+                    ddl.alter_table_operation_check_not_valid_items[0].?.end -= 1;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_alter_table_check_not_valid));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &stale_alter_table_check_not_valid, .{}));
+
+    var missing_create_table_inline_constraint_kind = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text CONSTRAINT generated_usage_id_pk PRIMARY KEY, status text UNIQUE);");
+    defer missing_create_table_inline_constraint_kind.deinit(alloc);
+    if (missing_create_table_inline_constraint_kind.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl.kind);
+                    if (ddl.alter_table_operation_inline_constraint_items.count != 2) return error.TestUnexpectedResult;
+                    if (ddl.alter_table_operation_inline_constraint_kind_items.len != 2) return error.TestUnexpectedResult;
+                    ddl.alter_table_operation_inline_constraint_kind_items[0].end -= 1;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_create_table_inline_constraint_kind));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_create_table_inline_constraint_kind, .{}));
+
+    var stale_create_table_inline_constraint_name = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text CONSTRAINT generated_usage_id_pk PRIMARY KEY, status text UNIQUE);");
+    defer stale_create_table_inline_constraint_name.deinit(alloc);
+    if (stale_create_table_inline_constraint_name.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl.kind);
+                    if (ddl.alter_table_operation_inline_constraint_name_items.len != 2) return error.TestUnexpectedResult;
+                    try std.testing.expect(ddl.alter_table_operation_inline_constraint_name_items[0] != null);
+                    ddl.alter_table_operation_inline_constraint_name_items[0].?.start -= 1;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_create_table_inline_constraint_name));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &stale_create_table_inline_constraint_name, .{}));
+
+    var missing_add_column_inline_foreign_key_payload = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD COLUMN tenant_id text REFERENCES tenants (id) NOT VALID;");
+    defer missing_add_column_inline_foreign_key_payload.deinit(alloc);
+    if (missing_add_column_inline_foreign_key_payload.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+                    if (ddl.alter_table_operation_inline_foreign_key_payload_items.len != 1) return error.TestUnexpectedResult;
+                    try std.testing.expect(ddl.alter_table_operation_inline_foreign_key_payload_items[0] != null);
+                    ddl.alter_table_operation_inline_foreign_key_payload_items[0] = null;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_add_column_inline_foreign_key_payload));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_add_column_inline_foreign_key_payload, .{}));
+
+    var stale_add_column_inline_foreign_key_not_valid = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD COLUMN tenant_id text REFERENCES tenants (id) NOT VALID;");
+    defer stale_add_column_inline_foreign_key_not_valid.deinit(alloc);
+    if (stale_add_column_inline_foreign_key_not_valid.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+                    if (ddl.alter_table_operation_inline_foreign_key_not_valid_items.len != 1) return error.TestUnexpectedResult;
+                    try std.testing.expect(ddl.alter_table_operation_inline_foreign_key_not_valid_items[0] != null);
+                    ddl.alter_table_operation_inline_foreign_key_not_valid_items[0].?.start -= 1;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_add_column_inline_foreign_key_not_valid));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &stale_add_column_inline_foreign_key_not_valid, .{}));
+
+    var missing_add_column_inline_check_payload = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD COLUMN amount int CHECK (amount >= 0) NOT VALID;");
+    defer missing_add_column_inline_check_payload.deinit(alloc);
+    if (missing_add_column_inline_check_payload.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+                    if (ddl.alter_table_operation_inline_check_payload_items.len != 1) return error.TestUnexpectedResult;
+                    try std.testing.expect(ddl.alter_table_operation_inline_check_payload_items[0] != null);
+                    ddl.alter_table_operation_inline_check_payload_items[0] = null;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_add_column_inline_check_payload));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_add_column_inline_check_payload, .{}));
+
+    var stale_add_column_inline_check_not_valid = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD COLUMN amount int CHECK (amount >= 0) NOT VALID;");
+    defer stale_add_column_inline_check_not_valid.deinit(alloc);
+    if (stale_add_column_inline_check_not_valid.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+                    if (ddl.alter_table_operation_inline_check_not_valid_items.len != 1) return error.TestUnexpectedResult;
+                    try std.testing.expect(ddl.alter_table_operation_inline_check_not_valid_items[0] != null);
+                    ddl.alter_table_operation_inline_check_not_valid_items[0].?.start -= 1;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_add_column_inline_check_not_valid));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &stale_add_column_inline_check_not_valid, .{}));
+
+    var stale_add_column_inline_constraint_kind = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD COLUMN status text UNIQUE;");
+    defer stale_add_column_inline_constraint_kind.deinit(alloc);
+    if (stale_add_column_inline_constraint_kind.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+                    if (ddl.alter_table_operation_inline_constraint_items.count != 1) return error.TestUnexpectedResult;
+                    if (ddl.alter_table_operation_inline_constraint_kind_items.len != 1) return error.TestUnexpectedResult;
+                    ddl.alter_table_operation_inline_constraint_kind_items[0].start -= 1;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_add_column_inline_constraint_kind));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &stale_add_column_inline_constraint_kind, .{}));
+
+    var stale_create_table_inline_timing = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (tenant_id text, email text UNIQUE INCLUDE (tenant_id) DEFERRABLE INITIALLY DEFERRED);");
+    defer stale_create_table_inline_timing.deinit(alloc);
+    if (stale_create_table_inline_timing.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl.kind);
+                    if (ddl.alter_table_operation_inline_constraint_timing_items.len != 1) return error.TestUnexpectedResult;
+                    try std.testing.expect(ddl.alter_table_operation_inline_constraint_timing_items[0] != null);
+                    ddl.alter_table_operation_inline_constraint_timing_items[0].?.start += 1;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_create_table_inline_timing));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &stale_create_table_inline_timing, .{}));
+
+    var missing_add_column_inline_not_valid = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD COLUMN email text UNIQUE INCLUDE (tenant_id) NOT VALID;");
+    defer missing_add_column_inline_not_valid.deinit(alloc);
+    if (missing_add_column_inline_not_valid.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+                    if (ddl.alter_table_operation_inline_constraint_not_valid_items.len != 1) return error.TestUnexpectedResult;
+                    try std.testing.expect(ddl.alter_table_operation_inline_constraint_not_valid_items[0] != null);
+                    ddl.alter_table_operation_inline_constraint_not_valid_items[0] = null;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_add_column_inline_not_valid));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_add_column_inline_not_valid, .{}));
+
+    var missing_create_table_default = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text, status text DEFAULT 'pending');");
+    defer missing_create_table_default.deinit(alloc);
+    if (missing_create_table_default.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl.kind);
+                    if (ddl.alter_table_operation_default_value_items.len != 2) return error.TestUnexpectedResult;
+                    try std.testing.expect(ddl.alter_table_operation_default_value_items[1] != null);
+                    ddl.alter_table_operation_default_value_items[1] = null;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_create_table_default));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_create_table_default, .{}));
+
+    var missing_create_table_default_clause = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text, status text DEFAULT 'pending');");
+    defer missing_create_table_default_clause.deinit(alloc);
+    if (missing_create_table_default_clause.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl.kind);
+                    if (ddl.alter_table_operation_column_default_clause_items.len != 2) return error.TestUnexpectedResult;
+                    try std.testing.expect(ddl.alter_table_operation_column_default_clause_items[1] != null);
+                    ddl.alter_table_operation_column_default_clause_items[1] = null;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_create_table_default_clause));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_create_table_default_clause, .{}));
+
+    var stale_add_column_default = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD COLUMN status text DEFAULT 'pending';");
+    defer stale_add_column_default.deinit(alloc);
+    if (stale_add_column_default.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+                    if (ddl.alter_table_operation_default_value_items.len != 1) return error.TestUnexpectedResult;
+                    try std.testing.expect(ddl.alter_table_operation_default_value_items[0] != null);
+                    ddl.alter_table_operation_default_value_items[0].?.end += 1;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_add_column_default));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &stale_add_column_default, .{}));
 
     var runtime_multi_alter_table = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD COLUMN notes text, DROP COLUMN IF EXISTS old_status RESTRICT;");
     defer runtime_multi_alter_table.deinit(alloc);
@@ -28913,6 +32633,8 @@ test "sql adapter generated unsupported routine and alter table diagnostics vali
     const alter_table_owner_sql = "ALTER TABLE IF EXISTS ONLY usage_records OWNER TO app_role";
     try expectGeneratedUnsupportedCatalogPayloadMutationFails(alloc, alter_table_owner_sql, .alter_table_owner, .alter_table_name_start);
     try expectGeneratedUnsupportedCatalogPayloadMutationFails(alloc, alter_table_owner_sql, .alter_table_owner, .alter_table_operation_start);
+    try expectGeneratedUnsupportedCatalogPayloadMutationFails(alloc, alter_table_owner_sql, .alter_table_owner, .alter_table_operation_kind);
+    try expectGeneratedUnsupportedCatalogPayloadMutationFails(alloc, alter_table_owner_sql, .alter_table_owner, .alter_table_operation_subject_start);
 }
 
 test "sql adapter generated create table and index AST lowers to DDL plans" {
@@ -28920,22 +32642,18 @@ test "sql adapter generated create table and index AST lowers to DDL plans" {
 
     var generated_table = try generatedDdlPlanForTestAlloc(alloc, "CREATE TABLE usage_records (id text PRIMARY KEY, status text NOT NULL);");
     defer generated_table.deinit(alloc);
-    var legacy_table = try runtimeDdlPlanForTestAlloc(alloc, "CREATE TABLE usage_records (id text PRIMARY KEY, status text NOT NULL);");
-    defer legacy_table.deinit(alloc);
     switch (generated_table) {
-        .create_table => |generated| switch (legacy_table) {
-            .create_table => |legacy| {
-                try std.testing.expectEqualStrings(legacy.table_name, generated.table_name);
-                try std.testing.expectEqual(legacy.if_not_exists, generated.if_not_exists);
-                try std.testing.expectEqual(legacy.columns.len, generated.columns.len);
-                try std.testing.expectEqualStrings(legacy.columns[0].name, generated.columns[0].name);
-                try std.testing.expectEqual(legacy.columns[0].nullable, generated.columns[0].nullable);
-                try std.testing.expectEqualStrings(legacy.columns[1].name, generated.columns[1].name);
-                try std.testing.expectEqual(legacy.columns[1].nullable, generated.columns[1].nullable);
-                try std.testing.expect(legacy.primary_key != null);
-                try std.testing.expect(generated.primary_key != null);
-            },
-            else => return error.TestUnexpectedResult,
+        .create_table => |generated| {
+            try std.testing.expectEqualStrings("usage_records", generated.table_name);
+            try std.testing.expect(!generated.if_not_exists);
+            try std.testing.expectEqual(@as(usize, 2), generated.columns.len);
+            try std.testing.expectEqualStrings("id", generated.columns[0].name);
+            try std.testing.expect(!generated.columns[0].nullable);
+            try std.testing.expectEqualStrings("status", generated.columns[1].name);
+            try std.testing.expect(!generated.columns[1].nullable);
+            const primary_key = generated.primary_key orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(@as(usize, 1), primary_key.columns.len);
+            try std.testing.expectEqualStrings("id", primary_key.columns[0]);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -28989,36 +32707,26 @@ test "sql adapter generated create table and index AST lowers to DDL plans" {
     const drop_table_sql = "DROP TABLE IF EXISTS usage_records CASCADE;";
     var generated_drop_table = try generatedDdlPlanForTestAlloc(alloc, drop_table_sql);
     defer generated_drop_table.deinit(alloc);
-    var legacy_drop_table = try runtimeDdlPlanForTestAlloc(alloc, drop_table_sql);
-    defer legacy_drop_table.deinit(alloc);
     switch (generated_drop_table) {
-        .drop_table => |generated| switch (legacy_drop_table) {
-            .drop_table => |legacy| {
-                try std.testing.expectEqualStrings(legacy.table_name, generated.table_name);
-                try std.testing.expectEqual(legacy.if_exists, generated.if_exists);
-                try std.testing.expectEqual(legacy.cascade, generated.cascade);
-            },
-            else => return error.TestUnexpectedResult,
+        .drop_table => |generated| {
+            try std.testing.expectEqualStrings("usage_records", generated.table_name);
+            try std.testing.expect(generated.if_exists);
+            try std.testing.expect(generated.cascade);
         },
         else => return error.TestUnexpectedResult,
     }
 
     var generated_index = try generatedDdlPlanForTestAlloc(alloc, "CREATE INDEX usage_records_status_idx ON usage_records (status);");
     defer generated_index.deinit(alloc);
-    var legacy_index = try runtimeDdlPlanForTestAlloc(alloc, "CREATE INDEX usage_records_status_idx ON usage_records (status);");
-    defer legacy_index.deinit(alloc);
     switch (generated_index) {
-        .create_index => |generated| switch (legacy_index) {
-            .create_index => |legacy| {
-                try std.testing.expectEqualStrings(legacy.index_name, generated.index_name);
-                try std.testing.expectEqualStrings(legacy.table_name, generated.table_name);
-                try std.testing.expectEqual(legacy.if_not_exists, generated.if_not_exists);
-                try std.testing.expectEqual(legacy.unique, generated.unique);
-                try std.testing.expectEqual(legacy.method, generated.method);
-                try std.testing.expectEqual(legacy.columns.len, generated.columns.len);
-                try std.testing.expectEqualStrings(legacy.columns[0], generated.columns[0]);
-            },
-            else => return error.TestUnexpectedResult,
+        .create_index => |generated| {
+            try std.testing.expectEqualStrings("usage_records_status_idx", generated.index_name);
+            try std.testing.expectEqualStrings("usage_records", generated.table_name);
+            try std.testing.expect(!generated.if_not_exists);
+            try std.testing.expect(!generated.unique);
+            try std.testing.expectEqual(DdlIndexMethod.btree, generated.method);
+            try std.testing.expectEqual(@as(usize, 1), generated.columns.len);
+            try std.testing.expectEqualStrings("status", generated.columns[0]);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -29026,20 +32734,15 @@ test "sql adapter generated create table and index AST lowers to DDL plans" {
     const concurrent_index_sql = "CREATE INDEX CONCURRENTLY usage_records_created_at_idx ON usage_records (created_at);";
     var generated_concurrent_index = try generatedDdlPlanForTestAlloc(alloc, concurrent_index_sql);
     defer generated_concurrent_index.deinit(alloc);
-    var legacy_concurrent_index = try runtimeDdlPlanForTestAlloc(alloc, concurrent_index_sql);
-    defer legacy_concurrent_index.deinit(alloc);
     switch (generated_concurrent_index) {
-        .create_index => |generated| switch (legacy_concurrent_index) {
-            .create_index => |legacy| {
-                try std.testing.expectEqualStrings(legacy.index_name, generated.index_name);
-                try std.testing.expectEqualStrings(legacy.table_name, generated.table_name);
-                try std.testing.expectEqual(legacy.if_not_exists, generated.if_not_exists);
-                try std.testing.expectEqual(legacy.unique, generated.unique);
-                try std.testing.expectEqual(legacy.method, generated.method);
-                try std.testing.expectEqual(legacy.columns.len, generated.columns.len);
-                try std.testing.expectEqualStrings(legacy.columns[0], generated.columns[0]);
-            },
-            else => return error.TestUnexpectedResult,
+        .create_index => |generated| {
+            try std.testing.expectEqualStrings("usage_records_created_at_idx", generated.index_name);
+            try std.testing.expectEqualStrings("usage_records", generated.table_name);
+            try std.testing.expect(!generated.if_not_exists);
+            try std.testing.expect(!generated.unique);
+            try std.testing.expectEqual(DdlIndexMethod.btree, generated.method);
+            try std.testing.expectEqual(@as(usize, 1), generated.columns.len);
+            try std.testing.expectEqualStrings("created_at", generated.columns[0]);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -29047,15 +32750,11 @@ test "sql adapter generated create table and index AST lowers to DDL plans" {
     const drop_index_sql = "DROP INDEX IF EXISTS usage_records_status_idx RESTRICT;";
     var generated_drop_index = try generatedDdlPlanForTestAlloc(alloc, drop_index_sql);
     defer generated_drop_index.deinit(alloc);
-    var legacy_drop_index = try runtimeDdlPlanForTestAlloc(alloc, drop_index_sql);
-    defer legacy_drop_index.deinit(alloc);
     switch (generated_drop_index) {
-        .drop_index => |generated| switch (legacy_drop_index) {
-            .drop_index => |legacy| {
-                try std.testing.expectEqualStrings(legacy.index_name, generated.index_name);
-                try std.testing.expectEqual(legacy.if_exists, generated.if_exists);
-            },
-            else => return error.TestUnexpectedResult,
+        .drop_index => |generated| {
+            try std.testing.expectEqualStrings("usage_records_status_idx", generated.index_name);
+            try std.testing.expect(generated.if_exists);
+            try std.testing.expectEqual(DropDependencyMode.restrict, generated.dependency_mode);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -29063,15 +32762,12 @@ test "sql adapter generated create table and index AST lowers to DDL plans" {
     const concurrent_drop_index_sql = "DROP INDEX CONCURRENTLY IF EXISTS usage_records_status_idx RESTRICT;";
     var generated_concurrent_drop_index = try generatedDdlPlanForTestAlloc(alloc, concurrent_drop_index_sql);
     defer generated_concurrent_drop_index.deinit(alloc);
-    var legacy_concurrent_drop_index = try runtimeDdlPlanForTestAlloc(alloc, concurrent_drop_index_sql);
-    defer legacy_concurrent_drop_index.deinit(alloc);
     switch (generated_concurrent_drop_index) {
-        .drop_index => |generated| switch (legacy_concurrent_drop_index) {
-            .drop_index => |legacy| {
-                try std.testing.expectEqualStrings(legacy.index_name, generated.index_name);
-                try std.testing.expectEqual(legacy.if_exists, generated.if_exists);
-            },
-            else => return error.TestUnexpectedResult,
+        .drop_index => |generated| {
+            try std.testing.expectEqualStrings("usage_records_status_idx", generated.index_name);
+            try std.testing.expect(generated.if_exists);
+            try std.testing.expect(generated.concurrently);
+            try std.testing.expectEqual(DropDependencyMode.restrict, generated.dependency_mode);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -29079,20 +32775,18 @@ test "sql adapter generated create table and index AST lowers to DDL plans" {
     const alter_add_sql = "ALTER TABLE usage_records ADD COLUMN status text;";
     var generated_alter_add = try generatedDdlPlanForTestAlloc(alloc, alter_add_sql);
     defer generated_alter_add.deinit(alloc);
-    var legacy_alter_add = try runtimeDdlPlanForTestAlloc(alloc, alter_add_sql);
-    defer legacy_alter_add.deinit(alloc);
     switch (generated_alter_add) {
-        .alter_table => |generated| switch (legacy_alter_add) {
-            .alter_table => |legacy| {
-                try std.testing.expectEqualStrings(legacy.table_name, generated.table_name);
-                try std.testing.expectEqual(legacy.if_exists, generated.if_exists);
-                try std.testing.expectEqual(legacy.operations.len, generated.operations.len);
-                switch (generated.operations[0]) {
-                    .add_column => |operation| try std.testing.expectEqualStrings("status", operation.column.name),
-                    else => return error.TestUnexpectedResult,
-                }
-            },
-            else => return error.TestUnexpectedResult,
+        .alter_table => |generated| {
+            try std.testing.expectEqualStrings("usage_records", generated.table_name);
+            try std.testing.expect(!generated.if_exists);
+            try std.testing.expectEqual(@as(usize, 1), generated.operations.len);
+            switch (generated.operations[0]) {
+                .add_column => |operation| {
+                    try std.testing.expectEqualStrings("status", operation.column.name);
+                    try std.testing.expectEqual(runtime_schema.RelationalType.keyword, operation.column.field_type);
+                },
+                else => return error.TestUnexpectedResult,
+            }
         },
         else => return error.TestUnexpectedResult,
     }
@@ -29100,24 +32794,19 @@ test "sql adapter generated create table and index AST lowers to DDL plans" {
     const alter_drop_sql = "ALTER TABLE IF EXISTS ONLY usage_records DROP COLUMN IF EXISTS status RESTRICT;";
     var generated_alter_drop = try generatedDdlPlanForTestAlloc(alloc, alter_drop_sql);
     defer generated_alter_drop.deinit(alloc);
-    var legacy_alter_drop = try runtimeDdlPlanForTestAlloc(alloc, alter_drop_sql);
-    defer legacy_alter_drop.deinit(alloc);
     switch (generated_alter_drop) {
-        .alter_table => |generated| switch (legacy_alter_drop) {
-            .alter_table => |legacy| {
-                try std.testing.expectEqualStrings(legacy.table_name, generated.table_name);
-                try std.testing.expectEqual(legacy.if_exists, generated.if_exists);
-                try std.testing.expectEqual(legacy.operations.len, generated.operations.len);
-                switch (generated.operations[0]) {
-                    .drop_column => |operation| {
-                        try std.testing.expectEqualStrings("status", operation.name);
-                        try std.testing.expect(operation.if_exists);
-                        try std.testing.expectEqual(DropDependencyMode.restrict, operation.dependency_mode);
-                    },
-                    else => return error.TestUnexpectedResult,
-                }
-            },
-            else => return error.TestUnexpectedResult,
+        .alter_table => |generated| {
+            try std.testing.expectEqualStrings("usage_records", generated.table_name);
+            try std.testing.expect(generated.if_exists);
+            try std.testing.expectEqual(@as(usize, 1), generated.operations.len);
+            switch (generated.operations[0]) {
+                .drop_column => |operation| {
+                    try std.testing.expectEqualStrings("status", operation.name);
+                    try std.testing.expect(operation.if_exists);
+                    try std.testing.expectEqual(DropDependencyMode.restrict, operation.dependency_mode);
+                },
+                else => return error.TestUnexpectedResult,
+            }
         },
         else => return error.TestUnexpectedResult,
     }
@@ -29125,22 +32814,17 @@ test "sql adapter generated create table and index AST lowers to DDL plans" {
     const alter_rename_sql = "ALTER TABLE usage_records RENAME COLUMN status TO state;";
     var generated_alter_rename = try generatedDdlPlanForTestAlloc(alloc, alter_rename_sql);
     defer generated_alter_rename.deinit(alloc);
-    var legacy_alter_rename = try runtimeDdlPlanForTestAlloc(alloc, alter_rename_sql);
-    defer legacy_alter_rename.deinit(alloc);
     switch (generated_alter_rename) {
-        .alter_table => |generated| switch (legacy_alter_rename) {
-            .alter_table => |legacy| {
-                try std.testing.expectEqualStrings(legacy.table_name, generated.table_name);
-                try std.testing.expectEqual(legacy.operations.len, generated.operations.len);
-                switch (generated.operations[0]) {
-                    .rename_column => |operation| {
-                        try std.testing.expectEqualStrings("status", operation.old_name);
-                        try std.testing.expectEqualStrings("state", operation.new_name);
-                    },
-                    else => return error.TestUnexpectedResult,
-                }
-            },
-            else => return error.TestUnexpectedResult,
+        .alter_table => |generated| {
+            try std.testing.expectEqualStrings("usage_records", generated.table_name);
+            try std.testing.expectEqual(@as(usize, 1), generated.operations.len);
+            switch (generated.operations[0]) {
+                .rename_column => |operation| {
+                    try std.testing.expectEqualStrings("status", operation.old_name);
+                    try std.testing.expectEqualStrings("state", operation.new_name);
+                },
+                else => return error.TestUnexpectedResult,
+            }
         },
         else => return error.TestUnexpectedResult,
     }
@@ -29148,19 +32832,14 @@ test "sql adapter generated create table and index AST lowers to DDL plans" {
     const alter_validate_sql = "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_amount_check;";
     var generated_alter_validate = try generatedDdlPlanForTestAlloc(alloc, alter_validate_sql);
     defer generated_alter_validate.deinit(alloc);
-    var legacy_alter_validate = try runtimeDdlPlanForTestAlloc(alloc, alter_validate_sql);
-    defer legacy_alter_validate.deinit(alloc);
     switch (generated_alter_validate) {
-        .alter_table => |generated| switch (legacy_alter_validate) {
-            .alter_table => |legacy| {
-                try std.testing.expectEqualStrings(legacy.table_name, generated.table_name);
-                try std.testing.expectEqual(legacy.operations.len, generated.operations.len);
-                switch (generated.operations[0]) {
-                    .validate_constraint => |constraint_name| try std.testing.expectEqualStrings("usage_records_amount_check", constraint_name),
-                    else => return error.TestUnexpectedResult,
-                }
-            },
-            else => return error.TestUnexpectedResult,
+        .alter_table => |generated| {
+            try std.testing.expectEqualStrings("usage_records", generated.table_name);
+            try std.testing.expectEqual(@as(usize, 1), generated.operations.len);
+            switch (generated.operations[0]) {
+                .validate_constraint => |constraint_name| try std.testing.expectEqualStrings("usage_records_amount_check", constraint_name),
+                else => return error.TestUnexpectedResult,
+            }
         },
         else => return error.TestUnexpectedResult,
     }
@@ -29174,73 +32853,83 @@ test "sql adapter generated create table and index AST lowers to DDL plans" {
     ;
     var generated_alter_constraint = try generatedDdlPlanForTestAlloc(alloc, alter_constraint_sql);
     defer generated_alter_constraint.deinit(alloc);
-    var legacy_alter_constraint = try runtimeDdlPlanForTestAlloc(alloc, alter_constraint_sql);
-    defer legacy_alter_constraint.deinit(alloc);
     switch (generated_alter_constraint) {
-        .alter_table => |generated| switch (legacy_alter_constraint) {
-            .alter_table => |legacy| {
-                try std.testing.expectEqualStrings(legacy.table_name, generated.table_name);
-                try std.testing.expectEqual(legacy.operations.len, generated.operations.len);
-                switch (generated.operations[0]) {
-                    .add_column => |operation| {
-                        try std.testing.expectEqualStrings("tenant_status_key", operation.column.name);
-                        try std.testing.expect(operation.column.generated != null);
-                        try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.concat, operation.column.generated.?.op);
-                    },
-                    else => return error.TestUnexpectedResult,
-                }
-                switch (generated.operations[1]) {
-                    .add_unique_constraint => |constraint| {
-                        try std.testing.expectEqualStrings("usage_records_tenant_status_key", constraint.name);
-                        try std.testing.expectEqual(@as(usize, 2), constraint.columns.len);
-                    },
-                    else => return error.TestUnexpectedResult,
-                }
-                switch (generated.operations[2]) {
-                    .add_foreign_key => |foreign_key| {
-                        try std.testing.expectEqualStrings("usage_records_tenant_fkey", foreign_key.name);
-                        try std.testing.expectEqual(runtime_schema.ForeignKeyMatch.full, foreign_key.match);
-                    },
-                    else => return error.TestUnexpectedResult,
-                }
-                switch (generated.operations[3]) {
-                    .add_check => |check| {
-                        try std.testing.expectEqualStrings("usage_records_amount_check", check.name);
-                        try std.testing.expectEqualStrings("amount", check.field);
-                        try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gte, check.op);
-                    },
-                    else => return error.TestUnexpectedResult,
-                }
-            },
-            else => return error.TestUnexpectedResult,
+        .alter_table => |generated| {
+            try std.testing.expectEqualStrings("usage_records", generated.table_name);
+            try std.testing.expectEqual(@as(usize, 4), generated.operations.len);
+            switch (generated.operations[0]) {
+                .add_column => |operation| {
+                    try std.testing.expectEqualStrings("tenant_status_key", operation.column.name);
+                    try std.testing.expect(operation.column.generated != null);
+                    try expectGeneratedConcatExpressionForTest(operation.column.generated.?, .concat, &.{ "tenant_id", "status" }, "\":\"");
+                },
+                else => return error.TestUnexpectedResult,
+            }
+            switch (generated.operations[1]) {
+                .add_unique_constraint => |constraint| {
+                    try std.testing.expectEqualStrings("usage_records_tenant_status_key", constraint.name);
+                    try std.testing.expectEqual(@as(usize, 2), constraint.columns.len);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+            switch (generated.operations[2]) {
+                .add_foreign_key => |foreign_key| {
+                    try std.testing.expectEqualStrings("usage_records_tenant_fkey", foreign_key.name);
+                    try std.testing.expectEqual(runtime_schema.ForeignKeyMatch.full, foreign_key.match);
+                    try std.testing.expectEqual(runtime_schema.ForeignKeyAction.set_null, foreign_key.on_delete);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+            switch (generated.operations[3]) {
+                .add_check => |check| {
+                    try std.testing.expectEqualStrings("usage_records_amount_check", check.name);
+                    try std.testing.expectEqualStrings("amount", check.field);
+                    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gte, check.op);
+                },
+                else => return error.TestUnexpectedResult,
+            }
         },
         else => return error.TestUnexpectedResult,
     }
 
+    var missing_alter_generated_expression = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "ALTER TABLE usage_records ADD COLUMN tenant_status_key text GENERATED ALWAYS AS (concat(tenant_id, ':', status)) STORED;",
+    );
+    defer missing_alter_generated_expression.deinit(alloc);
+    if (missing_alter_generated_expression.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    if (ddl.alter_table_operation_generated_expression_items.len == 0) return error.TestUnexpectedResult;
+                    ddl.alter_table_operation_generated_expression_items[0] = null;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_alter_generated_expression));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_alter_generated_expression, .{}));
+
     const covering_partial_sql = "CREATE UNIQUE INDEX usage_records_status_active_idx ON usage_records (status) INCLUDE (tenant_id, amount) WHERE deleted_at IS NULL;";
     var generated_covering_partial = try generatedDdlPlanForTestAlloc(alloc, covering_partial_sql);
     defer generated_covering_partial.deinit(alloc);
-    var legacy_covering_partial = try runtimeDdlPlanForTestAlloc(alloc, covering_partial_sql);
-    defer legacy_covering_partial.deinit(alloc);
     switch (generated_covering_partial) {
-        .create_index => |generated| switch (legacy_covering_partial) {
-            .create_index => |legacy| {
-                try std.testing.expectEqualStrings(legacy.index_name, generated.index_name);
-                try std.testing.expectEqualStrings(legacy.table_name, generated.table_name);
-                try std.testing.expectEqual(legacy.if_not_exists, generated.if_not_exists);
-                try std.testing.expectEqual(legacy.unique, generated.unique);
-                try std.testing.expectEqual(legacy.method, generated.method);
-                try std.testing.expectEqual(legacy.columns.len, generated.columns.len);
-                try std.testing.expectEqualStrings(legacy.columns[0], generated.columns[0]);
-                try std.testing.expectEqual(legacy.include_columns.len, generated.include_columns.len);
-                try std.testing.expectEqualStrings(legacy.include_columns[0], generated.include_columns[0]);
-                try std.testing.expectEqualStrings(legacy.include_columns[1], generated.include_columns[1]);
-                try std.testing.expectEqual(legacy.where.len, generated.where.len);
-                try std.testing.expectEqualStrings(legacy.where[0].field, generated.where[0].field);
-                try std.testing.expectEqual(legacy.where[0].op, generated.where[0].op);
-                try std.testing.expectEqual(legacy.where_expressions.len, generated.where_expressions.len);
-            },
-            else => return error.TestUnexpectedResult,
+        .create_index => |generated| {
+            try std.testing.expectEqualStrings("usage_records_status_active_idx", generated.index_name);
+            try std.testing.expectEqualStrings("usage_records", generated.table_name);
+            try std.testing.expect(!generated.if_not_exists);
+            try std.testing.expect(generated.unique);
+            try std.testing.expectEqual(DdlIndexMethod.btree, generated.method);
+            try std.testing.expectEqual(@as(usize, 1), generated.columns.len);
+            try std.testing.expectEqualStrings("status", generated.columns[0]);
+            try std.testing.expectEqual(@as(usize, 2), generated.include_columns.len);
+            try std.testing.expectEqualStrings("tenant_id", generated.include_columns[0]);
+            try std.testing.expectEqualStrings("amount", generated.include_columns[1]);
+            try std.testing.expectEqual(@as(usize, 1), generated.where.len);
+            try std.testing.expectEqualStrings("deleted_at", generated.where[0].field);
+            try std.testing.expectEqual(runtime_schema.UniquePredicateOp.is_null, generated.where[0].op);
+            try std.testing.expectEqual(@as(usize, 0), generated.where_expressions.len);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -29248,25 +32937,20 @@ test "sql adapter generated create table and index AST lowers to DDL plans" {
     const expression_partial_sql = "CREATE UNIQUE INDEX users_lower_email_active_expr_key ON users (tenant_id, lower(email)) WHERE lower(status) = 'active';";
     var generated_expression_partial = try generatedDdlPlanForTestAlloc(alloc, expression_partial_sql);
     defer generated_expression_partial.deinit(alloc);
-    var legacy_expression_partial = try runtimeDdlPlanForTestAlloc(alloc, expression_partial_sql);
-    defer legacy_expression_partial.deinit(alloc);
     switch (generated_expression_partial) {
-        .create_index => |generated| switch (legacy_expression_partial) {
-            .create_index => |legacy| {
-                try std.testing.expectEqualStrings(legacy.index_name, generated.index_name);
-                try std.testing.expectEqualStrings(legacy.table_name, generated.table_name);
-                try std.testing.expectEqual(legacy.unique, generated.unique);
-                try std.testing.expectEqual(legacy.columns.len, generated.columns.len);
-                try std.testing.expectEqualStrings(legacy.columns[0], generated.columns[0]);
-                try std.testing.expectEqual(legacy.expressions.len, generated.expressions.len);
-                try std.testing.expectEqual(legacy.expressions[0].op, generated.expressions[0].op);
-                try std.testing.expectEqualStrings(legacy.expressions[0].field, generated.expressions[0].field);
-                try std.testing.expectEqual(legacy.where.len, generated.where.len);
-                try std.testing.expectEqual(legacy.where_expressions.len, generated.where_expressions.len);
-                try std.testing.expectEqual(legacy.where_expressions[0].op, generated.where_expressions[0].op);
-                try std.testing.expectEqual(legacy.where_expressions[0].lhs.kind, generated.where_expressions[0].lhs.kind);
-            },
-            else => return error.TestUnexpectedResult,
+        .create_index => |generated| {
+            try std.testing.expectEqualStrings("users_lower_email_active_expr_key", generated.index_name);
+            try std.testing.expectEqualStrings("users", generated.table_name);
+            try std.testing.expect(generated.unique);
+            try std.testing.expectEqual(@as(usize, 1), generated.columns.len);
+            try std.testing.expectEqualStrings("tenant_id", generated.columns[0]);
+            try std.testing.expectEqual(@as(usize, 1), generated.expressions.len);
+            try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.lower, generated.expressions[0].op);
+            try std.testing.expectEqualStrings("email", generated.expressions[0].field);
+            try std.testing.expectEqual(@as(usize, 0), generated.where.len);
+            try std.testing.expectEqual(@as(usize, 1), generated.where_expressions.len);
+            try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionOp.eq, generated.where_expressions[0].op);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, generated.where_expressions[0].lhs.kind);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -29585,23 +33269,15 @@ test "sql adapter generated prepared AST lowers to prepared statement plans" {
     const generated_prepare_sql = "PREPARE usage_plan(text) AS SELECT id FROM usage_records WHERE status = $1;";
     var generated_prepare = try generatedPreparedStatementPlanForTestAlloc(alloc, generated_prepare_sql);
     defer generated_prepare.deinit(alloc);
-    var legacy_prepare = try runtimeDdlPlanForTestAlloc(alloc, generated_prepare_sql);
-    defer legacy_prepare.deinit(alloc);
     switch (generated_prepare) {
-        .prepare => |generated| switch (legacy_prepare) {
-            .prepared_statement => |legacy_plan| switch (legacy_plan) {
-                .prepare => |legacy| {
-                    try std.testing.expectEqualStrings(legacy.statement_name, generated.statement_name);
-                    try std.testing.expectEqual(legacy.parameter_count, generated.parameter_count);
-                    try std.testing.expectEqual(legacy.statement_kind, generated.statement_kind);
-                    try std.testing.expectEqual(legacy.statement_family, generated.statement_family);
-                    const subject = generated.subject_parsed_sql orelse return error.TestUnexpectedResult;
-                    try std.testing.expectEqualStrings("SELECT id FROM usage_records WHERE status = $1", subject.sql());
-                    try std.testing.expectEqualStrings("SELECT id FROM usage_records WHERE status = $1", subject.statementSql());
-                },
-                else => return error.TestUnexpectedResult,
-            },
-            else => return error.TestUnexpectedResult,
+        .prepare => |generated| {
+            try std.testing.expectEqualStrings("usage_plan", generated.statement_name);
+            try std.testing.expectEqual(@as(usize, 1), generated.parameter_count);
+            try std.testing.expectEqual(PreparedStatementSubjectKind.read, generated.statement_kind);
+            try std.testing.expectEqual(PreparedStatementStatementKind.read, generated.statement_family);
+            const subject = generated.subject_parsed_sql orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("SELECT id FROM usage_records WHERE status = $1", subject.sql());
+            try std.testing.expectEqualStrings("SELECT id FROM usage_records WHERE status = $1", subject.statementSql());
         },
         else => return error.TestUnexpectedResult,
     }
@@ -29710,38 +33386,46 @@ test "sql adapter generated prepared AST lowers to prepared statement plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var generated_execute = try generatedPreparedStatementPlanForTestAlloc(alloc, "EXECUTE usage_plan('open', 10);");
-    defer generated_execute.deinit(alloc);
-    var legacy_execute = try runtimeDdlPlanForTestAlloc(alloc, "EXECUTE usage_plan('open', 10);");
-    defer legacy_execute.deinit(alloc);
-    switch (generated_execute) {
-        .execute => |generated| switch (legacy_execute) {
-            .prepared_statement => |legacy_plan| switch (legacy_plan) {
-                .execute => |legacy| {
-                    try std.testing.expectEqualStrings(legacy.statement_name, generated.statement_name);
-                    try std.testing.expectEqual(legacy.argument_count, generated.argument_count);
+    var stale_prepared_ddl = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "PREPARE stale_create_table_plan AS CREATE TABLE prepared_usage_records (id uuid);",
+    );
+    defer stale_prepared_ddl.deinit(alloc);
+    if (stale_prepared_ddl.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .prepared => |*prepared_ast| {
+                    const inner_ast = prepared_ast.inner_statement_ast orelse return error.TestUnexpectedResult;
+                    switch (inner_ast.*) {
+                        .ddl => |*ddl_ast| ddl_ast.object_name_tokens = .{
+                            .start = stale_prepared_ddl.items().len,
+                            .end = stale_prepared_ddl.items().len + 1,
+                        },
+                        else => return error.TestUnexpectedResult,
+                    }
                 },
                 else => return error.TestUnexpectedResult,
-            },
-            else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_prepared_ddl));
+
+    var generated_execute = try generatedPreparedStatementPlanForTestAlloc(alloc, "EXECUTE usage_plan('open', 10);");
+    defer generated_execute.deinit(alloc);
+    switch (generated_execute) {
+        .execute => |generated| {
+            try std.testing.expectEqualStrings("usage_plan", generated.statement_name);
+            try std.testing.expectEqual(@as(usize, 2), generated.argument_count);
         },
         else => return error.TestUnexpectedResult,
     }
 
     var generated_deallocate = try generatedPreparedStatementPlanForTestAlloc(alloc, "DEALLOCATE usage_plan;");
     defer generated_deallocate.deinit(alloc);
-    var legacy_deallocate = try runtimeDdlPlanForTestAlloc(alloc, "DEALLOCATE usage_plan;");
-    defer legacy_deallocate.deinit(alloc);
     switch (generated_deallocate) {
-        .deallocate => |generated| switch (legacy_deallocate) {
-            .prepared_statement => |legacy_plan| switch (legacy_plan) {
-                .deallocate => |legacy| {
-                    try std.testing.expectEqual(legacy.all, generated.all);
-                    try std.testing.expectEqualStrings(legacy.statement_name orelse return error.TestUnexpectedResult, generated.statement_name orelse return error.TestUnexpectedResult);
-                },
-                else => return error.TestUnexpectedResult,
-            },
-            else => return error.TestUnexpectedResult,
+        .deallocate => |generated| {
+            try std.testing.expect(!generated.all);
+            try std.testing.expectEqualStrings("usage_plan", generated.statement_name orelse return error.TestUnexpectedResult);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -29828,6 +33512,48 @@ fn generatedPreparedStatementPlanForTestAlloc(alloc: std.mem.Allocator, sql: []c
         else => return error.UnsupportedSqlShape,
     };
     return try preparedStatementPlanFromGeneratedAstAlloc(alloc, &parsed, prepared_ast);
+}
+
+fn expectGeneratedUnaryExpressionForTest(
+    generated: runtime_schema.RelationalGeneratedValue,
+    kind: db_mod.types.RelationalRowsExpressionKind,
+    field: []const u8,
+) !void {
+    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.expression, generated.op);
+    const expression = generated.expression orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(kind, expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), expression.operands.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.field, expression.operands[0].kind);
+    try std.testing.expectEqualStrings(field, expression.operands[0].field);
+}
+
+fn expectGeneratedConcatExpressionForTest(
+    generated: runtime_schema.RelationalGeneratedValue,
+    kind: db_mod.types.RelationalRowsExpressionKind,
+    fields: []const []const u8,
+    separator_json: []const u8,
+) !void {
+    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.expression, generated.op);
+    const expression = generated.expression orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(kind, expression.kind);
+    const expected_operands = fields.len + if (kind == .concat_ws) @as(usize, 1) else fields.len - 1;
+    try std.testing.expectEqual(expected_operands, expression.operands.len);
+    var operand_index: usize = 0;
+    if (kind == .concat_ws) {
+        try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.value, expression.operands[operand_index].kind);
+        try std.testing.expectEqualStrings(separator_json, expression.operands[operand_index].value_json);
+        operand_index += 1;
+    }
+    for (fields, 0..) |field, field_index| {
+        if (kind == .concat and field_index != 0) {
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.value, expression.operands[operand_index].kind);
+            try std.testing.expectEqualStrings(separator_json, expression.operands[operand_index].value_json);
+            operand_index += 1;
+        }
+        try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.field, expression.operands[operand_index].kind);
+        try std.testing.expectEqualStrings(field, expression.operands[operand_index].field);
+        operand_index += 1;
+    }
 }
 
 fn generatedSessionCatalogPlanForTestAlloc(alloc: std.mem.Allocator, sql: []const u8) !SessionCatalogPlan {
@@ -30455,7 +34181,8 @@ test "sql adapter ddl plan lowers scalar subquery defaults into structured query
 
 test "sql adapter ddl plan rejects corrupted generated scalar subquery default metadata" {
     const alloc = std.testing.allocator;
-    const scalar_default_sql = "ALTER TABLE usage_records ALTER COLUMN status SET DEFAULT (SELECT status FROM usage_records WHERE id = 'u2' ORDER BY id LIMIT 1);";
+    const scalar_default_sql = "ALTER TABLE usage_records ALTER COLUMN status SET DEFAULT (SELECT status FROM usage_records WHERE id = 'u2' LIMIT 1);";
+    const ordered_scalar_default_sql = "CREATE TABLE usage_records (id uuid PRIMARY KEY, status text DEFAULT (SELECT status FROM usage_records ORDER BY id LIMIT 1));";
     try expectGeneratedScalarSubqueryDefaultDdlMutationFails(alloc, scalar_default_sql, .stale_operation_range);
     try expectGeneratedScalarSubqueryDefaultDdlMutationFails(alloc, scalar_default_sql, .missing_operation_items);
     try expectGeneratedScalarSubqueryDefaultDdlMutationFails(alloc, scalar_default_sql, .operation_starts_inside_default);
@@ -30465,7 +34192,7 @@ test "sql adapter ddl plan rejects corrupted generated scalar subquery default m
     try expectGeneratedScalarSubqueryDefaultDdlMutationFails(alloc, scalar_default_sql, .missing_child_source);
     try expectGeneratedScalarSubqueryDefaultDdlMutationFails(alloc, scalar_default_sql, .aggregate_child_without_distinct);
     try expectGeneratedScalarSubqueryDefaultDdlMutationFails(alloc, scalar_default_sql, .stale_child_where_expression);
-    try expectGeneratedScalarSubqueryDefaultDdlMutationFails(alloc, scalar_default_sql, .stale_child_order_item);
+    try expectGeneratedScalarSubqueryDefaultDdlMutationFails(alloc, ordered_scalar_default_sql, .stale_child_order_item);
     try expectGeneratedScalarSubqueryDefaultDdlMutationFails(alloc, scalar_default_sql, .stale_child_limit_expression);
 
     var missing_retained_child = try tokenized.ParsedSql.initAlloc(alloc, scalar_default_sql);
@@ -30479,34 +34206,35 @@ test "sql adapter ddl plan rejects corrupted generated scalar subquery default m
         runtimeDdlPlanFromGeneratedAstAlloc(alloc, missing_retained_child.items(), missing_retained_child_ast, ddlPlanParserOptionsForTest(alloc, missing_retained_child.items())),
     );
 
-    const expression_default_sql = "ALTER TABLE usage_records ALTER COLUMN status SET DEFAULT (SELECT lower(status) AS status_key FROM usage_records WHERE id = 'u2' ORDER BY id LIMIT 1);";
+    const expression_default_sql = "CREATE TABLE usage_records (id uuid PRIMARY KEY, status text DEFAULT (SELECT lower(status) AS status_key FROM usage_records WHERE id = 'u2' ORDER BY id LIMIT 1));";
     try expectGeneratedScalarSubqueryDefaultDdlMutationFails(alloc, expression_default_sql, .stale_child_projection_expression);
 
-    const cast_expression_default_sql = "ALTER TABLE usage_records ALTER COLUMN status SET DEFAULT (SELECT CAST(amount AS text) AS amount_text FROM usage_records LIMIT 1);";
+    const cast_expression_default_sql = "CREATE TABLE usage_records (id uuid PRIMARY KEY, status text DEFAULT (SELECT CAST(amount AS text) AS amount_text FROM usage_records LIMIT 1));";
     try expectGeneratedScalarSubqueryDefaultDdlMutationFails(alloc, cast_expression_default_sql, .stale_child_projection_expression);
 
-    const distinct_default_sql = "ALTER TABLE usage_records ALTER COLUMN status SET DEFAULT (SELECT DISTINCT status FROM usage_records ORDER BY status LIMIT 1);";
+    const distinct_default_sql = "CREATE TABLE usage_records (id uuid PRIMARY KEY, status text DEFAULT (SELECT DISTINCT status FROM usage_records ORDER BY status LIMIT 1));";
     try expectGeneratedScalarSubqueryDefaultDdlMutationFails(alloc, distinct_default_sql, .aggregate_child_without_distinct);
 }
 
 test "sql adapter ddl plan rejects corrupted generated scalar subquery default metadata at public boundary" {
     const alloc = std.testing.allocator;
-    const scalar_default_sql = "ALTER TABLE usage_records ALTER COLUMN status SET DEFAULT (SELECT status FROM usage_records WHERE id = 'u2' ORDER BY id LIMIT 1);";
+    const scalar_default_sql = "ALTER TABLE usage_records ALTER COLUMN status SET DEFAULT (SELECT status FROM usage_records WHERE id = 'u2' LIMIT 1);";
+    const ordered_scalar_default_sql = "CREATE TABLE usage_records (id uuid PRIMARY KEY, status text DEFAULT (SELECT status FROM usage_records ORDER BY id LIMIT 1));";
     try expectGeneratedScalarSubqueryDefaultDdlPublicMutationFails(alloc, scalar_default_sql, .stale_default_query_range);
     try expectGeneratedScalarSubqueryDefaultDdlPublicMutationFails(alloc, scalar_default_sql, .missing_child_projection);
     try expectGeneratedScalarSubqueryDefaultDdlPublicMutationFails(alloc, scalar_default_sql, .missing_child_source);
     try expectGeneratedScalarSubqueryDefaultDdlPublicMutationFails(alloc, scalar_default_sql, .aggregate_child_without_distinct);
     try expectGeneratedScalarSubqueryDefaultDdlPublicMutationFails(alloc, scalar_default_sql, .stale_child_where_expression);
-    try expectGeneratedScalarSubqueryDefaultDdlPublicMutationFails(alloc, scalar_default_sql, .stale_child_order_item);
+    try expectGeneratedScalarSubqueryDefaultDdlPublicMutationFails(alloc, ordered_scalar_default_sql, .stale_child_order_item);
     try expectGeneratedScalarSubqueryDefaultDdlPublicMutationFails(alloc, scalar_default_sql, .stale_child_limit_expression);
 
-    const expression_default_sql = "ALTER TABLE usage_records ALTER COLUMN status SET DEFAULT (SELECT lower(status) AS status_key FROM usage_records WHERE id = 'u2' ORDER BY id LIMIT 1);";
+    const expression_default_sql = "CREATE TABLE usage_records (id uuid PRIMARY KEY, status text DEFAULT (SELECT lower(status) AS status_key FROM usage_records WHERE id = 'u2' ORDER BY id LIMIT 1));";
     try expectGeneratedScalarSubqueryDefaultDdlPublicMutationFails(alloc, expression_default_sql, .stale_child_projection_expression);
 
-    const cast_expression_default_sql = "ALTER TABLE usage_records ALTER COLUMN status SET DEFAULT (SELECT CAST(amount AS text) AS amount_text FROM usage_records LIMIT 1);";
+    const cast_expression_default_sql = "CREATE TABLE usage_records (id uuid PRIMARY KEY, status text DEFAULT (SELECT CAST(amount AS text) AS amount_text FROM usage_records LIMIT 1));";
     try expectGeneratedScalarSubqueryDefaultDdlPublicMutationFails(alloc, cast_expression_default_sql, .stale_child_projection_expression);
 
-    const distinct_default_sql = "ALTER TABLE usage_records ALTER COLUMN status SET DEFAULT (SELECT DISTINCT status FROM usage_records ORDER BY status LIMIT 1);";
+    const distinct_default_sql = "CREATE TABLE usage_records (id uuid PRIMARY KEY, status text DEFAULT (SELECT DISTINCT status FROM usage_records ORDER BY status LIMIT 1));";
     try expectGeneratedScalarSubqueryDefaultDdlPublicMutationFails(alloc, distinct_default_sql, .aggregate_child_without_distinct);
 }
 
@@ -30572,6 +34300,8 @@ const GeneratedUnsupportedCatalogPayloadMutation = enum {
     stale_alter_table_payload,
     alter_table_name_start,
     alter_table_operation_start,
+    alter_table_operation_kind,
+    alter_table_operation_subject_start,
     stale_routine_payload,
 };
 
@@ -30618,6 +34348,11 @@ fn expectGeneratedUnsupportedCatalogPayloadMutationFails(
                             const range = unsupported.alter_table_operation_tokens orelse return error.TestUnexpectedResult;
                             unsupported.alter_table_operation_tokens = .{ .start = range.start + 1, .end = range.end };
                         },
+                        .alter_table_operation_kind => unsupported.alter_table_operation_kind = .alter_table_tablespace,
+                        .alter_table_operation_subject_start => {
+                            const range = unsupported.alter_table_operation_subject_tokens orelse return error.TestUnexpectedResult;
+                            unsupported.alter_table_operation_subject_tokens = .{ .start = range.start - 1, .end = range.end };
+                        },
                         .stale_routine_payload => unsupported.routine_name_tokens = subject,
                     }
                     try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedUnsupportedCatalogAst(parsed.items(), unsupported.*, boundary));
@@ -30631,7 +34366,10 @@ fn expectGeneratedUnsupportedCatalogPayloadMutationFails(
 }
 
 const GeneratedIndexAstMutation = enum {
+    missing_element_items,
+    corrupt_element_expression,
     missing_include,
+    missing_include_items,
     corrupt_include,
     stale_include,
     missing_options,
@@ -30639,6 +34377,7 @@ const GeneratedIndexAstMutation = enum {
     stale_options,
     missing_where,
     corrupt_where,
+    corrupt_where_expression,
     stale_where,
     stale_unique,
     stale_if_not_exists,
@@ -30658,7 +34397,19 @@ fn expectGeneratedIndexAstMutationFails(
         if (generated_statement.ast) |*generated_ast| {
             switch (generated_ast.*) {
                 .extension_index => |*ddl| switch (mutation) {
+                    .missing_element_items => {
+                        ddl.index_element_items.deinit(alloc);
+                        ddl.index_element_items = .{};
+                    },
+                    .corrupt_element_expression => {
+                        if (ddl.index_element_items.expression_items.len == 0) return error.TestUnexpectedResult;
+                        ddl.index_element_items.expression_items[0].start += 1;
+                    },
                     .missing_include => ddl.index_include_tokens = null,
+                    .missing_include_items => {
+                        ddl.index_include_items.deinit(alloc);
+                        ddl.index_include_items = .{};
+                    },
                     .corrupt_include => ddl.index_include_tokens = .{ .start = 0, .end = 1 },
                     .stale_include => ddl.index_include_tokens = ddl.index_elements_tokens,
                     .missing_options => ddl.index_options_tokens = null,
@@ -30666,6 +34417,9 @@ fn expectGeneratedIndexAstMutationFails(
                     .stale_options => ddl.index_options_tokens = ddl.index_elements_tokens,
                     .missing_where => ddl.index_where_tokens = null,
                     .corrupt_where => ddl.index_where_tokens = .{ .start = 0, .end = 1 },
+                    .corrupt_where_expression => {
+                        ddl.index_where_expression.kind = .function_call;
+                    },
                     .stale_where => ddl.index_where_tokens = ddl.index_elements_tokens,
                     .stale_unique => ddl.unique = !ddl.unique,
                     .stale_if_not_exists => ddl.if_not_exists = !ddl.if_not_exists,
@@ -30701,22 +34455,17 @@ test "sql adapter ddl plan lowers generated graph AST into typed index plans" {
     ));
 
     const graph_index_sql = "CREATE GRAPH INDEX docs_edge_graph_syntax ON doc_edges EDGE (source_doc -> target_doc) TYPE edge_type WEIGHT confidence WITH (edge_policy = 'all');";
-    var legacy_graph_index = try runtimeDdlPlanForTestAlloc(alloc, graph_index_sql);
-    defer legacy_graph_index.deinit(alloc);
     var generated_graph_index = try generatedGraphDdlPlanForTestAlloc(alloc, graph_index_sql);
     defer generated_graph_index.deinit(alloc);
     switch (generated_graph_index) {
-        .create_index => |generated| switch (legacy_graph_index) {
-            .create_index => |legacy| {
-                try std.testing.expectEqual(legacy.method, generated.method);
-                try std.testing.expectEqualStrings(legacy.index_name, generated.index_name);
-                try std.testing.expectEqualStrings(legacy.table_name, generated.table_name);
-                try std.testing.expectEqual(legacy.if_not_exists, generated.if_not_exists);
-                try std.testing.expectEqual(@as(usize, 2), generated.columns.len);
-                try std.testing.expectEqualStrings(legacy.columns[0], generated.columns[0]);
-                try std.testing.expectEqualStrings(legacy.columns[1], generated.columns[1]);
-            },
-            else => return error.TestUnexpectedResult,
+        .create_index => |generated| {
+            try std.testing.expectEqual(DdlIndexMethod.antfly_graph, generated.method);
+            try std.testing.expectEqualStrings("docs_edge_graph_syntax", generated.index_name);
+            try std.testing.expectEqualStrings("doc_edges", generated.table_name);
+            try std.testing.expect(!generated.if_not_exists);
+            try std.testing.expectEqual(@as(usize, 2), generated.columns.len);
+            try std.testing.expectEqualStrings("source_doc", generated.columns[0]);
+            try std.testing.expectEqualStrings("target_doc", generated.columns[1]);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -30754,25 +34503,20 @@ test "sql adapter ddl plan lowers generated graph AST into typed index plans" {
     }
 
     const graph_extraction_sql = "CREATE GRAPH INDEX docs_rel_graph ON docs SOURCE ENRICHMENT relations_v1 FROM body USING extractor MODEL 'relations' EDGES JSON_PATH '$.relations[*]' SOURCE _id TARGET target.document_id TYPE type WEIGHT confidence WITH (edge_policy = 'all');";
-    var legacy_graph_extraction = try runtimeDdlPlanForTestAlloc(alloc, graph_extraction_sql);
-    defer legacy_graph_extraction.deinit(alloc);
     var generated_graph_extraction = try generatedGraphDdlPlanForTestAlloc(alloc, graph_extraction_sql);
     defer generated_graph_extraction.deinit(alloc);
     switch (generated_graph_extraction) {
-        .create_index => |generated| switch (legacy_graph_extraction) {
-            .create_index => |legacy| {
-                try std.testing.expectEqual(legacy.method, generated.method);
-                try std.testing.expectEqualStrings(legacy.index_name, generated.index_name);
-                try std.testing.expectEqualStrings(legacy.table_name, generated.table_name);
-                try std.testing.expectEqual(@as(usize, 1), generated.columns.len);
-                try std.testing.expectEqualStrings(legacy.columns[0], generated.columns[0]);
-                const config = generated.derived_index_config_json orelse return error.TestUnexpectedResult;
-                try std.testing.expect(std.mem.indexOf(u8, config, "\"artifact\":\"relations_v1\"") != null);
-                try std.testing.expect(std.mem.indexOf(u8, config, "\"field\":\"body\"") != null);
-                try std.testing.expect(std.mem.indexOf(u8, config, "\"target\":\"{{ _item.target.document_id }}\"") != null);
-                try std.testing.expect(std.mem.indexOf(u8, config, "\"edge_policy\":\"all\"") != null);
-            },
-            else => return error.TestUnexpectedResult,
+        .create_index => |generated| {
+            try std.testing.expectEqual(DdlIndexMethod.antfly_graph, generated.method);
+            try std.testing.expectEqualStrings("docs_rel_graph", generated.index_name);
+            try std.testing.expectEqualStrings("docs", generated.table_name);
+            try std.testing.expectEqual(@as(usize, 1), generated.columns.len);
+            try std.testing.expectEqualStrings("body", generated.columns[0]);
+            const config = generated.derived_index_config_json orelse return error.TestUnexpectedResult;
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"artifact\":\"relations_v1\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"field\":\"body\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"target\":\"{{ _item.target.document_id }}\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"edge_policy\":\"all\"") != null);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -30871,6 +34615,14 @@ test "sql adapter ddl plan lowers routine expression bindings into ddl plans" {
         .arity = 1,
         .expression = normalize_expression,
     }};
+
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        runtimeDdlPlanForTestAlloc(
+            alloc,
+            "CREATE TABLE usage_records (id text PRIMARY KEY, status text, status_key text GENERATED ALWAYS AS (normalize_status(status)) STORED);",
+        ),
+    );
 
     var generated_table = try runtimeDdlPlanWithFunctionBindingsForTestAlloc(
         alloc,
@@ -31411,6 +35163,65 @@ test "sql adapter generated domain DDL AST lowers to catalog plans" {
         },
         else => return error.TestUnexpectedResult,
     }
+
+    var missing_domain_default_payload = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "CREATE DOMAIN generated_amount AS numeric DEFAULT 0 NOT NULL CONSTRAINT generated_amount_positive CHECK (VALUE >= 0);",
+    );
+    defer missing_domain_default_payload.deinit(alloc);
+    if (missing_domain_default_payload.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    if (ddl.domain_operation_default_value_items.len != 3) return error.TestUnexpectedResult;
+                    try std.testing.expect(ddl.domain_operation_default_value_items[0] != null);
+                    ddl.domain_operation_default_value_items[0] = null;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_domain_default_payload));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_domain_default_payload, .{}));
+
+    var stale_domain_option_kind = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "CREATE DOMAIN generated_amount AS numeric DEFAULT 0 NOT NULL CONSTRAINT generated_amount_positive CHECK (VALUE >= 0);",
+    );
+    defer stale_domain_option_kind.deinit(alloc);
+    if (stale_domain_option_kind.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    if (ddl.domain_operation_kind_items.len != 3) return error.TestUnexpectedResult;
+                    ddl.domain_operation_kind_items[2].start -= 1;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_domain_option_kind));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &stale_domain_option_kind, .{}));
+
+    var missing_domain_check_payload = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "CREATE DOMAIN generated_amount AS numeric DEFAULT 0 NOT NULL CONSTRAINT generated_amount_positive CHECK (VALUE >= 0);",
+    );
+    defer missing_domain_check_payload.deinit(alloc);
+    if (missing_domain_check_payload.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    if (ddl.domain_operation_check_payload_items.len != 3) return error.TestUnexpectedResult;
+                    try std.testing.expect(ddl.domain_operation_check_payload_items[2] != null);
+                    ddl.domain_operation_check_payload_items[2] = null;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_domain_check_payload));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_domain_check_payload, .{}));
 
     var alter_sql = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -32686,6 +36497,38 @@ test "sql adapter generated utility unsupported AST lowers to typed catalog plan
     } else return error.TestUnexpectedResult;
     try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_call_subject));
 
+    var stale_call_routine_name = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "CALL rotate_usage();",
+    );
+    defer stale_call_routine_name.deinit(alloc);
+    if (stale_call_routine_name.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .unsupported => |*unsupported| unsupported.routine_name_tokens = .{ .start = 0, .end = 1 },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_call_routine_name));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &stale_call_routine_name, .{}));
+
+    var missing_call_routine_name = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "CALL rotate_usage();",
+    );
+    defer missing_call_routine_name.deinit(alloc);
+    if (missing_call_routine_name.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .unsupported => |*unsupported| unsupported.routine_name_tokens = null,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_call_routine_name));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_call_routine_name, .{}));
+
     var malformed_lock_subject = try tokenized.ParsedSql.initAlloc(
         alloc,
         "LOCK TABLE usage_records IN SHARE MODE;",
@@ -32700,6 +36543,36 @@ test "sql adapter generated utility unsupported AST lowers to typed catalog plan
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
     try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_lock_subject));
+
+    var stale_lock_table_item = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "LOCK TABLE usage_records IN SHARE MODE;",
+    );
+    defer stale_lock_table_item.deinit(alloc);
+    if (stale_lock_table_item.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .unsupported => |*unsupported| unsupported.table_lock_table_items.items[0] = .{ .start = 0, .end = 1 },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_lock_table_item));
+
+    var stale_lock_mode = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "LOCK TABLE usage_records IN SHARE MODE;",
+    );
+    defer stale_lock_mode.deinit(alloc);
+    if (stale_lock_mode.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .unsupported => |*unsupported| unsupported.table_lock_mode = .exclusive,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_lock_mode));
 
     var call_logical_sql = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -32810,6 +36683,99 @@ test "sql adapter generated utility unsupported AST lowers to typed catalog plan
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
     try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_trigger_subject));
+
+    var malformed_trigger_only_create_subject = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "CREATE TRIGGER usage_audit BEFORE INSERT ON usage_records FOR EACH ROW EXECUTE FUNCTION audit_usage();",
+    );
+    defer malformed_trigger_only_create_subject.deinit(alloc);
+    if (malformed_trigger_only_create_subject.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .unsupported => |*unsupported| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlUnsupportedKind.create_trigger, unsupported.kind);
+                    unsupported.subject_tokens = .{ .start = 1, .end = malformed_trigger_only_create_subject.items().len - 1 };
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerRoutineTriggerCatalogPlanParsedSqlAlloc(
+        alloc,
+        &malformed_trigger_only_create_subject,
+    ));
+
+    var stale_trigger_only_create_metadata = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "CREATE TRIGGER usage_audit BEFORE INSERT ON usage_records FOR EACH ROW EXECUTE FUNCTION audit_usage();",
+    );
+    defer stale_trigger_only_create_metadata.deinit(alloc);
+    if (stale_trigger_only_create_metadata.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .unsupported => |*unsupported| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlUnsupportedKind.create_trigger, unsupported.kind);
+                    unsupported.trigger_table_tokens = unsupported.trigger_name_tokens;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(
+        alloc,
+        &stale_trigger_only_create_metadata,
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerRoutineTriggerCatalogPlanParsedSqlAlloc(
+        alloc,
+        &stale_trigger_only_create_metadata,
+    ));
+
+    var malformed_trigger_only_drop_subject = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "DROP TRIGGER IF EXISTS usage_audit ON usage_records;",
+    );
+    defer malformed_trigger_only_drop_subject.deinit(alloc);
+    if (malformed_trigger_only_drop_subject.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .unsupported => |*unsupported| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlUnsupportedKind.drop_trigger, unsupported.kind);
+                    unsupported.subject_tokens = .{ .start = 1, .end = malformed_trigger_only_drop_subject.items().len - 1 };
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerRoutineTriggerCatalogPlanParsedSqlAlloc(
+        alloc,
+        &malformed_trigger_only_drop_subject,
+    ));
+
+    var stale_trigger_only_drop_metadata = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "DROP TRIGGER IF EXISTS usage_audit ON usage_records;",
+    );
+    defer stale_trigger_only_drop_metadata.deinit(alloc);
+    if (stale_trigger_only_drop_metadata.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .unsupported => |*unsupported| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlUnsupportedKind.drop_trigger, unsupported.kind);
+                    try std.testing.expect(unsupported.trigger_if_exists);
+                    unsupported.trigger_if_exists = false;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(
+        alloc,
+        &stale_trigger_only_drop_metadata,
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerRoutineTriggerCatalogPlanParsedSqlAlloc(
+        alloc,
+        &stale_trigger_only_drop_metadata,
+    ));
 }
 
 test "sql adapter generated notification unsupported AST lowers to catalog plans" {
@@ -32842,6 +36808,24 @@ test "sql adapter generated notification unsupported AST lowers to catalog plans
             .notify => |notify| {
                 try std.testing.expectEqualStrings("usage_events", notify.channel_name);
                 try std.testing.expectEqualStrings("\"updated\"", notify.payload_json orelse return error.TestUnexpectedResult);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var notify_without_payload_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "NOTIFY usage_events;",
+    );
+    defer notify_without_payload_sql.deinit(alloc);
+    var notify_without_payload_plan = try runtimeDdlPlanParsedSqlAlloc(alloc, &notify_without_payload_sql);
+    defer notify_without_payload_plan.deinit(alloc);
+    switch (notify_without_payload_plan) {
+        .notification_channel => |catalog| switch (catalog) {
+            .notify => |notify| {
+                try std.testing.expectEqualStrings("usage_events", notify.channel_name);
+                try std.testing.expect(notify.payload_json == null);
             },
             else => return error.TestUnexpectedResult,
         },
@@ -32895,6 +36879,51 @@ test "sql adapter generated notification unsupported AST lowers to catalog plans
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
     try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_subject));
+
+    var stale_listen_channel = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "LISTEN usage_events;",
+    );
+    defer stale_listen_channel.deinit(alloc);
+    if (stale_listen_channel.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .unsupported => |*unsupported| unsupported.notification_channel_tokens = .{ .start = 0, .end = 1 },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_listen_channel));
+
+    var missing_notify_payload = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "NOTIFY usage_events, 'updated';",
+    );
+    defer missing_notify_payload.deinit(alloc);
+    if (missing_notify_payload.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .unsupported => |*unsupported| unsupported.notification_payload_tokens = null,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_notify_payload));
+
+    var stale_unlisten_all = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "UNLISTEN *;",
+    );
+    defer stale_unlisten_all.deinit(alloc);
+    if (stale_unlisten_all.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .unsupported => |*unsupported| unsupported.notification_unlisten_all = false,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_unlisten_all));
 
     var stale_reindex_kind = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -33117,6 +37146,96 @@ test "sql adapter generated maintenance unsupported AST lowers to catalog plans"
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
     try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_subject));
+
+    var missing_vacuum_name = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "VACUUM usage_records;",
+    );
+    defer missing_vacuum_name.deinit(alloc);
+    if (missing_vacuum_name.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .unsupported => |*unsupported| unsupported.maintenance_name_tokens = null,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_vacuum_name));
+
+    var stale_vacuum_option = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "VACUUM FULL usage_records;",
+    );
+    defer stale_vacuum_option.deinit(alloc);
+    if (stale_vacuum_option.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .unsupported => |*unsupported| unsupported.maintenance_vacuum_full = false,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_vacuum_option));
+
+    var stale_analyze_column = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "ANALYZE VERBOSE usage_records (status, amount);",
+    );
+    defer stale_analyze_column.deinit(alloc);
+    if (stale_analyze_column.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .unsupported => |*unsupported| unsupported.maintenance_column_items.items[0] = unsupported.maintenance_name_tokens.?,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_analyze_column));
+
+    var stale_reindex_target = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "REINDEX TABLE usage_records;",
+    );
+    defer stale_reindex_target.deinit(alloc);
+    if (stale_reindex_target.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .unsupported => |*unsupported| unsupported.maintenance_reindex_target = .index,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_reindex_target));
+
+    var missing_reindex_name = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "REINDEX TABLE usage_records;",
+    );
+    defer missing_reindex_name.deinit(alloc);
+    if (missing_reindex_name.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .unsupported => |*unsupported| unsupported.maintenance_name_tokens = null,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_reindex_name));
+
+    var stale_cluster_index = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "CLUSTER usage_records USING usage_records_status_idx;",
+    );
+    defer stale_cluster_index.deinit(alloc);
+    if (stale_cluster_index.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .unsupported => |*unsupported| unsupported.maintenance_secondary_name_tokens = unsupported.maintenance_name_tokens,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_cluster_index));
 }
 
 test "sql adapter logical ddl plan accepts validated generated unsupported maintenance without vacuum analyze wrapper fallback" {
@@ -33221,32 +37340,6 @@ test "sql adapter logical ddl plan accepts validated generated unsupported maint
         stripped_generated.generated_statement = null;
     } else return error.TestUnexpectedResult;
     try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stripped_generated));
-}
-
-test "sql adapter legacy prepared and cursor subject tail parsers fail closed" {
-    const alloc = std.testing.allocator;
-
-    var prepare_tail = try tokenized.TokenizedSql.initAlloc(
-        alloc,
-        "usage_plan(text) AS SELECT id FROM usage_records WHERE status = $1",
-    );
-    defer prepare_tail.deinit(alloc);
-    var prepare_pos: usize = 0;
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        parsePrepareStatementPlanTailAlloc(alloc, prepare_tail.items(), &prepare_pos),
-    );
-
-    var cursor_tail = try tokenized.TokenizedSql.initAlloc(
-        alloc,
-        "usage_cursor CURSOR FOR SELECT id FROM usage_records ORDER BY id",
-    );
-    defer cursor_tail.deinit(alloc);
-    var cursor_pos: usize = 0;
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        parseDeclareCursorPortalPlanTailAlloc(alloc, cursor_tail.items(), &cursor_pos),
-    );
 }
 
 test "sql adapter generated cursor and savepoint transaction AST lowers to catalog plans" {
@@ -33391,6 +37484,21 @@ test "sql adapter generated cursor and savepoint transaction AST lowers to catal
     } else return error.TestUnexpectedResult;
     try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_cursor_tail));
 
+    var missing_cursor_portal = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "DECLARE usage_cursor CURSOR FOR SELECT id FROM usage_records ORDER BY id;",
+    );
+    defer missing_cursor_portal.deinit(alloc);
+    if (missing_cursor_portal.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .cursor => |*cursor| cursor.portal_name_tokens = null,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_cursor_portal));
+
     var stale_cursor_subject = try tokenized.ParsedSql.initAlloc(
         alloc,
         "DECLARE usage_cursor CURSOR FOR SELECT id FROM usage_records ORDER BY id;",
@@ -33405,6 +37513,21 @@ test "sql adapter generated cursor and savepoint transaction AST lowers to catal
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
     try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_cursor_subject));
+
+    var missing_cursor_subject_ast = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "DECLARE usage_cursor CURSOR FOR SELECT id FROM usage_records ORDER BY id;",
+    );
+    defer missing_cursor_subject_ast.deinit(alloc);
+    if (missing_cursor_subject_ast.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .cursor => |*cursor| cursor.subject_ast = null,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_cursor_subject_ast));
 
     var malformed_subject = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -33572,6 +37695,66 @@ test "sql adapter generated copy unsupported AST lowers to bulk io plan" {
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
     try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_subject));
+
+    var missing_bulk_table = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "COPY usage_records FROM STDIN;",
+    );
+    defer missing_bulk_table.deinit(alloc);
+    if (missing_bulk_table.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .unsupported => |*unsupported| unsupported.bulk_table_tokens = null,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_bulk_table));
+
+    var stale_bulk_endpoint = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "COPY usage_records FROM STDIN;",
+    );
+    defer stale_bulk_endpoint.deinit(alloc);
+    if (stale_bulk_endpoint.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .unsupported => |*unsupported| unsupported.bulk_endpoint_kind = .file,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_bulk_endpoint));
+
+    var stale_bulk_columns = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "COPY usage_records (id, status) FROM STDIN;",
+    );
+    defer stale_bulk_columns.deinit(alloc);
+    if (stale_bulk_columns.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .unsupported => |*unsupported| unsupported.bulk_column_items.items[0].start = 0,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_bulk_columns));
+
+    var missing_bulk_format = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "COPY usage_records FROM STDIN WITH (FORMAT csv);",
+    );
+    defer missing_bulk_format.deinit(alloc);
+    if (missing_bulk_format.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .unsupported => |*unsupported| unsupported.bulk_format_tokens = null,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_bulk_format));
 }
 
 test "sql adapter ddl plan rejects unsupported ddl shapes explicitly" {
@@ -33929,6 +38112,36 @@ test "sql adapter ddl plan lowers application-time temporal table constraints" {
     try std.testing.expectEqualStrings("valid_time", runtime.periods[0].name);
     try std.testing.expectEqualStrings("valid_time", runtime.primary_key.?.without_overlaps_period.?);
 
+    var missing_period_payload = try tokenized.ParsedSql.initAlloc(alloc,
+        \\CREATE TABLE account_prices (
+        \\  tenant_id text NOT NULL,
+        \\  valid_from timestamptz NOT NULL,
+        \\  valid_to timestamptz NOT NULL,
+        \\  PERIOD FOR valid_time (valid_from, valid_to)
+        \\);
+    );
+    defer missing_period_payload.deinit(alloc);
+    if (missing_period_payload.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    var cleared = false;
+                    for (ddl.alter_table_operation_period_payload_items) |*payload| {
+                        if (payload.* != null) {
+                            payload.* = null;
+                            cleared = true;
+                            break;
+                        }
+                    }
+                    if (!cleared) return error.TestUnexpectedResult;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_period_payload));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_period_payload, .{}));
+
     var child = try runtimeDdlPlanForTestAlloc(
         alloc,
         \\CREATE TABLE price_adjustments (
@@ -34010,6 +38223,242 @@ test "sql adapter ddl plan lowers application-time temporal table constraints" {
         },
         else => return error.TestUnexpectedResult,
     }
+
+    var stale_alter_period_payload = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE account_prices ADD PERIOD FOR sell_time (valid_from, valid_to);");
+    defer stale_alter_period_payload.deinit(alloc);
+    if (stale_alter_period_payload.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    var corrupted = false;
+                    for (ddl.alter_table_operation_period_payload_items) |*payload| {
+                        if (payload.*) |*range| {
+                            range.start += 1;
+                            corrupted = true;
+                            break;
+                        }
+                    }
+                    if (!corrupted) return error.TestUnexpectedResult;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_alter_period_payload));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &stale_alter_period_payload, .{}));
+}
+
+test "sql adapter ddl plan parses ddl known defaults and types privately" {
+    const alloc = std.testing.allocator;
+
+    var absent_tokens = try lexer.tokenizeAlloc(alloc, "DEFAULT");
+    defer lexer.freeTokens(alloc, &absent_tokens);
+    var absent_pos: usize = 0;
+    try parseOptionalCurrentTimestampPrecision(absent_tokens.items, &absent_pos);
+    try std.testing.expectEqual(@as(usize, 0), absent_pos);
+
+    var precision_tokens = try lexer.tokenizeAlloc(alloc, "(6) + interval '1 day'");
+    defer lexer.freeTokens(alloc, &precision_tokens);
+    var precision_pos: usize = 0;
+    try parseOptionalCurrentTimestampPrecision(precision_tokens.items, &precision_pos);
+    try std.testing.expect(precision_tokens.items[precision_pos].kind == .plus);
+
+    var too_large_precision_tokens = try lexer.tokenizeAlloc(alloc, "(7)");
+    defer lexer.freeTokens(alloc, &too_large_precision_tokens);
+    var too_large_precision_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseOptionalCurrentTimestampPrecision(too_large_precision_tokens.items, &too_large_precision_pos));
+
+    var null_tokens = try lexer.tokenizeAlloc(alloc, "NULL,");
+    defer lexer.freeTokens(alloc, &null_tokens);
+    var null_pos: usize = 0;
+    try std.testing.expectEqual(DdlKnownDefault.null_literal, (try parseOptionalDdlKnownDefault(null_tokens.items, &null_pos)).?);
+    try std.testing.expect(null_tokens.items[null_pos].kind == .comma);
+
+    var uuid_tokens = try lexer.tokenizeAlloc(alloc, "gen_random_uuid() PRIMARY KEY");
+    defer lexer.freeTokens(alloc, &uuid_tokens);
+    var uuid_pos: usize = 0;
+    try std.testing.expectEqual(DdlKnownDefault.uuid_v4, (try parseOptionalDdlKnownDefault(uuid_tokens.items, &uuid_pos)).?);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(uuid_tokens.items[uuid_pos].text, "primary"));
+
+    var now_tokens = try lexer.tokenizeAlloc(alloc, "CURRENT_TIMESTAMP(6)");
+    defer lexer.freeTokens(alloc, &now_tokens);
+    var now_pos: usize = 0;
+    try std.testing.expectEqual(DdlKnownDefault.now_ns, (try parseOptionalDdlKnownDefault(now_tokens.items, &now_pos)).?);
+    try std.testing.expectEqual(now_tokens.items.len, now_pos);
+
+    var date_tokens = try lexer.tokenizeAlloc(alloc, "CURRENT_DATE");
+    defer lexer.freeTokens(alloc, &date_tokens);
+    var date_pos: usize = 0;
+    try std.testing.expectEqual(DdlKnownDefault.current_date_ns, (try parseOptionalDdlKnownDefault(date_tokens.items, &date_pos)).?);
+    try std.testing.expectEqual(date_tokens.items.len, date_pos);
+
+    var literal_tokens = try lexer.tokenizeAlloc(alloc, "'active'");
+    defer lexer.freeTokens(alloc, &literal_tokens);
+    var literal_pos: usize = 0;
+    try std.testing.expect((try parseOptionalDdlKnownDefault(literal_tokens.items, &literal_pos)) == null);
+    try std.testing.expectEqual(@as(usize, 0), literal_pos);
+
+    var malformed_uuid_tokens = try lexer.tokenizeAlloc(alloc, "gen_random_uuid");
+    defer lexer.freeTokens(alloc, &malformed_uuid_tokens);
+    var malformed_uuid_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseOptionalDdlKnownDefault(malformed_uuid_tokens.items, &malformed_uuid_pos));
+
+    var scalar_subquery_tokens = try lexer.tokenizeAlloc(alloc, "(SELECT status FROM usage_records LIMIT 1)");
+    defer lexer.freeTokens(alloc, &scalar_subquery_tokens);
+    var scalar_subquery_pos: usize = 0;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        parseDdlDefaultValueUntypedLiteralAlloc(alloc, scalar_subquery_tokens.items, &scalar_subquery_pos),
+    );
+    try std.testing.expectEqual(@as(usize, 0), scalar_subquery_pos);
+
+    var numeric_tokens = try lexer.tokenizeAlloc(alloc, "numeric(18, 2) DEFAULT 0");
+    defer lexer.freeTokens(alloc, &numeric_tokens);
+    var numeric_pos: usize = 0;
+    const numeric = try parseDdlType(numeric_tokens.items, &numeric_pos);
+    try std.testing.expectEqual(runtime_schema.AntflyType.numeric, numeric.field_type);
+    try std.testing.expect(numeric.array_item_type == null);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(numeric_tokens.items[numeric_pos].text, "default"));
+
+    var character_tokens = try lexer.tokenizeAlloc(alloc, "character varying(255) COLLATE \"C\"");
+    defer lexer.freeTokens(alloc, &character_tokens);
+    var character_pos: usize = 0;
+    const character = try parseDdlType(character_tokens.items, &character_pos);
+    try std.testing.expectEqual(runtime_schema.AntflyType.keyword, character.field_type);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(character_tokens.items[character_pos].text, "collate"));
+
+    var double_tokens = try lexer.tokenizeAlloc(alloc, "double precision NOT NULL");
+    defer lexer.freeTokens(alloc, &double_tokens);
+    var double_pos: usize = 0;
+    const double = try parseDdlType(double_tokens.items, &double_pos);
+    try std.testing.expectEqual(runtime_schema.AntflyType.numeric, double.field_type);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(double_tokens.items[double_pos].text, "not"));
+
+    var timestamp_tokens = try lexer.tokenizeAlloc(alloc, "timestamp with time zone DEFAULT now()");
+    defer lexer.freeTokens(alloc, &timestamp_tokens);
+    var timestamp_pos: usize = 0;
+    const timestamp = try parseDdlType(timestamp_tokens.items, &timestamp_pos);
+    try std.testing.expectEqual(runtime_schema.AntflyType.datetime, timestamp.field_type);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(timestamp_tokens.items[timestamp_pos].text, "default"));
+
+    var array_tokens = try lexer.tokenizeAlloc(alloc, "text[] NOT NULL");
+    defer lexer.freeTokens(alloc, &array_tokens);
+    var array_pos: usize = 0;
+    const array = try parseDdlType(array_tokens.items, &array_pos);
+    try std.testing.expectEqual(runtime_schema.AntflyType.array, array.field_type);
+    try std.testing.expectEqual(runtime_schema.AntflyType.keyword, array.array_item_type.?);
+
+    var json_array_tokens = try lexer.tokenizeAlloc(alloc, "jsonb[]");
+    defer lexer.freeTokens(alloc, &json_array_tokens);
+    var json_array_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseDdlType(json_array_tokens.items, &json_array_pos));
+
+    var unknown_tokens = try lexer.tokenizeAlloc(alloc, "money");
+    defer lexer.freeTokens(alloc, &unknown_tokens);
+    var unknown_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseDdlType(unknown_tokens.items, &unknown_pos));
+
+    var unclosed_tokens = try lexer.tokenizeAlloc(alloc, "numeric(18, 2");
+    defer lexer.freeTokens(alloc, &unclosed_tokens);
+    var unclosed_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseDdlType(unclosed_tokens.items, &unclosed_pos));
+}
+
+test "sql adapter ddl plan parses ddl constraint timing privately" {
+    const alloc = std.testing.allocator;
+
+    var deferred_tokens = try lexer.tokenizeAlloc(alloc, "DEFERRABLE INITIALLY DEFERRED,");
+    defer lexer.freeTokens(alloc, &deferred_tokens);
+    var deferred_pos: usize = 0;
+    const deferred = try parseOptionalDdlConstraintTiming(deferred_tokens.items, &deferred_pos);
+    try std.testing.expect(deferred.deferrable);
+    try std.testing.expectEqual(runtime_schema.ForeignKeyTiming.deferred, deferred.timing);
+    try std.testing.expect(deferred_tokens.items[deferred_pos].kind == .comma);
+
+    var immediate_tokens = try lexer.tokenizeAlloc(alloc, "NOT DEFERRABLE INITIALLY IMMEDIATE,");
+    defer lexer.freeTokens(alloc, &immediate_tokens);
+    var immediate_pos: usize = 0;
+    const immediate = try parseOptionalDdlConstraintTiming(immediate_tokens.items, &immediate_pos);
+    try std.testing.expect(!immediate.deferrable);
+    try std.testing.expectEqual(runtime_schema.ForeignKeyTiming.immediate, immediate.timing);
+    try std.testing.expect(immediate_tokens.items[immediate_pos].kind == .comma);
+
+    var contradictory_tokens = try lexer.tokenizeAlloc(alloc, "NOT DEFERRABLE INITIALLY DEFERRED,");
+    defer lexer.freeTokens(alloc, &contradictory_tokens);
+    var contradictory_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseOptionalDdlConstraintTiming(contradictory_tokens.items, &contradictory_pos));
+
+    var duplicate_tokens = try lexer.tokenizeAlloc(alloc, "DEFERRABLE NOT DEFERRABLE,");
+    defer lexer.freeTokens(alloc, &duplicate_tokens);
+    var duplicate_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseOptionalDdlConstraintTiming(duplicate_tokens.items, &duplicate_pos));
+}
+
+test "sql adapter ddl plan parses ddl constraint column lists privately" {
+    const alloc = std.testing.allocator;
+
+    var list_tokens = try lexer.tokenizeAlloc(alloc, "(tenant_id, usage_id) INCLUDE (status)");
+    defer lexer.freeTokens(alloc, &list_tokens);
+    var list_pos: usize = 0;
+    const columns = try parseDdlColumnListAlloc(alloc, list_tokens.items, &list_pos);
+    defer freeStringSlice(alloc, columns);
+    try std.testing.expectEqual(@as(usize, 2), columns.len);
+    try std.testing.expectEqualStrings("tenant_id", columns[0]);
+    try std.testing.expectEqualStrings("usage_id", columns[1]);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(list_tokens.items[list_pos].text, "include"));
+
+    const include = try parseOptionalDdlConstraintIncludeAlloc(alloc, list_tokens.items, &list_pos);
+    defer freeStringSlice(alloc, include);
+    try std.testing.expectEqual(@as(usize, 1), include.len);
+    try std.testing.expectEqualStrings("status", include[0]);
+    try std.testing.expectEqual(list_tokens.items.len, list_pos);
+
+    var temporal_tokens = try lexer.tokenizeAlloc(alloc, "(tenant_id, valid_at WITHOUT OVERLAPS)");
+    defer lexer.freeTokens(alloc, &temporal_tokens);
+    var temporal_pos: usize = 0;
+    const temporal = try parseDdlTemporalColumnListAlloc(alloc, temporal_tokens.items, &temporal_pos);
+    defer temporal.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), temporal.columns.len);
+    try std.testing.expectEqualStrings("tenant_id", temporal.columns[0]);
+    try std.testing.expectEqualStrings("valid_at", temporal.without_overlaps_period.?);
+    try std.testing.expectEqual(temporal_tokens.items.len, temporal_pos);
+
+    var duplicate_tokens = try lexer.tokenizeAlloc(alloc, "(tenant_id, tenant_id)");
+    defer lexer.freeTokens(alloc, &duplicate_tokens);
+    var duplicate_pos: usize = 0;
+    const duplicate = try parseDdlColumnListAlloc(alloc, duplicate_tokens.items, &duplicate_pos);
+    defer freeStringSlice(alloc, duplicate);
+    try std.testing.expectEqual(@as(usize, 2), duplicate.len);
+
+    var duplicate_unique_tokens = try lexer.tokenizeAlloc(alloc, "(tenant_id, TENANT_ID)");
+    defer lexer.freeTokens(alloc, &duplicate_unique_tokens);
+    var duplicate_unique_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseDdlUniqueColumnListAlloc(alloc, duplicate_unique_tokens.items, &duplicate_unique_pos));
+
+    var duplicate_include_tokens = try lexer.tokenizeAlloc(alloc, "INCLUDE (status, STATUS)");
+    defer lexer.freeTokens(alloc, &duplicate_include_tokens);
+    var duplicate_include_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseOptionalDdlConstraintIncludeUniqueAlloc(alloc, duplicate_include_tokens.items, &duplicate_include_pos, &.{"tenant_id"}));
+
+    var overlapping_include_tokens = try lexer.tokenizeAlloc(alloc, "INCLUDE (usage_id)");
+    defer lexer.freeTokens(alloc, &overlapping_include_tokens);
+    var overlapping_include_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseOptionalDdlConstraintIncludeUniqueAlloc(alloc, overlapping_include_tokens.items, &overlapping_include_pos, &.{ "tenant_id", "usage_id" }));
+
+    var duplicate_temporal_tokens = try lexer.tokenizeAlloc(alloc, "(tenant_id, TENANT_ID WITHOUT OVERLAPS)");
+    defer lexer.freeTokens(alloc, &duplicate_temporal_tokens);
+    var duplicate_temporal_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseDdlUniqueTemporalColumnListAlloc(alloc, duplicate_temporal_tokens.items, &duplicate_temporal_pos));
+
+    var empty_tokens = try lexer.tokenizeAlloc(alloc, "()");
+    defer lexer.freeTokens(alloc, &empty_tokens);
+    var empty_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseDdlColumnListAlloc(alloc, empty_tokens.items, &empty_pos));
+
+    var double_period_tokens = try lexer.tokenizeAlloc(alloc, "(valid_from WITHOUT OVERLAPS, valid_to WITHOUT OVERLAPS)");
+    defer lexer.freeTokens(alloc, &double_period_tokens);
+    var double_period_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseDdlTemporalColumnListAlloc(alloc, double_period_tokens.items, &double_period_pos));
 }
 
 test "sql adapter ddl plan lowers computed check constraints into native expression checks" {
@@ -34101,39 +38550,7 @@ test "sql adapter ddl plan lowers computed check constraints into native express
     }
 }
 
-test "SQL adapter DDL syntax conversions map grammar enums to plan enums" {
-    try std.testing.expectEqual(CursorScrollMode.no_scroll, cursorScrollModeFromSyntax(.no_scroll));
-    try std.testing.expectEqual(CursorFetchDirection.backward, cursorFetchDirectionFromSyntax(.backward));
-    try std.testing.expectEqual(PreparedStatementSubjectKind.write, preparedStatementSubjectKindFromSyntax(.write));
-    try std.testing.expectEqual(PreparedStatementStatementKind.insert_source, preparedStatementStatementKindFromSyntax(.insert_source));
-    try std.testing.expectEqual(TableLockMode.share_row_exclusive, tableLockModeFromSyntax(.share_row_exclusive));
-    try std.testing.expectEqual(ConstraintCheckMode.deferred, constraintCheckModeFromSyntax(.deferred));
-    try std.testing.expectEqual(runtime_schema.ForeignKeyAction.cascade, ddlForeignKeyActionFromSyntax(.cascade));
-    try std.testing.expectEqual(runtime_schema.ForeignKeyTiming.deferred, ddlForeignKeyTimingFromSyntax(.deferred));
-    try std.testing.expectEqual(runtime_schema.ForeignKeyMatch.full, ddlForeignKeyMatchFromSyntax(.full));
-    const foreign_key_options = ddlForeignKeyOptionsFromSyntax(.{
-        .on_delete = .set_null,
-        .on_update = .cascade,
-        .deferrable = true,
-        .timing = .deferred,
-        .match = .full,
-    });
-    try std.testing.expectEqual(runtime_schema.ForeignKeyAction.set_null, foreign_key_options.on_delete);
-    try std.testing.expectEqual(runtime_schema.ForeignKeyAction.cascade, foreign_key_options.on_update);
-    try std.testing.expect(foreign_key_options.deferrable);
-    try std.testing.expectEqual(runtime_schema.ForeignKeyTiming.deferred, foreign_key_options.timing);
-    try std.testing.expectEqual(runtime_schema.ForeignKeyMatch.full, foreign_key_options.match);
-    try std.testing.expectEqual(grammar.TransactionModeStarterSyntax.begin, transactionModeStarterToSyntax(.begin));
-    try std.testing.expectEqual(TransactionModeStarter.start_transaction, transactionModeStarterFromSyntax(.start_transaction));
-    try std.testing.expectEqual(TransactionIsolationLevel.repeatable_read, transactionIsolationLevelFromSyntax(.repeatable_read).?);
-    try std.testing.expectEqual(@as(?TransactionIsolationLevel, null), transactionIsolationLevelFromSyntax(null));
-    try std.testing.expectEqual(TransactionAccessMode.read_write, transactionAccessModeFromSyntax(.read_write).?);
-    try std.testing.expectEqual(@as(?TransactionAccessMode, null), transactionAccessModeFromSyntax(null));
-    try std.testing.expectEqual(AdvisoryLockAction.unlock, advisoryLockActionFromSyntax(.unlock));
-    try std.testing.expectEqual(ReindexMaintenanceTarget.system, reindexMaintenanceTargetFromSyntax(.system));
-    try std.testing.expectEqual(BulkIoDirection.to, bulkIoDirectionFromSyntax(.to));
-    try std.testing.expectEqual(grammar.PrivilegeChangeActionSyntax.grant, privilegeChangeActionToSyntax(.grant));
-    try std.testing.expectEqual(RoutineKind.procedure, routineKindFromSyntax(.procedure));
+test "SQL adapter DDL helper conversions map names to runtime enums" {
     try std.testing.expectEqual(runtime_schema.AntflyType.datetime, ddlRangeBoundTypeForName("tstzrange").?);
     try std.testing.expectEqual(runtime_schema.AntflyType.numeric, ddlRangeBoundTypeForName("numrange").?);
     try std.testing.expectEqual(runtime_schema.RelationalPeriodRangeType.tsrange, ddlRangeTypeForName("tsrange").?);
@@ -34152,42 +38569,33 @@ test "SQL adapter DDL syntax conversions map grammar enums to plan enums" {
     try std.testing.expectEqualStrings("rebuild_required", relationalIndexLifecycleName(.rebuild_required));
     try std.testing.expectEqualStrings("failed", relationalIndexLifecycleName(.failed));
     const alloc = std.testing.allocator;
-    var syntax: grammar.CreateExtensionSyntax = .{
+    var plan: CreateExtensionPlan = .{
         .extension_name = try alloc.dupe(u8, "pgcrypto"),
-        .schema_name = try alloc.dupe(u8, "public"),
         .version = try alloc.dupe(u8, "1.3"),
         .if_not_exists = true,
     };
-    defer syntax.deinit(alloc);
-    var plan = try createExtensionPlanFromSyntax(&syntax, "public");
     defer plan.deinit(alloc);
     try std.testing.expectEqualStrings("pgcrypto", plan.extension_name);
     try std.testing.expectEqualStrings("1.3", plan.version.?);
     try std.testing.expect(plan.if_not_exists);
 
-    var unsupported_schema: grammar.CreateExtensionSyntax = .{
-        .extension_name = try alloc.dupe(u8, "pgcrypto"),
+    var create_schema: CreateSchemaNamespacePlan = .{
         .schema_name = try alloc.dupe(u8, "tenant"),
         .if_not_exists = true,
     };
-    defer unsupported_schema.deinit(alloc);
-    try std.testing.expectError(error.UnsupportedSqlShape, createExtensionPlanFromSyntax(&unsupported_schema, "public"));
-
-    var create_schema_syntax: grammar.CreateSchemaNamespaceSyntax = .{
-        .schema_name = try alloc.dupe(u8, "tenant"),
-        .if_not_exists = true,
-    };
-    var create_schema = createSchemaNamespacePlanFromSyntax(&create_schema_syntax);
     defer create_schema.deinit(alloc);
     try std.testing.expectEqualStrings("tenant", create_schema.schema_name);
     try std.testing.expect(create_schema.if_not_exists);
 
-    var alter_database_syntax: grammar.AlterDatabaseSyntax = .{
-        .database_name = try alloc.dupe(u8, "app"),
-        .setting_name = try alloc.dupe(u8, "statement_timeout"),
+    const alter_database_operations = try alloc.alloc(DatabaseAlterOperation, 1);
+    alter_database_operations[0] = .{ .set_parameter = .{
+        .name = try alloc.dupe(u8, "statement_timeout"),
         .value_json = try alloc.dupe(u8, "5000"),
+    } };
+    var alter_database: AlterDatabasePlan = .{
+        .database_name = try alloc.dupe(u8, "app"),
+        .operations = alter_database_operations,
     };
-    var alter_database = try alterDatabasePlanFromSyntaxAlloc(alloc, &alter_database_syntax);
     defer alter_database.deinit(alloc);
     try std.testing.expectEqualStrings("app", alter_database.database_name);
     try std.testing.expectEqual(@as(usize, 1), alter_database.operations.len);
@@ -34198,26 +38606,16 @@ test "SQL adapter DDL syntax conversions map grammar enums to plan enums" {
         },
     }
 
-    var notify_syntax: grammar.NotifyNotificationSyntax = .{
-        .channel_name = try alloc.dupe(u8, "jobs"),
-        .payload_json = try alloc.dupe(u8, "\"ready\""),
-    };
-    var notify = notifyNotificationPlanFromSyntax(&notify_syntax);
-    defer notify.deinit(alloc);
-    try std.testing.expectEqualStrings("jobs", notify.channel_name);
-    try std.testing.expectEqualStrings("\"ready\"", notify.payload_json.?);
-
-    var publication_tables = try alloc.alloc(grammar.PublicationTableSyntax, 1);
+    var publication_tables = try alloc.alloc(PublicationTablePlan, 1);
     publication_tables[0] = .{
         .table_name = try alloc.dupe(u8, "usage_records"),
         .column_names = try cloneStringSlice(alloc, &.{ "id", "status" }),
         .where_predicate_sql = try alloc.dupe(u8, "status = 'open'"),
     };
-    var publication_syntax: grammar.CreatePublicationSyntax = .{
+    var publication = CreatePublicationPlan{
         .publication_name = try alloc.dupe(u8, "usage_pub"),
         .tables = publication_tables,
     };
-    var publication = createPublicationPlanFromSyntax(&publication_syntax);
     defer publication.deinit(alloc);
     try std.testing.expectEqualStrings("usage_pub", publication.publication_name);
     try std.testing.expectEqualStrings("usage_records", publication.tables[0].table_name);
@@ -34226,7 +38624,7 @@ test "SQL adapter DDL syntax conversions map grammar enums to plan enums" {
 
     var subscription_publications = try alloc.alloc([]const u8, 1);
     subscription_publications[0] = try alloc.dupe(u8, "usage_pub");
-    var subscription_syntax: grammar.CreateSubscriptionSyntax = .{
+    var subscription = CreateSubscriptionPlan{
         .subscription_name = try alloc.dupe(u8, "usage_sub"),
         .connection_json = try alloc.dupe(u8, "\"host=primary\""),
         .publication_names = subscription_publications,
@@ -34245,7 +38643,6 @@ test "SQL adapter DDL syntax conversions map grammar enums to plan enums" {
         .origin_json = try alloc.dupe(u8, "\"none\""),
         .slot_name_json = try alloc.dupe(u8, "\"usage_slot\""),
     };
-    var subscription = createSubscriptionPlanFromSyntax(&subscription_syntax);
     defer subscription.deinit(alloc);
     try std.testing.expectEqualStrings("usage_sub", subscription.subscription_name);
     try std.testing.expectEqualStrings("\"host=primary\"", subscription.connection_json);
@@ -34265,99 +38662,17 @@ test "SQL adapter DDL syntax conversions map grammar enums to plan enums" {
     try std.testing.expectEqualStrings("\"none\"", subscription.origin_json.?);
     try std.testing.expectEqualStrings("\"usage_slot\"", subscription.slot_name_json.?);
 
-    const prepare = try prepareStatementPlanFromSyntaxAlloc(alloc, .{
-        .statement_name = "usage_plan",
-        .parameter_count = 2,
-        .statement_kind = .read,
-        .statement_family = .read,
-    });
-    var mutable_prepare = prepare;
-    defer mutable_prepare.deinit(alloc);
-    try std.testing.expectEqualStrings("usage_plan", mutable_prepare.statement_name);
-    try std.testing.expectEqual(@as(usize, 2), mutable_prepare.parameter_count);
-
-    const declare = try declareCursorPortalPlanFromSyntaxAlloc(alloc, .{
-        .portal_name = "usage_cursor",
-        .scroll = .scroll,
-        .hold = true,
-        .statement_kind = .read,
-    });
-    var mutable_declare = declare;
-    defer mutable_declare.deinit(alloc);
-    try std.testing.expectEqualStrings("usage_cursor", mutable_declare.portal_name);
-    try std.testing.expectEqual(CursorScrollMode.scroll, mutable_declare.scroll);
-    try std.testing.expect(mutable_declare.hold);
-
-    var comment_syntax: grammar.CommentMetadataSyntax = .{
-        .target = .column,
-        .object_name = try alloc.dupe(u8, "amount"),
-        .parent_table_name = try alloc.dupe(u8, "usage_records"),
-        .comment_json = try alloc.dupe(u8, "\"billable amount\""),
-    };
-    var comment = commentMetadataPlanFromSyntax(&comment_syntax);
-    defer comment.deinit(alloc);
-    try std.testing.expectEqual(CommentMetadataTarget.column, comment.target);
-    try std.testing.expectEqualStrings("amount", comment.object_name);
-    try std.testing.expectEqualStrings("usage_records", comment.parent_table_name.?);
-
-    var lock_tables = try alloc.alloc([]const u8, 1);
-    lock_tables[0] = try alloc.dupe(u8, "usage_records");
-    var lock_syntax: grammar.TableLockSyntax = .{
-        .table_names = lock_tables,
-        .mode = .share,
-    };
-    var table_lock = tableLockPlanFromSyntax(&lock_syntax);
-    defer table_lock.deinit(alloc);
-    try std.testing.expectEqual(TableLockMode.share, table_lock.mode);
-    try std.testing.expectEqualStrings("usage_records", table_lock.table_names[0]);
-
-    var constraint_names = try alloc.alloc([]const u8, 1);
-    constraint_names[0] = try alloc.dupe(u8, "usage_tenant_fk");
-    var constraint_syntax: grammar.ConstraintModeSyntax = .{
-        .constraint_names = constraint_names,
-        .mode = .deferred,
-    };
-    var constraint_mode = constraintModePlanFromSyntax(&constraint_syntax);
-    defer constraint_mode.deinit(alloc);
-    try std.testing.expectEqual(ConstraintCheckMode.deferred, constraint_mode.mode);
-    try std.testing.expectEqualStrings("usage_tenant_fk", constraint_mode.constraint_names[0]);
-
-    const transaction_mode = transactionModePlanFromSyntax(.{
-        .starter = .start_transaction,
-        .isolation_level = .serializable,
-        .access_mode = .read_only,
-        .deferrable = true,
-    });
-    try std.testing.expectEqual(TransactionModeStarter.start_transaction, transaction_mode.starter);
-    try std.testing.expectEqual(TransactionIsolationLevel.serializable, transaction_mode.isolation_level.?);
-    try std.testing.expectEqual(TransactionAccessMode.read_only, transaction_mode.access_mode.?);
-    try std.testing.expect(transaction_mode.deferrable.?);
-
-    const advisory_lock = advisoryLockPlanFromSyntax(.{
-        .action = .lock,
-        .key1 = 42,
-        .key2 = 7,
-    });
-    try std.testing.expectEqual(AdvisoryLockAction.lock, advisory_lock.action);
-    try std.testing.expectEqual(@as(i64, 42), advisory_lock.key1);
-    try std.testing.expectEqual(@as(i64, 7), advisory_lock.key2.?);
-
-    var validate_syntax: grammar.AlterTableValidateConstraintSyntax = .{
-        .constraint_name = try alloc.dupe(u8, "usage_amount_check"),
-    };
-    const validate_operation = alterTableValidateConstraintOperationFromSyntax(&validate_syntax);
+    const validate_operation: AlterTableOperation = .{ .validate_constraint = try alloc.dupe(u8, "usage_amount_check") };
     defer freeAlterTableOperation(alloc, validate_operation);
     switch (validate_operation) {
         .validate_constraint => |constraint_name| try std.testing.expectEqualStrings("usage_amount_check", constraint_name),
         else => return error.TestExpectedEqual,
     }
 
-    var rename_syntax: grammar.AlterTableRenameOperationSyntax = .{
-        .target = .constraint,
+    const rename_operation: AlterTableOperation = .{ .rename_constraint = .{
         .old_name = try alloc.dupe(u8, "usage_amount_check"),
         .new_name = try alloc.dupe(u8, "usage_amount_positive"),
-    };
-    const rename_operation = alterTableRenameOperationFromSyntax(&rename_syntax);
+    } };
     defer freeAlterTableOperation(alloc, rename_operation);
     switch (rename_operation) {
         .rename_constraint => |rename| {
@@ -34367,13 +38682,11 @@ test "SQL adapter DDL syntax conversions map grammar enums to plan enums" {
         else => return error.TestExpectedEqual,
     }
 
-    var drop_syntax: grammar.AlterTableDropOperationSyntax = .{
-        .target = .column,
+    const drop_operation: AlterTableOperation = .{ .drop_column = .{
         .name = try alloc.dupe(u8, "legacy_amount"),
         .if_exists = true,
         .dependency_mode = .restrict,
-    };
-    const drop_operation = alterTableDropOperationFromSyntax(&drop_syntax);
+    } };
     defer freeAlterTableOperation(alloc, drop_operation);
     switch (drop_operation) {
         .drop_column => |drop| {
@@ -34384,11 +38697,10 @@ test "SQL adapter DDL syntax conversions map grammar enums to plan enums" {
         else => return error.TestExpectedEqual,
     }
 
-    var nullability_syntax: grammar.AlterTableColumnNullabilitySyntax = .{
+    const nullability_operation: AlterTableOperation = .{ .alter_column_nullability = .{
         .column_name = try alloc.dupe(u8, "amount"),
         .nullable = false,
-    };
-    const nullability_operation = alterTableColumnNullabilityOperationFromSyntax(&nullability_syntax);
+    } };
     defer freeAlterTableOperation(alloc, nullability_operation);
     switch (nullability_operation) {
         .alter_column_nullability => |nullability| {
@@ -34398,14 +38710,13 @@ test "SQL adapter DDL syntax conversions map grammar enums to plan enums" {
         else => return error.TestExpectedEqual,
     }
 
-    var default_syntax: grammar.AlterTableColumnDefaultSyntax = .{
+    const default_operation: AlterTableOperation = .{ .alter_column_default = .{
         .column_name = try alloc.dupe(u8, "amount"),
-        .action = .set,
-    };
-    const default_operation = alterTableColumnDefaultOperationFromSyntax(&default_syntax, .{
-        .kind = .literal,
-        .value_json = try alloc.dupe(u8, "0"),
-    });
+        .default_value = .{
+            .kind = .literal,
+            .value_json = try alloc.dupe(u8, "0"),
+        },
+    } };
     defer freeAlterTableOperation(alloc, default_operation);
     switch (default_operation) {
         .alter_column_default => |default| {
@@ -34415,15 +38726,11 @@ test "SQL adapter DDL syntax conversions map grammar enums to plan enums" {
         else => return error.TestExpectedEqual,
     }
 
-    var type_syntax: grammar.AlterTableColumnTypeHeaderSyntax = .{
+    const type_operation: AlterTableOperation = .{ .alter_column_type = .{
         .column_name = try alloc.dupe(u8, "amount_text"),
-    };
-    const type_operation = alterTableColumnTypeOperationFromSyntax(
-        &type_syntax,
-        .{ .field_type = .text },
-        try alloc.dupe(u8, "C"),
-        null,
-    );
+        .field_type = .text,
+        .collation = try alloc.dupe(u8, "C"),
+    } };
     defer freeAlterTableOperation(alloc, type_operation);
     switch (type_operation) {
         .alter_column_type => |type_change| {
@@ -34458,17 +38765,6 @@ test "SQL adapter DDL syntax conversions map grammar enums to plan enums" {
         .add_period => |period| try std.testing.expectEqualStrings("valid_time", period.name),
         else => return error.TestExpectedEqual,
     }
-
-    var period_syntax: grammar.DdlPeriodSyntax = .{
-        .name = try alloc.dupe(u8, "system_time"),
-        .start_column = try alloc.dupe(u8, "system_from"),
-        .end_column = try alloc.dupe(u8, "system_to"),
-    };
-    const built_period = ddlPeriodFromSyntax(&period_syntax);
-    defer freeDdlPeriod(alloc, built_period);
-    try std.testing.expectEqualStrings("system_time", built_period.name);
-    try std.testing.expectEqualStrings("system_from", built_period.start_column);
-    try std.testing.expectEqualStrings("system_to", built_period.end_column);
 
     var primary_columns = try alloc.alloc([]const u8, 1);
     primary_columns[0] = try alloc.dupe(u8, "id");
@@ -34593,9 +38889,11 @@ test "SQL adapter DDL syntax conversions map grammar enums to plan enums" {
     const built_foreign_key = try makeDdlForeignKeyAlloc(
         alloc,
         null,
-        .{ .columns = fk_child_columns },
+        fk_child_columns,
+        null,
         try alloc.dupe(u8, "tenants"),
-        .{ .columns = fk_parent_columns },
+        fk_parent_columns,
+        null,
         .{ .on_delete = .cascade },
     );
     defer freeDdlForeignKey(alloc, built_foreign_key);
@@ -34633,12 +38931,11 @@ test "SQL adapter DDL syntax conversions map grammar enums to plan enums" {
     try std.testing.expectEqualStrings("amount", built_check.field);
     try std.testing.expectEqualStrings("0", built_check.value_json.?);
 
-    var sequence_syntax: grammar.CreateSequenceSyntax = .{
+    var sequence: CreateSequencePlan = .{
         .sequence_name = try alloc.dupe(u8, "usage_seq"),
         .if_not_exists = true,
         .options = .{ .start_with = 10 },
     };
-    var sequence = createSequencePlanFromSyntax(&sequence_syntax);
     defer sequence.deinit(alloc);
     try std.testing.expectEqualStrings("usage_seq", sequence.sequence_name);
     try std.testing.expect(sequence.if_not_exists);
@@ -34647,126 +38944,54 @@ test "SQL adapter DDL syntax conversions map grammar enums to plan enums" {
     var enum_values = try alloc.alloc([]const u8, 2);
     enum_values[0] = try alloc.dupe(u8, "queued");
     enum_values[1] = try alloc.dupe(u8, "running");
-    var enum_syntax: grammar.CreateEnumTypeSyntax = .{
+    var enum_plan: CreateEnumTypePlan = .{
         .type_name = try alloc.dupe(u8, "job_state"),
         .values = enum_values,
     };
-    var enum_plan = createEnumTypePlanFromSyntax(&enum_syntax);
     defer enum_plan.deinit(alloc);
     try std.testing.expectEqualStrings("job_state", enum_plan.type_name);
     try std.testing.expectEqualStrings("running", enum_plan.values[1]);
 
-    var collation_syntax: grammar.RenameCollationSyntax = .{
+    var collation: RenameCollationPlan = .{
         .collation_name = try alloc.dupe(u8, "old_collation"),
         .new_collation_name = try alloc.dupe(u8, "new_collation"),
     };
-    var collation = renameCollationPlanFromSyntax(&collation_syntax);
     defer collation.deinit(alloc);
     try std.testing.expectEqualStrings("old_collation", collation.collation_name);
     try std.testing.expectEqualStrings("new_collation", collation.new_collation_name);
 
-    var cast_syntax: grammar.CreateCastSyntax = .{
+    var cast_plan: CreateCastPlan = .{
         .source_type = try alloc.dupe(u8, "text"),
         .target_type = try alloc.dupe(u8, "jsonb"),
         .function_name = try alloc.dupe(u8, "text_to_jsonb"),
         .assignment = true,
     };
-    var cast_plan = createCastPlanFromSyntax(&cast_syntax);
     defer cast_plan.deinit(alloc);
     try std.testing.expectEqualStrings("text", cast_plan.source_type);
     try std.testing.expectEqualStrings("jsonb", cast_plan.target_type);
     try std.testing.expect(cast_plan.assignment);
 
-    var view_fields = try alloc.alloc([]const u8, 1);
-    view_fields[0] = try alloc.dupe(u8, "tenant_id");
-    var view_outputs = try alloc.alloc([]const u8, 1);
-    view_outputs[0] = try alloc.dupe(u8, "tenant_id");
-    var view_syntax: grammar.CreateViewSyntax = .{
-        .view_name = try alloc.dupe(u8, "active_usage"),
-        .source_table_name = try alloc.dupe(u8, "usage_records"),
-        .source_fields = view_fields,
-        .output_fields = view_outputs,
-        .replace_existing = true,
-    };
-    var view_plan = createViewPlanFromSyntax(&view_syntax);
-    defer view_plan.deinit(alloc);
-    try std.testing.expectEqualStrings("active_usage", view_plan.view_name);
-    try std.testing.expectEqualStrings("usage_records", view_plan.source_table_name);
-    try std.testing.expectEqualStrings("tenant_id", view_plan.output_fields[0]);
-    try std.testing.expect(view_plan.replace_existing);
-
-    var materialized_syntax: grammar.CreateMaterializedViewSyntax = .{
-        .view_name = try alloc.dupe(u8, "usage_rollup"),
-        .source_table_name = try alloc.dupe(u8, "usage_records"),
-        .if_not_exists = true,
-        .populate_on_create = false,
-    };
-    var materialized_plan = createMaterializedViewPlanFromSyntax(&materialized_syntax);
-    defer materialized_plan.deinit(alloc);
-    try std.testing.expectEqualStrings("usage_rollup", materialized_plan.view_name);
-    try std.testing.expect(materialized_plan.if_not_exists);
-    try std.testing.expect(!materialized_plan.populate_on_create);
-
-    var drop_table_syntax: grammar.DropTableSyntax = .{
+    var drop_table = DropTablePlan{
         .table_name = try alloc.dupe(u8, "usage_records"),
         .if_exists = true,
         .cascade = true,
     };
-    var drop_table = dropTablePlanFromSyntax(&drop_table_syntax);
     defer drop_table.deinit(alloc);
     try std.testing.expectEqualStrings("usage_records", drop_table.table_name);
     try std.testing.expect(drop_table.if_exists);
     try std.testing.expect(drop_table.cascade);
 
-    var drop_index_syntax: grammar.DropIndexSyntax = .{
+    var drop_index = DropIndexPlan{
         .index_name = try alloc.dupe(u8, "usage_tenant_idx"),
         .if_exists = true,
     };
-    var drop_index = dropIndexPlanFromSyntax(&drop_index_syntax);
     defer drop_index.deinit(alloc);
     try std.testing.expectEqualStrings("usage_tenant_idx", drop_index.index_name);
     try std.testing.expect(drop_index.if_exists);
 
-    var create_policy_syntax: grammar.CreateUpdatePolicySyntax = .{
-        .trigger_name = try alloc.dupe(u8, "usage_updated_at"),
-        .table_name = try alloc.dupe(u8, "usage_records"),
-        .column_name = try alloc.dupe(u8, "updated_at"),
-    };
-    var create_policy = try createUpdatePolicyTriggerPlanFromSyntaxAlloc(alloc, &create_policy_syntax);
-    defer create_policy.deinit(alloc);
-    try std.testing.expectEqualStrings("usage_updated_at", create_policy.trigger_name);
-    try std.testing.expectEqualStrings("usage_records", create_policy.table_name);
-    try std.testing.expectEqualStrings("updated_at", create_policy.column_name);
-    try std.testing.expectEqual(runtime_schema.RelationalDefaultKind.now_ns, create_policy.on_update_value.kind);
-
-    var drop_policy_syntax: grammar.DropUpdatePolicySyntax = .{
-        .trigger_name = try alloc.dupe(u8, "usage_updated_at"),
-        .table_name = try alloc.dupe(u8, "usage_records"),
-        .if_exists = true,
-    };
-    var drop_policy = try dropUpdatePolicyTriggerPlanFromSyntaxAlloc(alloc, &drop_policy_syntax);
-    defer drop_policy.deinit(alloc);
-    try std.testing.expectEqualStrings("usage_records", drop_policy.table_name);
-    try std.testing.expectEqual(@as(usize, 1), drop_policy.operations.len);
-    switch (drop_policy.operations[0]) {
-        .drop_update_policy => |operation| {
-            try std.testing.expectEqualStrings("usage_updated_at", operation.trigger_name);
-            try std.testing.expect(operation.if_exists);
-        },
-        else => return error.TestExpectedEqual,
-    }
-
-    var alter_row_security = try alterRowSecurityPlanFromSyntaxAlloc(alloc, .{
-        .table_identifier = "public.usage_records",
-        .enabled = true,
-    });
-    defer alter_row_security.deinit(alloc);
-    try std.testing.expectEqualStrings("usage_records", alter_row_security.table_name);
-    try std.testing.expect(alter_row_security.enabled);
-
     var policy_roles = try alloc.alloc([]const u8, 1);
     policy_roles[0] = try alloc.dupe(u8, "tenant_reader");
-    var create_row_policy_syntax: grammar.CreateRowSecurityPolicySyntax = .{
+    var create_row_policy = CreateRowSecurityPolicyPlan{
         .policy_name = try alloc.dupe(u8, "tenant_visible"),
         .table_name = try alloc.dupe(u8, "usage_records"),
         .role_targets = policy_roles,
@@ -34775,7 +39000,6 @@ test "SQL adapter DDL syntax conversions map grammar enums to plan enums" {
             .value_json = try alloc.dupe(u8, "\"tenant_a\""),
         } },
     };
-    var create_row_policy = createRowSecurityPolicyPlanFromSyntax(&create_row_policy_syntax);
     defer create_row_policy.deinit(alloc);
     try std.testing.expectEqualStrings("tenant_visible", create_row_policy.policy_name);
     try std.testing.expectEqualStrings("tenant_reader", create_row_policy.role_targets[0]);
@@ -34784,7 +39008,7 @@ test "SQL adapter DDL syntax conversions map grammar enums to plan enums" {
         else => return error.TestExpectedEqual,
     }
 
-    var alter_row_policy_syntax: grammar.AlterRowSecurityPolicySyntax = .{
+    var alter_row_policy = AlterRowSecurityPolicyPlan{
         .policy_name = try alloc.dupe(u8, "tenant_visible"),
         .table_name = try alloc.dupe(u8, "usage_records"),
         .predicate = .{ .literal_equals = .{
@@ -34792,7 +39016,6 @@ test "SQL adapter DDL syntax conversions map grammar enums to plan enums" {
             .value_json = try alloc.dupe(u8, "\"us\""),
         } },
     };
-    var alter_row_policy = alterRowSecurityPolicyPlanFromSyntax(&alter_row_policy_syntax);
     defer alter_row_policy.deinit(alloc);
     try std.testing.expectEqualStrings("tenant_visible", alter_row_policy.policy_name);
     switch (alter_row_policy.predicate orelse return error.TestUnexpectedResult) {
@@ -34800,12 +39023,11 @@ test "SQL adapter DDL syntax conversions map grammar enums to plan enums" {
         else => return error.TestExpectedEqual,
     }
 
-    var drop_row_policy_syntax: grammar.DropRowSecurityPolicySyntax = .{
+    var drop_row_policy = DropRowSecurityPolicyPlan{
         .policy_name = try alloc.dupe(u8, "tenant_visible"),
         .table_name = try alloc.dupe(u8, "usage_records"),
         .if_exists = true,
     };
-    var drop_row_policy = dropRowSecurityPolicyPlanFromSyntax(&drop_row_policy_syntax);
     defer drop_row_policy.deinit(alloc);
     try std.testing.expectEqualStrings("tenant_visible", drop_row_policy.policy_name);
     try std.testing.expect(drop_row_policy.if_exists);
@@ -34871,6 +39093,7 @@ pub fn cloneRelationalRuntimeSchemaAlloc(alloc: std.mem.Allocator, current: runt
     schema.periods = try cloneDdlPeriods(alloc, current.periods);
     schema.foreign_keys = try cloneDdlForeignKeys(alloc, current.foreign_keys);
     schema.unique_constraints = try cloneDdlUniqueConstraints(alloc, current.unique_constraints);
+    schema.relational_indexes = try cloneDdlRelationalIndexes(alloc, current.relational_indexes);
     schema.checks = try cloneDdlRelationalChecks(alloc, current.checks);
     return schema;
 }
@@ -34903,6 +39126,21 @@ pub fn appendUniqueConstraintAlloc(
     out[len] = try cloneDdlUniqueConstraint(alloc, constraint);
     if (len > 0) alloc.free(schema.unique_constraints);
     schema.unique_constraints = out;
+}
+
+pub fn appendRelationalIndexAlloc(
+    alloc: std.mem.Allocator,
+    schema: *runtime_schema.TableSchema,
+    index: runtime_schema.RelationalIndex,
+) !void {
+    if (binder.relationalIndexCatalogNameExists(schema.relational_indexes, index.name)) return error.InvalidSqlCatalog;
+    const len = schema.relational_indexes.len;
+    const out = try alloc.alloc(runtime_schema.RelationalIndex, len + 1);
+    errdefer alloc.free(out);
+    @memcpy(out[0..len], schema.relational_indexes);
+    out[len] = try cloneDdlRelationalIndex(alloc, index);
+    if (len > 0) alloc.free(schema.relational_indexes);
+    schema.relational_indexes = out;
 }
 
 pub fn appendForeignKeyAlloc(
@@ -35099,6 +39337,12 @@ fn renameUniqueConstraintByNameAlloc(
     for (@constCast(schema.unique_constraints)) |*constraint| {
         if (!std.mem.eql(u8, constraint.name, old_name)) continue;
         try replaceOwnedStringIfEqualAlloc(alloc, &constraint.name, old_name, new_name);
+        for (@constCast(schema.relational_indexes)) |*index| {
+            if (index.owner_kind != .unique_constraint) continue;
+            if (!std.mem.eql(u8, index.owner_name, old_name)) continue;
+            try replaceOwnedStringIfEqualAlloc(alloc, &index.owner_name, old_name, new_name);
+            try replaceOwnedStringIfEqualAlloc(alloc, &index.name, old_name, new_name);
+        }
         return true;
     }
     return false;
@@ -35202,8 +39446,11 @@ pub fn dropIndexFromRuntimeSchemaAlloc(
     schema: *runtime_schema.TableSchema,
     plan: DropIndexPlan,
 ) !void {
-    if (try dropUniqueConstraintByNameAlloc(alloc, schema, plan.index_name)) return;
-    if (try dropSecondaryIndexByNameAlloc(alloc, schema, plan.index_name)) return;
+    if (try dropUniqueConstraintByNameAlloc(alloc, schema, plan.index_name)) {
+        _ = try dropRelationalIndexByNameAlloc(alloc, schema, plan.index_name);
+        return;
+    }
+    if (try dropRelationalIndexByNameAlloc(alloc, schema, plan.index_name)) return;
     if (plan.if_exists) return;
     return error.InvalidSqlCatalog;
 }
@@ -35271,82 +39518,6 @@ pub fn alterRelationalColumnNullability(
     columns[index].nullable = operation.nullable;
 }
 
-pub fn markColumnIndexedAlloc(
-    alloc: std.mem.Allocator,
-    schema: *runtime_schema.TableSchema,
-    index_name: []const u8,
-    index_access_method: runtime_schema.RelationalIndexAccessMethod,
-    index_schema_fingerprint: []const u8,
-    column_name: []const u8,
-    include_columns: []const []const u8,
-    index_keys: []const runtime_schema.RelationalIndexKey,
-    predicates: []const runtime_schema.UniquePredicate,
-    expression_predicates: []const db_mod.types.RelationalRowsExpressionCondition,
-    index_generation: u64,
-) !void {
-    const index = binder.relationalColumnIndex(schema.relational_columns, column_name) orelse return error.InvalidSqlCatalog;
-    const columns = @constCast(schema.relational_columns);
-    if (columns[index].index_name) |existing| {
-        if (!std.mem.eql(u8, existing, index_name)) return error.InvalidSqlCatalog;
-    }
-    const cloned_predicates = try cloneDdlUniquePredicates(alloc, predicates);
-    errdefer freeDdlUniquePredicates(alloc, cloned_predicates);
-    const cloned_expression_predicates = try plan_mod.cloneExpressionConditionsAlloc(alloc, expression_predicates);
-    errdefer {
-        freeExpressionConditions(alloc, cloned_expression_predicates);
-        if (cloned_expression_predicates.len > 0) alloc.free(cloned_expression_predicates);
-    }
-    const cloned_index_name = try alloc.dupe(u8, index_name);
-    errdefer alloc.free(cloned_index_name);
-    const cloned_index_schema_fingerprint = try alloc.dupe(u8, index_schema_fingerprint);
-    errdefer alloc.free(cloned_index_schema_fingerprint);
-    const cloned_include_columns = try cloneStringSlice(alloc, include_columns);
-    errdefer freeStringSlice(alloc, cloned_include_columns);
-    const cloned_index_keys = try cloneDdlRelationalIndexKeys(alloc, index_keys);
-    errdefer freeDdlRelationalIndexKeys(alloc, cloned_index_keys);
-    freeDdlUniquePredicates(alloc, columns[index].index_where);
-    freeExpressionConditions(alloc, columns[index].index_where_expressions);
-    if (columns[index].index_where_expressions.len > 0) alloc.free(columns[index].index_where_expressions);
-    if (columns[index].index_name) |existing| alloc.free(existing);
-    if (columns[index].index_schema_fingerprint) |existing| alloc.free(existing);
-    freeStringSlice(alloc, columns[index].index_include_columns);
-    freeDdlRelationalIndexKeys(alloc, columns[index].index_keys);
-    columns[index].indexed = true;
-    columns[index].index_lifecycle = .building;
-    columns[index].index_generation = index_generation;
-    columns[index].index_name = cloned_index_name;
-    columns[index].index_access_method = index_access_method;
-    columns[index].index_schema_fingerprint = cloned_index_schema_fingerprint;
-    columns[index].index_include_columns = cloned_include_columns;
-    columns[index].index_keys = cloned_index_keys;
-    columns[index].index_where = cloned_predicates;
-    columns[index].index_where_expressions = cloned_expression_predicates;
-}
-
-pub fn markColumnsIndexedAlloc(
-    alloc: std.mem.Allocator,
-    schema: *runtime_schema.TableSchema,
-    index_name: []const u8,
-    index_access_method: runtime_schema.RelationalIndexAccessMethod,
-    index_schema_fingerprint: []const u8,
-    column_names: []const []const u8,
-    include_columns: []const []const u8,
-    index_keys: []const runtime_schema.RelationalIndexKey,
-    predicates: []const runtime_schema.UniquePredicate,
-    expression_predicates: []const db_mod.types.RelationalRowsExpressionCondition,
-    index_generation: u64,
-) !void {
-    for (column_names) |column_name| {
-        const index = binder.relationalColumnIndex(schema.relational_columns, column_name) orelse return error.InvalidSqlCatalog;
-        if (schema.relational_columns[index].index_name) |existing| {
-            if (!std.mem.eql(u8, existing, index_name)) return error.InvalidSqlCatalog;
-        }
-    }
-    for (column_names) |column_name| {
-        try markColumnIndexedAlloc(alloc, schema, index_name, index_access_method, index_schema_fingerprint, column_name, include_columns, index_keys, predicates, expression_predicates, index_generation);
-    }
-}
-
 pub fn relationalAccessMethodForCreateIndex(plan: CreateIndexPlan) !runtime_schema.RelationalIndexAccessMethod {
     return switch (plan.method) {
         .btree => .ordered_tuple,
@@ -35355,6 +39526,17 @@ pub fn relationalAccessMethodForCreateIndex(plan: CreateIndexPlan) !runtime_sche
         .antfly_algebraic => .algebraic_filter,
         .hnsw, .antfly_aknn, .antfly_graph, .antfly_graph_metric, .antfly_hybrid => error.UnsupportedSqlShape,
     };
+}
+
+pub fn createIndexPlanIsSchemaDerivedAlgebraic(plan: CreateIndexPlan) bool {
+    if (plan.method != .antfly_algebraic) return false;
+    if (plan.unique or plan.opclass != .default) return false;
+    if (plan.columns.len != 0 or plan.include_columns.len != 0 or plan.index_keys.len != 0) return false;
+    if (plan.expressions.len != 0 or plan.generated_expression != null) return false;
+    if (plan.without_overlaps_period != null or plan.nulls_not_distinct) return false;
+    if (plan.where.len != 0 or plan.where_expressions.len != 0) return false;
+    const config = plan.derived_index_config_json orelse return false;
+    return std.mem.indexOf(u8, config, "\"derive_from_schema\":true") != null;
 }
 
 pub fn stableSecondaryIndexSchemaFingerprintAlloc(alloc: std.mem.Allocator, plan: CreateIndexPlan) ![]u8 {
@@ -35405,6 +39587,12 @@ pub fn stableSecondaryIndexGeneration(plan: CreateIndexPlan) u64 {
         } else {
             hasher.update(&.{0});
         }
+    } else {
+        hasher.update(&.{0});
+    }
+    if (plan.derived_index_config_json) |config_json| {
+        hasher.update(&.{1});
+        hashPlanField(&hasher, config_json);
     } else {
         hasher.update(&.{0});
     }
@@ -35609,29 +39797,6 @@ fn dropPrimaryKeyByNameAlloc(
     return error.UnsupportedSqlShape;
 }
 
-fn dropSecondaryIndexByNameAlloc(
-    alloc: std.mem.Allocator,
-    schema: *runtime_schema.TableSchema,
-    index_name: []const u8,
-) !bool {
-    const index = binder.relationalColumnIndexForIndexName(schema.relational_columns, index_name) orelse return false;
-    if (schema.relational_columns[index].generated != null) {
-        const column_name = schema.relational_columns[index].name;
-        try dropRelationalColumnAlloc(alloc, schema, .{ .name = column_name, .if_exists = false, .dependency_mode = .cascade });
-        return true;
-    }
-
-    const columns = @constCast(schema.relational_columns);
-    var removed = false;
-    for (columns) |*column| {
-        if (!binder.relationalColumnHasIndexName(column.*, index_name)) continue;
-        if (column.generated != null) return error.InvalidSqlCatalog;
-        clearClonedColumnIndexMetadata(alloc, column);
-        removed = true;
-    }
-    return removed;
-}
-
 fn dropUniqueConstraintByNameAlloc(
     alloc: std.mem.Allocator,
     schema: *runtime_schema.TableSchema,
@@ -35659,6 +39824,76 @@ fn dropUniqueConstraintByNameAlloc(
     }
     if (schema.unique_constraints.len > 0) alloc.free(schema.unique_constraints);
     schema.unique_constraints = out;
+    _ = try dropRelationalIndexesForOwnerAlloc(alloc, schema, .unique_constraint, constraint_name);
+    return true;
+}
+
+fn dropRelationalIndexByNameAlloc(
+    alloc: std.mem.Allocator,
+    schema: *runtime_schema.TableSchema,
+    index_name: []const u8,
+) !bool {
+    var found = false;
+    for (schema.relational_indexes) |index| {
+        if (std.mem.eql(u8, index.name, index_name)) {
+            found = true;
+            break;
+        }
+    }
+    if (!found) return false;
+
+    const kept = schema.relational_indexes.len - 1;
+    const out: []runtime_schema.RelationalIndex = if (kept > 0) try alloc.alloc(runtime_schema.RelationalIndex, kept) else &.{};
+    var out_i: usize = 0;
+    for (schema.relational_indexes) |index| {
+        if (std.mem.eql(u8, index.name, index_name)) {
+            if (index.owner_kind == .relational_column and std.mem.eql(u8, index.owner_name, index.name)) {
+                if (binder.relationalColumnForDdl(schema.relational_columns, index.owner_name)) |column| {
+                    if (column.generated != null) {
+                        try dropRelationalColumnAlloc(alloc, schema, .{ .name = index.owner_name, .if_exists = false, .dependency_mode = .cascade });
+                    }
+                }
+            }
+            freeDdlRelationalIndex(alloc, index);
+        } else {
+            out[out_i] = index;
+            out_i += 1;
+        }
+    }
+    if (schema.relational_indexes.len > 0) alloc.free(schema.relational_indexes);
+    schema.relational_indexes = out;
+    return true;
+}
+
+fn dropRelationalIndexesForOwnerAlloc(
+    alloc: std.mem.Allocator,
+    schema: *runtime_schema.TableSchema,
+    owner_kind: runtime_schema.RelationalIndexOwnerKind,
+    owner_name: []const u8,
+) !bool {
+    var kept: usize = 0;
+    var removed = false;
+    for (schema.relational_indexes) |index| {
+        if (index.owner_kind == owner_kind and std.mem.eql(u8, index.owner_name, owner_name)) {
+            removed = true;
+        } else {
+            kept += 1;
+        }
+    }
+    if (!removed) return false;
+
+    const out: []runtime_schema.RelationalIndex = if (kept > 0) try alloc.alloc(runtime_schema.RelationalIndex, kept) else &.{};
+    var out_i: usize = 0;
+    for (schema.relational_indexes) |index| {
+        if (index.owner_kind == owner_kind and std.mem.eql(u8, index.owner_name, owner_name)) {
+            freeDdlRelationalIndex(alloc, index);
+        } else {
+            out[out_i] = index;
+            out_i += 1;
+        }
+    }
+    if (schema.relational_indexes.len > 0) alloc.free(schema.relational_indexes);
+    schema.relational_indexes = out;
     return true;
 }
 
@@ -35950,11 +40185,6 @@ pub fn cloneDdlUniqueConstraint(alloc: std.mem.Allocator, constraint: runtime_sc
     out.columns = try cloneStringSlice(alloc, constraint.columns);
     out.expressions = try cloneDdlUniqueExpressions(alloc, constraint.expressions);
     out.include_columns = try cloneStringSlice(alloc, constraint.include_columns);
-    out.index_keys = try cloneDdlRelationalIndexKeys(alloc, constraint.index_keys);
-    out.index_lifecycle = constraint.index_lifecycle;
-    out.index_generation = constraint.index_generation;
-    out.index_access_method = constraint.index_access_method;
-    out.index_schema_fingerprint = if (constraint.index_schema_fingerprint) |fingerprint| try alloc.dupe(u8, fingerprint) else null;
     out.without_overlaps_period = if (constraint.without_overlaps_period) |period| try alloc.dupe(u8, period) else null;
     out.nulls_not_distinct = constraint.nulls_not_distinct;
     out.deferrable = constraint.deferrable;
@@ -35962,6 +40192,43 @@ pub fn cloneDdlUniqueConstraint(alloc: std.mem.Allocator, constraint: runtime_sc
     out.where = try cloneDdlUniquePredicates(alloc, constraint.where);
     out.where_expressions = try plan_mod.cloneExpressionConditionsAlloc(alloc, constraint.where_expressions);
     out.validation_state = constraint.validation_state;
+    return out;
+}
+
+pub fn cloneDdlRelationalIndex(alloc: std.mem.Allocator, index: runtime_schema.RelationalIndex) !runtime_schema.RelationalIndex {
+    var out: runtime_schema.RelationalIndex = .{
+        .name = try alloc.dupe(u8, index.name),
+        .owner_kind = index.owner_kind,
+        .owner_name = try alloc.dupe(u8, index.owner_name),
+        .access_method = index.access_method,
+        .method_config_json = if (index.method_config_json) |config| try alloc.dupe(u8, config) else null,
+        .unique = index.unique,
+    };
+    errdefer freeDdlRelationalIndex(alloc, out);
+    out.columns = try cloneStringSlice(alloc, index.columns);
+    out.expressions = try cloneDdlUniqueExpressions(alloc, index.expressions);
+    out.include_columns = try cloneStringSlice(alloc, index.include_columns);
+    out.keys = try cloneDdlRelationalIndexKeys(alloc, index.keys);
+    out.lifecycle = index.lifecycle;
+    out.generation = index.generation;
+    out.schema_fingerprint = if (index.schema_fingerprint) |fingerprint| try alloc.dupe(u8, fingerprint) else null;
+    out.where = try cloneDdlUniquePredicates(alloc, index.where);
+    out.where_expressions = try plan_mod.cloneExpressionConditionsAlloc(alloc, index.where_expressions);
+    return out;
+}
+
+pub fn cloneDdlRelationalIndexes(alloc: std.mem.Allocator, indexes: []const runtime_schema.RelationalIndex) ![]const runtime_schema.RelationalIndex {
+    if (indexes.len == 0) return &.{};
+    const out = try alloc.alloc(runtime_schema.RelationalIndex, indexes.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |index| freeDdlRelationalIndex(alloc, index);
+        alloc.free(out);
+    }
+    for (indexes, 0..) |index, i| {
+        out[i] = try cloneDdlRelationalIndex(alloc, index);
+        initialized += 1;
+    }
     return out;
 }
 
@@ -36198,12 +40465,33 @@ pub fn freeDdlUniqueConstraint(alloc: std.mem.Allocator, constraint: runtime_sch
     freeStringSlice(alloc, constraint.columns);
     freeDdlUniqueExpressions(alloc, constraint.expressions);
     freeStringSlice(alloc, constraint.include_columns);
-    freeDdlRelationalIndexKeys(alloc, constraint.index_keys);
-    if (constraint.index_schema_fingerprint) |fingerprint| alloc.free(fingerprint);
     if (constraint.without_overlaps_period) |period| alloc.free(period);
     freeDdlUniquePredicates(alloc, constraint.where);
     freeExpressionConditions(alloc, constraint.where_expressions);
     if (constraint.where_expressions.len > 0) alloc.free(constraint.where_expressions);
+}
+
+pub fn freeDdlRelationalIndex(alloc: std.mem.Allocator, index: runtime_schema.RelationalIndex) void {
+    alloc.free(index.name);
+    alloc.free(index.owner_name);
+    if (index.method_config_json) |config| alloc.free(config);
+    freeStringSlice(alloc, index.columns);
+    freeDdlUniqueExpressions(alloc, index.expressions);
+    freeStringSlice(alloc, index.include_columns);
+    freeDdlRelationalIndexKeys(alloc, index.keys);
+    if (index.schema_fingerprint) |fingerprint| alloc.free(fingerprint);
+    freeDdlUniquePredicates(alloc, index.where);
+    freeExpressionConditions(alloc, index.where_expressions);
+    if (index.where_expressions.len > 0) alloc.free(index.where_expressions);
+}
+
+pub fn clearDdlRelationalIndexes(alloc: std.mem.Allocator, indexes: []const runtime_schema.RelationalIndex) void {
+    for (indexes) |index| freeDdlRelationalIndex(alloc, index);
+}
+
+pub fn freeDdlRelationalIndexes(alloc: std.mem.Allocator, indexes: []const runtime_schema.RelationalIndex) void {
+    clearDdlRelationalIndexes(alloc, indexes);
+    if (indexes.len > 0) alloc.free(indexes);
 }
 
 pub fn clearDdlUniqueConstraints(alloc: std.mem.Allocator, constraints: []const runtime_schema.UniqueConstraint) void {
@@ -36229,10 +40517,14 @@ pub fn freeDdlUniqueExpressions(alloc: std.mem.Allocator, expressions: []const r
     if (expressions.len > 0) alloc.free(expressions);
 }
 
+fn freeDdlUniquePredicate(alloc: std.mem.Allocator, predicate: runtime_schema.UniquePredicate) void {
+    alloc.free(predicate.field);
+    if (predicate.value_json) |value| alloc.free(value);
+}
+
 pub fn freeDdlUniquePredicates(alloc: std.mem.Allocator, predicates: []const runtime_schema.UniquePredicate) void {
     for (predicates) |predicate| {
-        alloc.free(predicate.field);
-        if (predicate.value_json) |value| alloc.free(value);
+        freeDdlUniquePredicate(alloc, predicate);
     }
     if (predicates.len > 0) alloc.free(predicates);
 }

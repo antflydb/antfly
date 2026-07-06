@@ -119,7 +119,7 @@ fn deinitAntflyQueryFunctionArgs(alloc: std.mem.Allocator, args: []const SqlQuer
     }
 }
 
-pub fn parseAntflyQueryFunctionCall(
+fn parseAntflyQueryFunctionCall(
     alloc: std.mem.Allocator,
     tokens: []const Token,
     pos: *usize,
@@ -134,7 +134,7 @@ pub fn parseAntflyQueryFunctionCall(
     return function;
 }
 
-pub fn parseAntflyQueryFunctionExpressionAlloc(
+fn parseAntflyQueryFunctionExpressionAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
     pos: *usize,
@@ -669,7 +669,7 @@ pub fn lowerAntflyQueryFunctionExpressionParsedSqlAlloc(
     return request;
 }
 
-pub fn lowerAntflyQueryFunctionExpressionBodyTokensAlloc(
+fn lowerAntflyQueryFunctionExpressionBodyTokensAlloc(
     alloc: std.mem.Allocator,
     semantic_resolver: ?query_contract.SemanticResolver,
     tokens: []const Token,
@@ -681,7 +681,83 @@ pub fn lowerAntflyQueryFunctionExpressionBodyTokensAlloc(
     return lowered;
 }
 
-pub fn lowerAntflyQueryFunctionExpressionRawBodyTokensAlloc(
+pub fn lowerAntflyQueryFunctionExpressionBodyGeneratedAstAlloc(
+    alloc: std.mem.Allocator,
+    semantic_resolver: ?query_contract.SemanticResolver,
+    tokens: []const Token,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) !LoweredAntflyQueryFunctionExpressionBody {
+    var args = std.ArrayListUnmanaged(SqlQueryFunctionArg).empty;
+    defer {
+        deinitAntflyQueryFunctionArgs(alloc, args.items);
+        args.deinit(alloc);
+    }
+    const function = try generatedAntflyQueryFunctionExpressionArgsAlloc(alloc, tokens, expression, &args);
+
+    const table_name = antflyQueryFunctionStringArg(args.items, "table_name") orelse
+        antflyQueryFunctionStringArg(args.items, "table") orelse return error.UnsupportedSqlShape;
+    const owned_table_name = try alloc.dupe(u8, table_name);
+    errdefer alloc.free(owned_table_name);
+
+    const body_json = try buildAntflyQueryFunctionBodyAlloc(alloc, function, args.items);
+    errdefer alloc.free(body_json);
+    const primary_text_index_name = try antflyQueryFunctionPrimaryTextIndexAlloc(alloc, function, args.items);
+    errdefer if (primary_text_index_name) |index_name| alloc.free(@constCast(index_name));
+
+    var validated = try query_contract.parseQueryRequest(alloc, semantic_resolver, owned_table_name, body_json);
+    validated.deinit(alloc);
+
+    return .{
+        .function = function,
+        .table_name = owned_table_name,
+        .body_json = body_json,
+        .primary_text_index_name = primary_text_index_name,
+    };
+}
+
+fn generatedAntflyQueryFunctionExpressionArgsAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+    args: *std.ArrayListUnmanaged(SqlQueryFunctionArg),
+) !AntflyQueryFunction {
+    if (expression.kind != .function_call) return error.UnsupportedSqlShape;
+    const expression_tokens = expression.tokens orelse return error.UnsupportedSqlShape;
+    if (expression_tokens.start >= expression_tokens.end or expression_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+    const function_name_tokens = expression.function_name_tokens orelse return error.UnsupportedSqlShape;
+    if (function_name_tokens.start + 1 != function_name_tokens.end or
+        function_name_tokens.start != expression_tokens.start or
+        function_name_tokens.end > tokens.len)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    const function = antflyQueryFunctionFromSqlToken(tokens[function_name_tokens.start]) orelse return error.UnsupportedSqlShape;
+    const argument_tokens = expression.argument_tokens orelse return error.UnsupportedSqlShape;
+    if (argument_tokens.start <= function_name_tokens.end or argument_tokens.end + 1 != expression_tokens.end or argument_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+    if (tokens[function_name_tokens.end].kind != .lparen or tokens[argument_tokens.end].kind != .rparen) return error.UnsupportedSqlShape;
+
+    const items = expression.argument_items;
+    if (items.count == 0 or items.items.len != items.count) return error.UnsupportedSqlShape;
+    try args.ensureTotalCapacity(alloc, args.items.len + items.count);
+    for (items.items) |item| {
+        if (item.start >= item.end or item.start < argument_tokens.start or item.end > argument_tokens.end) return error.UnsupportedSqlShape;
+        if (item.start + 3 > item.end) return error.UnsupportedSqlShape;
+        if (tokens[item.start].kind != .identifier) return error.UnsupportedSqlShape;
+        const name_token = tokens[item.start];
+        var value_start = item.start + 2;
+        if (tokens[item.start + 1].kind != .eq) return error.UnsupportedSqlShape;
+        if (value_start < item.end and tokens[value_start].kind == .gt) value_start += 1;
+        if (value_start >= item.end) return error.UnsupportedSqlShape;
+        if (antflyQueryFunctionArg(args.items, name_token.text) != null) return error.UnsupportedSqlShape;
+        args.appendAssumeCapacity(.{
+            .name = name_token.text,
+            .value = try generatedAntflyQueryFunctionArgValueAlloc(alloc, tokens, name_token, .{ .start = value_start, .end = item.end }),
+        });
+    }
+    return function;
+}
+
+fn lowerAntflyQueryFunctionExpressionRawBodyTokensAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
 ) !LoweredAntflyQueryFunctionExpressionBody {

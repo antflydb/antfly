@@ -373,17 +373,16 @@ pub const Reconciler = struct {
             const runtime = schema_mod.deriveRuntimeTableSchema(self.alloc, parsed) catch continue;
             defer @import("../storage/schema.zig").freeSchema(self.alloc, runtime);
 
-            for (runtime.relational_columns) |column| {
-                if (!secondaryIndexColumnNeedsRebuild(column)) continue;
-                const index_name = relationalColumnIndexIdentity(column);
+            for (runtime.relational_indexes) |index| {
+                if (!secondaryIndexNeedsRebuild(index)) continue;
                 for (ranges) |range| {
                     if (range.table_id != table.table_id) continue;
-                    if (secondaryIndexRebuildRangeIdentityExists(self.alloc, manager, table.table_id, index_name, column.index_generation, range.start_key, range.range_id)) continue;
-                    const group_id = try deriveSecondaryIndexRebuildGroupId(self.alloc, manager, ranges, table.table_id, index_name, column.index_generation, range.start_key, range.range_id);
+                    if (secondaryIndexRebuildRangeIdentityExists(self.alloc, manager, table.table_id, index.name, index.generation, range.start_key, range.range_id)) continue;
+                    const group_id = try deriveSecondaryIndexRebuildGroupId(self.alloc, manager, ranges, table.table_id, index.name, index.generation, range.start_key, range.range_id);
                     try manager.upsertSecondaryIndexRebuildRange(.{
                         .table_id = table.table_id,
-                        .index_name = index_name,
-                        .index_generation = column.index_generation,
+                        .index_name = index.name,
+                        .index_generation = index.generation,
                         .start_row_key = range.start_key,
                         .end_row_key = range.end_key,
                         .group_id = group_id,
@@ -2292,14 +2291,9 @@ fn uniqueConstraintGroupIdExists(
     return false;
 }
 
-fn secondaryIndexColumnNeedsRebuild(column: anytype) bool {
-    return column.indexed and
-        column.index_generation != 0 and
-        column.index_lifecycle == .building;
-}
-
-fn relationalColumnIndexIdentity(column: anytype) []const u8 {
-    return column.index_name orelse column.name;
+fn secondaryIndexNeedsRebuild(index: anytype) bool {
+    return index.generation != 0 and
+        index.lifecycle == .building;
 }
 
 fn secondaryIndexRebuildRangeStillDeclared(
@@ -2316,10 +2310,10 @@ fn secondaryIndexRebuildRangeStillDeclared(
     const runtime = schema_mod.deriveRuntimeTableSchema(alloc, parsed) catch return false;
     defer @import("../storage/schema.zig").freeSchema(alloc, runtime);
     var declared = false;
-    for (runtime.relational_columns) |column| {
-        if (!secondaryIndexColumnNeedsRebuild(column)) continue;
-        if (column.index_generation != record.index_generation) continue;
-        if (!std.mem.eql(u8, relationalColumnIndexIdentity(column), record.index_name)) continue;
+    for (runtime.relational_indexes) |index| {
+        if (!secondaryIndexNeedsRebuild(index)) continue;
+        if (index.generation != record.index_generation) continue;
+        if (!std.mem.eql(u8, index.name, record.index_name)) continue;
         declared = true;
         break;
     }
@@ -2967,10 +2961,10 @@ test "metadata reconciler derives primary key and unique owner ranges from table
 
 test "metadata reconciler derives secondary index rebuild ranges from building relational indexes" {
     const schema =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-lifecycle":"building","x-antfly-index-generation":77}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status","owner_kind":"relational_column","owner_name":"status","access_method":"scalar_column","columns":["status"],"lifecycle":"building","generation":77,"schema_fingerprint":"secondary-index-v1:status"}]}
     ;
     const ready_schema =
-        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-generation":77}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status","owner_kind":"relational_column","owner_name":"status","access_method":"scalar_column","columns":["status"],"lifecycle":"ready","generation":77,"schema_fingerprint":"secondary-index-v1:status"}]}
     ;
 
     var manager = table_manager.TableManager.init(std.testing.allocator);

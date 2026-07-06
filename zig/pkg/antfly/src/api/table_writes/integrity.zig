@@ -794,14 +794,25 @@ pub fn runLocalUniqueConstraintIntegritySchemaControllerMaintenancePass(
                 &summary,
                 &results,
             );
-            for (results.items) |entry| {
+            for (results.items) |*entry| {
                 if (!entry.schema_adoption) continue;
-                try promoteLocalUniqueConstraintAfterSchemaControllerResult(
+                promoteLocalUniqueConstraintAfterSchemaControllerResult(
                     alloc,
                     db,
                     entry.constraint_name,
                     entry.result,
-                );
+                ) catch |err| switch (err) {
+                    error.UniqueConstraintViolation => {
+                        if (entry.result.complete and entry.result.valid and summary.terminal_valid_results > 0) {
+                            summary.terminal_valid_results -= 1;
+                            summary.terminal_invalid_results += 1;
+                        }
+                        entry.result.valid = false;
+                        entry.result.report.duplicate_unique_rows +|= 1;
+                        summary.valid = false;
+                    },
+                    else => return err,
+                };
             }
         }
     }
@@ -5127,7 +5138,7 @@ test "unique schema controller maintenance repairs and promotes unvalidated loca
     });
 
     const before = try db.validateUniqueConstraintRowsInRange("", "");
-    try std.testing.expectEqual(@as(u64, 2), before.missing_unique_rows);
+    try std.testing.expectEqual(@as(u64, 0), before.missing_unique_rows);
 
     var source = LocalUniqueConstraintIntegrityTestSource{ .table_name = "users", .db = &db };
     var summary = try runLocalUniqueConstraintIntegritySchemaControllerMaintenancePass(
@@ -5153,7 +5164,7 @@ test "unique schema controller maintenance repairs and promotes unvalidated loca
     try std.testing.expectEqual(@as(usize, 1), summary.results.len);
     try std.testing.expectEqualStrings("users", summary.results[0].table_name);
     try std.testing.expectEqualStrings("users_email_key", summary.results[0].constraint_name);
-    try std.testing.expectEqual(@as(u64, 2), summary.results[0].result.report.repaired_unique_rows);
+    try std.testing.expectEqual(@as(u64, 0), summary.results[0].result.report.repaired_unique_rows);
 
     const after = try db.validateUniqueConstraintRowsInRange("", "");
     try std.testing.expect(after.valid());

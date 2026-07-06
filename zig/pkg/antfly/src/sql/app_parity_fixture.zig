@@ -143,10 +143,7 @@ pub fn validateAppParityFixtureMetadataWithBaseSchema(
     seen_names: *std.StringHashMapUnmanaged(void),
     callbacks: AppParityFixtureMetadataCallbacks,
 ) !void {
-    var parsed_sql = tokenized.ParsedSql.initAlloc(alloc, entry.sql) catch |err| {
-        if (try corpus.sourceCorpusGeneratedParseFailureEntryAlloc(alloc, entry, err)) return;
-        return error.TestUnexpectedResult;
-    };
+    var parsed_sql = tokenized.ParsedSql.initAlloc(alloc, entry.sql) catch return error.TestUnexpectedResult;
     defer parsed_sql.deinit(alloc);
     try corpus.validateFixtureMetadataCoreParsedSql(entry, &parsed_sql);
     try corpus.validateNativeEquivalenceSummaryForEntryAlloc(alloc, entry);

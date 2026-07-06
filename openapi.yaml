@@ -4156,8 +4156,8 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/relational-column-backed-index-repair/jobs/{jobId}:
-    parameters:
+  ? /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/relational-column-backed-index-repair/jobs/{jobId}
+  : parameters:
       - name: databaseName
         in: path
         required: true
@@ -4940,7 +4940,8 @@ paths:
           minLength: 1
     get:
       summary: Get relational index repair job status
-      description: Reads durable relational column-backed index repair job progress for the default public table.
+      description: Reads durable relational column-backed index repair job progress for the default public
+        table.
       tags:
         - index_management
       operationId: getRelationalIndexRepairJob
@@ -11285,7 +11286,8 @@ components:
         job_id:
           type: string
           minLength: 1
-          description: Optional durable repair job identifier used to persist pass progress and resume metadata.
+          description: Optional durable repair job identifier used to persist pass progress and resume
+            metadata.
         lease_ms:
           type: integer
           format: int64
@@ -19055,6 +19057,110 @@ components:
             - unvalidated
           description: Unique validation state. Unvalidated constraints are durable metadata but do not
             enforce writes until promoted.
+    RelationalIndexKey:
+      type: object
+      additionalProperties: false
+      description: Ordered component of a relational ordered-tuple index key.
+      properties:
+        column:
+          type: string
+          minLength: 1
+          description: Declared relational column used by this key component.
+        direction:
+          type: string
+          enum:
+            - asc
+            - desc
+          description: Sort direction for ordered scans. Omitted defaults to asc.
+        nulls:
+          type: string
+          enum:
+            - default
+            - first
+            - last
+          description: Null placement for ordered scans. Omitted uses method default.
+      required:
+        - column
+    RelationalIndex:
+      type: object
+      additionalProperties: false
+      description: Durable relational secondary-index metadata.
+      properties:
+        name:
+          type: string
+          minLength: 1
+          description: Stable index name, unique within the table schema.
+        owner_kind:
+          type: string
+          enum:
+            - relational_column
+            - unique_constraint
+            - table
+          description: Catalog object that owns this physical index.
+        owner_name:
+          type: string
+          description: Owner column, constraint, or table-level sentinel name.
+        access_method:
+          type: string
+          enum:
+            - scalar_column
+            - ordered_tuple
+            - algebraic_filter
+            - text_search
+          description: Logical access method implemented by this index.
+        method_config:
+          type: object
+          additionalProperties: true
+          description: Access-method-specific durable configuration, for example full-text analyzer/scoring options or schema-derived algebraic settings.
+        unique:
+          type: boolean
+          description: True when the entry backs a unique constraint.
+        columns:
+          type: array
+          items:
+            type: string
+          description: Declared relational columns maintained by the index.
+        include_columns:
+          type: array
+          items:
+            type: string
+          description: Covering payload columns stored with ordered tuple entries.
+        keys:
+          type: array
+          items:
+            $ref: '#/components/schemas/RelationalIndexKey'
+          description: Ordered tuple key definition. Required for ordered_tuple indexes.
+        lifecycle:
+          type: string
+          enum:
+            - ready
+            - building
+            - catching_up
+            - stale
+            - rebuild_required
+            - failed
+            - invalid
+            - dropping
+          description: Durable lifecycle state for this index generation.
+        generation:
+          type: integer
+          format: uint64
+          description: Monotonic physical index generation.
+        schema_fingerprint:
+          type: string
+          description: Stable fingerprint of the index-defining catalog shape.
+        where:
+          $ref: '#/components/schemas/RowsUniquePredicateGroup'
+          description: Field-only partial index predicate shorthand.
+        where_expressions:
+          type: array
+          items:
+            $ref: '#/components/schemas/RowsExpressionCondition'
+          description: Deterministic row-expression predicates for index participation.
+      required:
+        - name
+        - owner_kind
+        - access_method
     TableSchema:
       type: object
       description: Schema definition for a table with multiple document types
@@ -19190,6 +19296,20 @@ components:
             committed integrity rows; rows with any absent nullable component do
 
             not create unique rows.
+        relational_indexes:
+          type: array
+          items:
+            $ref: '#/components/schemas/RelationalIndex'
+          description: >
+            Durable relational secondary-index catalog entries. This is the
+
+            public schema shape for relational scalar-column, ordered-tuple,
+
+            algebraic-filter, and text-search index metadata; lifecycle,
+
+            generation, and schema_fingerprint identify the physical index
+
+            generation that may be promoted to ready.
     Boost:
       type: number
       format: double
@@ -20076,10 +20196,42 @@ components:
           x-go-type-skip-optional-pointer: true
           type: integer
           format: uint64
+    RelationalIndexRebuildStatus:
+      type: object
+      description: Aggregate secondary-index rebuild progress projected from authoritative metadata ranges.
+      properties:
+        range_count:
+          type: integer
+          format: uint64
+        matching_generation_range_count:
+          type: integer
+          format: uint64
+        stale_generation_range_count:
+          type: integer
+          format: uint64
+        declared_range_count:
+          type: integer
+          format: uint64
+        building_range_count:
+          type: integer
+          format: uint64
+        ready_range_count:
+          type: integer
+          format: uint64
+        invalid_range_count:
+          type: integer
+          format: uint64
+        completed_row_count:
+          type: integer
+          format: uint64
+        progress_row_key:
+          type: string
+        last_error:
+          type: string
     RelationalIndexRepairReport:
       type: object
-      description: Counters from relational column-backed index repair. These counters describe
-        disposable derived-index artifacts rebuilt from authoritative packed rows.
+      description: Counters from relational column-backed index repair. These counters describe disposable
+        derived-index artifacts rebuilt from authoritative packed rows.
       properties:
         scanned_rows:
           type: integer
@@ -20115,7 +20267,8 @@ components:
           $ref: '#/components/schemas/RelationalIndexRepairReport'
     RelationalIndexRepairStatus:
       type: object
-      description: Aggregate durable repair-job evidence for schema-backed relational indexes on this table.
+      description: Aggregate durable repair-job evidence for schema-backed relational indexes on this
+        table.
       properties:
         job_count:
           type: integer
@@ -20143,38 +20296,6 @@ components:
         latest:
           nullable: true
           $ref: '#/components/schemas/RelationalIndexRepairLatest'
-    RelationalIndexRebuildStatus:
-      type: object
-      description: Aggregate secondary-index rebuild progress projected from authoritative metadata ranges.
-      properties:
-        range_count:
-          type: integer
-          format: uint64
-        matching_generation_range_count:
-          type: integer
-          format: uint64
-        stale_generation_range_count:
-          type: integer
-          format: uint64
-        declared_range_count:
-          type: integer
-          format: uint64
-        building_range_count:
-          type: integer
-          format: uint64
-        ready_range_count:
-          type: integer
-          format: uint64
-        invalid_range_count:
-          type: integer
-          format: uint64
-        completed_row_count:
-          type: integer
-          format: uint64
-        progress_row_key:
-          type: string
-        last_error:
-          type: string
     RelationalIndexStats:
       type: object
       description: Public status for schema-backed relational indexes.

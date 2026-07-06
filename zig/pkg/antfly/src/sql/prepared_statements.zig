@@ -210,10 +210,11 @@ pub const Runtime = struct {
 };
 
 fn preparedStatementFamilyFromParsedSql(parsed_sql: *const sql_adapter.ParsedSql) !?sql_adapter.PreparedStatementStatementKind {
-    if (parsed_sql.generatedStatementKind() == .read and parsed_sql.readStatementKindIncludingGeneratedAst() == null) return error.UnsupportedSqlShape;
+    const read_kind = parsed_sql.readStatementKindIncludingGeneratedAst();
+    if (parsed_sql.generatedStatementKind() == .read and read_kind == null) return error.UnsupportedSqlShape;
     if (parsed_sql.generatedStatementKind() == .dml and parsed_sql.writeStatementKindIncludingGeneratedAst() == null) return error.UnsupportedSqlShape;
     return switch (parsed_sql.statement) {
-        .read => if (parsed_sql.readStatementKindIncludingGeneratedAst() != null) .read else null,
+        .read, .unsupported => if (read_kind != null) .read else null,
         .write => switch (parsed_sql.writeStatementKindIncludingGeneratedAst() orelse return null) {
             .insert => .insert,
             .insert_source => .insert_source,
@@ -228,7 +229,7 @@ fn preparedStatementFamilyFromParsedSql(parsed_sql: *const sql_adapter.ParsedSql
         .prepared,
         .session,
         => .ddl,
-        .unsupported, .unknown => null,
+        .unknown => null,
     };
 }
 
@@ -337,6 +338,22 @@ test "sql prepared statement runtime stores session scoped plans" {
     try std.testing.expectEqualStrings("SELECT id FROM usage_records WHERE status = $1", generated_executable.parsed_sql.sql());
     try std.testing.expectEqualStrings("SELECT id FROM usage_records WHERE status = $1", generated_executable.parsed_sql.statementSql());
     try runtime.apply(.{ .deallocate = .{ .statement_name = "generated_usage_plan" } }, session_a);
+
+    var graph_prepare_plan = try prepareStatementPlanForTestAlloc(
+        alloc,
+        "graph_usage_plan",
+        0,
+        .read,
+        .read,
+        "MATCH (doc)-[:cites]->(target) WITH GRAPH docs_edge_graph ON usage_records START 'doc:root' RETURN doc.key AS source_id",
+    );
+    defer graph_prepare_plan.deinit(alloc);
+    try std.testing.expectEqual(sql_adapter.SqlReadStatementKind.query, graph_prepare_plan.subject_parsed_sql.?.readStatementKindIncludingGeneratedAst().?);
+    try runtime.apply(.{ .prepare = graph_prepare_plan }, session_a);
+    const graph_executable = try runtime.executableForExecute(session_a, .{ .statement_name = "graph_usage_plan" });
+    try std.testing.expectEqual(sql_adapter.PreparedStatementStatementKind.read, graph_executable.statement_family);
+    try std.testing.expectEqual(sql_adapter.SqlReadStatementKind.query, graph_executable.parsed_sql.readStatementKindIncludingGeneratedAst().?);
+    try runtime.apply(.{ .deallocate = .{ .statement_name = "graph_usage_plan" } }, session_a);
 
     var read_plan = try prepareStatementPlanForTestAlloc(alloc, "read_plan", 0, .read, .read, "SELECT id FROM usage_records;");
     defer read_plan.deinit(alloc);

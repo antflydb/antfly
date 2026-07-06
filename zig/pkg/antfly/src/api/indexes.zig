@@ -824,24 +824,12 @@ fn appendRelationalIndexStatusesForTable(
     const runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
     defer storage_schema.freeSchema(alloc, runtime);
 
-    for (runtime.relational_columns) |column| {
-        const access_method = column.index_access_method orelse continue;
-        const index_name = column.index_name orelse column.name;
-        if (emitted_names.contains(index_name)) continue;
+    for (runtime.relational_indexes) |index| {
+        if (emitted_names.contains(index.name)) continue;
         if (!first.*) try out.append(alloc, ',');
         first.* = false;
-        try appendRelationalColumnIndexStatus(alloc, out, snapshot, table, column, index_name, access_method, repair_records);
-        try emitted_names.put(alloc, index_name, {});
-    }
-
-    for (runtime.unique_constraints) |constraint| {
-        const access_method = constraint.index_access_method orelse continue;
-        const index_name = constraint.name;
-        if (emitted_names.contains(index_name)) continue;
-        if (!first.*) try out.append(alloc, ',');
-        first.* = false;
-        try appendRelationalUniqueIndexStatus(alloc, out, snapshot, table, constraint, index_name, access_method, repair_records);
-        try emitted_names.put(alloc, index_name, {});
+        try appendRelationalCatalogIndexStatus(alloc, out, snapshot, table, index, repair_records);
+        try emitted_names.put(alloc, index.name, {});
     }
 }
 
@@ -860,78 +848,63 @@ fn encodeSingleRelationalIndexForTable(
 
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
-    for (runtime.relational_columns) |column| {
-        const access_method = column.index_access_method orelse continue;
-        const relational_index_name = column.index_name orelse column.name;
-        if (!std.mem.eql(u8, relational_index_name, index_name)) continue;
-        try appendRelationalColumnIndexStatus(alloc, &out, snapshot, table, column, relational_index_name, access_method, repair_records);
-        return try out.toOwnedSlice(alloc);
-    }
-    for (runtime.unique_constraints) |constraint| {
-        const access_method = constraint.index_access_method orelse continue;
-        if (!std.mem.eql(u8, constraint.name, index_name)) continue;
-        try appendRelationalUniqueIndexStatus(alloc, &out, snapshot, table, constraint, index_name, access_method, repair_records);
+    for (runtime.relational_indexes) |index| {
+        if (!std.mem.eql(u8, index.name, index_name)) continue;
+        try appendRelationalCatalogIndexStatus(alloc, &out, snapshot, table, index, repair_records);
         return try out.toOwnedSlice(alloc);
     }
     out.deinit(alloc);
     return null;
 }
 
-fn appendRelationalColumnIndexStatus(
+fn appendRelationalCatalogIndexStatus(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
     snapshot: *const metadata_api.AdminSnapshot,
     table: *const metadata_table_manager.TableRecord,
-    column: storage_schema.RelationalColumn,
-    index_name: []const u8,
-    access_method: storage_schema.RelationalIndexAccessMethod,
+    index: storage_schema.RelationalIndex,
     repair_records: []const db_mod.DB.RelationalIndexRepairJobRecord,
 ) !void {
+    const source = switch (index.owner_kind) {
+        .relational_column => "column",
+        .unique_constraint => "unique_constraint",
+        .table => "table",
+    };
     try out.appendSlice(alloc, "{\"config\":{");
-    try appendRelationalIndexConfigPrefix(alloc, out, index_name, "column", access_method, column.index_lifecycle, column.index_generation, column.index_schema_fingerprint);
-    try out.appendSlice(alloc, ",\"column\":");
-    try appendJsonString(alloc, out, column.name);
+    try appendRelationalIndexConfigPrefix(alloc, out, index.name, source, index.access_method, index.lifecycle, index.generation, index.schema_fingerprint);
+    switch (index.owner_kind) {
+        .relational_column => {
+            try out.appendSlice(alloc, ",\"column\":");
+            try appendJsonString(alloc, out, index.owner_name);
+        },
+        .unique_constraint => {
+            try out.appendSlice(alloc, ",\"columns\":");
+            try appendJsonStringArray(alloc, out, index.columns);
+        },
+        .table => {
+            try out.appendSlice(alloc, ",\"owner\":");
+            try appendJsonString(alloc, out, index.owner_name);
+        },
+    }
+    try out.appendSlice(alloc, ",\"method_config\":");
+    if (index.method_config_json) |config| {
+        try out.appendSlice(alloc, config);
+    } else {
+        try out.appendSlice(alloc, "null");
+    }
     try out.appendSlice(alloc, ",\"keys\":");
-    try appendRelationalIndexKeysOrColumns(alloc, out, column.index_keys, &.{column.name});
+    try appendRelationalIndexKeysOrColumns(alloc, out, index.keys, index.columns);
     try out.appendSlice(alloc, ",\"include_columns\":");
-    try appendJsonStringArray(alloc, out, column.index_include_columns);
+    try appendJsonStringArray(alloc, out, index.include_columns);
     try out.appendSlice(alloc, ",\"predicate_count\":");
-    try appendIntValue(alloc, out, @intCast(column.index_where.len));
+    try appendIntValue(alloc, out, @intCast(index.where.len));
     try out.appendSlice(alloc, ",\"expression_predicate_count\":");
-    try appendIntValue(alloc, out, @intCast(column.index_where_expressions.len));
+    try appendIntValue(alloc, out, @intCast(index.where_expressions.len));
+    if (index.unique) try out.appendSlice(alloc, ",\"unique\":true");
     try out.appendSlice(alloc, "},\"status\":");
-    try appendRelationalIndexRuntimeStatus(alloc, out, snapshot, table, index_name, access_method, column.index_lifecycle, column.index_generation, column.index_schema_fingerprint, repair_records);
+    try appendRelationalIndexRuntimeStatus(alloc, out, snapshot, table, index.name, index.access_method, index.lifecycle, index.generation, index.schema_fingerprint, repair_records);
     try out.appendSlice(alloc, ",\"shard_status\":");
-    try appendRelationalIndexRuntimeStatus(alloc, out, snapshot, table, index_name, access_method, column.index_lifecycle, column.index_generation, column.index_schema_fingerprint, repair_records);
-    try out.append(alloc, '}');
-}
-
-fn appendRelationalUniqueIndexStatus(
-    alloc: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    snapshot: *const metadata_api.AdminSnapshot,
-    table: *const metadata_table_manager.TableRecord,
-    constraint: storage_schema.UniqueConstraint,
-    index_name: []const u8,
-    access_method: storage_schema.RelationalIndexAccessMethod,
-    repair_records: []const db_mod.DB.RelationalIndexRepairJobRecord,
-) !void {
-    try out.appendSlice(alloc, "{\"config\":{");
-    try appendRelationalIndexConfigPrefix(alloc, out, index_name, "unique_constraint", access_method, constraint.index_lifecycle, constraint.index_generation, constraint.index_schema_fingerprint);
-    try out.appendSlice(alloc, ",\"columns\":");
-    try appendJsonStringArray(alloc, out, constraint.columns);
-    try out.appendSlice(alloc, ",\"keys\":");
-    try appendRelationalIndexKeysOrColumns(alloc, out, constraint.index_keys, constraint.columns);
-    try out.appendSlice(alloc, ",\"include_columns\":");
-    try appendJsonStringArray(alloc, out, constraint.include_columns);
-    try out.appendSlice(alloc, ",\"predicate_count\":");
-    try appendIntValue(alloc, out, @intCast(constraint.where.len));
-    try out.appendSlice(alloc, ",\"expression_predicate_count\":");
-    try appendIntValue(alloc, out, @intCast(constraint.where_expressions.len));
-    try out.appendSlice(alloc, ",\"unique\":true},\"status\":");
-    try appendRelationalIndexRuntimeStatus(alloc, out, snapshot, table, index_name, access_method, constraint.index_lifecycle, constraint.index_generation, constraint.index_schema_fingerprint, repair_records);
-    try out.appendSlice(alloc, ",\"shard_status\":");
-    try appendRelationalIndexRuntimeStatus(alloc, out, snapshot, table, index_name, access_method, constraint.index_lifecycle, constraint.index_generation, constraint.index_schema_fingerprint, repair_records);
+    try appendRelationalIndexRuntimeStatus(alloc, out, snapshot, table, index.name, index.access_method, index.lifecycle, index.generation, index.schema_fingerprint, repair_records);
     try out.append(alloc, '}');
 }
 
@@ -3467,7 +3440,7 @@ test "index encoders expose relational schema index status" {
         .table_id = 42,
         .name = "orders",
         .schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword","x-antfly-index-name":"tenant_status_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-lifecycle":"building","x-antfly-index-generation":7,"x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_status","x-antfly-index-keys":[{"column":"tenant_id"},{"column":"status","direction":"desc","nulls":"last"}],"x-antfly-index-include":["id"],"x-antfly-index-where":{"all":[{"field":"tenant_id","op":"is_not_null"}]}},"status":{"type":"keyword"},"created_at":{"type":"datetime"}},"required":["id","tenant_id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"orders_tenant_status_key","columns":["tenant_id","status"],"index_access_method":"ordered_tuple","index_lifecycle":"ready","index_generation":9,"index_schema_fingerprint":"secondary-index-v1:unique_tenant_status","index_keys":[{"column":"tenant_id"},{"column":"status"}],"include_columns":["created_at"]}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"status":{"type":"keyword"},"created_at":{"type":"datetime"}},"required":["id","tenant_id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"orders_tenant_status_key","columns":["tenant_id","status"],"include_columns":["created_at"]}],"relational_indexes":[{"name":"tenant_status_idx","owner_kind":"relational_column","owner_name":"tenant_id","access_method":"ordered_tuple","columns":["tenant_id"],"include_columns":["id"],"keys":[{"column":"tenant_id"},{"column":"status","direction":"desc","nulls":"last"}],"lifecycle":"building","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_status","where":{"all":[{"field":"tenant_id","op":"is_not_null"}]}},{"name":"orders_tenant_status_key","owner_kind":"unique_constraint","owner_name":"orders_tenant_status_key","access_method":"ordered_tuple","unique":true,"columns":["tenant_id","status"],"include_columns":["created_at"],"keys":[{"column":"tenant_id"},{"column":"status"}],"lifecycle":"ready","generation":9,"schema_fingerprint":"secondary-index-v1:unique_tenant_status"}]}
         ,
         .indexes_json = "{}",
     };

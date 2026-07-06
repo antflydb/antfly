@@ -106,11 +106,30 @@ pub fn generatedUnaryTextColumnForField(
     }
     for (schema.relational_columns) |column| {
         const generated = column.generated orelse continue;
-        if (generated.op != op) continue;
-        const generated_field = generated.field orelse continue;
-        if (std.mem.eql(u8, generated_field, field)) return column;
+        if (generated.op == op) {
+            const generated_field = generated.field orelse continue;
+            if (std.mem.eql(u8, generated_field, field)) return column;
+        } else if (generated.op == .expression and generatedUnaryExpressionMatchesField(generated.expression orelse continue, op, field)) {
+            return column;
+        }
     }
     return null;
+}
+
+fn generatedUnaryExpressionMatchesField(
+    expression: runtime_schema.RelationalRowsExpression,
+    op: runtime_schema.RelationalGeneratedOp,
+    field: []const u8,
+) bool {
+    const kind: runtime_schema.RelationalRowsExpressionKind = switch (op) {
+        .lower => .lower,
+        .upper => .upper,
+        .md5 => .md5,
+        .concat, .concat_ws, .expression => return false,
+    };
+    if (expression.kind != kind or expression.operands.len != 1) return false;
+    const operand = expression.operands[0];
+    return operand.kind == .field and std.mem.eql(u8, operand.field, field);
 }
 
 pub fn generatedConcatColumnAt(
@@ -124,17 +143,34 @@ pub fn generatedConcatColumnAt(
 ) !?runtime_schema.RelationalColumn {
     for (schema.relational_columns) |column| {
         const generated = column.generated orelse continue;
-        if (generated.op != .concat and generated.op != .concat_ws) continue;
-        if (try concatCallMatchesGeneratedAt(
-            alloc,
-            tokens,
-            pos,
-            schema,
-            generated,
-            field_expression_qualifiers,
-            returning_expression_qualifiers,
-            defer_row_expression_field_validation,
-        )) return column;
+        switch (generated.op) {
+            .concat, .concat_ws => {
+                if (try concatCallMatchesGeneratedAt(
+                    alloc,
+                    tokens,
+                    pos,
+                    schema,
+                    generated,
+                    field_expression_qualifiers,
+                    returning_expression_qualifiers,
+                    defer_row_expression_field_validation,
+                )) return column;
+            },
+            .expression => {
+                const expression = generated.expression orelse continue;
+                if (try concatCallMatchesGeneratedExpressionAt(
+                    alloc,
+                    tokens,
+                    pos,
+                    schema,
+                    expression,
+                    field_expression_qualifiers,
+                    returning_expression_qualifiers,
+                    defer_row_expression_field_validation,
+                )) return column;
+            },
+            else => {},
+        }
     }
     return null;
 }
@@ -184,6 +220,21 @@ pub fn parseGeneratedFieldExpressionOwnedAlloc(
     )) orelse return error.UnsupportedSqlShape;
     pos.* += 2;
     const generated_value = generated.generated orelse return error.UnsupportedSqlShape;
+    if (generated_value.op == .expression) {
+        pos.* -= 2;
+        const expression = generated_value.expression orelse return error.UnsupportedSqlShape;
+        try consumeConcatCallMatchingGeneratedExpression(
+            alloc,
+            tokens,
+            pos,
+            schema,
+            expression,
+            field_expression_qualifiers,
+            returning_expression_qualifiers,
+            defer_row_expression_field_validation,
+        );
+        return try alloc.dupe(u8, generated.name);
+    }
     if (generated_value.op == .concat_ws) {
         const separator = parser.matchToken(tokens, pos, .string) orelse return error.UnsupportedSqlShape;
         if (!std.mem.eql(u8, separator.text, generated_value.separator)) return error.UnsupportedSqlShape;
@@ -213,6 +264,58 @@ pub fn parseGeneratedFieldExpressionOwnedAlloc(
     }
     try parser.expectToken(tokens, pos, .rparen);
     return try alloc.dupe(u8, generated.name);
+}
+
+fn consumeConcatCallMatchingGeneratedExpression(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    expression: runtime_schema.RelationalRowsExpression,
+    field_expression_qualifiers: []const []const u8,
+    returning_expression_qualifiers: []const []const u8,
+    defer_row_expression_field_validation: bool,
+) !void {
+    if (expression.kind != .concat and expression.kind != .concat_ws) return error.UnsupportedSqlShape;
+    if (tokens[pos.*].kind != .identifier) return error.UnsupportedSqlShape;
+    if (expression.kind == .concat and !tokens[pos.*].matchesKeywordTag(.concat)) return error.UnsupportedSqlShape;
+    if (expression.kind == .concat_ws and !tokens[pos.*].matchesKeywordTag(.concat_ws)) return error.UnsupportedSqlShape;
+    pos.* += 1;
+    try parser.expectToken(tokens, pos, .lparen);
+
+    var operand_index: usize = 0;
+    if (expression.kind == .concat_ws) {
+        const separator = parser.matchToken(tokens, pos, .string) orelse return error.UnsupportedSqlShape;
+        if (expression.operands[0].kind != .value) return error.UnsupportedSqlShape;
+        if (!(try valueExpressionStringEquals(alloc, expression.operands[0], separator.text))) return error.UnsupportedSqlShape;
+        if (parser.matchToken(tokens, pos, .comma) == null) return error.UnsupportedSqlShape;
+        operand_index = 1;
+    }
+
+    while (operand_index < expression.operands.len) : (operand_index += 1) {
+        const operand = expression.operands[operand_index];
+        if (operand.kind == .value and expression.kind == .concat) {
+            const separator = parser.matchToken(tokens, pos, .string) orelse return error.UnsupportedSqlShape;
+            if (!(try valueExpressionStringEquals(alloc, operand, separator.text))) return error.UnsupportedSqlShape;
+        } else if (operand.kind == .field) {
+            const parsed_source = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+            defer alloc.free(parsed_source);
+            const source = try binder.normalizeRowExpressionFieldAlloc(
+                alloc,
+                schema,
+                parsed_source,
+                field_expression_qualifiers,
+                returning_expression_qualifiers,
+                defer_row_expression_field_validation,
+            );
+            defer alloc.free(source);
+            if (!std.mem.eql(u8, source, operand.field)) return error.UnsupportedSqlShape;
+        } else {
+            return error.UnsupportedSqlShape;
+        }
+        if (operand_index + 1 < expression.operands.len and parser.matchToken(tokens, pos, .comma) == null) return error.UnsupportedSqlShape;
+    }
+    try parser.expectToken(tokens, pos, .rparen);
 }
 
 pub fn parseGeneratedFieldExpressionOrNullOwnedAlloc(
@@ -387,6 +490,76 @@ fn concatCallMatchesGeneratedAt(
     return i < tokens.len and tokens[i].kind == .rparen;
 }
 
+fn concatCallMatchesGeneratedExpressionAt(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: usize,
+    schema: runtime_schema.TableSchema,
+    expression: runtime_schema.RelationalRowsExpression,
+    field_expression_qualifiers: []const []const u8,
+    returning_expression_qualifiers: []const []const u8,
+    defer_row_expression_field_validation: bool,
+) !bool {
+    if (expression.kind != .concat and expression.kind != .concat_ws) return false;
+    if (expression.operands.len == 0) return false;
+    if (pos + 2 >= tokens.len or tokens[pos].kind != .identifier or tokens[pos + 1].kind != .lparen) return false;
+    if (expression.kind == .concat and !tokens[pos].matchesKeywordTag(.concat)) return false;
+    if (expression.kind == .concat_ws and !tokens[pos].matchesKeywordTag(.concat_ws)) return false;
+
+    var token_i: usize = pos + 2;
+    var operand_i: usize = 0;
+    if (expression.kind == .concat_ws) {
+        if (token_i >= tokens.len or tokens[token_i].kind != .string) return false;
+        if (expression.operands[0].kind != .value) return false;
+        if (!(try valueExpressionStringEquals(alloc, expression.operands[0], tokens[token_i].text))) return false;
+        token_i += 1;
+        if (token_i >= tokens.len or tokens[token_i].kind != .comma) return false;
+        token_i += 1;
+        operand_i = 1;
+    }
+
+    while (operand_i < expression.operands.len) : (operand_i += 1) {
+        const operand = expression.operands[operand_i];
+        if (operand.kind == .value and expression.kind == .concat) {
+            if (token_i >= tokens.len or tokens[token_i].kind != .string) return false;
+            if (!(try valueExpressionStringEquals(alloc, operand, tokens[token_i].text))) return false;
+            token_i += 1;
+        } else if (operand.kind == .field) {
+            if (token_i >= tokens.len or tokens[token_i].kind != .identifier) return false;
+            const normalized_field = try binder.normalizeRowExpressionFieldAlloc(
+                alloc,
+                schema,
+                tokens[token_i].text,
+                field_expression_qualifiers,
+                returning_expression_qualifiers,
+                defer_row_expression_field_validation,
+            );
+            defer alloc.free(normalized_field);
+            if (!std.mem.eql(u8, normalized_field, operand.field)) return false;
+            token_i += 1;
+        } else {
+            return false;
+        }
+        if (operand_i + 1 < expression.operands.len) {
+            if (token_i >= tokens.len or tokens[token_i].kind != .comma) return false;
+            token_i += 1;
+        }
+    }
+
+    return token_i < tokens.len and tokens[token_i].kind == .rparen;
+}
+
+fn valueExpressionStringEquals(
+    alloc: std.mem.Allocator,
+    expression: runtime_schema.RelationalRowsExpression,
+    expected: []const u8,
+) !bool {
+    if (expression.kind != .value) return false;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, expression.value_json, .{}) catch return false;
+    defer parsed.deinit();
+    return parsed.value == .string and std.mem.eql(u8, parsed.value.string, expected);
+}
+
 test "sql expr_generated resolves generated field expressions" {
     const alloc = std.testing.allocator;
     const quoted_generated_name = Token{ .kind = .identifier, .text = "md5", .source_start = 0, .source_end = 5 };
@@ -399,13 +572,29 @@ test "sql expr_generated resolves generated field expressions" {
             .name = "status_lower",
             .path = "status_lower",
             .field_type = .keyword,
-            .generated = .{ .op = .lower, .field = "status" },
+            .generated = .{
+                .op = .expression,
+                .expression = .{
+                    .kind = .lower,
+                    .operands = &.{.{ .kind = .field, .field = "status" }},
+                },
+            },
         },
         .{
             .name = "tenant_status",
             .path = "tenant_status",
             .field_type = .keyword,
-            .generated = .{ .op = .concat_ws, .fields = &.{ "tenant_id", "status" }, .separator = ":" },
+            .generated = .{
+                .op = .expression,
+                .expression = .{
+                    .kind = .concat_ws,
+                    .operands = &.{
+                        .{ .kind = .value, .value_json = "\":\"" },
+                        .{ .kind = .field, .field = "tenant_id" },
+                        .{ .kind = .field, .field = "status" },
+                    },
+                },
+            },
         },
     };
     const schema: runtime_schema.TableSchema = .{ .relational_columns = &generated_columns };

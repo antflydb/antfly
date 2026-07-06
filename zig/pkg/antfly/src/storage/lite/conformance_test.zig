@@ -187,17 +187,22 @@ test "storage.lite relational ordered tuple doc range cleanup survives reopen" {
             .name = "status",
             .path = "status",
             .field_type = .keyword,
-            .indexed = true,
-            .index_name = "orders_status_amount_idx",
-            .index_access_method = .ordered_tuple,
-            .index_generation = 7,
-            .index_schema_fingerprint = "secondary-index-v1:orders_status_amount_idx",
-            .index_lifecycle = .ready,
-            .index_keys = index_keys[0..],
+            .indexed = false,
         },
         .{ .name = "amount", .path = "amount", .field_type = .numeric },
     };
-    const policy = relational_store.ColumnIndexPolicy.fromColumns(columns[0..]);
+    const indexes = [_]schema_mod.RelationalIndex{.{
+        .name = "orders_status_amount_idx",
+        .owner_kind = .relational_column,
+        .owner_name = "status",
+        .access_method = .ordered_tuple,
+        .columns = &.{ "status", "amount" },
+        .keys = index_keys[0..],
+        .lifecycle = .ready,
+        .generation = 7,
+        .schema_fingerprint = "secondary-index-v1:orders_status_amount_idx",
+    }};
+    const policy = relational_store.ColumnIndexPolicy.fromSchemaParts(columns[0..], indexes[0..]);
 
     const tuple_a = try relational_store.orderedTupleValueForIndexKeysAlloc(allocator, row_a, index_keys[0..], columns[0..]);
     defer allocator.free(tuple_a);
@@ -307,19 +312,36 @@ test "storage.lite relational ordered tuple repair survives reopen" {
             .name = "status",
             .path = "status",
             .field_type = .keyword,
-            .indexed = true,
-            .index_name = "orders_status_amount_idx",
-            .index_access_method = .ordered_tuple,
-            .index_generation = 7,
-            .index_schema_fingerprint = "secondary-index-v1:orders_status_amount_idx",
-            .index_lifecycle = .ready,
-            .index_keys = index_keys[0..],
-            .index_include_columns = include_columns[0..],
+            .indexed = false,
         },
-        .{ .name = "amount", .path = "amount", .field_type = .numeric, .indexed = true },
+        .{ .name = "amount", .path = "amount", .field_type = .numeric, .indexed = false },
         .{ .name = "note", .path = "note", .field_type = .keyword },
     };
-    const policy = relational_store.ColumnIndexPolicy.fromColumns(columns[0..]);
+    const indexes = [_]schema_mod.RelationalIndex{
+        .{
+            .name = "orders_status_amount_idx",
+            .owner_kind = .relational_column,
+            .owner_name = "status",
+            .access_method = .ordered_tuple,
+            .columns = &.{ "status", "amount" },
+            .keys = index_keys[0..],
+            .include_columns = include_columns[0..],
+            .lifecycle = .ready,
+            .generation = 7,
+            .schema_fingerprint = "secondary-index-v1:orders_status_amount_idx",
+        },
+        .{
+            .name = "amount",
+            .owner_kind = .relational_column,
+            .owner_name = "amount",
+            .access_method = .scalar_column,
+            .columns = &.{"amount"},
+            .lifecycle = .ready,
+            .generation = 7,
+            .schema_fingerprint = "secondary-index-v1:amount",
+        },
+    };
+    const policy = relational_store.ColumnIndexPolicy.fromSchemaParts(columns[0..], indexes[0..]);
 
     const tuple_a = try relational_store.orderedTupleValueForIndexKeysAlloc(allocator, row_a, index_keys[0..], columns[0..]);
     defer allocator.free(tuple_a);

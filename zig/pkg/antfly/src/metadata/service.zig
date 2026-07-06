@@ -6171,9 +6171,9 @@ fn catalogSourceVTable(comptime Service: type) catalog_source.CatalogSource.VTab
             alloc: std.mem.Allocator,
             table_name: []const u8,
             index_name: []const u8,
-            expected_generation: u64,
+            expected: metadata_table_manager.SecondaryIndexReadyExpectation,
         ) !bool {
-            return try promoteSecondaryIndexReadyOnMetadataService(service(ptr), alloc, table_name, index_name, expected_generation);
+            return try promoteSecondaryIndexReadyOnMetadataService(service(ptr), alloc, table_name, index_name, expected);
         }
 
         fn compareAndSwapTableSchema(ptr: *anyopaque, request: metadata_table_manager.TableSchemaCompareAndSwapRequest) !void {
@@ -6221,20 +6221,26 @@ fn promoteSecondaryIndexReadyOnMetadataService(
     alloc: std.mem.Allocator,
     table_name: []const u8,
     index_name: []const u8,
-    expected_generation: u64,
+    expected: metadata_table_manager.SecondaryIndexReadyExpectation,
 ) !bool {
     var snapshot = try service.adminSnapshot();
     defer service.freeAdminSnapshot(&snapshot);
     const table = findTableRecordByName(&snapshot, table_name) orelse return error.TableNotFound;
-    const schema_json = sql_schema_mutation.schemaWithSecondaryIndexReadyAlloc(
+    const schema_json = sql_schema_mutation.schemaWithSecondaryIndexReadyCheckedAlloc(
         alloc,
         table.schema_json,
         index_name,
-        expected_generation,
+        .{
+            .generation = expected.generation,
+            .access_method = expected.access_method,
+            .schema_fingerprint = expected.schema_fingerprint,
+        },
     ) catch |err| switch (err) {
         error.SecondaryIndexNotBuilding,
         error.SecondaryIndexGenerationMismatch,
         error.SecondaryIndexNotFound,
+        error.SecondaryIndexAccessMethodMismatch,
+        error.SecondaryIndexSchemaFingerprintMismatch,
         => return false,
         else => return err,
     };
@@ -6244,7 +6250,7 @@ fn promoteSecondaryIndexReadyOnMetadataService(
     try service.promoteSecondaryIndexReady(.{
         .table_id = table.table_id,
         .index_name = index_name,
-        .expected_index_generation = expected_generation,
+        .expected = expected,
         .expected_schema_json = table.schema_json,
         .promoted_table = updated,
     });
@@ -12944,13 +12950,13 @@ test "metadata service secondary index promotion command uses schema compare and
     defer std.testing.allocator.free(root);
 
     const building_schema =
-        \\{"version":0,"document_schemas":{"row":{"schema":{"type":"object","properties":{"status":{"type":"string","x-antfly-index":true,"x-antfly-index-lifecycle":"building","x-antfly-index-generation":42}}}}}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status","owner_kind":"relational_column","owner_name":"status","access_method":"scalar_column","columns":["status"],"lifecycle":"building","generation":42,"schema_fingerprint":"secondary-index-v1:status"}]}
     ;
     const stale_ready_schema =
-        \\{"version":0,"document_schemas":{"row":{"schema":{"type":"object","properties":{"status":{"type":"string","x-antfly-index":true,"x-antfly-index-lifecycle":"bad-ready","x-antfly-index-generation":42}}}}}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status","owner_kind":"relational_column","owner_name":"status","access_method":"scalar_column","columns":["status"],"lifecycle":"bad-ready","generation":42,"schema_fingerprint":"secondary-index-v1:status"}]}
     ;
     const ready_schema =
-        \\{"version":0,"document_schemas":{"row":{"schema":{"type":"object","properties":{"status":{"type":"string","x-antfly-index":true,"x-antfly-index-lifecycle":"ready","x-antfly-index-generation":42}}}}}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status","owner_kind":"relational_column","owner_name":"status","access_method":"scalar_column","columns":["status"],"lifecycle":"ready","generation":42,"schema_fingerprint":"secondary-index-v1:status"}]}
     ;
 
     const table_cmd = try metadata_storage.encodeTransitionCommand(std.testing.allocator, .{
@@ -12999,7 +13005,11 @@ test "metadata service secondary index promotion command uses schema compare and
         .promote_secondary_index_ready = .{
             .table_id = 41,
             .index_name = "status",
-            .expected_index_generation = 42,
+            .expected = .{
+                .generation = 42,
+                .access_method = .scalar_column,
+                .schema_fingerprint = "secondary-index-v1:status",
+            },
             .expected_schema_json = "{\"stale\":true}",
             .promoted_table = .{
                 .table_id = 41,
@@ -13013,7 +13023,11 @@ test "metadata service secondary index promotion command uses schema compare and
         .promote_secondary_index_ready = .{
             .table_id = 41,
             .index_name = "status",
-            .expected_index_generation = 42,
+            .expected = .{
+                .generation = 42,
+                .access_method = .scalar_column,
+                .schema_fingerprint = "secondary-index-v1:status",
+            },
             .expected_schema_json = building_schema,
             .promoted_table = .{
                 .table_id = 41,

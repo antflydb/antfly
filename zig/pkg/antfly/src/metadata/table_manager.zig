@@ -537,10 +537,16 @@ pub const SecondaryIndexRebuildRangeInvalidateRequest = struct {
     last_error: []const u8,
 };
 
+pub const SecondaryIndexReadyExpectation = struct {
+    generation: u64,
+    access_method: runtime_schema.RelationalIndexAccessMethod,
+    schema_fingerprint: []const u8,
+};
+
 pub const SecondaryIndexReadyPromotionRequest = struct {
     table_id: u64,
     index_name: []const u8,
-    expected_index_generation: u64,
+    expected: SecondaryIndexReadyExpectation,
     expected_schema_json: []const u8,
     promoted_table: TableRecord,
 };

@@ -769,14 +769,14 @@ fn lowerGeneratedSetOperationQueryPlanAlloc(
         .schema = context.schema,
         .params = context.params,
         .function_bindings = context.function_bindings,
-        .generated_read_ast = read_ast,
+        .generated_read_ast = null,
     };
     return lower_expr.parseQueryPlanAlloc(
         context.alloc,
         tokens,
         &parser_state.pos,
         context.params,
-        read_ast,
+        null,
         parser_context.ParserState.ContextAccessors.cteSelectParserHooks(&parser_state),
         parser_context.ParserState.ContextAccessors.queryPlanParserHooks(&parser_state),
         parser_context.ParserState.ContextAccessors.simpleSelectSetTailHooks(&parser_state),

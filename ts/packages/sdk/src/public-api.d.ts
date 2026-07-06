@@ -9585,6 +9585,64 @@ export interface components {
              */
             validation_state?: "enforced" | "unvalidated";
         };
+        /** @description Ordered component of a relational ordered-tuple index key. */
+        RelationalIndexKey: {
+            /** @description Declared relational column used by this key component. */
+            column: string;
+            /**
+             * @description Sort direction for ordered scans. Omitted defaults to asc.
+             * @enum {string}
+             */
+            direction?: "asc" | "desc";
+            /**
+             * @description Null placement for ordered scans. Omitted uses method default.
+             * @enum {string}
+             */
+            nulls?: "default" | "first" | "last";
+        };
+        /** @description Durable relational secondary-index metadata. */
+        RelationalIndex: {
+            /** @description Stable index name, unique within the table schema. */
+            name: string;
+            /**
+             * @description Catalog object that owns this physical index.
+             * @enum {string}
+             */
+            owner_kind: "relational_column" | "unique_constraint" | "table";
+            /** @description Owner column, constraint, or table-level sentinel name. */
+            owner_name?: string;
+            /**
+             * @description Logical access method implemented by this index.
+             * @enum {string}
+             */
+            access_method: "scalar_column" | "ordered_tuple" | "algebraic_filter" | "text_search";
+            /** @description Access-method-specific durable configuration, for example full-text analyzer/scoring options or schema-derived algebraic settings. */
+            method_config?: Record<string, unknown>;
+            /** @description True when the entry backs a unique constraint. */
+            unique?: boolean;
+            /** @description Declared relational columns maintained by the index. */
+            columns?: string[];
+            /** @description Covering payload columns stored with ordered tuple entries. */
+            include_columns?: string[];
+            /** @description Ordered tuple key definition. Required for ordered_tuple indexes. */
+            keys?: components["schemas"]["RelationalIndexKey"][];
+            /**
+             * @description Durable lifecycle state for this index generation.
+             * @enum {string}
+             */
+            lifecycle?: "ready" | "building" | "catching_up" | "stale" | "rebuild_required" | "failed" | "invalid" | "dropping";
+            /**
+             * Format: uint64
+             * @description Monotonic physical index generation.
+             */
+            generation?: number;
+            /** @description Stable fingerprint of the index-defining catalog shape. */
+            schema_fingerprint?: string;
+            /** @description Field-only partial index predicate shorthand. */
+            where?: components["schemas"]["RowsUniquePredicateGroup"];
+            /** @description Deterministic row-expression predicates for index participation. */
+            where_expressions?: components["schemas"]["RowsExpressionCondition"][];
+        };
         /** @description Schema definition for a table with multiple document types */
         TableSchema: {
             /**
@@ -9674,6 +9732,14 @@ export interface components {
              *     not create unique rows.
              */
             unique_constraints?: components["schemas"]["UniqueConstraint"][];
+            /**
+             * @description Durable relational secondary-index catalog entries. This is the
+             *     public schema shape for relational scalar-column, ordered-tuple,
+             *     algebraic-filter, and text-search index metadata; lifecycle,
+             *     generation, and schema_fingerprint identify the physical index
+             *     generation that may be promoted to ready.
+             */
+            relational_indexes?: components["schemas"]["RelationalIndex"][];
         };
         /**
          * Format: double

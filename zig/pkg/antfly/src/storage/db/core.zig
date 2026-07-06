@@ -828,6 +828,7 @@ pub const DBCore = struct {
             .alloc = alloc,
             .relational_base_rows = schemaUsesRelationalBaseRows(self.schema),
             .relational_columns = relationalColumnsForSchema(self.schema),
+            .relational_indexes = relationalIndexesForSchema(self.schema),
         };
         var effective_config = config;
         effective_config.resolution_extra_hooks = transactionRecoveryIdentityHooks(&identity_ctx);
@@ -1216,6 +1217,7 @@ pub const DBCore = struct {
             .alloc = self.alloc,
             .relational_base_rows = schemaUsesRelationalBaseRows(self.schema),
             .relational_columns = relationalColumnsForSchema(self.schema),
+            .relational_indexes = relationalIndexesForSchema(self.schema),
         };
         return try manager.recoverTransactionsWithExtraBatchHooks(
             cutoff_timestamp,
@@ -1231,6 +1233,7 @@ pub const TransactionRecoveryIdentityContext = struct {
     alloc: Allocator,
     relational_base_rows: bool = false,
     relational_columns: []const schema_mod.RelationalColumn = &.{},
+    relational_indexes: []const schema_mod.RelationalIndex = &.{},
 };
 
 pub fn transactionRecoveryIdentityHooks(ctx: *TransactionRecoveryIdentityContext) transactions_mod.TxnManager.RecoveryExtraBatchHooks {
@@ -1340,7 +1343,7 @@ fn buildTransactionRecoveryIdentityExtraBatch(
                     &extra_deletes,
                     mutation.key,
                     row_value,
-                    relational_store_mod.ColumnIndexPolicy.fromColumns(identity_ctx.relational_columns),
+                    relational_store_mod.ColumnIndexPolicy.fromSchemaParts(identity_ctx.relational_columns, identity_ctx.relational_indexes),
                 );
                 row_value_owned = false;
 
@@ -1615,6 +1618,12 @@ fn relationalColumnsForSchema(schema: ?schema_mod.TableSchema) []const schema_mo
     const active = schema orelse return &.{};
     if (active.storage_mode != .relational) return &.{};
     return active.relational_columns;
+}
+
+fn relationalIndexesForSchema(schema: ?schema_mod.TableSchema) []const schema_mod.RelationalIndex {
+    const active = schema orelse return &.{};
+    if (active.storage_mode != .relational) return &.{};
+    return active.relational_indexes;
 }
 
 fn loadArtifactCleanupMaybe(alloc: Allocator, store: *docstore_mod.DocStore) !bool {

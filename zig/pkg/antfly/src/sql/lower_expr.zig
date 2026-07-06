@@ -4771,7 +4771,7 @@ pub fn parseSelectAlloc(
             .field_source = options.field_source,
             .select_item_options = options.select_item_options,
             .generated_read_ast = options.generated_read_ast,
-            .allow_generated_projection_fallback = options.allow_select_set_result_tail_boundary,
+            .allow_set_operation_right_projection_side = options.allow_select_set_result_tail_boundary,
         },
     );
     errdefer strings.freeStringSlice(alloc, select.fields);
@@ -7321,8 +7321,7 @@ pub fn parseQueryPlanAlloc(
         while (grammar.nextIsSelectSetOperationKeyword(tokens, pos.*)) {
             parsed_set_operation = true;
             if (lowered.ctes.len != 0) return error.UnsupportedSqlShape;
-            const generated_op = try parseGeneratedSelectSetOperation(tokens, pos, generated_read_ast);
-            const op = generated_op orelse try grammar.parseSelectSetOperation(tokens, pos);
+            const op = try parseSelectSetOperationForCurrentRead(tokens, pos, generated_read_ast);
             var rhs = try parseQueryPlanSelectWithContext(query_hooks, &.{}, true, true);
             defer rhs.deinit(alloc);
             if (rhs.ctes.len != 0) return error.UnsupportedSqlShape;
@@ -7376,8 +7375,7 @@ pub fn parseQueryPlanAlloc(
     var parsed_set_operation = false;
     while (grammar.nextIsSelectSetOperationKeyword(tokens, pos.*)) {
         parsed_set_operation = true;
-        const generated_op = try parseGeneratedSelectSetOperation(tokens, pos, generated_read_ast);
-        const op = generated_op orelse try grammar.parseSelectSetOperation(tokens, pos);
+        const op = try parseSelectSetOperationForCurrentRead(tokens, pos, generated_read_ast);
         var rhs = try parseQueryPlanSelectWithContext(query_hooks, ctes, true, true);
         defer rhs.deinit(alloc);
         try plan_mod.resolveSelectSourceForPlanAlloc(alloc, &rhs, ctes, &base_table_name);
@@ -7418,7 +7416,13 @@ fn parseGeneratedSelectSetOperation(
     const read = generated_read_ast orelse return null;
     const range = read.set_operation_tokens orelse return error.UnsupportedSqlShape;
     if (range.start != pos.*) {
-        if (pos.* > range.start and pos.* < range.end) return null;
+        if (pos.* > range.start and pos.* < range.end) {
+            const start = pos.*;
+            const op = try grammar.parseSelectSetOperation(tokens, pos);
+            if (pos.* <= start or pos.* > range.end) return error.UnsupportedSqlShape;
+            if (!tokens[pos.* - 1].matchesKeywordTag(.select)) return error.UnsupportedSqlShape;
+            return op;
+        }
         return error.UnsupportedSqlShape;
     }
     if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
@@ -7455,6 +7459,16 @@ fn parseGeneratedSelectSetOperation(
     };
     pos.* = right_query.start;
     return op;
+}
+
+fn parseSelectSetOperationForCurrentRead(
+    tokens: []const Token,
+    pos: *usize,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+) !ast.SelectSetOperation {
+    if (try parseGeneratedSelectSetOperation(tokens, pos, generated_read_ast)) |op| return op;
+    if (generated_read_ast != null) return error.UnsupportedSqlShape;
+    return try grammar.parseSelectSetOperation(tokens, pos);
 }
 
 fn parseQueryPlanSelectWithContext(
@@ -10390,6 +10404,25 @@ test "sql adapter lower expr lowers direct select set operation query plans" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
         alloc,
         &malformed_generated_set_operation_kind,
+        schema,
+        &.{},
+        .{},
+    ));
+
+    var malformed_generated_set_operation_missing_operator = try tokenized.ParsedSql.initAlloc(alloc, generated_set_operation_sql);
+    defer malformed_generated_set_operation_missing_operator.deinit(alloc);
+    if (malformed_generated_set_operation_missing_operator.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read_ast| {
+                if (read_ast.set_operation.operator_tokens == null) return error.TestUnexpectedResult;
+                read_ast.set_operation.operator_tokens = null;
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_set_operation_missing_operator,
         schema,
         &.{},
         .{},
@@ -14363,6 +14396,28 @@ test "sql adapter lower expr lowers pagination limit all and fetch forms" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedSetOperationPlanWithFunctionBindingsForLowerExprTestAlloc(
         alloc,
         &malformed_generated_set_operation_pagination,
+        schema,
+        &.{},
+        .{},
+    ));
+
+    var malformed_generated_set_operation_kind_for_plan = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = 'open' UNION SELECT id FROM usage_records WHERE status = 'closed'",
+    );
+    defer malformed_generated_set_operation_kind_for_plan.deinit(alloc);
+    if (malformed_generated_set_operation_kind_for_plan.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                if (read.set_operation.kind == null) return error.TestUnexpectedResult;
+                read.set_operation.kind = .except;
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedSetOperationPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_set_operation_kind_for_plan,
         schema,
         &.{},
         .{},
@@ -21903,7 +21958,7 @@ test "sql adapter lower expr lowers row query output order aliases" {
 test "sql adapter lower expr lowers generated case-fold query pushdown" {
     const alloc = std.testing.allocator;
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"email_key":{"type":"keyword","generated":{"op":"lower","field":"email"}},"email_upper_key":{"type":"keyword","generated":{"op":"upper","field":"email"}},"email_md5_key":{"type":"keyword","generated":{"op":"md5","field":"email"}}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"email_key":{"type":"keyword","generated":{"op":"expression","expression":{"op":"lower","args":[{"field":"email"}]}}},"email_upper_key":{"type":"keyword","generated":{"op":"expression","expression":{"op":"upper","args":[{"field":"email"}]}}},"email_md5_key":{"type":"keyword","generated":{"op":"expression","expression":{"op":"md5","args":[{"field":"email"}]}}}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
     defer runtime_schema.freeSchema(alloc, schema);
@@ -21972,7 +22027,7 @@ test "sql adapter lower expr lowers generated case-fold query pushdown" {
 test "sql adapter lower expr lowers generated concat query pushdown" {
     const alloc = std.testing.allocator;
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"status":{"type":"keyword"},"tenant_status_key":{"type":"keyword","generated":{"op":"concat","fields":["tenant_id","status"],"separator":":"}}},"required":["id","tenant_id","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"status":{"type":"keyword"},"tenant_status_key":{"type":"keyword","generated":{"op":"expression","expression":{"op":"concat","args":[{"field":"tenant_id"},{"value":":"},{"field":"status"}]}}}},"required":["id","tenant_id","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
     defer runtime_schema.freeSchema(alloc, schema);
@@ -22008,7 +22063,7 @@ test "sql adapter lower expr lowers generated concat query pushdown" {
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.concat, residual.plan.query.expression_predicates[0].lhs.kind);
 
     const concat_ws_schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"status":{"type":"keyword"},"tenant_status_key":{"type":"keyword","generated":{"op":"concat_ws","fields":["tenant_id","status"],"separator":":"}}},"required":["id","tenant_id","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"status":{"type":"keyword"},"tenant_status_key":{"type":"keyword","generated":{"op":"expression","expression":{"op":"concat_ws","args":[{"value":":"},{"field":"tenant_id"},{"field":"status"}]}}}},"required":["id","tenant_id","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     const concat_ws_schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, concat_ws_schema_json);
     defer runtime_schema.freeSchema(alloc, concat_ws_schema);
@@ -22034,7 +22089,7 @@ test "sql adapter lower expr lowers generated concat query pushdown" {
 test "sql adapter lower expr lowers qualified generated read-source predicates" {
     const alloc = std.testing.allocator;
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"},"email_key":{"type":"keyword","generated":{"op":"lower","field":"email"}},"tenant_status_key":{"type":"keyword","generated":{"op":"concat","fields":["tenant_id","status"],"separator":":"}}},"required":["id","tenant_id","email","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"},"email_key":{"type":"keyword","generated":{"op":"expression","expression":{"op":"lower","args":[{"field":"email"}]}}},"tenant_status_key":{"type":"keyword","generated":{"op":"expression","expression":{"op":"concat","args":[{"field":"tenant_id"},{"value":":"},{"field":"status"}]}}}},"required":["id","tenant_id","email","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
     defer runtime_schema.freeSchema(alloc, schema);
@@ -23849,6 +23904,27 @@ test "sql adapter lower expr lowers non recursive cte query plans" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
         alloc,
         &malformed_final_set_operation_kind,
+        schema,
+        &.{},
+        .{},
+    ));
+
+    var malformed_final_set_operation_missing_operator = try tokenized.ParsedSql.initAlloc(alloc, final_set_operation_sql);
+    defer malformed_final_set_operation_missing_operator.deinit(alloc);
+    if (malformed_final_set_operation_missing_operator.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read_ast| {
+                    if (read_ast.set_operation.operator_tokens == null) return error.TestUnexpectedResult;
+                    read_ast.set_operation.operator_tokens = null;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_final_set_operation_missing_operator,
         schema,
         &.{},
         .{},

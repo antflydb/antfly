@@ -1,10 +1,9 @@
 {
   "fixture_format": 1,
-  "source_sha256": "ffd35690323739ec2af7db2bf2ec190f7de83e30ad19aa585f0039944a83b5d6",
-  "source_entry_count": 1579,
-  "entry_count": 1578,
+  "source_sha256": "b35f962cc1bf508ce62ca641b5931334a8fd2fd244a1f826c54da1981e8d5e5f",
+  "source_entry_count": 1581,
+  "entry_count": 1581,
   "skipped_entries": [
-    "schema create algebraic filter access method index"
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
   "entries": [
@@ -19154,6 +19153,60 @@
       "sql": "CREATE TEXT SEARCH usage_records_status_fts ON usage_records (status) WITH (analyzer = 'standard', scoring = 'bm25', highlight = true, snippet = true, segment_lifecycle = 'merge_on_commit');"
     },
     {
+      "name": "schema create full text access method index",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_index",
+        "table_name": "usage_records"
+      },
+      "native_request_kind": "derived_index_lifecycle",
+      "native_request_json": "{\"classification\":\"native_equivalent\",\"surface\":\"derived_index_lifecycle\",\"native_model\":\"derived_index_lifecycle\",\"native_route\":\"index_management\",\"target_resource\":\"usage_records\",\"permission\":\"admin\",\"diagnostic\":\"\",\"sql_plan\":\"ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=0:unique=false:if_not_exists=false:method=text_search\",\"execution_plan\":\"\"}",
+      "sql_fingerprint": "native_equivalence:class=native_equivalent:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=index_management:target=usage_records:permission=admin:diagnostic=:plan=ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=0:unique=false:if_not_exists=false:method=text_search:execution=",
+      "native_fingerprint": "native_equivalence:class=native_equivalent:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=index_management:target=usage_records:permission=admin:diagnostic=:plan=ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=0:unique=false:if_not_exists=false:method=text_search:execution=",
+      "native_equivalence": {
+        "classification": "native_equivalent",
+        "surface": "derived_index_lifecycle",
+        "native_model": "derived_index_lifecycle",
+        "native_route": "index_management",
+        "target_resource": "usage_records",
+        "auth_resource": "table",
+        "permission": "admin",
+        "audit_action": "create_index",
+        "row_filter": "not_applicable",
+        "request_fingerprint": "native_equivalence:class=native_equivalent:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=index_management:target=usage_records:permission=admin:diagnostic=:plan=ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=0:unique=false:if_not_exists=false:method=text_search:execution="
+      },
+      "plan": "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=0:unique=false:if_not_exists=false:method=text_search",
+      "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=1:work=rebuild/table/derived_artifacts",
+      "sql": "CREATE INDEX usage_records_status_fts_method ON usage_records USING antfly_full_text (status) WITH (analyzer = 'standard');"
+    },
+    {
+      "name": "schema create algebraic filter access method index",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_index",
+        "table_name": "usage_records"
+      },
+      "native_request_kind": "derived_index_lifecycle",
+      "native_request_json": "{\"classification\":\"native_equivalent\",\"surface\":\"derived_index_lifecycle\",\"native_model\":\"derived_index_lifecycle\",\"native_route\":\"index_management\",\"target_resource\":\"usage_records\",\"permission\":\"admin\",\"diagnostic\":\"\",\"sql_plan\":\"ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=0:where=0:unique=false:if_not_exists=false:method=algebraic_filter\",\"execution_plan\":\"\"}",
+      "sql_fingerprint": "native_equivalence:class=native_equivalent:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=index_management:target=usage_records:permission=admin:diagnostic=:plan=ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=0:where=0:unique=false:if_not_exists=false:method=algebraic_filter:execution=",
+      "native_fingerprint": "native_equivalence:class=native_equivalent:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=index_management:target=usage_records:permission=admin:diagnostic=:plan=ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=0:where=0:unique=false:if_not_exists=false:method=algebraic_filter:execution=",
+      "native_equivalence": {
+        "classification": "native_equivalent",
+        "surface": "derived_index_lifecycle",
+        "native_model": "derived_index_lifecycle",
+        "native_route": "index_management",
+        "target_resource": "usage_records",
+        "auth_resource": "table",
+        "permission": "admin",
+        "audit_action": "create_index",
+        "row_filter": "not_applicable",
+        "request_fingerprint": "native_equivalence:class=native_equivalent:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=index_management:target=usage_records:permission=admin:diagnostic=:plan=ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=0:where=0:unique=false:if_not_exists=false:method=algebraic_filter:execution="
+      },
+      "plan": "ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=0:where=0:unique=false:if_not_exists=false:method=algebraic_filter",
+      "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=1:work=rebuild/table/derived_artifacts",
+      "sql": "CREATE INDEX usage_records_algebraic_filter_idx ON usage_records USING antfly_algebraic () WITH (derive_from_schema = true);"
+    },
+    {
       "name": "unsupported create algebraic filter internal materialization option",
       "family": "unsupported_ddl",
       "native_request_kind": "derived_index_lifecycle",
@@ -19176,6 +19229,30 @@
       "plan": "unsupported:ddl:requires=index_access_method_plan",
       "classification_reason": "index_access_method_plan",
       "sql": "CREATE INDEX usage_records_algebraic_filter_bad_idx ON usage_records USING antfly_algebraic () WITH (derive_from_schema = true, materializations = 'internal');"
+    },
+    {
+      "name": "unsupported create algebraic filter mistyped derive option",
+      "family": "unsupported_ddl",
+      "native_request_kind": "derived_index_lifecycle",
+      "native_request_json": "{\"classification\":\"unsupported\",\"surface\":\"derived_index_lifecycle\",\"native_model\":\"derived_index_lifecycle\",\"native_route\":\"unsupported\",\"target_resource\":\"\",\"permission\":\"none\",\"diagnostic\":\"index_access_method_plan\",\"sql_plan\":\"unsupported:ddl:requires=index_access_method_plan\",\"execution_plan\":\"\"}",
+      "sql_fingerprint": "native_equivalence:class=unsupported:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=unsupported:target=:permission=none:diagnostic=index_access_method_plan:plan=unsupported:ddl:requires=index_access_method_plan:execution=",
+      "native_fingerprint": "native_equivalence:class=unsupported:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=unsupported:target=:permission=none:diagnostic=index_access_method_plan:plan=unsupported:ddl:requires=index_access_method_plan:execution=",
+      "native_equivalence": {
+        "classification": "unsupported",
+        "surface": "derived_index_lifecycle",
+        "native_model": "derived_index_lifecycle",
+        "native_route": "unsupported",
+        "target_resource": "",
+        "auth_resource": "none",
+        "permission": "none",
+        "audit_action": "reject",
+        "row_filter": "not_applicable",
+        "request_fingerprint": "native_equivalence:class=unsupported:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=unsupported:target=:permission=none:diagnostic=index_access_method_plan:plan=unsupported:ddl:requires=index_access_method_plan:execution=",
+        "diagnostic": "index_access_method_plan"
+      },
+      "plan": "unsupported:ddl:requires=index_access_method_plan",
+      "classification_reason": "index_access_method_plan",
+      "sql": "CREATE INDEX usage_records_algebraic_filter_bad_type_idx ON usage_records USING antfly_algebraic () WITH (derive_from_schema = 'true');"
     },
     {
       "name": "schema covering partial index",
@@ -19417,9 +19494,9 @@
         "select": 1
       },
       "native_request_kind": "derived_index_lifecycle",
-      "native_request_json": "{\"classification\":\"native_equivalent\",\"surface\":\"derived_index_lifecycle\",\"native_model\":\"derived_index_lifecycle\",\"native_route\":\"index_management\",\"target_resource\":\"usage_records\",\"permission\":\"admin\",\"diagnostic\":\"\",\"sql_plan\":\"ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=concat\",\"execution_plan\":\"\"}",
-      "sql_fingerprint": "native_equivalence:class=native_equivalent:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=index_management:target=usage_records:permission=admin:diagnostic=:plan=ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=concat:execution=",
-      "native_fingerprint": "native_equivalence:class=native_equivalent:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=index_management:target=usage_records:permission=admin:diagnostic=:plan=ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=concat:execution=",
+      "native_request_json": "{\"classification\":\"native_equivalent\",\"surface\":\"derived_index_lifecycle\",\"native_model\":\"derived_index_lifecycle\",\"native_route\":\"index_management\",\"target_resource\":\"usage_records\",\"permission\":\"admin\",\"diagnostic\":\"\",\"sql_plan\":\"ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=expression\",\"execution_plan\":\"\"}",
+      "sql_fingerprint": "native_equivalence:class=native_equivalent:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=index_management:target=usage_records:permission=admin:diagnostic=:plan=ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=expression:execution=",
+      "native_fingerprint": "native_equivalence:class=native_equivalent:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=index_management:target=usage_records:permission=admin:diagnostic=:plan=ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=expression:execution=",
       "native_equivalence": {
         "classification": "native_equivalent",
         "surface": "derived_index_lifecycle",
@@ -19430,9 +19507,9 @@
         "permission": "admin",
         "audit_action": "create_index",
         "row_filter": "not_applicable",
-        "request_fingerprint": "native_equivalence:class=native_equivalent:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=index_management:target=usage_records:permission=admin:diagnostic=:plan=ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=concat:execution="
+        "request_fingerprint": "native_equivalence:class=native_equivalent:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=index_management:target=usage_records:permission=admin:diagnostic=:plan=ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=expression:execution="
       },
-      "plan": "ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=concat",
+      "plan": "ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=expression",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, tenant_id text, status text);"],
       "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=1:work=rebuild/table/derived_artifacts",
       "sql": "CREATE INDEX usage_records_tenant_status_idx ON usage_records (concat(tenant_id, ':', status));"
@@ -19446,9 +19523,9 @@
         "select": 1
       },
       "native_request_kind": "derived_index_lifecycle",
-      "native_request_json": "{\"classification\":\"native_equivalent\",\"surface\":\"derived_index_lifecycle\",\"native_model\":\"derived_index_lifecycle\",\"native_route\":\"index_management\",\"target_resource\":\"usage_records\",\"permission\":\"admin\",\"diagnostic\":\"\",\"sql_plan\":\"ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=concat_ws\",\"execution_plan\":\"\"}",
-      "sql_fingerprint": "native_equivalence:class=native_equivalent:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=index_management:target=usage_records:permission=admin:diagnostic=:plan=ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=concat_ws:execution=",
-      "native_fingerprint": "native_equivalence:class=native_equivalent:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=index_management:target=usage_records:permission=admin:diagnostic=:plan=ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=concat_ws:execution=",
+      "native_request_json": "{\"classification\":\"native_equivalent\",\"surface\":\"derived_index_lifecycle\",\"native_model\":\"derived_index_lifecycle\",\"native_route\":\"index_management\",\"target_resource\":\"usage_records\",\"permission\":\"admin\",\"diagnostic\":\"\",\"sql_plan\":\"ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=expression\",\"execution_plan\":\"\"}",
+      "sql_fingerprint": "native_equivalence:class=native_equivalent:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=index_management:target=usage_records:permission=admin:diagnostic=:plan=ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=expression:execution=",
+      "native_fingerprint": "native_equivalence:class=native_equivalent:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=index_management:target=usage_records:permission=admin:diagnostic=:plan=ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=expression:execution=",
       "native_equivalence": {
         "classification": "native_equivalent",
         "surface": "derived_index_lifecycle",
@@ -19459,9 +19536,9 @@
         "permission": "admin",
         "audit_action": "create_index",
         "row_filter": "not_applicable",
-        "request_fingerprint": "native_equivalence:class=native_equivalent:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=index_management:target=usage_records:permission=admin:diagnostic=:plan=ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=concat_ws:execution="
+        "request_fingerprint": "native_equivalence:class=native_equivalent:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=index_management:target=usage_records:permission=admin:diagnostic=:plan=ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=expression:execution="
       },
-      "plan": "ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=concat_ws",
+      "plan": "ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=expression",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, tenant_id text, status text);"],
       "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=1:work=rebuild/table/derived_artifacts",
       "sql": "CREATE INDEX usage_records_tenant_status_ws_idx ON usage_records (concat_ws(':', tenant_id, status));"
@@ -19475,9 +19552,9 @@
         "select": 1
       },
       "native_request_kind": "derived_index_lifecycle",
-      "native_request_json": "{\"classification\":\"native_equivalent\",\"surface\":\"derived_index_lifecycle\",\"native_model\":\"derived_index_lifecycle\",\"native_route\":\"index_management\",\"target_resource\":\"usage_records\",\"permission\":\"admin\",\"diagnostic\":\"\",\"sql_plan\":\"ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=lower\",\"execution_plan\":\"\"}",
-      "sql_fingerprint": "native_equivalence:class=native_equivalent:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=index_management:target=usage_records:permission=admin:diagnostic=:plan=ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=lower:execution=",
-      "native_fingerprint": "native_equivalence:class=native_equivalent:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=index_management:target=usage_records:permission=admin:diagnostic=:plan=ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=lower:execution=",
+      "native_request_json": "{\"classification\":\"native_equivalent\",\"surface\":\"derived_index_lifecycle\",\"native_model\":\"derived_index_lifecycle\",\"native_route\":\"index_management\",\"target_resource\":\"usage_records\",\"permission\":\"admin\",\"diagnostic\":\"\",\"sql_plan\":\"ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=expression\",\"execution_plan\":\"\"}",
+      "sql_fingerprint": "native_equivalence:class=native_equivalent:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=index_management:target=usage_records:permission=admin:diagnostic=:plan=ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=expression:execution=",
+      "native_fingerprint": "native_equivalence:class=native_equivalent:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=index_management:target=usage_records:permission=admin:diagnostic=:plan=ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=expression:execution=",
       "native_equivalence": {
         "classification": "native_equivalent",
         "surface": "derived_index_lifecycle",
@@ -19488,9 +19565,9 @@
         "permission": "admin",
         "audit_action": "create_index",
         "row_filter": "not_applicable",
-        "request_fingerprint": "native_equivalence:class=native_equivalent:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=index_management:target=usage_records:permission=admin:diagnostic=:plan=ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=lower:execution="
+        "request_fingerprint": "native_equivalence:class=native_equivalent:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=index_management:target=usage_records:permission=admin:diagnostic=:plan=ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=expression:execution="
       },
-      "plan": "ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=lower",
+      "plan": "ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=expression",
       "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=1:work=rebuild/table/derived_artifacts",
       "sql": "CREATE INDEX usage_records_lower_email_idx ON usage_records ((lower(email)));"
     },
@@ -19503,9 +19580,9 @@
         "select": 1
       },
       "native_request_kind": "derived_index_lifecycle",
-      "native_request_json": "{\"classification\":\"native_equivalent\",\"surface\":\"derived_index_lifecycle\",\"native_model\":\"derived_index_lifecycle\",\"native_route\":\"index_management\",\"target_resource\":\"usage_records\",\"permission\":\"admin\",\"diagnostic\":\"\",\"sql_plan\":\"ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=lower:include=1\",\"execution_plan\":\"\"}",
-      "sql_fingerprint": "native_equivalence:class=native_equivalent:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=index_management:target=usage_records:permission=admin:diagnostic=:plan=ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=lower:include=1:execution=",
-      "native_fingerprint": "native_equivalence:class=native_equivalent:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=index_management:target=usage_records:permission=admin:diagnostic=:plan=ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=lower:include=1:execution=",
+      "native_request_json": "{\"classification\":\"native_equivalent\",\"surface\":\"derived_index_lifecycle\",\"native_model\":\"derived_index_lifecycle\",\"native_route\":\"index_management\",\"target_resource\":\"usage_records\",\"permission\":\"admin\",\"diagnostic\":\"\",\"sql_plan\":\"ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=expression:include=1\",\"execution_plan\":\"\"}",
+      "sql_fingerprint": "native_equivalence:class=native_equivalent:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=index_management:target=usage_records:permission=admin:diagnostic=:plan=ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=expression:include=1:execution=",
+      "native_fingerprint": "native_equivalence:class=native_equivalent:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=index_management:target=usage_records:permission=admin:diagnostic=:plan=ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=expression:include=1:execution=",
       "native_equivalence": {
         "classification": "native_equivalent",
         "surface": "derived_index_lifecycle",
@@ -19516,9 +19593,9 @@
         "permission": "admin",
         "audit_action": "create_index",
         "row_filter": "not_applicable",
-        "request_fingerprint": "native_equivalence:class=native_equivalent:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=index_management:target=usage_records:permission=admin:diagnostic=:plan=ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=lower:include=1:execution="
+        "request_fingerprint": "native_equivalence:class=native_equivalent:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=index_management:target=usage_records:permission=admin:diagnostic=:plan=ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=expression:include=1:execution="
       },
-      "plan": "ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=lower:include=1",
+      "plan": "ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=expression:include=1",
       "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=1:work=rebuild/table/derived_artifacts",
       "sql": "CREATE INDEX usage_records_lower_email_cover_idx ON usage_records (lower(email)) INCLUDE (tenant_id);"
     },
@@ -19531,9 +19608,9 @@
         "select": 1
       },
       "native_request_kind": "derived_index_lifecycle",
-      "native_request_json": "{\"classification\":\"native_equivalent\",\"surface\":\"derived_index_lifecycle\",\"native_model\":\"derived_index_lifecycle\",\"native_route\":\"index_management\",\"target_resource\":\"usage_records\",\"permission\":\"admin\",\"diagnostic\":\"\",\"sql_plan\":\"ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=upper\",\"execution_plan\":\"\"}",
-      "sql_fingerprint": "native_equivalence:class=native_equivalent:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=index_management:target=usage_records:permission=admin:diagnostic=:plan=ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=upper:execution=",
-      "native_fingerprint": "native_equivalence:class=native_equivalent:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=index_management:target=usage_records:permission=admin:diagnostic=:plan=ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=upper:execution=",
+      "native_request_json": "{\"classification\":\"native_equivalent\",\"surface\":\"derived_index_lifecycle\",\"native_model\":\"derived_index_lifecycle\",\"native_route\":\"index_management\",\"target_resource\":\"usage_records\",\"permission\":\"admin\",\"diagnostic\":\"\",\"sql_plan\":\"ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=expression\",\"execution_plan\":\"\"}",
+      "sql_fingerprint": "native_equivalence:class=native_equivalent:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=index_management:target=usage_records:permission=admin:diagnostic=:plan=ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=expression:execution=",
+      "native_fingerprint": "native_equivalence:class=native_equivalent:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=index_management:target=usage_records:permission=admin:diagnostic=:plan=ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=expression:execution=",
       "native_equivalence": {
         "classification": "native_equivalent",
         "surface": "derived_index_lifecycle",
@@ -19544,9 +19621,9 @@
         "permission": "admin",
         "audit_action": "create_index",
         "row_filter": "not_applicable",
-        "request_fingerprint": "native_equivalence:class=native_equivalent:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=index_management:target=usage_records:permission=admin:diagnostic=:plan=ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=upper:execution="
+        "request_fingerprint": "native_equivalence:class=native_equivalent:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=index_management:target=usage_records:permission=admin:diagnostic=:plan=ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=expression:execution="
       },
-      "plan": "ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=upper",
+      "plan": "ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=expression",
       "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=1:work=rebuild/table/derived_artifacts",
       "sql": "CREATE INDEX usage_records_upper_email_idx ON usage_records (upper(email));"
     },
@@ -19559,9 +19636,9 @@
         "select": 1
       },
       "native_request_kind": "derived_index_lifecycle",
-      "native_request_json": "{\"classification\":\"native_equivalent\",\"surface\":\"derived_index_lifecycle\",\"native_model\":\"derived_index_lifecycle\",\"native_route\":\"index_management\",\"target_resource\":\"usage_records\",\"permission\":\"admin\",\"diagnostic\":\"\",\"sql_plan\":\"ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=md5\",\"execution_plan\":\"\"}",
-      "sql_fingerprint": "native_equivalence:class=native_equivalent:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=index_management:target=usage_records:permission=admin:diagnostic=:plan=ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=md5:execution=",
-      "native_fingerprint": "native_equivalence:class=native_equivalent:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=index_management:target=usage_records:permission=admin:diagnostic=:plan=ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=md5:execution=",
+      "native_request_json": "{\"classification\":\"native_equivalent\",\"surface\":\"derived_index_lifecycle\",\"native_model\":\"derived_index_lifecycle\",\"native_route\":\"index_management\",\"target_resource\":\"usage_records\",\"permission\":\"admin\",\"diagnostic\":\"\",\"sql_plan\":\"ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=expression\",\"execution_plan\":\"\"}",
+      "sql_fingerprint": "native_equivalence:class=native_equivalent:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=index_management:target=usage_records:permission=admin:diagnostic=:plan=ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=expression:execution=",
+      "native_fingerprint": "native_equivalence:class=native_equivalent:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=index_management:target=usage_records:permission=admin:diagnostic=:plan=ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=expression:execution=",
       "native_equivalence": {
         "classification": "native_equivalent",
         "surface": "derived_index_lifecycle",
@@ -19572,9 +19649,9 @@
         "permission": "admin",
         "audit_action": "create_index",
         "row_filter": "not_applicable",
-        "request_fingerprint": "native_equivalence:class=native_equivalent:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=index_management:target=usage_records:permission=admin:diagnostic=:plan=ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=md5:execution="
+        "request_fingerprint": "native_equivalence:class=native_equivalent:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=index_management:target=usage_records:permission=admin:diagnostic=:plan=ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=expression:execution="
       },
-      "plan": "ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=md5",
+      "plan": "ddl:create_index:table=usage_records:columns=0:expr=0:generated_expr=1:where=0:unique=false:if_not_exists=false:method=scalar_column:generated_op=expression",
       "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=1:work=rebuild/table/derived_artifacts",
       "sql": "CREATE INDEX usage_records_md5_email_idx ON usage_records (md5(email));"
     },
@@ -20460,7 +20537,7 @@
       },
       "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:alter_type=1:alter_type_rewrite_expr=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, updated_at_ns bigint);"],
-      "applied_plan": "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=3:work=rebuild/table/derived_artifacts,validate/table/constraints,rewrite/table/row_images(target=updated_at_ns:expr=field[row:updated_at_ns])",
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=3:work=rebuild/table/derived_artifacts,validate/table/constraints,rewrite/table/row_images(target=updated_at_ns:expr=cast[datetime|field[row:updated_at_ns]])",
       "sql": "ALTER TABLE usage_records ALTER COLUMN updated_at_ns TYPE timestamptz USING updated_at_ns::timestamptz;"
     },
     {
@@ -25095,7 +25172,7 @@
         "request_fingerprint": "native_equivalence:class=native_equivalent:surface=document_write:model=document_write_request:route=document_write:target=docs:permission=write:diagnostic=:plan=document_write:table=docs:operation=document_patch:writes=0:transforms=1:deletes=0:execution="
       },
       "plan": "document_write:table=docs:operation=document_patch:writes=0:transforms=1:deletes=0",
-      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"title_lc\":{\"type\":\"keyword\",\"generated\":{\"op\":\"lower\",\"field\":\"title\"}}},\"additionalProperties\":true}}}}",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"title_lc\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"lower\",\"args\":[{\"field\":\"title\"}]}}}},\"additionalProperties\":true}}}}",
       "sql": "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":[{\"op\":\"set\",\"path\":\"title_lc\",\"value\":\"launch\"}]}') WHERE _id = 'doc:a'"
     },
     {
@@ -25369,7 +25446,7 @@
       },
       "plan": "unsupported:write:requires=document_sql_write_unsupported",
       "classification_reason": "document_sql_write_unsupported",
-      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"title_lc\":{\"type\":\"keyword\",\"generated\":{\"op\":\"lower\",\"field\":\"title\"}}},\"additionalProperties\":true}}}}",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"title_lc\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"lower\",\"args\":[{\"field\":\"title\"}]}}}},\"additionalProperties\":true}}}}",
       "sql": "INSERT INTO docs (_id, title_lc) VALUES ('doc:a', 'launch')"
     },
     {
@@ -26377,7 +26454,7 @@
         "request_fingerprint": "native_equivalence:class=native_equivalent:surface=document_write:model=document_write_request:route=document_write:target=docs:permission=write:diagnostic=:plan=document_joined_write:table=docs:source_table=docs:operation=projection_write:target_producer=indexed_query:source_producer=join_key_indexed_lookup:join_keys=1:template=transform:ops=1:max_target_rows=1:max_source_rows=1:duplicate_source=reject:execution="
       },
       "plan": "document_joined_write:table=docs:source_table=docs:operation=projection_write:target_producer=indexed_query:source_producer=join_key_indexed_lookup:join_keys=1:template=transform:ops=1:max_target_rows=1:max_source_rows=1:duplicate_source=reject",
-      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"status_lower\":{\"type\":\"keyword\",\"generated\":{\"op\":\"lower\",\"field\":\"status\"}}},\"additionalProperties\":true}}}}",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"status_lower\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"lower\",\"args\":[{\"field\":\"status\"}]}}}},\"additionalProperties\":true}}}}",
       "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND lower(docs.status) = 'draft'"
     },
     {
@@ -26405,7 +26482,7 @@
         "request_fingerprint": "native_equivalence:class=native_equivalent:surface=document_write:model=document_write_request:route=document_write:target=docs:permission=write:diagnostic=:plan=document_joined_write:table=docs:source_table=docs:operation=projection_write:target_producer=indexed_query:source_producer=join_key_indexed_lookup:join_keys=1:template=transform:ops=1:max_target_rows=1:max_source_rows=1:duplicate_source=reject:execution="
       },
       "plan": "document_joined_write:table=docs:source_table=docs:operation=projection_write:target_producer=indexed_query:source_producer=join_key_indexed_lookup:join_keys=1:template=transform:ops=1:max_target_rows=1:max_source_rows=1:duplicate_source=reject",
-      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"status_title_key\":{\"type\":\"keyword\",\"generated\":{\"op\":\"concat\",\"fields\":[\"status\",\"title\"],\"separator\":\":\"}},\"status_title_ws\":{\"type\":\"keyword\",\"generated\":{\"op\":\"concat_ws\",\"fields\":[\"status\",\"title\"],\"separator\":\":\"}}},\"additionalProperties\":true}}}}",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"status_title_key\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"concat\",\"args\":[{\"field\":\"status\"},{\"value\":\":\"},{\"field\":\"title\"}]}}},\"status_title_ws\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"concat_ws\",\"args\":[{\"value\":\":\"},{\"field\":\"status\"},{\"field\":\"title\"}]}}}},\"additionalProperties\":true}}}}",
       "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND concat(docs.status, ':', docs.title) = 'draft:Launch'"
     },
     {
@@ -26433,7 +26510,7 @@
         "request_fingerprint": "native_equivalence:class=native_equivalent:surface=document_write:model=document_write_request:route=document_write:target=docs:permission=write:diagnostic=:plan=document_joined_write:table=docs:source_table=docs:operation=projection_write:target_producer=indexed_query:source_producer=join_key_indexed_lookup:join_keys=1:template=transform:ops=1:max_target_rows=1:max_source_rows=1:duplicate_source=reject:execution="
       },
       "plan": "document_joined_write:table=docs:source_table=docs:operation=projection_write:target_producer=indexed_query:source_producer=join_key_indexed_lookup:join_keys=1:template=transform:ops=1:max_target_rows=1:max_source_rows=1:duplicate_source=reject",
-      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"status_title_key\":{\"type\":\"keyword\",\"generated\":{\"op\":\"concat\",\"fields\":[\"status\",\"title\"],\"separator\":\":\"}},\"status_title_ws\":{\"type\":\"keyword\",\"generated\":{\"op\":\"concat_ws\",\"fields\":[\"status\",\"title\"],\"separator\":\":\"}}},\"additionalProperties\":true}}}}",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"status_title_key\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"concat\",\"args\":[{\"field\":\"status\"},{\"value\":\":\"},{\"field\":\"title\"}]}}},\"status_title_ws\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"concat_ws\",\"args\":[{\"value\":\":\"},{\"field\":\"status\"},{\"field\":\"title\"}]}}}},\"additionalProperties\":true}}}}",
       "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND concat_ws(':', docs.status, docs.title) = 'draft:Launch'"
     },
     {
@@ -26461,7 +26538,7 @@
       },
       "plan": "unsupported:write:requires=document_sql_write_join_missing_exact_producer",
       "classification_reason": "document_sql_write_join_missing_exact_producer",
-      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"status_title_key\":{\"type\":\"keyword\",\"generated\":{\"op\":\"concat\",\"fields\":[\"status\",\"title\"],\"separator\":\":\"}},\"status_title_ws\":{\"type\":\"keyword\",\"generated\":{\"op\":\"concat_ws\",\"fields\":[\"status\",\"title\"],\"separator\":\":\"}}},\"additionalProperties\":true}}}}",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"status_title_key\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"concat\",\"args\":[{\"field\":\"status\"},{\"value\":\":\"},{\"field\":\"title\"}]}}},\"status_title_ws\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"concat_ws\",\"args\":[{\"value\":\":\"},{\"field\":\"status\"},{\"field\":\"title\"}]}}}},\"additionalProperties\":true}}}}",
       "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND concat(source.status, ':', source.title) = 'draft:Launch'"
     },
     {
@@ -29233,7 +29310,7 @@
         "request_fingerprint": "native_equivalence:class=native_equivalent:surface=document_write:model=document_write_request:route=document_write:target=docs:permission=write:diagnostic=:plan=document_joined_write:table=docs:source_table=docs:operation=projection_write:target_producer=indexed_query:source_producer=join_key_indexed_lookup:join_keys=1:source_assignments=1:template=transform:max_target_rows=1:max_source_rows=1:duplicate_source=reject:execution="
       },
       "plan": "document_joined_write:table=docs:source_table=docs:operation=projection_write:target_producer=indexed_query:source_producer=join_key_indexed_lookup:join_keys=1:source_assignments=1:template=transform:max_target_rows=1:max_source_rows=1:duplicate_source=reject",
-      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"status_lower\":{\"type\":\"keyword\",\"generated\":{\"op\":\"lower\",\"field\":\"status\"}}},\"additionalProperties\":true}}}}",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"status_lower\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"lower\",\"args\":[{\"field\":\"status\"}]}}}},\"additionalProperties\":true}}}}",
       "sql": "UPDATE docs SET title = source.title FROM docs AS source WHERE docs.status = source.status AND lower(docs.status) = 'draft'"
     },
     {
@@ -29625,7 +29702,7 @@
       },
       "plan": "unsupported:write:requires=document_sql_write_source_assignment_generated_field",
       "classification_reason": "document_sql_write_source_assignment_generated_field",
-      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"status\":{\"type\":\"keyword\"},\"status_lower\":{\"type\":\"keyword\",\"generated\":{\"op\":\"lower\",\"field\":\"status\"}}},\"additionalProperties\":true}}}}",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"status\":{\"type\":\"keyword\"},\"status_lower\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"lower\",\"args\":[{\"field\":\"status\"}]}}}},\"additionalProperties\":true}}}}",
       "sql": "UPDATE docs SET status = source.status_lower FROM docs AS source WHERE docs._id = source._id AND docs._id = 'doc:a'"
     },
     {
@@ -29681,7 +29758,7 @@
       },
       "plan": "unsupported:write:requires=document_sql_write_source_assignment_target_generated_field",
       "classification_reason": "document_sql_write_source_assignment_target_generated_field",
-      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"status\":{\"type\":\"keyword\"},\"status_lower\":{\"type\":\"keyword\",\"generated\":{\"op\":\"lower\",\"field\":\"status\"}}},\"additionalProperties\":true}}}}",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"status\":{\"type\":\"keyword\"},\"status_lower\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"lower\",\"args\":[{\"field\":\"status\"}]}}}},\"additionalProperties\":true}}}}",
       "sql": "UPDATE docs SET status_lower = source.status FROM docs AS source WHERE docs._id = source._id AND docs._id = 'doc:a'"
     },
     {
@@ -29819,7 +29896,7 @@
       },
       "plan": "unsupported:write:requires=document_sql_write_unsupported",
       "classification_reason": "document_sql_write_unsupported",
-      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"title_lc\":{\"type\":\"keyword\",\"generated\":{\"op\":\"lower\",\"field\":\"title\"}}},\"additionalProperties\":true}}}}",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"title_lc\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"lower\",\"args\":[{\"field\":\"title\"}]}}}},\"additionalProperties\":true}}}}",
       "sql": "UPDATE docs SET title_lc = 'launch' WHERE _id = 'doc:a'"
     },
     {
@@ -30306,7 +30383,7 @@
         "request_fingerprint": "native_equivalence:class=native_equivalent:surface=document_write:model=document_write_request:route=document_write:target=docs:permission=write:diagnostic=:plan=document_joined_write:table=docs:source_table=docs:operation=non_identity_delete:target_producer=indexed_query:source_producer=join_key_indexed_lookup:join_keys=1:template=delete:max_target_rows=1:max_source_rows=1:duplicate_source=reject:execution="
       },
       "plan": "document_joined_write:table=docs:source_table=docs:operation=non_identity_delete:target_producer=indexed_query:source_producer=join_key_indexed_lookup:join_keys=1:template=delete:max_target_rows=1:max_source_rows=1:duplicate_source=reject",
-      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"status_lower\":{\"type\":\"keyword\",\"generated\":{\"op\":\"lower\",\"field\":\"status\"}}},\"additionalProperties\":true}}}}",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"status_lower\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"lower\",\"args\":[{\"field\":\"status\"}]}}}},\"additionalProperties\":true}}}}",
       "sql": "DELETE FROM docs USING docs AS source WHERE docs.status = source.status AND lower(docs.status) = 'draft'"
     },
     {

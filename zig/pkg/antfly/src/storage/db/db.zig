@@ -958,6 +958,10 @@ pub const DB = struct {
         return schema_runtime_impl.relationalColumnsForStore(self);
     }
 
+    pub fn relationalIndexesForStore(self: *DB) []const schema_mod.RelationalIndex {
+        return schema_runtime_impl.relationalIndexesForStore(self);
+    }
+
     pub fn rebuildRelationalSecondaryIndexInRange(
         self: *DB,
         index_name: []const u8,
@@ -3777,10 +3781,20 @@ pub const DB = struct {
     pub fn searchRuntimeRelationalColumnIndexUsableForQuery(
         self: *DB,
         alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
         column: schema_mod.RelationalColumn,
         implications: relational_store_mod.PredicateImplications,
     ) !bool {
-        return try search_runtime_impl.relationalColumnIndexUsableForQuery(self, alloc, column, implications);
+        return try search_runtime_impl.relationalColumnIndexUsableForQuery(self, alloc, runtime_schema, column, implications);
+    }
+
+    pub fn searchRuntimeRelationalColumnIndexHasPredicate(
+        self: *DB,
+        runtime_schema: schema_mod.TableSchema,
+        column: schema_mod.RelationalColumn,
+    ) bool {
+        _ = self;
+        return search_runtime_impl.relationalColumnIndexHasPredicate(runtime_schema, column);
     }
 
     pub fn resolveRelationalRowsQueryCandidateSetAlloc(

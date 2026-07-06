@@ -144,6 +144,16 @@ components:
             non-json relational columns. Present scalar tuples are enforced by
             committed integrity rows; rows with any absent nullable component do
             not create unique rows.
+        relational_indexes:
+          type: array
+          items:
+            $ref: "#/components/schemas/RelationalIndex"
+          description: |
+            Durable relational secondary-index catalog entries. This is the
+            public schema shape for relational scalar-column, ordered-tuple,
+            algebraic-filter, and text-search index metadata; lifecycle,
+            generation, and schema_fingerprint identify the physical index
+            generation that may be promoted to ready.
 
     ForeignKeyReference:
       type: object
@@ -527,6 +537,100 @@ components:
           type: string
           enum: [enforced, unvalidated]
           description: Unique validation state. Unvalidated constraints are durable metadata but do not enforce writes until promoted.
+
+    RelationalIndexKey:
+      type: object
+      additionalProperties: false
+      description: Ordered component of a relational ordered-tuple index key.
+      properties:
+        column:
+          type: string
+          minLength: 1
+          description: Declared relational column used by this key component.
+        direction:
+          type: string
+          enum: [asc, desc]
+          description: Sort direction for ordered scans. Omitted defaults to asc.
+        nulls:
+          type: string
+          enum: [default, first, last]
+          description: Null placement for ordered scans. Omitted uses method default.
+      required:
+        - column
+
+    RelationalIndex:
+      type: object
+      additionalProperties: false
+      description: Durable relational secondary-index metadata.
+      properties:
+        name:
+          type: string
+          minLength: 1
+          description: Stable index name, unique within the table schema.
+        owner_kind:
+          type: string
+          enum: [relational_column, unique_constraint, table]
+          description: Catalog object that owns this physical index.
+        owner_name:
+          type: string
+          description: Owner column, constraint, or table-level sentinel name.
+        access_method:
+          type: string
+          enum: [scalar_column, ordered_tuple, algebraic_filter, text_search]
+          description: Logical access method implemented by this index.
+        method_config:
+          type: object
+          additionalProperties: true
+          description: Access-method-specific durable configuration, for example full-text analyzer/scoring options or schema-derived algebraic settings.
+        unique:
+          type: boolean
+          description: True when the entry backs a unique constraint.
+        columns:
+          type: array
+          items:
+            type: string
+          description: Declared relational columns maintained by the index.
+        include_columns:
+          type: array
+          items:
+            type: string
+          description: Covering payload columns stored with ordered tuple entries.
+        keys:
+          type: array
+          items:
+            $ref: "#/components/schemas/RelationalIndexKey"
+          description: Ordered tuple key definition. Required for ordered_tuple indexes.
+        lifecycle:
+          type: string
+          enum:
+            - ready
+            - building
+            - catching_up
+            - stale
+            - rebuild_required
+            - failed
+            - invalid
+            - dropping
+          description: Durable lifecycle state for this index generation.
+        generation:
+          type: integer
+          format: uint64
+          description: Monotonic physical index generation.
+        schema_fingerprint:
+          type: string
+          description: Stable fingerprint of the index-defining catalog shape.
+        where:
+          $ref: "#/components/schemas/RowsUniquePredicateGroup"
+          description: Field-only partial index predicate shorthand.
+        where_expressions:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsExpressionCondition"
+          description: Deterministic row-expression predicates for index participation.
+      required:
+        - name
+        - owner_kind
+        - access_method
 
     DynamicTemplate:
       type: object

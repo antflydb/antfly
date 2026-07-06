@@ -734,7 +734,7 @@ test "api public SQL endpoint executes document merge matched branches" {
 test "api public SQL endpoint executes document joined write parity cases" {
     const alloc = std.testing.allocator;
     const schema_json =
-        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"category":{"type":"keyword","x-antfly-index":false},"status_lower":{"type":"keyword","generated":{"op":"lower","field":"status"}},"status_slug":{"type":"keyword","generated":{"op":"expression","expression":{"op":"replace","args":[{"op":"lower","args":[{"field":"status"}]},{"value":" "},{"value":"-"}]}}},"amount":{"type":"numeric"},"amount_abs":{"type":"numeric","generated":{"op":"expression","expression":{"op":"abs","args":[{"field":"amount"}]}}},"note":{"type":"text"},"metadata":{"type":"json"},"tags":{"type":"array","items":{"type":"keyword"}}},"required":["title"],"additionalProperties":true}}}}
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"category":{"type":"keyword","x-antfly-index":false},"status_lower":{"type":"keyword","generated":{"op":"expression","expression":{"op":"lower","args":[{"field":"status"}]}}},"status_slug":{"type":"keyword","generated":{"op":"expression","expression":{"op":"replace","args":[{"op":"lower","args":[{"field":"status"}]},{"value":" "},{"value":"-"}]}}},"amount":{"type":"numeric"},"amount_abs":{"type":"numeric","generated":{"op":"expression","expression":{"op":"abs","args":[{"field":"amount"}]}}},"note":{"type":"text"},"metadata":{"type":"json"},"tags":{"type":"array","items":{"type":"keyword"}}},"required":["title"],"additionalProperties":true}}}}
     ;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1983,7 +1983,7 @@ test "api public SQL endpoint executes document joined write parity cases" {
 test "api public SQL endpoint rejects document joined generated proof gaps" {
     const alloc = std.testing.allocator;
     const ready_generated_schema =
-        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"status_lower":{"type":"keyword","generated":{"op":"lower","field":"status"}}},"additionalProperties":true}}}}
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"status_lower":{"type":"keyword","generated":{"op":"expression","expression":{"op":"lower","args":[{"field":"status"}]}}}},"additionalProperties":true}}}}
     ;
     try expectDocumentJoinedWriteProofDiagnostic(
         alloc,
@@ -2007,7 +2007,7 @@ test "api public SQL endpoint rejects document joined generated proof gaps" {
     );
 
     const stale_generated_schema =
-        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"status_lower":{"type":"keyword","generated":{"op":"lower","field":"status"},"x-antfly-index-lifecycle":"building"}},"additionalProperties":true}}}}
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"status_lower":{"type":"keyword","generated":{"op":"expression","expression":{"op":"lower","args":[{"field":"status"}]}},"x-antfly-index-lifecycle":"building"}},"additionalProperties":true}}}}
     ;
     try expectDocumentJoinedWriteProofDiagnostic(
         alloc,
@@ -2019,7 +2019,7 @@ test "api public SQL endpoint rejects document joined generated proof gaps" {
     );
 
     const partial_generated_schema =
-        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"status_lower":{"type":"keyword","generated":{"op":"lower","field":"status"},"x-antfly-index-where":{"all":[{"field":"status_lower","op":"is_not_null"}]}}},"additionalProperties":true}}}}
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"status_lower":{"type":"keyword","generated":{"op":"expression","expression":{"op":"lower","args":[{"field":"status"}]}},"x-antfly-index-where":{"all":[{"field":"status_lower","op":"is_not_null"}]}}},"additionalProperties":true}}}}
     ;
     try expectDocumentJoinedWriteProofDiagnostic(
         alloc,
@@ -2031,7 +2031,7 @@ test "api public SQL endpoint rejects document joined generated proof gaps" {
     );
 
     const ordered_generated_schema =
-        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"status_lower":{"type":"keyword","generated":{"op":"lower","field":"status"},"x-antfly-index-name":"status_lower_idx","x-antfly-index-keys":[{"column":"status_lower","direction":"desc"}]}},"additionalProperties":true}}}}
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"status_lower":{"type":"keyword","generated":{"op":"expression","expression":{"op":"lower","args":[{"field":"status"}]}},"x-antfly-index-name":"status_lower_idx","x-antfly-index-keys":[{"column":"status_lower","direction":"desc"}]}},"additionalProperties":true}}}}
     ;
     try expectDocumentJoinedWriteProofDiagnostic(
         alloc,
@@ -4881,7 +4881,7 @@ test "api public SQL endpoint applies SQL row triggers to public SQL writes" {
 test "api public SQL endpoint executes public SQL COPY FROM STDIN payload" {
     const alloc = std.testing.allocator;
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"status_key":{"type":"keyword","generated":{"op":"lower","field":"status"}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"status_key":{"type":"keyword","generated":{"op":"expression","expression":{"op":"lower","args":[{"field":"status"}]}}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     const FakeSource = struct {
         fn iface(self: *@This()) StatusSource {

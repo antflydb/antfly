@@ -91,6 +91,32 @@ fn findUniqueConstraintByName(unique_constraints: []const schema_mod.UniqueConst
     return null;
 }
 
+fn expectOrderedUniqueEntryAndNoDedicatedOwner(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    runtime_schema: schema_mod.TableSchema,
+    constraint_name: []const u8,
+    row_value: []const u8,
+    doc_key: []const u8,
+) !void {
+    const constraint = findUniqueConstraintByName(runtime_schema.unique_constraints, constraint_name) orelse return error.TestUnexpectedResult;
+    const index = relational_store_mod.relationalIndexForUniqueConstraint(runtime_schema.relational_indexes, constraint, .ordered_tuple) orelse return error.TestUnexpectedResult;
+    if (index.lifecycle != .ready or index.keys.len == 0) return error.TestUnexpectedResult;
+
+    const logical_tuple = (try relational_store_mod.uniqueConstraintTupleValueWithColumnsAlloc(alloc, row_value, constraint, runtime_schema.relational_columns)) orelse return error.TestExpectedEqual;
+    defer alloc.free(logical_tuple);
+    const ordered_tuple = try relational_store_mod.orderedTupleValueForIndexKeysAlloc(alloc, row_value, index.keys, runtime_schema.relational_columns);
+    defer alloc.free(ordered_tuple);
+    const forward_key = try internal_keys.relationalOrderedTupleIndexKeyAlloc(alloc, index.name, ordered_tuple, doc_key);
+    defer alloc.free(forward_key);
+    const forward_value = try store.get(alloc, forward_key);
+    defer alloc.free(forward_value);
+
+    const dedicated_owner_key = try internal_keys.relationalUniqueKeyAlloc(alloc, constraint.name, logical_tuple);
+    defer alloc.free(dedicated_owner_key);
+    try std.testing.expectError(error.NotFound, store.get(alloc, dedicated_owner_key));
+}
+
 fn uniqueOwnerConstraintsAlloc(alloc: Allocator, runtime_schema: schema_mod.TableSchema) ![]schema_mod.UniqueConstraint {
     const extra: usize = if (runtime_schema.primary_key != null) 1 else 0;
     const constraints = try alloc.alloc(schema_mod.UniqueConstraint, runtime_schema.unique_constraints.len + extra);
@@ -658,7 +684,7 @@ pub fn Impl(comptime DB: type) type {
             const foreign_keys = try foreignKeysForIntegrityConstraint(self.alloc, runtime_schema.foreign_keys, constraint_name);
             defer if (constraint_name == null and foreign_keys.len > 0) self.alloc.free(foreign_keys);
             if (foreign_keys.len == 0) return .{};
-            const report = try relational_store_mod.reconcileForeignKeyRefsInRangeWithPrimaryKey(
+            const report = try relational_store_mod.reconcileForeignKeyRefsInRangeWithPrimaryKeyAndIndexes(
                 self.alloc,
                 self.core.store,
                 runtime_schema.default_type,
@@ -667,6 +693,7 @@ pub fn Impl(comptime DB: type) type {
                 foreign_keys,
                 runtime_schema.primary_key,
                 runtime_schema.unique_constraints,
+                runtime_schema.relational_indexes,
                 lower_doc_key,
                 upper_doc_key,
                 mode,
@@ -816,7 +843,7 @@ pub fn Impl(comptime DB: type) type {
                 if (!(relational_store_mod.temporalPeriodSpanBytesValid(mutation.temporal_start.?, mutation.temporal_end.?) catch return error.UniqueConstraintViolation)) {
                     return error.UniqueConstraintViolation;
                 }
-            } else if (constraint.without_overlaps_period != null) {
+            } else if (constraint.without_overlaps_period != null or !relational_store_mod.uniqueConstraintUsesDedicatedOwnerRows(constraint)) {
                 return error.UniqueConstraintViolation;
             }
             return constraint;
@@ -830,7 +857,13 @@ pub fn Impl(comptime DB: type) type {
             unique_writes: []const types.UniqueConstraintMutation,
             unique_deletes: []const types.UniqueConstraintMutation,
         ) !void {
+            if (unique_writes.len == 0 and unique_deletes.len == 0) return;
+            const runtime_schema = self.core.schema orelse return error.UniqueConstraintViolation;
+            if (runtime_schema.storage_mode != .relational) return error.UniqueConstraintViolation;
+            const owner_constraints = try uniqueOwnerConstraintsAlloc(self.alloc, runtime_schema);
+            defer self.alloc.free(owner_constraints);
             for (unique_deletes) |mutation| {
+                _ = try Self.validateUniqueConstraintMutation(self, owner_constraints, mutation);
                 const key = if (mutationIsTemporal(mutation))
                     try internal_keys.relationalTemporalUniqueKeyAlloc(self.alloc, mutation.constraint_name, mutation.encoded_value, mutation.temporal_start.?, mutation.temporal_end.?, mutation.owner_key)
                 else
@@ -840,6 +873,7 @@ pub fn Impl(comptime DB: type) type {
                 try intents.append(self.alloc, .{ .key = key, .value = null });
             }
             for (unique_writes) |mutation| {
+                _ = try Self.validateUniqueConstraintMutation(self, owner_constraints, mutation);
                 const key = if (mutationIsTemporal(mutation))
                     try internal_keys.relationalTemporalUniqueKeyAlloc(self.alloc, mutation.constraint_name, mutation.encoded_value, mutation.temporal_start.?, mutation.temporal_end.?, mutation.owner_key)
                 else
@@ -1194,17 +1228,34 @@ pub fn Impl(comptime DB: type) type {
                     continue;
                 }
                 if (check.parent_constraint_name) |constraint_name| {
-                    if (findUniqueConstraintByName(runtime_schema.unique_constraints, constraint_name) == null) return error.ForeignKeyViolation;
+                    const constraint = findUniqueConstraintByName(runtime_schema.unique_constraints, constraint_name) orelse return error.ForeignKeyViolation;
                     if (findUniqueConstraintMutation(unique_deletes, constraint_name, check.parent_key) != null and
                         findUniqueConstraintMutation(unique_writes, constraint_name, check.parent_key) == null) return error.ForeignKeyViolation;
-                    if (findUniqueConstraintMutation(unique_writes, constraint_name, check.parent_key) != null) continue;
-                    const unique_key = try internal_keys.relationalUniqueKeyAlloc(self.alloc, constraint_name, check.parent_key);
-                    defer self.alloc.free(unique_key);
-                    const owner = self.core.store.get(self.alloc, unique_key) catch |err| switch (err) {
-                        error.NotFound => return error.ForeignKeyViolation,
-                        else => return err,
-                    };
-                    self.alloc.free(owner);
+                    if (findUniqueConstraintMutation(unique_writes, constraint_name, check.parent_key) != null) return error.ForeignKeyViolation;
+                    if (try stagedWriteSatisfiesUniqueParentCheck(self.alloc, runtime_schema, writes, constraint, check.parent_key)) continue;
+                    const ordered_index = relational_store_mod.relationalIndexForUniqueConstraint(runtime_schema.relational_indexes, constraint, .ordered_tuple) orelse return error.ForeignKeyViolation;
+                    if (!relational_store_mod.orderedTupleUniqueIndexLookupReady(constraint, ordered_index)) return error.ForeignKeyViolation;
+                    const owners = try relational_store_mod.scanOrderedTupleDocKeysAlloc(self.alloc, self.core.store, ordered_index.name, "", "", "");
+                    defer relational_store_mod.freeDocKeys(self.alloc, owners);
+                    var found_parent = false;
+                    for (owners) |owner_doc_key| {
+                        if (containsString(deletes, owner_doc_key)) continue;
+                        const parent = try relational_store_mod.getRawAlloc(self.alloc, self.core.store, owner_doc_key);
+                        if (parent) |raw| {
+                            defer self.alloc.free(raw);
+                            const tuple = (try relational_store_mod.uniqueConstraintTupleValueWithColumnsAlloc(
+                                self.alloc,
+                                raw,
+                                constraint,
+                                runtime_schema.relational_columns,
+                            )) orelse continue;
+                            defer self.alloc.free(tuple);
+                            if (!std.mem.eql(u8, tuple, check.parent_key)) continue;
+                            found_parent = true;
+                            break;
+                        }
+                    }
+                    if (!found_parent) return error.ForeignKeyViolation;
                     continue;
                 }
                 if (!isForeignKeyExternalDocKey(check.parent_key)) return error.ForeignKeyViolation;
@@ -1214,6 +1265,28 @@ pub fn Impl(comptime DB: type) type {
                 defer if (existing) |body| self.alloc.free(body);
                 if (existing == null) return error.ForeignKeyViolation;
             }
+        }
+
+        fn stagedWriteSatisfiesUniqueParentCheck(
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            writes: []const types.TransactionWrite,
+            constraint: schema_mod.UniqueConstraint,
+            parent_key: []const u8,
+        ) !bool {
+            for (writes) |write| {
+                const row_value = mapper.buildRelationalRowValueAlloc(alloc, write.value, runtime_schema.relational_columns) catch continue;
+                defer alloc.free(row_value);
+                const tuple = (try relational_store_mod.uniqueConstraintTupleValueWithColumnsAlloc(
+                    alloc,
+                    row_value,
+                    constraint,
+                    runtime_schema.relational_columns,
+                )) orelse continue;
+                defer alloc.free(tuple);
+                if (std.mem.eql(u8, tuple, parent_key)) return true;
+            }
+            return false;
         }
 
         pub fn validateForeignKeyReferenceShapes(
@@ -1770,8 +1843,8 @@ pub fn Impl(comptime DB: type) type {
         }
 
         fn relationalColumnIndexPolicyForStore(self: *DB) relational_store_mod.ColumnIndexPolicy {
-            const schema = self.core.schema orelse return relational_store_mod.ColumnIndexPolicy.all();
-            if (schema.storage_mode != .relational) return relational_store_mod.ColumnIndexPolicy.all();
+            const schema = self.core.schema orelse return relational_store_mod.ColumnIndexPolicy.empty();
+            if (schema.storage_mode != .relational) return relational_store_mod.ColumnIndexPolicy.empty();
             return relational_store_mod.ColumnIndexPolicy.fromSchema(schema);
         }
 
@@ -4979,11 +5052,17 @@ test "db direct schema apply builds added unique constraints before foreign keys
 
     const parent_tuple = try relational_store_mod.bytesTupleValueAlloc(alloc, &.{"a@example.com"});
     defer alloc.free(parent_tuple);
-    const unique_key = try internal_keys.relationalUniqueKeyAlloc(alloc, "users_email_key", parent_tuple);
-    defer alloc.free(unique_key);
-    const unique_owner = try db.core.store.get(alloc, unique_key);
-    defer alloc.free(unique_owner);
-    try std.testing.expectEqualStrings("user:a", unique_owner);
+    const parent_row_key = try internal_keys.relationalRowKeyAlloc(alloc, "user:a");
+    defer alloc.free(parent_row_key);
+    const parent_row = try db.core.store.get(alloc, parent_row_key);
+    defer alloc.free(parent_row);
+    const users_email_index = relational_store_mod.relationalIndexForUniqueConstraint(db.core.schema.?.relational_indexes, db.core.schema.?.unique_constraints[0], .ordered_tuple) orelse return error.TestUnexpectedResult;
+    const parent_ordered_tuple = try relational_store_mod.orderedTupleValueForIndexKeysAlloc(alloc, parent_row, users_email_index.keys, db.core.schema.?.relational_columns);
+    defer alloc.free(parent_ordered_tuple);
+    const unique_owners = try relational_store_mod.scanOrderedTupleDocKeysAlloc(alloc, db.core.store, "users_email_key", parent_ordered_tuple, "", "");
+    defer relational_store_mod.freeDocKeys(alloc, unique_owners);
+    try std.testing.expectEqual(@as(usize, 1), unique_owners.len);
+    try std.testing.expectEqualStrings("user:a", unique_owners[0]);
 
     const fk_ref = try internal_keys.relationalForeignKeyRefKeyAlloc(alloc, "users_ref_email_fkey", "row", parent_tuple, "row", "user:b");
     defer alloc.free(fk_ref);
@@ -5858,13 +5937,10 @@ test "db direct schema apply validates and builds added unique constraints" {
 
     try db.applyTableSchemaJson(alloc, schema_v2, .{});
 
-    const unique_value = try relational_store_mod.bytesTupleValueAlloc(alloc, &.{"a@example.com"});
-    defer alloc.free(unique_value);
-    const unique_key = try internal_keys.relationalUniqueKeyAlloc(alloc, "users_email_key", unique_value);
-    defer alloc.free(unique_key);
-    const owner = try db.core.store.get(alloc, unique_key);
-    defer alloc.free(owner);
-    try std.testing.expectEqualStrings("user:a", owner);
+    const row_a = try relational_store_mod.getRawAlloc(alloc, db.core.store, "user:a") orelse return error.TestExpectedEqual;
+    defer alloc.free(row_a);
+    const runtime_schema = db.core.schema orelse return error.TestExpectedEqual;
+    try expectOrderedUniqueEntryAndNoDedicatedOwner(alloc, db.core.store, runtime_schema, "users_email_key", row_a, "user:a");
 
     try std.testing.expectError(error.UniqueConstraintViolation, db.batch(.{
         .writes = &.{.{ .key = "user:c", .value = "{\"id\":\"user:c\",\"email\":\"a@example.com\"}" }},
@@ -5904,7 +5980,7 @@ test "db direct schema apply rejects added unique constraints with duplicate exi
     try std.testing.expectEqual(@as(usize, 0), durable_schema.unique_constraints.len);
 }
 
-test "relational expression partial predicates maintain indexes and unique owners" {
+test "relational expression partial predicates maintain indexes and ordered unique tuples" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
@@ -5917,7 +5993,7 @@ test "relational expression partial predicates maintain indexes and unique owner
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword","x-antfly-index-where-expressions":[{"lhs":{"op":"lower","args":[{"field":"status"}]},"op":"eq","rhs":{"value":"active"}}]},"status":{"type":"keyword"},"name":{"type":"keyword"}},"required":["id","email","status","name"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_active_email_key","columns":["email"],"where_expressions":[{"lhs":{"op":"lower","args":[{"field":"status"}]},"op":"eq","rhs":{"value":"active"}}]}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"},"name":{"type":"keyword"}},"required":["id","email","status","name"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_active_email_key","columns":["email"],"where_expressions":[{"lhs":{"op":"lower","args":[{"field":"status"}]},"op":"eq","rhs":{"value":"active"}}]}],"relational_indexes":[{"name":"email","owner_kind":"relational_column","owner_name":"email","access_method":"scalar_column","columns":["email"],"where_expressions":[{"lhs":{"op":"lower","args":[{"field":"status"}]},"op":"eq","rhs":{"value":"active"}}]}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -5944,13 +6020,7 @@ test "relational expression partial predicates maintain indexes and unique owner
 
     const active_row = try relational_store_mod.getRawAlloc(alloc, db.core.store, "user:active") orelse return error.TestExpectedEqual;
     defer alloc.free(active_row);
-    const active_tuple = (try relational_store_mod.uniqueConstraintTupleValueAlloc(alloc, active_row, runtime_schema.unique_constraints[0])) orelse return error.TestExpectedEqual;
-    defer alloc.free(active_tuple);
-    const owner_key = try internal_keys.relationalUniqueKeyAlloc(alloc, "users_active_email_key", active_tuple);
-    defer alloc.free(owner_key);
-    const owner = try db.core.store.get(alloc, owner_key);
-    defer alloc.free(owner);
-    try std.testing.expectEqualStrings("user:active", owner);
+    try expectOrderedUniqueEntryAndNoDedicatedOwner(alloc, db.core.store, runtime_schema, "users_active_email_key", active_row, "user:active");
 
     const inactive_row = try relational_store_mod.getRawAlloc(alloc, db.core.store, "user:inactive") orelse return error.TestExpectedEqual;
     defer alloc.free(inactive_row);
@@ -5975,11 +6045,12 @@ test "relational expression partial predicates maintain indexes and unique owner
         .op = .eq,
         .rhs = active_expression_rhs[0..],
     }};
-    try std.testing.expect(!(try db.searchRuntimeRelationalColumnIndexUsableForQuery(alloc, runtime_schema.relational_columns[1], .{
+    const email_column = runtime_schema.relational_columns[1];
+    try std.testing.expect(!(try db.searchRuntimeRelationalColumnIndexUsableForQuery(alloc, runtime_schema, email_column, .{
         .predicates = &.{},
         .expressions = &.{},
     })));
-    try std.testing.expect(try db.searchRuntimeRelationalColumnIndexUsableForQuery(alloc, runtime_schema.relational_columns[1], .{
+    try std.testing.expect(try db.searchRuntimeRelationalColumnIndexUsableForQuery(alloc, runtime_schema, email_column, .{
         .predicates = &.{},
         .expressions = active_expression_predicates[0..],
     }));
@@ -5997,7 +6068,7 @@ test "relational expression partial predicates maintain indexes and unique owner
             .value_json = "\"ACTIVE\"",
         },
     };
-    try std.testing.expect(try db.searchRuntimeRelationalColumnIndexUsableForQuery(alloc, runtime_schema.relational_columns[1], .{
+    try std.testing.expect(try db.searchRuntimeRelationalColumnIndexUsableForQuery(alloc, runtime_schema, email_column, .{
         .predicates = semantic_index_predicates[0..],
         .expressions = &.{},
     }));
@@ -6032,7 +6103,7 @@ test "relational expression partial predicates maintain indexes and unique owner
     try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"ACTIVE\"}", semantic_query.rows[0]);
 }
 
-test "relational text expression partial predicates maintain indexes and unique owners" {
+test "relational text expression partial predicates maintain indexes and ordered unique tuples" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
@@ -6045,7 +6116,7 @@ test "relational text expression partial predicates maintain indexes and unique 
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword","x-antfly-index-where-expressions":[{"lhs":{"op":"split_part","args":[{"field":"status"},{"value":"-"},{"value":1}]},"op":"eq","rhs":{"value":"active"}},{"lhs":{"op":"regexp_replace","args":[{"field":"status"},{"value":"[0-9]+"},{"value":"#"},{"value":"g"}]},"op":"eq","rhs":{"value":"active-#"}},{"lhs":{"op":"starts_with","args":[{"field":"tag"},{"value":"h"}]},"op":"eq","rhs":{"value":true}}]},"status":{"type":"keyword"},"tag":{"type":"keyword"}},"required":["id","email","status","tag"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_hot_email_key","columns":["email"],"where_expressions":[{"lhs":{"op":"replace","args":[{"field":"tag"},{"value":"-"},{"value":""}]},"op":"eq","rhs":{"value":"hot"}},{"lhs":{"op":"regexp_replace","args":[{"field":"status"},{"value":"[0-9]+"},{"value":"#"},{"value":"g"}]},"op":"eq","rhs":{"value":"active-#"}}]}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"},"tag":{"type":"keyword"}},"required":["id","email","status","tag"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_hot_email_key","columns":["email"],"where_expressions":[{"lhs":{"op":"replace","args":[{"field":"tag"},{"value":"-"},{"value":""}]},"op":"eq","rhs":{"value":"hot"}},{"lhs":{"op":"regexp_replace","args":[{"field":"status"},{"value":"[0-9]+"},{"value":"#"},{"value":"g"}]},"op":"eq","rhs":{"value":"active-#"}}]}],"relational_indexes":[{"name":"email","owner_kind":"relational_column","owner_name":"email","access_method":"scalar_column","columns":["email"],"where_expressions":[{"lhs":{"op":"split_part","args":[{"field":"status"},{"value":"-"},{"value":1}]},"op":"eq","rhs":{"value":"active"}},{"lhs":{"op":"regexp_replace","args":[{"field":"status"},{"value":"[0-9]+"},{"value":"#"},{"value":"g"}]},"op":"eq","rhs":{"value":"active-#"}},{"lhs":{"op":"starts_with","args":[{"field":"tag"},{"value":"h"}]},"op":"eq","rhs":{"value":true}}]}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -6072,13 +6143,7 @@ test "relational text expression partial predicates maintain indexes and unique 
 
     const active_row = try relational_store_mod.getRawAlloc(alloc, db.core.store, "user:active") orelse return error.TestExpectedEqual;
     defer alloc.free(active_row);
-    const active_tuple = (try relational_store_mod.uniqueConstraintTupleValueAlloc(alloc, active_row, runtime_schema.unique_constraints[0])) orelse return error.TestExpectedEqual;
-    defer alloc.free(active_tuple);
-    const owner_key = try internal_keys.relationalUniqueKeyAlloc(alloc, "users_hot_email_key", active_tuple);
-    defer alloc.free(owner_key);
-    const owner = try db.core.store.get(alloc, owner_key);
-    defer alloc.free(owner);
-    try std.testing.expectEqualStrings("user:active", owner);
+    try expectOrderedUniqueEntryAndNoDedicatedOwner(alloc, db.core.store, runtime_schema, "users_hot_email_key", active_row, "user:active");
 
     const inactive_row = try relational_store_mod.getRawAlloc(alloc, db.core.store, "user:inactive") orelse return error.TestExpectedEqual;
     defer alloc.free(inactive_row);
@@ -6088,7 +6153,7 @@ test "relational text expression partial predicates maintain indexes and unique 
     }
 }
 
-test "relational scalar expression partial predicates maintain indexes and unique owners" {
+test "relational scalar expression partial predicates maintain indexes and ordered unique tuples" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
@@ -6101,7 +6166,7 @@ test "relational scalar expression partial predicates maintain indexes and uniqu
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword","x-antfly-index-where-expressions":[{"lhs":{"op":"add","args":[{"field":"amount"},{"field":"bonus"}]},"op":"gte","rhs":{"value":10}},{"lhs":{"op":"cast","to":"numeric","args":[{"field":"rank_text"}]},"op":"eq","rhs":{"value":6}},{"lhs":{"op":"greatest","args":[{"field":"amount"},{"field":"bonus"}]},"op":"gte","rhs":{"value":6}},{"lhs":{"op":"least","args":[{"field":"amount"},{"field":"cap"}]},"op":"lte","rhs":{"value":5}}]},"status":{"type":"keyword"},"amount":{"type":"numeric"},"bonus":{"type":"numeric"},"cap":{"type":"numeric"},"rank_text":{"type":"keyword"}},"required":["id","email","status","amount","bonus","cap","rank_text"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_active_email_key","columns":["email"],"where_expressions":[{"lhs":{"op":"nullif","args":[{"field":"status"},{"value":"blocked"}]},"op":"is_not_null"},{"lhs":{"op":"mod","args":[{"field":"amount"},{"value":2}]},"op":"eq","rhs":{"value":0}}]}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"bonus":{"type":"numeric"},"cap":{"type":"numeric"},"rank_text":{"type":"keyword"}},"required":["id","email","status","amount","bonus","cap","rank_text"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_active_email_key","columns":["email"],"where_expressions":[{"lhs":{"op":"nullif","args":[{"field":"status"},{"value":"blocked"}]},"op":"is_not_null"},{"lhs":{"op":"mod","args":[{"field":"amount"},{"value":2}]},"op":"eq","rhs":{"value":0}}]}],"relational_indexes":[{"name":"email","owner_kind":"relational_column","owner_name":"email","access_method":"scalar_column","columns":["email"],"where_expressions":[{"lhs":{"op":"add","args":[{"field":"amount"},{"field":"bonus"}]},"op":"gte","rhs":{"value":10}},{"lhs":{"op":"cast","to":"numeric","args":[{"field":"rank_text"}]},"op":"eq","rhs":{"value":6}},{"lhs":{"op":"greatest","args":[{"field":"amount"},{"field":"bonus"}]},"op":"gte","rhs":{"value":6}},{"lhs":{"op":"least","args":[{"field":"amount"},{"field":"cap"}]},"op":"lte","rhs":{"value":5}}]}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -6128,13 +6193,7 @@ test "relational scalar expression partial predicates maintain indexes and uniqu
 
     const active_row = try relational_store_mod.getRawAlloc(alloc, db.core.store, "user:active") orelse return error.TestExpectedEqual;
     defer alloc.free(active_row);
-    const active_tuple = (try relational_store_mod.uniqueConstraintTupleValueAlloc(alloc, active_row, runtime_schema.unique_constraints[0])) orelse return error.TestExpectedEqual;
-    defer alloc.free(active_tuple);
-    const owner_key = try internal_keys.relationalUniqueKeyAlloc(alloc, "users_active_email_key", active_tuple);
-    defer alloc.free(owner_key);
-    const owner = try db.core.store.get(alloc, owner_key);
-    defer alloc.free(owner);
-    try std.testing.expectEqualStrings("user:active", owner);
+    try expectOrderedUniqueEntryAndNoDedicatedOwner(alloc, db.core.store, runtime_schema, "users_active_email_key", active_row, "user:active");
 
     const inactive_row = try relational_store_mod.getRawAlloc(alloc, db.core.store, "user:inactive") orelse return error.TestExpectedEqual;
     defer alloc.free(inactive_row);
@@ -6144,7 +6203,7 @@ test "relational scalar expression partial predicates maintain indexes and uniqu
     }
 }
 
-test "relational boolean and pattern expression partial predicates maintain indexes and unique owners" {
+test "relational boolean and pattern expression partial predicates maintain indexes and ordered unique tuples" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
@@ -6157,7 +6216,7 @@ test "relational boolean and pattern expression partial predicates maintain inde
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword","x-antfly-index-where-expressions":[{"lhs":{"op":"ilike","args":[{"field":"name"},{"value":"al%"}]},"op":"eq","rhs":{"value":true}},{"lhs":{"op":"bool_and","args":[{"field":"enabled"},{"value":true}]},"op":"eq","rhs":{"value":true}}]},"name":{"type":"keyword"},"status":{"type":"keyword"},"enabled":{"type":"boolean"},"archived":{"type":"boolean"}},"required":["id","email","name","status","enabled","archived"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_visible_email_key","columns":["email"],"where_expressions":[{"lhs":{"op":"like","args":[{"field":"status"},{"value":"act%"}]},"op":"eq","rhs":{"value":true}},{"lhs":{"op":"bool_not","args":[{"field":"archived"}]},"op":"eq","rhs":{"value":true}}]}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"name":{"type":"keyword"},"status":{"type":"keyword"},"enabled":{"type":"boolean"},"archived":{"type":"boolean"}},"required":["id","email","name","status","enabled","archived"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_visible_email_key","columns":["email"],"where_expressions":[{"lhs":{"op":"like","args":[{"field":"status"},{"value":"act%"}]},"op":"eq","rhs":{"value":true}},{"lhs":{"op":"bool_not","args":[{"field":"archived"}]},"op":"eq","rhs":{"value":true}}]}],"relational_indexes":[{"name":"email","owner_kind":"relational_column","owner_name":"email","access_method":"scalar_column","columns":["email"],"where_expressions":[{"lhs":{"op":"ilike","args":[{"field":"name"},{"value":"al%"}]},"op":"eq","rhs":{"value":true}},{"lhs":{"op":"bool_and","args":[{"field":"enabled"},{"value":true}]},"op":"eq","rhs":{"value":true}}]}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -6184,13 +6243,7 @@ test "relational boolean and pattern expression partial predicates maintain inde
 
     const visible_row = try relational_store_mod.getRawAlloc(alloc, db.core.store, "user:visible") orelse return error.TestExpectedEqual;
     defer alloc.free(visible_row);
-    const visible_tuple = (try relational_store_mod.uniqueConstraintTupleValueAlloc(alloc, visible_row, runtime_schema.unique_constraints[0])) orelse return error.TestExpectedEqual;
-    defer alloc.free(visible_tuple);
-    const owner_key = try internal_keys.relationalUniqueKeyAlloc(alloc, "users_visible_email_key", visible_tuple);
-    defer alloc.free(owner_key);
-    const owner = try db.core.store.get(alloc, owner_key);
-    defer alloc.free(owner);
-    try std.testing.expectEqualStrings("user:visible", owner);
+    try expectOrderedUniqueEntryAndNoDedicatedOwner(alloc, db.core.store, runtime_schema, "users_visible_email_key", visible_row, "user:visible");
 
     const hidden_row = try relational_store_mod.getRawAlloc(alloc, db.core.store, "user:hidden") orelse return error.TestExpectedEqual;
     defer alloc.free(hidden_row);
@@ -6200,7 +6253,7 @@ test "relational boolean and pattern expression partial predicates maintain inde
     }
 }
 
-test "relational array and json object expression partial predicates maintain indexes and unique owners" {
+test "relational array and json object expression partial predicates maintain indexes and ordered unique tuples" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
@@ -6213,7 +6266,7 @@ test "relational array and json object expression partial predicates maintain in
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword","x-antfly-index-where-expressions":[{"lhs":{"op":"array_position","args":[{"field":"tags"},{"value":"hot"}]},"op":"eq","rhs":{"value":1}},{"lhs":{"op":"array_to_string","args":[{"op":"array_append","args":[{"field":"tags"},{"value":"vip"}]},{"value":","}]},"op":"eq","rhs":{"value":"hot,vip"}},{"lhs":{"op":"json_build_object","args":[{"value":"source"},{"op":"json_extract","args":[{"field":"metadata"}],"path":"source","as_text":true}]},"op":"eq","rhs":{"value":{"source":"api"}}}]},"tags":{"type":"array","items":{"type":"keyword"}},"scope":{"type":"keyword"},"metadata":{"type":"json"}},"required":["id","email","tags","scope","metadata"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_array_json_email_key","columns":["email"],"where_expressions":[{"lhs":{"op":"array_to_string","args":[{"op":"array_replace","args":[{"field":"tags"},{"value":"hot"},{"value":"warm"}]},{"value":","}]},"op":"eq","rhs":{"value":"warm"}},{"lhs":{"op":"array_position","args":[{"op":"string_to_array","args":[{"field":"scope"},{"value":" "}]},{"value":"read"}]},"op":"eq","rhs":{"value":1}}]}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"tags":{"type":"array","items":{"type":"keyword"}},"scope":{"type":"keyword"},"metadata":{"type":"json"}},"required":["id","email","tags","scope","metadata"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_array_json_email_key","columns":["email"],"where_expressions":[{"lhs":{"op":"array_to_string","args":[{"op":"array_replace","args":[{"field":"tags"},{"value":"hot"},{"value":"warm"}]},{"value":","}]},"op":"eq","rhs":{"value":"warm"}},{"lhs":{"op":"array_position","args":[{"op":"string_to_array","args":[{"field":"scope"},{"value":" "}]},{"value":"read"}]},"op":"eq","rhs":{"value":1}}]}],"relational_indexes":[{"name":"email","owner_kind":"relational_column","owner_name":"email","access_method":"scalar_column","columns":["email"],"where_expressions":[{"lhs":{"op":"array_position","args":[{"field":"tags"},{"value":"hot"}]},"op":"eq","rhs":{"value":1}},{"lhs":{"op":"array_to_string","args":[{"op":"array_append","args":[{"field":"tags"},{"value":"vip"}]},{"value":","}]},"op":"eq","rhs":{"value":"hot,vip"}},{"lhs":{"op":"json_build_object","args":[{"value":"source"},{"op":"json_extract","args":[{"field":"metadata"}],"path":"source","as_text":true}]},"op":"eq","rhs":{"value":{"source":"api"}}}]}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -6240,13 +6293,7 @@ test "relational array and json object expression partial predicates maintain in
 
     const visible_row = try relational_store_mod.getRawAlloc(alloc, db.core.store, "user:visible") orelse return error.TestExpectedEqual;
     defer alloc.free(visible_row);
-    const visible_tuple = (try relational_store_mod.uniqueConstraintTupleValueAlloc(alloc, visible_row, runtime_schema.unique_constraints[0])) orelse return error.TestExpectedEqual;
-    defer alloc.free(visible_tuple);
-    const owner_key = try internal_keys.relationalUniqueKeyAlloc(alloc, "users_array_json_email_key", visible_tuple);
-    defer alloc.free(owner_key);
-    const owner = try db.core.store.get(alloc, owner_key);
-    defer alloc.free(owner);
-    try std.testing.expectEqualStrings("user:visible", owner);
+    try expectOrderedUniqueEntryAndNoDedicatedOwner(alloc, db.core.store, runtime_schema, "users_array_json_email_key", visible_row, "user:visible");
 
     const hidden_row = try relational_store_mod.getRawAlloc(alloc, db.core.store, "user:hidden") orelse return error.TestExpectedEqual;
     defer alloc.free(hidden_row);
@@ -6256,7 +6303,7 @@ test "relational array and json object expression partial predicates maintain in
     }
 }
 
-test "relational temporal and case expression partial predicates maintain indexes and unique owners" {
+test "relational temporal and case expression partial predicates maintain indexes and ordered unique tuples" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
     const DB = @import("mod.zig").DB;
@@ -6269,7 +6316,7 @@ test "relational temporal and case expression partial predicates maintain indexe
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword","x-antfly-index-where-expressions":[{"lhs":{"op":"date_trunc","args":[{"value":"hour"},{"field":"created_at_ns"}]},"op":"eq","rhs":{"value":3600000000000}},{"lhs":{"op":"case","cases":[{"when":{"lhs":{"field":"status"},"op":"eq","rhs":{"value":"active"}},"then":{"value":true}}],"else":{"value":false}},"op":"eq","rhs":{"value":true}}]},"status":{"type":"keyword"},"created_at_ns":{"type":"datetime"}},"required":["id","email","status","created_at_ns"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_temporal_email_key","columns":["email"],"where_expressions":[{"lhs":{"op":"date_bin","args":[{"op":"interval_ns","args":[{"value":3600000000000}]},{"field":"created_at_ns"},{"value":0}]},"op":"eq","rhs":{"value":3600000000000}},{"lhs":{"op":"date_part","args":[{"value":"hour"},{"field":"created_at_ns"}]},"op":"eq","rhs":{"value":1}}]}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"},"created_at_ns":{"type":"datetime"}},"required":["id","email","status","created_at_ns"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_temporal_email_key","columns":["email"],"where_expressions":[{"lhs":{"op":"date_bin","args":[{"op":"interval_ns","args":[{"value":3600000000000}]},{"field":"created_at_ns"},{"value":0}]},"op":"eq","rhs":{"value":3600000000000}},{"lhs":{"op":"date_part","args":[{"value":"hour"},{"field":"created_at_ns"}]},"op":"eq","rhs":{"value":1}}]}],"relational_indexes":[{"name":"email","owner_kind":"relational_column","owner_name":"email","access_method":"scalar_column","columns":["email"],"where_expressions":[{"lhs":{"op":"date_trunc","args":[{"value":"hour"},{"field":"created_at_ns"}]},"op":"eq","rhs":{"value":3600000000000}},{"lhs":{"op":"case","cases":[{"when":{"lhs":{"field":"status"},"op":"eq","rhs":{"value":"active"}},"then":{"value":true}}],"else":{"value":false}},"op":"eq","rhs":{"value":true}}]}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -6296,13 +6343,7 @@ test "relational temporal and case expression partial predicates maintain indexe
 
     const visible_row = try relational_store_mod.getRawAlloc(alloc, db.core.store, "user:visible") orelse return error.TestExpectedEqual;
     defer alloc.free(visible_row);
-    const visible_tuple = (try relational_store_mod.uniqueConstraintTupleValueAlloc(alloc, visible_row, runtime_schema.unique_constraints[0])) orelse return error.TestExpectedEqual;
-    defer alloc.free(visible_tuple);
-    const owner_key = try internal_keys.relationalUniqueKeyAlloc(alloc, "users_temporal_email_key", visible_tuple);
-    defer alloc.free(owner_key);
-    const owner = try db.core.store.get(alloc, owner_key);
-    defer alloc.free(owner);
-    try std.testing.expectEqualStrings("user:visible", owner);
+    try expectOrderedUniqueEntryAndNoDedicatedOwner(alloc, db.core.store, runtime_schema, "users_temporal_email_key", visible_row, "user:visible");
 
     const hidden_row = try relational_store_mod.getRawAlloc(alloc, db.core.store, "user:hidden") orelse return error.TestExpectedEqual;
     defer alloc.free(hidden_row);
@@ -7753,7 +7794,7 @@ test "db relational integrity constraints relational unique constraints enforce 
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"email":{"type":"keyword"},"handle":{"type":"keyword"},"age":{"type":"numeric"},"slug":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_email_key","columns":["email"]},{"name":"users_age_key","columns":["age"]},{"name":"users_tenant_handle_key","columns":["tenant_id","handle"]},{"name":"users_active_slug_key","columns":["slug"],"where":{"all":[{"field":"status","op":"eq","value":"active"}]}},{"name":"users_lower_email_key","expressions":[{"op":"lower","field":"email"}]}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"email":{"type":"keyword"},"handle":{"type":"keyword"},"age":{"type":"numeric"},"slug":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_email_key","columns":["email"]},{"name":"users_age_key","columns":["age"]},{"name":"users_tenant_handle_key","columns":["tenant_id","handle"]},{"name":"users_active_slug_key","columns":["slug"],"where":{"all":[{"field":"status","op":"eq","value":"active"}]}}]}
     ;
     var parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -7778,9 +7819,6 @@ test "db relational integrity constraints relational unique constraints enforce 
 
     try std.testing.expectError(error.UniqueConstraintViolation, db.batch(.{
         .writes = &.{.{ .key = "user:2", .value = "{\"id\":\"user:2\",\"email\":\"a@example.com\",\"age\":31}" }},
-    }));
-    try std.testing.expectError(error.UniqueConstraintViolation, db.batch(.{
-        .writes = &.{.{ .key = "user:2-case", .value = "{\"id\":\"user:2-case\",\"email\":\"A@EXAMPLE.COM\",\"age\":41}" }},
     }));
     try std.testing.expectError(error.UniqueConstraintViolation, db.batch(.{
         .writes = &.{.{ .key = "user:3", .value = "{\"id\":\"user:3\",\"email\":\"b@example.com\",\"age\":30}" }},
@@ -7961,52 +7999,48 @@ test "db relational integrity constraints unique constraint integrity repair reb
     const validate = try db.validateUniqueConstraintRowsInRange("", "");
     try std.testing.expect(!validate.valid());
     try std.testing.expectEqual(@as(u64, 2), validate.scanned_rows);
-    try std.testing.expectEqual(@as(u64, 2), validate.expected_unique_rows);
-    try std.testing.expectEqual(@as(u64, 1), validate.missing_unique_rows);
+    try std.testing.expectEqual(@as(u64, 0), validate.expected_unique_rows);
+    try std.testing.expectEqual(@as(u64, 0), validate.missing_unique_rows);
     try std.testing.expectEqual(@as(u64, 2), validate.stale_unique_rows);
 
     const dry_run = try db.dryRunRepairUniqueConstraintRowsInRange("", "");
     try std.testing.expect(!dry_run.valid());
-    try std.testing.expectEqual(@as(u64, 2), dry_run.repaired_unique_rows);
-    try std.testing.expectEqual(@as(u64, 1), dry_run.deleted_stale_unique_rows);
+    try std.testing.expectEqual(@as(u64, 0), dry_run.repaired_unique_rows);
+    try std.testing.expectEqual(@as(u64, 2), dry_run.deleted_stale_unique_rows);
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, ada_key));
 
     const repair = try db.repairUniqueConstraintRowsInRange("", "");
     try std.testing.expect(!repair.valid());
-    try std.testing.expectEqual(@as(u64, 2), repair.repaired_unique_rows);
-    try std.testing.expectEqual(@as(u64, 1), repair.deleted_stale_unique_rows);
+    try std.testing.expectEqual(@as(u64, 0), repair.repaired_unique_rows);
+    try std.testing.expectEqual(@as(u64, 2), repair.deleted_stale_unique_rows);
     const repair_progress = (try db.loadUniqueConstraintIntegrityProgressRecord(.repair, "", "")) orelse return error.TestUnexpectedResult;
     defer db.freeUniqueConstraintIntegrityProgressRecord(repair_progress);
     try std.testing.expectEqualStrings("repair", repair_progress.mode);
     try std.testing.expect(repair_progress.completed);
     try std.testing.expect(repair_progress.valid);
-    try std.testing.expectEqual(@as(u64, 2), repair_progress.report.repaired_unique_rows);
-    try std.testing.expectEqual(@as(u64, 1), repair_progress.report.deleted_stale_unique_rows);
+    try std.testing.expectEqual(@as(u64, 0), repair_progress.report.repaired_unique_rows);
+    try std.testing.expectEqual(@as(u64, 2), repair_progress.report.deleted_stale_unique_rows);
 
     const after = try db.validateUniqueConstraintRowsInRange("", "");
     try std.testing.expect(after.valid());
     try std.testing.expectEqual(@as(u64, 2), after.scanned_rows);
-    try std.testing.expectEqual(@as(u64, 2), after.scanned_unique_rows);
+    try std.testing.expectEqual(@as(u64, 0), after.scanned_unique_rows);
     const validate_progress = (try db.loadUniqueConstraintIntegrityProgressRecord(.validate, "", "")) orelse return error.TestUnexpectedResult;
     defer db.freeUniqueConstraintIntegrityProgressRecord(validate_progress);
     try std.testing.expectEqualStrings("validate", validate_progress.mode);
     try std.testing.expect(validate_progress.completed);
     try std.testing.expect(validate_progress.valid);
-    try std.testing.expectEqual(@as(u64, 2), validate_progress.report.scanned_unique_rows);
+    try std.testing.expectEqual(@as(u64, 0), validate_progress.report.scanned_unique_rows);
     const dry_run_progress = (try db.loadUniqueConstraintIntegrityProgressRecord(.dry_run, "", "")) orelse return error.TestUnexpectedResult;
     defer db.freeUniqueConstraintIntegrityProgressRecord(dry_run_progress);
     try std.testing.expectEqualStrings("dry_run", dry_run_progress.mode);
     try std.testing.expect(!dry_run_progress.valid);
-    try std.testing.expectEqual(@as(u64, 2), dry_run_progress.report.repaired_unique_rows);
+    try std.testing.expectEqual(@as(u64, 0), dry_run_progress.report.repaired_unique_rows);
     const all_progress = try db.listUniqueConstraintIntegrityProgressRecords();
     defer db.freeUniqueConstraintIntegrityProgressRecords(all_progress);
     try std.testing.expectEqual(@as(usize, 3), all_progress.len);
-    const ada_owner = try db.core.store.get(alloc, ada_key);
-    defer alloc.free(ada_owner);
-    try std.testing.expectEqualStrings("user:ada", ada_owner);
-    const grace_owner = try db.core.store.get(alloc, grace_key);
-    defer alloc.free(grace_owner);
-    try std.testing.expectEqualStrings("user:grace", grace_owner);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, ada_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, grace_key));
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, stale_key));
 }
 
@@ -8758,7 +8792,7 @@ test "db relational integrity transaction deferred foreign keys validate at loca
 
     const forced_immediate_without_proof_txn = try db.beginTransaction(14_925);
     try db.writeTransaction(forced_immediate_without_proof_txn, .{
-        .writes = &.{.{ .key = "aa-order:forced-immediate-legacy", .value = "{\"id\":\"aa-order:forced-immediate-legacy\",\"customer_id\":\"zz-customer:forced-immediate-legacy\"}" }},
+        .writes = &.{.{ .key = "aa-order:forced-immediate-without-proof", .value = "{\"id\":\"aa-order:forced-immediate-without-proof\",\"customer_id\":\"zz-customer:forced-immediate-without-proof\"}" }},
         .foreign_key_constraint_timing_overrides = &.{.{
             .constraint_name = "orders_customer_id_fkey",
             .timing = .immediate,
@@ -9305,6 +9339,10 @@ test "db relational integrity transaction foreign key parent checks validate uni
 
     const create_txn = try db.beginTransaction(18_200);
     try db.writeTransaction(create_txn, .{
+        .writes = &.{.{
+            .key = "customer:ada",
+            .value = "{\"email\":\"ada@example.test\",\"name\":\"Ada\"}",
+        }},
         .foreign_key_parent_checks = &.{.{
             .constraint_name = "orders_customer_email_fkey",
             .child_table = "orders",
@@ -9312,11 +9350,6 @@ test "db relational integrity transaction foreign key parent checks validate uni
             .parent_table = "customers",
             .parent_key = parent_key,
             .parent_constraint_name = "customers_email_key",
-        }},
-        .unique_constraint_writes = &.{.{
-            .constraint_name = "customers_email_key",
-            .encoded_value = parent_key,
-            .owner_key = "customer:ada",
         }},
     });
     try db.commitTransaction(create_txn, 18_201);
@@ -9331,11 +9364,7 @@ test "db relational integrity transaction foreign key parent checks validate uni
             .parent_key = parent_key,
             .parent_constraint_name = "customers_email_key",
         }},
-        .unique_constraint_deletes = &.{.{
-            .constraint_name = "customers_email_key",
-            .encoded_value = parent_key,
-            .owner_key = "customer:ada",
-        }},
+        .deletes = &.{"customer:ada"},
     }));
     try db.abortTransaction(delete_txn, 18_301);
 }
@@ -10595,7 +10624,7 @@ test "db relational temporal mutation source splits portions transactionally" {
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"sku":{"type":"keyword"},"valid_from":{"type":"numeric"},"valid_to":{"type":"numeric"},"price":{"type":"numeric"}},"required":["sku","valid_from","valid_to"],"additionalProperties":false}}},"periods":[{"name":"valid_time","start_column":"valid_from","end_column":"valid_to"}],"primary_key":{"columns":["sku"],"without_overlaps_period":"valid_time"}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"sku":{"type":"keyword"},"valid_from":{"type":"numeric"},"valid_to":{"type":"numeric"},"price":{"type":"numeric"}},"required":["sku","valid_from","valid_to"],"additionalProperties":false}}},"periods":[{"name":"valid_time","start_column":"valid_from","end_column":"valid_to"}],"primary_key":{"columns":["sku"],"without_overlaps_period":"valid_time"},"relational_indexes":[{"name":"sku","owner_kind":"relational_column","owner_name":"sku","access_method":"scalar_column","columns":["sku"]}]}
     ;
     var parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -10854,7 +10883,7 @@ test "db relational temporal mutation source preserves foreign key coverage" {
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"sku":{"type":"keyword"},"parent_sku":{"type":"keyword"},"valid_from":{"type":"numeric"},"valid_to":{"type":"numeric"},"price":{"type":"numeric"}},"required":["sku","valid_from","valid_to"],"additionalProperties":false}}},"periods":[{"name":"valid_time","start_column":"valid_from","end_column":"valid_to"}],"primary_key":{"columns":["sku"],"without_overlaps_period":"valid_time"},"foreign_keys":[{"name":"price_parent_period_fkey","columns":["parent_sku"],"period":"valid_time","references":{"table":"row","columns":["sku"],"period":"valid_time"},"validation_state":"enforced"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"sku":{"type":"keyword"},"parent_sku":{"type":"keyword"},"valid_from":{"type":"numeric"},"valid_to":{"type":"numeric"},"price":{"type":"numeric"}},"required":["sku","valid_from","valid_to"],"additionalProperties":false}}},"periods":[{"name":"valid_time","start_column":"valid_from","end_column":"valid_to"}],"primary_key":{"columns":["sku"],"without_overlaps_period":"valid_time"},"foreign_keys":[{"name":"price_parent_period_fkey","columns":["parent_sku"],"period":"valid_time","references":{"table":"row","columns":["sku"],"period":"valid_time"},"validation_state":"enforced"}],"relational_indexes":[{"name":"sku","owner_kind":"relational_column","owner_name":"sku","access_method":"scalar_column","columns":["sku"]},{"name":"parent_sku","owner_kind":"relational_column","owner_name":"parent_sku","access_method":"scalar_column","columns":["parent_sku"]}]}
     ;
     var parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -10943,7 +10972,7 @@ test "db relational temporal workload combines portion splits foreign key repair
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"sku":{"type":"keyword"},"parent_sku":{"type":"keyword"},"valid_from":{"type":"numeric"},"valid_to":{"type":"numeric"},"price":{"type":"numeric"}},"required":["sku","valid_from","valid_to"],"additionalProperties":false}}},"periods":[{"name":"valid_time","start_column":"valid_from","end_column":"valid_to"}],"primary_key":{"columns":["sku"],"without_overlaps_period":"valid_time"},"foreign_keys":[{"name":"price_parent_period_fkey","columns":["parent_sku"],"period":"valid_time","references":{"table":"row","columns":["sku"],"period":"valid_time"},"validation_state":"enforced"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"sku":{"type":"keyword"},"parent_sku":{"type":"keyword"},"valid_from":{"type":"numeric"},"valid_to":{"type":"numeric"},"price":{"type":"numeric"}},"required":["sku","valid_from","valid_to"],"additionalProperties":false}}},"periods":[{"name":"valid_time","start_column":"valid_from","end_column":"valid_to"}],"primary_key":{"columns":["sku"],"without_overlaps_period":"valid_time"},"foreign_keys":[{"name":"price_parent_period_fkey","columns":["parent_sku"],"period":"valid_time","references":{"table":"row","columns":["sku"],"period":"valid_time"},"validation_state":"enforced"}],"relational_indexes":[{"name":"sku","owner_kind":"relational_column","owner_name":"sku","access_method":"scalar_column","columns":["sku"]},{"name":"parent_sku","owner_kind":"relational_column","owner_name":"parent_sku","access_method":"scalar_column","columns":["parent_sku"]}]}
     ;
     var parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);

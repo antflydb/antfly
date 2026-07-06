@@ -30,6 +30,7 @@ pub const relational_json_path_index_namespace: u8 = 0x0c;
 pub const relational_temporal_unique_namespace: u8 = 0x0d;
 pub const relational_ordered_tuple_index_namespace: u8 = 0x0e;
 pub const relational_ordered_tuple_index_by_doc_namespace: u8 = 0x0f;
+pub const relational_ordered_tuple_unique_conflict_namespace: u8 = 0x14;
 pub const replay_all_kind: u8 = 0xfe;
 
 pub const primary_kind: u8 = 0x10;
@@ -89,6 +90,7 @@ pub fn isRelationalPhysicalTableDataKey(key: []const u8) bool {
         isRelationalTemporalUniqueKey(key) or
         isRelationalOrderedTupleIndexKey(key) or
         isRelationalOrderedTupleIndexByDocKey(key) or
+        isRelationalOrderedTupleUniqueConflictKey(key) or
         isRelationalForeignKeyConflictKey(key);
 }
 
@@ -518,6 +520,19 @@ pub fn relationalOrderedTupleIndexByDocKeyAlloc(
     defer list.deinit(alloc);
     try list.append(alloc, relational_ordered_tuple_index_by_doc_namespace);
     try appendEncodedComponent(&list, alloc, doc_key);
+    try appendEncodedComponent(&list, alloc, index_id);
+    try appendEncodedComponent(&list, alloc, encoded_tuple);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn relationalOrderedTupleUniqueConflictKeyAlloc(
+    alloc: Allocator,
+    index_id: []const u8,
+    encoded_tuple: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.append(alloc, relational_ordered_tuple_unique_conflict_namespace);
     try appendEncodedComponent(&list, alloc, index_id);
     try appendEncodedComponent(&list, alloc, encoded_tuple);
     return try list.toOwnedSlice(alloc);
@@ -1041,6 +1056,14 @@ pub fn isRelationalOrderedTupleIndexByDocKey(key: []const u8) bool {
     const doc_term = findComponentTerminator(key, 1) orelse return false;
     const index_start = doc_term + 2;
     const index_term = findComponentTerminator(key, index_start) orelse return false;
+    const tuple_start = index_term + 2;
+    const tuple_term = findComponentTerminator(key, tuple_start) orelse return false;
+    return tuple_term + 2 == key.len;
+}
+
+pub fn isRelationalOrderedTupleUniqueConflictKey(key: []const u8) bool {
+    if (key.len == 0 or key[0] != relational_ordered_tuple_unique_conflict_namespace) return false;
+    const index_term = findComponentTerminator(key, 1) orelse return false;
     const tuple_start = index_term + 2;
     const tuple_term = findComponentTerminator(key, tuple_start) orelse return false;
     return tuple_term + 2 == key.len;
@@ -2028,6 +2051,8 @@ test "relational row key shares document range but is not primary" {
     defer alloc.free(ordered_tuple);
     const ordered_tuple_by_doc = try relationalOrderedTupleIndexByDocKeyAlloc(alloc, raw, "orders_status_created_idx", "active\x001234");
     defer alloc.free(ordered_tuple_by_doc);
+    const ordered_tuple_unique_conflict = try relationalOrderedTupleUniqueConflictKeyAlloc(alloc, "orders_status_created_idx", "active\x001234");
+    defer alloc.free(ordered_tuple_unique_conflict);
     const ordered_tuple_prefix = try relationalOrderedTupleIndexTuplePrefixAlloc(alloc, "orders_status_created_idx", "active\x001234");
     defer alloc.free(ordered_tuple_prefix);
     const ordered_tuple_upper = (try relationalOrderedTupleIndexTuplePrefixUpperAlloc(alloc, "orders_status_created_idx", "active\x001234")).?;
@@ -2066,6 +2091,7 @@ test "relational row key shares document range but is not primary" {
     try std.testing.expect(isRelationalColumnIndexByDocKey(relational_column_index_by_doc));
     try std.testing.expect(isRelationalOrderedTupleIndexKey(ordered_tuple));
     try std.testing.expect(isRelationalOrderedTupleIndexByDocKey(ordered_tuple_by_doc));
+    try std.testing.expect(isRelationalOrderedTupleUniqueConflictKey(ordered_tuple_unique_conflict));
     try std.testing.expect(isRelationalForeignKeyRefKey(fk_ref));
     try std.testing.expect(isRelationalUniqueKey(unique));
     try std.testing.expect(isRelationalTemporalUniqueKey(temporal_unique));
@@ -2080,6 +2106,7 @@ test "relational row key shares document range but is not primary" {
     try std.testing.expect(isInternalPhysicalTableDataKey(relational_column_index_by_doc));
     try std.testing.expect(isInternalPhysicalTableDataKey(ordered_tuple));
     try std.testing.expect(isInternalPhysicalTableDataKey(ordered_tuple_by_doc));
+    try std.testing.expect(isInternalPhysicalTableDataKey(ordered_tuple_unique_conflict));
     try std.testing.expect(isInternalPhysicalTableDataKey(fk_ref));
     try std.testing.expect(isInternalPhysicalTableDataKey(unique));
     try std.testing.expect(isInternalPhysicalTableDataKey(temporal_unique));
@@ -2092,6 +2119,7 @@ test "relational row key shares document range but is not primary" {
     try std.testing.expect(!isInternalMetadataKey(relational_column_index_by_doc));
     try std.testing.expect(!isInternalMetadataKey(ordered_tuple));
     try std.testing.expect(!isInternalMetadataKey(ordered_tuple_by_doc));
+    try std.testing.expect(!isInternalMetadataKey(ordered_tuple_unique_conflict));
     try std.testing.expect(!isInternalMetadataKey(fk_ref));
     try std.testing.expect(!isInternalMetadataKey(unique));
     try std.testing.expect(!isInternalMetadataKey(temporal_unique));
@@ -2105,6 +2133,7 @@ test "relational row key shares document range but is not primary" {
     try std.testing.expect(!isStoredDocumentRowKey(relational_column_index_by_doc));
     try std.testing.expect(!isStoredDocumentRowKey(ordered_tuple));
     try std.testing.expect(!isStoredDocumentRowKey(ordered_tuple_by_doc));
+    try std.testing.expect(!isStoredDocumentRowKey(ordered_tuple_unique_conflict));
     const decoded_relational = (try decodeStoredDocumentRowKeyAlloc(alloc, relational)).?;
     defer alloc.free(decoded_relational);
     try std.testing.expectEqualSlices(u8, raw, decoded_relational);

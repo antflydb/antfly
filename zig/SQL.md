@@ -213,6 +213,9 @@ reason and cannot change durable catalog, document, or row state.
 
 SQL DML lowers into the same typed row APIs as REST and SDK callers:
 
+- Public DML ingress carries retained generated statement metadata into typed
+  lowerers. Token-walking DML parser helpers are internal implementation
+  details, not exported compatibility APIs.
 - Point inserts, updates, deletes, `ON CONFLICT`, defaults, generated columns,
   triggers, row filters, and `RETURNING` use row-batch and shared
   row-expression plans.
@@ -641,16 +644,21 @@ backend SQL strings or user-visible physical data-structure names.
 Ordinary relational `CREATE INDEX` and `CREATE UNIQUE INDEX` lower to the
 `ordered_tuple` access method by default. This is the SQL scalar/compound index
 contract: equality prefixes, range scans, `ORDER BY` satisfaction, uniqueness,
-foreign-key owner lookup, partial predicates, expression keys, collation/null
-ordering, descending key parts, lifecycle generations, and reverse cleanup all
-belong to the ordered tuple capability. The implementation may use sorted KV,
-BT-tree-like storage, or a future trie-backed physical layout, but SQL should
-not expose that choice unless a method proves the same semantics.
+foreign-key owner lookup, partial predicates, collation/null ordering,
+descending key parts, lifecycle generations, and reverse cleanup all belong to
+the ordered tuple capability. Non-unique SQL expression indexes lower through
+stored generated columns whose generated value is the ordered key. Unique SQL
+expression indexes create first-class unique-constraint-owned `ordered_tuple`
+catalog entries with native expression-key metadata for write maintenance and
+rebuild; planner use of expression-key bounds remains gated until predicate
+proof is exact. The implementation may use sorted KV, BT-tree-like
+storage, or a future trie-backed physical layout, but SQL should not expose that
+choice unless a method proves the same semantics.
 
 SQL-visible index lifecycle is still native catalog state, not backend DDL text.
 Only `ready` indexes are eligible for query plans; `building` and `catching_up`
 can be maintained during writes; `stale`, `rebuild_required`, `failed`,
-`dropping`, and legacy `invalid` fail closed until catalog-owned rebuild,
+`dropping`, and `invalid` fail closed until catalog-owned rebuild,
 repair, retry, or cleanup promotes a matching generation.
 Rebuild work records durable owner-range progress with leases, completed-row
 counts, resume row keys, and error state; SQL DDL never owns a separate backend
@@ -658,14 +666,31 @@ cursor or hidden physical index job.
 
 Lowered SQL index definitions should populate the native
 `TableSchema.relational_indexes` catalog shape: stable index name, owner kind,
-owner name, access method, uniqueness, key columns, expression keys, include
-columns, ordered key parts, lifecycle, generation, schema fingerprint, and
-typed predicates. Column-local and unique-constraint-local metadata can remain
-schema-input projections during migration, but planner-visible SQL catalog
-state should use the first-class index catalog as the source of capability
-truth. Runtime consumers that still walk owner columns must synthesize effective
-index metadata from the catalog entry before enforcing lifecycle, predicate,
-key, include, or access-method behavior.
+owner name, access method, uniqueness, key columns, include columns, ordered key
+parts, lifecycle, generation, schema fingerprint, method-specific config, and
+typed predicates. `method_config` carries logical access-method options such as
+full-text analyzer/scoring settings and schema-derived algebraic flags; it must
+not carry physical backend names or SQL text. SQL catalog lowering includes
+`method_config` in the stable secondary-index generation and schema fingerprint,
+so configured access-method changes cannot reuse stale ready index state. The
+durable shape admits expression-key metadata only for matching
+`unique_constraint` owners. Non-unique SQL expression indexes use generated
+column keys until native expression-key secondary planning is proven.
+Column-local and unique-constraint-local metadata can remain schema-input
+projections during migration, but planner-visible SQL catalog state should use
+the first-class index catalog as the source of capability truth.
+Runtime consumers that walk owner columns must carry the matching
+`RelationalIndex` alongside the owner column when enforcing lifecycle,
+predicate, key, include, or access-method behavior; they must not project
+catalog index metadata back into synthetic owner-column fields.
+Document SQL lowerers that need index or uniqueness proofs use
+`TableSchema.relational_indexes` whenever a schema is relational or already
+carries first-class index catalog entries; embedded property-index flags remain
+only a document-mode schema input/API compatibility surface.
+Owner kind is part of the durable contract: `relational_column` owns ordinary
+secondary indexes, `unique_constraint` owns non-temporal unique ordered owners,
+and `table` owns schema-derived table-level access methods using the sentinel
+owner name `__antfly_table__`.
 
 - `USING antfly_full_text` for full-text indexes.
 - `USING hnsw` or `USING antfly_aknn` for external vector or managed embedding
@@ -688,8 +713,10 @@ rechecks still read the committed base row. Queries combine methods by
 intersecting compatible doc sets, for example a `text_search` result with an
 `ordered_tuple` tenant/status filter or an `algebraic_filter` JSON path fact.
 
-`USING antfly_algebraic` lowers to an `algebraic_filter` access method or to
-native algebraic materialization metadata, depending on the requested shape.
+`USING antfly_algebraic () WITH (derive_from_schema = true)` lowers to a
+table-owned `algebraic_filter` access method. Other `USING antfly_algebraic`
+forms lower to native algebraic materialization metadata only after their public
+options and artifact semantics are proven.
 Algebraic dictionaries, FSTs, tries, postings, and path facts are planner
 accelerators for fact/path/filter/aggregate workloads. They should not be used
 as the SQL compound scalar index backend unless the implementation advertises

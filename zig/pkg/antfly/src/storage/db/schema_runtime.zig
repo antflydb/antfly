@@ -862,9 +862,25 @@ pub fn Impl(comptime DB: type) type {
                     self.getRange().start,
                     self.getRange().end,
                 );
+                _ = try relational_store_mod.repairColumnBackedIndexesFromRowsInRangeWithColumnIndexPolicy(
+                    alloc,
+                    self.core.store,
+                    self.getRange().start,
+                    self.getRange().end,
+                    relational_store_mod.ColumnIndexPolicy.fromSchema(next_schema),
+                );
+                try relational_store_mod.rebuildOrderedTupleUniqueConstraintsFromRowsInRange(
+                    alloc,
+                    self.core.store,
+                    next_schema.relational_columns,
+                    next_schema.unique_constraints,
+                    next_schema.relational_indexes,
+                    self.getRange().start,
+                    self.getRange().end,
+                );
             }
             if (foreign_keys_to_build.items.len > 0) {
-                const validate_report = try relational_store_mod.reconcileForeignKeyRefsInRangeWithPrimaryKey(
+                const validate_report = try relational_store_mod.reconcileForeignKeyRefsInRangeWithPrimaryKeyAndIndexes(
                     alloc,
                     self.core.store,
                     next_schema.default_type,
@@ -873,6 +889,7 @@ pub fn Impl(comptime DB: type) type {
                     foreign_keys_to_build.items,
                     next_schema.primary_key,
                     next_schema.unique_constraints,
+                    next_schema.relational_indexes,
                     self.getRange().start,
                     self.getRange().end,
                     .validate,
@@ -880,7 +897,7 @@ pub fn Impl(comptime DB: type) type {
                 try Self.recordForeignKeyIntegrityProgressLocked(self, alloc, .validate, null, self.getRange().start, self.getRange().end, validate_report);
                 if (validate_report.missing_parent_rows != 0) return error.ForeignKeyViolation;
 
-                const repair_report = try relational_store_mod.reconcileForeignKeyRefsInRangeWithPrimaryKey(
+                const repair_report = try relational_store_mod.reconcileForeignKeyRefsInRangeWithPrimaryKeyAndIndexes(
                     alloc,
                     self.core.store,
                     next_schema.default_type,
@@ -889,6 +906,7 @@ pub fn Impl(comptime DB: type) type {
                     foreign_keys_to_build.items,
                     next_schema.primary_key,
                     next_schema.unique_constraints,
+                    next_schema.relational_indexes,
                     self.getRange().start,
                     self.getRange().end,
                     .repair,
@@ -1165,6 +1183,15 @@ pub fn Impl(comptime DB: type) type {
                         new_row,
                         column_index_policy,
                     );
+                    try relational_store_mod.appendColumnBackedIndexWritesForRowWithColumnIndexPolicy(
+                        alloc,
+                        &writes,
+                        &owned_keys,
+                        &owned_values,
+                        row.doc_key,
+                        new_row,
+                        column_index_policy,
+                    );
                     try owned_values.append(alloc, new_row);
                     new_row_owned = false;
                     report.rewritten_rows += 1;
@@ -1297,9 +1324,15 @@ pub fn Impl(comptime DB: type) type {
             return schema.relational_columns;
         }
 
+        pub fn relationalIndexesForStore(self: *DB) []const schema_mod.RelationalIndex {
+            const schema = self.core.schema orelse return &.{};
+            if (schema.storage_mode != .relational) return &.{};
+            return schema.relational_indexes;
+        }
+
         pub fn relationalColumnIndexPolicyForStore(self: *DB) relational_store_mod.ColumnIndexPolicy {
-            const schema = self.core.schema orelse return relational_store_mod.ColumnIndexPolicy.all();
-            if (schema.storage_mode != .relational) return relational_store_mod.ColumnIndexPolicy.all();
+            const schema = self.core.schema orelse return relational_store_mod.ColumnIndexPolicy.empty();
+            if (schema.storage_mode != .relational) return relational_store_mod.ColumnIndexPolicy.empty();
             return relational_store_mod.ColumnIndexPolicy.fromSchema(schema);
         }
 
@@ -1407,9 +1440,7 @@ fn validateRuntimeTableSchemaTransition(current_schema: schema_mod.TableSchema, 
 fn validateRelationalColumnCatalogTransition(current_columns: []const schema_mod.RelationalColumn, next_columns: []const schema_mod.RelationalColumn) !void {
     for (next_columns) |column| {
         if (findRelationalColumnByPath(current_columns, column.path)) |current_column| {
-            if (!schema_mod.relationalColumnCatalogsEqual(&.{current_column.*}, &.{column}) and
-                !relationalColumnDefinitionsEqualIgnoringSecondaryIndexCatalog(current_column.*, column))
-            {
+            if (!schema_mod.relationalColumnCatalogsEqual(&.{current_column.*}, &.{column})) {
                 return error.InvalidSchemaUpdateRequest;
             }
             continue;
@@ -1417,36 +1448,6 @@ fn validateRelationalColumnCatalogTransition(current_columns: []const schema_mod
         if (try relationalColumnHasUniqueDroppedRenameSource(current_columns, next_columns, column)) continue;
         try validateNewRelationalColumnTransition(current_columns, next_columns, column);
     }
-}
-
-fn relationalColumnDefinitionsEqualIgnoringSecondaryIndexCatalog(
-    current: schema_mod.RelationalColumn,
-    next: schema_mod.RelationalColumn,
-) bool {
-    if (!std.mem.eql(u8, current.name, next.name)) return false;
-    if (!std.mem.eql(u8, current.path, next.path)) return false;
-
-    var normalized_current = current;
-    var normalized_next = next;
-    normalized_current.indexed = false;
-    normalized_next.indexed = false;
-    normalized_current.index_lifecycle = .ready;
-    normalized_next.index_lifecycle = .ready;
-    normalized_current.index_generation = 0;
-    normalized_next.index_generation = 0;
-    normalized_current.index_name = null;
-    normalized_next.index_name = null;
-    normalized_current.index_include_columns = &.{};
-    normalized_next.index_include_columns = &.{};
-    normalized_current.index_keys = &.{};
-    normalized_next.index_keys = &.{};
-    normalized_current.index_where = &.{};
-    normalized_next.index_where = &.{};
-    normalized_current.index_where_expressions = &.{};
-    normalized_next.index_where_expressions = &.{};
-    normalized_current.cardinality_proof = .none;
-    normalized_next.cardinality_proof = .none;
-    return schema_mod.relationalColumnDefinitionsEqual(normalized_current, normalized_next);
 }
 
 fn findRelationalColumnByPath(columns: []const schema_mod.RelationalColumn, path: []const u8) ?*const schema_mod.RelationalColumn {
@@ -1702,11 +1703,6 @@ fn uniqueConstraintsSameDefinition(a: schema_mod.UniqueConstraint, b: schema_mod
         stringSlicesEqual(a.columns, b.columns) and
         uniqueExpressionSlicesEqual(a.expressions, b.expressions) and
         stringSlicesEqual(a.include_columns, b.include_columns) and
-        schema_mod.relationalIndexKeySlicesEqual(a.index_keys, b.index_keys) and
-        a.index_lifecycle == b.index_lifecycle and
-        a.index_generation == b.index_generation and
-        a.index_access_method == b.index_access_method and
-        optionalStringsEqual(a.index_schema_fingerprint, b.index_schema_fingerprint) and
         optionalStringsEqual(a.without_overlaps_period, b.without_overlaps_period) and
         a.nulls_not_distinct == b.nulls_not_distinct and
         a.deferrable == b.deferrable and
@@ -2183,7 +2179,7 @@ test "db direct schema apply appends literal default and generated columns throu
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["title"],"additionalProperties":false}}}}
     ;
     const schema_v2 =
-        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"amount":{"type":"numeric"},"status":{"type":"keyword","default":"ACTIVE"},"note":{"type":"keyword"},"title_lc":{"type":"keyword","generated":{"op":"lower","field":"title"}},"status_lc":{"type":"keyword","generated":{"op":"lower","field":"status"}},"status_expr_lc":{"type":"keyword","generated":{"op":"expression","expression":{"op":"lower","args":[{"field":"status"}]}}}},"required":["title"],"additionalProperties":false}}}}
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"amount":{"type":"numeric"},"status":{"type":"keyword","default":"ACTIVE"},"note":{"type":"keyword"},"title_lc":{"type":"keyword","generated":{"op":"expression","expression":{"op":"lower","args":[{"field":"title"}]}}},"status_lc":{"type":"keyword","generated":{"op":"expression","expression":{"op":"lower","args":[{"field":"status"}]}}},"status_expr_lc":{"type":"keyword","generated":{"op":"expression","expression":{"op":"lower","args":[{"field":"status"}]}}}},"required":["title"],"additionalProperties":false}}},"relational_indexes":[{"name":"status","owner_kind":"relational_column","owner_name":"status","access_method":"scalar_column","columns":["status"]},{"name":"title_lc","owner_kind":"relational_column","owner_name":"title_lc","access_method":"scalar_column","columns":["title_lc"]},{"name":"status_expr_lc","owner_kind":"relational_column","owner_name":"status_expr_lc","access_method":"scalar_column","columns":["status_expr_lc"]}]}
     ;
 
     try db.applyTableSchemaJson(alloc, schema_v1, .{});
@@ -2241,10 +2237,10 @@ test "db direct schema apply rejects generated columns without deterministic bac
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"}},"required":["title"],"additionalProperties":false}}}}
     ;
     const missing_source_schema =
-        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"note":{"type":"keyword"},"note_lc":{"type":"keyword","generated":{"op":"lower","field":"note"}}},"required":["title"],"additionalProperties":false}}}}
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"note":{"type":"keyword"},"note_lc":{"type":"keyword","generated":{"op":"expression","expression":{"op":"lower","args":[{"field":"note"}]}}}},"required":["title"],"additionalProperties":false}}}}
     ;
     const generated_source_schema =
-        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"title_lc":{"type":"keyword","generated":{"op":"lower","field":"title"}},"title_lc_md5":{"type":"keyword","generated":{"op":"md5","field":"title_lc"}}},"required":["title"],"additionalProperties":false}}}}
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"title_lc":{"type":"keyword","generated":{"op":"expression","expression":{"op":"lower","args":[{"field":"title"}]}}},"title_lc_md5":{"type":"keyword","generated":{"op":"expression","expression":{"op":"md5","args":[{"field":"title_lc"}]}}}},"required":["title"],"additionalProperties":false}}}}
     ;
 
     try db.applyTableSchemaJson(alloc, schema_v1, .{});
@@ -2265,7 +2261,7 @@ test "db repairs relational column backed indexes from authoritative packed rows
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-name":"orders_status_amount_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-lifecycle":"ready","x-antfly-index-generation":7,"x-antfly-index-schema-fingerprint":"secondary-index-v1:status_amount","x-antfly-index-keys":[{"column":"status"},{"column":"amount"}]},"amount":{"type":"numeric","x-antfly-index-lifecycle":"ready","x-antfly-index-generation":3}},"required":["id","status","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id","status","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"orders_status_amount_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"amount"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:status_amount"},{"name":"amount","owner_kind":"relational_column","owner_name":"amount","access_method":"scalar_column","columns":["amount"]}]}
     ;
     try db.applyTableSchemaJson(alloc, schema_json, .{});
     try db.batch(.{ .writes = &.{
@@ -2277,16 +2273,16 @@ test "db repairs relational column backed indexes from authoritative packed rows
     defer parsed_schema.deinit(alloc);
     const runtime_schema = try schema_api_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
     defer schema_mod.freeSchema(alloc, runtime_schema);
-    const ordered_column = blk: {
-        for (runtime_schema.relational_columns) |column| {
-            if (std.mem.eql(u8, column.name, "status")) break :blk column;
+    const ordered_index = blk: {
+        for (runtime_schema.relational_indexes) |index| {
+            if (std.mem.eql(u8, index.name, "orders_status_amount_idx")) break :blk index;
         }
         return error.TestUnexpectedResult;
     };
 
     const row_b = try relational_store_mod.getRawAlloc(alloc, db.core.store, "doc:b") orelse return error.TestUnexpectedResult;
     defer alloc.free(row_b);
-    const tuple_b = try relational_store_mod.orderedTupleValueForIndexKeysAlloc(alloc, row_b, ordered_column.index_keys, runtime_schema.relational_columns);
+    const tuple_b = try relational_store_mod.orderedTupleValueForIndexKeysAlloc(alloc, row_b, ordered_index.keys, runtime_schema.relational_columns);
     defer alloc.free(tuple_b);
 
     const doc_b_forward = try internal_keys.relationalOrderedTupleIndexKeyAlloc(alloc, "orders_status_amount_idx", tuple_b, "doc:b");
@@ -2373,7 +2369,7 @@ test "db executes claimed schema rewrite job expressions over relational rows" {
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"status":{"type":"keyword"}},"required":["title","status"],"additionalProperties":false}}}}
     ;
     const schema_v2 =
-        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"status":{"type":"keyword"},"status_key":{"type":"keyword"}},"required":["title","status"],"additionalProperties":false}}}}
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"status":{"type":"keyword"},"status_key":{"type":"keyword"}},"required":["title","status"],"additionalProperties":false}}},"relational_indexes":[{"name":"status_key","owner_kind":"relational_column","owner_name":"status_key","access_method":"scalar_column","columns":["status_key"]}]}
     ;
 
     try db.applyTableSchemaJson(alloc, schema_v1, .{});
@@ -2498,10 +2494,10 @@ test "db executes claimed full schema rewrite jobs over relational rows" {
     defer db.close();
 
     const schema_v1 =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"status":{"type":"keyword"}},"required":["title","status"],"additionalProperties":false}}}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"status":{"type":"keyword"}},"required":["title","status"],"additionalProperties":false}}},"relational_indexes":[{"name":"status","owner_kind":"relational_column","owner_name":"status","access_method":"scalar_column","columns":["status"]}]}
     ;
     const schema_v2 =
-        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"status":{"type":"keyword"}},"required":["title","status"],"additionalProperties":false}}}}
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"status":{"type":"keyword"}},"required":["title","status"],"additionalProperties":false}}},"relational_indexes":[{"name":"title","owner_kind":"relational_column","owner_name":"title","access_method":"scalar_column","columns":["title"]},{"name":"status","owner_kind":"relational_column","owner_name":"status","access_method":"scalar_column","columns":["status"]}]}
     ;
 
     try db.applyTableSchemaJson(alloc, schema_v1, .{});
@@ -2567,7 +2563,7 @@ test "db executes claimed schema rewrite row plans over relational rows" {
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"status":{"type":"keyword"},"legacy_status":{"type":"keyword"}},"required":["title","status"],"additionalProperties":false}}}}
     ;
     const schema_v2 =
-        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"state":{"type":"keyword"}},"required":["title","state"],"additionalProperties":false}}}}
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"state":{"type":"keyword"}},"required":["title","state"],"additionalProperties":false}}},"relational_indexes":[{"name":"state","owner_kind":"relational_column","owner_name":"state","access_method":"scalar_column","columns":["state"]}]}
     ;
 
     try db.applyTableSchemaJson(alloc, schema_v1, .{});

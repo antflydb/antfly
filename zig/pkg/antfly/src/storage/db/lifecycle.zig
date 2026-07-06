@@ -1108,6 +1108,7 @@ pub fn Impl(comptime DB: type) type {
                 .alloc = self.runtime_alloc,
                 .relational_base_rows = self.relationalColumnsForStore() != null,
                 .relational_columns = self.relationalColumnsForStore() orelse &.{},
+                .relational_indexes = self.relationalIndexesForStore(),
             };
             var effective_cfg = cfg;
             effective_cfg.resolution_extra_hooks = db_core.transactionRecoveryIdentityHooks(identity_ctx);
@@ -1973,6 +1974,7 @@ pub fn Impl(comptime DB: type) type {
                 ctx.identity_namespace = namespace;
                 ctx.relational_base_rows = self.relationalColumnsForStore() != null;
                 ctx.relational_columns = self.relationalColumnsForStore() orelse &.{};
+                ctx.relational_indexes = self.relationalIndexesForStore();
             }
         }
 

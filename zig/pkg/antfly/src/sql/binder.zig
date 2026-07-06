@@ -458,8 +458,15 @@ pub fn tableSchemaCatalogExists(current: runtime_schema.TableSchema) bool {
 }
 
 pub fn relationalIndexNameExists(schema: runtime_schema.TableSchema, index_name: []const u8) bool {
-    return uniqueConstraintNameExists(schema.unique_constraints, index_name) or
-        relationalColumnIndexForIndexName(schema.relational_columns, index_name) != null;
+    return relationalIndexCatalogNameExists(schema.relational_indexes, index_name) or
+        uniqueConstraintNameExists(schema.unique_constraints, index_name);
+}
+
+pub fn relationalIndexCatalogNameExists(indexes: []const runtime_schema.RelationalIndex, index_name: []const u8) bool {
+    for (indexes) |index| {
+        if (std.mem.eql(u8, index.name, index_name)) return true;
+    }
+    return false;
 }
 
 pub fn relationalConstraintNameExists(schema: runtime_schema.TableSchema, table_name: []const u8, name: []const u8) bool {
@@ -553,20 +560,8 @@ pub fn relationalColumnIndex(columns: []const runtime_schema.RelationalColumn, n
     return null;
 }
 
-pub fn relationalColumnIndexForIndexName(columns: []const runtime_schema.RelationalColumn, index_name: []const u8) ?usize {
-    for (columns, 0..) |column, i| {
-        if (relationalColumnHasIndexName(column, index_name)) return i;
-    }
-    return null;
-}
-
 pub fn relationalColumnHasDeclaredIndexName(column: runtime_schema.RelationalColumn, index_name: []const u8) bool {
     const declared_index_name = column.index_name orelse return false;
-    return std.mem.eql(u8, declared_index_name, index_name);
-}
-
-pub fn relationalColumnHasIndexName(column: runtime_schema.RelationalColumn, index_name: []const u8) bool {
-    const declared_index_name = column.index_name orelse column.name;
     return std.mem.eql(u8, declared_index_name, index_name);
 }
 
@@ -951,15 +946,12 @@ fn boundCatalogObjectForCatalogTableAlloc(
     const resolved = try resolvedExistingCatalogTableForObjectNameAlloc(alloc, &snapshot, table_name, session) orelse return error.TableNotFound;
     errdefer deinitCatalogTableRef(alloc, resolved.target);
     if (resolved.table.schema_json.len == 0) return error.InvalidSqlCatalog;
-    var parsed = try schema_api.parseValidatedTableSchema(alloc, resolved.table.schema_json);
-    defer parsed.deinit(alloc);
-    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
-    defer runtime_schema.freeSchema(alloc, schema);
+    const schema_info = try catalogSchemaInfoFromJsonAlloc(alloc, resolved.table.schema_json);
     return .{
         .role = role,
         .target = resolved.target,
-        .family = source_binding.familyForRuntimeSchema(schema),
-        .schema_version = schema.version,
+        .family = schema_info.family,
+        .schema_version = schema_info.version,
         .table_id = resolved.table.table_id,
         .schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(resolved.table.schema_json),
     };
@@ -977,10 +969,7 @@ fn boundCatalogObjectForTableRecordAlloc(
     errdefer alloc.free(namespace_name);
     const table_name = try alloc.dupe(u8, table.name);
     errdefer alloc.free(table_name);
-    var parsed = try schema_api.parseValidatedTableSchema(alloc, table.schema_json);
-    defer parsed.deinit(alloc);
-    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
-    defer runtime_schema.freeSchema(alloc, schema);
+    const schema_info = try catalogSchemaInfoFromJsonAlloc(alloc, table.schema_json);
     return .{
         .role = role,
         .target = .{
@@ -988,10 +977,44 @@ fn boundCatalogObjectForTableRecordAlloc(
             .namespace_name = namespace_name,
             .table_name = table_name,
         },
-        .family = source_binding.familyForRuntimeSchema(schema),
-        .schema_version = schema.version,
+        .family = schema_info.family,
+        .schema_version = schema_info.version,
         .table_id = table.table_id,
         .schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(table.schema_json),
+    };
+}
+
+const CatalogSchemaInfo = struct {
+    family: source_binding.SqlSourceFamily,
+    version: u32,
+};
+
+fn catalogSchemaInfoFromJsonAlloc(alloc: std.mem.Allocator, schema_json: []const u8) !CatalogSchemaInfo {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{});
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidSqlCatalog,
+    };
+    const version_value = switch (object.get("version") orelse return error.InvalidSqlCatalog) {
+        .integer => |value| value,
+        else => return error.InvalidSqlCatalog,
+    };
+    if (version_value < 0 or version_value > std.math.maxInt(u32)) return error.InvalidSqlCatalog;
+    const family: source_binding.SqlSourceFamily = if (object.get("external_base_source") != null)
+        .lake
+    else blk: {
+        const mode = switch (object.get("storage_mode") orelse return error.InvalidSqlCatalog) {
+            .string => |value| value,
+            else => return error.InvalidSqlCatalog,
+        };
+        if (std.mem.eql(u8, mode, "relational")) break :blk .relational;
+        if (std.mem.eql(u8, mode, "document")) break :blk .document;
+        return error.InvalidSqlCatalog;
+    };
+    return .{
+        .family = family,
+        .version = @intCast(version_value),
     };
 }
 
@@ -1050,11 +1073,46 @@ fn catalogTableSchemaHasIndexNameAlloc(
     index_name: []const u8,
 ) !bool {
     if (schema_json.len == 0) return false;
+    var raw = try std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{});
+    defer raw.deinit();
+    if (raw.value == .object) {
+        if (raw.value.object.get("storage_mode")) |mode| {
+            if (mode == .string and std.mem.eql(u8, mode.string, "relational")) {
+                if (schemaJsonNamedArrayContainsName(raw.value.object.get("relational_indexes"), index_name)) return true;
+                if (schemaJsonNamedArrayContainsName(raw.value.object.get("unique_constraints"), index_name)) return true;
+                if (schemaJsonNamedObjectNameEquals(raw.value.object.get("primary_key"), index_name)) return true;
+                return false;
+            }
+        }
+    }
     var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed.deinit(alloc);
     const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
     defer runtime_schema.freeSchema(alloc, schema);
     return relationalIndexNameExists(schema, index_name);
+}
+
+fn schemaJsonNamedArrayContainsName(value: ?std.json.Value, name: []const u8) bool {
+    const array = switch (value orelse return false) {
+        .array => |array| array,
+        else => return false,
+    };
+    for (array.items) |item| {
+        if (schemaJsonNamedObjectNameEquals(item, name)) return true;
+    }
+    return false;
+}
+
+fn schemaJsonNamedObjectNameEquals(value: ?std.json.Value, name: []const u8) bool {
+    const object = switch (value orelse return false) {
+        .object => |object| object,
+        else => return false,
+    };
+    const object_name = switch (object.get("name") orelse return false) {
+        .string => |string| string,
+        else => return false,
+    };
+    return std.mem.eql(u8, object_name, name);
 }
 
 fn catalogIndexesJsonHasIndexNameAlloc(
@@ -4972,7 +5030,7 @@ test "sql adapter binder resolves self merge table qualifier as target before so
 test "sql adapter binder validates relational catalog lookups" {
     const columns = [_]runtime_schema.RelationalColumn{
         .{ .name = "id", .path = "id", .field_type = .keyword },
-        .{ .name = "email", .path = "email", .field_type = .keyword, .index_name = "users_email_idx" },
+        .{ .name = "email", .path = "email", .field_type = .keyword },
         .{ .name = "status", .path = "status", .field_type = .keyword },
         .{ .name = "profile", .path = "profile", .field_type = .json },
     };
@@ -4987,11 +5045,23 @@ test "sql adapter binder validates relational catalog lookups" {
     };
     const foreign_keys = [_]runtime_schema.ForeignKey{.{ .name = "users_org_fkey", .parent_table = "orgs" }};
     const checks = [_]runtime_schema.RelationalCheck{.{ .name = "users_status_check", .field = "status" }};
+    const relational_indexes = [_]runtime_schema.RelationalIndex{.{
+        .name = "users_email_idx",
+        .owner_kind = .relational_column,
+        .owner_name = "email",
+        .access_method = .ordered_tuple,
+        .columns = &.{"email"},
+        .keys = &.{.{ .column = "email" }},
+        .lifecycle = .ready,
+        .generation = 7,
+        .schema_fingerprint = "secondary-index-v1:users_email_idx",
+    }};
     const schema = runtime_schema.TableSchema{
         .storage_mode = .relational,
         .relational_columns = &columns,
         .primary_key = primary_key,
         .unique_constraints = &uniques,
+        .relational_indexes = &relational_indexes,
         .foreign_keys = &foreign_keys,
         .checks = &checks,
     };
@@ -5001,7 +5071,7 @@ test "sql adapter binder validates relational catalog lookups" {
     try std.testing.expect(relationalColumnForReturningField(schema, "email") != null);
     try std.testing.expect(relationalColumnForReturningField(schema, "profile.city") != null);
     try std.testing.expect(relationalColumnForReturningField(schema, "email.domain") == null);
-    try std.testing.expectEqual(@as(?usize, 1), relationalColumnIndexForIndexName(&columns, "users_email_idx"));
+    try std.testing.expect(relationalIndexCatalogNameExists(schema.relational_indexes, "users_email_idx"));
     try std.testing.expect(relationalIndexNameExists(schema, "users_email_key"));
     try std.testing.expect(relationalIndexNameExists(schema, "users_email_idx"));
     try std.testing.expect(relationalConstraintNameExists(schema, "users", "users_pkey"));

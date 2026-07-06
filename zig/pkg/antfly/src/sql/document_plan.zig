@@ -14,10 +14,12 @@
 
 const std = @import("std");
 
+const db_mod = @import("../storage/db/mod.zig");
 const json_helpers = @import("../common/json_helpers.zig");
 const regex_mod = @import("../search/regex.zig");
 const document_sql_corpus = @import("document_sql_corpus.zig");
 const lowering_context = @import("lowering_context.zig");
+const query_contract = @import("../query/contract.zig");
 const query_function = @import("query_function.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const schema_api = @import("../schema/mod.zig");
@@ -28,7 +30,6 @@ const tokenized = @import("tokenized.zig");
 const generated_parser = @import("generated_parser.zig");
 
 const Token = token_mod.Token;
-const TokenKeyword = token_mod.TokenKeyword;
 
 const ParsedDocumentWhere = struct {
     id_lookup_seen: bool = false,
@@ -65,6 +66,23 @@ fn validatedDocumentReadStatementKind(parsed_sql: *const tokenized.ParsedSql) !s
     return parsed_sql.readStatementKind() orelse error.UnsupportedSqlShape;
 }
 
+fn generatedDocumentReadAst(parsed_sql: *const tokenized.ParsedSql) !?*const generated_parser.GeneratedSqlReadAst {
+    if (parsed_sql.generatedStatementKind() != .read) return null;
+    _ = parsed_sql.readStatementKindIncludingGeneratedAst() orelse return error.UnsupportedSqlShape;
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            return switch (generated_ast.*) {
+                .read => |read| blk: {
+                    try lowering_context.validateGeneratedReadAstForStatement(parsed_sql.items(), read);
+                    break :blk read;
+                },
+                else => error.UnsupportedSqlShape,
+            };
+        }
+    }
+    return error.UnsupportedSqlShape;
+}
+
 const DocumentProducerCapabilities = struct {
     indexed_scalar_filters: bool = true,
     indexed_scalar_filter_paths: []const []const u8 = &.{},
@@ -74,6 +92,7 @@ const DocumentProducerCapabilities = struct {
     full_text_indexes: []const source_binding.DocumentSqlFullTextIndex = &.{},
     semantic_filters: bool = false,
     semantic_index_names: []const []const u8 = &.{},
+    semantic_resolver: ?query_contract.SemanticResolver = null,
     vector_filters: bool = false,
     vector_index_names: []const []const u8 = &.{},
     hybrid_filters: bool = false,
@@ -614,6 +633,7 @@ pub fn lowerDocumentMutationProducerFromWhereAlloc(
     table_name: []const u8,
     alias: []const u8,
     bounded_scan_policy: ?source_binding.BoundedScanPolicy,
+    generated_where_expression: *const generated_parser.GeneratedSqlExpressionAst,
 ) !DocumentProducer {
     if (schema.storage_mode != .document) return error.InvalidSqlCatalog;
     if (where_index >= end_index or end_index > tokens.len) return error.UnsupportedSqlShape;
@@ -633,6 +653,7 @@ pub fn lowerDocumentMutationProducerFromWhereAlloc(
         source_ref,
         producer_capabilities,
         null,
+        generated_where_expression,
     ) catch |err| switch (err) {
         error.DocumentSqlIndexUnavailable => if (bounded_scan_policy) |policy|
             try parseWhereBoundedScanProducerAlloc(
@@ -815,6 +836,7 @@ pub fn lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(
             .full_text_indexes = capabilities.full_text_indexes,
             .semantic_filters = capabilities.semantic_filters,
             .semantic_index_names = capabilities.semantic_index_names,
+            .semantic_resolver = capabilities.semantic_resolver,
             .vector_filters = capabilities.vector_filters,
             .vector_index_names = capabilities.vector_index_names,
             .hybrid_filters = capabilities.hybrid_filters,
@@ -849,6 +871,7 @@ pub fn lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(
             .full_text_indexes = capabilities.full_text_indexes,
             .semantic_filters = capabilities.semantic_filters,
             .semantic_index_names = capabilities.semantic_index_names,
+            .semantic_resolver = capabilities.semantic_resolver,
             .vector_filters = capabilities.vector_filters,
             .vector_index_names = capabilities.vector_index_names,
             .hybrid_filters = capabilities.hybrid_filters,
@@ -882,6 +905,7 @@ fn documentProducerCapabilitiesForRuntimeSchema(
         .full_text_indexes = capabilities.full_text_indexes,
         .semantic_filters = capabilities.semantic_filters,
         .semantic_index_names = capabilities.semantic_index_names,
+        .semantic_resolver = capabilities.semantic_resolver,
         .vector_filters = capabilities.vector_filters,
         .vector_index_names = capabilities.vector_index_names,
         .hybrid_filters = capabilities.hybrid_filters,
@@ -935,6 +959,7 @@ fn lowerDocumentReadPlanInternalParsedSqlAlloc(
 ) !DocumentReadPlan {
     if (schema.storage_mode != .document) return error.InvalidSqlCatalog;
     const tokens = parsed_sql.items();
+    const generated_read_ast = try generatedDocumentReadAst(parsed_sql);
     if (tokens.len == 0 or !tokens[0].matchesKeywordTag(.select)) return error.UnsupportedSqlShape;
 
     const statement_end = documentSqlStatementEnd(tokens);
@@ -982,8 +1007,9 @@ fn lowerDocumentReadPlanInternalParsedSqlAlloc(
     };
     var producer = if (where_index) |idx| blk: {
         const end_index = order_index orelse limit_index orelse statement_end;
-        break :blk parseWhereProducerAlloc(alloc, tokens, idx, end_index, schema, virtual_schema, source_ref, producer_capabilities, if (from_binding.unnest) |*unnest| unnest else null) catch |err| switch (err) {
-            error.DocumentSqlIndexUnavailable => if (whereRangeHasExactProducerPredicate(tokens, idx, end_index))
+        const generated_where_expression = if (generated_read_ast) |read_ast| if (read_ast.where_tokens != null) &read_ast.where_expression else return error.UnsupportedSqlShape else return error.UnsupportedSqlShape;
+        break :blk parseWhereProducerAlloc(alloc, tokens, idx, end_index, schema, virtual_schema, source_ref, producer_capabilities, if (from_binding.unnest) |*unnest| unnest else null, generated_where_expression) catch |err| switch (err) {
+            error.DocumentSqlIndexUnavailable => if (generatedWhereHasExactProducerPredicate(tokens, generated_where_expression))
                 return error.DocumentSqlBoundedScanMissingExactProducer
             else
                 try parseWhereBoundedScanProducerAlloc(
@@ -1129,6 +1155,7 @@ fn lowerDocumentAlgebraicAggregatePlanWithBoundedScanPolicyInternalParsedSqlAllo
     if ((try validatedDocumentReadStatementKind(parsed_sql)) != .aggregate) return error.UnsupportedSqlShape;
 
     const tokens = parsed_sql.items();
+    const generated_read_ast = try generatedDocumentReadAst(parsed_sql);
     if (tokens.len == 0 or !tokens[0].matchesKeywordTag(.select)) return error.UnsupportedSqlShape;
 
     const statement_end = documentSqlStatementEnd(tokens);
@@ -1173,8 +1200,9 @@ fn lowerDocumentAlgebraicAggregatePlanWithBoundedScanPolicyInternalParsedSqlAllo
     errdefer if (!candidate_producer_transferred) if (candidate_producer) |*producer| producer.deinit(alloc);
     const filter_query_json: ?[]const u8 = if (where_index) |idx| blk: {
         const end_index = group_index orelse having_index orelse order_index orelse limit_index orelse statement_end;
-        var producer = parseWhereProducerAlloc(alloc, tokens, idx, end_index, schema, virtual_schema, source_ref, producer_capabilities, null) catch |err| switch (err) {
-            error.DocumentSqlIndexUnavailable => if (whereRangeHasExactProducerPredicate(tokens, idx, end_index))
+        const generated_where_expression = if (generated_read_ast) |read_ast| if (read_ast.where_tokens != null) &read_ast.where_expression else return error.UnsupportedSqlShape else return error.UnsupportedSqlShape;
+        var producer = parseWhereProducerAlloc(alloc, tokens, idx, end_index, schema, virtual_schema, source_ref, producer_capabilities, null, generated_where_expression) catch |err| switch (err) {
+            error.DocumentSqlIndexUnavailable => if (generatedWhereHasExactProducerPredicate(tokens, generated_where_expression))
                 return error.DocumentSqlBoundedScanMissingExactProducer
             else
                 try parseWhereBoundedScanProducerAlloc(
@@ -3377,6 +3405,44 @@ fn appendDocumentJsonPathSegmentAlloc(alloc: std.mem.Allocator, path: *[]u8, seg
     path.* = next;
 }
 
+fn parseGeneratedDocumentFullTextQueryAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    clause_range: generated_parser.GeneratedSqlTokenRange,
+    generated_clause_expression: ?*const generated_parser.GeneratedSqlExpressionAst,
+) !?[]const u8 {
+    const expression = generated_clause_expression orelse return null;
+    if (expression.kind != .function_call) return null;
+    if (!generatedExpressionTokensMatch(expression, clause_range)) return error.UnsupportedSqlShape;
+
+    const expression_tokens = expression.tokens orelse return error.UnsupportedSqlShape;
+    if (expression_tokens.start >= expression_tokens.end or expression_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+    const function_name_tokens = expression.function_name_tokens orelse return error.UnsupportedSqlShape;
+    if (function_name_tokens.start != expression_tokens.start or function_name_tokens.start + 1 != function_name_tokens.end or function_name_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+    if (!tokens[function_name_tokens.start].matchesKeywordTag(.full_text_search)) return null;
+
+    const argument_tokens = expression.argument_tokens orelse return error.UnsupportedSqlShape;
+    if (argument_tokens.start <= function_name_tokens.end or argument_tokens.end + 1 != expression_tokens.end or argument_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+    if (tokens[function_name_tokens.end].kind != .lparen or tokens[argument_tokens.end].kind != .rparen) return error.UnsupportedSqlShape;
+
+    const items = expression.argument_items;
+    if (items.count != 1 or
+        items.items.len != 1 or
+        items.expression_items.len != 1 or
+        items.expressions.len != 1)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    const item = items.items[0];
+    const expression_item = items.expression_items[0];
+    const argument_expression = &items.expressions[0];
+    const argument_expression_tokens = argument_expression.tokens orelse return error.UnsupportedSqlShape;
+    if (!std.meta.eql(item, expression_item) or !std.meta.eql(item, argument_expression_tokens)) return error.UnsupportedSqlShape;
+    if (item.start < argument_tokens.start or item.end > argument_tokens.end or item.start + 1 != item.end or item.end > tokens.len) return error.UnsupportedSqlShape;
+    if (argument_expression.kind != .token_range or tokens[item.start].kind != .string) return error.UnsupportedSqlShape;
+    return try alloc.dupe(u8, tokens[item.start].text);
+}
+
 fn parseWhereProducerAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -3387,9 +3453,12 @@ fn parseWhereProducerAlloc(
     source_ref: DocumentSourceRef,
     producer_capabilities: DocumentProducerCapabilities,
     unnest: ?*DocumentUnnest,
+    generated_where_expression: *const generated_parser.GeneratedSqlExpressionAst,
 ) !DocumentProducer {
     const where_tokens = tokens[where_index + 1 .. end_index];
     if (where_tokens.len == 0) return error.UnsupportedSqlShape;
+    const expression_tokens = generated_where_expression.tokens orelse return error.UnsupportedSqlShape;
+    if (expression_tokens.start != where_index + 1 or expression_tokens.end != end_index) return error.UnsupportedSqlShape;
 
     var parsed = ParsedDocumentWhere{};
     errdefer parsed.deinit(alloc);
@@ -3403,13 +3472,18 @@ fn parseWhereProducerAlloc(
         const end = findTopLevelAnd(where_tokens, start) orelse where_tokens.len;
         if (end == start) return error.UnsupportedSqlShape;
         const clause = where_tokens[start..end];
-        if (try parseFullTextQueryAlloc(alloc, clause)) |query| {
+        const clause_range = generated_parser.GeneratedSqlTokenRange{
+            .start = where_index + 1 + start,
+            .end = where_index + 1 + end,
+        };
+        const generated_clause_expression = generatedDocumentWhereClauseExpression(generated_where_expression, clause_range);
+        if (try parseGeneratedDocumentFullTextQueryAlloc(alloc, tokens, clause_range, generated_clause_expression)) |query| {
             if (parsed.full_text_query != null) {
                 alloc.free(query);
                 return error.UnsupportedSqlShape;
             }
             parsed.full_text_query = query;
-        } else if (try parseNativeAntflySearchIndexQueryAlloc(alloc, clause, source_ref, producer_capabilities)) |query| {
+        } else if (try parseNativeAntflySearchIndexQueryAlloc(alloc, tokens, clause_range, generated_clause_expression, source_ref, producer_capabilities)) |query| {
             if (native_query != null) {
                 var mutable = query;
                 mutable.deinit(alloc);
@@ -3525,14 +3599,66 @@ fn parseWhereProducerAlloc(
     return error.UnsupportedSqlShape;
 }
 
+fn generatedDocumentWhereClauseExpression(
+    generated_where_expression: ?*const generated_parser.GeneratedSqlExpressionAst,
+    clause_range: generated_parser.GeneratedSqlTokenRange,
+) ?*const generated_parser.GeneratedSqlExpressionAst {
+    const expression = generated_where_expression orelse return null;
+    if (generatedExpressionTokensMatch(expression, clause_range)) return expression;
+    if (expression.kind != .logical_and) return null;
+    const items = expression.boolean_condition_items;
+    if (items.expressions.len != items.count) return null;
+    for (items.expressions) |*child| {
+        if (generatedExpressionTokensMatch(child, clause_range)) return child;
+    }
+    return null;
+}
+
+fn generatedExpressionTokensMatch(
+    expression: *const generated_parser.GeneratedSqlExpressionAst,
+    range: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    const tokens = expression.tokens orelse return false;
+    return tokens.start == range.start and tokens.end == range.end;
+}
+
+fn resolveDocumentSqlValidationDenseQuery(
+    ptr: *anyopaque,
+    allocator: std.mem.Allocator,
+    table_name: []const u8,
+    index_name: []const u8,
+    semantic_search: []const u8,
+    embedding_template: ?[]const u8,
+    limit: u32,
+) anyerror!db_mod.types.DenseKnnQuery {
+    _ = ptr;
+    _ = table_name;
+    _ = index_name;
+    _ = semantic_search;
+    _ = embedding_template;
+    return .{
+        .vector = try allocator.dupe(f32, &[_]f32{ 0.0, 0.0, 0.0 }),
+        .k = limit,
+    };
+}
+
 fn parseNativeAntflySearchIndexQueryAlloc(
     alloc: std.mem.Allocator,
-    clause: []const Token,
+    tokens: []const Token,
+    clause_range: generated_parser.GeneratedSqlTokenRange,
+    generated_clause_expression: ?*const generated_parser.GeneratedSqlExpressionAst,
     source_ref: DocumentSourceRef,
     producer_capabilities: DocumentProducerCapabilities,
 ) !?DocumentIndexQuery {
-    if (!clauseHasNativeAntflySearchFunction(clause)) return null;
-    var lowered = try query_function.lowerAntflyQueryFunctionExpressionRawBodyTokensAlloc(alloc, clause);
+    const expression = generated_clause_expression orelse return null;
+    if (!generatedExpressionIsAntflyQueryFunction(tokens, expression)) return null;
+    if (!generatedExpressionTokensMatch(expression, clause_range)) return error.UnsupportedSqlShape;
+    var resolver_state: u8 = 0;
+    const validation_resolver = producer_capabilities.semantic_resolver orelse query_contract.SemanticResolver{
+        .ptr = &resolver_state,
+        .vtable = &.{ .resolve_dense_query = resolveDocumentSqlValidationDenseQuery },
+    };
+    var lowered = try query_function.lowerAntflyQueryFunctionExpressionBodyGeneratedAstAlloc(alloc, validation_resolver, tokens, expression.*);
     defer lowered.deinit(alloc);
     if (!source_ref.matchesQualifier(lowered.table_name)) return error.UnsupportedSqlShape;
     switch (lowered.function) {
@@ -3565,6 +3691,60 @@ fn parseNativeAntflySearchIndexQueryAlloc(
     return .{
         .native_query_json = try alloc.dupe(u8, lowered.body_json),
     };
+}
+
+fn generatedExpressionIsAntflyQueryFunction(
+    tokens: []const Token,
+    expression: *const generated_parser.GeneratedSqlExpressionAst,
+) bool {
+    if (expression.kind != .function_call) return false;
+    const function_name_tokens = expression.function_name_tokens orelse return false;
+    if (function_name_tokens.start + 1 != function_name_tokens.end or function_name_tokens.end > tokens.len) return false;
+    return query_function.antflyQueryFunctionFromSqlToken(tokens[function_name_tokens.start]) != null;
+}
+
+fn generatedWhereHasExactProducerPredicate(
+    tokens: []const Token,
+    generated_where_expression: ?*const generated_parser.GeneratedSqlExpressionAst,
+) bool {
+    const expression = generated_where_expression orelse return false;
+    return generatedExpressionHasExactProducerPredicate(tokens, expression);
+}
+
+fn generatedExpressionHasExactProducerPredicate(
+    tokens: []const Token,
+    expression: *const generated_parser.GeneratedSqlExpressionAst,
+) bool {
+    if (generatedExpressionIsFullTextQueryFunction(tokens, expression) or
+        generatedExpressionIsAntflyQueryFunction(tokens, expression))
+    {
+        return true;
+    }
+    switch (expression.kind) {
+        .logical_and, .logical_or => {
+            if (expression.boolean_condition_items.expressions.len != expression.boolean_condition_count) return false;
+            for (expression.boolean_condition_items.expressions) |*child| {
+                if (generatedExpressionHasExactProducerPredicate(tokens, child)) return true;
+            }
+            return false;
+        },
+        .logical_not, .grouped, .unary_positive, .unary_negative => {
+            if (expression.inner_expression_kind == null) return false;
+            const inner = expression.inner_expression orelse return false;
+            return generatedExpressionHasExactProducerPredicate(tokens, inner);
+        },
+        else => return false,
+    }
+}
+
+fn generatedExpressionIsFullTextQueryFunction(
+    tokens: []const Token,
+    expression: *const generated_parser.GeneratedSqlExpressionAst,
+) bool {
+    if (expression.kind != .function_call) return false;
+    const function_name_tokens = expression.function_name_tokens orelse return false;
+    if (function_name_tokens.start + 1 != function_name_tokens.end or function_name_tokens.end > tokens.len) return false;
+    return tokens[function_name_tokens.start].matchesKeywordTag(.full_text_search);
 }
 
 fn documentNativeIndexNameReady(index_names: []const []const u8, index_name: []const u8) bool {
@@ -4369,31 +4549,6 @@ fn documentAggregateOutputName(tokens: []const Token, source_ref: DocumentSource
     return "group";
 }
 
-fn parseWhereClauseIntoAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    schema: runtime_schema.TableSchema,
-    virtual_schema: source_binding.DocumentSqlSchema,
-    source_ref: DocumentSourceRef,
-    out: *ParsedDocumentWhere,
-) !void {
-    if (try parseFullTextQueryAlloc(alloc, tokens)) |query| {
-        if (out.full_text_query != null) {
-            alloc.free(query);
-            return error.UnsupportedSqlShape;
-        }
-        out.full_text_query = query;
-        return;
-    }
-    if (try parseDocumentIdClauseIntoAlloc(alloc, tokens, source_ref, out)) return;
-    if (try parseScalarFilterClauseAlloc(alloc, tokens, schema, virtual_schema, source_ref)) |clause| {
-        errdefer alloc.free(clause);
-        try out.filter_clauses.append(alloc, clause);
-        return;
-    }
-    return error.UnsupportedSqlShape;
-}
-
 fn parseDocumentIdClauseIntoAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -4547,66 +4702,6 @@ fn documentUnnestHasValueFilter(unnest: DocumentUnnest) bool {
         unnest.filter_not_query_json != null or
         unnest.filter_is_not_null or
         unnest.filter_match_none;
-}
-
-fn parseFullTextQueryAlloc(alloc: std.mem.Allocator, tokens: []const Token) !?[]const u8 {
-    if (tokens.len != 4) return null;
-    if (!tokens[0].matchesKeywordTag(.full_text_search)) return null;
-    if (tokens[1].kind != .lparen or tokens[2].kind != .string or tokens[3].kind != .rparen) return error.UnsupportedSqlShape;
-    return try alloc.dupe(u8, tokens[2].text);
-}
-
-fn whereRangeHasExactProducerPredicate(tokens: []const Token, where_index: usize, end_index: usize) bool {
-    if (where_index + 1 >= end_index) return false;
-    for (tokens[where_index + 1 .. end_index]) |token| {
-        if (token.matchesKeywordTag(.full_text_search)) return true;
-        if (tokenMatchesAntflyQualifiedKeywordTagOnly(token, .semantic_search) or
-            tokenMatchesAntflyQualifiedKeywordTagOnly(token, .vector_search) or
-            tokenMatchesAntflyQualifiedKeywordTagOnly(token, .hybrid_search) or
-            tokenMatchesAntflyQualifiedKeywordTagOnly(token, .graph_traverse) or
-            tokenMatchesAntflyQualifiedKeywordTagOnly(token, .graph_neighbors) or
-            tokenMatchesAntflyQualifiedKeywordTagOnly(token, .graph_shortest_path) or
-            tokenMatchesAntflyQualifiedKeywordTagOnly(token, .graph_k_shortest_paths) or
-            tokenMatchesAntflyQualifiedKeywordTagOnly(token, .graph_match) or
-            tokenMatchesAntflyQualifiedKeywordTagOnly(token, .graph_metric) or
-            tokenMatchesAntflyQualifiedKeywordTagOnly(token, .graph_metric_rerank))
-        {
-            return true;
-        }
-    }
-    return false;
-}
-
-fn clauseHasNativeAntflySearchFunction(tokens: []const Token) bool {
-    for (tokens) |token| {
-        if (tokenMatchesAntflyQualifiedKeywordTagOnly(token, .full_text_search) or
-            tokenMatchesAntflyQualifiedKeywordTagOnly(token, .semantic_search) or
-            tokenMatchesAntflyQualifiedKeywordTagOnly(token, .vector_search) or
-            tokenMatchesAntflyQualifiedKeywordTagOnly(token, .hybrid_search) or
-            tokenMatchesAntflyQualifiedKeywordTagOnly(token, .graph_traverse) or
-            tokenMatchesAntflyQualifiedKeywordTagOnly(token, .graph_neighbors) or
-            tokenMatchesAntflyQualifiedKeywordTagOnly(token, .graph_shortest_path) or
-            tokenMatchesAntflyQualifiedKeywordTagOnly(token, .graph_k_shortest_paths) or
-            tokenMatchesAntflyQualifiedKeywordTagOnly(token, .graph_match) or
-            tokenMatchesAntflyQualifiedKeywordTagOnly(token, .graph_metric) or
-            tokenMatchesAntflyQualifiedKeywordTagOnly(token, .graph_metric_rerank))
-        {
-            return true;
-        }
-    }
-    return false;
-}
-
-fn tokenMatchesAntflyQualifiedKeywordTagOnly(token: Token, keyword: TokenKeyword) bool {
-    if (token.kind != .identifier) return false;
-    const dot = std.mem.indexOfScalar(u8, token.text, '.') orelse return false;
-    if (std.mem.indexOfScalar(u8, token.text[dot + 1 ..], '.') != null) return false;
-    if (!std.ascii.eqlIgnoreCase(token.text[0..dot], "antfly")) return false;
-    const member = token.text[dot + 1 ..];
-    return if (token_mod.keywordFromIdentifier(member)) |member_keyword|
-        member_keyword == keyword
-    else
-        false;
 }
 
 fn parseScalarFilterClauseAlloc(
@@ -11920,7 +12015,49 @@ test "document SQL capability-aware aggregate requires full text producer" {
     var parsed = try tokenized.ParsedSql.initAlloc(alloc, "SELECT count(*) AS row_count FROM docs WHERE full_text_search('body:alpha')");
     defer parsed.deinit(alloc);
 
+    var stale_argument = try tokenized.ParsedSql.initAlloc(alloc, "SELECT count(*) AS row_count FROM docs WHERE full_text_search('body:alpha')");
+    defer stale_argument.deinit(alloc);
+    if (stale_argument.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                if (read.where_expression.argument_items.items.len == 0) return error.TestUnexpectedResult;
+                read.where_expression.argument_items.items[0].end = read.where_expression.argument_items.items[0].start;
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentAggregatePlanWithOptionalIndexesAndCapabilitiesParsedSqlAlloc(alloc, &stale_argument, schema, null, .{
+        .full_text_filters = true,
+        .bounded_scan = .{ .max_rows = 25 },
+    }));
+
     try std.testing.expectError(error.DocumentSqlBoundedScanMissingExactProducer, lowerDocumentAggregatePlanWithOptionalIndexesAndCapabilitiesParsedSqlAlloc(alloc, &parsed, schema, null, .{
+        .full_text_filters = false,
+        .bounded_scan = .{ .max_rows = 25 },
+    }));
+
+    var stale_exact_producer = try tokenized.ParsedSql.initAlloc(alloc, "SELECT count(*) AS row_count FROM docs WHERE full_text_search('body:alpha')");
+    defer stale_exact_producer.deinit(alloc);
+    if (stale_exact_producer.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| read.where_expression.kind = .token_range,
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentAggregatePlanWithOptionalIndexesAndCapabilitiesParsedSqlAlloc(alloc, &stale_exact_producer, schema, null, .{
+        .full_text_filters = false,
+        .bounded_scan = .{ .max_rows = 25 },
+    }));
+
+    var missing_where_metadata = try tokenized.ParsedSql.initAlloc(alloc, "SELECT count(*) AS row_count FROM docs WHERE full_text_search('body:alpha')");
+    defer missing_where_metadata.deinit(alloc);
+    if (missing_where_metadata.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| read.where_tokens = null,
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentAggregatePlanWithOptionalIndexesAndCapabilitiesParsedSqlAlloc(alloc, &missing_where_metadata, schema, null, .{
         .full_text_filters = false,
         .bounded_scan = .{ .max_rows = 25 },
     }));
@@ -12400,6 +12537,32 @@ test "document SQL lowers full text producer" {
     defer lowered.deinit(alloc);
     try std.testing.expectEqualStrings("title:alpha", lowered.producer.indexed_query.full_text_query.?);
     try std.testing.expectEqual(@as(?u32, 5), lowered.limit);
+
+    var stale_argument = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id, title FROM docs WHERE full_text_search('title:alpha') LIMIT 5");
+    defer stale_argument.deinit(alloc);
+    if (stale_argument.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                if (read.where_expression.argument_items.items.len == 0) return error.TestUnexpectedResult;
+                read.where_expression.argument_items.items[0].end = read.where_expression.argument_items.items[0].start;
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &stale_argument, schema));
+
+    var stale_argument_kind = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id, title FROM docs WHERE full_text_search('title:alpha') LIMIT 5");
+    defer stale_argument_kind.deinit(alloc);
+    if (stale_argument_kind.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                if (read.where_expression.argument_items.expressions.len == 0) return error.TestUnexpectedResult;
+                read.where_expression.argument_items.expressions[0].kind = .current_date;
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &stale_argument_kind, schema));
 }
 
 test "document SQL lowers vector search predicate to native query producer" {
@@ -12429,6 +12592,29 @@ test "document SQL lowers vector search predicate to native query producer" {
     var no_vector = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE antfly.vector_search(table_name => 'docs', index => 'docs_embedding_hnsw', vector => '[0.1,0.2,0.3]', limit => 5)");
     defer no_vector.deinit(alloc);
     try std.testing.expectError(error.DocumentSqlBoundedScanMissingExactProducer, lowerDocumentReadPlanParsedSqlAlloc(alloc, &no_vector, no_vector_schema));
+
+    var stale_argument = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE antfly.vector_search(table_name => 'docs', index => 'docs_embedding_hnsw', vector => '[0.1,0.2,0.3]', limit => 5)");
+    defer stale_argument.deinit(alloc);
+    if (stale_argument.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                if (read.where_expression.argument_items.items.len == 0) return error.TestUnexpectedResult;
+                read.where_expression.argument_items.items[0].end = read.where_expression.argument_items.items[0].start;
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &stale_argument, schema));
+
+    var stale_kind = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE antfly.vector_search(table_name => 'docs', index => 'docs_embedding_hnsw', vector => '[0.1,0.2,0.3]', limit => 5)");
+    defer stale_kind.deinit(alloc);
+    if (stale_kind.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| read.where_expression.kind = .token_range,
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &stale_kind, schema));
 }
 
 test "document SQL rejects antfly query functions as scalar predicates" {
@@ -12463,6 +12649,32 @@ test "document SQL capability-aware lowering requires full text producer" {
     defer parsed.deinit(alloc);
 
     try std.testing.expectError(error.DocumentSqlBoundedScanMissingExactProducer, lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(alloc, &parsed, schema, .{
+        .full_text_filters = false,
+        .bounded_scan = .{ .max_rows = 25 },
+    }));
+
+    var stale_exact_producer = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id, title FROM docs WHERE full_text_search('title:alpha') LIMIT 5");
+    defer stale_exact_producer.deinit(alloc);
+    if (stale_exact_producer.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| read.where_expression.kind = .token_range,
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(alloc, &stale_exact_producer, schema, .{
+        .full_text_filters = false,
+        .bounded_scan = .{ .max_rows = 25 },
+    }));
+
+    var missing_where_metadata = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id, title FROM docs WHERE full_text_search('title:alpha') LIMIT 5");
+    defer missing_where_metadata.deinit(alloc);
+    if (missing_where_metadata.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| read.where_tokens = null,
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(alloc, &missing_where_metadata, schema, .{
         .full_text_filters = false,
         .bounded_scan = .{ .max_rows = 25 },
     }));

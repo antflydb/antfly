@@ -133,7 +133,7 @@ pub const CatalogSource = struct {
             alloc: std.mem.Allocator,
             table_name: []const u8,
             index_name: []const u8,
-            expected_generation: u64,
+            expected: metadata_table_manager.SecondaryIndexReadyExpectation,
         ) anyerror!bool = null,
         compare_and_swap_table_schema: ?*const fn (
             ptr: *anyopaque,
@@ -367,10 +367,10 @@ pub const CatalogSource = struct {
         alloc: std.mem.Allocator,
         table_name: []const u8,
         index_name: []const u8,
-        expected_generation: u64,
+        expected: metadata_table_manager.SecondaryIndexReadyExpectation,
     ) !bool {
         const fn_ptr = self.vtable.promote_secondary_index_ready orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, alloc, table_name, index_name, expected_generation);
+        return try fn_ptr(self.ptr, alloc, table_name, index_name, expected);
     }
 
     pub fn compareAndSwapTableSchema(

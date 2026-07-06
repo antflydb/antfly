@@ -4,14 +4,14 @@
     {
       "family": "backups",
       "compatibility_entry_point": "removed: retained generated AST required",
-      "generated_ast_entry_point": "ddl_plan.planGeneratedLogicalDdlAstAlloc",
+      "generated_ast_entry_point": "generated_parser.GeneratedSqlUnsupportedAst backup/restore lifecycle diagnostics",
       "entrypoints": ["http", "pgwire", "sql_adapter", "tokenized"],
-      "parser_status": "generated_gated_unsupported",
+      "parser_status": "generated_owned",
       "retained_ast_corruption_test": "tokenized parsed sql retained AST corruption rejects generated unsupported DDL",
       "coverage_file": "zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json",
-      "removal_gate": "Add raw generated-AST fixtures, binder/lowering diagnostics, and API parity for BACKUP/RESTORE before deleting token-tail fallback.",
+      "removal_gate": "BACKUP/RESTORE public SQL is generated-owned as deterministic backup_lifecycle_sql_unavailable unsupported diagnostics; no token-tail fallback remains.",
       "removal_evidence": {
-        "raw_ast_fixtures": ["backups-backup-database-generated-rejection", "backups-restore-database-generated-rejection"],
+        "raw_ast_fixtures": ["backups-backup-database-generated-unsupported-ast", "backups-restore-database-generated-unsupported-ast"],
         "binder_fixtures": ["unsupported backup database sql unavailable", "unsupported restore database sql unavailable"],
         "lowering_fixtures": ["unsupported backup database sql unavailable", "unsupported restore database sql unavailable"],
         "runtime_fixtures": ["unsupported backup database sql unavailable", "unsupported restore database sql unavailable"],
@@ -118,12 +118,12 @@
     {
       "family": "maintenance",
       "compatibility_entry_point": "removed: retained generated AST required",
-      "generated_ast_entry_point": "ddl_plan.planGeneratedLogicalDdlAstAlloc",
+      "generated_ast_entry_point": "ddl_plan.planGeneratedLogicalDdlAstAlloc via retained generated unsupported maintenance AST",
       "entrypoints": ["http", "pgwire", "sql_adapter", "tokenized"],
-      "parser_status": "generated_gated_unsupported",
+      "parser_status": "generated_owned",
       "retained_ast_corruption_test": "sql adapter logical ddl plan accepts validated generated unsupported maintenance without vacuum analyze wrapper fallback",
       "coverage_file": "zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json",
-      "removal_gate": "VACUUM, ANALYZE, REINDEX, CLUSTER, cursor, prepared statement, and transaction maintenance commands have generated-AST fixtures and app-parity coverage.",
+      "removal_gate": "VACUUM, ANALYZE, REINDEX, CLUSTER, cursor, prepared statement, and transaction maintenance commands lower from retained generated AST metadata with app-parity coverage and stale-AST fail-closed tests.",
       "removal_evidence": {
         "raw_ast_fixtures": [
           "maintenance-analyze-generated-unsupported-ast",

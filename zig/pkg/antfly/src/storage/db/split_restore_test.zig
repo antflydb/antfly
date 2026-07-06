@@ -66,11 +66,11 @@ fn waitForAppliedSequenceAdvance(
     return applied;
 }
 
-fn orderedTupleIndexColumn(runtime_schema: schema_mod.TableSchema, index_name: []const u8) !schema_mod.RelationalColumn {
-    for (runtime_schema.relational_columns) |column| {
-        if (column.index_name) |candidate| {
-            if (std.mem.eql(u8, candidate, index_name)) return column;
-        }
+fn orderedTupleIndexKeys(runtime_schema: schema_mod.TableSchema, index_name: []const u8) ![]const schema_mod.RelationalIndexKey {
+    for (runtime_schema.relational_indexes) |index| {
+        if (!std.mem.eql(u8, index.name, index_name)) continue;
+        if (index.access_method != .ordered_tuple) return error.TestUnexpectedResult;
+        return index.keys;
     }
     return error.TestUnexpectedResult;
 }
@@ -81,10 +81,10 @@ fn orderedTupleValueForDocKeyAlloc(
     runtime_schema: schema_mod.TableSchema,
     doc_key: []const u8,
 ) ![]u8 {
-    const index_column = try orderedTupleIndexColumn(runtime_schema, "status_amount_idx");
+    const index_keys = try orderedTupleIndexKeys(runtime_schema, "status_amount_idx");
     const row = (try relational_store_mod.getRawAlloc(alloc, store, doc_key)) orelse return error.TestExpectedEqual;
     defer alloc.free(row);
-    return try relational_store_mod.orderedTupleValueForIndexKeysAlloc(alloc, row, index_column.index_keys, runtime_schema.relational_columns);
+    return try relational_store_mod.orderedTupleValueForIndexKeysAlloc(alloc, row, index_keys, runtime_schema.relational_columns);
 }
 
 fn expectSingleOrderedTupleDocKeyForTuple(
@@ -445,7 +445,7 @@ test "db split moves relational rows and column entries" {
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"title":{"type":"text"},"status":{"type":"keyword","x-antfly-index-name":"status_amount_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":1,"x-antfly-index-schema-fingerprint":"secondary-index-v1:status_amount_idx","x-antfly-index-keys":[{"column":"status"},{"column":"amount"}]},"amount":{"type":"numeric"}},"required":["id","title"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"title":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id","title"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_amount_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"amount"}],"lifecycle":"ready","generation":1,"schema_fingerprint":"secondary-index-v1:status_amount_idx"},{"name":"amount","owner_kind":"relational_column","owner_name":"amount","access_method":"scalar_column","columns":["amount"]}]}
     ;
     var parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -2462,7 +2462,7 @@ test "db merge-style cutover routes relational rows and column scans across reop
 
     const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"title":{"type":"text"},"status":{"type":"keyword","x-antfly-index-name":"status_amount_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":1,"x-antfly-index-schema-fingerprint":"secondary-index-v1:status_amount_idx","x-antfly-index-keys":[{"column":"status"},{"column":"amount"}]},"amount":{"type":"numeric"}},"required":["id","title"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"title":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id","title"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_amount_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"amount"}],"lifecycle":"ready","generation":1,"schema_fingerprint":"secondary-index-v1:status_amount_idx"},{"name":"amount","owner_kind":"relational_column","owner_name":"amount","access_method":"scalar_column","columns":["amount"]}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);

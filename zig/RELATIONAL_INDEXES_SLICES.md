@@ -28,30 +28,107 @@ row/index baseline.
     `TableSchema.relational_indexes` now persists index identity, owner kind,
     owner name, access method, uniqueness, key columns, expression keys,
     included columns, ordered key parts, lifecycle, generation, schema
-    fingerprint, field predicates, and expression predicates. Runtime schema
-    derivation populates catalog entries from indexed relational columns and
-    unique constraints, with binary round-trip and runtime derivation coverage
-    for scalar, ordered tuple, algebraic, text-search, and unique-constraint
-    owner entries.
-  - [ ] Migrate write/query/rebuild call sites to consume the first-class
+    fingerprint, method-specific configuration, field predicates, and
+    expression predicates. Parsed schema JSON and runtime DDL keep relational
+    index identity in first-class `relational_indexes`; relational schemas
+    reject duplicated embedded column index identity and unique-constraint
+    physical index fields, and runtime DDL create/drop/index-name resolution
+    uses only first-class catalog entries for relational indexes.
+    `method_config` now persists logical full-text options
+    and schema-derived algebraic settings without storing physical backend names
+    or raw SQL text.
+  - [x] Migrate write/query/rebuild call sites to consume the first-class
     relational index catalog instead of reading column-backed or
-    unique-constraint-backed metadata directly. Keep the old owner fields only
-    as schema input/compatibility projection until every planner, maintenance,
-    lifecycle, and repair path uses catalog entries. Write maintenance and
-    rebuild policy construction now carry `TableSchema.relational_indexes` into
-    `ColumnIndexPolicy`, synthesize effective scalar/ordered-tuple column
-    metadata from catalog entries, and have focused coverage for catalog-only
-    scalar rebuild plus catalog-only ordered-tuple write/rebuild behavior.
-    Remaining consumers include query planning, unique/FK owner lookups, public
-    schema JSON/API surfaces, lifecycle repair status, and legacy embedded-field
-    removal.
-  - [ ] Add method-specific catalog options once planner/runtime consumers need
-    them, without storing physical backend names or SQL text in durable
-    metadata.
+    unique-constraint-backed metadata directly. Runtime schema derivation,
+    SQL schema JSON mutation, runtime `CREATE INDEX`/`DROP INDEX`, index-name
+    existence checks, write maintenance, rebuild policy construction,
+    ordered-tuple/scalar query planning, unique/FK ordered-owner lookup, and
+    public index list/detail status now consume `TableSchema.relational_indexes`
+    for relational indexes. When a runtime schema carries any
+    `relational_indexes`, the catalog is authoritative for index maintenance,
+    readiness checks, query planning, and rebuild targeting; embedded
+    column/constraint metadata is rejected rather than treated as a fallback,
+    including the old property-level `x-antfly-index` boolean shorthand.
+    Relational schema JSON fixtures and focused ordered-tuple write-path
+    coverage now express secondary index identity through first-class
+    `relational_indexes`, not embedded property or unique-constraint index
+    metadata. Runtime derivation no longer synthesizes ready ordered-tuple
+    owners from bare unique constraints or scalar-column catalog entries from
+    column `indexed` flags; a secondary index or ordered-tuple unique owner is
+    active only when its first-class `relational_indexes` entry is present.
+    Bare logical unique constraints remain backed by dedicated owner rows.
+    Storage no longer falls back to embedded index names, access methods,
+    generations, predicates, include columns, key metadata, or
+    unique-constraint physical fields. The old unrestricted
+    `ColumnIndexPolicy` mode that maintained scalar side rows for every packed
+    cell without catalog metadata has been removed; low-level helpers now use
+    an empty catalog policy when no relational schema is available. Relational
+    runtime schema derivation also drops embedded property index metadata and
+    owner-local unique physical index fields instead of preserving them as
+    compatibility state, and schema-transition validation no longer ignores
+    owner-column secondary-index fields as a compatibility exception. Ordered
+    unique maintenance now fails closed without matching catalog metadata.
+    Runtime schema format v52 omits relational column/unique embedded-index
+    payloads entirely, rejects older schema blobs instead of byte-skipping old
+    embedded relational index layouts, and relational column catalog equality
+    ignores the deprecated embedded index fields; runtime `UniqueConstraint`
+    no longer carries embedded physical index fields at all, while public
+    document schema property index settings remain document-mode API state.
+    Secondary-index rebuild targeting now returns the first-class catalog index
+    and owner column separately, so scalar and ordered-tuple rebuilds no longer
+    synthesize column-shaped metadata from catalog entries. Ordered-tuple query
+    planning now selects from `TableSchema.relational_indexes` directly, stores
+    the selected `RelationalIndex` in candidate/scan plans, uses the catalog
+    index name for tuple scans, and rechecks covering payloads against the
+    catalog index rather than projecting lifecycle, generation, predicates,
+    keys, and include payloads back into synthetic relational columns. Scalar
+    column query planning now also resolves readiness, key shape, and partial
+    predicates from the first-class scalar `RelationalIndex` while scanning the
+    owner column's physical column-major entries, instead of projecting catalog
+    lifecycle, predicates, or key metadata back into a temporary column. Ordered
+    unique write enforcement, FK parent lookup, ordered-owner rebuild, query
+    planning, and distributed conflict participant routing now carry the
+    logical `UniqueConstraint` plus its owning `RelationalIndex` explicitly
+    instead of projecting catalog lifecycle, generation, predicates, keys, and
+    include payloads into deprecated `UniqueConstraint.index_*` fields. SQL
+    document/join write lowering now proves index readiness, partial-shape,
+    ordered-key shape, and uniqueness from `TableSchema.relational_indexes` for
+    relational/catalog-mode schemas, leaving embedded property-index fields only
+    as document-mode API compatibility input.
+  - [x] Add method-specific catalog options without storing physical backend
+    names or SQL text in durable metadata. SQL DDL now populates durable
+    `method_config` for `USING antfly_full_text` and schema-derived
+    `USING antfly_algebraic`, schema JSON parses/emits/validates it, the
+    binary runtime schema persists it, and the public API/OpenAPI surfaces carry
+    it as access-method-specific configuration. Relational `text_search`
+    entries now fail closed unless the config field, catalog owner, and indexed
+    column all name the same relational column; table-owned algebraic entries
+    fail closed unless they carry the schema-derived algebraic config. SQL
+    lowering now hashes method config into the stable index generation and
+    schema fingerprint, so access-method option changes cannot reuse stale ready
+    derived artifacts.
   - [ ] Extend ordered tuple value encoding beyond scalar column keys to cover
     expression keys and planner coverage for descending/null-order-specific
-    bounds.
-  - [ ] Support included payload columns only as optional index-local payload
+    bounds. SQL/catalog application now creates first-class ordered-tuple
+    relational index owners for unique expression constraints, including pure
+    expression keys and mixed column plus expression keys; relational schema
+    validation admits expression metadata only when the relational index owner
+    is the matching unique constraint. Ordered-tuple unique maintenance and
+    rebuild encode those expression tuples from the shared unique-expression
+    model while bare logical UNIQUE constraints stay on dedicated owner rows;
+    exact row-query owner lookup now uses the ordered expression tuple when
+    equality predicates prove every source column needed to compute the unique
+    expression key, or when direct expression equality predicates supply the
+    expression key value; source-field predicates remain residual row rechecks
+    while direct expression predicates count as proven tuple components.
+    Non-unique expression indexes continue to use stored generated columns as
+    ordered tuple keys, including mixed column plus expression indexes where the
+    generated catalog column is appended to the first-class ordered-tuple
+    `columns`/`keys` entry. Remaining work is planner proof for native
+    expression-key range/order bounds, descending/null-order expression cases,
+    and routed evidence for expression-key owners before this whole slice is
+    checked.
+  - [x] Support included payload columns only as optional index-local payload
     for covering reads; the packed row remains authoritative and covering reads
     must recheck row generation before returning user-visible data. Query
     profiles and the benchmark matrix now distinguish rows projected from
@@ -66,25 +143,70 @@ row/index baseline.
     non-temporal, column-keyed unique constraints that carry `ordered_tuple`
     metadata, including partial predicate membership, include-payload rewrites,
     key-change cleanup, delete cleanup, identity rewrite cleanup, and
-    ready/building/catching-up lifecycle gating; uniqueness enforcement still
-    uses the dedicated owner namespace until write-time owner enforcement is
-    replaced. Query candidate resolution now routes ready, non-temporal,
-    column-keyed compound unique constraints through ordered-tuple metadata
-    before the dedicated owner namespace, with profile evidence and a regression
-    test that removes the legacy owner key and scalar indexes.
+    ready/building/catching-up lifecycle gating. Local participant write
+    enforcement probes ready ordered-tuple owner entries only when a matching
+    first-class `relational_indexes` entry exists; bare logical UNIQUE
+    constraints remain enforced through dedicated owner rows. Query candidate
+    resolution now uses ordered-tuple metadata for explicit ordered unique
+    constraints and dedicated owner lookup for bare logical UNIQUE and primary
+    key owner paths. Schema migration rebuilds ordered unique owner entries from
+    committed rows before validating new FKs, and FK transaction parent checks
+    validate staged parent rows, committed ordered owners, or committed
+    dedicated owner rows by rechecking the authoritative row's logical unique
+    tuple. Write maintenance and query resolution now derive ordered unique
+    metadata only from first-class `relational_indexes` entries, with
+    catalog-only regressions that leave `UniqueConstraint.index_*` fields empty.
+    DB transaction prepare now adds a transient internal ordered-unique conflict
+    lock keyed by
+    `(unique_index_id, encoded_tuple)`, so conflicting compound unique prepares
+    intent-conflict before commit while the committed ordered-tuple index rows
+    remain the durable ordered owner state. The transient conflict key is now
+    derived from the first-class catalog `RelationalIndex` identity, so explicit
+    ordered unique indexes whose index name differs from the logical constraint
+    owner name still conflict on the durable ordered-owner tuple. Public
+    non-temporal
+    `unique_constraint_writes`/`unique_constraint_deletes` mutation requests
+    continue to target the dedicated logical owner-row path; explicit
+    ordered-tuple unique indexes use internal conflict keys. Explicit
+    ordered-tuple unique owners now fail closed when their catalog entry exists
+    but is not lookup-ready, including ready entries missing generation or
+    schema fingerprint, instead of falling back to dedicated owner rows.
+    Distributed coordinator coverage now proves explicit ordered-tuple unique
+    indexes whose catalog index name differs from the logical constraint owner
+    name resolve owner topology through the logical unique owner range while
+    staging only internal catalog-index conflict key writes/deletes, not public
+    unique owner mutations. Remaining work is hosted remote execution evidence
+    for ordered owner conflicts.
   - [ ] Enforce partial unique constraints by proving the proposed row satisfies
     the stored predicate, then probing only the matching ordered tuple owner.
+    Local participant write enforcement now uses ready ordered-tuple unique
+    metadata as the conflict source for non-temporal unique constraints,
+    including partial predicate membership and same-batch staged tuple writes;
+    focused coverage proves inactive rows are outside the partial owner, active
+    duplicates fail from committed ordered-tuple entries, same-batch duplicates
+    fail from staged ordered-tuple writes, and no dedicated unique-owner row is
+    written for the ready ordered owner. DB transaction coverage now proves
+    active rows for a partial ordered unique catalog index intent-conflict on
+    the catalog index owner tuple, inactive rows do not conflict, and duplicates
+    reject after the winner commits. Remaining work is routed/hosted prepare
+    evidence and benchmark deltas before checking the slice.
   - [ ] Route FK parent existence checks to ordered tuple primary/unique owners
     for compound parent keys, including hosted participant routing where owner
     topology is required. Local participant FK parent checks now precompute the
     parent ordered tuple from decoded child cells for ready, non-temporal,
     column-keyed compound unique parents; commit validation probes ordered-tuple
     metadata and rechecks the authoritative packed parent row before accepting
-    the child. Regression coverage removes the legacy unique-owner key to prove
-    committed FK checks use ordered-tuple metadata, removes ordered-tuple entries
-    to prove the ready ordered path fails closed, and proves same-batch
-    parent/child inserts see staged ordered-tuple writes after removing the
-    staged legacy owner write.
+    the child. DB integrity validation now receives the runtime
+    `relational_indexes` catalog, encodes the ordered parent tuple from child
+    cells when ordered metadata exists, and otherwise validates unique-parent
+    existence through dedicated logical owner rows. Regression coverage asserts
+    explicit ordered-tuple unique indexes do not need dedicated owner rows,
+    removes ordered-tuple entries to prove the ready ordered path fails closed,
+    and proves same-batch parent/child inserts see staged ordered-tuple writes
+    without a staged dedicated owner write. FK parent lookup now also uses
+    catalog-only unique-owner metadata from `relational_indexes` with empty
+    `UniqueConstraint.index_*` fields, while bare logical UNIQUE parents resolve
+    through dedicated owner rows.
   - [ ] Route restrict parent-delete checks through child ordered indexes when
     a child FK maps to compound parent keys; fail closed when the matching child
     index is not ready or cannot prove predicate compatibility. Local
@@ -92,23 +214,28 @@ row/index baseline.
     child index that covers all FK child columns, encode the lookup tuple from
     authoritative parent row cells, and hydrate/recheck each candidate child row
     against the FK parent key before blocking the delete. Regression coverage
-    removes legacy FK reference rows to prove the ordered child index path
+    removes dedicated FK reference rows to prove the ordered child index path
     blocks a parent delete, and verifies a covering but stale child ordered
     index fails closed instead of trusting missing derived state. Simple partial
     child index predicates over FK child columns can now be proven from the
     mapped parent key before using the ordered child index; expression predicates
     or predicates over non-FK columns still fail closed, with focused coverage
-    for both the proven and unproved partial-predicate cases.
+    for both the proven and unproved partial-predicate cases. The local
+    restrict-delete lookup consumes the first-class `RelationalIndex` entry
+    directly, rather than projecting catalog metadata back through a synthetic
+    relational column.
   - [ ] Add concurrency tests for conflicting prepares on the same unique/FK
     owner tuple and stale generation tests that reject old index state. DB
     transaction coverage now proves conflicting prepares on the same compound
     ordered-tuple unique owner intent conflict before commit and reject
-    duplicate writes after the winner commits. DB transaction coverage also
-    proves compound FK child-reference and parent-delete prepares conflict on
-    the same encoded parent tuple before commit and reject parent deletes after
-    the child reference commits. Constraint lookup now rejects ready
+    duplicate writes after the winner commits, including partial ordered unique
+    catalog indexes whose index name differs from the logical constraint owner
+    name. DB transaction coverage also proves compound FK child-reference and
+    parent-delete prepares conflict on the same encoded parent tuple before
+    commit and reject parent deletes after the child reference commits.
+    Constraint lookup now rejects ready
     ordered-tuple metadata that lacks a current generation/fingerprint instead
-    of trusting stale tuple state; focused FK parent coverage keeps the legacy
+    of trusting stale tuple state; focused FK parent coverage keeps the dedicated
     owner absent and proves the stale ordered tuple is not accepted.
 
 - [ ] Query planner ordered-index selection
@@ -123,13 +250,42 @@ row/index baseline.
     constrain every range key to the encoded non-null component domain before
     applying scalar bounds, with focused coverage for one-sided ranges over
     `ASC NULLS FIRST` and `DESC NULLS LAST` indexes that keep null rows out of
-    the proven candidate set.
+    the proven candidate set. Planner candidates now retain the first-class
+    `RelationalIndex` identity and optional owner column separately, so range
+    bounds, profile counters, tuple scans, and covering-payload rechecks use the
+    catalog index metadata directly instead of a synthetic column projection.
   - [ ] Satisfy `ORDER BY` from ordered indexes only when direction, nulls,
-    collation, predicate domain, and tie-breaker semantics are exact.
+    collation, predicate domain, and tie-breaker semantics are exact. Ordered
+    tuple planning now rejects ORDER BY satisfaction when an index has trailing
+    key parts that are not fixed by equality predicates, because those keys
+    would sort ties before the row/doc-key fallback tie-breaker. The profile
+    exposes `ordered_tuple_order_tiebreaker_not_covered`, and focused storage
+    coverage proves fallback for `(status, amount, tenant)` when ordering by
+    `amount` with only `status` fixed, then proves streaming becomes valid when
+    `tenant` is also equality-proven.
   - [ ] Use selectivity estimates or bounded probe accounting to choose between
     ordered index scan, algebraic/text doc-set intersection, and base-row scan.
+    Row-query candidate planning now records per-method candidate-set evidence
+    for scalar, array, JSON, mixed, and ordered-tuple doc sets, sorts planned
+    sets by estimated cardinality before intersection, and publishes the
+    selected candidate estimate in profile JSON and `plan_summary`. Focused
+    storage coverage proves selective array/JSON doc sets can win over a
+    broader scalar set. Remaining work is bringing algebraic/text result sets
+    into the same measured planner path and replacing base-scan crossover
+    decisions with benchmarked thresholds.
   - [ ] Make residual predicate recheck explicit in the plan for every ordered
-    scan where the index does not fully prove the typed filter.
+    scan where the index does not fully prove the typed filter. Ordered-tuple
+    plan profiles now carry `ordered_tuple_residual_recheck_required` alongside
+    proven/residual predicate counts, and focused stream-plan coverage proves it
+    is false for fully proven scans and true when residual row rechecks are
+    required. Public row-query profile JSON now emits
+    `ordered_tuple.residual_recheck_required`, and `plan_summary` includes the
+    residual recheck decision. Ordered-tuple doc-set coverage now proves the
+    flag is false when OR/access-OR branches fully prove their predicates and
+    true when a doc-set scan leaves a typed residual predicate for row recheck.
+    Ordered unique lookup coverage now proves the flag is false when the unique
+    tuple fully proves the filter and true when extra typed predicates require
+    authoritative row recheck.
   - [ ] Add plan-summary evidence that names the selected access method,
     generation, predicate proof, scan bounds, estimated candidates, residual
     predicates, and fallback reason. Rows query profiles now carry and serialize
@@ -137,7 +293,10 @@ row/index baseline.
     observations, residual rechecks, ordered-tuple plan metadata, and a stable
     `plan_summary` string naming access method, fallback reason, generation,
     predicate proof counts, scan-bound byte widths, estimated candidates, and
-    measured row counters; remaining work is cross-method selectivity evidence.
+    measured row counters. Profiles now also include per-method candidate-set
+    counts and the selected candidate estimate for scalar, array, JSON, mixed,
+    and ordered-tuple doc-set planning; remaining work is algebraic/text
+    candidate-set evidence and public explain output.
 
 - [ ] Access-method catalog and SQL lowering
   - [ ] Lower ordinary `CREATE INDEX` and `CREATE UNIQUE INDEX` to
@@ -147,10 +306,13 @@ row/index baseline.
   - [ ] Lower `USING antfly_algebraic` to `algebraic_filter` access metadata or
     native algebraic materialization metadata, depending on whether the DDL asks
     for a filter index or a fold/materialization. `USING antfly_algebraic ()
-    WITH (derive_from_schema = true)` now has SQL/API parity evidence as
-    native `algebraic_filter`; unknown public SQL options such as internal
-    `materializations` now fail closed with unsupported fixture evidence, and
-    fold/materialization-specific SQL options remain tracked here.
+    WITH (derive_from_schema = true)` now has SQL/API parity evidence as a
+    durable table-owned native `algebraic_filter`
+    (`owner_kind: table`, `owner_name: __antfly_table__`); `derive_from_schema =
+    false`, mistyped `derive_from_schema`, and unknown public SQL options such
+    as internal `materializations` fail closed with unsupported fixture or
+    runtime-catalog evidence. Fold/materialization-specific SQL options remain
+    tracked here.
   - [ ] Lower `CREATE TEXT SEARCH` and `USING antfly_full_text` to the
     `text_search` access method with analyzer, scoring, highlight/snippet, and
     segment lifecycle config. `CREATE TEXT SEARCH [IF NOT EXISTS] name ON table
@@ -169,18 +331,27 @@ row/index baseline.
     lowers to algebraic JSON/array index metadata where validated, public
     SQL/API fingerprints report native access-method names rather than physical
     SQL spellings for these cases, and unsupported names such as `gist`/`trie`
-    fail before they can enter durable catalog state. Remaining expression-key
-    catalog work is compound expression-key coverage, unique expression-key
-    ordered owners, and planner use of expression-key bounds beyond the stored
-    generated-column representation.
+    fail before they can enter durable catalog state. Unique expression
+    constraints remain name-addressable constraint metadata and now create
+    unique-constraint-owned ordered-tuple catalog owners with native expression
+    metadata. Remaining expression-key catalog work is planner use of
+    expression-key bounds beyond the stored generated-column representation and
+    broader routed/topology evidence.
   - [ ] Add catalog JSON/API round-trip tests and SQL/API parity fixtures for
     each admitted access method and each unsupported option family. Binary
     runtime catalog round-trip coverage now exists for the first-class
     `relational_indexes` shape, and runtime derivation coverage exists for
     admitted `scalar_column`, `ordered_tuple`, `algebraic_filter`, and
-    `text_search` methods; remaining work is exposing/validating the same
-    first-class shape through public schema JSON and SQL/API fixtures rather
-    than only deriving it from existing column/constraint inputs.
+    `text_search` methods. Public table-schema OpenAPI parsing and catalog
+    normalization now preserve first-class `relational_indexes` entries for all
+    admitted access methods without relying on `indexes_json`, and the public
+    lifecycle enum matches the durable storage lifecycle states instead of
+    advertising unsupported `paused`. SQL/API parity fixtures now cover
+    `CREATE TEXT SEARCH`, `USING antfly_full_text`, table-owned
+    schema-derived `USING antfly_algebraic`, mistyped algebraic options, and
+    internal materialization-option rejection; remaining work is filling any
+    missing admitted-method/unsupported-option fixture gaps as new public
+    options are added.
 
 - [ ] Algebraic and text-search planner integration
   - [ ] Expose `algebraic_filter` capability metadata for fact/path/dictionary
@@ -199,14 +370,20 @@ row/index baseline.
 
 - [ ] Lifecycle, rebuild, and range movement
   - [ ] Add compare-and-swap catalog promotion for index lifecycle transitions.
-    Durable column-backed secondary-index metadata now carries `ready`,
+    Durable relational secondary-index metadata now carries `ready`,
     `building`, `catching_up`, `stale`, `rebuild_required`, `dropping`,
-    `failed`, and legacy `invalid`; reads only plan against `ready` indexes,
+    `failed`, and `invalid`; reads only plan against `ready` indexes,
     writes maintain `ready`/`building`/`catching_up` ordered-tuple entries, and
     stale/rebuild-required/failed/dropping/invalid states fail closed. Schema
     promotion helpers can now verify expected generation, access method, and
     schema fingerprint before marking an index ready, and Lite local rebuild
-    uses that checked promotion after rebuilding.
+    uses that checked promotion after rebuilding. Catalog-source promotion and
+    the durable raft transition now carry the same expected generation, access
+    method, and schema fingerprint; raft apply recomputes the checked ready
+    schema from the current schema JSON before committing the promoted table.
+    The generation-only ready helper has been removed, and the remaining
+    promotion fixtures use first-class `relational_indexes` instead of embedded
+    `x-antfly-index-*` lifecycle metadata.
   - [ ] Rebuild ordered indexes from committed packed rows using bounded,
     resumable cursors and publish only after all owner ranges reach the target
     generation. Scalar secondary-index rebuild workers now page local rebuild
@@ -276,9 +453,10 @@ row/index baseline.
     and hosted participant routing. Lite native `.aflite` coverage now proves
     ordered-tuple document-range cleanup and local column-backed repair survive
     close/reopen, including repair of missing ordered-tuple/scalar entries and
-    cleanup of stale forward-only tuple corruption from committed packed rows.
-    Remaining work is Lite evidence for every future local rebuild/repair
-    operation added under this slice.
+    cleanup of stale forward-only tuple corruption from committed packed rows;
+    those Lite fixtures now use first-class `relational_indexes` rather than
+    column-embedded index metadata. Remaining work is Lite evidence for every
+    future local rebuild/repair operation added under this slice.
 
 - [ ] Write-path performance hardening
   - [ ] Parse/destructure the packed old and new row once per upsert/delete and
@@ -287,8 +465,14 @@ row/index baseline.
     expressions, algebraic projection, and text-search projection. Current
     participant writes reuse decoded cells for primary/unique/FK checks,
     scalar/ordered column index maintenance, and ordered-tuple unique constraint
-    maintenance; generated values plus algebraic/text projections remain
-    tracked here.
+    maintenance. Ordered-tuple secondary-index writes now iterate
+    first-class catalog entries directly instead of manufacturing temporary
+    column-shaped index metadata for the write-maintenance hot path. FK child
+    restrict lookup and secondary-index rebuild selection now also consume
+    first-class catalog entries directly. Ordered unique maintenance and
+    lookup paths no longer allocate projected/effective unique-constraint
+    metadata from catalog indexes. Generated values plus algebraic/text
+    projections remain tracked here.
   - [ ] Batch key/value construction with scratch arenas or reusable buffers for
     tuple keys, reverse keys, serialized scalar cells, and mutation arrays while
     preserving ownership across transaction staging. Current ordered-tuple
@@ -331,12 +515,14 @@ row/index baseline.
     candidate-gate exceeded counts, hydrated rows, residual rechecks,
     ordered-tuple covering-payload projections, projected rows, selected
     access-method query counts in single-run and
-    matrix output, ordered-tuple plan-shape counters for selected plan count,
+    matrix output, row-query profile candidate-set counts by scalar, array,
+    JSON, mixed, and ordered-tuple method, selected candidate estimates,
+    ordered-tuple plan-shape counters for selected plan count,
     max key count, max equality-prefix length, max filter/proven/residual
     predicate counts, range-plan count, prefix-scan count, fallback flags
     including candidate gates, materialization caps, order mismatch, index not
-    ready, stale generation, predicate-not-proven, and no-usable-bounds, and
-    write-amplification ratios.
+    ready, stale generation, predicate-not-proven, no-usable-bounds, and
+    unfixed trailing ORDER BY tie-breakers, and write-amplification ratios.
     Ordered tuple doc-set planning no longer uses the old exact-query
     `limit * 4` / 32-row cutoff as the fallback decision; it probes to the
     bounded materialization cap and reports the observed candidate count with a
@@ -395,7 +581,9 @@ row/index baseline.
     maintenance rejection before staging any mutations when ready/building
     metadata lacks a generation or schema fingerprint, durable lifecycle
     parsing/promotion/write-maintenance behavior, missing catalog-column
-    references, and unsupported key-column collations.
+    references, unsupported key-column collations, and ordered-tuple unique
+    enforcement rejection before staging any mutations when explicit ready
+    owner metadata lacks a generation or schema fingerprint.
   - [ ] Add public SQL/API parity rows for admitted index DDL and indexed query
     behavior, plus unsupported-reason rows for shapes that intentionally remain
     fail-closed.
@@ -419,9 +607,11 @@ row/index baseline.
     counts, rebuild range counts, stale-generation range counts, completed-row
     progress, resume key, per-range state, and last error. Schema-backed
     relational single-index detail now resolves through table schema metadata
-    instead of requiring legacy `indexes_json` entries. Public index status now
-    has a typed `index_type: "relational"` OpenAPI stats variant and table
-    index list/detail responses include aggregate durable repair-job evidence:
+    instead of requiring document `indexes_json` entries, and relational status
+    renders directly from authoritative `TableSchema.relational_indexes`.
+    Public index status now has a typed `index_type: "relational"` OpenAPI
+    stats variant and table index list/detail responses include aggregate
+    durable repair-job evidence:
     job counts, active/completed/failed counts, total scanned/repaired/missing
     ranges, latest job status, and aggregate repair counters. Default and
     namespace-qualified repair-job status endpoints still expose explicit job

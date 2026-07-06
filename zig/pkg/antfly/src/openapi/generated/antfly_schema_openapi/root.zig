@@ -19,5 +19,7 @@ pub const RowsExpressionCaseBranch = types.RowsExpressionCaseBranch;
 pub const RowsExpressionCondition = types.RowsExpressionCondition;
 pub const ForeignKey = types.ForeignKey;
 pub const UniqueConstraint = types.UniqueConstraint;
+pub const RelationalIndexKey = types.RelationalIndexKey;
+pub const RelationalIndex = types.RelationalIndex;
 pub const DynamicTemplate = types.DynamicTemplate;
 pub const TemplateFieldMapping = types.TemplateFieldMapping;

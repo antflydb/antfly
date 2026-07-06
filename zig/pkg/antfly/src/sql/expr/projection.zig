@@ -1867,7 +1867,7 @@ pub fn testProjectionBuildsJoinOutputs() !void {
     try std.testing.expectError(error.UnsupportedSqlShape, joinOutputFieldByOrdinalAlloc(alloc, &join_projections, 0));
 }
 
-fn generatedSetOperationRightQueryEndedBefore(
+fn generatedSetOperationRightProjectionSideEndedBefore(
     read: *const generated_parser.GeneratedSqlReadAst,
     pos: usize,
 ) !bool {
@@ -1938,6 +1938,8 @@ fn generatedReturningItemAtStart(
             return .{
                 .tokens = item,
                 .expression = &list.expressions[index],
+                .alias_tokens = list.alias_items[index],
+                .alias_name_tokens = list.alias_name_items[index],
             };
         }
     }
@@ -1948,6 +1950,22 @@ fn validateGeneratedExpressionItemEnd(generated_item: ?GeneratedExpressionItem, 
     if (generated_item) |item| {
         if (pos != item.tokens.end) return error.UnsupportedSqlShape;
     }
+}
+
+fn parseOptionalGeneratedProjectionAliasAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    generated_item: ?GeneratedExpressionItem,
+) !?[]const u8 {
+    const generated = generated_item orelse return try grammar.parseOptionalProjectionAliasAlloc(alloc, tokens, pos);
+    const alias = generated.alias_tokens orelse return null;
+    const alias_name = generated.alias_name_tokens orelse return error.UnsupportedSqlShape;
+    if (alias.start != pos.* or alias.end != generated.tokens.end or alias.end > tokens.len) return error.UnsupportedSqlShape;
+    if (alias_name.start != alias.start + 1 or alias_name.end != alias.end or alias_name.end != alias_name.start + 1) return error.UnsupportedSqlShape;
+    if (!tokens[alias.start].matchesKeywordTag(.as) or tokens[alias_name.start].kind != .identifier) return error.UnsupportedSqlShape;
+    pos.* = alias.end;
+    return try alloc.dupe(u8, tokens[alias_name.start].text);
 }
 
 fn consumeGeneratedProjectionAliasAlloc(
@@ -2285,7 +2303,7 @@ pub fn parseReturningProjectionAlloc(
             };
             var field_owned = true;
             errdefer if (field_owned) alloc.free(field);
-            const alias = try grammar.parseOptionalProjectionAliasAlloc(alloc, tokens, pos);
+            const alias = try parseOptionalGeneratedProjectionAliasAlloc(alloc, tokens, pos, generated_item);
             var alias_owned = true;
             errdefer if (alias_owned) if (alias) |owned| alloc.free(owned);
             if (alias) |output| {
@@ -2450,7 +2468,7 @@ pub fn parseJoinedMutationReturningProjectionAlloc(
             if (try binder.normalizeJoinedMutationReturningSourceFieldAlloc(alloc, schema, joined_source_schema, parsed_field, source_alias)) |source_field| {
                 var source_field_owned = true;
                 errdefer if (source_field_owned) alloc.free(source_field);
-                const alias = try grammar.parseOptionalProjectionAliasAlloc(alloc, tokens, pos);
+                const alias = try parseOptionalGeneratedProjectionAliasAlloc(alloc, tokens, pos, generated_item);
                 var alias_owned = true;
                 errdefer if (alias_owned) if (alias) |owned| alloc.free(owned);
                 const output = alias orelse try alloc.dupe(u8, source_field);
@@ -2471,7 +2489,7 @@ pub fn parseJoinedMutationReturningProjectionAlloc(
                 const field = try binder.normalizeReturningFieldAlloc(alloc, schema, parsed_field, returning_qualifiers);
                 var field_owned = true;
                 errdefer if (field_owned) alloc.free(field);
-                const alias = try grammar.parseOptionalProjectionAliasAlloc(alloc, tokens, pos);
+                const alias = try parseOptionalGeneratedProjectionAliasAlloc(alloc, tokens, pos, generated_item);
                 var alias_owned = true;
                 errdefer if (alias_owned) if (alias) |owned| alloc.free(owned);
                 if (alias) |output| {
@@ -2640,7 +2658,7 @@ pub const SelectListParserOptions = struct {
     field_source: db_mod.types.RelationalRowsExpressionFieldSource = .row,
     select_item_options: SelectItemParserOptions,
     generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst = null,
-    allow_generated_projection_fallback: bool = false,
+    allow_set_operation_right_projection_side: bool = false,
 };
 
 pub const ReturningSelectItemParserOptions = struct {
@@ -2807,7 +2825,7 @@ pub fn parseSelectListAlloc(
         const item_start = pos.*;
         const generated_item = try generatedProjectionItemAtStart(tokens, item_start, options.generated_read_ast);
         if (generated_item == null and options.generated_read_ast != null) {
-            if (!options.allow_generated_projection_fallback or !try generatedSetOperationRightQueryEndedBefore(options.generated_read_ast.?, item_start)) return error.UnsupportedSqlShape;
+            if (!options.allow_set_operation_right_projection_side or !try generatedSetOperationRightProjectionSideEndedBefore(options.generated_read_ast.?, item_start)) return error.UnsupportedSqlShape;
         }
         const generated_expression = if (generated_item) |item| item.expression else null;
         var select_item_options = options.select_item_options;

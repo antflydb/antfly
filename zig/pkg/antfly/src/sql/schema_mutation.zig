@@ -166,21 +166,10 @@ pub fn schemaWithUniqueConstraintValidationStateAlloc(
     return updated;
 }
 
-pub fn schemaWithSecondaryIndexReadyAlloc(
-    alloc: std.mem.Allocator,
-    schema_json: []const u8,
-    index_name: []const u8,
-    expected_generation: u64,
-) ![]u8 {
-    return try schemaWithSecondaryIndexReadyCheckedAlloc(alloc, schema_json, index_name, .{
-        .generation = expected_generation,
-    });
-}
-
 pub const SecondaryIndexReadyExpectation = struct {
     generation: u64,
-    access_method: ?runtime_schema.RelationalIndexAccessMethod = null,
-    schema_fingerprint: ?[]const u8 = null,
+    access_method: runtime_schema.RelationalIndexAccessMethod,
+    schema_fingerprint: []const u8,
 };
 
 pub fn schemaWithSecondaryIndexReadyCheckedAlloc(
@@ -198,39 +187,24 @@ pub fn schemaWithSecondaryIndexReadyCheckedAlloc(
         .object => |*object| object,
         else => return error.InvalidSchemaUpdateRequest,
     };
-    const default_type_value = root.get("default_type") orelse return error.InvalidSchemaUpdateRequest;
-    if (default_type_value != .string) return error.InvalidSchemaUpdateRequest;
-    const document_schemas = root.getPtr("document_schemas") orelse return error.InvalidSchemaUpdateRequest;
-    if (document_schemas.* != .object) return error.InvalidSchemaUpdateRequest;
-    const document_schema = document_schemas.object.getPtr(default_type_value.string) orelse return error.InvalidSchemaUpdateRequest;
-    if (document_schema.* != .object) return error.InvalidSchemaUpdateRequest;
-    const schema = document_schema.object.getPtr("schema") orelse return error.InvalidSchemaUpdateRequest;
-    if (schema.* != .object) return error.InvalidSchemaUpdateRequest;
-    const properties = schema.object.getPtr("properties") orelse return error.InvalidSchemaUpdateRequest;
-    if (properties.* != .object) return error.InvalidSchemaUpdateRequest;
-    const property = schemaPropertyForSecondaryIndex(properties, index_name) orelse return error.SecondaryIndexNotFound;
-    if (property.* != .object) return error.InvalidSchemaUpdateRequest;
+    const index = relationalIndexObjectForSecondaryIndex(root, index_name) orelse return error.SecondaryIndexNotFound;
 
-    const generation_value = property.object.get("x-antfly-index-generation") orelse return error.SecondaryIndexGenerationMismatch;
+    const generation_value = index.get("generation") orelse return error.SecondaryIndexGenerationMismatch;
     if (generation_value != .integer or generation_value.integer <= 0) return error.InvalidSchemaUpdateRequest;
     const generation: u64 = @intCast(generation_value.integer);
     if (generation != expected_generation) return error.SecondaryIndexGenerationMismatch;
 
-    if (expected.access_method) |expected_method| {
-        const access_method_value = property.object.get("x-antfly-index-access-method") orelse return error.SecondaryIndexAccessMethodMismatch;
-        if (access_method_value != .string) return error.InvalidSchemaUpdateRequest;
-        const actual_method = runtime_schema.RelationalIndexAccessMethod.fromString(access_method_value.string) orelse return error.InvalidSchemaUpdateRequest;
-        if (actual_method != expected_method) return error.SecondaryIndexAccessMethodMismatch;
-    }
+    const access_method_value = index.get("access_method") orelse return error.SecondaryIndexAccessMethodMismatch;
+    if (access_method_value != .string) return error.InvalidSchemaUpdateRequest;
+    const actual_method = runtime_schema.RelationalIndexAccessMethod.fromString(access_method_value.string) orelse return error.InvalidSchemaUpdateRequest;
+    if (actual_method != expected.access_method) return error.SecondaryIndexAccessMethodMismatch;
 
-    if (expected.schema_fingerprint) |expected_fingerprint| {
-        if (expected_fingerprint.len == 0) return error.InvalidSchemaUpdateRequest;
-        const fingerprint_value = property.object.get("x-antfly-index-schema-fingerprint") orelse return error.SecondaryIndexSchemaFingerprintMismatch;
-        if (fingerprint_value != .string or fingerprint_value.string.len == 0) return error.InvalidSchemaUpdateRequest;
-        if (!std.mem.eql(u8, fingerprint_value.string, expected_fingerprint)) return error.SecondaryIndexSchemaFingerprintMismatch;
-    }
+    if (expected.schema_fingerprint.len == 0) return error.InvalidSchemaUpdateRequest;
+    const fingerprint_value = index.get("schema_fingerprint") orelse return error.SecondaryIndexSchemaFingerprintMismatch;
+    if (fingerprint_value != .string or fingerprint_value.string.len == 0) return error.InvalidSchemaUpdateRequest;
+    if (!std.mem.eql(u8, fingerprint_value.string, expected.schema_fingerprint)) return error.SecondaryIndexSchemaFingerprintMismatch;
 
-    const lifecycle_value = property.object.getPtr("x-antfly-index-lifecycle") orelse return error.SecondaryIndexNotBuilding;
+    const lifecycle_value = index.getPtr("lifecycle") orelse return error.SecondaryIndexNotBuilding;
     if (lifecycle_value.* != .string) return error.InvalidSchemaUpdateRequest;
     if (!std.mem.eql(u8, lifecycle_value.string, "building") and !std.mem.eql(u8, lifecycle_value.string, "catching_up")) return error.SecondaryIndexNotBuilding;
     lifecycle_value.* = .{ .string = "ready" };
@@ -242,15 +216,16 @@ pub fn schemaWithSecondaryIndexReadyCheckedAlloc(
     return updated;
 }
 
-fn schemaPropertyForSecondaryIndex(properties: *std.json.Value, index_name: []const u8) ?*std.json.Value {
-    if (properties.* != .object) return null;
-    var it = properties.object.iterator();
-    while (it.next()) |entry| {
-        if (entry.value_ptr.* != .object) continue;
-        const declared = entry.value_ptr.object.get("x-antfly-index-name") orelse continue;
-        if (declared == .string and std.mem.eql(u8, declared.string, index_name)) return entry.value_ptr;
+fn relationalIndexObjectForSecondaryIndex(root: *std.json.ObjectMap, index_name: []const u8) ?*std.json.ObjectMap {
+    const indexes = root.getPtr("relational_indexes") orelse return null;
+    if (indexes.* != .array) return null;
+    for (indexes.array.items) |*index_value| {
+        if (index_value.* != .object) continue;
+        const name = index_value.object.get("name") orelse continue;
+        if (name != .string or !std.mem.eql(u8, name.string, index_name)) continue;
+        return &index_value.object;
     }
-    return properties.object.getPtr(index_name);
+    return null;
 }
 
 pub fn schemaVersion(schema_json: []const u8) !u32 {

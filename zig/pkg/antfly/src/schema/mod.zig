@@ -76,11 +76,10 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
     errdefer freeRuntimeForeignKeys(alloc, foreign_keys);
     const unique_constraints = try deriveRuntimeUniqueConstraints(alloc, schema);
     errdefer freeRuntimeUniqueConstraints(alloc, unique_constraints);
-    const relational_indexes = try deriveRuntimeRelationalIndexes(alloc, relational_columns, unique_constraints);
+    const relational_indexes = try cloneRuntimeRelationalIndexes(alloc, schema.relational_indexes);
     errdefer freeRuntimeRelationalIndexes(alloc, relational_indexes);
     const checks = try deriveRuntimeRelationalChecks(alloc, schema);
     errdefer freeRuntimeRelationalChecks(alloc, checks);
-    try validateRuntimeRelationalIndexMetadata(relational_columns, unique_constraints);
     const external_base_source = if (schema.external_base_source) |source| try cloneRuntimeExternalBaseSource(alloc, source) else null;
     errdefer if (external_base_source) |source| storage_schema.freeExternalBaseSource(alloc, source);
     const storage_mode: storage_schema.StorageMode = switch (schema.storage_mode) {
@@ -249,11 +248,12 @@ fn deriveRuntimeRelationalColumns(alloc: std.mem.Allocator, schema: ParsedTableS
         columns.deinit(alloc);
     }
 
+    const embedded_index_metadata = schema.storage_mode == .document;
     for (schema.document_schemas) |document_schema| {
         for (document_schema.properties) |property| {
             const required = requiredFieldsContain(document_schema.required_fields, property.name);
-            try appendRuntimeRelationalColumnForProperty(alloc, &columns, property, property.name, required, false);
-            try appendRuntimeRelationalColumnAliasesForPropertyChildren(alloc, &columns, property, property.name, required);
+            try appendRuntimeRelationalColumnForProperty(alloc, &columns, property, property.name, required, false, embedded_index_metadata);
+            try appendRuntimeRelationalColumnAliasesForPropertyChildren(alloc, &columns, property, property.name, required, embedded_index_metadata);
         }
     }
 
@@ -266,15 +266,16 @@ fn appendRuntimeRelationalColumnAliasesForPropertyChildren(
     property: anytype,
     path: []const u8,
     parent_required: bool,
+    embedded_index_metadata: bool,
 ) !void {
     for (property.properties) |child| {
         const child_path = try appendPath(alloc, path, child.name);
         defer alloc.free(child_path);
         const child_required = parent_required and requiredFieldsContain(property.required_fields, child.name);
         if (child.sql_column_name != null) {
-            try appendRuntimeRelationalColumnForProperty(alloc, columns, child, child_path, child_required, true);
+            try appendRuntimeRelationalColumnForProperty(alloc, columns, child, child_path, child_required, true, embedded_index_metadata);
         }
-        try appendRuntimeRelationalColumnAliasesForPropertyChildren(alloc, columns, child, child_path, child_required);
+        try appendRuntimeRelationalColumnAliasesForPropertyChildren(alloc, columns, child, child_path, child_required, embedded_index_metadata);
     }
 }
 
@@ -285,6 +286,7 @@ fn appendRuntimeRelationalColumnForProperty(
     path: []const u8,
     required: bool,
     require_column: bool,
+    embedded_index_metadata: bool,
 ) !void {
     const field_type = runtimeRelationalColumnType(property) orelse {
         if (require_column) return error.InvalidSchemaUpdateRequest;
@@ -302,10 +304,6 @@ fn appendRuntimeRelationalColumnForProperty(
     const owned_path = try alloc.dupe(u8, path);
     var path_owned = true;
     errdefer if (path_owned) alloc.free(owned_path);
-    const index_access_method = runtimeRelationalIndexAccessMethodForProperty(property);
-    const index_schema_fingerprint = try runtimeRelationalIndexSchemaFingerprintAlloc(alloc, property);
-    var index_schema_fingerprint_owned = true;
-    errdefer if (index_schema_fingerprint_owned) if (index_schema_fingerprint) |fingerprint| alloc.free(fingerprint);
     var column: storage_schema.RelationalColumn = .{
         .name = name,
         .path = owned_path,
@@ -313,41 +311,36 @@ fn appendRuntimeRelationalColumnForProperty(
         .array_item_type = runtimeRelationalArrayItemType(property),
         .nullable = nullable,
         .collation = if (property.collation) |collation| try alloc.dupe(u8, collation) else null,
-        .indexed = if (property.antfly_index) |indexed| indexed else true,
-        .index_lifecycle = runtimeRelationalIndexLifecycle(property.index_lifecycle),
-        .index_generation = property.index_generation orelse 0,
-        .index_access_method = index_access_method,
+        .indexed = if (embedded_index_metadata) property.antfly_index orelse true else false,
+        .index_lifecycle = if (embedded_index_metadata and property.index_lifecycle != null) switch (property.index_lifecycle.?) {
+            .ready => .ready,
+            .building => .building,
+            .invalid => .invalid,
+            .dropping => .dropping,
+            .catching_up => .catching_up,
+            .stale => .stale,
+            .rebuild_required => .rebuild_required,
+            .failed => .failed,
+        } else .ready,
+        .index_generation = if (embedded_index_metadata) property.index_generation orelse 0 else 0,
+        .index_name = if (embedded_index_metadata) if (property.index_name) |index_name| try alloc.dupe(u8, index_name) else null else null,
+        .index_access_method = if (embedded_index_metadata) property.index_access_method else null,
+        .index_schema_fingerprint = if (embedded_index_metadata) if (property.index_schema_fingerprint) |fingerprint| try alloc.dupe(u8, fingerprint) else null else null,
+        .index_include_columns = if (embedded_index_metadata) try cloneStringSlice(alloc, property.index_include_columns) else &.{},
+        .index_keys = if (embedded_index_metadata) try cloneRelationalIndexKeys(alloc, property.index_keys) else &.{},
         .cardinality_proof = property.cardinality_proof,
     };
     name_owned = false;
     path_owned = false;
     var column_owned = true;
     errdefer if (column_owned) freeRuntimeRelationalColumn(alloc, column);
-    column.index_name = if (property.index_name) |index_name| try alloc.dupe(u8, index_name) else null;
-    column.index_schema_fingerprint = index_schema_fingerprint;
-    index_schema_fingerprint_owned = false;
-    column.index_include_columns = try cloneStringSlice(alloc, property.index_include_columns);
-    column.index_keys = try cloneRelationalIndexKeys(alloc, property.index_keys);
     column.default_value = if (property.default_value) |default_value| try cloneRelationalDefaultValue(alloc, default_value) else null;
     column.on_update_value = if (property.on_update_value) |on_update_value| try cloneRelationalDefaultValue(alloc, on_update_value) else null;
     column.generated = if (property.generated) |generated| try cloneRelationalGeneratedValue(alloc, generated) else null;
-    column.index_where = try cloneUniquePredicates(alloc, property.index_where);
-    column.index_where_expressions = try cloneRelationalRowsExpressionConditionsAlloc(alloc, property.index_where_expressions);
+    column.index_where = if (embedded_index_metadata) try cloneStorageUniquePredicatesFromImpl(alloc, property.index_where) else &.{};
+    column.index_where_expressions = if (embedded_index_metadata) try cloneRelationalRowsExpressionConditionsAlloc(alloc, property.index_where_expressions) else &.{};
     try columns.append(alloc, column);
     column_owned = false;
-}
-
-fn runtimeRelationalIndexAccessMethodForProperty(property: anytype) ?storage_schema.RelationalIndexAccessMethod {
-    if (property.index_access_method) |access_method| return access_method;
-    if (property.index_name == null) return null;
-    if (property.index_keys.len == 0) return .scalar_column;
-    return .ordered_tuple;
-}
-
-fn runtimeRelationalIndexSchemaFingerprintAlloc(alloc: std.mem.Allocator, property: anytype) !?[]u8 {
-    if (property.index_schema_fingerprint) |fingerprint| return try alloc.dupe(u8, fingerprint);
-    const index_name = property.index_name orelse return null;
-    return try std.fmt.allocPrint(alloc, "legacy-secondary-index-v1:{s}", .{index_name});
 }
 
 fn runtimeRelationalColumnNameExists(columns: []const storage_schema.RelationalColumn, name: []const u8) bool {
@@ -357,106 +350,45 @@ fn runtimeRelationalColumnNameExists(columns: []const storage_schema.RelationalC
     return false;
 }
 
-fn runtimeRelationalColumnForField(columns: []const storage_schema.RelationalColumn, field: []const u8) ?storage_schema.RelationalColumn {
-    for (columns) |column| {
-        if (std.mem.eql(u8, column.name, field) or std.mem.eql(u8, column.path, field)) return column;
-    }
-    return null;
-}
-
-fn deriveRuntimeRelationalIndexes(
+fn cloneRuntimeRelationalIndexes(
     alloc: std.mem.Allocator,
-    columns: []const storage_schema.RelationalColumn,
-    unique_constraints: []const storage_schema.UniqueConstraint,
+    indexes: []const storage_schema.RelationalIndex,
 ) ![]const storage_schema.RelationalIndex {
-    var indexes = std.ArrayListUnmanaged(storage_schema.RelationalIndex).empty;
+    if (indexes.len == 0) return &.{};
+    const out = try alloc.alloc(storage_schema.RelationalIndex, indexes.len);
+    var initialized: usize = 0;
     errdefer {
-        for (indexes.items) |index| freeRuntimeRelationalIndex(alloc, index);
-        indexes.deinit(alloc);
+        for (out[0..initialized]) |index| freeRuntimeRelationalIndex(alloc, index);
+        alloc.free(out);
     }
-
-    for (columns) |column| {
-        if (!runtimeColumnHasRelationalIndexCatalogEntry(column)) continue;
-        const index_name = column.index_name orelse column.name;
-        const access_method = runtimeRelationalColumnIndexAccessMethod(column);
-        const index_columns = [_][]const u8{column.name};
-        const name = try alloc.dupe(u8, index_name);
-        var name_owned = true;
-        errdefer if (name_owned) alloc.free(name);
-        const owner_name = try alloc.dupe(u8, column.name);
-        var owner_name_owned = true;
-        errdefer if (owner_name_owned) alloc.free(owner_name);
-        const index: storage_schema.RelationalIndex = .{
-            .name = name,
-            .owner_kind = .relational_column,
-            .owner_name = owner_name,
-            .access_method = access_method,
-            .unique = false,
-            .columns = try cloneStringSlice(alloc, index_columns[0..]),
-            .include_columns = try cloneStringSlice(alloc, column.index_include_columns),
-            .keys = try cloneRelationalIndexKeys(alloc, column.index_keys),
-            .lifecycle = column.index_lifecycle,
-            .generation = column.index_generation,
-            .schema_fingerprint = if (column.index_schema_fingerprint) |fingerprint| try alloc.dupe(u8, fingerprint) else null,
-            .where = try cloneStorageUniquePredicates(alloc, column.index_where),
-            .where_expressions = try cloneRelationalRowsExpressionConditionsAlloc(alloc, column.index_where_expressions),
-        };
-        name_owned = false;
-        owner_name_owned = false;
-        var index_owned = true;
-        errdefer if (index_owned) freeRuntimeRelationalIndex(alloc, index);
-        try indexes.append(alloc, index);
-        index_owned = false;
+    for (indexes) |index| {
+        out[initialized] = try cloneRuntimeRelationalIndex(alloc, index);
+        initialized += 1;
     }
-
-    for (unique_constraints) |constraint| {
-        const name = try alloc.dupe(u8, constraint.name);
-        var name_owned = true;
-        errdefer if (name_owned) alloc.free(name);
-        const owner_name = try alloc.dupe(u8, constraint.name);
-        var owner_name_owned = true;
-        errdefer if (owner_name_owned) alloc.free(owner_name);
-        const index: storage_schema.RelationalIndex = .{
-            .name = name,
-            .owner_kind = .unique_constraint,
-            .owner_name = owner_name,
-            .access_method = constraint.index_access_method orelse .ordered_tuple,
-            .unique = true,
-            .columns = try cloneStringSlice(alloc, constraint.columns),
-            .expressions = try cloneStorageUniqueExpressions(alloc, constraint.expressions),
-            .include_columns = try cloneStringSlice(alloc, constraint.include_columns),
-            .keys = try cloneRelationalIndexKeys(alloc, constraint.index_keys),
-            .lifecycle = constraint.index_lifecycle,
-            .generation = constraint.index_generation,
-            .schema_fingerprint = if (constraint.index_schema_fingerprint) |fingerprint| try alloc.dupe(u8, fingerprint) else null,
-            .where = try cloneStorageUniquePredicates(alloc, constraint.where),
-            .where_expressions = try cloneRelationalRowsExpressionConditionsAlloc(alloc, constraint.where_expressions),
-        };
-        name_owned = false;
-        owner_name_owned = false;
-        var index_owned = true;
-        errdefer if (index_owned) freeRuntimeRelationalIndex(alloc, index);
-        try indexes.append(alloc, index);
-        index_owned = false;
-    }
-
-    return try indexes.toOwnedSlice(alloc);
+    return out;
 }
 
-fn runtimeColumnHasRelationalIndexCatalogEntry(column: storage_schema.RelationalColumn) bool {
-    return column.indexed or
-        column.index_name != null or
-        column.index_access_method != null or
-        column.index_keys.len != 0 or
-        column.index_include_columns.len != 0 or
-        column.index_where.len != 0 or
-        column.index_where_expressions.len != 0;
-}
-
-fn runtimeRelationalColumnIndexAccessMethod(column: storage_schema.RelationalColumn) storage_schema.RelationalIndexAccessMethod {
-    if (column.index_access_method) |access_method| return access_method;
-    if (column.index_keys.len != 0) return .ordered_tuple;
-    return .scalar_column;
+fn cloneRuntimeRelationalIndex(
+    alloc: std.mem.Allocator,
+    index: storage_schema.RelationalIndex,
+) !storage_schema.RelationalIndex {
+    return .{
+        .name = try alloc.dupe(u8, index.name),
+        .owner_kind = index.owner_kind,
+        .owner_name = try alloc.dupe(u8, index.owner_name),
+        .access_method = index.access_method,
+        .method_config_json = if (index.method_config_json) |config| try alloc.dupe(u8, config) else null,
+        .unique = index.unique,
+        .columns = try cloneStringSlice(alloc, index.columns),
+        .expressions = try cloneStorageUniqueExpressions(alloc, index.expressions),
+        .include_columns = try cloneStringSlice(alloc, index.include_columns),
+        .keys = try cloneRelationalIndexKeys(alloc, index.keys),
+        .lifecycle = index.lifecycle,
+        .generation = index.generation,
+        .schema_fingerprint = if (index.schema_fingerprint) |fingerprint| try alloc.dupe(u8, fingerprint) else null,
+        .where = try cloneStorageUniquePredicates(alloc, index.where),
+        .where_expressions = try cloneRelationalRowsExpressionConditionsAlloc(alloc, index.where_expressions),
+    };
 }
 
 fn freeRuntimeRelationalIndexes(alloc: std.mem.Allocator, indexes: []const storage_schema.RelationalIndex) void {
@@ -467,6 +399,7 @@ fn freeRuntimeRelationalIndexes(alloc: std.mem.Allocator, indexes: []const stora
 fn freeRuntimeRelationalIndex(alloc: std.mem.Allocator, index: storage_schema.RelationalIndex) void {
     alloc.free(index.name);
     alloc.free(index.owner_name);
+    if (index.method_config_json) |config| alloc.free(config);
     for (index.columns) |column| alloc.free(column);
     if (index.columns.len > 0) alloc.free(index.columns);
     freeStorageUniqueExpressions(alloc, index.expressions);
@@ -476,132 +409,6 @@ fn freeRuntimeRelationalIndex(alloc: std.mem.Allocator, index: storage_schema.Re
     if (index.schema_fingerprint) |fingerprint| alloc.free(fingerprint);
     freeStorageUniquePredicates(alloc, index.where);
     freeRelationalRowsExpressionConditions(alloc, index.where_expressions);
-}
-
-fn validateRuntimeRelationalIndexMetadata(
-    columns: []const storage_schema.RelationalColumn,
-    unique_constraints: []const storage_schema.UniqueConstraint,
-) !void {
-    for (columns) |column| {
-        try validateRuntimeRelationalColumnIndexIdentity(columns, column);
-        try validateRuntimeRelationalIndexKeys(columns, column.index_keys);
-        try validateRuntimeRelationalFieldReferences(columns, column.index_include_columns);
-        try validateRuntimeRelationalPredicates(columns, column.index_where);
-        try validateRuntimeRelationalExpressionConditions(columns, column.index_where_expressions);
-    }
-    for (unique_constraints) |constraint| {
-        try validateRuntimeRelationalUniqueIndexIdentity(constraint);
-        try validateRuntimeRelationalFieldReferences(columns, constraint.columns);
-        try validateRuntimeRelationalUniqueExpressions(columns, constraint.expressions);
-        try validateRuntimeRelationalFieldReferences(columns, constraint.include_columns);
-        try validateRuntimeRelationalIndexKeys(columns, constraint.index_keys);
-        try validateRuntimeRelationalPredicates(columns, constraint.where);
-        try validateRuntimeRelationalExpressionConditions(columns, constraint.where_expressions);
-    }
-}
-
-fn validateRuntimeRelationalUniqueIndexIdentity(
-    constraint: storage_schema.UniqueConstraint,
-) !void {
-    if (constraint.index_generation == 0 and constraint.index_access_method == null and constraint.index_schema_fingerprint == null and constraint.index_lifecycle == .ready) return;
-    if (constraint.index_generation == 0) return error.InvalidSchemaUpdateRequest;
-    const access_method = constraint.index_access_method orelse return error.InvalidSchemaUpdateRequest;
-    const fingerprint = constraint.index_schema_fingerprint orelse return error.InvalidSchemaUpdateRequest;
-    if (fingerprint.len == 0) return error.InvalidSchemaUpdateRequest;
-    switch (access_method) {
-        .ordered_tuple => if (constraint.columns.len + constraint.expressions.len == 0) return error.InvalidSchemaUpdateRequest,
-        .scalar_column, .algebraic_filter, .text_search => return error.InvalidSchemaUpdateRequest,
-    }
-}
-
-fn validateRuntimeRelationalColumnIndexIdentity(
-    columns: []const storage_schema.RelationalColumn,
-    column: storage_schema.RelationalColumn,
-) !void {
-    const index_name = column.index_name orelse return;
-    const has_access_method_identity = column.index_schema_fingerprint != null or column.index_generation != 0 or column.index_keys.len != 0;
-    if (!has_access_method_identity) return;
-    if (column.index_generation == 0 and column.index_keys.len == 0) {
-        if (column.index_schema_fingerprint) |fingerprint| {
-            if (std.mem.startsWith(u8, fingerprint, "legacy-secondary-index-v1:")) return;
-        }
-    }
-    if (column.index_generation == 0) return error.InvalidSchemaUpdateRequest;
-    const access_method = column.index_access_method orelse return error.InvalidSchemaUpdateRequest;
-    const fingerprint = column.index_schema_fingerprint orelse return error.InvalidSchemaUpdateRequest;
-    if (fingerprint.len == 0) return error.InvalidSchemaUpdateRequest;
-    switch (access_method) {
-        .ordered_tuple => if (column.index_keys.len == 0) return error.InvalidSchemaUpdateRequest,
-        .scalar_column, .algebraic_filter, .text_search => if (column.index_keys.len != 0) return error.InvalidSchemaUpdateRequest,
-    }
-    for (columns) |candidate| {
-        const candidate_index_name = candidate.index_name orelse continue;
-        if (!std.mem.eql(u8, candidate_index_name, index_name)) continue;
-        if (candidate.index_access_method == null) return error.InvalidSchemaUpdateRequest;
-        if (candidate.index_access_method.? != access_method) return error.InvalidSchemaUpdateRequest;
-        if (candidate.index_generation != column.index_generation) return error.InvalidSchemaUpdateRequest;
-        const candidate_fingerprint = candidate.index_schema_fingerprint orelse return error.InvalidSchemaUpdateRequest;
-        if (!std.mem.eql(u8, candidate_fingerprint, fingerprint)) return error.InvalidSchemaUpdateRequest;
-    }
-}
-
-fn validateRuntimeRelationalIndexKeys(
-    columns: []const storage_schema.RelationalColumn,
-    keys: []const storage_schema.RelationalIndexKey,
-) !void {
-    for (keys) |key| if (runtimeRelationalColumnForField(columns, key.column) == null) return error.InvalidSchemaUpdateRequest;
-}
-
-fn validateRuntimeRelationalFieldReferences(
-    columns: []const storage_schema.RelationalColumn,
-    fields: []const []const u8,
-) !void {
-    for (fields) |field| if (runtimeRelationalColumnForField(columns, field) == null) return error.InvalidSchemaUpdateRequest;
-}
-
-fn validateRuntimeRelationalPredicates(
-    columns: []const storage_schema.RelationalColumn,
-    predicates: []const storage_schema.UniquePredicate,
-) !void {
-    for (predicates) |predicate| if (runtimeRelationalColumnForField(columns, predicate.field) == null) return error.InvalidSchemaUpdateRequest;
-}
-
-fn validateRuntimeRelationalUniqueExpressions(
-    columns: []const storage_schema.RelationalColumn,
-    expressions: []const storage_schema.UniqueExpression,
-) !void {
-    for (expressions) |expression| {
-        switch (expression.op) {
-            .lower, .upper, .md5 => if (runtimeRelationalColumnForField(columns, expression.field) == null) return error.InvalidSchemaUpdateRequest,
-            .expression => if (expression.expression) |row_expression| try validateRuntimeRelationalExpression(columns, row_expression) else return error.InvalidSchemaUpdateRequest,
-        }
-    }
-}
-
-fn validateRuntimeRelationalExpressionConditions(
-    columns: []const storage_schema.RelationalColumn,
-    conditions: []const storage_schema.RelationalRowsExpressionCondition,
-) !void {
-    for (conditions) |condition| {
-        try validateRuntimeRelationalExpression(columns, condition.lhs);
-        for (condition.rhs) |rhs| try validateRuntimeRelationalExpression(columns, rhs);
-    }
-}
-
-fn validateRuntimeRelationalExpression(
-    columns: []const storage_schema.RelationalColumn,
-    expression: storage_schema.RelationalRowsExpression,
-) !void {
-    if (expression.field.len != 0 and expression.field_source == .row and runtimeRelationalColumnForField(columns, expression.field) == null) {
-        return error.InvalidSchemaUpdateRequest;
-    }
-    for (expression.operands) |operand| try validateRuntimeRelationalExpression(columns, operand);
-    for (expression.case_branches) |branch| {
-        try validateRuntimeRelationalExpression(columns, branch.when.lhs);
-        for (branch.when.rhs) |rhs| try validateRuntimeRelationalExpression(columns, rhs);
-        try validateRuntimeRelationalExpression(columns, branch.then);
-    }
-    for (expression.case_else) |fallback| try validateRuntimeRelationalExpression(columns, fallback);
 }
 
 fn runtimeRelationalColumnSupportsCollation(field_type: storage_schema.AntflyType) bool {
@@ -914,20 +721,6 @@ fn deriveRuntimeUniqueConstraints(alloc: std.mem.Allocator, schema: ParsedTableS
             .columns = try cloneStringSlice(alloc, constraint.columns),
             .expressions = try cloneUniqueExpressions(alloc, constraint.expressions),
             .include_columns = try cloneStringSlice(alloc, constraint.include_columns),
-            .index_keys = try cloneRelationalIndexKeys(alloc, constraint.index_keys),
-            .index_lifecycle = switch (constraint.index_lifecycle) {
-                .ready => .ready,
-                .building => .building,
-                .invalid => .invalid,
-                .dropping => .dropping,
-                .catching_up => .catching_up,
-                .stale => .stale,
-                .rebuild_required => .rebuild_required,
-                .failed => .failed,
-            },
-            .index_generation = constraint.index_generation,
-            .index_access_method = constraint.index_access_method,
-            .index_schema_fingerprint = if (constraint.index_schema_fingerprint) |fingerprint| try alloc.dupe(u8, fingerprint) else null,
             .without_overlaps_period = if (constraint.without_overlaps_period) |period| try alloc.dupe(u8, period) else null,
             .nulls_not_distinct = constraint.nulls_not_distinct,
             .deferrable = constraint.deferrable,
@@ -961,8 +754,6 @@ fn freeRuntimeUniqueConstraints(alloc: std.mem.Allocator, constraints: []storage
         if (constraint.expressions.len > 0) alloc.free(constraint.expressions);
         for (constraint.include_columns) |column| alloc.free(column);
         if (constraint.include_columns.len > 0) alloc.free(constraint.include_columns);
-        storage_schema.freeRelationalIndexKeySlice(alloc, constraint.index_keys);
-        if (constraint.index_schema_fingerprint) |fingerprint| alloc.free(fingerprint);
         if (constraint.without_overlaps_period) |period| alloc.free(period);
         for (constraint.where) |predicate| {
             alloc.free(predicate.field);
@@ -1296,6 +1087,36 @@ fn cloneStorageUniquePredicates(
     return out;
 }
 
+fn cloneStorageUniquePredicatesFromImpl(
+    alloc: std.mem.Allocator,
+    values: []const impl.UniquePredicate,
+) ![]const storage_schema.UniquePredicate {
+    if (values.len == 0) return &.{};
+    const out = try alloc.alloc(storage_schema.UniquePredicate, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |predicate| {
+            alloc.free(predicate.field);
+            if (predicate.value_json) |value_json| alloc.free(value_json);
+        }
+        alloc.free(out);
+    }
+    for (values) |value| {
+        out[initialized] = .{
+            .field = try alloc.dupe(u8, value.field),
+            .op = switch (value.op) {
+                .is_null => .is_null,
+                .is_not_null => .is_not_null,
+                .eq => .eq,
+                .ne => .ne,
+            },
+            .value_json = if (value.value_json) |value_json| try alloc.dupe(u8, value_json) else null,
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
 fn freeStorageUniquePredicates(alloc: std.mem.Allocator, values: []const storage_schema.UniquePredicate) void {
     for (values) |predicate| {
         alloc.free(predicate.field);
@@ -1376,19 +1197,6 @@ fn runtimeRelationalArrayItemType(property: anytype) ?storage_schema.AntflyType 
     if (property.field_type == null or !std.mem.eql(u8, property.field_type.?, "array")) return null;
     const item = property.item orelse return null;
     return runtimeRelationalColumnType(item.*);
-}
-
-fn runtimeRelationalIndexLifecycle(lifecycle: ?impl.RelationalIndexLifecycle) storage_schema.RelationalIndexLifecycle {
-    return switch (lifecycle orelse .ready) {
-        .ready => .ready,
-        .building => .building,
-        .invalid => .invalid,
-        .dropping => .dropping,
-        .catching_up => .catching_up,
-        .stale => .stale,
-        .rebuild_required => .rebuild_required,
-        .failed => .failed,
-    };
 }
 
 fn requiredFieldsContain(required_fields: []const []const u8, name: []const u8) bool {
@@ -2060,11 +1868,26 @@ test "deriveRuntimeTableSchema rejects invalid document join cardinality proofs"
         try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseValidatedTableSchema(alloc, schema_json));
     }
 
-    var mismatched_fingerprint = try parseValidatedTableSchema(alloc,
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword","x-antfly-index-name":"tenant_status_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":7,"x-antfly-index-schema-fingerprint":"secondary-index-v1:left","x-antfly-index-keys":[{"column":"tenant_id"},{"column":"status"}]},"status":{"type":"keyword","x-antfly-index-name":"tenant_status_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":7,"x-antfly-index-schema-fingerprint":"secondary-index-v1:right","x-antfly-index-keys":[{"column":"tenant_id"},{"column":"status"}]}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
-    );
-    defer mismatched_fingerprint.deinit(alloc);
-    try std.testing.expectError(error.InvalidSchemaUpdateRequest, deriveRuntimeTableSchema(alloc, mismatched_fingerprint));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseValidatedTableSchema(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_status_idx","owner_kind":"relational_column","owner_name":"tenant_id","access_method":"scalar_column","columns":["tenant_id"]}]}
+    ));
+    const invalid_relational_embedded_index_schemas = [_][]const u8{
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index":false}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        ,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-name":"status_idx"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        ,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-lifecycle":"ready"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        ,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-keys":[{"column":"status"}]}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        ,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-where":{"all":[{"field":"status","op":"is_not_null"}]}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        ,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-where-expressions":[{"lhs":{"field":"status"},"op":"is_not_null"}]}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        ,
+    };
+    for (invalid_relational_embedded_index_schemas) |schema_json| {
+        try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseValidatedTableSchema(alloc, schema_json));
+    }
 }
 
 test "deriveRuntimeTableSchema rejects invalid or duplicate document SQL column aliases" {
@@ -2129,7 +1952,7 @@ test "deriveRuntimeTableSchema carries relational system-versioned marker" {
 test "deriveRuntimeTableSchema carries relational storage mode and column catalog" {
     const alloc = std.testing.allocator;
     var parsed = try parseValidatedTableSchema(alloc,
-        \\{"version":3,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword","collation":"C"},"tenant_id":{"type":"keyword"},"customer_id":{"type":"keyword","x-antfly-index-lifecycle":"building","x-antfly-index-generation":99,"x-antfly-index-name":"customer_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:customer","x-antfly-index-keys":[{"column":"customer_id","direction":"desc","nulls":"last"},{"column":"tenant_id","direction":"asc","nulls":"first"}],"x-antfly-index-where":{"all":[{"field":"tenant_id","op":"is_not_null"}]}},"amount":{"type":"numeric","x-antfly-index":false},"created_at":{"type":"datetime","x-antfly-on-update":{"op":"now_ns"}},"tags":{"type":"array","items":{"type":"keyword"}},"attrs":{"type":"object","properties":{"k":{"type":"keyword"}}},"payload":{"type":"json"}},"required":["id","tenant_id"],"additionalProperties":false}}},"primary_key":{"name":"orders_pkey","columns":["tenant_id","id"],"include_columns":["created_at","customer_id"]},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict","on_update":"no_action"}],"checks":[{"name":"tenant_case_match","field":"tenant_id","op":"eq","value":"TENANT","collation":"antfly.case_insensitive"}]}
+        \\{"version":3,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword","collation":"C"},"tenant_id":{"type":"keyword"},"customer_id":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"datetime","x-antfly-on-update":{"op":"now_ns"}},"tags":{"type":"array","items":{"type":"keyword"}},"attrs":{"type":"object","properties":{"k":{"type":"keyword"}}},"payload":{"type":"json"}},"required":["id","tenant_id"],"additionalProperties":false}}},"primary_key":{"name":"orders_pkey","columns":["tenant_id","id"],"include_columns":["created_at","customer_id"]},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict","on_update":"no_action"}],"checks":[{"name":"tenant_case_match","field":"tenant_id","op":"eq","value":"TENANT","collation":"antfly.case_insensitive"}],"relational_indexes":[{"name":"customer_idx","owner_kind":"relational_column","owner_name":"customer_id","access_method":"ordered_tuple","columns":["customer_id"],"keys":[{"column":"customer_id","direction":"desc","nulls":"last"},{"column":"tenant_id","direction":"asc","nulls":"first"}],"lifecycle":"building","generation":99,"schema_fingerprint":"secondary-index-v1:customer","where":{"all":[{"field":"tenant_id","op":"is_not_null"}]}}]}
     );
     defer parsed.deinit(alloc);
 
@@ -2146,21 +1969,24 @@ test "deriveRuntimeTableSchema carries relational storage mode and column catalo
     try std.testing.expect(!id.nullable); // required
     try std.testing.expect(id.indexed);
     const customer_id = findRuntimeColumn(runtime, "customer_id").?;
-    try std.testing.expectEqualStrings("customer_idx", customer_id.index_name.?);
-    try std.testing.expectEqual(@as(usize, 2), customer_id.index_keys.len);
-    try std.testing.expectEqualStrings("customer_id", customer_id.index_keys[0].column);
-    try std.testing.expectEqual(storage_schema.RelationalIndexKeyDirection.desc, customer_id.index_keys[0].direction);
-    try std.testing.expectEqual(storage_schema.RelationalIndexKeyNulls.last, customer_id.index_keys[0].nulls);
-    try std.testing.expectEqualStrings("tenant_id", customer_id.index_keys[1].column);
-    try std.testing.expectEqual(storage_schema.RelationalIndexKeyDirection.asc, customer_id.index_keys[1].direction);
-    try std.testing.expectEqual(storage_schema.RelationalIndexKeyNulls.first, customer_id.index_keys[1].nulls);
-    try std.testing.expectEqual(@as(usize, 1), customer_id.index_where.len);
-    try std.testing.expectEqual(storage_schema.RelationalIndexLifecycle.building, customer_id.index_lifecycle);
-    try std.testing.expectEqual(@as(u64, 99), customer_id.index_generation);
-    try std.testing.expectEqual(storage_schema.RelationalIndexAccessMethod.ordered_tuple, customer_id.index_access_method.?);
-    try std.testing.expectEqualStrings("secondary-index-v1:customer", customer_id.index_schema_fingerprint.?);
-    try std.testing.expectEqualStrings("tenant_id", customer_id.index_where[0].field);
-    try std.testing.expectEqual(storage_schema.UniquePredicateOp.is_not_null, customer_id.index_where[0].op);
+    try std.testing.expect(customer_id.index_name == null);
+    const customer_idx = findRuntimeRelationalIndex(runtime, "customer_idx") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(storage_schema.RelationalIndexOwnerKind.relational_column, customer_idx.owner_kind);
+    try std.testing.expectEqualStrings("customer_id", customer_idx.owner_name);
+    try std.testing.expectEqual(@as(usize, 2), customer_idx.keys.len);
+    try std.testing.expectEqualStrings("customer_id", customer_idx.keys[0].column);
+    try std.testing.expectEqual(storage_schema.RelationalIndexKeyDirection.desc, customer_idx.keys[0].direction);
+    try std.testing.expectEqual(storage_schema.RelationalIndexKeyNulls.last, customer_idx.keys[0].nulls);
+    try std.testing.expectEqualStrings("tenant_id", customer_idx.keys[1].column);
+    try std.testing.expectEqual(storage_schema.RelationalIndexKeyDirection.asc, customer_idx.keys[1].direction);
+    try std.testing.expectEqual(storage_schema.RelationalIndexKeyNulls.first, customer_idx.keys[1].nulls);
+    try std.testing.expectEqual(@as(usize, 1), customer_idx.where.len);
+    try std.testing.expectEqual(storage_schema.RelationalIndexLifecycle.building, customer_idx.lifecycle);
+    try std.testing.expectEqual(@as(u64, 99), customer_idx.generation);
+    try std.testing.expectEqual(storage_schema.RelationalIndexAccessMethod.ordered_tuple, customer_idx.access_method);
+    try std.testing.expectEqualStrings("secondary-index-v1:customer", customer_idx.schema_fingerprint.?);
+    try std.testing.expectEqualStrings("tenant_id", customer_idx.where[0].field);
+    try std.testing.expectEqual(storage_schema.UniquePredicateOp.is_not_null, customer_idx.where[0].op);
     try std.testing.expect(runtime.primary_key != null);
     try std.testing.expectEqualStrings("orders_pkey", runtime.primary_key.?.name.?);
     try std.testing.expectEqual(@as(usize, 2), runtime.primary_key.?.columns.len);
@@ -2171,7 +1997,7 @@ test "deriveRuntimeTableSchema carries relational storage mode and column catalo
     try std.testing.expectEqualStrings("customer_id", runtime.primary_key.?.include_columns[1]);
     try std.testing.expectEqual(storage_schema.AntflyType.numeric, findRuntimeColumn(runtime, "amount").?.field_type);
     try std.testing.expect(findRuntimeColumn(runtime, "amount").?.nullable);
-    try std.testing.expect(!findRuntimeColumn(runtime, "amount").?.indexed);
+    try std.testing.expect(findRuntimeColumn(runtime, "amount").?.indexed);
     try std.testing.expectEqual(storage_schema.AntflyType.datetime, findRuntimeColumn(runtime, "created_at").?.field_type);
     try std.testing.expect(findRuntimeColumn(runtime, "created_at").?.on_update_value != null);
     try std.testing.expectEqual(storage_schema.RelationalDefaultKind.now_ns, findRuntimeColumn(runtime, "created_at").?.on_update_value.?.kind);
@@ -2196,33 +2022,35 @@ test "parseValidatedTableSchema rejects malformed relational index metadata refe
     const alloc = std.testing.allocator;
 
     const invalid_schemas = [_][]const u8{
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-name":"status_missing_method_idx","x-antfly-index-generation":1,"x-antfly-index-schema-fingerprint":"secondary-index-v1:missing_method","x-antfly-index-keys":[{"column":"status"}]}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_missing_method_idx","owner_kind":"relational_column","owner_name":"status","access_method":"scalar_column","columns":["status"],"keys":[{"column":"status"}],"generation":1,"schema_fingerprint":"secondary-index-v1:missing_method"}]}
         ,
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-name":"status_unknown_method_idx","x-antfly-index-access-method":"btree","x-antfly-index-generation":1,"x-antfly-index-schema-fingerprint":"secondary-index-v1:unknown_method","x-antfly-index-keys":[{"column":"status"}]}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_unknown_method_idx","owner_kind":"relational_column","owner_name":"status","access_method":"btree","columns":["status"],"keys":[{"column":"status"}],"generation":1,"schema_fingerprint":"secondary-index-v1:unknown_method"}]}
         ,
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-name":"status_missing_generation_idx","x-antfly-index-access-method":"scalar_column","x-antfly-index-schema-fingerprint":"secondary-index-v1:missing_generation"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_missing_generation_idx","owner_kind":"relational_column","owner_name":"status","access_method":"scalar_column","columns":["status"],"schema_fingerprint":"secondary-index-v1:missing_generation"}]}
         ,
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword","x-antfly-index-name":"tenant_status_half_declared_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":1,"x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_status_half_declared","x-antfly-index-keys":[{"column":"tenant_id"},{"column":"status"}]},"status":{"type":"keyword","x-antfly-index-name":"tenant_status_half_declared_idx"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_status_half_declared_idx","owner_kind":"relational_column","owner_name":"tenant_id","access_method":"ordered_tuple","columns":["tenant_id"],"keys":[{"column":"tenant_id"},{"column":"status"}],"lifecycle":"ready","generation":1,"schema_fingerprint":"secondary-index-v1:tenant_status_half_declared"},{"name":"tenant_status_half_declared_idx","owner_kind":"relational_column","owner_name":"status","access_method":"scalar_column","columns":["status"]}]}
         ,
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-name":"status_scalar_tuple_idx","x-antfly-index-access-method":"scalar_column","x-antfly-index-generation":1,"x-antfly-index-schema-fingerprint":"secondary-index-v1:scalar_tuple","x-antfly-index-keys":[{"column":"status"}]}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_scalar_tuple_idx","owner_kind":"relational_column","owner_name":"status","access_method":"scalar_column","columns":["status"],"keys":[{"column":"status"}],"generation":1,"schema_fingerprint":"secondary-index-v1:scalar_tuple"}]}
         ,
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"attrs":{"type":"json","x-antfly-index-name":"attrs_algebraic_tuple_idx","x-antfly-index-access-method":"algebraic_filter","x-antfly-index-generation":1,"x-antfly-index-schema-fingerprint":"secondary-index-v1:algebraic_tuple","x-antfly-index-keys":[{"column":"attrs"}]}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"attrs":{"type":"json"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"attrs_algebraic_tuple_idx","owner_kind":"relational_column","owner_name":"attrs","access_method":"algebraic_filter","columns":["attrs"],"keys":[{"column":"attrs"}],"generation":1,"schema_fingerprint":"secondary-index-v1:algebraic_tuple"}]}
         ,
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"body":{"type":"text","x-antfly-index-name":"body_text_tuple_idx","x-antfly-index-access-method":"text_search","x-antfly-index-generation":1,"x-antfly-index-schema-fingerprint":"secondary-index-v1:text_tuple","x-antfly-index-keys":[{"column":"body"}]}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"body":{"type":"text"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"body_text_tuple_idx","owner_kind":"relational_column","owner_name":"body","access_method":"text_search","method_config":{"type":"full_text","field":"body"},"columns":["body"],"keys":[{"column":"body"}],"generation":1,"schema_fingerprint":"secondary-index-v1:text_tuple"}]}
         ,
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-name":"status_tuple_missing_keys_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":1,"x-antfly-index-schema-fingerprint":"secondary-index-v1:tuple_missing_keys"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_tuple_missing_keys_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"lifecycle":"ready","generation":1,"schema_fingerprint":"secondary-index-v1:tuple_missing_keys"}]}
         ,
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-name":"status_missing_fingerprint_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":1,"x-antfly-index-keys":[{"column":"status"}]}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_missing_fingerprint_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"}],"lifecycle":"ready","generation":1}]}
         ,
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-name":"status_missing_key_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":1,"x-antfly-index-schema-fingerprint":"secondary-index-v1:missing_key","x-antfly-index-keys":[{"column":"status"},{"column":"missing"}]}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_missing_key_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"missing"}],"lifecycle":"ready","generation":1,"schema_fingerprint":"secondary-index-v1:missing_key"}]}
         ,
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-name":"status_missing_include_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":1,"x-antfly-index-schema-fingerprint":"secondary-index-v1:missing_include","x-antfly-index-keys":[{"column":"status"}],"x-antfly-index-include":["missing"]}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_missing_include_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"}],"include_columns":["missing"],"lifecycle":"ready","generation":1,"schema_fingerprint":"secondary-index-v1:missing_include"}]}
         ,
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword","x-antfly-index-where":{"all":[{"field":"missing","op":"eq","value":"active"}]}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"email","owner_kind":"relational_column","owner_name":"email","access_method":"scalar_column","columns":["email"],"where":{"all":[{"field":"missing","op":"eq","value":"active"}]}}]}
         ,
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword","x-antfly-index-where-expressions":[{"lhs":{"field":"missing"},"op":"is_not_null"}]}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"email","owner_kind":"relational_column","owner_name":"email","access_method":"scalar_column","columns":["email"],"where_expressions":[{"lhs":{"field":"missing"},"op":"is_not_null"}]}]}
         ,
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"email_bad_key","columns":["email"],"index_keys":[{"column":"email"},{"column":"missing"}]}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"email_expr_key","columns":["id"],"expressions":[{"op":"lower","field":"email"}]}],"relational_indexes":[{"name":"email_expr_key","owner_kind":"unique_constraint","owner_name":"email_expr_key","access_method":"ordered_tuple","columns":["id"],"expressions":[{"op":"lower","field":"email"}],"unique":true,"keys":[{"column":"id"}],"lifecycle":"ready"}]}
+        ,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"email_bad_key","columns":["email"]}],"relational_indexes":[{"name":"email_bad_key","owner_kind":"unique_constraint","owner_name":"email_bad_key","access_method":"ordered_tuple","columns":["email"],"unique":true,"keys":[{"column":"email"},{"column":"missing"}],"lifecycle":"ready"}]}
         ,
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"email_bad_where_expr","columns":["email"],"where_expressions":[{"lhs":{"op":"lower","args":[{"field":"missing"}]},"op":"eq","rhs":{"value":"active"}}]}]}
         ,
@@ -2236,37 +2064,14 @@ test "parseValidatedTableSchema rejects malformed relational index metadata refe
 test "deriveRuntimeTableSchema carries admitted relational index access methods" {
     const alloc = std.testing.allocator;
     var parsed = try parseValidatedTableSchema(alloc,
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-name":"status_scalar_idx","x-antfly-index-access-method":"scalar_column","x-antfly-index-generation":3,"x-antfly-index-schema-fingerprint":"secondary-index-v1:status"},"tenant_id":{"type":"keyword","x-antfly-index-name":"tenant_status_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":4,"x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_status","x-antfly-index-keys":[{"column":"tenant_id"},{"column":"status"}],"x-antfly-index-include":["id"]},"attrs":{"type":"json","x-antfly-index-name":"attrs_algebraic_idx","x-antfly-index-access-method":"algebraic_filter","x-antfly-index-generation":5,"x-antfly-index-schema-fingerprint":"secondary-index-v1:attrs"},"body":{"type":"text","x-antfly-index-name":"body_text_idx","x-antfly-index-access-method":"text_search","x-antfly-index-generation":6,"x-antfly-index-schema-fingerprint":"secondary-index-v1:body"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"tenant_id":{"type":"keyword"},"attrs":{"type":"json"},"body":{"type":"text"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_scalar_idx","owner_kind":"relational_column","owner_name":"status","access_method":"scalar_column","columns":["status"],"generation":3,"schema_fingerprint":"secondary-index-v1:status"},{"name":"tenant_status_idx","owner_kind":"relational_column","owner_name":"tenant_id","access_method":"ordered_tuple","columns":["tenant_id"],"keys":[{"column":"tenant_id"},{"column":"status"}],"include_columns":["id"],"generation":4,"schema_fingerprint":"secondary-index-v1:tenant_status"},{"name":"attrs_algebraic_idx","owner_kind":"relational_column","owner_name":"attrs","access_method":"algebraic_filter","columns":["attrs"],"generation":5,"schema_fingerprint":"secondary-index-v1:attrs"},{"name":"body_text_idx","owner_kind":"relational_column","owner_name":"body","access_method":"text_search","method_config":{"type":"full_text","field":"body","analyzer":"standard"},"columns":["body"],"generation":6,"schema_fingerprint":"secondary-index-v1:body"}]}
     );
     defer parsed.deinit(alloc);
 
     const runtime = try deriveRuntimeTableSchema(alloc, parsed);
     defer storage_schema.freeSchema(alloc, runtime);
 
-    const status = findRuntimeColumn(runtime, "status") orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(storage_schema.RelationalIndexAccessMethod.scalar_column, status.index_access_method.?);
-    try std.testing.expectEqual(@as(usize, 0), status.index_keys.len);
-    try std.testing.expectEqualStrings("secondary-index-v1:status", status.index_schema_fingerprint.?);
-
-    const tenant_id = findRuntimeColumn(runtime, "tenant_id") orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(storage_schema.RelationalIndexAccessMethod.ordered_tuple, tenant_id.index_access_method.?);
-    try std.testing.expectEqual(@as(usize, 2), tenant_id.index_keys.len);
-    try std.testing.expectEqualStrings("tenant_id", tenant_id.index_keys[0].column);
-    try std.testing.expectEqualStrings("status", tenant_id.index_keys[1].column);
-    try std.testing.expectEqual(@as(usize, 1), tenant_id.index_include_columns.len);
-    try std.testing.expectEqualStrings("id", tenant_id.index_include_columns[0]);
-
-    const attrs = findRuntimeColumn(runtime, "attrs") orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(storage_schema.RelationalIndexAccessMethod.algebraic_filter, attrs.index_access_method.?);
-    try std.testing.expectEqual(@as(usize, 0), attrs.index_keys.len);
-    try std.testing.expectEqualStrings("secondary-index-v1:attrs", attrs.index_schema_fingerprint.?);
-
-    const body = findRuntimeColumn(runtime, "body") orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(storage_schema.RelationalIndexAccessMethod.text_search, body.index_access_method.?);
-    try std.testing.expectEqual(@as(usize, 0), body.index_keys.len);
-    try std.testing.expectEqualStrings("secondary-index-v1:body", body.index_schema_fingerprint.?);
-
-    try std.testing.expectEqual(@as(usize, 5), runtime.relational_indexes.len);
+    try std.testing.expectEqual(@as(usize, 4), runtime.relational_indexes.len);
     const status_idx = findRuntimeRelationalIndex(runtime, "status_scalar_idx") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(storage_schema.RelationalIndexOwnerKind.relational_column, status_idx.owner_kind);
     try std.testing.expectEqualStrings("status", status_idx.owner_name);
@@ -2289,12 +2094,13 @@ test "deriveRuntimeTableSchema carries admitted relational index access methods"
 
     const body_idx = findRuntimeRelationalIndex(runtime, "body_text_idx") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(storage_schema.RelationalIndexAccessMethod.text_search, body_idx.access_method);
+    try std.testing.expectEqualStrings("{\"type\":\"full_text\",\"field\":\"body\",\"analyzer\":\"standard\"}", body_idx.method_config_json.?);
 }
 
 test "deriveRuntimeTableSchema accepts relational index metadata through aliased runtime columns" {
     const alloc = std.testing.allocator;
     var parsed = try parseValidatedTableSchema(alloc,
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword","x-antfly-column-name":"tenant_key"},"status":{"type":"keyword","x-antfly-column-name":"status_key","x-antfly-index-name":"status_tenant_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-schema-fingerprint":"secondary-index-v1:status_tenant","x-antfly-index-generation":1,"x-antfly-index-keys":[{"column":"status"},{"column":"tenant_id"}],"x-antfly-index-include":["tenant_id"],"x-antfly-index-where":{"all":[{"field":"tenant_id","op":"is_not_null"}]},"x-antfly-index-where-expressions":[{"lhs":{"op":"lower","args":[{"field":"tenant_id"}]},"op":"is_not_null"}]}},"required":["id","tenant_id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"tenant_status_key","columns":["tenant_id","status"],"index_keys":[{"column":"tenant_id"},{"column":"status"}],"include_columns":["id"],"where":{"all":[{"field":"tenant_id","op":"is_not_null"}]},"where_expressions":[{"lhs":{"field":"status"},"op":"is_not_null"}]}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword","x-antfly-column-name":"tenant_key"},"status":{"type":"keyword","x-antfly-column-name":"status_key"}},"required":["id","tenant_id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"tenant_status_key","columns":["tenant_id","status"],"include_columns":["id"],"where":{"all":[{"field":"tenant_id","op":"is_not_null"}]},"where_expressions":[{"lhs":{"field":"status"},"op":"is_not_null"}]}],"relational_indexes":[{"name":"status_tenant_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"tenant_id"}],"include_columns":["tenant_id"],"where":{"all":[{"field":"tenant_id","op":"is_not_null"}]},"where_expressions":[{"lhs":{"op":"lower","args":[{"field":"tenant_id"}]},"op":"is_not_null"}],"generation":1,"schema_fingerprint":"secondary-index-v1:status_tenant"},{"name":"tenant_status_key","owner_kind":"unique_constraint","owner_name":"tenant_status_key","access_method":"ordered_tuple","unique":true,"columns":["tenant_id","status"],"keys":[{"column":"tenant_id"},{"column":"status"}],"include_columns":["id"],"where":{"all":[{"field":"tenant_id","op":"is_not_null"}]},"where_expressions":[{"lhs":{"field":"status"},"op":"is_not_null"}]}]}
     );
     defer parsed.deinit(alloc);
 
@@ -2303,15 +2109,12 @@ test "deriveRuntimeTableSchema accepts relational index metadata through aliased
 
     const status = findRuntimeColumn(runtime, "status_key") orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("status", status.path);
-    try std.testing.expectEqualStrings("status_tenant_idx", status.index_name.?);
-    try std.testing.expectEqual(@as(usize, 2), status.index_keys.len);
-    try std.testing.expectEqualStrings("status", status.index_keys[0].column);
-    try std.testing.expectEqualStrings("tenant_id", status.index_keys[1].column);
+    try std.testing.expect(status.index_name == null);
     try std.testing.expectEqual(@as(usize, 1), runtime.unique_constraints.len);
     try std.testing.expectEqualStrings("tenant_status_key", runtime.unique_constraints[0].name);
     const status_index = findRuntimeRelationalIndex(runtime, "status_tenant_idx") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(storage_schema.RelationalIndexOwnerKind.relational_column, status_index.owner_kind);
-    try std.testing.expectEqualStrings("status_key", status_index.owner_name);
+    try std.testing.expectEqualStrings("status", status_index.owner_name);
     try std.testing.expectEqual(@as(usize, 1), status_index.where.len);
     try std.testing.expectEqualStrings("tenant_id", status_index.where[0].field);
     try std.testing.expectEqual(@as(usize, 1), status_index.where_expressions.len);
@@ -2418,22 +2221,6 @@ test "deriveRuntimeTableSchema carries scalar subquery relational defaults" {
     try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseValidatedTableSchema(alloc,
         \\{"version":3,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-default":{"op":"scalar_subquery","query":"SELECT status FROM usage_records"}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ));
-}
-
-test "deriveRuntimeTableSchema normalizes legacy tokenized scalar subquery defaults" {
-    const alloc = std.testing.allocator;
-    var parsed = try parseValidatedTableSchema(alloc,
-        \\{"version":3,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-default":{"op":"scalar_subquery","query":{"kind":"tokenized_sql","tokens":[{"kind":"identifier","text":"SELECT","keyword":"select"},{"kind":"identifier","text":"status"},{"kind":"identifier","text":"FROM","keyword":"from"},{"kind":"identifier","text":"usage_records"},{"kind":"identifier","text":"ORDER","keyword":"order"},{"kind":"identifier","text":"BY","keyword":"by"},{"kind":"identifier","text":"id"},{"kind":"identifier","text":"DESC","keyword":"desc"},{"kind":"identifier","text":"LIMIT","keyword":"limit"},{"kind":"number","text":"1"}]}}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
-    );
-    defer parsed.deinit(alloc);
-
-    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
-    defer storage_schema.freeSchema(alloc, runtime);
-
-    const status = findRuntimeColumn(runtime, "status").?;
-    try std.testing.expect(status.default_value != null);
-    try std.testing.expectEqual(storage_schema.RelationalDefaultKind.scalar_subquery, status.default_value.?.kind);
-    try std.testing.expectEqualStrings("{\"query\":{\"table\":\"usage_records\",\"select\":[\"status\"],\"order_by\":[{\"field\":\"id\",\"direction\":\"desc\"}],\"limit\":1}}", status.default_value.?.value_json);
 }
 
 test "deriveRuntimeTableSchema projects embedded json schema as prefixed document fields" {

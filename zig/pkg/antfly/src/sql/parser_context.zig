@@ -281,14 +281,14 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
         pub fn updateJoinedMutationSourceParserHooks(ptr: *ParserType) lower_dml.JoinedMutationSourceParserHooks {
             return .{
                 .ptr = ptr,
-                .parse_joined_mutation_source = Accessors.parseUpdateJoinedMutationSourceWithCtesHook,
+                .parse_joined_mutation_source = Accessors.lowerUpdateJoinedMutationSourceWithCtesHook,
             };
         }
 
         pub fn deleteJoinedMutationSourceParserHooks(ptr: *ParserType) lower_dml.JoinedMutationSourceParserHooks {
             return .{
                 .ptr = ptr,
-                .parse_joined_mutation_source = Accessors.parseDeleteJoinedMutationSourceWithCtesHook,
+                .parse_joined_mutation_source = Accessors.lowerDeleteJoinedMutationSourceWithCtesHook,
             };
         }
 
@@ -338,7 +338,6 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
                 .returning_expression_qualifiers = ptr.returning_expression_qualifiers,
                 .defer_row_expression_field_validation = ptr.defer_row_expression_field_validation,
                 .expression_options = Accessors.ddlExpressionOptions(ptr),
-                .parse_rewrite_expression = true,
             };
         }
 
@@ -1111,30 +1110,6 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             };
         }
 
-        pub fn updateParserOptions(ptr: *ParserType) lower_dml.UpdateParserOptions {
-            return .{
-                .params = ptr.params,
-                .schema = ptr.schema,
-                .unique_resolver = ptr.unique_resolver,
-                .default_context = ptr.default_context,
-                .conflict_existing_qualifiers = ptr.conflict_existing_qualifiers,
-                .assignment_value_hooks = Accessors.conflictUpdateAssignmentValueParserOptions(ptr, &.{}, &.{}),
-                .returning_hooks = Accessors.returningProjectionParserOptions(ptr),
-                .realtime_ns = value_mod.currentRealtimeNs(),
-            };
-        }
-
-        pub fn deleteParserOptions(ptr: *ParserType) lower_dml.DeleteParserOptions {
-            return .{
-                .params = ptr.params,
-                .schema = ptr.schema,
-                .unique_resolver = ptr.unique_resolver,
-                .default_context = ptr.default_context,
-                .returning_hooks = Accessors.returningProjectionParserOptions(ptr),
-                .realtime_ns = value_mod.currentRealtimeNs(),
-            };
-        }
-
         pub fn mutationSourceParserOptions(ptr: *ParserType) !lower_dml.MutationSourceParserOptions {
             return .{
                 .params = ptr.params,
@@ -1154,127 +1129,6 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
                 .order_expression_hooks = Accessors.orderExpressionParserOptions(ptr),
                 .returning_hooks = Accessors.returningProjectionParserOptions(ptr),
             };
-        }
-
-        pub fn parseInsert(ptr: *ParserType) !plan.LoweredInsert {
-            return try lower_dml.parseInsertAlloc(ptr.alloc, ptr.tokens, &ptr.pos, Accessors.insertParserOptions(ptr));
-        }
-
-        pub fn parseUpdate(ptr: *ParserType) !plan.LoweredMutation {
-            return try lower_dml.parseUpdateAlloc(ptr.alloc, ptr.tokens, &ptr.pos, Accessors.updateParserOptions(ptr));
-        }
-
-        pub fn parseDelete(ptr: *ParserType) !plan.LoweredMutation {
-            return try lower_dml.parseDeleteAlloc(ptr.alloc, ptr.tokens, &ptr.pos, Accessors.deleteParserOptions(ptr));
-        }
-
-        pub fn parseUpdateMutationSource(ptr: *ParserType) !plan.LoweredMutationSource {
-            return try lower_dml.parseUpdateMutationSourceAlloc(ptr.alloc, ptr.tokens, &ptr.pos, try Accessors.mutationSourceParserOptions(ptr));
-        }
-
-        pub fn parseDeleteMutationSource(ptr: *ParserType) !plan.LoweredMutationSource {
-            return try lower_dml.parseDeleteMutationSourceAlloc(ptr.alloc, ptr.tokens, &ptr.pos, try Accessors.mutationSourceParserOptions(ptr));
-        }
-
-        pub fn parseTruncateMutationSource(ptr: *ParserType) !plan.LoweredMutationSource {
-            return try lower_dml.parseTruncateMutationSourceAlloc(
-                ptr.alloc,
-                ptr.tokens,
-                &ptr.pos,
-                ptr.schema,
-                try lower_dml.mutationRowClaimAlloc(ptr.alloc, ptr.mutation_claim, false),
-                ptr.generated_dml_ast,
-            );
-        }
-
-        pub fn parseMergeMutationBody(
-            ptr: *ParserType,
-            ctes: []const db_mod.types.RelationalRowsCte,
-            base_table_name: ?*?[]const u8,
-        ) !plan.LoweredMergeMutationPlan {
-            return try lower_dml.parseMergeMutationBodyAlloc(ptr.alloc, ptr.tokens, &ptr.pos, Accessors.mergeMutationParserOptions(ptr), .{
-                .ctes = ctes,
-                .base_table_name = base_table_name,
-            });
-        }
-
-        pub fn parseUpdateJoinedMutationSourceWithCtes(
-            ptr: *ParserType,
-            ctes: []const db_mod.types.RelationalRowsCte,
-            base_table_name: ?*?[]const u8,
-        ) !plan.LoweredJoinedMutationSource {
-            return try lower_dml.parseUpdateJoinedMutationSourceWithCtesAlloc(
-                ptr.alloc,
-                ptr.tokens,
-                &ptr.pos,
-                try Accessors.updateJoinedMutationSourceParserOptions(ptr, ctes, base_table_name),
-            );
-        }
-
-        pub fn parseDeleteJoinedMutationSourceWithCtes(
-            ptr: *ParserType,
-            ctes: []const db_mod.types.RelationalRowsCte,
-            base_table_name: ?*?[]const u8,
-        ) !plan.LoweredJoinedMutationSource {
-            return try lower_dml.parseDeleteJoinedMutationSourceWithCtesAlloc(
-                ptr.alloc,
-                ptr.tokens,
-                &ptr.pos,
-                try Accessors.deleteJoinedMutationSourceParserOptions(ptr, ctes, base_table_name),
-            );
-        }
-
-        pub fn parseRecursiveInsertSource(ptr: *ParserType) !plan.LoweredRecursiveInsertSource {
-            return try lower_dml.parseRecursiveInsertSourceAlloc(
-                ptr.alloc,
-                ptr.tokens,
-                &ptr.pos,
-                Accessors.recursiveCteParserHooks(ptr),
-                Accessors.insertSourceParserHooks(ptr),
-            );
-        }
-
-        pub fn parseRecursiveUpdateJoinedMutationSource(ptr: *ParserType) !plan.LoweredRecursiveJoinedMutationSource {
-            return try lower_dml.parseRecursiveJoinedMutationSourceAlloc(
-                ptr.alloc,
-                ptr.tokens,
-                &ptr.pos,
-                .update,
-                Accessors.recursiveCteParserHooks(ptr),
-                Accessors.updateJoinedMutationSourceParserHooks(ptr),
-            );
-        }
-
-        pub fn parseRecursiveDeleteJoinedMutationSource(ptr: *ParserType) !plan.LoweredRecursiveJoinedMutationSource {
-            return try lower_dml.parseRecursiveJoinedMutationSourceAlloc(
-                ptr.alloc,
-                ptr.tokens,
-                &ptr.pos,
-                .delete,
-                Accessors.recursiveCteParserHooks(ptr),
-                Accessors.deleteJoinedMutationSourceParserHooks(ptr),
-            );
-        }
-
-        pub fn parseRecursiveMergeMutation(ptr: *ParserType) !plan.LoweredRecursiveMergeMutation {
-            return try lower_dml.parseRecursiveMergeMutationAlloc(
-                ptr.alloc,
-                ptr.tokens,
-                &ptr.pos,
-                Accessors.recursiveCteParserHooks(ptr),
-                Accessors.mergeMutationParserOptions(ptr),
-            );
-        }
-
-        pub fn parseInsertSourceWithCtes(
-            ptr: *ParserType,
-            ctes: []const db_mod.types.RelationalRowsCte,
-            base_table_name: ?*?[]const u8,
-        ) !plan.LoweredInsertSource {
-            return try lower_dml.parseInsertSourceWithCtesAlloc(ptr.alloc, ptr.tokens, &ptr.pos, Accessors.insertSourceParserHooks(ptr), .{
-                .ctes = ctes,
-                .base_table_name = base_table_name,
-            });
         }
 
         pub fn parseInsertSourceSelectHook(
@@ -1309,22 +1163,32 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             return try Accessors.parseSelect(&sub);
         }
 
-        pub fn parseUpdateJoinedMutationSourceWithCtesHook(
+        pub fn lowerUpdateJoinedMutationSourceWithCtesHook(
             ptr: *anyopaque,
             ctes: []const db_mod.types.RelationalRowsCte,
             base_table_name: ?*?[]const u8,
         ) anyerror!plan.LoweredJoinedMutationSource {
             const self: *ParserType = @ptrCast(@alignCast(ptr));
-            return try Accessors.parseUpdateJoinedMutationSourceWithCtes(self, ctes, base_table_name);
+            return try lower_dml.lowerUpdateJoinedMutationSourceWithCtesAlloc(
+                self.alloc,
+                self.tokens,
+                &self.pos,
+                try Accessors.updateJoinedMutationSourceParserOptions(self, ctes, base_table_name),
+            );
         }
 
-        pub fn parseDeleteJoinedMutationSourceWithCtesHook(
+        pub fn lowerDeleteJoinedMutationSourceWithCtesHook(
             ptr: *anyopaque,
             ctes: []const db_mod.types.RelationalRowsCte,
             base_table_name: ?*?[]const u8,
         ) anyerror!plan.LoweredJoinedMutationSource {
             const self: *ParserType = @ptrCast(@alignCast(ptr));
-            return try Accessors.parseDeleteJoinedMutationSourceWithCtes(self, ctes, base_table_name);
+            return try lower_dml.lowerDeleteJoinedMutationSourceWithCtesAlloc(
+                self.alloc,
+                self.tokens,
+                &self.pos,
+                try Accessors.deleteJoinedMutationSourceParserOptions(self, ctes, base_table_name),
+            );
         }
 
         pub fn parseLateralSubqueryHook(

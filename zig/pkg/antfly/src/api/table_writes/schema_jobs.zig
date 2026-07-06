@@ -401,17 +401,21 @@ pub fn promoteReadySecondaryIndexesForCatalog(
     defer storage_schema.freeSchema(alloc, runtime);
 
     var promoted: u64 = 0;
-    for (runtime.relational_columns) |column| {
-        if (!column.indexed) continue;
-        if (column.index_lifecycle != .building) continue;
-        if (column.index_generation == 0) continue;
-        const index_name = column.index_name orelse column.name;
-        if (!secondaryIndexReadyForPromotion(&snapshot, table.table_id, index_name, column.index_generation)) continue;
+    for (runtime.relational_indexes) |index| {
+        if (index.lifecycle != .building) continue;
+        if (index.generation == 0) continue;
+        const schema_fingerprint = index.schema_fingerprint orelse continue;
+        if (schema_fingerprint.len == 0) continue;
+        if (!secondaryIndexReadyForPromotion(&snapshot, table.table_id, index.name, index.generation)) continue;
         const did_promote = catalog.promoteSecondaryIndexReady(
             alloc,
             table_name,
-            index_name,
-            column.index_generation,
+            index.name,
+            .{
+                .generation = index.generation,
+                .access_method = index.access_method,
+                .schema_fingerprint = schema_fingerprint,
+            },
         ) catch |err| switch (err) {
             error.UnsupportedOperation => false,
             else => return err,
@@ -1452,7 +1456,7 @@ test "secondary index rebuild worker helper claims repairs and finishes range" {
     defer db.close();
 
     const building_schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric","x-antfly-index-lifecycle":"building","x-antfly-index-generation":9,"x-antfly-index-where":{"all":[{"field":"status","op":"eq","value":"active"}]}},"status":{"type":"keyword"}},"required":["id","amount","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"},"status":{"type":"keyword"}},"required":["id","amount","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"amount","owner_kind":"relational_column","owner_name":"amount","access_method":"scalar_column","columns":["amount"],"lifecycle":"building","generation":9,"schema_fingerprint":"secondary-index-v1:amount","where":{"all":[{"field":"status","op":"eq","value":"active"}]}}]}
     ;
     try db.applyTableSchemaJson(alloc, building_schema_json, .{});
     try db.batch(.{ .writes = &.{
@@ -1509,7 +1513,7 @@ test "secondary index rebuild worker saves bounded progress and resumes range" {
     defer db.close();
 
     const building_schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric","x-antfly-index-lifecycle":"building","x-antfly-index-generation":9},"status":{"type":"keyword"}},"required":["id","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"},"status":{"type":"keyword"}},"required":["id","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"amount","owner_kind":"relational_column","owner_name":"amount","access_method":"scalar_column","columns":["amount"],"lifecycle":"building","generation":9,"schema_fingerprint":"secondary-index-v1:amount"}]}
     ;
     try db.applyTableSchemaJson(alloc, building_schema_json, .{});
     try db.batch(.{ .writes = &.{
@@ -1585,7 +1589,7 @@ test "secondary index rebuild worker rebuilds ordered tuple index in bounded pag
     defer db.close();
 
     const building_schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-name":"orders_status_amount_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-lifecycle":"building","x-antfly-index-generation":9,"x-antfly-index-schema-fingerprint":"secondary-index-v1:status_amount","x-antfly-index-keys":[{"column":"status"},{"column":"amount"}],"x-antfly-index-include":["note"],"x-antfly-index-where":{"all":[{"field":"status","op":"eq","value":"active"}]}},"amount":{"type":"numeric"},"note":{"type":"keyword"}},"required":["id","status","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"note":{"type":"keyword"}},"required":["id","status","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"orders_status_amount_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"amount"}],"include_columns":["note"],"lifecycle":"building","generation":9,"schema_fingerprint":"secondary-index-v1:status_amount","where":{"all":[{"field":"status","op":"eq","value":"active"}]}}]}
     ;
     try db.applyTableSchemaJson(alloc, building_schema_json, .{});
     var parsed_schema = try schema_mod.parseValidatedTableSchema(alloc, building_schema_json);
@@ -1604,15 +1608,15 @@ test "secondary index rebuild worker rebuilds ordered tuple index in bounded pag
     defer alloc.free(active_row);
     const inactive_row = try db_mod.relational_store.getRawAlloc(alloc, db.core.store, "row:b") orelse return error.TestUnexpectedResult;
     defer alloc.free(inactive_row);
-    const index_column = blk: {
-        for (runtime_schema.relational_columns) |column| {
-            if (std.mem.eql(u8, column.name, "status")) break :blk column;
+    const ordered_index = blk: {
+        for (runtime_schema.relational_indexes) |index| {
+            if (std.mem.eql(u8, index.name, "orders_status_amount_idx")) break :blk index;
         }
         return error.TestUnexpectedResult;
     };
-    const active_tuple = try db_mod.relational_store.orderedTupleValueForIndexKeysAlloc(alloc, active_row, index_column.index_keys, runtime_schema.relational_columns);
+    const active_tuple = try db_mod.relational_store.orderedTupleValueForIndexKeysAlloc(alloc, active_row, ordered_index.keys, runtime_schema.relational_columns);
     defer alloc.free(active_tuple);
-    const inactive_tuple = try db_mod.relational_store.orderedTupleValueForIndexKeysAlloc(alloc, inactive_row, index_column.index_keys, runtime_schema.relational_columns);
+    const inactive_tuple = try db_mod.relational_store.orderedTupleValueForIndexKeysAlloc(alloc, inactive_row, ordered_index.keys, runtime_schema.relational_columns);
     defer alloc.free(inactive_tuple);
     const active_forward_key = try db_mod.internal_keys.relationalOrderedTupleIndexKeyAlloc(alloc, "orders_status_amount_idx", active_tuple, "row:a");
     defer alloc.free(active_forward_key);
@@ -1735,12 +1739,14 @@ test "secondary index rebuild worker rebuilds ordered tuple index in bounded pag
             _: std.mem.Allocator,
             table_name: []const u8,
             index_name: []const u8,
-            expected_generation: u64,
+            expected: metadata_table_manager.SecondaryIndexReadyExpectation,
         ) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("orders", table_name);
             try std.testing.expectEqualStrings("orders_status_amount_idx", index_name);
-            try std.testing.expectEqual(@as(u64, 9), expected_generation);
+            try std.testing.expectEqual(@as(u64, 9), expected.generation);
+            try std.testing.expectEqual(storage_schema.RelationalIndexAccessMethod.ordered_tuple, expected.access_method);
+            try std.testing.expectEqualStrings("secondary-index-v1:status_amount", expected.schema_fingerprint);
             self.promoted = true;
             return true;
         }
@@ -1768,7 +1774,7 @@ test "secondary index rebuild worker rebuilds and promotes expression generated 
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"users_lower_email_idx":{"type":"keyword","generated":{"op":"lower","field":"email"},"x-antfly-index":true,"x-antfly-index-lifecycle":"building","x-antfly-index-generation":9,"x-antfly-index-name":"users_lower_email_idx"}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"users_lower_email_idx":{"type":"keyword","generated":{"op":"expression","expression":{"op":"lower","args":[{"field":"email"}]}}}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"users_lower_email_idx","owner_kind":"relational_column","owner_name":"users_lower_email_idx","access_method":"scalar_column","columns":["users_lower_email_idx"],"lifecycle":"building","generation":9,"schema_fingerprint":"secondary-index-v1:users_lower_email_idx"}]}
     ;
     try db.applyTableSchemaJson(alloc, schema_json, .{});
     var parsed_schema = try schema_mod.parseValidatedTableSchema(alloc, schema_json);
@@ -1879,12 +1885,14 @@ test "secondary index rebuild worker rebuilds and promotes expression generated 
             _: std.mem.Allocator,
             table_name: []const u8,
             index_name: []const u8,
-            expected_generation: u64,
+            expected: metadata_table_manager.SecondaryIndexReadyExpectation,
         ) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("users", table_name);
             try std.testing.expectEqualStrings("users_lower_email_idx", index_name);
-            try std.testing.expectEqual(@as(u64, 9), expected_generation);
+            try std.testing.expectEqual(@as(u64, 9), expected.generation);
+            try std.testing.expectEqual(storage_schema.RelationalIndexAccessMethod.scalar_column, expected.access_method);
+            try std.testing.expectEqualStrings("secondary-index-v1:users_lower_email_idx", expected.schema_fingerprint);
             self.promoted = true;
             return true;
         }
@@ -1912,7 +1920,7 @@ test "secondary index rebuild worker invalidates stale range before rebuilding i
     defer db.close();
 
     const building_schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric","x-antfly-index-lifecycle":"building","x-antfly-index-generation":9,"x-antfly-index-where":{"all":[{"field":"status","op":"eq","value":"active"}]}},"status":{"type":"keyword"}},"required":["id","amount","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"},"status":{"type":"keyword"}},"required":["id","amount","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"amount","owner_kind":"relational_column","owner_name":"amount","access_method":"scalar_column","columns":["amount"],"lifecycle":"building","generation":9,"schema_fingerprint":"secondary-index-v1:amount","where":{"all":[{"field":"status","op":"eq","value":"active"}]}}]}
     ;
     try db.applyTableSchemaJson(alloc, building_schema_json, .{});
     try db.batch(.{ .writes = &.{
@@ -3172,7 +3180,7 @@ test "table emptying and secondary index rebuild converge across chaos and reope
     defer alloc.free(path);
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric","x-antfly-index-lifecycle":"building","x-antfly-index-generation":9},"status":{"type":"keyword"}},"required":["id","amount","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"},"status":{"type":"keyword"}},"required":["id","amount","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"amount","owner_kind":"relational_column","owner_name":"amount","access_method":"scalar_column","columns":["amount"],"lifecycle":"building","generation":9,"schema_fingerprint":"secondary-index-v1:amount"}]}
     ;
     const table = metadata_table_manager.TableRecord{
         .table_id = 77,
@@ -4395,7 +4403,7 @@ test "table emptying worker pass can select same-name table by table id" {
 test "secondary index promotion ignores stale ready rebuild generation" {
     const alloc = std.testing.allocator;
     const stale_schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric","x-antfly-index-lifecycle":"building","x-antfly-index-generation":10},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"amount","owner_kind":"relational_column","owner_name":"amount","access_method":"scalar_column","columns":["amount"],"lifecycle":"building","generation":10,"schema_fingerprint":"secondary-index-v1:amount"}]}
     ;
 
     const Catalog = struct {

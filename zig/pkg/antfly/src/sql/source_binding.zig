@@ -15,6 +15,7 @@
 const std = @import("std");
 
 const metadata_table_manager = @import("../metadata/table_manager.zig");
+const query_contract = @import("../query/contract.zig");
 const runtime_schema = @import("../storage/schema.zig");
 
 pub const SqlSourceFamily = enum {
@@ -113,6 +114,7 @@ pub const DocumentSqlCapabilities = struct {
     semantic_filters: bool = false,
     semantic_index_names: []const []const u8 = &.{},
     owns_semantic_index_names: bool = false,
+    semantic_resolver: ?query_contract.SemanticResolver = null,
     vector_filters: bool = false,
     vector_index_names: []const []const u8 = &.{},
     owns_vector_index_names: bool = false,
@@ -2548,7 +2550,7 @@ test "source binding classifies relational document and lake schemas" {
         "docs",
     ));
     var generated_default_parsed = try schema_api.parseValidatedTableSchema(alloc,
-        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"status":{"type":"keyword","default":"new"},"status_lower":{"type":"keyword","generated":{"op":"lower","field":"status"}}},"required":[],"additionalProperties":false}}}}
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"status":{"type":"keyword","default":"new"},"status_lower":{"type":"keyword","generated":{"op":"expression","expression":{"op":"lower","args":[{"field":"status"}]}}}},"required":[],"additionalProperties":false}}}}
     );
     defer generated_default_parsed.deinit(alloc);
     const generated_default_schema = try schema_api.deriveRuntimeTableSchema(alloc, generated_default_parsed);

@@ -997,9 +997,12 @@ carrying
 - `physical` — the `typed_doc_values` value type it lands in
   (`bytes_val` / `u64_val` / `f64_val` / `bool_val` / `geo_point`)
 - `nullable` — `false` when the field is in the type's `required_fields`
-- `indexed` — whether to maintain an inverted/typed index for the column
 - `is_json` — nested objects, arrays, and `json`-typed fields collapse to a
   single `json` column at their path instead of recursing
+
+Secondary index capability is not part of the relational column plan. It lives
+in `TableSchema.relational_indexes`, whose entries decide which scalar,
+ordered-tuple, algebraic, or text-search derived rows are maintained.
 
 This reuses the existing `schema_capability` traversal. Unlike the algebraic
 `Plan` (which emits group/measure/time *fact* roles and may emit a field under
@@ -1153,8 +1156,8 @@ intersects doc sets with ordered relational candidates.
 Every relational index has explicit durable lifecycle and generation metadata.
 `ready` is the only query-plannable state. `building` and `catching_up` entries
 may be maintained by foreground writes so a rebuild can converge without
-serving reads. `stale`, `rebuild_required`, `failed`, `dropping`, and legacy
-`invalid` are fail-closed for planning and ordinary write maintenance; they
+serving reads. `stale`, `rebuild_required`, `failed`, `dropping`, and `invalid`
+are fail-closed for planning and ordinary write maintenance; they
 require rebuild, repair, retry, or cleanup work before promotion. Promotion to
 `ready` must be a compare-and-swap catalog transition over the expected schema
 fingerprint, access method, generation, and all covered owner ranges. The
@@ -1163,18 +1166,63 @@ promotion commands, so stale or incomplete rebuild evidence cannot bypass the
 worker's promotion checks.
 
 The durable runtime schema carries this through `TableSchema.relational_indexes`.
-Each entry records stable index identity, owner kind (`relational_column` or
-`unique_constraint`), owner name, access method, uniqueness, indexed columns,
-expression keys, include columns, ordered key parts, lifecycle, generation,
-schema fingerprint, field predicates, and expression predicates. Existing
-column-backed and unique-constraint-backed fields remain schema inputs while
-write maintenance, planning, rebuild, repair, and SQL catalog surfaces migrate
-to the first-class index catalog. Planner code should consume the catalog entry
-as the capability boundary instead of inferring access method behavior from
-column key shape. Runtime consumers that still iterate owner columns must first
-synthesize the effective index metadata from `TableSchema.relational_indexes`;
-duplicating access-method, lifecycle, predicate, key, or include metadata onto
-the owner column is a compatibility projection, not the durable source of truth.
+Each entry records stable index identity, owner kind (`relational_column`,
+`unique_constraint`, or `table`), owner name, access method, uniqueness,
+indexed columns, expression keys, include columns, ordered key parts, lifecycle,
+generation, schema fingerprint, method-specific configuration, field
+predicates, and expression predicates.
+`table` ownership uses the stable owner sentinel `__antfly_table__` for
+schema-derived table-level access methods such as
+`USING antfly_algebraic () WITH (derive_from_schema = true)`. SQL DDL stores
+access-method options in `relational_indexes.method_config`; for example,
+schema-derived algebraic indexes persist
+`{"type":"algebraic","derive_from_schema":true}` and full-text indexes persist
+their analyzer/scoring field options as `{"type":"full_text",...}`. The durable
+config describes logical method behavior only; it must not store backend
+physical data-structure names or raw SQL text. Method config is part of the
+stable index generation and schema fingerprint, so changing analyzer, scoring,
+or schema-derived method options requires a new physical generation before the
+index can be promoted ready. Relational schema JSON and
+runtime DDL keep index identity in this first-class catalog; duplicated
+access-method, lifecycle, predicate, key, or include metadata on owner columns
+is rejected for relational schemas, as are physical access-method, lifecycle,
+generation, key, and fingerprint fields on unique constraints. Logical unique
+constraint metadata such as `include_columns`, `where`, and
+`where_expressions` remains on the constraint. The old
+property-level `x-antfly-index` boolean shorthand is also document-mode only;
+relational secondary indexes must be declared as `relational_indexes` entries.
+Planner, write-maintenance, rebuild, repair, and SQL catalog code should
+consume the catalog entry as the capability boundary instead of inferring access
+method behavior from column key shape. The `relational_indexes` catalog is
+authoritative for relational index maintenance, readiness, query planning,
+rebuild targeting, and ordered-tuple unique-owner lookup; embedded
+column/constraint index fields are rejected at relational schema validation and
+are not used as compatibility fallbacks. Runtime schema derivation does not
+synthesize scalar indexes from column `indexed` flags or ordered unique-owner
+entries from bare unique
+constraints; a secondary index or ordered-tuple unique owner is active only when
+its first-class catalog entry is present. Bare logical `unique_constraints`
+remain durable constraint metadata and use dedicated unique-owner rows unless an
+explicit `relational_indexes` entry owned by the constraint selects an ordered
+tuple access path. Runtime schema derivation also drops
+embedded property index metadata and owner-local unique physical index fields
+for relational schemas. Low-level storage helpers that do not receive a
+relational schema use an empty catalog policy and do not maintain scalar side
+rows.
+Runtime schema format v52 removes relational column and unique-constraint
+embedded-index payload slots from the durable shape and rejects older schema
+blobs instead of byte-skipping legacy embedded relational index layouts.
+Relational column catalog equality ignores the deprecated embedded index fields;
+public document schema property index settings remain document-mode API state.
+Non-temporal unique constraints with an explicit ordered-tuple catalog owner use
+that owner for write enforcement, FK parent checks, schema-transition rebuild,
+and query candidate lookup; bare logical unique constraints use the dedicated
+owner-row namespace. Transaction prepare adds a transient internal conflict lock
+key derived from the ordered unique index identity and encoded tuple, so
+concurrent inserts for the same logical unique tuple contend before commit
+without creating a durable owner row. The dedicated unique-owner namespace
+remains the primary-key owner path, while temporal unique constraints remain on
+the temporal owner namespace.
 
 Rebuild progress is durable owner-range state, not local worker memory. Each
 secondary-index rebuild range records the access identity, row-key span, group
@@ -1197,6 +1245,22 @@ The query planner chooses indexes by capability:
 4. Intersect compatible doc sets and always hydrate/recheck from the committed
    row when a derived method is involved or when partial-predicate proof is not
    complete.
+
+An ordered tuple may satisfy `ORDER BY` only when the requested direction,
+null ordering, collation, predicate domain, and tie-breaker semantics are
+exact. If requested order keys are matched but the index has trailing key parts,
+those trailing parts must be fixed by equality predicates; otherwise they would
+sort ties before the row/doc-key tie-breaker and the planner must fall back with
+`ordered_tuple_order_tiebreaker_not_covered`.
+
+Planner profiles are part of the contract for making those choices observable.
+Row-query profiles name the selected access method and record planned
+candidate-set counts by scalar, array, JSON, mixed, and ordered-tuple sources,
+the selected candidate estimate, measured candidate rows, hydrated rows,
+residual rechecks, covering-payload rechecks, ordered-tuple generation/bounds,
+and the deterministic fallback reason. Algebraic and text-search candidates
+should plug into the same measured doc-set path instead of adding separate
+planner side channels.
 
 This keeps the relational schema stable while leaving the physical backend open
 to benchmark-driven replacement. The first production compound index should be
@@ -1716,7 +1780,7 @@ type-name/modifier grammar, and
 `CURRENT_TIMESTAMP(p)` precision grammar, `PERIOD FOR name (start, end)`
 constraint grammar, and stored generated-column value grammar for
 `ALWAYS AS (...) STORED` over the deterministic row-expression subset used by
-generated-column metadata, including legacy shorthand forms for
+generated-column metadata, including canonical expression forms for
 `lower(field)`, `upper(field)`, `md5(field)`, `concat(field, separator, ...)`,
 and `concat_ws(separator, field, ...)`, broader scalar/function/arithmetic
 expressions such as `replace(lower(field), ' ', '-')`, and JSON path extraction
@@ -2852,17 +2916,14 @@ expression keys:
         "type": "object",
         "properties": {
           "email": {
-            "type": "keyword",
-            "x-antfly-index-name": "users_email_active_idx",
-            "x-antfly-index-where": {
-              "all": [
-                { "field": "status", "op": "eq", "value": "active" }
-              ]
-            }
+            "type": "keyword"
           },
           "email_lc": {
             "type": "keyword",
-            "generated": { "op": "lower", "field": "email" }
+            "generated": {
+              "op": "expression",
+              "expression": { "op": "lower", "args": [{ "field": "email" }] }
+            }
           }
         }
       }
@@ -2892,6 +2953,50 @@ expression keys:
         { "op": "upper", "field": "email" }
       ]
     }
+  ],
+  "relational_indexes": [
+    {
+      "name": "users_email_active_idx",
+      "owner_kind": "relational_column",
+      "owner_name": "email",
+      "access_method": "ordered_tuple",
+      "columns": ["email"],
+      "keys": [{ "column": "email" }],
+      "lifecycle": "ready",
+      "generation": 7,
+      "schema_fingerprint": "secondary-index-v1:users_email_active_idx",
+      "where": {
+        "all": [
+          { "field": "status", "op": "eq", "value": "active" }
+        ]
+      }
+    },
+    {
+      "name": "users_email_lc_idx",
+      "owner_kind": "relational_column",
+      "owner_name": "email_lc",
+      "access_method": "ordered_tuple",
+      "columns": ["email_lc"],
+      "keys": [{ "column": "email_lc" }],
+      "lifecycle": "ready",
+      "generation": 8,
+      "schema_fingerprint": "secondary-index-v1:users_email_lc_idx"
+    },
+    {
+      "name": "users_status_fts_idx",
+      "owner_kind": "relational_column",
+      "owner_name": "status",
+      "access_method": "text_search",
+      "method_config": {
+        "type": "full_text",
+        "field": "status",
+        "analyzer": "standard"
+      },
+      "columns": ["status"],
+      "lifecycle": "ready",
+      "generation": 9,
+      "schema_fingerprint": "secondary-index-v1:users_status_fts_idx"
+    }
   ]
 }
 ```
@@ -2904,18 +3009,19 @@ backend catalog stores typed Antfly AST metadata such as `{ "op": "lower",
 "field": "email" }` or `{ "op": "upper", "field": "email" }` and predicate
 atoms such as `{ "field": "status", "op": "eq", "value": "active" }`.
 
-Partial secondary indexes are per-column catalog metadata. `x-antfly-index-name`
-stores the stable DDL/catalog identity for the derived secondary index, and
-`x-antfly-index-include` stores non-key covering payload columns for
-`CREATE INDEX ... INCLUDE (...)` on ordinary btree secondary indexes. Unique
-constraints store the same non-key covering payload columns as first-class
-constraint metadata, and SQL `UNIQUE (...) INCLUDE (...)` lowers to that typed
-metadata for both `CREATE TABLE` constraints and additive `ALTER TABLE` unique
-constraints. Primary-key metadata has the same explicit covering payload list:
-SQL `PRIMARY KEY (...) INCLUDE (...)` lowers to `primary_key.include_columns`
-while row identity, physical keys, FK targets, and conflict binding continue to
-use only `primary_key.columns`.
-`x-antfly-index-where` stores the typed predicate. Writes evaluate the predicate against the same
+Partial secondary indexes are first-class `relational_indexes` entries.
+`name` stores the stable DDL/catalog identity, `include_columns` stores non-key
+covering payload columns for `CREATE INDEX ... INCLUDE (...)`, and `where`
+stores the typed predicate. Unique constraints store the same non-key covering
+payload columns as first-class constraint metadata, while their physical access
+method, keys, lifecycle, generation, and predicate-proof state live in a
+`relational_indexes` entry owned by the constraint. SQL `UNIQUE (...) INCLUDE
+(...)` lowers to that typed metadata for both `CREATE TABLE` constraints and
+additive `ALTER TABLE` unique constraints. Primary-key metadata has the same
+explicit covering payload list: SQL `PRIMARY KEY (...) INCLUDE (...)` lowers to
+`primary_key.include_columns` while row identity, physical keys, FK targets, and
+conflict binding continue to use only `primary_key.columns`.
+Writes evaluate the predicate against the same
 committed packed row that supplies the column values. Matching rows receive the
 ordinary column-major, array-element, or JSON-value side rows; non-matching rows
 keep their authoritative base-row cells but do not receive secondary scan
@@ -2933,7 +3039,7 @@ runtime-schema clone/drop/rename paths, and schema validation rejects include
 columns that do not exist, that repeat key columns for ordinary column indexes,
 or that are JSON/array payload columns. Ordinary btree secondary indexes,
 generated-expression secondary indexes, and JSON/array GIN secondary indexes all
-preserve `INCLUDE (...)` payload columns as `x-antfly-index-include`, so
+preserve `INCLUDE (...)` payload columns as `relational_indexes.include_columns`, so
 PostgreSQL covering-index syntax is not accepted unless the catalog can retain
 the covering-column metadata exactly. Ordered tuple scans may project simple
 declared-column selections from the include payload only after reading the
@@ -2950,26 +3056,35 @@ is filled; responses that intentionally do not prove the full count include
 `total_exact: false`.
 
 Unique expression constraints store the expression key directly on the unique
-constraint, evaluate the key from the committed row, and maintain the
-unique-owner row in the same 2PC path as ordinary column unique owners. The
-legacy compact forms `lower(field)`, `upper(field)`, and `md5(field)` remain
-encoded as `op + field` shorthand for stable case-fold and hash keys. Richer
-deterministic scalar keys such as `replace(status, 'old', 'new')` are encoded as
-the same shared row-expression AST used by checks, generated columns, partial
-predicates, update transforms, and returning projections. AST-backed unique
-keys participate in schema validation, column rename/drop dependency checks,
-index generation hashing, duplicate conflict-target identity, row-write owner
-tuple maintenance, and query candidate-set owner lookup through their referenced
-row fields.
+constraint and keep the constraint addressable by name for validation, drop,
+rename/drop dependency checks, generation hashing, and conflict-target
+identity. Deterministic scalar keys such as `lower(email)`, `md5(email)`, and
+`replace(status, 'old', 'new')` are encoded as the same shared row-expression
+AST used by checks, generated columns, partial predicates, update transforms,
+and returning projections. Native ordered-tuple owner rows and query candidate lookup for
+unique expression keys use first-class `relational_indexes` owner rows when
+the owner is the matching unique constraint. The catalog entry stores the same
+expression list as the logical unique constraint, ordered-tuple maintenance and
+rebuild encode the expression tuple, and bare logical unique constraints remain
+backed by dedicated owner rows. Row-query owner lookup may use a ready
+expression-owned ordered tuple for exact equality probes when every source field
+needed to compute the expression key is supplied by an equality predicate; the
+authoritative packed row is still hydrated and the original source-field
+predicates remain residual rechecks. Broader query planner expression-bound
+proof is still a separate capability gate: expression unique owners are not used
+for arbitrary predicate/range planning until the planner can prove the
+expression key, collation, null ordering, and residual predicate semantics
+exactly.
 Non-unique expression access paths use stored generated columns as the canonical
 model-level representation. For example, a SQL adapter lowers
 `CREATE INDEX users_lower_email_idx ON users (lower(email))` into a generated
 relational column such as `"email_lc": { "type": "keyword", "generated": {
-"op": "lower", "field": "email" }, "x-antfly-index-access-method":
-"ordered_tuple", "x-antfly-index-keys": [{ "column": "email_lc" }] }`;
-because generated columns are ordinary packed-row columns, their ordered-tuple
-side rows are rebuilt, moved, repaired, and queried through the same lifecycle
-as hand-authored indexed columns. Predicate queries then target
+ "op": "expression", "expression": { "op": "lower", "args": [{ "field":
+"email" }] } } }` plus a `relational_indexes` entry owned by
+`email_lc` with `access_method: "ordered_tuple"` and key `{ "column":
+"email_lc" }`; because generated columns are ordinary packed-row columns, their
+ordered-tuple side rows are rebuilt, moved, repaired, and queried through the
+same lifecycle as hand-authored indexed columns. Predicate queries then target
 `email_lc = "ada@example.test"` in the typed request rather than carrying the
 SQL expression string through storage. Schema validation
 checks each expression, dependency tracking records the base columns it reads,
@@ -3471,11 +3586,12 @@ before building the final result stream. Empty containment operands fall back to
 the base-row scan path because there is no selective element key. `array_eq`
 uses the whole-array value index as its candidate stream when available, then
 hydrates the base row and rechecks exact array equality before projection.
-Columns declared with `x-antfly-index: false` keep the same typed array
-validation and canonical row storage but resolve array predicates by scanning
-base rows instead of writing side-index entries. Row-query planning ranks array
-candidate sets by estimated cardinality alongside scalar and JSON candidate sets
-before intersecting them. Native requests and SQL lowering validate `array_any`,
+Columns without a maintained first-class `scalar_column` catalog index keep the
+same typed array validation and canonical row storage but resolve array
+predicates by scanning base rows instead of writing side-index entries.
+Row-query planning ranks array candidate sets by estimated cardinality
+alongside scalar and JSON candidate sets before intersecting them. Native
+requests and SQL lowering validate `array_any`,
 `array_contains`, and `array_eq` predicate values against the declared array
 item type before producing typed plans; whole-array predicates must contain only
 declared item values. Broader SQL operator sugar, such as dialect-specific null
@@ -3648,10 +3764,10 @@ rows, partial rebuilds, and intentionally lossy leaf choices safe. The path
 index records object, array, and scalar paths, so existence checks are not
 limited to scalar leaf values. Containment predicates that do not have an
 indexable scalar leaf, object/array path equality, empty object/array
-containment, or columns declared with `x-antfly-index: false`, fall back to a
-base-row scan with the same evaluator. Row-query planning ranks JSON candidate
-sets by estimated cardinality alongside scalar and array candidate sets before
-intersecting them. When both relational JSON value/path rows and algebraic
+containment, or columns without a maintained first-class `scalar_column`
+catalog index, fall back to a base-row scan with the same evaluator. Row-query
+planning ranks JSON candidate sets by estimated cardinality alongside scalar
+and array candidate sets before intersecting them. When both relational JSON value/path rows and algebraic
 path-fact access paths can serve the same predicate, the planner can choose
 between them without changing the public typed JSON predicate contract.
 
@@ -3692,7 +3808,10 @@ need table-owned `CHECK` predicates, server-side defaults, and generated values:
           "email": { "type": "keyword" },
           "email_key": {
             "type": "keyword",
-            "generated": { "op": "lower", "field": "email" }
+            "generated": {
+              "op": "expression",
+              "expression": { "op": "lower", "args": [{ "field": "email" }] }
+            }
           },
           "status": { "type": "keyword", "default": "active" },
           "created_at_ns": {
@@ -5963,9 +6082,9 @@ tables:
 - **Column access:** document-scoped column entries are maintained alongside the
   row entry for range movement and delete cleanup, and column-major scan entries
   (`column_path -> doc_key`) are maintained from the same packed row for scalar
-  predicate scans when the column catalog marks the path `indexed`. Both are
-  secondary to the packed row and can be regenerated from it. `indexed: false`
-  suppresses only the column-major scan entry; the packed row and
+  predicate scans when a ready scalar `relational_indexes` entry owns the
+  column. Both are secondary to the packed row and can be regenerated from it.
+  Without a matching ready scalar catalog index, the packed row and
   document-scoped cell remain authoritative, and filters over that column fall
   back to base-row evaluation.
 - **Commit boundary:** prepare/commit/abort/read/scan methods participate in the
@@ -6368,10 +6487,18 @@ separate SQL aggregate store:
 
 ```sql
 CREATE INDEX docs_algebraic ON docs USING antfly_algebraic
+  ()
   WITH (
     derive_from_schema = true
   );
 ```
+
+That SQL shape lowers to a table-owned `relational_indexes` entry with
+`owner_kind: "table"`, `owner_name: "__antfly_table__"`, and
+`access_method: "algebraic_filter"`. Its `method_config` is
+`{"type":"algebraic","derive_from_schema":true}`. The entry has no ordered key
+columns; it is a schema-derived fact/doc-set capability, not a scalar
+`ordered_tuple` index.
 
 When users request explicit algebraic materializations, the catalog should lower
 them to native grouped folds or expression folds over the committed `RowSource`.

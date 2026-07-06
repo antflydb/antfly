@@ -271,13 +271,11 @@ fn reindexIndexTargetWithSessionAlloc(
         const runtime = try table_ddl.deriveRuntimeTableSchema(alloc, parsed);
         defer @import("../../storage/schema.zig").freeSchema(alloc, runtime);
         if (runtime.storage_mode != .relational) continue;
-        for (runtime.relational_columns) |column| {
-            if (!column.indexed) continue;
-            const identity = column.index_name orelse column.name;
-            if (!std.mem.eql(u8, identity, target.table_name)) continue;
+        for (runtime.relational_indexes) |index| {
+            if (!std.mem.eql(u8, index.name, target.table_name)) continue;
             if (found_table != null) return error.InvalidSqlCatalog;
             found_table = table;
-            matched_generation = column.index_generation;
+            matched_generation = index.generation;
         }
     }
     const table = found_table orelse return error.IndexNotFound;
@@ -300,11 +298,9 @@ fn schemaWithAllSecondaryIndexesBuildingAlloc(
     var current_schema_json = try alloc.dupe(u8, schema_json);
     errdefer alloc.free(current_schema_json);
     var changed = false;
-    for (runtime.relational_columns) |column| {
-        if (!column.indexed) continue;
-        if (column.index_generation == std.math.maxInt(u64)) return error.InvalidSchemaUpdateRequest;
-        const identity = column.index_name orelse column.name;
-        const updated = try table_ddl.schemaWithSecondaryIndexBuildingAlloc(alloc, current_schema_json, identity, column.index_generation + 1);
+    for (runtime.relational_indexes) |index| {
+        if (index.generation == std.math.maxInt(u64)) return error.InvalidSchemaUpdateRequest;
+        const updated = try table_ddl.schemaWithSecondaryIndexBuildingAlloc(alloc, current_schema_json, index.name, index.generation + 1);
         alloc.free(current_schema_json);
         current_schema_json = updated;
         changed = true;

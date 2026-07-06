@@ -19092,6 +19092,7 @@ pub const ApiHttpServer = struct {
             error.UnknownGroup => return null,
             error.ReadOnly => return null,
             error.HAReadOnlyStandby => return null,
+            error.LsmRootWriterAlreadyOpen => return null,
             else => return err,
         }) orelse null;
     }
@@ -34292,7 +34293,7 @@ test "api http server applies safe before insert SQL triggers to rows batch" {
 test "api http server resolves scalar subquery defaults in public rows batch" {
     const alloc = std.testing.allocator;
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-default":{"op":"scalar_subquery","query":{"kind":"tokenized_sql","tokens":[{"kind":"identifier","text":"SELECT","keyword":"select"},{"kind":"identifier","text":"status"},{"kind":"identifier","text":"FROM","keyword":"from"},{"kind":"identifier","text":"events"},{"kind":"identifier","text":"ORDER","keyword":"order"},{"kind":"identifier","text":"BY","keyword":"by"},{"kind":"identifier","text":"id"}]}}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-default":{"op":"scalar_subquery","query":{"table":"events","select":["status"],"order_by":[{"field":"id"}]}}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -35090,7 +35091,7 @@ test "api http server refreshes SQL routine hooks from ready extension query fun
 test "api http server executes SQL COPY FROM STDIN through catalog rows batch" {
     const alloc = std.testing.allocator;
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"status_key":{"type":"keyword","generated":{"op":"lower","field":"status"}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"status_key":{"type":"keyword","generated":{"op":"expression","expression":{"op":"lower","args":[{"field":"status"}]}}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
     const FakeSource = struct {
         fn iface(self: *@This()) StatusSource {

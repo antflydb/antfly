@@ -120,6 +120,16 @@ pub const RowsExpressionValue = struct {
     value: std.json.Value,
 };
 
+/// Ordered component of a relational ordered-tuple index key.
+pub const RelationalIndexKey = struct {
+    /// Declared relational column used by this key component.
+    column: []const u8,
+    /// Sort direction for ordered scans. Omitted defaults to asc.
+    direction: ?[]const u8 = null,
+    /// Null placement for ordered scans. Omitted uses method default.
+    nulls: ?[]const u8 = null,
+};
+
 /// Field mapping to apply when a dynamic template matches
 pub const TemplateFieldMapping = struct {
     type: ?AntflyType = null,
@@ -206,6 +216,8 @@ pub const TableSchema = struct {
     primary_key: ?PrimaryKey = null,
     /// Relational-mode unique constraints over one or more ordered declared non-json relational columns. Present scalar tuples are enforced by committed integrity rows; rows with any absent nullable component do not create unique rows.
     unique_constraints: ?[]const UniqueConstraint = null,
+    /// Durable relational secondary-index catalog entries. This is the public schema shape for relational scalar-column, ordered-tuple, algebraic-filter, and text-search index metadata; lifecycle, generation, and schema_fingerprint identify the physical index generation that may be promoted to ready.
+    relational_indexes: ?[]const RelationalIndex = null,
 };
 
 /// Shared typed row-expression AST. A node is exactly one of `{ "field": "name" }`, `{ "value": ... }`, or an operator node such as `{ "op": "lower", "args": [{ "field": "email" }] }`. Supported operators are the shared row-local expression surface used by schema predicates, mutation expressions, query projections, filters, grouping, ordering, and SQL lowering.
@@ -316,4 +328,36 @@ pub const UniqueConstraint = struct {
     where_expressions: ?[]const RowsExpressionCondition = null,
     /// Unique validation state. Unvalidated constraints are durable metadata but do not enforce writes until promoted.
     validation_state: ?[]const u8 = null,
+};
+
+/// Durable relational secondary-index metadata.
+pub const RelationalIndex = struct {
+    /// Stable index name, unique within the table schema.
+    name: []const u8,
+    /// Catalog object that owns this physical index.
+    owner_kind: []const u8,
+    /// Owner column or constraint name.
+    owner_name: ?[]const u8 = null,
+    /// Logical access method implemented by this index.
+    access_method: []const u8,
+    /// Access-method-specific durable configuration, for example full-text analyzer/scoring options or schema-derived algebraic settings.
+    method_config: ?std.json.Value = null,
+    /// True when the entry backs a unique constraint.
+    unique: ?bool = null,
+    /// Declared relational columns maintained by the index.
+    columns: ?[]const []const u8 = null,
+    /// Covering payload columns stored with ordered tuple entries.
+    include_columns: ?[]const []const u8 = null,
+    /// Ordered tuple key definition. Required for ordered_tuple indexes.
+    keys: ?[]const RelationalIndexKey = null,
+    /// Durable lifecycle state for this index generation.
+    lifecycle: ?[]const u8 = null,
+    /// Monotonic physical index generation.
+    generation: ?i64 = null,
+    /// Stable fingerprint of the index-defining catalog shape.
+    schema_fingerprint: ?[]const u8 = null,
+    /// Field-only partial index predicate shorthand.
+    where: ?RowsUniquePredicateGroup = null,
+    /// Deterministic row-expression predicates for index participation.
+    where_expressions: ?[]const RowsExpressionCondition = null,
 };

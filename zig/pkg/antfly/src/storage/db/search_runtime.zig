@@ -560,7 +560,7 @@ test "relational unindexed column filters fall back to base rows" {
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"amount":{"type":"numeric","x-antfly-index":false}},"required":["title","amount"],"additionalProperties":false}}}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"amount":{"type":"numeric"}},"required":["title","amount"],"additionalProperties":false}}}}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -2949,33 +2949,56 @@ pub fn Impl(comptime DB: type) type {
         pub fn relationalColumnIndexUsableForQuery(
             self: *DB,
             alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
             column: schema_mod.RelationalColumn,
             implications: relational_store_mod.PredicateImplications,
         ) !bool {
-            return try Self.relationalColumnIndexUsableForQueryWithColumns(self, alloc, column, implications, &.{column});
+            const index = Self.relationalScalarIndexForColumn(runtime_schema, column) orelse return false;
+            return try Self.relationalScalarIndexUsableForQueryWithColumns(self, alloc, index, column, implications, runtime_schema.relational_columns);
         }
 
-        fn relationalColumnIndexUsableForQueryWithColumns(
+        pub fn relationalColumnIndexHasPredicate(
+            runtime_schema: schema_mod.TableSchema,
+            column: schema_mod.RelationalColumn,
+        ) bool {
+            const index = Self.relationalScalarIndexForColumn(runtime_schema, column) orelse return false;
+            return index.where.len != 0 or index.where_expressions.len != 0;
+        }
+
+        fn relationalScalarIndexUsableForQueryWithColumns(
             self: *DB,
             alloc: Allocator,
+            index: schema_mod.RelationalIndex,
             column: schema_mod.RelationalColumn,
             implications: relational_store_mod.PredicateImplications,
             columns: []const schema_mod.RelationalColumn,
         ) !bool {
-            if (!column.indexed) return false;
-            if (column.index_lifecycle != .ready) return false;
-            if (!relationalColumnIndexKeysUsableForQuery(column)) return false;
-            if (!(try relational_store_mod.predicatesImplyUniqueWhereWithColumns(alloc, implications.predicates, column.index_where, columns))) return false;
-            return try self.relationalRowsExpressionPredicatesImply(alloc, implications, column.index_where_expressions);
+            if (index.lifecycle != .ready) return false;
+            if (!relationalScalarIndexKeysUsableForQuery(index, column)) return false;
+            if (!(try relational_store_mod.predicatesImplyUniqueWhereWithColumns(alloc, implications.predicates, index.where, columns))) return false;
+            return try self.relationalRowsExpressionPredicatesImply(alloc, implications, index.where_expressions);
         }
 
-        fn relationalColumnIndexKeysUsableForQuery(column: schema_mod.RelationalColumn) bool {
-            if (column.index_keys.len == 0) return true;
-            if (column.index_keys.len != 1) return false;
-            const key = column.index_keys[0];
-            return std.mem.eql(u8, key.column, column.name) and
+        fn relationalScalarIndexKeysUsableForQuery(index: schema_mod.RelationalIndex, column: schema_mod.RelationalColumn) bool {
+            if (index.keys.len == 0) return true;
+            if (index.keys.len != 1) return false;
+            const key = index.keys[0];
+            return (std.mem.eql(u8, key.column, column.name) or std.mem.eql(u8, key.column, column.path)) and
                 key.direction == .asc and
                 key.nulls == .default;
+        }
+
+        fn relationalScalarIndexForColumn(
+            runtime_schema: schema_mod.TableSchema,
+            column: schema_mod.RelationalColumn,
+        ) ?schema_mod.RelationalIndex {
+            for (runtime_schema.relational_indexes) |index| {
+                if (index.owner_kind != .relational_column) continue;
+                if (index.access_method != .scalar_column) continue;
+                if (!std.mem.eql(u8, index.owner_name, column.name) and !std.mem.eql(u8, index.owner_name, column.path)) continue;
+                return index;
+            }
+            return null;
         }
 
         pub fn resolveRelationalFilterQueryDocSetAlloc(
@@ -3025,7 +3048,7 @@ pub fn Impl(comptime DB: type) type {
         ) !?doc_set.ResolvedDocSet {
             const column = relational_store_mod.columnForField(runtime_schema, term.field) orelse return null;
             if (column.field_type != .keyword) return null;
-            return try Self.scanRelationalColumnFilterDocSetAlloc(self, alloc, runtime_schema.relational_columns, column, implications, generation, struct {
+            return try Self.scanRelationalColumnFilterDocSetAlloc(self, alloc, runtime_schema, column, implications, generation, struct {
                 wanted: []const u8,
                 collation: ?[]const u8,
 
@@ -3052,7 +3075,11 @@ pub fn Impl(comptime DB: type) type {
                 doc_ids.deinit(alloc);
             }
 
-            if (try Self.relationalColumnIndexUsableForQueryWithColumns(self, alloc, column, implications, runtime_schema.relational_columns)) {
+            const can_use_index = if (Self.relationalScalarIndexForColumn(runtime_schema, column)) |index|
+                try Self.relationalScalarIndexUsableForQueryWithColumns(self, alloc, index, column, implications, runtime_schema.relational_columns)
+            else
+                false;
+            if (can_use_index) {
                 const element_key = try relational_store_mod.arrayElementIndexKeyForValueAlloc(alloc, array_any.value);
                 defer alloc.free(element_key);
                 const indexed_doc_ids = try relational_store_mod.scanArrayElementDocKeysAlloc(alloc, self.core.store, column.path, element_key, "", "");
@@ -3102,7 +3129,11 @@ pub fn Impl(comptime DB: type) type {
                 doc_ids.deinit(alloc);
             }
 
-            if ((try Self.relationalColumnIndexUsableForQueryWithColumns(self, alloc, column, implications, runtime_schema.relational_columns)) and relational_store_mod.jsonContainsHasIndexableLeaf(json_contains.value)) {
+            const can_use_index = if (Self.relationalScalarIndexForColumn(runtime_schema, column)) |index|
+                (try Self.relationalScalarIndexUsableForQueryWithColumns(self, alloc, index, column, implications, runtime_schema.relational_columns)) and relational_store_mod.jsonContainsHasIndexableLeaf(json_contains.value)
+            else
+                false;
+            if (can_use_index) {
                 const indexed_doc_ids = try relational_store_mod.scanJsonContainmentDocKeysAlloc(alloc, self.core.store, column.path, json_contains.value, "", "");
                 defer relational_store_mod.freeDocKeys(alloc, indexed_doc_ids);
                 for (indexed_doc_ids) |doc_id| {
@@ -3140,7 +3171,7 @@ pub fn Impl(comptime DB: type) type {
                 return try Self.resolveRelationalArrayTermRangeFilterDocSetAlloc(self, alloc, runtime_schema, column, range, implications, generation);
             }
             if (column.field_type != .keyword) return null;
-            return try Self.scanRelationalColumnFilterDocSetAlloc(self, alloc, runtime_schema.relational_columns, column, implications, generation, struct {
+            return try Self.scanRelationalColumnFilterDocSetAlloc(self, alloc, runtime_schema, column, implications, generation, struct {
                 min: ?[]const u8,
                 max: ?[]const u8,
                 inclusive_min: bool,
@@ -3184,7 +3215,11 @@ pub fn Impl(comptime DB: type) type {
                 doc_ids.deinit(alloc);
             }
 
-            if (try Self.relationalColumnIndexUsableForQueryWithColumns(self, alloc, column, implications, runtime_schema.relational_columns)) {
+            const can_use_index = if (Self.relationalScalarIndexForColumn(runtime_schema, column)) |index|
+                try Self.relationalScalarIndexUsableForQueryWithColumns(self, alloc, index, column, implications, runtime_schema.relational_columns)
+            else
+                false;
+            if (can_use_index) {
                 const indexed_doc_ids = try relational_store_mod.scanArrayElementTermRangeDocKeysAlloc(
                     alloc,
                     self.core.store,
@@ -3244,7 +3279,7 @@ pub fn Impl(comptime DB: type) type {
         ) !?doc_set.ResolvedDocSet {
             const column = relational_store_mod.columnForField(runtime_schema, range.field) orelse return null;
             if (column.field_type != .numeric) return null;
-            return try Self.scanRelationalColumnFilterDocSetAlloc(self, alloc, runtime_schema.relational_columns, column, implications, generation, struct {
+            return try Self.scanRelationalColumnFilterDocSetAlloc(self, alloc, runtime_schema, column, implications, generation, struct {
                 min: ?f64,
                 max: ?f64,
                 inclusive_min: bool,
@@ -3275,7 +3310,7 @@ pub fn Impl(comptime DB: type) type {
         ) !?doc_set.ResolvedDocSet {
             const column = relational_store_mod.columnForField(runtime_schema, range.field) orelse return null;
             if (column.field_type != .datetime) return null;
-            return try Self.scanRelationalColumnFilterDocSetAlloc(self, alloc, runtime_schema.relational_columns, column, implications, generation, struct {
+            return try Self.scanRelationalColumnFilterDocSetAlloc(self, alloc, runtime_schema, column, implications, generation, struct {
                 start_ns: ?u64,
                 end_ns: ?u64,
                 inclusive_start: bool,
@@ -3306,7 +3341,7 @@ pub fn Impl(comptime DB: type) type {
         ) !?doc_set.ResolvedDocSet {
             const column = relational_store_mod.columnForField(runtime_schema, bool_query.field) orelse return null;
             if (column.field_type != .boolean) return null;
-            return try Self.scanRelationalColumnFilterDocSetAlloc(self, alloc, runtime_schema.relational_columns, column, implications, generation, struct {
+            return try Self.scanRelationalColumnFilterDocSetAlloc(self, alloc, runtime_schema, column, implications, generation, struct {
                 wanted: bool,
 
                 fn matches(ctx: @This(), value: relational_store_mod.OwnedColumnValue) bool {
@@ -3325,7 +3360,7 @@ pub fn Impl(comptime DB: type) type {
         ) !?doc_set.ResolvedDocSet {
             const column = relational_store_mod.columnForField(runtime_schema, geo_query.field) orelse return null;
             if (column.field_type != .geopoint) return null;
-            return try Self.scanRelationalColumnFilterDocSetAlloc(self, alloc, runtime_schema.relational_columns, column, implications, generation, struct {
+            return try Self.scanRelationalColumnFilterDocSetAlloc(self, alloc, runtime_schema, column, implications, generation, struct {
                 center: search_mod.GeoPoint,
                 radius_meters: f64,
 
@@ -3353,7 +3388,7 @@ pub fn Impl(comptime DB: type) type {
         ) !?doc_set.ResolvedDocSet {
             const column = relational_store_mod.columnForField(runtime_schema, geo_query.field) orelse return null;
             if (column.field_type != .geopoint) return null;
-            return try Self.scanRelationalColumnFilterDocSetAlloc(self, alloc, runtime_schema.relational_columns, column, implications, generation, struct {
+            return try Self.scanRelationalColumnFilterDocSetAlloc(self, alloc, runtime_schema, column, implications, generation, struct {
                 min_lat: f64,
                 min_lon: f64,
                 max_lat: f64,
@@ -3432,13 +3467,16 @@ pub fn Impl(comptime DB: type) type {
         fn scanRelationalColumnFilterDocSetAlloc(
             self: *DB,
             alloc: Allocator,
-            columns: []const schema_mod.RelationalColumn,
+            runtime_schema: schema_mod.TableSchema,
             column: schema_mod.RelationalColumn,
             implications: relational_store_mod.PredicateImplications,
             generation: ?u64,
             matcher: anytype,
         ) !doc_set.ResolvedDocSet {
-            if (!(try Self.relationalColumnIndexUsableForQueryWithColumns(self, alloc, column, implications, columns))) {
+            const index = Self.relationalScalarIndexForColumn(runtime_schema, column) orelse {
+                return try Self.scanRelationalBaseRowsFilterDocSetAlloc(self, alloc, column, generation, matcher);
+            };
+            if (!(try Self.relationalScalarIndexUsableForQueryWithColumns(self, alloc, index, column, implications, runtime_schema.relational_columns))) {
                 return try Self.scanRelationalBaseRowsFilterDocSetAlloc(self, alloc, column, generation, matcher);
             }
 
@@ -3451,7 +3489,7 @@ pub fn Impl(comptime DB: type) type {
                 if (!matcher.matches(value)) continue;
                 try doc_ids.append(alloc, value.doc_key);
             }
-            if (doc_ids.items.len == 0 and (column.index_where.len != 0 or column.index_where_expressions.len != 0)) {
+            if (doc_ids.items.len == 0 and (index.where.len != 0 or index.where_expressions.len != 0)) {
                 return try Self.scanRelationalBaseRowsFilterDocSetAlloc(self, alloc, column, generation, matcher);
             }
             return try Self.resolveDocIdsToDocSet(self, alloc, doc_ids.items, generation);

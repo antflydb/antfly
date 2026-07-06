@@ -1504,6 +1504,9 @@ pub fn ddlAppliedFingerprintAlloc(alloc: std.mem.Allocator, applied: AppliedDdlS
         if (column.index_lifecycle != .ready) building_indexes += 1;
         if (column.on_update_value != null) update_policies += 1;
     }
+    for (schema.relational_indexes) |index| {
+        if (index.owner_kind != .unique_constraint and index.lifecycle != .ready) building_indexes += 1;
+    }
 
     var unvalidated_unique: usize = 0;
     for (schema.unique_constraints) |constraint| {

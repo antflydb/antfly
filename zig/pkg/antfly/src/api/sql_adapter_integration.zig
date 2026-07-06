@@ -1393,23 +1393,6 @@ fn expectAppParityInvalidPlanEntry(
     try expectAppParityPlan(entry.plan, fingerprint);
 }
 
-fn expectAppParityGeneratedParseFailureEntry(
-    alloc: std.mem.Allocator,
-    entry: AppParityCorpusEntry,
-    err: anyerror,
-) !bool {
-    if (!(try sql_adapter.sourceCorpusGeneratedParseFailureEntryAlloc(alloc, entry, err))) return false;
-    const fingerprint_family = sql_adapter.corpusUnsupportedPlanFamily(entry.family) orelse return error.TestUnexpectedResult;
-    const diagnostic_reason = sql_adapter.classificationReasonFromToken(entry.classification_reason) orelse return error.TestUnexpectedResult;
-    const fingerprint = sql_adapter.unsupportedFingerprintAlloc(alloc, fingerprint_family, diagnostic_reason) catch |fingerprint_err| switch (fingerprint_err) {
-        error.UnsupportedSqlShape => return error.TestUnexpectedResult,
-        else => return fingerprint_err,
-    };
-    defer alloc.free(fingerprint);
-    try expectAppParityPlan(entry.plan, fingerprint);
-    return true;
-}
-
 const AppParitySchemaCache = struct {
     alloc: std.mem.Allocator,
     schemas: std.StringHashMapUnmanaged(runtime_schema.TableSchema) = .{},
@@ -1452,10 +1435,7 @@ fn expectAppParityCorpusEntry(
     row_claim: db_mod.types.RowClaimRequest,
     schema_cache: ?*AppParitySchemaCache,
 ) !void {
-    var parsed_sql = sql_adapter.ParsedSql.initAlloc(alloc, entry.sql) catch |err| {
-        if (try expectAppParityGeneratedParseFailureEntry(alloc, entry, err)) return;
-        return err;
-    };
+    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, entry.sql);
     defer parsed_sql.deinit(alloc);
 
     var effective_schema = schema;

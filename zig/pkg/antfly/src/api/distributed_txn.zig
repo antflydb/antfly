@@ -24,6 +24,7 @@ const table_reads = @import("table_reads.zig");
 const table_writes = @import("table_writes.zig");
 const schema_mod = @import("../schema/mod.zig");
 const storage_schema = @import("../storage/schema.zig");
+const internal_keys = @import("../storage/internal_keys.zig");
 const relational_store = @import("../storage/db/relational_store.zig");
 const document_mapper = @import("../storage/db/document_mapper.zig");
 const platform_clock = @import("../platform/clock.zig");
@@ -1567,6 +1568,9 @@ const ParticipantTxn = struct {
     deletes: std.ArrayListUnmanaged([]const u8) = .empty,
     transforms: std.ArrayListUnmanaged(db_mod.types.DocumentTransform) = .empty,
     predicates: std.ArrayListUnmanaged(db_mod.types.TransactionVersionPredicate) = .empty,
+    owned_write_keys: std.ArrayListUnmanaged([]u8) = .empty,
+    owned_write_values: std.ArrayListUnmanaged([]u8) = .empty,
+    owned_delete_keys: std.ArrayListUnmanaged([]u8) = .empty,
     owned_predicate_keys: std.ArrayListUnmanaged([]u8) = .empty,
     foreign_key_parent_checks: std.ArrayListUnmanaged(db_mod.types.ForeignKeyParentCheck) = .empty,
     foreign_key_parent_delete_checks: std.ArrayListUnmanaged(db_mod.types.ForeignKeyParentDeleteCheck) = .empty,
@@ -1628,6 +1632,12 @@ const ParticipantTxn = struct {
         self.unique_constraint_deletes.deinit(alloc);
         for (self.foreign_key_constraint_timing_overrides.items) |override| freeForeignKeyConstraintTimingOverrideFields(alloc, override);
         self.foreign_key_constraint_timing_overrides.deinit(alloc);
+        for (self.owned_write_keys.items) |key| alloc.free(key);
+        self.owned_write_keys.deinit(alloc);
+        for (self.owned_write_values.items) |value| alloc.free(value);
+        self.owned_write_values.deinit(alloc);
+        for (self.owned_delete_keys.items) |key| alloc.free(key);
+        self.owned_delete_keys.deinit(alloc);
         self.writes.deinit(alloc);
         self.deletes.deinit(alloc);
         self.transforms.deinit(alloc);
@@ -3071,6 +3081,33 @@ fn addUniqueConstraintOwnerMutationsForWrite(
             null else null;
         defer if (new_span) |*span| span.deinit(alloc);
         if (old_value != null and new_value != null and std.mem.eql(u8, old_value.?, new_value.?) and temporalUniqueSpansEqual(old_span, new_span)) continue;
+        const ordered_index = relational_store.relationalIndexForUniqueConstraint(runtime_schema.relational_indexes, constraint, .ordered_tuple);
+        if (!relational_store.uniqueConstraintUsesDedicatedOwnerRows(constraint) and
+            ordered_index != null and relational_store.orderedTupleUniqueIndexLookupReady(constraint, ordered_index.?))
+        {
+            const old_ordered_tuple = if (old_row != null)
+                try relational_store.orderedTupleValueForIndexKeysAlloc(alloc, old_row.?, ordered_index.?.keys, runtime_schema.relational_columns)
+            else
+                null;
+            defer if (old_ordered_tuple) |value| alloc.free(value);
+            const new_ordered_tuple = if (new_row != null)
+                try relational_store.orderedTupleValueForIndexKeysAlloc(alloc, new_row.?, ordered_index.?.keys, runtime_schema.relational_columns)
+            else
+                null;
+            defer if (new_ordered_tuple) |value| alloc.free(value);
+            if (old_ordered_tuple != null and new_ordered_tuple != null and std.mem.eql(u8, old_ordered_tuple.?, new_ordered_tuple.?)) continue;
+            if (old_value) |value| {
+                if (old_ordered_tuple) |ordered_tuple| {
+                    try addOrderedTupleUniqueConflictDeleteParticipant(alloc, catalog, participants, table_name, constraint, ordered_index.?, value, ordered_tuple);
+                }
+            }
+            if (new_value) |value| {
+                if (new_ordered_tuple) |ordered_tuple| {
+                    try addOrderedTupleUniqueConflictWriteParticipant(alloc, catalog, participants, table_name, constraint, ordered_index.?, value, ordered_tuple, owner_key);
+                }
+            }
+            continue;
+        }
         if (old_value) |value| {
             if (!try addUniqueConstraintOwnerDeleteParticipant(alloc, catalog, participants, table_name, constraint, value, old_span, owner_key)) return error.UnsupportedOperation;
         }
@@ -3151,6 +3188,61 @@ fn addUniqueConstraintOwnerWriteParticipant(
     const participant = try ensureParticipantTxn(alloc, participants, table_name, resolution.groups[0], resolution.topology_epoch);
     try appendUniqueConstraintMutation(alloc, &participant.unique_constraint_writes, constraint.name, encoded_value, temporal_span, owner_key);
     return true;
+}
+
+fn addOrderedTupleUniqueConflictWriteParticipant(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    participants: *std.ArrayListUnmanaged(ParticipantTxn),
+    table_name: []const u8,
+    constraint: storage_schema.UniqueConstraint,
+    index: storage_schema.RelationalIndex,
+    route_value: []const u8,
+    ordered_tuple: []const u8,
+    owner_key: []const u8,
+) !void {
+    var resolution = try table_catalog.resolveUniqueConstraintOwnerGroups(alloc, catalog, table_name, constraint.name, route_value);
+    defer resolution.deinit(alloc);
+    if (!resolution.configured) return;
+    if (resolution.groups.len == 0) return error.UnknownGroup;
+    if (resolution.groups.len != 1) return error.TopologyChanged;
+    const participant = try ensureParticipantTxn(alloc, participants, table_name, resolution.groups[0], resolution.topology_epoch);
+    const conflict_key = try internal_keys.relationalOrderedTupleUniqueConflictKeyAlloc(alloc, index.name, ordered_tuple);
+    var conflict_key_owned = true;
+    errdefer if (conflict_key_owned) alloc.free(conflict_key);
+    const conflict_value = try std.json.Stringify.valueAlloc(alloc, owner_key, .{ .emit_null_optional_fields = false });
+    var conflict_value_owned = true;
+    errdefer if (conflict_value_owned) alloc.free(conflict_value);
+    try appendInjectedVersionPredicate(alloc, participant, conflict_key, 0);
+    try participant.writes.append(alloc, .{ .key = conflict_key, .value = conflict_value });
+    try participant.owned_write_keys.append(alloc, conflict_key);
+    conflict_key_owned = false;
+    try participant.owned_write_values.append(alloc, conflict_value);
+    conflict_value_owned = false;
+}
+
+fn addOrderedTupleUniqueConflictDeleteParticipant(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    participants: *std.ArrayListUnmanaged(ParticipantTxn),
+    table_name: []const u8,
+    constraint: storage_schema.UniqueConstraint,
+    index: storage_schema.RelationalIndex,
+    route_value: []const u8,
+    ordered_tuple: []const u8,
+) !void {
+    var resolution = try table_catalog.resolveUniqueConstraintOwnerGroups(alloc, catalog, table_name, constraint.name, route_value);
+    defer resolution.deinit(alloc);
+    if (!resolution.configured) return;
+    if (resolution.groups.len == 0) return error.UnknownGroup;
+    if (resolution.groups.len != 1) return error.TopologyChanged;
+    const participant = try ensureParticipantTxn(alloc, participants, table_name, resolution.groups[0], resolution.topology_epoch);
+    const conflict_key = try internal_keys.relationalOrderedTupleUniqueConflictKeyAlloc(alloc, index.name, ordered_tuple);
+    var conflict_key_owned = true;
+    errdefer if (conflict_key_owned) alloc.free(conflict_key);
+    try participant.deletes.append(alloc, conflict_key);
+    try participant.owned_delete_keys.append(alloc, conflict_key);
+    conflict_key_owned = false;
 }
 
 fn addUniqueConstraintOwnerDeleteParticipant(
@@ -7427,6 +7519,198 @@ test "distributed txn coordinator routes unique constraint writes through owner 
     try std.testing.expectEqual(@as(usize, 1), delete_recorder.lookup_calls);
 }
 
+test "distributed txn coordinator routes ordered tuple unique conflicts through catalog index owners" {
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"email":{"type":"keyword","collation":"antfly.case_insensitive"}},"required":["tenant_id","email"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_tenant_email_key","columns":["tenant_id","email"]}],"relational_indexes":[{"name":"users_tenant_email_idx","owner_kind":"unique_constraint","owner_name":"users_tenant_email_key","access_method":"ordered_tuple","unique":true,"columns":["tenant_id","email"],"keys":[{"column":"tenant_id"},{"column":"email"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"unique-index-v1:users_tenant_email"}]}
+    ;
+    var parsed_schema = try schema_mod.parseValidatedTableSchema(std.testing.allocator, schema_json);
+    defer parsed_schema.deinit(std.testing.allocator);
+    const runtime_schema = try schema_mod.deriveRuntimeTableSchema(std.testing.allocator, parsed_schema);
+    defer storage_schema.freeSchema(std.testing.allocator, runtime_schema);
+    const unique_index = relational_store.relationalIndexForUniqueConstraint(
+        runtime_schema.relational_indexes,
+        runtime_schema.unique_constraints[0],
+        .ordered_tuple,
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("users_tenant_email_idx", unique_index.name);
+    try std.testing.expectEqualStrings("users_tenant_email_key", unique_index.owner_name);
+
+    const expected_row = try document_mapper.buildRelationalRowValueAlloc(std.testing.allocator, "{\"tenant_id\":\"tenant:1\",\"email\":\"Ada@Example.Test\"}", runtime_schema.relational_columns);
+    defer std.testing.allocator.free(expected_row);
+    const expected_value = try relational_store.uniqueConstraintTupleValueWithColumnsAlloc(std.testing.allocator, expected_row, runtime_schema.unique_constraints[0], runtime_schema.relational_columns);
+    defer if (expected_value) |value| std.testing.allocator.free(value);
+    const expected_route_value = expected_value orelse unreachable;
+    const expected_tuple = try relational_store.orderedTupleValueForIndexKeysAlloc(std.testing.allocator, expected_row, unique_index.keys, runtime_schema.relational_columns);
+    defer std.testing.allocator.free(expected_tuple);
+    const expected_conflict_key = try internal_keys.relationalOrderedTupleUniqueConflictKeyAlloc(std.testing.allocator, unique_index.name, expected_tuple);
+    defer std.testing.allocator.free(expected_conflict_key);
+
+    const FakeCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !@import("../metadata/api.zig").AdminSnapshot {
+            const metadata_table_manager = @import("../metadata/table_manager.zig");
+            const raft_reconciler = @import("../raft/reconciler.zig");
+            const metadata_transition_state = @import("../metadata/transition_state.zig");
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{
+                    .{ .table_id = 7, .name = "users", .schema_json = schema_json, .placement_role = "data" },
+                })[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = "user:m" },
+                    .{ .group_id = 7002, .table_id = 7, .start_key = "user:m", .end_key = null },
+                })[0..]),
+                .unique_constraint_ranges = @constCast((&[_]metadata_table_manager.UniqueConstraintRangeRecord{.{
+                    .table_id = 7,
+                    .constraint_name = "users_tenant_email_key",
+                    .start_encoded_value = "",
+                    .end_encoded_value = null,
+                    .group_id = 9001,
+                    .topology_epoch = 1,
+                    .state = metadata_table_manager.unique_constraint_range_active,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *@import("../metadata/api.zig").AdminSnapshot) void {}
+    };
+
+    const Recorder = struct {
+        const Mode = enum { write, delete };
+
+        mode: Mode = .write,
+        expected_conflict_key: []const u8,
+        prepared_row: bool = false,
+        prepared_owner: bool = false,
+        lookup_calls: usize = 0,
+
+        fn worker(self: *@This()) ParticipantWorker {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .begin_group = begin,
+                    .prepare_group = prepare,
+                    .resolve_group = resolve,
+                    .status_group = status,
+                    .lookup_group = lookup,
+                },
+            };
+        }
+
+        fn begin(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, req: TxnBeginRequest) !void {
+            try std.testing.expectEqual(@as(usize, 2), req.participants.len);
+        }
+
+        fn prepare(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnPrepareRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("users", table_name);
+            if (group_id == 7002) {
+                if (self.mode == .write) {
+                    try std.testing.expectEqual(@as(usize, 1), req.req.writes.len);
+                    try std.testing.expectEqual(@as(usize, 0), req.req.deletes.len);
+                    try std.testing.expectEqual(@as(usize, 1), req.req.predicates.len);
+                    try std.testing.expectEqualStrings("user:z", req.req.predicates[0].key);
+                    try std.testing.expectEqual(@as(u64, 0), req.req.predicates[0].expected_version);
+                } else {
+                    try std.testing.expectEqual(@as(usize, 0), req.req.writes.len);
+                    try std.testing.expectEqual(@as(usize, 1), req.req.deletes.len);
+                    try std.testing.expectEqualStrings("user:z", req.req.deletes[0]);
+                    try std.testing.expectEqual(@as(usize, 1), req.req.predicates.len);
+                    try std.testing.expectEqualStrings("user:z", req.req.predicates[0].key);
+                    try std.testing.expectEqual(@as(u64, 5), req.req.predicates[0].expected_version);
+                }
+                self.prepared_row = true;
+            } else if (group_id == 9001) {
+                try std.testing.expectEqual(@as(usize, 0), req.req.unique_constraint_writes.len);
+                try std.testing.expectEqual(@as(usize, 0), req.req.unique_constraint_deletes.len);
+                if (self.mode == .write) {
+                    try std.testing.expectEqual(@as(usize, 1), req.req.writes.len);
+                    try std.testing.expectEqual(@as(usize, 0), req.req.deletes.len);
+                    try std.testing.expectEqual(@as(usize, 1), req.req.predicates.len);
+                    try std.testing.expectEqualStrings(self.expected_conflict_key, req.req.predicates[0].key);
+                    try std.testing.expectEqual(@as(u64, 0), req.req.predicates[0].expected_version);
+                    try std.testing.expectEqualStrings(self.expected_conflict_key, req.req.writes[0].key);
+                    try std.testing.expectEqualStrings("\"user:z\"", req.req.writes[0].value);
+                } else {
+                    try std.testing.expectEqual(@as(usize, 0), req.req.writes.len);
+                    try std.testing.expectEqual(@as(usize, 1), req.req.deletes.len);
+                    try std.testing.expectEqualStrings(self.expected_conflict_key, req.req.deletes[0]);
+                }
+                self.prepared_owner = true;
+            } else return error.UnexpectedGroup;
+        }
+
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnResolveRequest) !void {}
+
+        fn status(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
+            return .pending;
+        }
+
+        fn lookup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, key: []const u8) !?table_reads.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.lookup_calls += 1;
+            try std.testing.expectEqual(@as(u64, 7002), group_id);
+            try std.testing.expectEqualStrings("users", table_name);
+            try std.testing.expectEqualStrings("user:z", key);
+            if (self.mode == .write) return null;
+            return .{
+                .json = try alloc.dupe(u8, "{\"tenant_id\":\"tenant:1\",\"email\":\"Ada@Example.Test\"}"),
+                .version = 5,
+            };
+        }
+    };
+
+    var recorder = Recorder{ .mode = .write, .expected_conflict_key = expected_conflict_key };
+    const result = try executeCrossGroup(
+        std.testing.allocator,
+        FakeCatalog.iface(),
+        recorder.worker(),
+        "users",
+        try parseTxnIdHex("51515151515151515151515151515151"),
+        31_000,
+        31_001,
+        .{
+            .writes = &.{.{ .key = "user:z", .value = "{\"tenant_id\":\"tenant:1\",\"email\":\"Ada@Example.Test\"}" }},
+        },
+        null,
+    );
+    try std.testing.expectEqual(@as(usize, 2), result.participant_count);
+    try std.testing.expect(recorder.prepared_row);
+    try std.testing.expect(recorder.prepared_owner);
+    try std.testing.expectEqual(@as(usize, 1), recorder.lookup_calls);
+
+    var delete_recorder = Recorder{ .mode = .delete, .expected_conflict_key = expected_conflict_key };
+    const delete_result = try executeCrossGroup(
+        std.testing.allocator,
+        FakeCatalog.iface(),
+        delete_recorder.worker(),
+        "users",
+        try parseTxnIdHex("51515151515151515151515151515152"),
+        31_100,
+        31_101,
+        .{ .deletes = &.{"user:z"} },
+        null,
+    );
+    try std.testing.expectEqual(@as(usize, 2), delete_result.participant_count);
+    try std.testing.expect(delete_recorder.prepared_row);
+    try std.testing.expect(delete_recorder.prepared_owner);
+    try std.testing.expectEqual(@as(usize, 1), delete_recorder.lookup_calls);
+    _ = expected_route_value;
+}
+
 test "distributed txn coordinator routes unique owner handoff with row version proofs" {
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"email":{"type":"keyword"}},"additionalProperties":false}}},"unique_constraints":[{"name":"users_email_key","columns":["email"]}]}
@@ -8913,6 +9197,7 @@ test "distributed txn coordinator routes unique foreign key parent deletes throu
                 self.row_prepared = true;
             } else if (group_id == 9002) {
                 try std.testing.expectEqual(@as(usize, 0), req.req.writes.len);
+                try std.testing.expectEqual(@as(usize, 0), req.req.deletes.len);
                 try std.testing.expectEqual(@as(usize, 1), req.req.unique_constraint_deletes.len);
                 try std.testing.expectEqual(@as(usize, 0), req.req.unique_constraint_writes.len);
                 try std.testing.expectEqualStrings("users_email_key", req.req.unique_constraint_deletes[0].constraint_name);

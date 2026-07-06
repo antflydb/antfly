@@ -1087,8 +1087,8 @@ pub fn Impl(comptime DB: type) type {
         }
 
         fn relationalColumnIndexPolicy(self: *DB) relational_store_mod.ColumnIndexPolicy {
-            const schema = self.core.schema orelse return relational_store_mod.ColumnIndexPolicy.all();
-            if (schema.storage_mode != .relational) return relational_store_mod.ColumnIndexPolicy.all();
+            const schema = self.core.schema orelse return relational_store_mod.ColumnIndexPolicy.empty();
+            if (schema.storage_mode != .relational) return relational_store_mod.ColumnIndexPolicy.empty();
             return relational_store_mod.ColumnIndexPolicy.fromSchema(schema);
         }
 

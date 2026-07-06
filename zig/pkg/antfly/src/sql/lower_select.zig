@@ -1161,7 +1161,7 @@ pub fn lowerLateralPlanWithSchemasParsedSqlAlloc(
 
 const Parser = sql_adapter.ParserState;
 
-test "recursive cte lowerer validates retained generated ast before token fallback" {
+test "recursive cte lowerer fails closed on stale retained generated ast" {
     const alloc = std.testing.allocator;
     const schema = runtime_schema.TableSchema{
         .storage_mode = .relational,

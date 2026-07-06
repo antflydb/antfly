@@ -320,7 +320,6 @@ pub fn Impl(comptime DB: type) type {
         ) !void {
             const relational_columns = relationalColumnsForStore(self) orelse return;
             const runtime_schema = self.core.schema orelse return;
-            if (runtime_schema.foreign_keys.len != 0) return;
 
             var relational_delete_keys = std.ArrayListUnmanaged([]const u8).empty;
             defer relational_delete_keys.deinit(self.alloc);
@@ -342,7 +341,7 @@ pub fn Impl(comptime DB: type) type {
                 owned_values,
                 relationalColumnIndexPolicyForStore(self),
             );
-            relational_participant.configureForeignKeys(runtime_schema.default_type, runtime_schema.foreign_keys, relational_delete_keys.items);
+            relational_participant.configureForeignKeys(runtime_schema.default_type, &.{}, relational_delete_keys.items);
             relational_participant.configurePrimaryKey(runtime_schema.primary_key);
             relational_participant.configureUniqueConstraints(runtime_schema.unique_constraints);
             relational_participant.configurePeriods(runtime_schema.periods, runtime_schema.relational_columns);
@@ -389,12 +388,60 @@ pub fn Impl(comptime DB: type) type {
                 try relational_participant.closePreparedIntents();
                 relational_participant_closed = true;
             }
+            try appendOrderedTupleUniqueConflictIntents(
+                self.alloc,
+                intents,
+                owned_keys,
+                relational_prepare_writes.items,
+                runtime_schema.relational_indexes,
+            );
             for (relational_prepare_writes.items) |write| {
                 try intents.append(self.alloc, .{ .key = write.key, .value = write.value });
             }
             for (relational_prepare_deletes.items) |key| {
                 try intents.append(self.alloc, .{ .key = key, .value = null });
             }
+        }
+
+        fn appendOrderedTupleUniqueConflictIntents(
+            alloc: Allocator,
+            intents: *std.ArrayListUnmanaged(transactions_mod.WriteIntent),
+            owned_keys: *std.ArrayListUnmanaged([]u8),
+            writes: []const docstore_mod.KVPair,
+            relational_indexes: []const schema_mod.RelationalIndex,
+        ) !void {
+            if (writes.len == 0 or relational_indexes.len == 0) return;
+            for (writes) |write| {
+                var decoded = (try internal_keys.decodeRelationalOrderedTupleIndexKeyAlloc(alloc, write.key)) orelse continue;
+                defer decoded.deinit(alloc);
+                const index = findOrderedTupleUniqueIndexByName(relational_indexes, decoded.index_id) orelse continue;
+                if (index.access_method != .ordered_tuple or !index.unique or index.owner_kind != .unique_constraint) continue;
+                const conflict_key = try internal_keys.relationalOrderedTupleUniqueConflictKeyAlloc(alloc, decoded.index_id, decoded.encoded_tuple);
+                var conflict_key_owned = true;
+                errdefer if (conflict_key_owned) alloc.free(conflict_key);
+                if (containsOwnedKey(owned_keys.items, conflict_key)) {
+                    alloc.free(conflict_key);
+                    conflict_key_owned = false;
+                    continue;
+                }
+                try owned_keys.append(alloc, conflict_key);
+                conflict_key_owned = false;
+                try intents.append(alloc, .{ .key = conflict_key, .value = null });
+            }
+        }
+
+        fn findOrderedTupleUniqueIndexByName(relational_indexes: []const schema_mod.RelationalIndex, name: []const u8) ?schema_mod.RelationalIndex {
+            for (relational_indexes) |index| {
+                if (std.mem.eql(u8, index.name, name)) return index;
+            }
+            return null;
+        }
+
+        fn containsOwnedKey(keys: []const []u8, needle: []const u8) bool {
+            for (keys) |key| {
+                if (std.mem.eql(u8, key, needle)) return true;
+            }
+            return false;
         }
 
         pub fn claimRowsForTransaction(
@@ -776,6 +823,7 @@ pub fn Impl(comptime DB: type) type {
                         for (mutations) |*mutation| mutation.deinit(self.alloc);
                         if (mutations.len > 0) self.alloc.free(mutations);
                     }
+                    try appendOrderedTupleUniqueConflictSkipKeys(self.alloc, mutations, &relational_skip_intent_keys);
                     std.mem.sort(transactions_mod.OwnedIntentMutation, mutations, {}, struct {
                         fn lessThan(_: void, lhs: transactions_mod.OwnedIntentMutation, rhs: transactions_mod.OwnedIntentMutation) bool {
                             const lhs_is_write = lhs.value != null;
@@ -1002,6 +1050,21 @@ pub fn Impl(comptime DB: type) type {
             }
         }
 
+        fn appendOrderedTupleUniqueConflictSkipKeys(
+            alloc: Allocator,
+            mutations: []const transactions_mod.OwnedIntentMutation,
+            skip_keys: *std.ArrayListUnmanaged([]const u8),
+        ) !void {
+            for (mutations) |mutation| {
+                if (!internal_keys.isRelationalOrderedTupleUniqueConflictKey(mutation.key)) continue;
+                const skip_key = try alloc.dupe(u8, mutation.key);
+                var skip_key_owned = true;
+                errdefer if (skip_key_owned) alloc.free(skip_key);
+                try skip_keys.append(alloc, skip_key);
+                skip_key_owned = false;
+            }
+        }
+
         pub fn abortTransaction(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64) !void {
             try self.resolveTransactionIntents(txn_id, .aborted, timestamp_ns);
         }
@@ -1090,8 +1153,8 @@ pub fn Impl(comptime DB: type) type {
         }
 
         fn relationalColumnIndexPolicyForStore(self: *DB) relational_store_mod.ColumnIndexPolicy {
-            const schema = self.core.schema orelse return relational_store_mod.ColumnIndexPolicy.all();
-            if (schema.storage_mode != .relational) return relational_store_mod.ColumnIndexPolicy.all();
+            const schema = self.core.schema orelse return relational_store_mod.ColumnIndexPolicy.empty();
+            if (schema.storage_mode != .relational) return relational_store_mod.ColumnIndexPolicy.empty();
             return relational_store_mod.ColumnIndexPolicy.fromSchema(schema);
         }
 
@@ -1476,7 +1539,7 @@ test "db transactions durable foreign key action schedules are atomic" {
     try std.testing.expectEqual(@as(u32, 64), generated_schedule.cascade_max_depth);
 }
 
-test "db transactions unique constraint mutations enforce owner handoff" {
+test "db transactions reject non-temporal unique constraint mutation owner handoff" {
     const DB = @import("mod.zig").DB;
     const alloc = std.testing.allocator;
 
@@ -1502,30 +1565,14 @@ test "db transactions unique constraint mutations enforce owner handoff" {
     defer alloc.free(ada_value);
 
     const owner_write_txn = try db.beginTransaction(41_000);
-    try db.writeTransaction(owner_write_txn, .{
+    try std.testing.expectError(error.UniqueConstraintViolation, db.writeTransaction(owner_write_txn, .{
         .unique_constraint_writes = &.{.{
             .constraint_name = "users_email_key",
             .encoded_value = ada_value,
             .owner_key = "user:1",
         }},
-    });
-    try db.commitTransaction(owner_write_txn, 41_001);
-
-    const unique_key = try internal_keys.relationalUniqueKeyAlloc(alloc, "users_email_key", ada_value);
-    defer alloc.free(unique_key);
-    const owner = try db.core.store.get(alloc, unique_key);
-    defer alloc.free(owner);
-    try std.testing.expectEqualStrings("user:1", owner);
-
-    const conflicting_owner_txn = try db.beginTransaction(41_100);
-    try std.testing.expectError(error.UniqueConstraintViolation, db.writeTransaction(conflicting_owner_txn, .{
-        .unique_constraint_writes = &.{.{
-            .constraint_name = "users_email_key",
-            .encoded_value = ada_value,
-            .owner_key = "user:2",
-        }},
     }));
-    try db.abortTransaction(conflicting_owner_txn, 41_101);
+    try db.abortTransaction(owner_write_txn, 41_001);
 
     const wrong_delete_txn = try db.beginTransaction(41_200);
     try std.testing.expectError(error.UniqueConstraintViolation, db.writeTransaction(wrong_delete_txn, .{
@@ -1536,36 +1583,6 @@ test "db transactions unique constraint mutations enforce owner handoff" {
         }},
     }));
     try db.abortTransaction(wrong_delete_txn, 41_201);
-
-    const handoff_txn = try db.beginTransaction(41_300);
-    try db.writeTransaction(handoff_txn, .{
-        .unique_constraint_deletes = &.{.{
-            .constraint_name = "users_email_key",
-            .encoded_value = ada_value,
-            .owner_key = "user:1",
-        }},
-        .unique_constraint_writes = &.{.{
-            .constraint_name = "users_email_key",
-            .encoded_value = ada_value,
-            .owner_key = "user:2",
-        }},
-    });
-    try db.commitTransaction(handoff_txn, 41_301);
-
-    const handed_off_owner = try db.core.store.get(alloc, unique_key);
-    defer alloc.free(handed_off_owner);
-    try std.testing.expectEqualStrings("user:2", handed_off_owner);
-
-    const delete_txn = try db.beginTransaction(41_400);
-    try db.writeTransaction(delete_txn, .{
-        .unique_constraint_deletes = &.{.{
-            .constraint_name = "users_email_key",
-            .encoded_value = ada_value,
-            .owner_key = "user:2",
-        }},
-    });
-    try db.commitTransaction(delete_txn, 41_401);
-    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, unique_key));
 }
 
 test "db transactions ordered tuple compound unique prepares conflict on owner tuple" {
@@ -1582,14 +1599,20 @@ test "db transactions ordered tuple compound unique prepares conflict on owner t
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"email":{"type":"keyword"},"display_name":{"type":"keyword"}},"required":["id","tenant_id","email"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_tenant_email_key","columns":["tenant_id","email"],"include_columns":["display_name"],"index_keys":[{"column":"tenant_id"},{"column":"email"}],"index_lifecycle":"ready","index_generation":7,"index_access_method":"ordered_tuple","index_schema_fingerprint":"unique-index-v1:users_tenant_email"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"email":{"type":"keyword"},"display_name":{"type":"keyword"}},"required":["id","tenant_id","email"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_tenant_email_key","columns":["tenant_id","email"],"include_columns":["display_name"]}],"relational_indexes":[{"name":"users_tenant_email_key","owner_kind":"unique_constraint","owner_name":"users_tenant_email_key","access_method":"ordered_tuple","unique":true,"columns":["tenant_id","email"],"include_columns":["display_name"],"keys":[{"column":"tenant_id"},{"column":"email"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"unique-index-v1:users_tenant_email"}]}
     ;
     var parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
     const runtime_schema = try schema_api_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
     defer schema_mod.freeSchema(alloc, runtime_schema);
     try db.setSchema(runtime_schema);
-    try std.testing.expectEqual(schema_mod.RelationalIndexAccessMethod.ordered_tuple, runtime_schema.unique_constraints[0].index_access_method.?);
+    const unique_index = blk: {
+        for (runtime_schema.relational_indexes) |index| {
+            if (index.owner_kind == .unique_constraint and std.mem.eql(u8, index.owner_name, "users_tenant_email_key")) break :blk index;
+        }
+        return error.TestUnexpectedResult;
+    };
+    try std.testing.expectEqual(schema_mod.RelationalIndexAccessMethod.ordered_tuple, unique_index.access_method);
 
     const first_txn = try db.beginTransaction(42_000);
     try db.writeTransaction(first_txn, .{
@@ -1613,13 +1636,13 @@ test "db transactions ordered tuple compound unique prepares conflict on owner t
     const ordered_tuple = try relational_store_mod.orderedTupleValueForIndexKeysAlloc(
         alloc,
         parent_row,
-        runtime_schema.unique_constraints[0].index_keys,
+        unique_index.keys,
         runtime_schema.relational_columns,
     );
     defer alloc.free(ordered_tuple);
     const ordered_forward_key = try internal_keys.relationalOrderedTupleIndexKeyAlloc(
         alloc,
-        runtime_schema.unique_constraints[0].name,
+        unique_index.name,
         ordered_tuple,
         "user:ada",
     );
@@ -1637,6 +1660,54 @@ test "db transactions ordered tuple compound unique prepares conflict on owner t
     try db.abortTransaction(duplicate_after_commit_txn, 42_021);
 }
 
+test "db transactions partial ordered tuple unique prepares conflict on catalog index owner tuple" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id","tenant_id","email","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_active_email_key","columns":["tenant_id","email"]}],"relational_indexes":[{"name":"users_active_email_idx","owner_kind":"unique_constraint","owner_name":"users_active_email_key","access_method":"ordered_tuple","unique":true,"columns":["tenant_id","email"],"keys":[{"column":"tenant_id"},{"column":"email"}],"where":{"all":[{"field":"status","op":"eq","value":"active"}]},"lifecycle":"ready","generation":7,"schema_fingerprint":"unique-index-v1:users_active_email"}]}
+    ;
+    var parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try schema_api_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    const first_txn = try db.beginTransaction(43_000);
+    try db.writeTransaction(first_txn, .{
+        .writes = &.{.{ .key = "user:active", .value = "{\"id\":\"user:active\",\"tenant_id\":\"tenant:1\",\"email\":\"ada@example.test\",\"status\":\"active\"}" }},
+    });
+
+    const inactive_txn = try db.beginTransaction(43_001);
+    try db.writeTransaction(inactive_txn, .{
+        .writes = &.{.{ .key = "user:inactive", .value = "{\"id\":\"user:inactive\",\"tenant_id\":\"tenant:1\",\"email\":\"ada@example.test\",\"status\":\"inactive\"}" }},
+    });
+    try db.abortTransaction(inactive_txn, 43_002);
+
+    const conflicting_txn = try db.beginTransaction(43_003);
+    try std.testing.expectError(transactions_mod.TxnError.IntentConflict, db.writeTransaction(conflicting_txn, .{
+        .writes = &.{.{ .key = "user:active-duplicate", .value = "{\"id\":\"user:active-duplicate\",\"tenant_id\":\"tenant:1\",\"email\":\"ada@example.test\",\"status\":\"active\"}" }},
+    }));
+    try db.abortTransaction(conflicting_txn, 43_004);
+
+    try db.commitTransaction(first_txn, 43_010);
+
+    const duplicate_after_commit_txn = try db.beginTransaction(43_020);
+    try std.testing.expectError(error.UniqueConstraintViolation, db.writeTransaction(duplicate_after_commit_txn, .{
+        .writes = &.{.{ .key = "user:active-duplicate-after-commit", .value = "{\"id\":\"user:active-duplicate-after-commit\",\"tenant_id\":\"tenant:1\",\"email\":\"ada@example.test\",\"status\":\"active\"}" }},
+    }));
+    try db.abortTransaction(duplicate_after_commit_txn, 43_021);
+}
+
 test "db transactions compound foreign key prepares conflict on parent tuple" {
     const DB = @import("mod.zig").DB;
     const alloc = std.testing.allocator;
@@ -1651,7 +1722,7 @@ test "db transactions compound foreign key prepares conflict on parent tuple" {
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"rows","enforce_types":true,"document_schemas":{"rows":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"email":{"type":"keyword"},"order_tenant_id":{"type":"keyword"},"order_email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_tenant_email_key","columns":["tenant_id","email"],"index_keys":[{"column":"tenant_id"},{"column":"email"}],"index_lifecycle":"ready","index_generation":7,"index_access_method":"ordered_tuple","index_schema_fingerprint":"unique-index-v1:users_tenant_email"}],"foreign_keys":[{"name":"orders_user_email_fkey","columns":["order_tenant_id","order_email"],"references":{"table":"rows","columns":["tenant_id","email"]},"on_delete":"restrict"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"rows","enforce_types":true,"document_schemas":{"rows":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"email":{"type":"keyword"},"order_tenant_id":{"type":"keyword"},"order_email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_tenant_email_key","columns":["tenant_id","email"]}],"foreign_keys":[{"name":"orders_user_email_fkey","columns":["order_tenant_id","order_email"],"references":{"table":"rows","columns":["tenant_id","email"]},"on_delete":"restrict"}],"relational_indexes":[{"name":"users_tenant_email_key","owner_kind":"unique_constraint","owner_name":"users_tenant_email_key","access_method":"ordered_tuple","unique":true,"columns":["tenant_id","email"],"keys":[{"column":"tenant_id"},{"column":"email"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"unique-index-v1:users_tenant_email"}]}
     ;
     var parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -2523,7 +2594,7 @@ test "db transactions recovery resolves committed mutation source row claims aft
     defer TestHelpers.cleanupTempDir(path);
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status","owner_kind":"relational_column","owner_name":"status","access_method":"scalar_column","columns":["status"]}]}
     ;
     var parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);

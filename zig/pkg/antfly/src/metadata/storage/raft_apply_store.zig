@@ -22,6 +22,7 @@ const metadata = @import("../mod.zig");
 const extension_domain = @import("../../extensions/mod.zig");
 const metadata_table_manager = @import("../table_manager.zig");
 const runtime_schema = @import("../../storage/schema.zig");
+const sql_schema_mutation = @import("../../sql/schema_mutation.zig");
 const raft_catalog = @import("../../raft/catalog.zig");
 const raft_reconciler = @import("../../raft/reconciler.zig");
 const raft_storage_mod = @import("../../raft/storage/mod.zig");
@@ -4084,7 +4085,9 @@ pub const RaftApplyStore = struct {
         request: metadata_table_manager.SecondaryIndexReadyPromotionRequest,
     ) !void {
         if (request.table_id == 0 or request.promoted_table.table_id != request.table_id) return error.InvalidSecondaryIndexPromotionRequest;
-        if (request.index_name.len == 0 or request.expected_index_generation == 0) return error.InvalidSecondaryIndexPromotionRequest;
+        if (request.index_name.len == 0 or request.expected.generation == 0 or request.expected.schema_fingerprint.len == 0) {
+            return error.InvalidSecondaryIndexPromotionRequest;
+        }
 
         var key_buf: [160]u8 = undefined;
         const key = try tableKeyForGroup(&key_buf, group_id, request.table_id);
@@ -4102,8 +4105,23 @@ pub const RaftApplyStore = struct {
             group_id,
             request.table_id,
             request.index_name,
-            request.expected_index_generation,
+            request.expected.generation,
         ))) return error.SecondaryIndexRebuildRangesIncomplete;
+
+        const expected_ready_schema = sql_schema_mutation.schemaWithSecondaryIndexReadyCheckedAlloc(
+            self.alloc,
+            current.schema_json,
+            request.index_name,
+            .{
+                .generation = request.expected.generation,
+                .access_method = request.expected.access_method,
+                .schema_fingerprint = request.expected.schema_fingerprint,
+            },
+        ) catch return error.InvalidSecondaryIndexPromotionRequest;
+        defer self.alloc.free(expected_ready_schema);
+        if (!std.mem.eql(u8, request.promoted_table.schema_json, expected_ready_schema)) {
+            return error.InvalidSecondaryIndexPromotionRequest;
+        }
 
         const value = try encodeTableRecord(self.alloc, request.promoted_table);
         defer self.alloc.free(value);
@@ -4417,6 +4435,7 @@ fn freeTableEmptyingBarrierPromotionRequest(alloc: std.mem.Allocator, request: m
 
 fn freeSecondaryIndexReadyPromotionRequest(alloc: std.mem.Allocator, request: metadata_table_manager.SecondaryIndexReadyPromotionRequest) void {
     alloc.free(request.index_name);
+    alloc.free(request.expected.schema_fingerprint);
     alloc.free(request.expected_schema_json);
     metadata_table_manager.freeTable(alloc, request.promoted_table);
 }
@@ -6936,7 +6955,9 @@ fn appendSecondaryIndexReadyPromotionRequest(
 ) !void {
     try appendInt(alloc, out, u64, request.table_id);
     try appendRequiredString(alloc, out, request.index_name);
-    try appendInt(alloc, out, u64, request.expected_index_generation);
+    try appendInt(alloc, out, u64, request.expected.generation);
+    try appendInt(alloc, out, u8, @intFromEnum(request.expected.access_method));
+    try appendRequiredString(alloc, out, request.expected.schema_fingerprint);
     try appendRequiredString(alloc, out, request.expected_schema_json);
     try appendTableRecord(alloc, out, request.promoted_table);
 }
@@ -8216,7 +8237,10 @@ fn readSecondaryIndexReadyPromotionRequest(
     const table_id = try readInt(encoded, pos, u64);
     const index_name = try readRequiredString(alloc, encoded, pos);
     errdefer alloc.free(index_name);
-    const expected_index_generation = try readInt(encoded, pos, u64);
+    const expected_generation = try readInt(encoded, pos, u64);
+    const expected_access_method: runtime_schema.RelationalIndexAccessMethod = @enumFromInt(try readInt(encoded, pos, u8));
+    const expected_schema_fingerprint = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(expected_schema_fingerprint);
     const expected_schema_json = try readRequiredString(alloc, encoded, pos);
     errdefer alloc.free(expected_schema_json);
     const promoted_table = try readTableRecord(alloc, encoded, pos);
@@ -8224,7 +8248,11 @@ fn readSecondaryIndexReadyPromotionRequest(
     return .{
         .table_id = table_id,
         .index_name = index_name,
-        .expected_index_generation = expected_index_generation,
+        .expected = .{
+            .generation = expected_generation,
+            .access_method = expected_access_method,
+            .schema_fingerprint = expected_schema_fingerprint,
+        },
         .expected_schema_json = expected_schema_json,
         .promoted_table = promoted_table,
     };
@@ -11284,10 +11312,10 @@ test "metadata raft apply store rejects secondary index promotion until every ra
     defer std.testing.allocator.free(root);
 
     const building_schema =
-        \\{"version":0,"document_schemas":{"row":{"schema":{"type":"object","properties":{"status":{"type":"string","x-antfly-index":true,"x-antfly-index-lifecycle":"building","x-antfly-index-generation":42}}}}}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status","owner_kind":"relational_column","owner_name":"status","access_method":"scalar_column","columns":["status"],"lifecycle":"building","generation":42,"schema_fingerprint":"secondary-index-v1:status"}]}
     ;
     const ready_schema =
-        \\{"version":0,"document_schemas":{"row":{"schema":{"type":"object","properties":{"status":{"type":"string","x-antfly-index":true,"x-antfly-index-lifecycle":"ready","x-antfly-index-generation":42}}}}}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status","owner_kind":"relational_column","owner_name":"status","access_method":"scalar_column","columns":["status"],"lifecycle":"ready","generation":42,"schema_fingerprint":"secondary-index-v1:status"}]}
     ;
 
     const table_cmd = try encodeTransitionCommand(std.testing.allocator, .{
@@ -11336,7 +11364,11 @@ test "metadata raft apply store rejects secondary index promotion until every ra
         .promote_secondary_index_ready = .{
             .table_id = 41,
             .index_name = "status",
-            .expected_index_generation = 42,
+            .expected = .{
+                .generation = 42,
+                .access_method = .scalar_column,
+                .schema_fingerprint = "secondary-index-v1:status",
+            },
             .expected_schema_json = building_schema,
             .promoted_table = .{
                 .table_id = 41,
@@ -11374,13 +11406,13 @@ test "metadata raft apply store promotes secondary index schema with compare and
     defer std.testing.allocator.free(root);
 
     const building_schema =
-        \\{"version":0,"document_schemas":{"row":{"schema":{"type":"object","properties":{"status":{"type":"string","x-antfly-index":true,"x-antfly-index-lifecycle":"building","x-antfly-index-generation":42}}}}}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status","owner_kind":"relational_column","owner_name":"status","access_method":"scalar_column","columns":["status"],"lifecycle":"building","generation":42,"schema_fingerprint":"secondary-index-v1:status"}]}
     ;
     const stale_ready_schema =
-        \\{"version":0,"document_schemas":{"row":{"schema":{"type":"object","properties":{"status":{"type":"string","x-antfly-index":true,"x-antfly-index-lifecycle":"bad-ready","x-antfly-index-generation":42}}}}}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status","owner_kind":"relational_column","owner_name":"status","access_method":"scalar_column","columns":["status"],"lifecycle":"bad-ready","generation":42,"schema_fingerprint":"secondary-index-v1:status"}]}
     ;
     const ready_schema =
-        \\{"version":0,"document_schemas":{"row":{"schema":{"type":"object","properties":{"status":{"type":"string","x-antfly-index":true,"x-antfly-index-lifecycle":"ready","x-antfly-index-generation":42}}}}}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status","owner_kind":"relational_column","owner_name":"status","access_method":"scalar_column","columns":["status"],"lifecycle":"ready","generation":42,"schema_fingerprint":"secondary-index-v1:status"}]}
     ;
 
     const table_cmd = try encodeTransitionCommand(std.testing.allocator, .{
@@ -11429,7 +11461,11 @@ test "metadata raft apply store promotes secondary index schema with compare and
         .promote_secondary_index_ready = .{
             .table_id = 41,
             .index_name = "status",
-            .expected_index_generation = 42,
+            .expected = .{
+                .generation = 42,
+                .access_method = .scalar_column,
+                .schema_fingerprint = "secondary-index-v1:status",
+            },
             .expected_schema_json = "{\"stale\":true}",
             .promoted_table = .{
                 .table_id = 41,
@@ -11443,7 +11479,11 @@ test "metadata raft apply store promotes secondary index schema with compare and
         .promote_secondary_index_ready = .{
             .table_id = 41,
             .index_name = "status",
-            .expected_index_generation = 42,
+            .expected = .{
+                .generation = 42,
+                .access_method = .scalar_column,
+                .schema_fingerprint = "secondary-index-v1:status",
+            },
             .expected_schema_json = building_schema,
             .promoted_table = .{
                 .table_id = 41,
@@ -12593,7 +12633,7 @@ test "metadata.table record decoder round-trips read schema metadata" {
 test "metadata.table record decoder round-trips relational index access method metadata" {
     const schema_api = @import("../../schema/mod.zig");
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-name":"status_scalar_idx","x-antfly-index-access-method":"scalar_column","x-antfly-index-generation":3,"x-antfly-index-schema-fingerprint":"secondary-index-v1:status"},"tenant_id":{"type":"keyword","x-antfly-index-name":"tenant_status_idx","x-antfly-index-access-method":"ordered_tuple","x-antfly-index-generation":4,"x-antfly-index-schema-fingerprint":"secondary-index-v1:tenant_status","x-antfly-index-keys":[{"column":"tenant_id"},{"column":"status"}],"x-antfly-index-include":["id"]},"attrs":{"type":"json","x-antfly-index-name":"attrs_algebraic_idx","x-antfly-index-access-method":"algebraic_filter","x-antfly-index-generation":5,"x-antfly-index-schema-fingerprint":"secondary-index-v1:attrs"},"body":{"type":"text","x-antfly-index-name":"body_text_idx","x-antfly-index-access-method":"text_search","x-antfly-index-generation":6,"x-antfly-index-schema-fingerprint":"secondary-index-v1:body"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"tenant_id":{"type":"keyword"},"attrs":{"type":"json"},"body":{"type":"text"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_scalar_idx","owner_kind":"relational_column","owner_name":"status","access_method":"scalar_column","columns":["status"],"lifecycle":"ready","generation":3,"schema_fingerprint":"secondary-index-v1:status"},{"name":"tenant_status_idx","owner_kind":"relational_column","owner_name":"tenant_id","access_method":"ordered_tuple","columns":["tenant_id"],"keys":[{"column":"tenant_id"},{"column":"status"}],"include_columns":["id"],"lifecycle":"ready","generation":4,"schema_fingerprint":"secondary-index-v1:tenant_status"},{"name":"attrs_algebraic_idx","owner_kind":"relational_column","owner_name":"attrs","access_method":"algebraic_filter","columns":["attrs"],"lifecycle":"ready","generation":5,"schema_fingerprint":"secondary-index-v1:attrs"},{"name":"body_text_idx","owner_kind":"relational_column","owner_name":"body","access_method":"text_search","method_config":{"type":"full_text","field":"body","analyzer":"standard","scoring":"bm25","highlight":true,"snippet":true,"segment_lifecycle":"merge_on_commit"},"columns":["body"],"lifecycle":"ready","generation":6,"schema_fingerprint":"secondary-index-v1:body"}]}
     ;
     const indexes_json =
         \\{"attrs_algebraic_idx":{"type":"algebraic","group_fields":["attrs.kind"],"capability_fingerprint":"secondary-index-v1:attrs"},"body_text_idx":{"type":"full_text","field":"body","analyzer":"standard","scoring":"bm25","highlight":true,"snippet":true,"segment_lifecycle":"merge_on_commit"}}
@@ -12629,36 +12669,39 @@ test "metadata.table record decoder round-trips relational index access method m
     defer runtime_schema.freeSchema(std.testing.allocator, runtime);
 
     const Find = struct {
-        fn column(schema: runtime_schema.TableSchema, name: []const u8) ?runtime_schema.RelationalColumn {
-            for (schema.relational_columns) |candidate| {
+        fn index(schema: runtime_schema.TableSchema, name: []const u8) ?runtime_schema.RelationalIndex {
+            for (schema.relational_indexes) |candidate| {
                 if (std.mem.eql(u8, candidate.name, name)) return candidate;
             }
             return null;
         }
     };
 
-    const status = Find.column(runtime, "status") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(runtime_schema.RelationalIndexAccessMethod.scalar_column, status.index_access_method.?);
-    try std.testing.expectEqual(@as(usize, 0), status.index_keys.len);
-    try std.testing.expectEqualStrings("secondary-index-v1:status", status.index_schema_fingerprint.?);
+    const status = Find.index(runtime, "status_scalar_idx") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(runtime_schema.RelationalIndexAccessMethod.scalar_column, status.access_method);
+    try std.testing.expectEqual(@as(usize, 0), status.keys.len);
+    try std.testing.expectEqualStrings("secondary-index-v1:status", status.schema_fingerprint.?);
 
-    const tenant_id = Find.column(runtime, "tenant_id") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(runtime_schema.RelationalIndexAccessMethod.ordered_tuple, tenant_id.index_access_method.?);
-    try std.testing.expectEqual(@as(usize, 2), tenant_id.index_keys.len);
-    try std.testing.expectEqualStrings("tenant_id", tenant_id.index_keys[0].column);
-    try std.testing.expectEqualStrings("status", tenant_id.index_keys[1].column);
-    try std.testing.expectEqual(@as(usize, 1), tenant_id.index_include_columns.len);
-    try std.testing.expectEqualStrings("id", tenant_id.index_include_columns[0]);
+    const tenant_id = Find.index(runtime, "tenant_status_idx") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(runtime_schema.RelationalIndexAccessMethod.ordered_tuple, tenant_id.access_method);
+    try std.testing.expectEqual(@as(usize, 2), tenant_id.keys.len);
+    try std.testing.expectEqualStrings("tenant_id", tenant_id.keys[0].column);
+    try std.testing.expectEqualStrings("status", tenant_id.keys[1].column);
+    try std.testing.expectEqual(@as(usize, 1), tenant_id.include_columns.len);
+    try std.testing.expectEqualStrings("id", tenant_id.include_columns[0]);
 
-    const attrs = Find.column(runtime, "attrs") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(runtime_schema.RelationalIndexAccessMethod.algebraic_filter, attrs.index_access_method.?);
-    try std.testing.expectEqual(@as(usize, 0), attrs.index_keys.len);
-    try std.testing.expectEqualStrings("secondary-index-v1:attrs", attrs.index_schema_fingerprint.?);
+    const attrs = Find.index(runtime, "attrs_algebraic_idx") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(runtime_schema.RelationalIndexAccessMethod.algebraic_filter, attrs.access_method);
+    try std.testing.expectEqual(@as(usize, 0), attrs.keys.len);
+    try std.testing.expectEqualStrings("secondary-index-v1:attrs", attrs.schema_fingerprint.?);
 
-    const body = Find.column(runtime, "body") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(runtime_schema.RelationalIndexAccessMethod.text_search, body.index_access_method.?);
-    try std.testing.expectEqual(@as(usize, 0), body.index_keys.len);
-    try std.testing.expectEqualStrings("secondary-index-v1:body", body.index_schema_fingerprint.?);
+    const body = Find.index(runtime, "body_text_idx") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(runtime_schema.RelationalIndexAccessMethod.text_search, body.access_method);
+    try std.testing.expectEqual(@as(usize, 0), body.keys.len);
+    try std.testing.expectEqualStrings("secondary-index-v1:body", body.schema_fingerprint.?);
+    try std.testing.expect(body.method_config_json != null);
+    try std.testing.expect(std.mem.indexOf(u8, body.method_config_json.?, "\"field\":\"body\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body.method_config_json.?, "\"segment_lifecycle\":\"merge_on_commit\"") != null);
 }
 
 test "metadata.table record decoder round-trips catalog identity" {
