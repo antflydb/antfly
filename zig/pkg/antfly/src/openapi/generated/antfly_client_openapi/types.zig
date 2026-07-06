@@ -364,6 +364,7 @@ pub const ArtifactRepairKind = enum {
     chunk,
     graph,
     full_text,
+    algebraic,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -372,6 +373,7 @@ pub const ArtifactRepairKind = enum {
             .chunk => "chunk",
             .graph => "graph",
             .full_text => "full_text",
+            .algebraic => "algebraic",
         };
         try jw.write(s);
     }
@@ -387,6 +389,7 @@ pub const ArtifactRepairKind = enum {
             .{ "chunk", .chunk },
             .{ "graph", .graph },
             .{ "full_text", .full_text },
+            .{ "algebraic", .algebraic },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }

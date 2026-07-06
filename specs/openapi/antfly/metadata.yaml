@@ -2024,6 +2024,7 @@ components:
         - chunk
         - graph
         - full_text
+        - algebraic
     ArtifactRepairReason:
       type: string
       description: Reason an artifact was added to the repair queue.

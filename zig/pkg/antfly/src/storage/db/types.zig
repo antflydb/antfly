@@ -1630,6 +1630,7 @@ pub const ArtifactRepairKind = enum {
     chunk,
     graph,
     full_text,
+    algebraic,
 };
 
 pub const RepairTarget = enum {

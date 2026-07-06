@@ -2750,6 +2750,8 @@ pub const DB = struct {
     doc_set_planning_stats: DocSetPlanningRuntimeStats = .{},
     index_repair_barriers: std.atomic.Value(u32) = .init(0),
     published_dense_searches: std.atomic.Value(u32) = .init(0),
+    index_repair_mutex: std.atomic.Mutex = .unlocked,
+    active_index_repairs: std.StringHashMapUnmanaged(void) = .{},
 
     const engine_vtable = db_core.Engine.VTable{
         .batch = engineBatch,
@@ -3593,6 +3595,8 @@ pub const DB = struct {
         self.bulk_ingest_coalescer.deinit(self.alloc);
         self.clearBulkIngestSeenDocKeysLocked();
         self.bulk_ingest_seen_doc_keys.deinit(self.alloc);
+        self.clearActiveIndexRepairsLocked();
+        self.active_index_repairs.deinit(self.alloc);
         self.closeShadowIndexManager() catch {};
         if (self.transaction_runtime) |runtime| {
             runtime.deinit();
@@ -5312,6 +5316,30 @@ pub const DB = struct {
         self.bulk_ingest_seen_doc_keys.clearRetainingCapacity();
     }
 
+    fn clearActiveIndexRepairsLocked(self: *DB) void {
+        var it = self.active_index_repairs.keyIterator();
+        while (it.next()) |key_ptr| self.alloc.free(@constCast(key_ptr.*));
+        self.active_index_repairs.clearRetainingCapacity();
+    }
+
+    fn beginIndexRepairLease(self: *DB, index_name: []const u8) !bool {
+        lockAtomic(&self.index_repair_mutex);
+        defer self.index_repair_mutex.unlock();
+        if (self.active_index_repairs.contains(index_name)) return false;
+        const owned = try self.alloc.dupe(u8, index_name);
+        errdefer self.alloc.free(owned);
+        try self.active_index_repairs.put(self.alloc, owned, {});
+        return true;
+    }
+
+    fn endIndexRepairLease(self: *DB, index_name: []const u8) void {
+        lockAtomic(&self.index_repair_mutex);
+        defer self.index_repair_mutex.unlock();
+        if (self.active_index_repairs.fetchRemove(index_name)) |removed| {
+            self.alloc.free(@constCast(removed.key));
+        }
+    }
+
     fn primaryUserNamespaceIsEmptyLocked(self: *DB) !bool {
         var txn = try self.core.store.beginCurrentScanTxn();
         defer txn.abort();
@@ -6879,7 +6907,7 @@ pub const DB = struct {
             .dense_vector, .sparse_vector => .embedding,
             .graph => .graph,
             .full_text => .full_text,
-            .algebraic => null,
+            .algebraic => .algebraic,
         };
     }
 
@@ -6927,9 +6955,10 @@ pub const DB = struct {
                 .artifact_kind = artifact_kind,
                 .index_name = try alloc.dupe(u8, cfg.name),
                 .artifact_name = try alloc.dupe(u8, cfg.name),
-                .repairable = true,
+                .repairable = artifact_kind != .algebraic,
+                .unsupported_reason = if (artifact_kind == .algebraic) try alloc.dupe(u8, artifactRepairUnsupportedReason(.algebraic)) else "",
                 .reason = if (load_error != null) .unreadable_artifact else .missing_artifact,
-                .last_error = if (load_error) |err_name| try alloc.dupe(u8, err_name) else try alloc.dupe(u8, "index_repair_required"),
+                .last_error = if (load_error) |err_name| try alloc.dupe(u8, err_name) else try alloc.dupe(u8, if (artifact_kind == .algebraic) artifactRepairUnsupportedReason(.algebraic) else "index_repair_required"),
             });
             last_returned = cfg.name;
         }
@@ -7084,7 +7113,7 @@ pub const DB = struct {
         return switch (issue.artifact_kind) {
             .embedding => try self.embeddingArtifactNowReadable(alloc, issue),
             .asset => try self.documentAssetArtifactNowReadable(alloc, issue),
-            .chunk, .graph, .full_text => false,
+            .chunk, .graph, .full_text, .algebraic => false,
         };
     }
 
@@ -7158,7 +7187,7 @@ pub const DB = struct {
         return switch (issue.artifact_kind) {
             .embedding => try self.reprocessEmbeddingArtifactIssue(alloc, issue),
             .asset => try self.reprocessDocumentArtifact(alloc, if (issue.parent_doc_key.len > 0) issue.parent_doc_key else issue.doc_key, issue.artifact_name),
-            .chunk, .graph, .full_text => false,
+            .chunk, .graph, .full_text, .algebraic => false,
         };
     }
 
@@ -7283,13 +7312,22 @@ pub const DB = struct {
                 .dense_vector, .sparse_vector => kind == .embedding,
                 .graph => kind == .graph,
                 .full_text => kind == .full_text,
-                .algebraic => false,
+                .algebraic => kind == .algebraic,
             };
             if (!matches_kind) return error.NotFound;
         }
 
         const repair_required = try self.indexRepairRequired(alloc, cfg.name);
         if (!repair_required and !req.force) return result;
+
+        if (!(try self.beginIndexRepairLease(cfg.name))) {
+            result.scanned += 1;
+            result.failed += 1;
+            result.unresolved += 1;
+            result.debt_remaining = true;
+            return result;
+        }
+        defer self.endIndexRepairLease(cfg.name);
 
         var quarantined_retry_run = false;
         result.scanned += 1;
@@ -7385,10 +7423,9 @@ pub const DB = struct {
         };
         defer shadow_ctx.deinit(alloc);
 
-        var build_apply_locked = false;
         var build_floor_sequence: u64 = 0;
         const rebuilt: u64 = switch (cfg.kind) {
-            .dense_vector, .sparse_vector => rebuilt_blk: {
+            .dense_vector, .sparse_vector, .graph => rebuilt_blk: {
                 var snapshot_txn = try self.core.store.beginReadTxn();
                 var snapshot_open = true;
                 defer if (snapshot_open) snapshot_txn.abort();
@@ -7398,30 +7435,23 @@ pub const DB = struct {
                 const count: u64 = switch (cfg.kind) {
                     .dense_vector => @intCast(try rebuildDenseIndexForTargetCoverageContext(&shadow_ctx, cfg.name, 2048)),
                     .sparse_vector => @intCast(try rebuildSparseIndexFromStoredEmbeddingArtifactsContext(&shadow_ctx, cfg.name, 2048)),
+                    .graph => @intCast(try applySplitGraphArtifactsForIndexStreamingContext(
+                        &shadow_ctx,
+                        cfg.name,
+                        graph_repair_rebuild_batch_size,
+                    )),
                     else => unreachable,
                 };
                 snapshot_txn.abort();
                 snapshot_open = false;
                 break :rebuilt_blk count;
             },
-            .graph, .full_text => rebuilt_blk: {
+            .full_text => rebuilt_blk: {
                 lockApply(self);
-                build_apply_locked = true;
-                errdefer if (build_apply_locked) self.core.unlockApply();
+                errdefer self.core.unlockApply();
                 build_floor_sequence = self.core.nextDerivedSequence();
-                const count: u64 = switch (cfg.kind) {
-                    .graph => @intCast(try applySplitGraphArtifactsForIndexStreaming(
-                        alloc,
-                        self.core.store,
-                        &shadow_manager,
-                        cfg.name,
-                        graph_repair_rebuild_batch_size,
-                    )),
-                    .full_text => try shadow_manager.resetFullTextIndexForArtifactRebuild(self.core.store, cfg.name),
-                    else => unreachable,
-                };
+                const count = try shadow_manager.resetFullTextIndexForArtifactRebuild(self.core.store, cfg.name);
                 self.core.unlockApply();
-                build_apply_locked = false;
                 break :rebuilt_blk count;
             },
             .algebraic => return error.UnsupportedOperation,
@@ -23345,7 +23375,7 @@ fn artifactRepairIssueIdHashOptionalU64(hasher: *std.crypto.hash.sha2.Sha256, va
 fn artifactRepairKindHasAutomatedReprocessor(kind: types.ArtifactRepairKind) bool {
     return switch (kind) {
         .embedding, .asset => true,
-        .chunk, .graph, .full_text => false,
+        .chunk, .graph, .full_text, .algebraic => false,
     };
 }
 
@@ -23355,6 +23385,7 @@ fn artifactRepairUnsupportedReason(kind: types.ArtifactRepairKind) []const u8 {
         .chunk => "chunk_reprocessor_unavailable",
         .graph => "graph_reprocessor_unavailable",
         .full_text => "full_text_reprocessor_unavailable",
+        .algebraic => "algebraic_index_rebuild_unavailable",
     };
 }
 
@@ -27240,6 +27271,92 @@ fn applySplitGraphArtifactsForIndexStreaming(
     defer state.deinit();
 
     try dest_store.scanWithContext(store_lower, "", .{}, &state, ScanState.scanEntry);
+    try state.flush();
+    return state.mutation_count;
+}
+
+fn applySplitGraphArtifactsForIndexStreamingContext(
+    ctx: *AsyncContext,
+    index_name: []const u8,
+    batch_size: usize,
+) !usize {
+    _ = ctx.index_manager.graphIndex(index_name) orelse return error.IndexNotFound;
+    const store_lower = try documentRangeLowerAlloc(ctx.alloc, "");
+    defer ctx.alloc.free(store_lower);
+    const effective_batch_size = @max(batch_size, 1);
+
+    const ScanState = struct {
+        ctx: *AsyncContext,
+        index_name: []const u8,
+        batch_size: usize,
+        writes: std.ArrayListUnmanaged(types.GraphEdgeWrite) = .empty,
+        mutation_count: usize = 0,
+
+        fn freeWrites(state: *@This()) void {
+            for (state.writes.items) |write| {
+                state.ctx.alloc.free(@constCast(write.index_name));
+                state.ctx.alloc.free(@constCast(write.source));
+                state.ctx.alloc.free(@constCast(write.target));
+                state.ctx.alloc.free(@constCast(write.edge_type));
+                if (write.metadata_json.len > 0) state.ctx.alloc.free(@constCast(write.metadata_json));
+            }
+            state.writes.clearRetainingCapacity();
+        }
+
+        fn deinit(state: *@This()) void {
+            state.freeWrites();
+            state.writes.deinit(state.ctx.alloc);
+        }
+
+        fn flush(state: *@This()) !void {
+            if (state.writes.items.len == 0) return;
+            if (comptime builtin.is_test) {
+                _ = test_graph_repair_stream_flushes.fetchAdd(1, .monotonic);
+            }
+            try state.ctx.index_manager.applyGraphMutationsByName(state.index_name, state.writes.items, &.{});
+            state.mutation_count += state.writes.items.len;
+            state.freeWrites();
+        }
+
+        fn scanEntry(scan_ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+            const state: *@This() = @ptrCast(@alignCast(scan_ctx orelse return error.InvalidArgument));
+            if (!internal_keys.isGraphEdgeArtifactKey(key)) return .@"continue";
+            const parsed = (try internal_keys.parseGraphEdgeArtifactKeyAlloc(state.ctx.alloc, key)) orelse return .@"continue";
+            defer {
+                state.ctx.alloc.free(parsed.doc_key);
+                state.ctx.alloc.free(parsed.index_name);
+                state.ctx.alloc.free(parsed.edge_type);
+                state.ctx.alloc.free(parsed.target_doc_key);
+            }
+            if (!std.mem.eql(u8, parsed.index_name, state.index_name)) return .@"continue";
+
+            var decoded = try enrichment_artifact_codec.decodeGraphEdgeAlloc(state.ctx.alloc, value);
+            errdefer decoded.deinit(state.ctx.alloc);
+            try state.writes.append(state.ctx.alloc, .{
+                .index_name = try state.ctx.alloc.dupe(u8, parsed.index_name),
+                .source = try state.ctx.alloc.dupe(u8, parsed.doc_key),
+                .target = try state.ctx.alloc.dupe(u8, parsed.target_doc_key),
+                .edge_type = try state.ctx.alloc.dupe(u8, parsed.edge_type),
+                .weight = decoded.weight,
+                .created_at = decoded.created_at,
+                .updated_at = decoded.updated_at,
+                .metadata_json = decoded.metadata_json,
+            });
+            decoded.metadata_json = &.{};
+            decoded.deinit(state.ctx.alloc);
+            if (state.writes.items.len >= state.batch_size) try state.flush();
+            return .@"continue";
+        }
+    };
+
+    var state = ScanState{
+        .ctx = ctx,
+        .index_name = index_name,
+        .batch_size = effective_batch_size,
+    };
+    defer state.deinit();
+
+    try scanStoreForRebuildContext(ctx, store_lower, "", .{}, &state, ScanState.scanEntry);
     try state.flush();
     return state.mutation_count;
 }
@@ -38657,6 +38774,89 @@ test "db repair issue list reports index repair candidates" {
     try std.testing.expectEqual(.graph, page.issues[0].artifact_kind);
     try std.testing.expectEqualStrings("graph_v1", page.issues[0].index_name);
     try std.testing.expectEqualStrings("index_repair_required", page.issues[0].last_error);
+}
+
+test "db repair issue list reports algebraic index debt as unsupported" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const cfg: types.IndexConfig = .{
+        .name = "alg_v1",
+        .kind = .algebraic,
+        .config_json =
+        \\{
+        \\  "table": "docs",
+        \\  "schema_version": 1,
+        \\  "capability_fingerprint": "test-capability"
+        \\}
+        ,
+    };
+    try db.addIndex(cfg);
+    try db.core.saveProjectionCheckpoint("alg_v1", .{
+        .applied_sequence = 0,
+        .status = .repair_required,
+        .config_hash = types.indexConfigHash(cfg),
+    });
+
+    var page = try db.listArtifactRepairIssuesPage(alloc, .{
+        .target = .index,
+        .artifact_kind = .algebraic,
+        .index_name = "alg_v1",
+        .limit = 1,
+    });
+    defer page.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), page.issues.len);
+    try std.testing.expectEqual(types.ArtifactRepairKind.algebraic, page.issues[0].artifact_kind);
+    try std.testing.expect(!page.issues[0].repairable);
+    try std.testing.expectEqualStrings("algebraic_index_rebuild_unavailable", page.issues[0].unsupported_reason);
+    try std.testing.expectEqualStrings("algebraic_index_rebuild_unavailable", page.issues[0].last_error);
+
+    var repair = try db.repairArtifactIssuesWithRequest(alloc, .{
+        .target = .index,
+        .artifact_kind = .algebraic,
+        .index_name = "alg_v1",
+        .limit = 1,
+    });
+    defer repair.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), repair.scanned);
+    try std.testing.expectEqual(@as(u64, 1), repair.unsupported);
+    try std.testing.expectEqual(@as(u64, 1), repair.unresolved);
+    try std.testing.expect(repair.debt_remaining);
+}
+
+test "db index repair serializes duplicate repairs for one index" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{ .name = "graph_v1", .kind = .graph, .config_json = "{}" });
+    try std.testing.expect(try db.beginIndexRepairLease("graph_v1"));
+    defer db.endIndexRepairLease("graph_v1");
+
+    var repair = try db.repairArtifactIssuesWithRequest(alloc, .{
+        .target = .index,
+        .artifact_kind = .graph,
+        .index_name = "graph_v1",
+        .limit = 1,
+        .force = true,
+    });
+    defer repair.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), repair.scanned);
+    try std.testing.expectEqual(@as(u64, 1), repair.failed);
+    try std.testing.expectEqual(@as(u64, 1), repair.unresolved);
+    try std.testing.expect(repair.debt_remaining);
+    try std.testing.expectEqual(@as(u64, 0), repair.indexes_rebuilt);
 }
 
 test "db index repair recovers quarantined index load before rebuild" {

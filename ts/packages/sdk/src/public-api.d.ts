@@ -2737,7 +2737,7 @@ export interface components {
          * @description Kind of stored artifact tracked by the repair queue.
          * @enum {string}
          */
-        ArtifactRepairKind: "embedding" | "asset" | "chunk" | "graph" | "full_text";
+        ArtifactRepairKind: "embedding" | "asset" | "chunk" | "graph" | "full_text" | "algebraic";
         /**
          * @description Reason an artifact was added to the repair queue.
          * @enum {string}

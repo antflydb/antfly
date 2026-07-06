@@ -138,6 +138,7 @@ const (
 
 // Defines values for ArtifactRepairKind.
 const (
+	ArtifactRepairKindAlgebraic ArtifactRepairKind = "algebraic"
 	ArtifactRepairKindAsset     ArtifactRepairKind = "asset"
 	ArtifactRepairKindChunk     ArtifactRepairKind = "chunk"
 	ArtifactRepairKindEmbedding ArtifactRepairKind = "embedding"
