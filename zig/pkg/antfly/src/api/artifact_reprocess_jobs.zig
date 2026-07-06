@@ -346,7 +346,8 @@ pub const Store = struct {
         defer parsed_current.deinit();
         const current = parsed_current.value;
         if (isTerminalPhase(current.phase)) return try alloc.dupe(u8, current_encoded);
-        if (!jobStateTransitionTokenMatches(current, expected)) return try alloc.dupe(u8, current_encoded);
+        if (!std.mem.eql(u8, current.table_name, expected.table_name) or !std.mem.eql(u8, current.artifact_name, expected.artifact_name)) return error.NotFound;
+        if (current.cancel_requested) return try alloc.dupe(u8, current_encoded);
 
         const phase: JobPhase = if (std.mem.eql(u8, current.phase, phaseString(.running))) .running else .cancelled;
         const encoded = try encodeState(alloc, .{

@@ -110,6 +110,29 @@ test "repair job store applies running cancellation at pass boundary" {
     try std.testing.expectEqual(@as(u64, 2), parsed_update.value.result.repaired);
 }
 
+test "repair job store records cancel requested across stale queued token" {
+    const alloc = std.testing.allocator;
+    var store = repair_jobs.Store.init(alloc, .{});
+    defer store.deinit();
+
+    const started = try store.startJob(alloc, "docs", .{ .target = "artifact", .limit = 2 });
+    defer alloc.free(started);
+    var parsed_start = try std.json.parseFromSlice(repair_jobs.JobState, alloc, started, .{ .ignore_unknown_fields = true });
+    defer parsed_start.deinit();
+
+    const begin = try store.beginAdvance(alloc, parsed_start.value);
+    defer alloc.free(begin.encoded);
+    try std.testing.expect(begin.started);
+
+    const cancelling = try store.requestCancel(alloc, parsed_start.value);
+    defer alloc.free(cancelling);
+    var parsed_cancelling = try std.json.parseFromSlice(repair_jobs.JobState, alloc, cancelling, .{ .ignore_unknown_fields = true });
+    defer parsed_cancelling.deinit();
+    try std.testing.expectEqualStrings("running", parsed_cancelling.value.phase);
+    try std.testing.expect(parsed_cancelling.value.cancel_requested);
+    try std.testing.expectEqualStrings("cancel_requested", parsed_cancelling.value.last_error.?);
+}
+
 test "artifact reprocess job store applies running cancellation at pass boundary" {
     const alloc = std.testing.allocator;
     var store = artifact_reprocess_jobs.Store.init(alloc, .{});
@@ -147,6 +170,29 @@ test "artifact reprocess job store applies running cancellation at pass boundary
     try std.testing.expect(parsed_update.value.cancel_requested);
     try std.testing.expectEqualStrings("cancel_requested", parsed_update.value.last_error.?);
     try std.testing.expectEqual(@as(usize, 2), parsed_update.value.reprocessed);
+}
+
+test "artifact reprocess job store records cancel requested across stale queued token" {
+    const alloc = std.testing.allocator;
+    var store = artifact_reprocess_jobs.Store.init(alloc, .{});
+    defer store.deinit();
+
+    const started = try store.startJob(alloc, "docs", "document_units_v1", .{ .limit = 2 });
+    defer alloc.free(started);
+    var parsed_start = try std.json.parseFromSlice(artifact_reprocess_jobs.JobState, alloc, started, .{ .ignore_unknown_fields = true });
+    defer parsed_start.deinit();
+
+    const begin = try store.beginAdvance(alloc, parsed_start.value);
+    defer alloc.free(begin.encoded);
+    try std.testing.expect(begin.started);
+
+    const cancelling = try store.requestCancel(alloc, parsed_start.value);
+    defer alloc.free(cancelling);
+    var parsed_cancelling = try std.json.parseFromSlice(artifact_reprocess_jobs.JobState, alloc, cancelling, .{ .ignore_unknown_fields = true });
+    defer parsed_cancelling.deinit();
+    try std.testing.expectEqualStrings("running", parsed_cancelling.value.phase);
+    try std.testing.expect(parsed_cancelling.value.cancel_requested);
+    try std.testing.expectEqualStrings("cancel_requested", parsed_cancelling.value.last_error.?);
 }
 
 test "repair job store does not expire future live running heartbeat" {

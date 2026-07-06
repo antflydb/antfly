@@ -3580,6 +3580,7 @@ pub const ApiHttpServer = struct {
                 .shard_ops = self.cfg.shard_ops,
                 .shard_db_adapter = self.cfg.shard_db_adapter,
                 .writes = self.table_writes,
+                .repair_job_store = &self.repair_job_store,
                 .batch_validator = .{
                     .ptr = self,
                     .validate = validateInternalGroupBatchWrites,
@@ -7696,6 +7697,8 @@ pub const ApiHttpServer = struct {
             .limit = running_state.limit,
             .cursor = running_state.cursor,
             .force = running_state.force,
+            .repair_job_id = running_state.job_id,
+            .repair_attempt_id = running_state.attempt_id,
         }, .{
             .cancel_check = .{
                 .ptr = &cancel_probe,

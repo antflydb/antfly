@@ -1712,6 +1712,8 @@ pub const ArtifactRepairRunRequest = struct {
     limit: u32 = 100,
     cursor: ?[]const u8 = null,
     force: bool = false,
+    repair_job_id: ?u64 = null,
+    repair_attempt_id: ?u64 = null,
 };
 
 pub const RepairCancelCheck = struct {

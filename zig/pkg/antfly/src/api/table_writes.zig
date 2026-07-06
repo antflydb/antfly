@@ -343,6 +343,8 @@ fn artifactRepairRunRequestForShard(
         .limit = limit,
         .cursor = cursor,
         .force = req.force,
+        .repair_job_id = req.repair_job_id,
+        .repair_attempt_id = req.repair_attempt_id,
     };
 }
 
@@ -354,6 +356,8 @@ test "artifact repair shard run request preserves repair target" {
         .limit = 10,
         .cursor = "idx_b",
         .force = true,
+        .repair_job_id = 42,
+        .repair_attempt_id = 7,
     }, 2, "idx_c");
 
     try std.testing.expectEqual(db_mod.types.RepairTarget.index, shard_req.target);
@@ -362,6 +366,8 @@ test "artifact repair shard run request preserves repair target" {
     try std.testing.expectEqual(@as(u32, 2), shard_req.limit);
     try std.testing.expectEqualStrings("idx_c", shard_req.cursor.?);
     try std.testing.expect(shard_req.force);
+    try std.testing.expectEqual(@as(u64, 42), shard_req.repair_job_id.?);
+    try std.testing.expectEqual(@as(u64, 7), shard_req.repair_attempt_id.?);
 }
 
 fn cloneArtifactRepairIssueAlloc(alloc: std.mem.Allocator, issue: db_mod.types.ArtifactRepairIssue) !db_mod.types.ArtifactRepairIssue {

@@ -2408,6 +2408,7 @@ fn remoteGroupConflictError(body: []const u8) anyerror {
     if (transactions_api.isTopologyChangedConflictMessage(body)) return error.TopologyChanged;
     if (std.mem.eql(u8, body, "TopologyChanged")) return error.TopologyChanged;
     if (isDocIdentityNamespaceMismatchConflictMessage(body)) return error.DocIdentityNamespaceMismatch;
+    if (std.mem.eql(u8, body, "repair cancelled")) return error.Canceled;
     return error.UnexpectedHttpStatus;
 }
 
