@@ -3370,6 +3370,55 @@ test "document mapper emits schema-derived mapped keyword subfield coverage" {
     try std.testing.expectEqualStrings("Beta Phone", second);
 }
 
+test "document mapper emits schema-derived direct keyword postings and typed doc values" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{
+        \\  "document_schemas": {
+        \\    "doc": {
+        \\      "schema": {
+        \\        "type": "object",
+        \\        "properties": {
+        \\          "status": {
+        \\            "type": "string",
+        \\            "x-antfly-field": {"type":"keyword","sortable":true}
+        \\          }
+        \\        }
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+    const segment = (try buildTextSegmentFromDocuments(alloc, &.{
+        .{ .key = "doc:1", .value = "{\"status\":\"active\"}" },
+        .{ .key = "doc:2", .value = "{\"status\":\"draft\"}" },
+    }, text_analysis, schema)).?;
+    defer alloc.free(segment);
+
+    var reader = try segment_mod.SegmentReader.init(alloc, segment);
+    defer reader.deinit();
+
+    var status_inv = (try reader.invertedIndex("status")) orelse return error.TestExpectedEqual;
+    try std.testing.expect((try reader.invertedIndex("status.keyword")) == null);
+    try std.testing.expect(status_inv.lookup("active") != null);
+
+    const section = reader.getSection("status", .typed_doc_values) orelse return error.TestExpectedEqual;
+    var values = try typed_dv.TypedDocValuesReader.init(alloc, section);
+    try std.testing.expectEqual(typed_dv.ValueType.bytes_val, values.value_type);
+    const first = (try values.getBytesAlloc(0)) orelse return error.TestExpectedEqual;
+    defer alloc.free(first);
+    const second = (try values.getBytesAlloc(1)) orelse return error.TestExpectedEqual;
+    defer alloc.free(second);
+    try std.testing.expectEqualStrings("active", first);
+    try std.testing.expectEqualStrings("draft", second);
+}
+
 test "document mapper omits multi-valued mapped keyword subfield typed doc values" {
     const alloc = std.testing.allocator;
     const text_analysis = introducer_mod.TextAnalysisConfig{};

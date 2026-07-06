@@ -4588,7 +4588,7 @@ test "distributed merge validates mapped sort fields when runtime schema is pres
         .order_by = &unmapped_order,
         .limit = 1,
     }, &.{result}, schema));
-    const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    var diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("unknown", diagnostic.field);
     try std.testing.expectEqualStrings("unmapped_sort_field", diagnostic.reason);
     try std.testing.expectEqualStrings("unmapped_field", diagnostic.detail);
@@ -7834,9 +7834,9 @@ fn searchQueryCanUseSnapshot(
         .term => |item| (try queryFieldUsesKeywordAnalyzer(item.field, text_analysis, runtime_schema)) and
             try snapshot.hasInvertedField(item.field),
         .fuzzy => |item| try snapshot.hasInvertedField(item.field),
-        .numeric_range => |item| try snapshot.hasInvertedField(item.field),
-        .date_range => |item| try snapshot.hasInvertedField(item.field),
-        .bool_field => |item| try snapshot.hasInvertedField(item.field),
+        .numeric_range => |item| try searchQueryCanUseMappedDocValues(snapshot, item.field, runtime_schema, .numeric),
+        .date_range => |item| try searchQueryCanUseMappedDocValues(snapshot, item.field, runtime_schema, .datetime),
+        .bool_field => |item| try searchQueryCanUseMappedDocValues(snapshot, item.field, runtime_schema, .boolean),
         .geo_distance => |item| try snapshot.hasInvertedField(item.field),
         .geo_bbox => |item| try snapshot.hasInvertedField(item.field),
         .term_range => |item| try snapshot.hasInvertedField(item.field),
@@ -7858,6 +7858,19 @@ fn searchQueryCanUseSnapshot(
             return true;
         },
     };
+}
+
+fn searchQueryCanUseMappedDocValues(
+    snapshot: *const index_mod.IndexSnapshot,
+    field: []const u8,
+    runtime_schema: ?runtime_schema_mod.TableSchema,
+    expected_type: runtime_schema_mod.AntflyType,
+) !bool {
+    const schema = runtime_schema orelse return false;
+    const mapping = runtime_schema_mod.resolveDeclaredFieldType(schema, field) orelse return false;
+    if (mapping.field_type != expected_type) return false;
+    if (!runtime_schema_mod.mappingIsAggregatable(mapping)) return false;
+    return try snapshotTypedDocValuesCoverageForMapping(snapshot, field, mapping) == .covered;
 }
 
 fn queryFieldUsesKeywordAnalyzer(

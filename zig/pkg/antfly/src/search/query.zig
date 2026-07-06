@@ -819,23 +819,29 @@ pub const RangeFilter = struct {
         errdefer result.deinit();
 
         for (0..seg.reader.doc_count) |doc_id| {
-            const val = reader.getF64(@intCast(doc_id)) catch continue;
-            if (val) |v| {
-                const above_min = if (self.min_val) |min|
-                    (if (self.inclusive_min) v >= min else v > min)
-                else
-                    true;
-                const below_max = if (self.max_val) |max|
-                    (if (self.inclusive_max) v <= max else v < max)
-                else
-                    true;
-                if (above_min and below_max) {
-                    try result.add(@intCast(doc_id));
-                }
-            }
+            const numeric_value: ?f64 = switch (reader.value_type) {
+                .f64_val => reader.getF64(@intCast(doc_id)) catch continue,
+                .i64_val => if (reader.getI64(@intCast(doc_id)) catch continue) |value| @floatFromInt(value) else null,
+                .u64_val => if (reader.getU64(@intCast(doc_id)) catch continue) |value| @floatFromInt(value) else null,
+                else => null,
+            };
+            const value = numeric_value orelse continue;
+            if (self.matches(value)) try result.add(@intCast(doc_id));
         }
 
         return result;
+    }
+
+    fn matches(self: RangeFilter, value: f64) bool {
+        const above_min = if (self.min_val) |min|
+            (if (self.inclusive_min) value >= min else value > min)
+        else
+            true;
+        const below_max = if (self.max_val) |max|
+            (if (self.inclusive_max) value <= max else value < max)
+        else
+            true;
+        return above_min and below_max;
     }
 };
 

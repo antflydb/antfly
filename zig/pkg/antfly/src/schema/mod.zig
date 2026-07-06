@@ -857,6 +857,13 @@ fn containsString(items: []const []const u8, needle: []const u8) bool {
     return false;
 }
 
+fn findFullTextField(fields: []const storage_schema.FullTextField, emitted_name: []const u8) ?storage_schema.FullTextField {
+    for (fields) |field| {
+        if (std.mem.eql(u8, field.emitted_name, emitted_name)) return field;
+    }
+    return null;
+}
+
 fn appendUniqueOwnedPath(
     alloc: std.mem.Allocator,
     paths: *std.ArrayListUnmanaged([]const u8),
@@ -936,6 +943,10 @@ test "runtime schema lowers document field mappings to exact declared fields" {
         \\                "keyword": {"type":"keyword","sortable":true}
         \\              }
         \\            }
+        \\          },
+        \\          "status": {
+        \\            "type": "string",
+        \\            "x-antfly-field": {"type":"keyword","sortable":true}
         \\          }
         \\        }
         \\      }
@@ -948,7 +959,7 @@ test "runtime schema lowers document field mappings to exact declared fields" {
     const runtime = try deriveRuntimeTableSchema(alloc, parsed);
     defer storage_schema.freeSchema(alloc, runtime);
 
-    try std.testing.expectEqual(@as(usize, 4), runtime.dynamic_templates.len);
+    try std.testing.expectEqual(@as(usize, 5), runtime.dynamic_templates.len);
     try std.testing.expectEqualStrings("created_at", runtime.dynamic_templates[0].name);
     try std.testing.expectEqualStrings("created_at", runtime.dynamic_templates[0].path_match.?);
     try std.testing.expectEqual(storage_schema.AntflyType.datetime, runtime.dynamic_templates[0].mapping.field_type);
@@ -974,6 +985,15 @@ test "runtime schema lowers document field mappings to exact declared fields" {
     try std.testing.expectEqual(storage_schema.AntflyType.keyword, keyword_mapping.field_type);
     try std.testing.expect(keyword_mapping.doc_values);
     try std.testing.expect(keyword_mapping.sortable);
+
+    const status_mapping = storage_schema.resolveDeclaredFieldType(runtime, "status") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(storage_schema.AntflyType.keyword, status_mapping.field_type);
+    try std.testing.expect(status_mapping.doc_values);
+    try std.testing.expect(status_mapping.sortable);
+    try std.testing.expectEqual(@as(usize, 1), runtime.full_text_documents.len);
+    const status_field = findFullTextField(runtime.full_text_documents[0].fields, "status") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("status", status_field.path);
+    try std.testing.expectEqualStrings("keyword", status_field.analyzer);
 
     const capabilities = try storage_schema.fieldCapabilitiesAlloc(alloc, runtime);
     defer storage_schema.freeFieldCapabilities(alloc, capabilities);
