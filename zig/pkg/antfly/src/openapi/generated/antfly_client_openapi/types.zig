@@ -468,6 +468,8 @@ pub const TableRepairRunResult = struct {
     unsupported: i64,
     /// Number of attempted repair records that remained queued after this pass.
     unresolved: i64,
+    /// Number of selected repair records or indexes skipped because another repair pass already owns them.
+    in_progress: i64,
     /// Number of indexes rebuilt by this pass when target is index.
     indexes_rebuilt: i64,
     /// Number of selected indexes that were already degraded or quarantined before repair.

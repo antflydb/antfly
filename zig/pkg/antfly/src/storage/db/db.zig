@@ -7322,7 +7322,7 @@ pub const DB = struct {
 
         if (!(try self.beginIndexRepairLease(cfg.name))) {
             result.scanned += 1;
-            result.failed += 1;
+            result.in_progress += 1;
             result.unresolved += 1;
             result.debt_remaining = true;
             return result;
@@ -7425,7 +7425,7 @@ pub const DB = struct {
 
         var build_floor_sequence: u64 = 0;
         const rebuilt: u64 = switch (cfg.kind) {
-            .dense_vector, .sparse_vector, .graph => rebuilt_blk: {
+            .dense_vector, .sparse_vector, .graph, .full_text => rebuilt_blk: {
                 var snapshot_txn = try self.core.store.beginReadTxn();
                 var snapshot_open = true;
                 defer if (snapshot_open) snapshot_txn.abort();
@@ -7440,18 +7440,15 @@ pub const DB = struct {
                         cfg.name,
                         graph_repair_rebuild_batch_size,
                     )),
+                    .full_text => try shadow_manager.resetFullTextIndexForArtifactRebuildFromReadTxn(
+                        self.core.store,
+                        &snapshot_txn,
+                        cfg.name,
+                    ),
                     else => unreachable,
                 };
                 snapshot_txn.abort();
                 snapshot_open = false;
-                break :rebuilt_blk count;
-            },
-            .full_text => rebuilt_blk: {
-                lockApply(self);
-                errdefer self.core.unlockApply();
-                build_floor_sequence = self.core.nextDerivedSequence();
-                const count = try shadow_manager.resetFullTextIndexForArtifactRebuild(self.core.store, cfg.name);
-                self.core.unlockApply();
                 break :rebuilt_blk count;
             },
             .algebraic => return error.UnsupportedOperation,
@@ -38700,6 +38697,13 @@ test "db index repair shadow swap survives reopen" {
             .config_hash = types.indexConfigHash(text_cfg),
         });
 
+        const stale_canonical_file = try std.fmt.allocPrint(alloc, "{s}/indexes/ft_v1/stale-before-repair", .{std.mem.span(path)});
+        defer alloc.free(stale_canonical_file);
+        try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+            .sub_path = stale_canonical_file,
+            .data = "stale",
+        });
+
         var repair = try db.repairArtifactIssuesWithRequest(alloc, .{
             .target = .index,
             .artifact_kind = .full_text,
@@ -38732,6 +38736,9 @@ test "db index repair shadow swap survives reopen" {
         try std.testing.expectEqual(@as(u32, 1), after.total_hits);
         try std.testing.expectEqualStrings("doc:a", after.hits[0].id);
         try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, abandoned_shadow, .{}));
+        const stale_canonical_file = try std.fmt.allocPrint(alloc, "{s}/indexes/ft_v1/stale-before-repair", .{std.mem.span(path)});
+        defer alloc.free(stale_canonical_file);
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, stale_canonical_file, .{}));
     }
 }
 
@@ -38853,7 +38860,8 @@ test "db index repair serializes duplicate repairs for one index" {
     });
     defer repair.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 1), repair.scanned);
-    try std.testing.expectEqual(@as(u64, 1), repair.failed);
+    try std.testing.expectEqual(@as(u64, 1), repair.in_progress);
+    try std.testing.expectEqual(@as(u64, 0), repair.failed);
     try std.testing.expectEqual(@as(u64, 1), repair.unresolved);
     try std.testing.expect(repair.debt_remaining);
     try std.testing.expectEqual(@as(u64, 0), repair.indexes_rebuilt);

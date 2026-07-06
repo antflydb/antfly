@@ -294,6 +294,7 @@ fn mergeArtifactRepairResult(dst: *db_mod.types.ArtifactRepairResult, src: db_mo
     dst.failed += src.failed;
     dst.unsupported += src.unsupported;
     dst.unresolved += src.unresolved;
+    dst.in_progress += src.in_progress;
     dst.indexes_rebuilt += src.indexes_rebuilt;
     dst.indexes_degraded += src.indexes_degraded;
     dst.debt_remaining = dst.debt_remaining or src.debt_remaining;
@@ -425,6 +426,7 @@ fn parseArtifactRepairResultAlloc(alloc: std.mem.Allocator, body: []const u8) !d
         .failed = parsed.value.failed,
         .unsupported = parsed.value.unsupported,
         .unresolved = parsed.value.unresolved,
+        .in_progress = parsed.value.in_progress,
         .indexes_rebuilt = parsed.value.indexes_rebuilt,
         .indexes_degraded = parsed.value.indexes_degraded,
         .limit = parsed.value.limit,

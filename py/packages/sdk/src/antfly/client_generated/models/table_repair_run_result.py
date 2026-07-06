@@ -24,6 +24,8 @@ class TableRepairRunResult:
         failed (int): Number of supported repair attempts that failed.
         unsupported (int): Number of repair records skipped because no automated repair exists for the selected target.
         unresolved (int): Number of attempted repair records that remained queued after this pass.
+        in_progress (int): Number of selected repair records or indexes skipped because another repair pass already owns
+            them.
         indexes_rebuilt (int): Number of indexes rebuilt by this pass when target is index.
         indexes_degraded (int): Number of selected indexes that were already degraded or quarantined before repair.
         limit (int): Effective repair limit.
@@ -42,6 +44,7 @@ class TableRepairRunResult:
     failed: int
     unsupported: int
     unresolved: int
+    in_progress: int
     indexes_rebuilt: int
     indexes_degraded: int
     limit: int
@@ -66,6 +69,8 @@ class TableRepairRunResult:
         unsupported = self.unsupported
 
         unresolved = self.unresolved
+
+        in_progress = self.in_progress
 
         indexes_rebuilt = self.indexes_rebuilt
 
@@ -95,6 +100,7 @@ class TableRepairRunResult:
                 "failed": failed,
                 "unsupported": unsupported,
                 "unresolved": unresolved,
+                "in_progress": in_progress,
                 "indexes_rebuilt": indexes_rebuilt,
                 "indexes_degraded": indexes_degraded,
                 "limit": limit,
@@ -126,6 +132,8 @@ class TableRepairRunResult:
 
         unresolved = d.pop("unresolved")
 
+        in_progress = d.pop("in_progress")
+
         indexes_rebuilt = d.pop("indexes_rebuilt")
 
         indexes_degraded = d.pop("indexes_degraded")
@@ -154,6 +162,7 @@ class TableRepairRunResult:
             failed=failed,
             unsupported=unsupported,
             unresolved=unresolved,
+            in_progress=in_progress,
             indexes_rebuilt=indexes_rebuilt,
             indexes_degraded=indexes_degraded,
             limit=limit,

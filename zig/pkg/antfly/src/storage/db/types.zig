@@ -1723,6 +1723,7 @@ pub const ArtifactRepairResult = struct {
     failed: u64 = 0,
     unsupported: u64 = 0,
     unresolved: u64 = 0,
+    in_progress: u64 = 0,
     indexes_rebuilt: u64 = 0,
     indexes_degraded: u64 = 0,
     limit: u32 = 0,

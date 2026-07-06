@@ -2907,6 +2907,11 @@ export interface components {
             unresolved: number;
             /**
              * Format: uint64
+             * @description Number of selected repair records or indexes skipped because another repair pass already owns them.
+             */
+            in_progress: number;
+            /**
+             * Format: uint64
              * @description Number of indexes rebuilt by this pass when target is index.
              */
             indexes_rebuilt: number;

@@ -2208,6 +2208,7 @@ components:
         - failed
         - unsupported
         - unresolved
+        - in_progress
         - indexes_rebuilt
         - indexes_degraded
         - limit
@@ -2246,6 +2247,10 @@ components:
           type: integer
           format: uint64
           description: Number of attempted repair records that remained queued after this pass.
+        in_progress:
+          type: integer
+          format: uint64
+          description: Number of selected repair records or indexes skipped because another repair pass already owns them.
         indexes_rebuilt:
           type: integer
           format: uint64
