@@ -35,7 +35,7 @@ pub const RequestQueue = struct {
 
     /// Acquire weighted capacity units. Single-slot callers should continue using acquire().
     pub fn acquireUnits(self: *RequestQueue, units: usize) !void {
-        const requested = @min(@max(units, 1), self.max_concurrent);
+        const requested = self.capacityUnits(units);
         if (self.active_units + requested > self.max_concurrent) {
             return error.QueueFull;
         }
@@ -49,13 +49,17 @@ pub const RequestQueue = struct {
     }
 
     pub fn releaseUnits(self: *RequestQueue, units: usize) void {
-        const requested = @min(@max(units, 1), self.max_concurrent);
+        const requested = self.capacityUnits(units);
         if (self.active_requests > 0) self.active_requests -= 1;
         if (self.active_units > requested) {
             self.active_units -= requested;
         } else {
             self.active_units = 0;
         }
+    }
+
+    pub fn capacityUnits(self: *const RequestQueue, units: usize) usize {
+        return @min(@max(units, 1), self.max_concurrent);
     }
 
     pub fn depth(self: *const RequestQueue) usize {
@@ -107,4 +111,7 @@ test "request queue weighted capacity" {
     q.releaseUnits(3);
     try std.testing.expectEqual(@as(usize, 1), q.depth());
     try std.testing.expectEqual(@as(usize, 1), q.requests());
+    try std.testing.expectEqual(@as(usize, 3), q.available());
+    try std.testing.expectEqual(@as(usize, 4), q.capacityUnits(100));
+    try std.testing.expectEqual(@as(usize, 1), q.capacityUnits(0));
 }

@@ -131,6 +131,57 @@ notification but still wake full-text, sparse, graph, and enrichment-derived
 workers. `.full_text` remains target-specific and does not wait behind dense
 bulk work.
 
+## Full-Text Routing From Enrichments
+
+Generated lexical content is configured at the enrichment level. Full-text
+indexes consume document rows and artifact rows; they do not own chunking,
+OCR, transcription, reader, or other model-producing work directly.
+
+The routing contract is:
+
+- `full_text_index: true` is valid on `chunk` and `asset` enrichments.
+- `full_text_index: true` is invalid on `embedding` enrichments; embeddings are
+  vector artifacts, not lexical full-text sources.
+- A chunk enrichment with `full_text_index: true` routes generated chunk text
+  into the table's default full-text index in addition to any artifact-specific
+  full-text index configured with `artifact_name` or `chunk_name`.
+- An asset enrichment with `full_text_index: true` routes the produced asset
+  value into the table's default full-text index. This is the path for
+  caption-like text, OCR text, transcriptions, reader output, extraction
+  summaries, and similar generated textual assets.
+- The existing full-text index template/schema still decides how row fields are
+  indexed. The enrichment flag only adds generated artifact text as an input
+  source for that full-text index.
+
+This keeps the ownership boundary clear:
+
+```text
+enrichment config
+  -> produces asset/chunk artifacts
+  -> optionally emits full-text derived documents for those artifacts
+  -> full-text index publishes searchable state from committed rows/artifacts
+```
+
+Full-text sync must not trigger enrichment generation. `sync_level=full_text`
+waits for full-text derived indexes to apply and publish the document/artifact
+changes already present in the committed stream. It must not call readers,
+transcribers, OCR, chunkers, embedders, or other enrichment producers merely
+because an enrichment is configured as a full-text source.
+
+The sync boundary is:
+
+- `write` and `propose`: commit primary rows and replay debt only.
+- `full_text`: wait for full-text index publication only.
+- `enrichments`: wait for generated enrichment artifacts to be produced.
+- `full_index`: drain enrichment work and downstream derived index publication
+  until stable.
+
+This means a write with `sync_level=full_text` may return before a newly
+configured OCR/transcription/chunk enrichment has produced text. After
+`sync_level=enrichments` or `sync_level=full_index` produces the artifact, the
+full-text index consumes the resulting artifact replay and makes that generated
+text searchable through normal derived-index catch-up.
+
 The next cuts should:
 
 1. Replace writer-cache driven dense auto-bulk finish with coordinator-owned
@@ -844,7 +895,7 @@ The concrete implementation order from the current tree is:
    - Each consumer rebuilds work from committed state plus thin journal hints.
    - Current status: implemented for dense, sparse, full-text, and graph.
 4. Make sync entirely watermark-based.
-   - `.enrichments`, `.full_text`, `.full_index`, and `.aknn` wait only on
+   - `.enrichments`, `.full_text`, and `.full_index` wait only on
      per-consumer `applied_seq`.
    - No sync path should depend on payload-log drain semantics.
    - Current status: implemented for the active journal-window path.

@@ -148,6 +148,7 @@ fn findIndexStats(indexes: []const db_mod.types.DBIndexStats, index_name: []cons
 
 fn indexStatsReady(index: db_mod.types.DBIndexStats) bool {
     if (index.kind != .full_text) return false;
+    if (!index.repair_summary_ready or index.repair_degraded) return false;
     if (index.backfill_active) return false;
     if (index.replay_catch_up_required) return false;
     if (index.replay_applied_sequence < index.replay_target_sequence) return false;

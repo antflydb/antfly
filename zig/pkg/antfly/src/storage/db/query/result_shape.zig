@@ -1078,8 +1078,25 @@ pub fn resolveChunkParentId(
     hit: types.SearchHit,
     resolver: ChunkParentResolver,
 ) ![]u8 {
-    if (internal_keys.isChunkArtifactRecordKey(hit.id)) {
+    if (hit.artifact_ref) |artifact_ref| {
+        if (artifact_ref.kind == .chunk or artifact_ref.kind == .asset) {
+            return try alloc.dupe(u8, artifact_ref.document_id);
+        }
+    }
+
+    if (internal_keys.isChunkArtifactRecordKey(hit.id) or internal_keys.isAssetArtifactKey(hit.id)) {
         return (try internal_keys.decodeDocumentComponentAlloc(alloc, hit.id)) orelse error.InvalidChunkArtifact;
+    }
+
+    if (artifact_ids.decodeArtifactPublicIdAlloc(alloc, hit.id) catch |err| switch (err) {
+        error.InvalidInternalUserKey => null,
+        else => return err,
+    }) |artifact_ref_value| {
+        var artifact_ref = artifact_ref_value;
+        defer artifact_ref.deinit(alloc);
+        if (artifact_ref.kind == .chunk or artifact_ref.kind == .asset) {
+            return try alloc.dupe(u8, artifact_ref.document_id);
+        }
     }
 
     const stored = if (hit.stored_data) |stored_data|
@@ -1090,8 +1107,8 @@ pub fn resolveChunkParentId(
 
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, stored, .{});
     defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidChunkArtifact;
-    const parent = parsed.value.object.get("_parent_doc_key") orelse parsed.value.object.get("parent_doc_key") orelse return error.InvalidChunkArtifact;
+    if (parsed.value != .object) return try alloc.dupe(u8, hit.id);
+    const parent = parsed.value.object.get("_parent_doc_key") orelse parsed.value.object.get("parent_doc_key") orelse return try alloc.dupe(u8, hit.id);
     if (parent != .string) return error.InvalidChunkArtifact;
     return try alloc.dupe(u8, parent.string);
 }

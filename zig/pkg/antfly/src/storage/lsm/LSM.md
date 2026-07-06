@@ -947,7 +947,7 @@ debt before returning.
 
 - `.write` and `.propose` batches append to durable journal/WAL state and return
   without waiting for dense/full-text/sparse/graph compaction.
-- `.full_text`, `.aknn`, and `.full_index` can wait for derived visibility, but
+- `.full_text`, `.enrichments`, and `.full_index` can wait for derived visibility, but
   they still should not require unbounded LSM compaction unless the requested
   contract explicitly includes storage cleanup.
 - Dense catch-up publishes query-visible HBC state in bounded windows.

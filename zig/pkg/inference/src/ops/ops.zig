@@ -151,6 +151,10 @@ pub const ExportTensorData = struct {
     },
 };
 
+pub const PendingI32ScalarDownload = struct {
+    handle: usize,
+};
+
 pub const SampleLastRowRequest = struct {
     tensor: CT,
     rows: usize,
@@ -173,6 +177,44 @@ pub const Gemma4MtpMaskedArgmaxRequest = struct {
     num_centroids: usize,
     top_k: usize,
     use_inverse_ordering: bool = false,
+};
+
+pub const Gemma4MtpMaskedSelectRequest = struct {
+    assistant_hidden: CT,
+    logits: CT,
+    centroid_weight: CT,
+    token_ordering: CT,
+    hidden_size: usize,
+    vocab_size: usize,
+    num_centroids: usize,
+    top_k: usize,
+    use_inverse_ordering: bool = false,
+};
+
+pub const Gemma4MtpMaskedSelectFromHiddenRequest = struct {
+    assistant_hidden: CT,
+    lm_head_weight: CT,
+    centroid_weight: CT,
+    token_ordering: CT,
+    hidden_size: usize,
+    vocab_size: usize,
+    num_centroids: usize,
+    top_k: usize,
+    use_inverse_ordering: bool = false,
+};
+
+pub const Gemma4MtpConcatOrder = enum(u32) {
+    embedding_activation = 0,
+    activation_embedding = 1,
+};
+
+pub const Gemma4MtpPreprojectRequest = struct {
+    target_embedding: CT,
+    activation: CT,
+    weight: CT,
+    backbone_hidden: usize,
+    draft_hidden: usize,
+    concat_order: Gemma4MtpConcatOrder = .embedding_activation,
 };
 
 pub const Gemma4MtpVerifyCommitResult = struct {
@@ -327,6 +369,7 @@ pub const DecoderRuntimeApplyRmsNormLinearArgmaxRequest = backend_contracts.Deco
 pub const DecoderRuntimeApplyRmsNormLinearRequest = backend_contracts.DecoderRuntimeApplyRmsNormLinearRequest;
 pub const DecoderRuntimeApplyLayerNormLinearSampleRequest = backend_contracts.DecoderRuntimeApplyLayerNormLinearSampleRequest;
 pub const DecoderRuntimeApplyRmsNormLinearSampleRequest = backend_contracts.DecoderRuntimeApplyRmsNormLinearSampleRequest;
+pub const DecoderRuntimeSampleResidentLogitsRequest = backend_contracts.DecoderRuntimeSampleResidentLogitsRequest;
 pub const DecoderRuntimePrepareLinearRequest = backend_contracts.DecoderRuntimePrepareLinearRequest;
 pub const DecoderRuntimeEnsureLinearSlotRequest = backend_contracts.DecoderRuntimeEnsureLinearSlotRequest;
 pub const DecoderRuntimeApplyLinearRequest = backend_contracts.DecoderRuntimeApplyLinearRequest;
@@ -470,6 +513,7 @@ pub const NativeQuantTimingStats = struct {
     metal_runtime_deberta_attention_legacy_calls: u64 = 0,
     metal_runtime_deberta_attention_gemm_calls: u64 = 0,
     metal_runtime_deberta_attention_gemm_fallbacks: u64 = 0,
+    metal_runtime_paged_attention_1x_calls: u64 = 0,
     metal_runtime_compute_encoder_count: u64 = 0,
     metal_runtime_blit_encoder_count: u64 = 0,
     metal_runtime_last_frame_compute_encoder_count: u64 = 0,
@@ -522,6 +566,24 @@ pub const NativeQuantTimingStats = struct {
     metal_runtime_q8_0_pair_activation_rms_scale_mmv_f16_output: u64 = 0,
     metal_runtime_q8_0_linear_mmv_f16_input: u64 = 0,
     metal_runtime_q8_0_linear_family_dispatch_counts: [12][4]u64 = [_][4]u64{[_]u64{0} ** 4} ** 12,
+    metal_runtime_q4_0_linear_reduce: u64 = 0,
+    metal_runtime_q4_0_linear_reduce_f16_input: u64 = 0,
+    metal_runtime_q4_0_linear_reduce_f16_output: u64 = 0,
+    metal_runtime_q4_0_linear_reduce_f16_input_f16_output: u64 = 0,
+    metal_runtime_q4_0_linear_reduce_sumsq: u64 = 0,
+    metal_runtime_q4_0_pair: u64 = 0,
+    metal_runtime_q4_0_pair_reduce: u64 = 0,
+    metal_runtime_q4_0_pair_activation_reduce: u64 = 0,
+    metal_runtime_q4_0_pair_activation_reduce_f16_output: u64 = 0,
+    metal_runtime_q4_0_pair_activation_rms_scale_reduce_f16_output: u64 = 0,
+    metal_runtime_q4_0_activation_rhs_reduce: u64 = 0,
+    metal_runtime_q4_0_activation_rhs_reduce_f16_output: u64 = 0,
+    metal_runtime_q4_0_ple_activation_rhs_reduce_f16_output: u64 = 0,
+    metal_runtime_q4_0_ple_linear_reduce_f16_input: u64 = 0,
+    metal_runtime_q4_0_linear_reduce_encode_nanos: u64 = 0,
+    metal_runtime_q4_0_pair_reduce_encode_nanos: u64 = 0,
+    metal_runtime_q4_0_pair_activation_reduce_encode_nanos: u64 = 0,
+    metal_runtime_q4_0_activation_rhs_reduce_encode_nanos: u64 = 0,
     metal_runtime_q4_k_linear_reduce: u64 = 0,
     metal_runtime_q4_k_pair_reduce: u64 = 0,
     metal_runtime_q4_k_pair_activation_reduce: u64 = 0,
@@ -529,6 +591,7 @@ pub const NativeQuantTimingStats = struct {
     metal_runtime_q4_k_activation_rhs_reduce: u64 = 0,
     metal_runtime_q6_k_linear_reduce: u64 = 0,
     metal_runtime_q6_k_linear_reduce_f16_input: u64 = 0,
+    metal_runtime_rms_norm_add_sumsq: u64 = 0,
     metal_provider_quantized_slots: u64 = 0,
     metal_provider_quantized_raw_bytes: u64 = 0,
     metal_provider_quantized_raw_owned_bytes: u64 = 0,
@@ -876,9 +939,19 @@ pub const ComputeBackend = struct {
         return op(self.ptr, input);
     }
 
+    pub fn debugCudaGraphRegisterFinalHiddenReplayAuxInput(self: *const ComputeBackend, input: CT) !void {
+        const op = self.vtable.debugCudaGraphRegisterFinalHiddenReplayAuxInput orelse return;
+        return op(self.ptr, input);
+    }
+
     pub fn debugCudaGraphPrepareFinalHiddenReplayInput(self: *const ComputeBackend, label: []const u8, input: CT) !?CT {
         const op = self.vtable.debugCudaGraphPrepareFinalHiddenReplayInput orelse return null;
         return op(self.ptr, label, input);
+    }
+
+    pub fn debugCudaGraphPrepareFinalHiddenReplayAuxInput(self: *const ComputeBackend, input: CT) !?CT {
+        const op = self.vtable.debugCudaGraphPrepareFinalHiddenReplayAuxInput orelse return null;
+        return op(self.ptr, input);
     }
 
     pub fn debugCudaGraphReplayFinalHidden(self: *const ComputeBackend, input: CT) !?CT {
@@ -886,9 +959,19 @@ pub const ComputeBackend = struct {
         return op(self.ptr, input);
     }
 
+    pub fn debugCudaGraphReplayFinalHiddenDiscard(self: *const ComputeBackend, input: CT) !bool {
+        const op = self.vtable.debugCudaGraphReplayFinalHiddenDiscard orelse return false;
+        return op(self.ptr, input);
+    }
+
     pub fn debugCudaGraphCaptureEnd(self: *const ComputeBackend, replay: bool) !void {
         const op = self.vtable.debugCudaGraphCaptureEnd orelse return;
         return op(self.ptr, replay);
+    }
+
+    pub fn debugCudaDeviceWarmup(self: *const ComputeBackend, bytes: usize, iterations: usize) !bool {
+        const op = self.vtable.debugCudaDeviceWarmup orelse return false;
+        return op(self.ptr, bytes, iterations);
     }
 
     pub const VTable = struct {
@@ -925,9 +1008,13 @@ pub const ComputeBackend = struct {
         debugCudaTraceTensor: ?*const fn (ctx: *anyopaque, label: []const u8, tensor: CT) anyerror!void = null,
         debugCudaGraphRegisterFinalHiddenReplayBoundary: ?*const fn (ctx: *anyopaque, input: CT, output: CT) anyerror!void = null,
         debugCudaGraphRegisterFinalHiddenReplayInput: ?*const fn (ctx: *anyopaque, input: CT) anyerror!void = null,
+        debugCudaGraphRegisterFinalHiddenReplayAuxInput: ?*const fn (ctx: *anyopaque, input: CT) anyerror!void = null,
         debugCudaGraphPrepareFinalHiddenReplayInput: ?*const fn (ctx: *anyopaque, label: []const u8, input: CT) anyerror!?CT = null,
+        debugCudaGraphPrepareFinalHiddenReplayAuxInput: ?*const fn (ctx: *anyopaque, input: CT) anyerror!?CT = null,
         debugCudaGraphReplayFinalHidden: ?*const fn (ctx: *anyopaque, input: CT) anyerror!?CT = null,
+        debugCudaGraphReplayFinalHiddenDiscard: ?*const fn (ctx: *anyopaque, input: CT) anyerror!bool = null,
         debugCudaGraphCaptureEnd: ?*const fn (ctx: *anyopaque, replay: bool) anyerror!void = null,
+        debugCudaDeviceWarmup: ?*const fn (ctx: *anyopaque, bytes: usize, iterations: usize) anyerror!bool = null,
 
         /// Look up a named weight tensor. Returned tensor is borrowed (do NOT free).
         getWeight: *const fn (ctx: *anyopaque, name: []const u8) anyerror!CT,
@@ -938,9 +1025,25 @@ pub const ComputeBackend = struct {
         /// Embedding table lookup: weight[ids[i]] for each i. Returns [total, dim].
         embeddingLookup: *const fn (ctx: *anyopaque, weight: CT, ids: []const i64, total: usize, dim: usize) anyerror!CT,
 
+        /// Embedding table lookup with an output scale fused into the backend gather.
+        /// Backends may return null to use embeddingLookup plus a scalar multiply.
+        embeddingLookupScaled: ?*const fn (ctx: *anyopaque, weight: CT, ids: []const i64, total: usize, dim: usize, scale: f32) anyerror!?CT = null,
+
         /// Embedding table lookup where the ids already live in a backend tensor.
         /// Backends may return null to use the host-id embedding path.
         embeddingLookupTensor: ?*const fn (ctx: *anyopaque, weight: CT, ids: CT, total: usize, dim: usize) anyerror!?CT = null,
+
+        /// Tensor-id embedding table lookup with an output scale fused into the
+        /// backend gather. Backends may return null to use the generic fallback.
+        embeddingLookupTensorScaled: ?*const fn (ctx: *anyopaque, weight: CT, ids: CT, total: usize, dim: usize, scale: f32) anyerror!?CT = null,
+
+        /// Tensor-id embedding lookup fused with `embedding * lhs_scale + rhs * rhs_scale`.
+        /// Backends may return null to use embeddingLookupTensor plus weighted add.
+        addWeightedEmbeddingTensor: ?*const fn (ctx: *anyopaque, weight: CT, ids: CT, rhs: CT, total: usize, dim: usize, lhs_scale: f32, rhs_scale: f32) anyerror!?CT = null,
+
+        /// PLE vector construction fused as `embedding(ids) * lhs_scale + rms_norm(input) * rhs_scale`.
+        /// `input` is [total, num_groups * group_dim], and `norm_weight` is [group_dim].
+        rmsNormAddWeightedEmbeddingTensor: ?*const fn (ctx: *anyopaque, input: CT, norm_weight: CT, embedding_weight: CT, ids: CT, total: usize, num_groups: usize, group_dim: usize, eps: f32, lhs_scale: f32, rhs_scale: f32) anyerror!?CT = null,
 
         /// DeBERTa-v3 embedding block: word lookup + row LayerNorm + attention-mask multiply.
         /// Backends may return null to use the generic embedding/layernorm/multiply path.
@@ -1017,9 +1120,18 @@ pub const ComputeBackend = struct {
         /// materializing the sliced PLE vector.
         activationMultiplySliceLastDim: ?*const fn (ctx: *anyopaque, gate: CT, source: CT, start: usize, stop: usize, activation: DecoderRuntimeActivationKind) anyerror!?CT = null,
 
+        /// Y = activation(input @ weight^T) * sliceLastDim(source, start, start + out_dim).
+        /// Backends may fuse Gemma4 QAT PLE gate projection with its activation/slice multiply.
+        linearNoBiasActivationSliceLastDim: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, source: CT, rows: usize, in_dim: usize, out_dim: usize, start: usize, activation: DecoderRuntimeActivationKind) anyerror!?CT = null,
+
         /// Y = (A + B) * scalar[0]. Backends may fuse residual add and a
         /// device-resident scalar multiply used by per-layer output scales.
         addMultiplyScalarTensor: ?*const fn (ctx: *anyopaque, a: CT, b: CT, scalar: CT) anyerror!?CT = null,
+
+        /// Y = A * scale_a + B * scale_b. Backends may fuse small PLE/residual
+        /// combines without materializing scalar tensors or launching a
+        /// follow-up scale kernel.
+        addWeightedScalars: ?*const fn (ctx: *anyopaque, a: CT, b: CT, scale_a: f32, scale_b: f32) anyerror!?CT = null,
 
         /// Y = rms_norm(input, weight, dim, eps) * scalar[0] + residual.
         /// Backends may fuse Gemma-style post-norm residual epilogues.
@@ -1470,6 +1582,13 @@ pub const ComputeBackend = struct {
         /// tensor in its native logical dtype without widening through f32.
         exportTensorData: ?*const fn (ctx: *anyopaque, tensor: CT, allocator: std.mem.Allocator) anyerror!?ExportTensorData = null,
 
+        /// Enqueue a backend-side i32 scalar download without blocking the
+        /// caller. The returned handle must be finished or canceled before the
+        /// backend is destroyed. Backends return null when unsupported.
+        beginI32ScalarDownload: ?*const fn (ctx: *anyopaque, tensor: CT) anyerror!?PendingI32ScalarDownload = null,
+        finishI32ScalarDownload: ?*const fn (ctx: *anyopaque, pending: PendingI32ScalarDownload) anyerror!i32 = null,
+        cancelI32ScalarDownload: ?*const fn (ctx: *anyopaque, pending: PendingI32ScalarDownload) void = null,
+
         /// Clone a tensor into a new backend handle with the requested logical
         /// shape without requiring host materialization. Backends may alias
         /// immutable device storage when lifetime/refcounting makes that safe.
@@ -1536,6 +1655,21 @@ pub const ComputeBackend = struct {
         /// top-k and restricted-token argmax on device; callers fall back to
         /// the portable host implementation when unsupported.
         gemma4MtpMaskedArgmax: ?*const fn (ctx: *anyopaque, request: *const Gemma4MtpMaskedArgmaxRequest) anyerror!?u32 = null,
+
+        /// Gemma4 MTP masked embedding selection fused with the assistant
+        /// hidden-to-centroid projection. Backends return null when unsupported
+        /// so callers can use centroid linear + masked argmax.
+        gemma4MtpMaskedSelect: ?*const fn (ctx: *anyopaque, request: *const Gemma4MtpMaskedSelectRequest) anyerror!?u32 = null,
+
+        /// Gemma4 MTP masked embedding selection fused all the way from
+        /// assistant hidden state to the restricted LM-head argmax. Backends
+        /// return null when unsupported so callers can compute full logits.
+        gemma4MtpMaskedSelectFromHidden: ?*const fn (ctx: *anyopaque, request: *const Gemma4MtpMaskedSelectFromHiddenRequest) anyerror!?u32 = null,
+
+        /// Gemma4 MTP preprojection helper. Backends may fuse the target
+        /// embedding/activation concat with pre_projection.weight; callers
+        /// fall back to concat + linear when unsupported.
+        gemma4MtpPreproject: ?*const fn (ctx: *anyopaque, request: *const Gemma4MtpPreprojectRequest) anyerror!?CT = null,
 
         /// Gemma4 pure-greedy MTP verification helper. Backends may combine
         /// hidden-to-LM-head argmax with draft comparison and commit metadata;
@@ -1696,6 +1830,11 @@ pub const ComputeBackend = struct {
         /// token from the resulting last-row logits using a penalty-free
         /// sampling config.
         decoderRuntimeApplyRmsNormLinearSample: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeApplyRmsNormLinearSampleRequest) anyerror!?usize = null,
+
+        /// Sample a token from the full logits left resident in the backend's
+        /// sample-logits buffer by the most recent decode frame's fused
+        /// lm-head tail.
+        decoderRuntimeSampleResidentLogits: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeSampleResidentLogitsRequest) anyerror!?usize = null,
 
         /// Upload dense linear parameters into a backend-owned whole-token
         /// runtime slot. Weight shape is [out_dim, in_dim], bias shape is
@@ -1925,9 +2064,37 @@ pub const ComputeBackend = struct {
         return self.vtable.embeddingLookup(self.ptr, weight, ids, total, dim);
     }
 
+    pub fn embeddingLookupScaled(self: *const ComputeBackend, weight: CT, ids: []const i64, total: usize, dim: usize, scale: f32) !?CT {
+        if (self.vtable.embeddingLookupScaled) |op| {
+            return op(self.ptr, weight, ids, total, dim, scale);
+        }
+        return null;
+    }
+
     pub fn embeddingLookupTensor(self: *const ComputeBackend, weight: CT, ids: CT, total: usize, dim: usize) !?CT {
         if (self.vtable.embeddingLookupTensor) |op| {
             return op(self.ptr, weight, ids, total, dim);
+        }
+        return null;
+    }
+
+    pub fn embeddingLookupTensorScaled(self: *const ComputeBackend, weight: CT, ids: CT, total: usize, dim: usize, scale: f32) !?CT {
+        if (self.vtable.embeddingLookupTensorScaled) |op| {
+            return op(self.ptr, weight, ids, total, dim, scale);
+        }
+        return null;
+    }
+
+    pub fn addWeightedEmbeddingTensor(self: *const ComputeBackend, weight: CT, ids: CT, rhs: CT, total: usize, dim: usize, lhs_scale: f32, rhs_scale: f32) !?CT {
+        if (self.vtable.addWeightedEmbeddingTensor) |op| {
+            return op(self.ptr, weight, ids, rhs, total, dim, lhs_scale, rhs_scale);
+        }
+        return null;
+    }
+
+    pub fn rmsNormAddWeightedEmbeddingTensor(self: *const ComputeBackend, input: CT, norm_weight: CT, embedding_weight: CT, ids: CT, total: usize, num_groups: usize, group_dim: usize, eps: f32, lhs_scale: f32, rhs_scale: f32) !?CT {
+        if (self.vtable.rmsNormAddWeightedEmbeddingTensor) |op| {
+            return op(self.ptr, input, norm_weight, embedding_weight, ids, total, num_groups, group_dim, eps, lhs_scale, rhs_scale);
         }
         return null;
     }
@@ -2876,9 +3043,19 @@ pub const ComputeBackend = struct {
         return op(self.ptr, gate, source, start, stop, activation);
     }
 
+    pub fn linearNoBiasActivationSliceLastDim(self: *const ComputeBackend, input: CT, weight: CT, source: CT, rows: usize, in_dim: usize, out_dim: usize, start: usize, activation: DecoderRuntimeActivationKind) !?CT {
+        const op = self.vtable.linearNoBiasActivationSliceLastDim orelse return null;
+        return op(self.ptr, input, weight, source, rows, in_dim, out_dim, start, activation);
+    }
+
     pub fn addMultiplyScalarTensor(self: *const ComputeBackend, a: CT, b: CT, scalar: CT) !?CT {
         const op = self.vtable.addMultiplyScalarTensor orelse return null;
         return op(self.ptr, a, b, scalar);
+    }
+
+    pub fn addWeightedScalars(self: *const ComputeBackend, a: CT, b: CT, scale_a: f32, scale_b: f32) !?CT {
+        const op = self.vtable.addWeightedScalars orelse return null;
+        return op(self.ptr, a, b, scale_a, scale_b);
     }
 
     pub fn rmsNormAddMultiplyScalarTensor(self: *const ComputeBackend, input: CT, weight: CT, residual: CT, scalar: CT, dim: usize, eps: f32) !?CT {
@@ -2958,6 +3135,26 @@ pub const ComputeBackend = struct {
             return export_tensor_data(self.ptr, tensor, allocator);
         }
         return null;
+    }
+
+    pub fn beginI32ScalarDownload(self: *const ComputeBackend, tensor: CT) !?PendingI32ScalarDownload {
+        if (self.vtable.beginI32ScalarDownload) |begin_i32_scalar_download| {
+            return begin_i32_scalar_download(self.ptr, tensor);
+        }
+        return null;
+    }
+
+    pub fn finishI32ScalarDownload(self: *const ComputeBackend, pending: PendingI32ScalarDownload) !i32 {
+        if (self.vtable.finishI32ScalarDownload) |finish_i32_scalar_download| {
+            return finish_i32_scalar_download(self.ptr, pending);
+        }
+        return error.UnsupportedBackendOp;
+    }
+
+    pub fn cancelI32ScalarDownload(self: *const ComputeBackend, pending: PendingI32ScalarDownload) void {
+        if (self.vtable.cancelI32ScalarDownload) |cancel_i32_scalar_download| {
+            cancel_i32_scalar_download(self.ptr, pending);
+        }
     }
 
     pub fn cloneTensorShape(self: *const ComputeBackend, tensor: CT, shape: []const i32) !?CT {
@@ -3080,6 +3277,27 @@ pub const ComputeBackend = struct {
 
     pub fn gemma4MtpMaskedArgmax(self: *const ComputeBackend, request: *const Gemma4MtpMaskedArgmaxRequest) !?u32 {
         if (self.vtable.gemma4MtpMaskedArgmax) |op| {
+            return op(self.ptr, request);
+        }
+        return null;
+    }
+
+    pub fn gemma4MtpMaskedSelect(self: *const ComputeBackend, request: *const Gemma4MtpMaskedSelectRequest) !?u32 {
+        if (self.vtable.gemma4MtpMaskedSelect) |op| {
+            return op(self.ptr, request);
+        }
+        return null;
+    }
+
+    pub fn gemma4MtpMaskedSelectFromHidden(self: *const ComputeBackend, request: *const Gemma4MtpMaskedSelectFromHiddenRequest) !?u32 {
+        if (self.vtable.gemma4MtpMaskedSelectFromHidden) |op| {
+            return op(self.ptr, request);
+        }
+        return null;
+    }
+
+    pub fn gemma4MtpPreproject(self: *const ComputeBackend, request: *const Gemma4MtpPreprojectRequest) !?CT {
+        if (self.vtable.gemma4MtpPreproject) |op| {
             return op(self.ptr, request);
         }
         return null;
@@ -3343,6 +3561,13 @@ pub const ComputeBackend = struct {
 
     pub fn decoderRuntimeApplyRmsNormLinearSample(self: *const ComputeBackend, request: *const DecoderRuntimeApplyRmsNormLinearSampleRequest) !?usize {
         if (self.vtable.decoderRuntimeApplyRmsNormLinearSample) |op| {
+            return op(self.ptr, request);
+        }
+        return null;
+    }
+
+    pub fn decoderRuntimeSampleResidentLogits(self: *const ComputeBackend, request: *const DecoderRuntimeSampleResidentLogitsRequest) !?usize {
+        if (self.vtable.decoderRuntimeSampleResidentLogits) |op| {
             return op(self.ptr, request);
         }
         return null;

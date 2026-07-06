@@ -1592,6 +1592,20 @@ func (t *TableApi) UpdateSchema(w http.ResponseWriter, r *http.Request, tableNam
 	}
 }
 
+func (t *TableApi) ListArtifactRepairIssues(w http.ResponseWriter, r *http.Request, tableName string) {
+	if !t.ln.ensureAuth(w, r, usermgr.ResourceTypeTable, tableName, usermgr.PermissionTypeAdmin) {
+		return
+	}
+	errorResponse(w, "table repair is only available in the Zig runtime", http.StatusMethodNotAllowed)
+}
+
+func (t *TableApi) RunTableRepair(w http.ResponseWriter, r *http.Request, tableName string) {
+	if !t.ln.ensureAuth(w, r, usermgr.ResourceTypeTable, tableName, usermgr.PermissionTypeAdmin) {
+		return
+	}
+	errorResponse(w, "table repair is only available in the Zig runtime", http.StatusMethodNotAllowed)
+}
+
 // authApiRoutes configures the public authentication API.
 func (ms *MetadataStore) authApiRoutes() *http.ServeMux {
 	mux := http.NewServeMux()
@@ -1808,7 +1822,11 @@ func parseSyncLevel(level SyncLevel) (db.Op_SyncLevel, error) {
 		return db.Op_SyncLevelWrite, nil
 	case "full_text":
 		return db.Op_SyncLevelFullText, nil
-	case "embeddings", "aknn":
+	case "enrichments":
+		return db.Op_SyncLevelEnrichments, nil
+	case "full_index":
+		return db.Op_SyncLevelEmbeddings, nil
+	case "embeddings":
 		return db.Op_SyncLevelEmbeddings, nil
 	default:
 		return db.Op_SyncLevelPropose, fmt.Errorf("invalid sync_level: %s", level)

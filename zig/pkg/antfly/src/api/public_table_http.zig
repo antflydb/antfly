@@ -19,6 +19,7 @@ const backups_api = @import("backups.zig");
 const batch_api = @import("batch.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const common_secrets = @import("../common/secrets.zig");
+const http_route_helpers = @import("http_route_helpers.zig");
 
 pub const DocumentArtifactManifestDetail = enum {
     summary,
@@ -29,13 +30,14 @@ pub const DocumentArtifactManifestOptions = struct {
     detail: DocumentArtifactManifestDetail = .raw,
 };
 
-pub fn parseDocumentArtifactManifestOptions(query: []const u8) !DocumentArtifactManifestOptions {
+pub fn parseDocumentArtifactManifestOptions(alloc: std.mem.Allocator, query: []const u8) !DocumentArtifactManifestOptions {
     var opts = DocumentArtifactManifestOptions{};
     if (query.len == 0) return opts;
     var it = std.mem.splitScalar(u8, query, '&');
     while (it.next()) |part| {
         if (!std.mem.startsWith(u8, part, "detail=")) continue;
-        const value = part["detail=".len..];
+        const value = try http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, part["detail=".len..]);
+        defer alloc.free(value);
         if (std.mem.eql(u8, value, "summary")) {
             opts.detail = .summary;
         } else if (std.mem.eql(u8, value, "raw")) {

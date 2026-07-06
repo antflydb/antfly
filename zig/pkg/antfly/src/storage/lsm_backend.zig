@@ -244,6 +244,13 @@ pub const Options = struct {
     bulk_ingest_current_scan_clone_total_max_bytes: u64 = 256 * 1024 * 1024,
 };
 
+fn normalizeOptionsForDurability(options: Options) Options {
+    var normalized = options;
+    normalized.wal_sync_on_commit = normalized.wal_sync_on_commit or
+        (!normalized.backend.read_only and normalized.backend.durability == .full);
+    return normalized;
+}
+
 fn writePressureDuringBulkIngestEnvEnabled() bool {
     const raw = platform.env.getenv("ANTFLY_LSM_WRITE_PRESSURE_DURING_BULK") orelse return false;
     if (raw.len == 0) return true;
@@ -1146,11 +1153,13 @@ pub const Backend = struct {
     }
 
     pub fn open(allocator: Allocator, root_dir: []const u8, options: Options) !Backend {
-        return try recovery_mod.open(Backend, allocator, root_dir, options.backend, options);
+        const normalized_options = normalizeOptionsForDurability(options);
+        return try recovery_mod.open(Backend, allocator, root_dir, normalized_options.backend, normalized_options);
     }
 
     pub fn openInto(self: *Backend, allocator: Allocator, root_dir: []const u8, options: Options) !void {
-        try recovery_mod.openInto(Backend, self, allocator, root_dir, options.backend, options);
+        const normalized_options = normalizeOptionsForDurability(options);
+        try recovery_mod.openInto(Backend, self, allocator, root_dir, normalized_options.backend, normalized_options);
     }
 
     pub fn close(self: *Backend) void {
@@ -1323,10 +1332,14 @@ pub const Backend = struct {
     }
 
     pub fn sync(self: *Backend, force: bool) !void {
-        _ = force;
         if (self.root_dir == null) return;
         const locked = runtime_mod.lockBackend(Backend, self);
         defer runtime_mod.unlockBackend(Backend, self, locked);
+        if (force and !self.options.backend.read_only and self.options.wal_enabled) {
+            var wal_lock = try self.acquireWalOperationLock(.exclusive);
+            defer wal_lock.release();
+            try wal_mod.syncCurrentState(self.storage.?, self.allocator, self.root_dir.?);
+        }
         try self.finalizeDeferredStorageWorkLocked();
     }
 
@@ -7409,6 +7422,7 @@ test "lsm backend write stats separate wal sync latency from append latency" {
         var storage = storage_io.MemoryStorage.init(std.testing.allocator);
         defer storage.deinit();
         var backend = try Backend.open(std.testing.allocator, "/lsm-wal-async-stats", .{
+            .backend = .{ .durability = .none },
             .storage = storage.storage(),
             .flush_threshold = 1024,
             .wal_sync_on_commit = false,
@@ -7423,6 +7437,24 @@ test "lsm backend write stats separate wal sync latency from append latency" {
         try std.testing.expectEqual(@as(u64, 1), stats.wal_append_records);
         try std.testing.expectEqual(@as(u64, 0), stats.wal_sync_records);
         try std.testing.expectEqual(@as(u64, 0), stats.wal_sync_ns);
+    }
+
+    {
+        var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+        defer storage.deinit();
+        var backend = try Backend.open(std.testing.allocator, "/lsm-wal-full-durability-stats", .{
+            .storage = storage.storage(),
+            .flush_threshold = 1024,
+        });
+        defer backend.close();
+
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, "doc:a", "A");
+        try txn.commit();
+
+        const stats = backend.snapshotWriteStats();
+        try std.testing.expectEqual(@as(u64, 1), stats.wal_append_records);
+        try std.testing.expectEqual(@as(u64, 1), stats.wal_sync_records);
     }
 
     {

@@ -34,6 +34,12 @@ from .anthropic_generator_config import AnthropicGeneratorConfig
 from .api_key import ApiKey
 from .api_key_row_filter_type_0 import ApiKeyRowFilterType0
 from .api_key_with_secret import ApiKeyWithSecret
+from .artifact_repair_issue import ArtifactRepairIssue
+from .artifact_repair_issue_list import ArtifactRepairIssueList
+from .artifact_repair_kind import ArtifactRepairKind
+from .artifact_repair_reason import ArtifactRepairReason
+from .artifact_repair_run_response import ArtifactRepairRunResponse
+from .artifact_repair_run_result import ArtifactRepairRunResult
 from .audio_chunk_options import AudioChunkOptions
 from .auth_subject import AuthSubject
 from .auth_subject_kind import AuthSubjectKind
@@ -471,6 +477,9 @@ from .query_result_graph_results import QueryResultGraphResults
 from .query_strategy import QueryStrategy
 from .query_string_query import QueryStringQuery
 from .regexp_query import RegexpQuery
+from .repair_issue_list_request import RepairIssueListRequest
+from .repair_run_request import RepairRunRequest
+from .repair_target import RepairTarget
 from .replication_source_action_hint import ReplicationSourceActionHint
 from .replication_source_status import ReplicationSourceStatus
 from .replication_transform_op import ReplicationTransformOp
@@ -622,6 +631,12 @@ __all__ = (
     "ApiKey",
     "ApiKeyRowFilterType0",
     "ApiKeyWithSecret",
+    "ArtifactRepairIssue",
+    "ArtifactRepairIssueList",
+    "ArtifactRepairKind",
+    "ArtifactRepairReason",
+    "ArtifactRepairRunResponse",
+    "ArtifactRepairRunResult",
     "AudioChunkOptions",
     "AuthSubject",
     "AuthSubjectKind",
@@ -1057,6 +1072,9 @@ __all__ = (
     "QueryStrategy",
     "QueryStringQuery",
     "RegexpQuery",
+    "RepairIssueListRequest",
+    "RepairRunRequest",
+    "RepairTarget",
     "ReplicationSourceActionHint",
     "ReplicationSourceStatus",
     "ReplicationTransformOp",

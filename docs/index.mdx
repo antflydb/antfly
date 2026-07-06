@@ -33,7 +33,7 @@ For AI Engineers we're also prioritizing telemetry, scaling and security. We kno
 - **Multi-Raft Design**: Separate consensus groups for metadata (single cluster) and storage (one per shard)
 - **Horizontal Sharding**: Data automatically partitioned across shards with configurable replication
 - **Distributed Transactions**: Atomic cross-shard writes using coordinator-based 2PC with intent-based locking
-- **Fine-Grained Durability**: Control write consistency with sync levels (propose, write, full_text, enrichments, aknn)
+- **Fine-Grained Durability**: Control write consistency with sync levels (propose, write, full_text, enrichments, full_index)
 
 ### AI-Native Features
 - **RAG**: Streaming retrieval-augmented generation with Server-Sent Events

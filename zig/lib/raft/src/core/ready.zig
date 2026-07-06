@@ -14,6 +14,7 @@
 
 const types = @import("types.zig");
 const message = @import("message.zig");
+const std = @import("std");
 
 pub const Ready = struct {
     soft_state: ?types.SoftState = null,
@@ -33,4 +34,24 @@ pub const Ready = struct {
             self.read_states.len == 0 and
             self.messages.len == 0;
     }
+
+    pub fn requiresPersistence(self: Ready) bool {
+        return self.hard_state != null or
+            self.snapshot != null or
+            self.entries.len > 0;
+    }
 };
+
+test "ready persistence predicate only includes durable raft state" {
+    var request_ctx = [_]u8{ 'c', 't', 'x' };
+    try std.testing.expect(!(Ready{ .messages = &.{.{
+        .msg_type = .heartbeat,
+        .from = 1,
+        .to = 2,
+    }} }).requiresPersistence());
+    try std.testing.expect(!(Ready{ .committed_entries = &.{.{ .term = 1, .index = 1 }} }).requiresPersistence());
+    try std.testing.expect(!(Ready{ .read_states = &.{.{ .index = 1, .request_ctx = &request_ctx }} }).requiresPersistence());
+    try std.testing.expect((Ready{ .hard_state = .{ .current_term = 2 } }).requiresPersistence());
+    try std.testing.expect((Ready{ .entries = &.{.{ .term = 2, .index = 3 }} }).requiresPersistence());
+    try std.testing.expect((Ready{ .snapshot = .{} }).requiresPersistence());
+}

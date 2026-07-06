@@ -1478,6 +1478,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    termite_ml_mod.addImport("antfly_platform", platform_mod);
     const ml_tabular_mod = b.addModule("ml_tabular", .{
         .root_source_file = b.path("lib/ml/tabular/src/root.zig"),
         .target = target,
@@ -1912,6 +1913,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseSafe,
         .single_threaded = true,
     });
+    wasm_inference_ml_mod.addImport("antfly_platform", wasm_platform_mod);
     const wasm_inference_onnx_graph_mod = b.createModule(.{
         .root_source_file = b.path("lib/onnx/src/root.zig"),
         .target = wasm_target,
@@ -2213,6 +2215,14 @@ pub fn build(b: *std.Build) void {
     const run_lib_ml_tabular_tests = b.addRunArtifact(lib_ml_tabular_tests);
     const lib_ml_tabular_test_step = b.step("lib-ml-tabular-test", "Run standalone lib/ml/tabular tests");
     lib_ml_tabular_test_step.dependOn(&run_lib_ml_tabular_tests.step);
+
+    const lib_onnx_tests = b.addTest(.{
+        .root_module = termite_onnx_graph_mod,
+    });
+    const run_lib_onnx_tests = b.addRunArtifact(lib_onnx_tests);
+    run_lib_onnx_tests.setEnvironmentVariable("ANTFLY_TEST_FAIL_ON_ERROR_LOGS", "0");
+    const lib_onnx_test_step = b.step("lib-onnx-test", "Run standalone lib/onnx tests");
+    lib_onnx_test_step.dependOn(&run_lib_onnx_tests.step);
 
     const fuzz_tabular_loader = b.addTest(.{
         .root_module = b.createModule(.{
@@ -2694,8 +2704,21 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_lib_common_config_tests = b.addRunArtifact(lib_common_config_tests);
+    run_lib_common_config_tests.setEnvironmentVariable("ANTFLY_TEST_FAIL_ON_ERROR_LOGS", "0");
     const lib_common_config_test_step = b.step("lib-common-config-test", "Run common/config tests");
     lib_common_config_test_step.dependOn(&run_lib_common_config_tests.step);
+
+    const lib_common_secrets_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"file secret store"},
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lib_common_secrets_tests = b.addRunArtifact(lib_common_secrets_tests);
+    const lib_common_secrets_test_step = b.step("lib-common-secrets-test", "Run common/secret store tests");
+    lib_common_secrets_test_step.dependOn(&run_lib_common_secrets_tests.step);
 
     const lib_casbin_tests = b.addTest(.{
         .root_module = casbin_mod,
@@ -2771,6 +2794,8 @@ pub fn build(b: *std.Build) void {
         "batch parser preserves oversized value errors",
         "batch parser accepts raw payload value under public request cap",
         "linear merge request parser accepts raw payload value under public request cap",
+        "public index contract exposes runtime status metadata",
+        "artifact enrichment request permits asset full text routing",
         "provisioned read cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails",
         "provisioned group storage wires remote content to writer caches",
         "write cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails",
@@ -3026,13 +3051,18 @@ pub fn build(b: *std.Build) void {
         "data runtime status refresh reuses managed writer snapshot instead of reopening table db",
         "data runtime keeps status refresh dirty for non-startup async index work",
         "data runtime runRound does not refresh provisioned replica root inline while worker is active",
+        "data runtime runRound backs off retryable provision metadata failures",
+        "data runtime provisioned root refresh worker backs off retryable metadata failures",
         "data runtime data changes mark provisioned startup catch-up dirty",
         "data runtime raft status changes force immediate store status publication",
         "data runtime structural changes preserve writer-published runtime status",
         "data runtime startup catch-up prefers cached admin snapshot",
+        "data runtime startup catch-up clears dirty bit for terminal degraded index load",
         "data runtime startup catch-up clears no-debt busy writer groups",
         "data runtime provisioned root refresh spawn failure preserves retry bookkeeping",
         "data runtime background maintenance is due for dense posting cadence without lsm debt",
+        "data runtime treats metadata leadership churn as retryable bootstrap failure",
+        "data runtime metadata bootstrap retry delay is bounded and jittered",
         "data runtime live writer source follows raft apply ownership",
         "data runtime local split fallback preserves source identity namespace",
         "data runtime split apply store seeding reuses cached source writer",
@@ -3499,6 +3529,8 @@ pub fn build(b: *std.Build) void {
         "provisioned table write source seeds doc identity namespace from table range",
         "provisioned table write source cached runtime status does not fetch catalog coverage",
         "managed startup catch-up uses provided indexes json without catalog fetch",
+        "managed startup catch-up marks FileNotFound index open terminal degraded",
+        "managed startup catch-up finishes restore repair before terminal index load degradation",
         "idle startup runtime status preserves live empty cached status",
         "api http server serves table batch transforms",
         "api http server updates local table schema through bound write source",
@@ -3524,7 +3556,7 @@ pub fn build(b: *std.Build) void {
         "api http server serves table metadata routes against real metadata service",
         "api http server create table with replication sources returns encoded table detail",
         "api http server lists cluster backups through public route",
-        "api http server forwards cluster backup mutations to metadata leader",
+        "api http server returns retryable not leader through public cluster adapter mutation",
         "api http server backs up and restores a table through public routes",
         "api http server prefers metadata-owned restore over inline write-source restore",
         "public API request body limit matches Go linear merge contract",
@@ -3562,13 +3594,10 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
         .filters = &.{
             "api http server requires auth on public routes when enabled",
-            "api http server forwards public metadata mutations to metadata leader",
-            "api http server does not reforward already-forwarded metadata mutations",
             "api http server returns retryable not leader for local public metadata mutation",
-            "api http server returns retryable not leader when metadata forwarder has no target",
+            "api http server returns retryable not leader when metadata proposal is dropped",
             "api http server returns retryable not leader through public table adapter mutation",
             "api http server returns retryable not leader through public cluster adapter mutation",
-            "api http server keeps public data routes local when metadata forwarder is configured",
             "api http server dispatches HA admin and internal executors",
             "api http server protects HA admin routes while exempting HA internal routes",
             "api http server forbids non-admin secret access when auth is enabled",
@@ -3621,6 +3650,7 @@ pub fn build(b: *std.Build) void {
             "distributed table reads reject stale doc identity before multigroup fanout",
             "api public table query rejects only top-level internal fields",
             "single embeddings index encoder scopes isolated enrichment failure to one index",
+            "empty embeddings index status is ready without dense artifact visibility",
             "api query contract rejects doc identity control fields when with relaxes schema",
             "api query contract public parser rejects internal shard doc identity controls",
             "api distributed graph hydrate carries identity generation and clears cross-range ordinals",
@@ -3812,11 +3842,16 @@ pub fn build(b: *std.Build) void {
             "provisioned table write source backs up a portable local table",
             "provisioned table restore rejects mismatched doc identity namespace",
             "provisioned table restore retry skips exact incomplete restore state with active writer",
+            "provisioned restore repair source deinit cancels sleeping retry worker",
             "provisioned restore repair open rejects stale doc identity namespace",
             "write cache blocks same-root generation replacement while stale lease stays live",
             "provisioned create index updates cached writer in place",
             "write cache metadata refresh preserves inactive adoptable seed",
             "write cache adopts active just-created db across generation bump",
+            "write cache local mutation reuses live stale-generation writer",
+            "write cache structural local mutation finishes auto bulk before reuse",
+            "write cache local mutation preempts stale startup writer",
+            "hosted runtime status prefers live writer over stale hosted snapshot",
             "runtime status collection leaves active stale write lease live",
             "primary lookup adopts seeded write cache across visible generation bump",
             "provisioned write cache close detaches promotion leadership callback before stats",
@@ -3826,12 +3861,18 @@ pub fn build(b: *std.Build) void {
             "provisioned table write coalescer isolates failed waiters",
             "provisioned table write source consistent visibility hook does not block on busy apply lock",
             "provisioned table write source consistent visibility refreshes stale dense status",
+            "provisioned table write source status visibility does not invalidate read cache",
             "managed startup catch-up repeats replay while dense debt progresses",
             "provisioned group storage wires remote content to writer caches",
             "startup runtime status snapshot publishes live db when active cache is empty",
             "best effort startup runtime status publishes live db when cache is empty",
             "idle startup runtime status publish is live when startup flag is still set",
             "managed startup catch-up uses provided indexes json without catalog fetch",
+            "managed startup catch-up marks FileNotFound index open terminal degraded",
+            "managed startup catch-up finishes restore repair before terminal index load degradation",
+            "managed source status-only open drains stale pending close before retry",
+            "hosted status-only open drains stale pending close before retry",
+            "write cache HA gate clear drains inactive pending closes before returning",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -3844,6 +3885,7 @@ pub fn build(b: *std.Build) void {
             "provisioned read cache invalidates repeated ownership moves with pinned leases",
             "parseRemoteSearchResult preserves fused index scores",
             "provisioned standby read gate permits stale reads and routes non-stale reads to primary",
+            "catalog backed router skips non-serving relocation placements",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -4007,7 +4049,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_lib_metadata_sim_forward_tests = b.addRunArtifact(lib_metadata_sim_forward_tests);
-    const lib_metadata_sim_forward_test_step = b.step("lib-metadata-sim-forward-test", "Run metadata HTTP forwarding simulation tests only");
+    const lib_metadata_sim_forward_test_step = b.step("lib-metadata-sim-forward-test", "Run public table IO forwarding simulation tests only");
     lib_metadata_sim_forward_test_step.dependOn(&run_lib_metadata_sim_forward_tests.step);
 
     const lib_metadata_service_tests = b.addTest(.{
@@ -4356,6 +4398,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_reranking_runtime_tests.step);
     unit_test_step.dependOn(&run_lib_common_tests.step);
     unit_test_step.dependOn(&run_lib_common_config_tests.step);
+    unit_test_step.dependOn(&run_lib_common_secrets_tests.step);
     unit_test_step.dependOn(&run_lib_casbin_tests.step);
     unit_test_step.dependOn(&run_lib_usermgr_tests.step);
     unit_test_step.dependOn(&run_embedded_tests.step);
@@ -4863,6 +4906,7 @@ pub fn build(b: *std.Build) void {
     // are wired here once.
     dependOnAll(unit_test_step, &.{
         &run_lib_json_tests.step,
+        &run_lib_onnx_tests.step,
         &run_httpx_json_tests.step,
         &run_httpx_tests.step,
         &run_api_json_helpers_tests.step,

@@ -39,6 +39,7 @@ pub const table_router = @import("table_router.zig");
 pub const tables = @import("tables.zig");
 pub const table_contract = @import("table_contract.zig");
 pub const indexes = @import("indexes.zig");
+const openapi_contract = @import("openapi_contract.zig");
 pub const http_routes = @import("http_routes.zig");
 pub const provisioned_storage = @import("provisioned_storage.zig");
 pub const table_reads = @import("table_reads.zig");
@@ -54,6 +55,7 @@ pub const http_server = @import("http_server.zig");
 pub const http_client = @import("http_client.zig");
 pub const httpx_handler = @import("httpx_handler.zig");
 pub const connections = @import("connections.zig");
+const protocol_adapters = @import("protocol_adapters.zig");
 
 pub const ClusterHealth = cluster.ClusterHealth;
 pub const ClusterStatus = cluster.ClusterStatus;
@@ -80,6 +82,10 @@ pub const HostedGroupRouter = table_router.HostedGroupRouter;
 pub const ApiHttpServer = http_server.ApiHttpServer;
 pub const ApiHttpClient = http_client.ApiHttpClient;
 
+test "public index contract exposes runtime status metadata" {
+    try openapi_contract.expectPublicIndexRuntimeStatusMetadata();
+}
+
 test "linear merge request parser accepts raw payload value under public request cap" {
     const alloc = std.testing.allocator;
     const payload = try alloc.alloc(u8, 6 * 1024 * 1024);
@@ -99,6 +105,14 @@ test "linear merge request parser accepts raw payload value under public request
 
     try std.testing.expectEqual(@as(usize, 1), req.writes.len);
     try std.testing.expect(std.mem.indexOf(u8, req.writes[0].value, "\"raw_payload\"") != null);
+}
+
+test "protocol adapters require extension runtime package digest identity" {
+    try protocol_adapters.testExtensionRuntimeBindingRequiresInstalledPackageDigestMatch();
+}
+
+test "protocol adapters carry matched extension runtime package digest" {
+    try protocol_adapters.testExtensionRuntimeBindingCarriesMatchedInstalledPackageDigest();
 }
 
 test "public batch default schema accepts docsaf doc_type row and rejects reserved _type" {
@@ -246,6 +260,18 @@ test "api module compiles" {
     _ = HostedGroupRouter;
     _ = ApiHttpServer;
     _ = ApiHttpClient;
+}
+
+test "artifact enrichment request permits asset full text routing" {
+    const config_json = try table_contract.parseArtifactEnrichmentRequest(
+        std.testing.allocator,
+        "image_caption_v1",
+        "{\"kind\":\"asset\",\"field\":\"caption_json\",\"full_text_index\":true}",
+    );
+    defer std.testing.allocator.free(config_json);
+
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"kind\":\"asset\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"full_text_index\":true") != null);
 }
 
 test "distributed graph result_ref fail-closed guards are covered" {

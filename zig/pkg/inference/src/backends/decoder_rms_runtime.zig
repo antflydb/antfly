@@ -246,13 +246,28 @@ pub fn embedToken(
     if (finished_at > started_at) timing_stats.embed_lookup_nanos += finished_at - started_at;
     defer cb.free(embed_w);
     started_at = monotonicNowNs();
-    const embedded = try cb.embeddingLookup(embed_w, input_ids[0..], 1, gpt_config.hidden_size);
+    const scaled = try gpt_arch.lookupScaledTokenEmbeddings(cb, allocator, gpt_config, embed_w, input_ids[0..], 1, gpt_config.hidden_size);
     finished_at = monotonicNowNs();
     if (finished_at > started_at) timing_stats.embed_gather_nanos += finished_at - started_at;
+    return scaled;
+}
+
+pub fn embedTokenTensor(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: gpt_mod.Config,
+    token_tensor: ops.CT,
+) !?ops.CT {
+    timing_stats.embed_calls += 1;
+    var started_at = monotonicNowNs();
+    const embed_w = try gpt_arch.getEmbeddingWeight(cb, gpt_config);
+    var finished_at = monotonicNowNs();
+    if (finished_at > started_at) timing_stats.embed_lookup_nanos += finished_at - started_at;
+    defer cb.free(embed_w);
     started_at = monotonicNowNs();
-    const scaled = try gpt_arch.maybeScaleTokenEmbeddings(cb, allocator, gpt_config, embedded, 1, gpt_config.hidden_size);
+    const scaled = (try gpt_arch.lookupScaledTokenEmbeddingsTensor(cb, allocator, gpt_config, embed_w, token_tensor, 1, gpt_config.hidden_size)) orelse return null;
     finished_at = monotonicNowNs();
-    if (finished_at > started_at) timing_stats.embed_scale_nanos += finished_at - started_at;
+    if (finished_at > started_at) timing_stats.embed_gather_nanos += finished_at - started_at;
     return scaled;
 }
 
@@ -269,12 +284,8 @@ pub fn embedTokens(
     if (finished_at > started_at) timing_stats.embed_lookup_nanos += finished_at - started_at;
     defer cb.free(embed_w);
     started_at = monotonicNowNs();
-    const embedded = try cb.embeddingLookup(embed_w, input_ids, input_ids.len, gpt_config.hidden_size);
+    const scaled = try gpt_arch.lookupScaledTokenEmbeddings(cb, allocator, gpt_config, embed_w, input_ids, input_ids.len, gpt_config.hidden_size);
     finished_at = monotonicNowNs();
     if (finished_at > started_at) timing_stats.embed_gather_nanos += finished_at - started_at;
-    started_at = monotonicNowNs();
-    const scaled = try gpt_arch.maybeScaleTokenEmbeddings(cb, allocator, gpt_config, embedded, input_ids.len, gpt_config.hidden_size);
-    finished_at = monotonicNowNs();
-    if (finished_at > started_at) timing_stats.embed_scale_nanos += finished_at - started_at;
     return scaled;
 }

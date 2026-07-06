@@ -249,6 +249,10 @@ pub fn reconcileDbIndexesWithOptions(
     if (index_summary.added > 0 or indexes_removed > 0 or enrichment_summary.changed() or enrichments_removed > 0 or resolver_summary.changed()) {
         const pending = db.pendingWorkStats();
         if (pending.enrichment.error_count == 0) {
+            // Reconciliation persists catalog/applied-sequence state through the
+            // primary store. Avoid forcing every newly-created empty index WAL
+            // during create-table; repair/replay paths force-sync real index
+            // mutations after applying data.
             try db.core.index_manager.syncAll(false);
         }
     }
@@ -502,7 +506,7 @@ fn removeMissingIndexes(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: 
 
     var removed: usize = 0;
     for (current) |cfg| {
-        if (object.contains(cfg.name)) continue;
+        if (try desiredIndexContains(object, cfg.name)) continue;
         if (try db.deleteIndex(cfg.name)) removed += 1;
     }
     return removed;
@@ -525,6 +529,20 @@ fn ensureIndexes(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const
     defer db_mod.types.freeIndexConfigs(alloc, current);
 
     var summary: IndexEnsureSummary = .{};
+    if (object.get("indexes")) |indexes_value| {
+        const items = switch (indexes_value) {
+            .array => |array| array.items,
+            else => return error.InvalidTableIndexMetadata,
+        };
+        for (items) |item| {
+            const name = try indexDefinitionName(item);
+            const kind = try parseIndexKind(item);
+            const config_value = indexDefinitionConfigValue(item);
+            try ensureIndexDefinition(alloc, db, current, &summary, name, kind, config_value, true);
+        }
+        return summary;
+    }
+
     var it = object.iterator();
     while (it.next()) |entry| {
         // Reserved top-level sections are handled by their own reconcilers, not
@@ -532,31 +550,81 @@ fn ensureIndexes(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const
         if (std.mem.eql(u8, entry.key_ptr.*, "resolvers") or
             std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
         const kind = try parseIndexKind(entry.value_ptr.*);
-
-        const existing = findIndexConfig(current, entry.key_ptr.*);
-        if (existing) |existing_cfg| {
-            if (existing_cfg.kind == kind and indexKindConfigReconcileDeferred(kind)) continue;
-        }
-
-        const config_json = try extractIndexConfigJson(alloc, entry.key_ptr.*, entry.value_ptr.*);
-        defer alloc.free(config_json);
-        const desired = db_mod.types.IndexConfig{
-            .name = entry.key_ptr.*,
-            .kind = kind,
-            .config_json = config_json,
-        };
-        if (existing) |existing_cfg| {
-            if (try indexConfigsEqual(alloc, existing_cfg, desired)) continue;
-            if (try db.deleteIndex(desired.name)) summary.removed += 1;
-        }
-        try db.addIndex(.{
-            .name = desired.name,
-            .kind = desired.kind,
-            .config_json = desired.config_json,
-        });
-        summary.added += 1;
+        try ensureIndexDefinition(alloc, db, current, &summary, entry.key_ptr.*, kind, entry.value_ptr.*, false);
     }
     return summary;
+}
+
+fn ensureIndexDefinition(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    current: []const db_mod.types.IndexConfig,
+    summary: *IndexEnsureSummary,
+    name: []const u8,
+    kind: db_mod.types.IndexKind,
+    config_value: std.json.Value,
+    storage_config: bool,
+) !void {
+    const existing = findIndexConfig(current, name);
+    if (existing) |existing_cfg| {
+        if (existing_cfg.kind == kind and indexKindConfigReconcileDeferred(kind)) return;
+    }
+
+    const config_json = if (storage_config)
+        try extractStoredIndexConfigJson(alloc, config_value)
+    else
+        try extractIndexConfigJsonForKind(alloc, name, kind, config_value);
+    defer alloc.free(config_json);
+    const desired = db_mod.types.IndexConfig{
+        .name = name,
+        .kind = kind,
+        .config_json = config_json,
+    };
+    if (existing) |existing_cfg| {
+        if (try indexConfigsEqual(alloc, existing_cfg, desired)) return;
+        if (try db.deleteIndex(desired.name)) summary.removed += 1;
+    }
+    try db.addIndex(.{
+        .name = desired.name,
+        .kind = desired.kind,
+        .config_json = desired.config_json,
+    });
+    summary.added += 1;
+}
+
+fn desiredIndexContains(object: std.json.ObjectMap, name: []const u8) !bool {
+    if (object.get("indexes")) |indexes_value| {
+        const items = switch (indexes_value) {
+            .array => |array| array.items,
+            else => return error.InvalidTableIndexMetadata,
+        };
+        for (items) |item| {
+            if (std.mem.eql(u8, try indexDefinitionName(item), name)) return true;
+        }
+        return false;
+    }
+    if (std.mem.eql(u8, name, "resolvers") or std.mem.eql(u8, name, "enrichments")) return false;
+    return object.contains(name);
+}
+
+fn indexDefinitionName(value: std.json.Value) ![]const u8 {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return error.InvalidTableIndexMetadata,
+    };
+    const name_value = object.get("name") orelse return error.InvalidTableIndexMetadata;
+    return switch (name_value) {
+        .string => |name| if (name.len > 0) name else error.InvalidTableIndexMetadata,
+        else => error.InvalidTableIndexMetadata,
+    };
+}
+
+fn indexDefinitionConfigValue(value: std.json.Value) std.json.Value {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return value,
+    };
+    return object.get("config") orelse value;
 }
 
 fn findIndexConfig(configs: []const db_mod.types.IndexConfig, name: []const u8) ?db_mod.types.IndexConfig {
@@ -902,6 +970,7 @@ fn findDbIndexStats(indexes: []const db_mod.types.DBIndexStats, index_name: []co
 
 fn indexStatsReady(index: db_mod.types.DBIndexStats) bool {
     if (index.kind != .full_text) return false;
+    if (!index.repair_summary_ready or index.repair_degraded) return false;
     if (index.backfill_active) return false;
     if (index.replay_catch_up_required) return false;
     if (index.replay_applied_sequence < index.replay_target_sequence) return false;
@@ -992,13 +1061,30 @@ fn parseIndexKind(value: std.json.Value) !db_mod.types.IndexKind {
     if (std.mem.eql(u8, type_value.string, "graph")) return .graph;
     if (std.mem.eql(u8, type_value.string, "algebraic")) return .algebraic;
     if (std.mem.eql(u8, type_value.string, "embeddings")) {
-        const sparse = if (value.object.get("sparse")) |sparse_value| switch (sparse_value) {
-            .bool => sparse_value.bool,
-            else => return error.InvalidCreateTableRequest,
-        } else false;
+        const sparse = try embeddingIndexSparseFlag(value);
         return if (sparse) .sparse_vector else .dense_vector;
     }
     return error.UnsupportedCreateTableRequest;
+}
+
+fn embeddingIndexSparseFlag(value: std.json.Value) !bool {
+    if (value != .object) return false;
+    if (value.object.get("sparse")) |sparse_value| {
+        return switch (sparse_value) {
+            .bool => sparse_value.bool,
+            else => error.InvalidCreateTableRequest,
+        };
+    }
+    const config_value = value.object.get("config") orelse return false;
+    const config_object = switch (config_value) {
+        .object => |object| object,
+        else => return error.InvalidCreateTableRequest,
+    };
+    const sparse_value = config_object.get("sparse") orelse return false;
+    return switch (sparse_value) {
+        .bool => sparse_value.bool,
+        else => error.InvalidCreateTableRequest,
+    };
 }
 
 fn looksLikeStoredAlgebraicIndexConfig(value: std.json.Value) bool {
@@ -1014,6 +1100,16 @@ fn looksLikeStoredAlgebraicIndexConfig(value: std.json.Value) bool {
 fn extractIndexConfigJson(alloc: std.mem.Allocator, index_name: []const u8, value: std.json.Value) ![]u8 {
     if (value != .object) return try alloc.dupe(u8, "{}");
     const kind = try parseIndexKind(value);
+    return try extractIndexConfigJsonForKind(alloc, index_name, kind, value);
+}
+
+fn extractIndexConfigJsonForKind(
+    alloc: std.mem.Allocator,
+    index_name: []const u8,
+    kind: db_mod.types.IndexKind,
+    value: std.json.Value,
+) ![]u8 {
+    if (value != .object) return try alloc.dupe(u8, "{}");
     switch (kind) {
         .dense_vector, .sparse_vector => return try managed_embedder.translateEmbeddingsIndexConfigJson(alloc, index_name, value),
         else => {},
@@ -1036,6 +1132,11 @@ fn extractIndexConfigJson(alloc: std.mem.Allocator, index_name: []const u8, valu
     }
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
+}
+
+fn extractStoredIndexConfigJson(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    if (value != .object) return try alloc.dupe(u8, "{}");
+    return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
 }
 
 fn skipPublicIndexMetadataField(kind: db_mod.types.IndexKind, field: []const u8) bool {
@@ -1155,6 +1256,37 @@ test "table provisioner materializes metadata indexes into hosted group dbs" {
     var db = try db_mod.DB.open(std.testing.allocator, db_path, .{});
     defer db.close();
     try std.testing.expect(db.core.index_manager.textIndex("full_text_index_v0") != null);
+}
+
+test "table provisioner materializes array-form metadata indexes" {
+    const path = "/tmp/antfly-metadata-table-provisioner-array-indexes";
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var db = try db_mod.DB.open(std.testing.allocator, path, .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    const indexes_json =
+        \\{"indexes":[
+        \\  {"name":"dense_idx","type":"embeddings","config":{"field":"embedding","dims":3,"metric":"l2_squared","external":true}},
+        \\  {"name":"sparse_idx","type":"embeddings","config":{"field":"tokens","sparse":true}},
+        \\  {"name":"full_text_index_v0","type":"full_text","config":{}}
+        \\]}
+    ;
+    const summary = try reconcileDbIndexesWithOptions(std.testing.allocator, &db, indexes_json, .{});
+    try std.testing.expectEqual(@as(usize, 3), summary.indexes_added);
+    try std.testing.expectEqual(@as(usize, 0), summary.indexes_removed);
+
+    const configs = try db.listIndexes(std.testing.allocator);
+    defer db_mod.types.freeIndexConfigs(std.testing.allocator, configs);
+    try std.testing.expect(findIndexConfig(configs, "dense_idx").?.kind == .dense_vector);
+    try std.testing.expect(findIndexConfig(configs, "sparse_idx").?.kind == .sparse_vector);
+    try std.testing.expect(findIndexConfig(configs, "full_text_index_v0").?.kind == .full_text);
 }
 
 test "table provisioner reconciliation is non-mutating for query read-only dbs" {

@@ -44,19 +44,6 @@ pub const MetadataServerDeps = struct {
     http: service.MetadataHttpServiceDeps = .{},
 };
 
-fn generateInternalMetadataForwardToken(alloc: std.mem.Allocator) ![]u8 {
-    var bytes: [32]u8 = undefined;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    try io_impl.io().randomSecure(&bytes);
-    const token = try alloc.alloc(u8, bytes.len * 2);
-    for (bytes, 0..) |byte, idx| {
-        token[idx * 2] = std.fmt.digitToChar(byte >> 4, .lower);
-        token[idx * 2 + 1] = std.fmt.digitToChar(byte & 0x0f, .lower);
-    }
-    return token;
-}
-
 pub const MetadataServer = struct {
     alloc: std.mem.Allocator,
     svc: *service.MetadataHttpService,
@@ -66,7 +53,6 @@ pub const MetadataServer = struct {
     owned_admin_http_server: ?*metadata_http_server.MetadataHttpServer = null,
     owned_public_read_source: ?*api_table_reads.HostedProvisionedTableReadSource = null,
     owned_public_write_source: ?*api_table_writes.HostedProvisionedTableWriteSource = null,
-    owned_public_forwarder: ?*MetadataPublicApiForwarder = null,
     owned_public_http_server: ?*public_api_http_server.ApiHttpServer = null,
     owned_admin_mux: ?*MetadataAdminMux = null,
     owned_admin_listener: ?*raft_transport.StdHttpListener = null,
@@ -76,14 +62,9 @@ pub const MetadataServer = struct {
         cfg: MetadataServerConfig,
         deps: MetadataServerDeps,
     ) !MetadataServer {
-        var service_cfg = cfg.service;
-        const owned_internal_metadata_forward_token = try resolveInternalMetadataForwardToken(alloc, service_cfg);
-        defer alloc.free(owned_internal_metadata_forward_token);
-        service_cfg.internal_metadata_forward_token = owned_internal_metadata_forward_token;
-
         const svc = try alloc.create(service.MetadataHttpService);
         errdefer alloc.destroy(svc);
-        svc.* = try service.MetadataHttpService.init(alloc, cfg.http, deps.http, service_cfg);
+        svc.* = try service.MetadataHttpService.init(alloc, cfg.http, deps.http, cfg.service);
         errdefer svc.deinit();
 
         var owned_hosted_shard_ops: ?*raft_hosted_shard_ops.HostedShardOperationAdapter = null;
@@ -125,8 +106,6 @@ pub const MetadataServer = struct {
         errdefer if (owned_public_read_source) |read_source| alloc.destroy(read_source);
         var owned_public_write_source: ?*api_table_writes.HostedProvisionedTableWriteSource = null;
         errdefer if (owned_public_write_source) |write_source| alloc.destroy(write_source);
-        var owned_public_forwarder: ?*MetadataPublicApiForwarder = null;
-        errdefer if (owned_public_forwarder) |forwarder| alloc.destroy(forwarder);
         var owned_public_http_server: ?*public_api_http_server.ApiHttpServer = null;
         errdefer if (owned_public_http_server) |public_http_server| {
             public_http_server.deinit();
@@ -170,18 +149,15 @@ pub const MetadataServer = struct {
                 data_router,
                 svc.raft.host.http_host.request_executor,
             );
+            _ = public_write_source.withBackendRuntime(try svc.ensureBackendRuntime());
+            _ = public_write_source.withInferenceAPIURL(if (cfg.api_server_cfg.node_config) |node_config| node_config.inference.api_url else null);
             _ = public_write_source.withSecretStore(cfg.api_server_cfg.secret_store);
             _ = public_write_source.withRemoteContent(cfg.api_server_cfg.remote_content);
             owned_public_write_source = public_write_source;
 
-            const public_forwarder = try alloc.create(MetadataPublicApiForwarder);
-            public_forwarder.* = .{ .svc = svc };
-            owned_public_forwarder = public_forwarder;
-
             var api_server_cfg = cfg.api_server_cfg;
             api_server_cfg.shard_ops = if (owned_hosted_shard_ops) |ops| ops.adapter() else null;
             api_server_cfg.shard_db_adapter = owned_hosted_shard_db.?.adapter();
-            api_server_cfg.metadata_mutation_forwarder = public_forwarder.forwarder();
 
             const public_http_server = try alloc.create(public_api_http_server.ApiHttpServer);
             public_http_server.* = public_api_http_server.ApiHttpServer.init(
@@ -200,13 +176,11 @@ pub const MetadataServer = struct {
             };
             owned_admin_mux = mux;
 
-            var admin_listener_cfg = listener_cfg;
-            admin_listener_cfg.internal_request_metadata_token = svc.internal_metadata_forward_token;
             const listener = try alloc.create(raft_transport.StdHttpListener);
             listener.* = if (svc.apiIoImpl()) |io_impl|
-                raft_transport.StdHttpListener.initShared(alloc, admin_listener_cfg, mux.executor(), io_impl)
+                raft_transport.StdHttpListener.initShared(alloc, listener_cfg, mux.executor(), io_impl)
             else
-                raft_transport.StdHttpListener.init(alloc, admin_listener_cfg, mux.executor());
+                raft_transport.StdHttpListener.init(alloc, listener_cfg, mux.executor());
             owned_admin_listener = listener;
         }
 
@@ -219,7 +193,6 @@ pub const MetadataServer = struct {
             .owned_admin_http_server = owned_admin_http_server,
             .owned_public_read_source = owned_public_read_source,
             .owned_public_write_source = owned_public_write_source,
-            .owned_public_forwarder = owned_public_forwarder,
             .owned_public_http_server = owned_public_http_server,
             .owned_admin_mux = owned_admin_mux,
             .owned_admin_listener = owned_admin_listener,
@@ -240,9 +213,6 @@ pub const MetadataServer = struct {
         }
         if (self.owned_public_write_source) |write_source| {
             self.alloc.destroy(write_source);
-        }
-        if (self.owned_public_forwarder) |forwarder| {
-            self.alloc.destroy(forwarder);
         }
         if (self.owned_public_read_source) |read_source| {
             self.alloc.destroy(read_source);
@@ -352,22 +322,6 @@ pub const MetadataServer = struct {
     }
 };
 
-const MetadataPublicApiForwarder = struct {
-    svc: *service.MetadataHttpService,
-
-    fn forwarder(self: *@This()) public_api_http_server.RequestForwarder {
-        return .{
-            .ptr = self,
-            .vtable = &.{ .forward = forward },
-        };
-    }
-
-    fn forward(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !?http_common.HttpResponse {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try self.svc.forwardMetadataLeaderRequest(alloc, req);
-    }
-};
-
 const MetadataAdminMux = struct {
     admin: *metadata_http_server.MetadataHttpServer,
     public_api: *public_api_http_server.ApiHttpServer,
@@ -446,7 +400,7 @@ fn metadataDataBearingStoreRouterNodeStatus(ptr: *anyopaque, node_id: u64, group
     defer snapshot.deinit(svc, svc.alloc);
     const store = storeForNode(snapshot.stores, node_id) orelse return .absent;
     if (!store.live or !std.mem.eql(u8, store.health_class, "healthy")) return .absent;
-    if (!nodeHasGroupPlacement(snapshot.placements, group_id, node_id)) return .absent;
+    if (!nodeHasReadableGroupPlacement(snapshot.placements, group_id, node_id)) return .absent;
     if (!storeHasGroupData(store, group_id)) return .absent;
     return .active;
 }
@@ -509,7 +463,7 @@ fn metadataStoreRouterNodeBaseUriForGroup(ptr: *anyopaque, alloc: std.mem.Alloca
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
     var snapshot = try loadMetadataRoutingSnapshot(svc, svc.alloc);
     defer snapshot.deinit(svc, svc.alloc);
-    if (!nodeHasGroupPlacement(snapshot.placements, group_id, node_id)) return null;
+    if (!nodeHasReadableGroupPlacement(snapshot.placements, group_id, node_id)) return null;
     const store = storeForNode(snapshot.stores, node_id) orelse return null;
     if (store.api_url.len == 0) return null;
     return try alloc.dupe(u8, store.api_url);
@@ -566,18 +520,6 @@ const DataBearingStoreCandidate = struct {
     updated_at_millis: u64 = 0,
 };
 
-fn resolveInternalMetadataForwardToken(
-    alloc: std.mem.Allocator,
-    cfg: service.MetadataServiceConfig,
-) ![]u8 {
-    if (cfg.internal_metadata_forward_token) |token| {
-        const trimmed = std.mem.trim(u8, token, " \t\r\n");
-        if (trimmed.len > 0) return try alloc.dupe(u8, trimmed);
-    }
-    if (cfg.metadata_orchestration_urls.len > 0) return error.MissingMetadataForwardingToken;
-    return try generateInternalMetadataForwardToken(alloc);
-}
-
 fn bestDataBearingStoreCandidate(
     stores: []const metadata_mod.StoreRecord,
     placements: []const raft_reconciler.PlacementIntent,
@@ -599,7 +541,7 @@ fn dataBearingStoreCandidate(
     group_id: u64,
 ) ?DataBearingStoreCandidate {
     if (!store.live or !std.mem.eql(u8, store.health_class, "healthy")) return null;
-    if (!nodeHasGroupPlacement(placements, group_id, store.node_id)) return null;
+    if (!nodeHasReadableGroupPlacement(placements, group_id, store.node_id)) return null;
 
     var candidate = DataBearingStoreCandidate{
         .node_id = store.node_id,
@@ -636,6 +578,14 @@ fn dataBearingStoreCandidateLessThan(a: DataBearingStoreCandidate, b: DataBearin
 fn nodeHasGroupPlacement(placements: []const raft_reconciler.PlacementIntent, group_id: u64, node_id: u64) bool {
     for (placements) |intent| {
         if (intent.record.group_id == group_id and intent.record.local_node_id == node_id) return true;
+    }
+    return false;
+}
+
+fn nodeHasReadableGroupPlacement(placements: []const raft_reconciler.PlacementIntent, group_id: u64, node_id: u64) bool {
+    for (placements) |intent| {
+        if (intent.record.group_id != group_id or intent.record.local_node_id != node_id) continue;
+        return raft_reconciler.placementReadableWithPeers(placements, intent);
     }
     return false;
 }
@@ -842,9 +792,6 @@ test "metadata server wires hosted shard adapters by default" {
                 },
             },
         },
-        .service = .{
-            .internal_metadata_forward_token = " configured-forward-token \n",
-        },
     }, .{
         .http = .{
             .http = .{
@@ -862,31 +809,6 @@ test "metadata server wires hosted shard adapters by default" {
     try std.testing.expect(server.owned_hosted_shard_db != null);
     try std.testing.expect(server.svc.routed_shard_db_adapter != null);
     try std.testing.expect(server.svc.raft.transition_svc != null);
-    try std.testing.expectEqualStrings("configured-forward-token", server.svc.internal_metadata_forward_token.?);
-}
-
-test "metadata server requires shared forwarding token for orchestration peers" {
-    const urls = [_]service.MetadataOrchestrationUrl{.{
-        .node_id = 2,
-        .url = "http://127.0.0.1:7102",
-    }};
-
-    try std.testing.expectError(error.MissingMetadataForwardingToken, MetadataServer.init(std.testing.allocator, .{
-        .http = .{
-            .http = .{
-                .host = .{
-                    .local_node_id = 1,
-                    .metadata_group_id = 1992,
-                },
-                .transport = .{
-                    .snapshot = .{ .root_dir = ".zig-cache/tmp/metadata-server-forward-token-required" },
-                },
-            },
-        },
-        .service = .{
-            .metadata_orchestration_urls = urls[0..],
-        },
-    }, .{}));
 }
 
 test "metadata server can expose admin listener endpoints" {

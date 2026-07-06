@@ -247,6 +247,48 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
         };
         return try http_route_helpers.jsonResponseWithStatus(ctx.alloc, 201, response);
     }
+    if (routes.Routes.matchGroupTableArtifactRepair(path)) |repair_route| {
+        const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        var parsed = std.json.parseFromSlice(db_mod.types.ArtifactRepairListRequest, ctx.alloc, if (req.body.len > 0) req.body else "{}", .{}) catch {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid artifact repair list request");
+        };
+        defer parsed.deinit();
+        var result = (writes.listArtifactRepairIssuesGroupLocal(
+            ctx.alloc,
+            repair_route.group_id,
+            repair_route.table_name,
+            parsed.value,
+        ) catch |err| switch (err) {
+            error.InvalidArgument => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid artifact repair list request"),
+            error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
+            error.UnsupportedOperation => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
+            error.UnknownGroup, error.TableNotFound, error.NotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
+            else => return err,
+        }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        defer result.deinit(ctx.alloc);
+        return try http_route_helpers.jsonResponse(ctx.alloc, result);
+    }
+    if (routes.Routes.matchGroupTableArtifactRepairRun(path)) |repair_route| {
+        const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        var parsed = std.json.parseFromSlice(db_mod.types.ArtifactRepairRunRequest, ctx.alloc, if (req.body.len > 0) req.body else "{}", .{}) catch {
+            return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid artifact repair request");
+        };
+        defer parsed.deinit();
+        var result = (writes.repairArtifactIssuesGroupLocal(
+            ctx.alloc,
+            repair_route.group_id,
+            repair_route.table_name,
+            parsed.value,
+        ) catch |err| switch (err) {
+            error.InvalidArgument => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid artifact repair request"),
+            error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
+            error.UnsupportedOperation => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
+            error.UnknownGroup, error.TableNotFound, error.NotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
+            else => return err,
+        }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+        defer result.deinit(ctx.alloc);
+        return try http_route_helpers.jsonResponseWithStatus(ctx.alloc, 202, result);
+    }
     if (routes.Routes.matchGroupTableArtifactReprocess(path)) |artifact_route| {
         const writes = ctx.writes orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
         const Request = struct {

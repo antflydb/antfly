@@ -397,7 +397,7 @@ fn printMtpPairValidation(
     try printGgufSummary(&draft_manifest, draft_report);
 
     const target_cfg = if (target_report) |report| report.gpt_config else null;
-    const draft_cfg = if (draft_report) |report| report.gpt_config else null;
+    const draft_cfg = if (draft_report) |report| report.gpt_config else try loadGptConfigFromManifestConfig(allocator, &draft_manifest);
     const target_tokenizer = try tokenizerFingerprint(allocator, target_model_dir);
     defer if (target_tokenizer) |fp| allocator.free(fp);
     const draft_tokenizer = try tokenizerFingerprint(allocator, draft_model_dir);
@@ -441,6 +441,18 @@ fn printMtpPairValidation(
 
     const verdict = mtpPairVerdict(target_cfg, draft_cfg, tokenizer_match);
     print("mtp_pair_verdict: {s}\n", .{mtpPairVerdictName(verdict)});
+}
+
+fn loadGptConfigFromManifestConfig(
+    allocator: std.mem.Allocator,
+    manifest: *const manifest_mod.ModelManifest,
+) !?gpt_mod.Config {
+    const config_path = manifest.config_path orelse return null;
+    const config_bytes = c_file.readFile(allocator, config_path) catch return null;
+    defer allocator.free(config_bytes);
+    const cfg = gpt_mod.parseConfig(allocator, config_bytes) catch return null;
+    if (cfg.family == .other) return null;
+    return cfg;
 }
 
 fn mtpPairVerdict(target_cfg: ?gpt_mod.Config, draft_cfg: ?gpt_mod.Config, tokenizer_match: bool) MtpPairVerdict {
@@ -672,16 +684,27 @@ fn printGgufSummary(
 
     if (gguf_report.gpt_config) |cfg| {
         print(
-            "  gpt family={s} layers={d} heads={d} kv_heads={d} hidden={d} sliding_window={d} sliding_pattern={d} kv_shared_layers={d} mtp_assistant={} mtp_backbone={d} mtp_centroids={d} mtp_top_k={d} moe={} experts={d} experts_per_tok={d}\n",
+            "  gpt family={s} layers={d} heads={d} kv_heads={d} global_kv_heads={d} hidden={d} head_dim={d} global_head_dim={d} sliding_window={d} sliding_pattern={d} kv_shared_layers={d} ple_hidden={d} rope_theta={d:.6} rope_local_theta={d:.6} rope_partial_factor={d:.6} rope_dim_override={d} final_logit_softcap={d:.6} weight_tying={} norm_offset={d:.6} mtp_assistant={} mtp_backbone={d} mtp_centroids={d} mtp_top_k={d} moe={} experts={d} experts_per_tok={d}\n",
             .{
                 @tagName(cfg.family),
                 cfg.num_hidden_layers,
                 cfg.num_attention_heads,
                 cfg.effectiveKVHeads(),
+                cfg.num_global_key_value_heads,
                 cfg.hidden_size,
+                cfg.attention_head_dim,
+                cfg.global_head_dim,
                 cfg.sliding_window,
                 cfg.sliding_window_pattern,
                 cfg.num_kv_shared_layers,
+                cfg.ple_hidden_size,
+                cfg.rope_theta,
+                cfg.rope_local_theta,
+                cfg.rope_partial_factor,
+                cfg.rope_dim_override,
+                cfg.final_logit_softcapping,
+                cfg.weight_tying,
+                cfg.norm_weight_offset,
                 cfg.gemma4_mtp_assistant,
                 cfg.mtp_backbone_hidden_size,
                 cfg.mtp_num_centroids,
@@ -691,6 +714,25 @@ fn printGgufSummary(
                 cfg.num_experts_per_tok,
             },
         );
+        const sample_layers = [_]usize{ 0, 4, 5, 23, 24, 41 };
+        for (sample_layers) |layer| {
+            if (layer >= cfg.num_hidden_layers) continue;
+            print(
+                "  gpt_layer layer={d} sliding={} shared_tail={} donor={?} kv_heads={d} head_dim={d} rope_dim={d} rope_active_dim={d} rope_freq_dim={d} omits_v={}\n",
+                .{
+                    layer,
+                    cfg.layerUsesSlidingAttention(layer),
+                    cfg.layerSharesKv(layer),
+                    cfg.kvDonorLayerIndex(layer),
+                    cfg.effectiveKVHeadsForLayer(layer),
+                    cfg.effectiveHeadDimForLayer(layer),
+                    cfg.layerRopeDim(layer),
+                    cfg.layerRopeActiveDim(layer),
+                    cfg.layerRopeFrequencyDim(layer),
+                    cfg.layerOmitsVProj(layer),
+                },
+            );
+        }
     }
 
     if (gguf_report.all_tensor_types.len == 0) {

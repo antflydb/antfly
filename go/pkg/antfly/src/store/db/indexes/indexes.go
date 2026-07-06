@@ -55,7 +55,7 @@ type EnrichableIndex interface {
 // EnrichmentComputer is implemented by indexes that can compute enrichments synchronously
 type EnrichmentComputer interface {
 	// ComputeEnrichments generates embeddings/summaries/chunks synchronously before Raft proposal
-	// This is called by dbWrapper.preEnrichBatch() when sync_level is "enrichments" or "aknn"
+	// This is called by dbWrapper.preEnrichBatch() when sync_level is "enrichments" or "full_index"
 	//
 	// Returns writes for ALL enrichments:
 	//  - Embeddings: key:i:<name>:e -> [hashID:uint64][embedding_vector]

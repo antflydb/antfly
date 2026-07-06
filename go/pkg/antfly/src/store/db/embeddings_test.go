@@ -806,11 +806,11 @@ func TestBatch_EmbeddingIndexedInVectorIndex(t *testing.T) {
 
 	key := []byte("test_key")
 
-	// Write the document with SyncLevelAknn to wait for vector indexing
+	// Write the document with SyncLevelFullIndex to wait for vector indexing
 	// This is safe because we're providing user embeddings (no enrichment needed)
 	// so there are no promptKeys requiring pre-enrichment in dbWrapper
 	err = db.Batch(t.Context(), [][2][]byte{{key, docJSON}}, nil, Op_SyncLevelEmbeddings)
-	// SyncLevelAknn returns ErrPartialSuccess (aknn synced, other indexes async)
+	// SyncLevelFullIndex returns ErrPartialSuccess (vector indexes synced, other indexes async)
 	if err != nil && !errors.Is(err, ErrPartialSuccess) {
 		require.NoError(t, err)
 	}
@@ -1217,7 +1217,7 @@ func TestVectorSearch_FilterQueryNoMatchesReturnsEmpty(t *testing.T) {
 	require.NoError(t, err)
 
 	key := []byte("doc1")
-	// Use SyncLevelAknn to wait for the vector index write to complete
+	// Use SyncLevelFullIndex to wait for the vector index write to complete
 	err = db.Batch(ctx, [][2][]byte{{key, docJSON}}, nil, Op_SyncLevelEmbeddings)
 	if err != nil && !errors.Is(err, ErrPartialSuccess) {
 		require.NoError(t, err)

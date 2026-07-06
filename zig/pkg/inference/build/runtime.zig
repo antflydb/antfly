@@ -181,7 +181,11 @@ pub fn create(config: Config) Graph {
     });
     const protobuf_mod = shared.protobuf orelse protobuf_dep.module("protobuf");
     const sentencepiece_proto_mod = shared.sentencepiece_proto orelse addSentencePieceProtoModule(b, protobuf_dep, paths, config.register_public_modules);
-    const ml_mod = shared.ml orelse createSharedModuleNamed(config, "ml", "lib/ml/src/root.zig");
+    const ml_mod = shared.ml orelse blk: {
+        const mod = createSharedModuleNamed(config, "ml", "lib/ml/src/root.zig");
+        mod.addImport("antfly_platform", platform_mod);
+        break :blk mod;
+    };
     const ml_tabular_mod = shared.ml_tabular orelse createSharedModuleNamed(config, "ml_tabular", "lib/ml/tabular/src/root.zig");
     const onnx_graph_mod = shared.onnx_graph orelse blk: {
         const mod = b.dependency("onnx_graph", .{

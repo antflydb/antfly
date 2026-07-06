@@ -33,13 +33,13 @@ def _assert_read_result_shape(result: dict):
     assert "text" in result
     assert isinstance(result["text"], str)
 
-    if "fields" in result:
+    if result.get("fields") is not None:
         assert isinstance(result["fields"], dict)
         for key, value in result["fields"].items():
             assert isinstance(key, str)
             assert isinstance(value, str)
 
-    if "regions" in result:
+    if result.get("regions") is not None:
         assert isinstance(result["regions"], list)
         for region in result["regions"]:
             assert isinstance(region, dict)
@@ -52,7 +52,7 @@ def _assert_read_result_shape(result: dict):
                 assert isinstance(coord, (int, float))
             if "confidence" in region:
                 assert isinstance(region["confidence"], (int, float))
-            if "label" in region:
+            if region.get("label") is not None:
                 assert isinstance(region["label"], str)
 
 
@@ -285,7 +285,7 @@ def test_read_multistage_model_round_trips_richer_shape(api):
     assert len(results) == 1
     _assert_read_result_shape(results[0])
 
-    regions = results[0].get("regions", [])
+    regions = results[0].get("regions") or []
     assert len(regions) >= 1
     assert any(region["text"].strip() for region in regions)
 

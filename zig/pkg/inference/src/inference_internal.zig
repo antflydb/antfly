@@ -21,6 +21,7 @@ pub const metal_runtime = if (build_options.enable_metal) @import("backends/meta
         return false;
     }
 };
+pub const metal_native_provider = if (build_options.enable_metal) @import("backends/metal_native_provider.zig") else struct {};
 pub const graph = @import("graph/root.zig");
 pub const io = @import("io/io.zig");
 pub const ops = @import("ops/ops.zig");
