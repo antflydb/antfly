@@ -11259,7 +11259,7 @@ pub const DB = struct {
         errdefer if (db_query_search.peekLastSortRejectionDiagnostic()) |diagnostic| {
             db_query_metrics.observeSortRejection(metric_name, .search, platform_time.monotonicNs() -| start_ns, diagnostic.reason, diagnostic.detail);
         };
-        return try db_query_search.searchComposed(alloc, req, .{
+        const result = try db_query_search.searchComposed(alloc, req, .{
             .ctx = self,
             .resolve_structured_doc_filter = resolveStructuredDocFilterForComposedCallback,
             .resolve_structured_text_doc_filter = resolveStructuredTextDocFilterForComposedCallback,
@@ -11272,6 +11272,10 @@ pub const DB = struct {
             .resolve_hits_to_doc_set = resolveSearchHitsToDocSetCallback,
             .attach_graph_results = attachGraphResultsCallback,
         });
+        if (result.sort_profile != null) {
+            db_query_metrics.observeSortProfile(metric_name, .search, platform_time.monotonicNs() -| start_ns, result.sort_profile);
+        }
+        return result;
     }
 
     fn composedQueryMetricIndexName(req: types.SearchRequest) ?[]const u8 {

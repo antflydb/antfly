@@ -34,7 +34,8 @@ class QueryHit:
             `ancestors` with response-local or requested DB-backed source/unit context when available.
         field_sort (list[Any] | Unset): Sort key values for this hit. Pass as search_after or search_before
             to paginate to the next/previous page. Values preserve their JSON
-            types. Only present when order_by is specified.
+            types. Present for ordered result pages, including cursor-only
+            requests whose effective order is `_id` ascending.
     """
 
     field_id: str

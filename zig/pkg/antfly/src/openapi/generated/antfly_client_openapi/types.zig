@@ -1580,7 +1580,7 @@ pub const QueryHit = struct {
     _source: ?std.json.Value = null,
     /// Stable ancestry envelope for derived document hierarchy hits. Present when the hit is a derived unit/chunk/embedding artifact or when a source-level rollup includes child chunks. Standard fields include `level`, `parent_doc_key`, optional `parent_unit_id`, `artifact`, `chunks`, and `ancestors` with response-local or requested DB-backed source/unit context when available.
     hierarchy: ?std.json.Value = null,
-    /// Sort key values for this hit. Pass as search_after or search_before to paginate to the next/previous page. Values preserve their JSON types. Only present when order_by is specified.
+    /// Sort key values for this hit. Pass as search_after or search_before to paginate to the next/previous page. Values preserve their JSON types. Present for ordered result pages, including cursor-only requests whose effective order is `_id` ascending.
     _sort: ?[]const std.json.Value = null,
 };
 
@@ -4144,6 +4144,10 @@ pub const SortProfile = struct {
     selection_reason: ?[]const u8 = null,
     /// Whether exact execution required native typed sort values.
     require_native: ?bool = null,
+    /// Native typed doc-values coverage status for mapped sort fields.
+    native_doc_values_coverage: ?[]const u8 = null,
+    /// Physical index_sort coverage status for the requested order.
+    index_sort_coverage: ?[]const u8 = null,
     /// Candidate documents considered by sort execution.
     candidate_count: ?i64 = null,
     /// Candidates rejected by cursor comparison.
@@ -6163,7 +6167,7 @@ pub const QueryProfile = struct {
     reranker: ?RerankerProfile = null,
     /// Result merge statistics (present for hybrid search).
     merge: ?MergeProfile = null,
-    /// Sort execution statistics (present when the query used order_by and profiling was enabled).
+    /// Sort execution statistics (present when the query used ordered page options and profiling was enabled).
     sort: ?SortProfile = null,
 };
 
@@ -7224,9 +7228,9 @@ pub const RetrievalQueryRequest = struct {
     timeout_ms: ?i64 = null,
     /// Sort order for results. Array of sort fields with direction. Antfly appends `_id` ascending as a stable tie-breaker when it is omitted. Supported for exact text-backed, match_all, and filter-only requests when each non-`_id` field is a mapped scalar field with sortable native doc-value coverage. Analyzed `text` fields are search-only; sort on a keyword/scalar mapping such as `title.keyword` instead. Requests that cannot be executed through an exact native sort path return 422 rather than falling back to stored JSON sorting. Semantic searches are always sorted by similarity score. Not supported when `count` is true.
     order_by: ?[]const SortField = null,
-    /// Cursor for forward pagination. Pass the `_sort` values from the last hit of the previous page exactly, including the appended `_id` tie-breaker. Values preserve their JSON types; for example numbers remain numbers, booleans remain booleans, and strings remain strings. Cursor values must be replayable JSON scalars; nulls, arrays, objects, and non-finite numbers are rejected. Mutually exclusive with `offset`. Requires `order_by` to be set. Supported for text-backed, match_all, and filter-only requests; not supported for semantic_search or count-only requests.
+    /// Cursor for forward pagination. Pass the `_sort` values from the last hit of the previous page exactly, including the appended `_id` tie-breaker. Values preserve their JSON types; for example numbers remain numbers, booleans remain booleans, and strings remain strings. Cursor values must be replayable JSON scalars; nulls, arrays, objects, and non-finite numbers are rejected. Mutually exclusive with `offset`. When `order_by` is omitted, Antfly uses `_id` ascending as the effective order and the cursor tuple must contain exactly one `_id` string. Supported for exact text-backed, match_all, and filter-only requests; not supported for semantic_search or count-only requests.
     search_after: ?[]const std.json.Value = null,
-    /// Cursor for backward pagination. Pass the `_sort` values from the first hit of the current page exactly, including the appended `_id` tie-breaker. Values preserve their JSON types; for example numbers remain numbers, booleans remain booleans, and strings remain strings. Cursor values must be replayable JSON scalars; nulls, arrays, objects, and non-finite numbers are rejected. Mutually exclusive with `offset`. Requires `order_by` to be set. Supported for text-backed, match_all, and filter-only requests; not supported for semantic_search or count-only requests.
+    /// Cursor for backward pagination. Pass the `_sort` values from the first hit of the current page exactly, including the appended `_id` tie-breaker. Values preserve their JSON types; for example numbers remain numbers, booleans remain booleans, and strings remain strings. Cursor values must be replayable JSON scalars; nulls, arrays, objects, and non-finite numbers are rejected. Mutually exclusive with `offset`. When `order_by` is omitted, Antfly uses `_id` ascending as the effective order and the cursor tuple must contain exactly one `_id` string. Supported for exact text-backed, match_all, and filter-only requests; not supported for semantic_search or count-only requests.
     search_before: ?[]const std.json.Value = null,
     /// Maximum distance threshold for semantic similarity search. Results with distance greater than this value are excluded. Lower distances indicate higher similarity. Useful for filtering out low-confidence matches.
     distance_under: ?f32 = null,
@@ -7378,9 +7382,9 @@ pub const QueryRequest = struct {
     timeout_ms: ?i64 = null,
     /// Sort order for results. Array of sort fields with direction. Antfly appends `_id` ascending as a stable tie-breaker when it is omitted. Supported for exact text-backed, match_all, and filter-only requests when each non-`_id` field is a mapped scalar field with sortable native doc-value coverage. Analyzed `text` fields are search-only; sort on a keyword/scalar mapping such as `title.keyword` instead. Requests that cannot be executed through an exact native sort path return 422 rather than falling back to stored JSON sorting. Semantic searches are always sorted by similarity score. Not supported when `count` is true.
     order_by: ?[]const SortField = null,
-    /// Cursor for forward pagination. Pass the `_sort` values from the last hit of the previous page exactly, including the appended `_id` tie-breaker. Values preserve their JSON types; for example numbers remain numbers, booleans remain booleans, and strings remain strings. Cursor values must be replayable JSON scalars; nulls, arrays, objects, and non-finite numbers are rejected. Mutually exclusive with `offset`. Requires `order_by` to be set. Supported for text-backed, match_all, and filter-only requests; not supported for semantic_search or count-only requests.
+    /// Cursor for forward pagination. Pass the `_sort` values from the last hit of the previous page exactly, including the appended `_id` tie-breaker. Values preserve their JSON types; for example numbers remain numbers, booleans remain booleans, and strings remain strings. Cursor values must be replayable JSON scalars; nulls, arrays, objects, and non-finite numbers are rejected. Mutually exclusive with `offset`. When `order_by` is omitted, Antfly uses `_id` ascending as the effective order and the cursor tuple must contain exactly one `_id` string. Supported for exact text-backed, match_all, and filter-only requests; not supported for semantic_search or count-only requests.
     search_after: ?[]const std.json.Value = null,
-    /// Cursor for backward pagination. Pass the `_sort` values from the first hit of the current page exactly, including the appended `_id` tie-breaker. Values preserve their JSON types; for example numbers remain numbers, booleans remain booleans, and strings remain strings. Cursor values must be replayable JSON scalars; nulls, arrays, objects, and non-finite numbers are rejected. Mutually exclusive with `offset`. Requires `order_by` to be set. Supported for text-backed, match_all, and filter-only requests; not supported for semantic_search or count-only requests.
+    /// Cursor for backward pagination. Pass the `_sort` values from the first hit of the current page exactly, including the appended `_id` tie-breaker. Values preserve their JSON types; for example numbers remain numbers, booleans remain booleans, and strings remain strings. Cursor values must be replayable JSON scalars; nulls, arrays, objects, and non-finite numbers are rejected. Mutually exclusive with `offset`. When `order_by` is omitted, Antfly uses `_id` ascending as the effective order and the cursor tuple must contain exactly one `_id` string. Supported for exact text-backed, match_all, and filter-only requests; not supported for semantic_search or count-only requests.
     search_before: ?[]const std.json.Value = null,
     /// Maximum distance threshold for semantic similarity search. Results with distance greater than this value are excluded. Lower distances indicate higher similarity. Useful for filtering out low-confidence matches.
     distance_under: ?f32 = null,

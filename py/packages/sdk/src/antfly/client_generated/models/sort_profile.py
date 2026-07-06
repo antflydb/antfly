@@ -33,6 +33,8 @@ class SortProfile:
             distributed_behavior (str | Unset): Distributed sort behavior.
             selection_reason (str | Unset): Stable reason the planner selected this sort plan.
             require_native (bool | Unset): Whether exact execution required native typed sort values.
+            native_doc_values_coverage (str | Unset): Native typed doc-values coverage status for mapped sort fields.
+            index_sort_coverage (str | Unset): Physical index_sort coverage status for the requested order.
             candidate_count (int | Unset): Candidate documents considered by sort execution.
             cursor_rejected_count (int | Unset): Candidates rejected by cursor comparison.
             selected_count (int | Unset): Hits selected for the returned page.
@@ -55,6 +57,8 @@ class SortProfile:
     distributed_behavior: str | Unset = UNSET
     selection_reason: str | Unset = UNSET
     require_native: bool | Unset = UNSET
+    native_doc_values_coverage: str | Unset = UNSET
+    index_sort_coverage: str | Unset = UNSET
     candidate_count: int | Unset = UNSET
     cursor_rejected_count: int | Unset = UNSET
     selected_count: int | Unset = UNSET
@@ -92,6 +96,10 @@ class SortProfile:
         selection_reason = self.selection_reason
 
         require_native = self.require_native
+
+        native_doc_values_coverage = self.native_doc_values_coverage
+
+        index_sort_coverage = self.index_sort_coverage
 
         candidate_count = self.candidate_count
 
@@ -136,6 +144,10 @@ class SortProfile:
             field_dict["selection_reason"] = selection_reason
         if require_native is not UNSET:
             field_dict["require_native"] = require_native
+        if native_doc_values_coverage is not UNSET:
+            field_dict["native_doc_values_coverage"] = native_doc_values_coverage
+        if index_sort_coverage is not UNSET:
+            field_dict["index_sort_coverage"] = index_sort_coverage
         if candidate_count is not UNSET:
             field_dict["candidate_count"] = candidate_count
         if cursor_rejected_count is not UNSET:
@@ -191,6 +203,10 @@ class SortProfile:
 
         require_native = d.pop("require_native", UNSET)
 
+        native_doc_values_coverage = d.pop("native_doc_values_coverage", UNSET)
+
+        index_sort_coverage = d.pop("index_sort_coverage", UNSET)
+
         candidate_count = d.pop("candidate_count", UNSET)
 
         cursor_rejected_count = d.pop("cursor_rejected_count", UNSET)
@@ -222,6 +238,8 @@ class SortProfile:
             distributed_behavior=distributed_behavior,
             selection_reason=selection_reason,
             require_native=require_native,
+            native_doc_values_coverage=native_doc_values_coverage,
+            index_sort_coverage=index_sort_coverage,
             candidate_count=candidate_count,
             cursor_rejected_count=cursor_rejected_count,
             selected_count=selected_count,

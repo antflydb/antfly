@@ -5224,9 +5224,10 @@ export interface components {
              *     must be replayable JSON scalars; nulls, arrays, objects, and non-finite
              *     numbers are rejected.
              *     Mutually exclusive with `offset`.
-             *     Requires `order_by` to be set. Supported for text-backed, match_all,
-             *     and filter-only requests; not supported for semantic_search or
-             *     count-only requests.
+             *     When `order_by` is omitted, Antfly uses `_id` ascending as the effective
+             *     order and the cursor tuple must contain exactly one `_id` string.
+             *     Supported for exact text-backed, match_all, and filter-only requests;
+             *     not supported for semantic_search or count-only requests.
              */
             search_after?: unknown[];
             /**
@@ -5237,9 +5238,10 @@ export interface components {
              *     must be replayable JSON scalars; nulls, arrays, objects, and non-finite
              *     numbers are rejected.
              *     Mutually exclusive with `offset`.
-             *     Requires `order_by` to be set. Supported for text-backed, match_all,
-             *     and filter-only requests; not supported for semantic_search or
-             *     count-only requests.
+             *     When `order_by` is omitted, Antfly uses `_id` ascending as the effective
+             *     order and the cursor tuple must contain exactly one `_id` string.
+             *     Supported for exact text-backed, match_all, and filter-only requests;
+             *     not supported for semantic_search or count-only requests.
              */
             search_before?: unknown[];
             /**
@@ -5587,7 +5589,7 @@ export interface components {
             reranker?: components["schemas"]["RerankerProfile"];
             /** @description Result merge statistics (present for hybrid search). */
             merge?: components["schemas"]["MergeProfile"];
-            /** @description Sort execution statistics (present when the query used order_by and profiling was enabled). */
+            /** @description Sort execution statistics (present when the query used ordered page options and profiling was enabled). */
             sort?: components["schemas"]["SortProfile"];
         };
         /**
@@ -5616,6 +5618,10 @@ export interface components {
             selection_reason?: string;
             /** @description Whether exact execution required native typed sort values. */
             require_native?: boolean;
+            /** @description Native typed doc-values coverage status for mapped sort fields. */
+            native_doc_values_coverage?: string;
+            /** @description Physical index_sort coverage status for the requested order. */
+            index_sort_coverage?: string;
             /**
              * Format: int64
              * @description Candidate documents considered by sort execution.
@@ -5823,7 +5829,8 @@ export interface components {
             /**
              * @description Sort key values for this hit. Pass as search_after or search_before
              *     to paginate to the next/previous page. Values preserve their JSON
-             *     types. Only present when order_by is specified.
+             *     types. Present for ordered result pages, including cursor-only
+             *     requests whose effective order is `_id` ascending.
              */
             _sort?: unknown[];
         };

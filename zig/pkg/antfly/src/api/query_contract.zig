@@ -1763,7 +1763,11 @@ fn applyCommonSearchRequestOptions(
     if (request.distance_over) |distance_over| req.distance_over = distance_over;
     if (request.distance_under) |distance_under| req.distance_under = distance_under;
     req.search_effort = request.search_effort;
-    if (request.order_by) |order_by| req.order_by = try cloneSortFieldsWithStableTiebreaker(alloc, order_by);
+    if (request.order_by) |order_by| {
+        req.order_by = try cloneSortFieldsWithStableTiebreaker(alloc, order_by);
+    } else if (request.search_after != null or request.search_before != null) {
+        req.order_by = try cloneDefaultIdSortField(alloc);
+    }
     if (request.search_after) |search_after| req.search_after = try cloneJsonValues(alloc, search_after);
     if (request.search_before) |search_before| req.search_before = try cloneJsonValues(alloc, search_before);
     if (request.merge_config) |merge_config| req.merge_config = try parseMergeConfig(alloc, merge_config);
@@ -1786,9 +1790,6 @@ fn applyCommonSearchRequestOptions(
         return unsupportedExactSort("*", "invalid_cursor_arity", "invalid_cursor_arity");
     }
     if (req.search_after.len > 0 and req.search_before.len > 0) {
-        return unsupportedExactSort("*", "invalid_cursor_arity", "invalid_cursor_arity");
-    }
-    if ((req.search_after.len > 0 or req.search_before.len > 0) and req.order_by.len == 0) {
         return unsupportedExactSort("*", "invalid_cursor_arity", "invalid_cursor_arity");
     }
     if (req.search_after.len > 0 and req.search_after.len != req.order_by.len) {
@@ -1865,6 +1866,16 @@ fn cloneSortFieldsWithStableTiebreaker(
         };
         initialized += 1;
     }
+    return out;
+}
+
+fn cloneDefaultIdSortField(alloc: std.mem.Allocator) ![]const db_mod.types.SortField {
+    const out = try alloc.alloc(db_mod.types.SortField, 1);
+    errdefer alloc.free(out);
+    out[0] = .{
+        .field = try alloc.dupe(u8, "_id"),
+        .desc = false,
+    };
     return out;
 }
 
@@ -2077,7 +2088,6 @@ fn buildPreflightSearchRequestAlloc(
     try applyCommonSearchRequestOptions(alloc, request, &req);
 
     if (request.search_after != null and request.search_before != null) return unsupportedExactSort("*", "invalid_cursor_arity", "invalid_cursor_arity");
-    if ((request.search_after != null or request.search_before != null) and request.order_by == null) return unsupportedExactSort("*", "invalid_cursor_arity", "invalid_cursor_arity");
 
     const fields = try applySearchRequestFields(alloc, request.fields, &req);
     errdefer freeClonedFields(alloc, fields);
@@ -2444,7 +2454,7 @@ fn toOpenApiHit(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: 
 }
 
 fn validateOpenApiHitSortTuple(req: db_mod.types.SearchRequest, hit: db_mod.types.SearchHit) !void {
-    if (req.order_by.len == 0) return;
+    if (!sortProfileRequestHasOrderedPage(req)) return;
     const expected_len = sortProfileEffectiveOrderLen(req);
     if (hit.sort_values.len != expected_len) {
         return invalidOutboundSortTuple("*", "sort_tuple_arity");
@@ -2809,6 +2819,8 @@ test "api query contract serializes sort profile diagnostics" {
             .selection_reason = "index_sort_sorted_segment_seek",
             .require_native = true,
             .native_loader = true,
+            .native_doc_values_coverage = "covered",
+            .index_sort_coverage = "covered_with_bounds",
             .index_sort_match = true,
             .sorted_segment_executor_available = true,
             .sorted_segment_bounds_available = true,
@@ -2873,6 +2885,8 @@ test "api query contract serializes sort profile diagnostics" {
     try std.testing.expectEqualStrings("index_sort_sorted_segment_seek", sort.get("selection_reason").?.string);
     try std.testing.expect(sort.get("require_native").?.bool);
     try std.testing.expect(sort.get("native_loader").?.bool);
+    try std.testing.expectEqualStrings("covered", sort.get("native_doc_values_coverage").?.string);
+    try std.testing.expectEqualStrings("covered_with_bounds", sort.get("index_sort_coverage").?.string);
     try std.testing.expect(sort.get("index_sort_match").?.bool);
     try std.testing.expect(sort.get("sorted_segment_executor_available").?.bool);
     try std.testing.expect(sort.get("sorted_segment_bounds_available").?.bool);
@@ -2926,6 +2940,89 @@ test "api query contract serializes ordered hit sort tuple" {
     try std.testing.expectEqual(@as(usize, 2), sort.len);
     try std.testing.expectEqual(@as(i64, 42), sort[0].integer);
     try std.testing.expectEqualStrings("doc:a", sort[1].string);
+}
+
+test "api query contract serializes cursor-only id sort tuple" {
+    const alloc = std.testing.allocator;
+
+    var result = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
+        .total_hits = 1,
+    };
+    defer result.deinit();
+
+    const sort_values = try alloc.alloc(std.json.Value, 1);
+    sort_values[0] = .{ .string = try alloc.dupe(u8, "doc:a") };
+    result.hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .score = 0.9,
+        .sort_values = sort_values,
+    };
+
+    const order_by = [_]db_mod.types.SortField{.{ .field = "_id" }};
+    const cursor = [_]std.json.Value{.{ .string = "doc:0" }};
+    var response = try encodeQueryResponses(alloc, "docs", .{
+        .order_by = &order_by,
+        .search_after = &cursor,
+    }, .{}, result);
+    defer response.deinit(alloc);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.json, .{});
+    defer parsed.deinit();
+    const hit = parsed.value.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items[0].object;
+    const sort = hit.get("_sort").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), sort.len);
+    try std.testing.expectEqualStrings("doc:a", sort[0].string);
+}
+
+test "api query contract validates cursor-only implicit id sort tuple" {
+    const alloc = std.testing.allocator;
+
+    var result = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
+        .total_hits = 1,
+    };
+    defer result.deinit();
+
+    const sort_values = try alloc.alloc(std.json.Value, 1);
+    sort_values[0] = .{ .string = try alloc.dupe(u8, "doc:a") };
+    result.hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .sort_values = sort_values,
+    };
+
+    const cursor = [_]std.json.Value{.{ .string = "doc:0" }};
+    var response = try encodeQueryResponses(alloc, "docs", .{
+        .search_after = &cursor,
+    }, .{}, result);
+    defer response.deinit(alloc);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.json, .{});
+    defer parsed.deinit();
+    const hit = parsed.value.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items[0].object;
+    const sort = hit.get("_sort").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), sort.len);
+    try std.testing.expectEqualStrings("doc:a", sort[0].string);
+
+    var bad_result = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = try alloc.alloc(db_mod.types.SearchHit, 1),
+        .total_hits = 1,
+    };
+    defer bad_result.deinit();
+
+    const bad_sort_values = try alloc.alloc(std.json.Value, 1);
+    bad_sort_values[0] = .{ .string = try alloc.dupe(u8, "doc:b") };
+    bad_result.hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .sort_values = bad_sort_values,
+    };
+
+    try std.testing.expectError(error.InvalidQueryRequest, encodeQueryResponses(alloc, "docs", .{
+        .search_after = &cursor,
+    }, .{}, bad_result));
 }
 
 test "api query contract rejects ordered hits without complete sort tuple" {
@@ -4188,6 +4285,8 @@ fn buildSortProfileValue(
     try sort.put(alloc, "selection_reason", .{ .string = profile.selection_reason });
     try sort.put(alloc, "require_native", .{ .bool = profile.require_native });
     try sort.put(alloc, "native_loader", .{ .bool = profile.native_loader });
+    try sort.put(alloc, "native_doc_values_coverage", .{ .string = profile.native_doc_values_coverage });
+    try sort.put(alloc, "index_sort_coverage", .{ .string = profile.index_sort_coverage });
     try sort.put(alloc, "index_sort_match", .{ .bool = profile.index_sort_match });
     try sort.put(alloc, "sorted_segment_executor_available", .{ .bool = profile.sorted_segment_executor_available });
     try sort.put(alloc, "sorted_segment_bounds_available", .{ .bool = profile.sorted_segment_bounds_available });
@@ -4224,11 +4323,21 @@ fn sortProfileNeedsImplicitIdTiebreaker(req: db_mod.types.SearchRequest) bool {
     return !std.mem.eql(u8, req.order_by[req.order_by.len - 1].field, "_id");
 }
 
+fn sortProfileRequestNeedsDefaultIdOrder(req: db_mod.types.SearchRequest) bool {
+    return req.order_by.len == 0 and (req.search_after.len > 0 or req.search_before.len > 0);
+}
+
+fn sortProfileRequestHasOrderedPage(req: db_mod.types.SearchRequest) bool {
+    return req.order_by.len > 0 or req.search_after.len > 0 or req.search_before.len > 0;
+}
+
 fn sortProfileEffectiveOrderLen(req: db_mod.types.SearchRequest) usize {
+    if (sortProfileRequestNeedsDefaultIdOrder(req)) return 1;
     return req.order_by.len + @intFromBool(sortProfileNeedsImplicitIdTiebreaker(req));
 }
 
 fn sortProfileEffectiveOrderField(req: db_mod.types.SearchRequest, index: usize) db_mod.types.SortField {
+    if (sortProfileRequestNeedsDefaultIdOrder(req)) return .{ .field = "_id" };
     if (index < req.order_by.len) return req.order_by[index];
     return .{ .field = "_id" };
 }
@@ -7019,7 +7128,26 @@ test "api query contract rejects count with search_before cursor" {
     try std.testing.expectEqualStrings("count_only_ordered_page", diagnostic.detail);
 }
 
-test "api query contract preflight rejects cursor pagination without sort" {
+test "api query contract defaults cursor pagination without sort to id order" {
+    const alloc = std.testing.allocator;
+
+    var parsed = try parseQueryRequest(alloc, null, "docs",
+        \\{
+        \\  "full_text_search": {"match":"raft","field":"body"},
+        \\  "search_after": ["doc-9"],
+        \\  "limit": 10
+        \\}
+    );
+    defer parsed.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), parsed.req.order_by.len);
+    try std.testing.expectEqualStrings("_id", parsed.req.order_by[0].field);
+    try std.testing.expect(!parsed.req.order_by[0].desc);
+    try std.testing.expectEqual(@as(usize, 1), parsed.req.search_after.len);
+    try std.testing.expectEqualStrings("doc-9", parsed.req.search_after[0].string);
+}
+
+test "api query contract preflight rejects cursor pagination without sort when cursor is not id arity" {
     var parsed = try std.json.parseFromSlice(metadata_openapi.QueryRequest, std.testing.allocator,
         \\{
         \\  "full_text_search": {"match":"raft","field":"body"},

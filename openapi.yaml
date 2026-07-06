@@ -11089,11 +11089,13 @@ components:
 
             Mutually exclusive with `offset`.
 
-            Requires `order_by` to be set. Supported for text-backed, match_all,
+            When `order_by` is omitted, Antfly uses `_id` ascending as the effective
 
-            and filter-only requests; not supported for semantic_search or
+            order and the cursor tuple must contain exactly one `_id` string.
 
-            count-only requests.
+            Supported for exact text-backed, match_all, and filter-only requests;
+
+            not supported for semantic_search or count-only requests.
         search_before:
           type: array
           items: {}
@@ -11112,11 +11114,13 @@ components:
 
             Mutually exclusive with `offset`.
 
-            Requires `order_by` to be set. Supported for text-backed, match_all,
+            When `order_by` is omitted, Antfly uses `_id` ascending as the effective
 
-            and filter-only requests; not supported for semantic_search or
+            order and the cursor tuple must contain exactly one `_id` string.
 
-            count-only requests.
+            Supported for exact text-backed, match_all, and filter-only requests;
+
+            not supported for semantic_search or count-only requests.
         distance_under:
           x-go-type-skip-optional-pointer: false
           type: number
@@ -11615,8 +11619,8 @@ components:
           description: Result merge statistics (present for hybrid search).
         sort:
           $ref: '#/components/schemas/SortProfile'
-          description: Sort execution statistics (present when the query used order_by and profiling was
-            enabled).
+          description: Sort execution statistics (present when the query used ordered page options and
+            profiling was enabled).
     SortProfile:
       type: object
       additionalProperties: true
@@ -11659,6 +11663,12 @@ components:
         require_native:
           type: boolean
           description: Whether exact execution required native typed sort values.
+        native_doc_values_coverage:
+          type: string
+          description: Native typed doc-values coverage status for mapped sort fields.
+        index_sort_coverage:
+          type: string
+          description: Physical index_sort coverage status for the requested order.
         candidate_count:
           type: integer
           format: int64
@@ -11905,7 +11915,9 @@ components:
 
             to paginate to the next/previous page. Values preserve their JSON
 
-            types. Only present when order_by is specified.
+            types. Present for ordered result pages, including cursor-only
+
+            requests whose effective order is `_id` ascending.
           x-go-name: sort
     QueryHits:
       x-omitempty: false

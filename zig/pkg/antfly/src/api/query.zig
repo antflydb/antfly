@@ -98,7 +98,7 @@ pub fn mergeSearchResultsWithRuntimeSchema(
         if (result.total_hits_relation == .gte) total_hits_relation = .gte;
     }
 
-    if (req.order_by.len > 0) {
+    if (req.order_by.len > 0 or req.search_after.len > 0 or req.search_before.len > 0) {
         var merge_req = req;
         merge_req.offset = offset;
         merge_req.limit = limit;
@@ -1061,6 +1061,17 @@ test "query parser records approximate source diagnostic for semantic exact sort
     try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.detail);
 }
 
+test "query parser rejects semantic cursor-only pagination as approximate source" {
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(std.testing.allocator, FakeSemanticResolver.iface(), "docs",
+        \\{"semantic_search":"alpha concept","indexes":["semantic_idx"],"search_after":["doc:a"],"limit":4}
+    ));
+    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("_id", diagnostic.field);
+    try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.reason);
+    try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.detail);
+}
+
 test "query parser rejects semantic score sort as approximate source" {
     const alloc = std.testing.allocator;
     db_mod.resetLastSortRejectionDiagnostic();
@@ -1421,6 +1432,17 @@ fn testSortedQueryHitAlloc(alloc: std.mem.Allocator, id: []const u8, rank: i64) 
     };
 }
 
+fn testIdSortedQueryHitAlloc(alloc: std.mem.Allocator, id: []const u8) !db_mod.types.SearchHit {
+    const sort_values = try alloc.alloc(std.json.Value, 1);
+    errdefer alloc.free(sort_values);
+    sort_values[0] = .{ .string = try alloc.dupe(u8, id) };
+    errdefer db_mod.types.deinitJsonValue(alloc, &sort_values[0]);
+    return .{
+        .id = try alloc.dupe(u8, id),
+        .sort_values = sort_values,
+    };
+}
+
 fn testScoreSortedQueryHitAlloc(alloc: std.mem.Allocator, id: []const u8, score: f32) !db_mod.types.SearchHit {
     const sort_values = try alloc.alloc(std.json.Value, 2);
     errdefer alloc.free(sort_values);
@@ -1551,6 +1573,48 @@ test "query merge applies distributed typed sort ordering and cursor paging" {
     try std.testing.expectEqual(@as(usize, 2), before_page.hits.len);
     try std.testing.expectEqualStrings("doc:c", before_page.hits[0].id);
     try std.testing.expectEqualStrings("doc:d", before_page.hits[1].id);
+}
+
+test "query merge applies default id cursor ordering without explicit order_by" {
+    const alloc = std.testing.allocator;
+
+    var left_hits = try alloc.alloc(db_mod.types.SearchHit, 2);
+    left_hits[0] = try testIdSortedQueryHitAlloc(alloc, "doc:a");
+    left_hits[1] = try testIdSortedQueryHitAlloc(alloc, "doc:c");
+    var right_hits = try alloc.alloc(db_mod.types.SearchHit, 2);
+    right_hits[0] = try testIdSortedQueryHitAlloc(alloc, "doc:b");
+    right_hits[1] = try testIdSortedQueryHitAlloc(alloc, "doc:d");
+
+    var left = db_mod.types.SearchResult{ .alloc = alloc, .hits = left_hits, .total_hits = 2 };
+    defer left.deinit();
+    var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 2 };
+    defer right.deinit();
+
+    const after_cursor = [_]std.json.Value{.{ .string = "doc:b" }};
+    var after_page = try mergeSearchResults(alloc, .{
+        .search_after = &after_cursor,
+        .limit = 2,
+        .profile = true,
+    }, &.{ left, right }, 0, 2);
+    defer after_page.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), after_page.hits.len);
+    try std.testing.expectEqualStrings("doc:c", after_page.hits[0].id);
+    try std.testing.expectEqualStrings("doc:d", after_page.hits[1].id);
+    const after_profile = after_page.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("distributed_k_way_merge", after_profile.plan);
+    try std.testing.expectEqualStrings("distributed_merge", after_profile.source);
+
+    const before_cursor = [_]std.json.Value{.{ .string = "doc:d" }};
+    var before_page = try mergeSearchResults(alloc, .{
+        .search_before = &before_cursor,
+        .limit = 2,
+    }, &.{ left, right }, 0, 2);
+    defer before_page.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), before_page.hits.len);
+    try std.testing.expectEqualStrings("doc:b", before_page.hits[0].id);
+    try std.testing.expectEqualStrings("doc:c", before_page.hits[1].id);
 }
 
 test "query merge sort profile does not inherit stale rejection diagnostic" {
