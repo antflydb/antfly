@@ -4061,6 +4061,17 @@ test "distributed merge cursor-only request uses implicit id order" {
     const right = types.SearchResult{ .alloc = alloc, .hits = &right_hits, .total_hits = 2 };
     const cursor = [_]std.json.Value{.{ .string = "doc:b" }};
 
+    const direct_shards = [_]DistributedSortedShard{
+        .{ .hits = &left_hits },
+        .{ .hits = &right_hits },
+    };
+    try validateDistributedSortedShards(alloc, .{
+        .search_after = &cursor,
+        .limit = 2,
+    }, .{
+        .kind = .distributed_k_way_merge,
+    }, &direct_shards);
+
     const hits = try mergeDistributedSortedSearchResultHitsWithRuntimeSchemaAlloc(alloc, .{
         .search_after = &cursor,
         .limit = 2,
@@ -4801,7 +4812,7 @@ fn validateDistributedSortedShards(
     plan: SortExecutionPlan,
     shards: []const DistributedSortedShard,
 ) !void {
-    const field_count = effectiveSortFieldCount(req.order_by);
+    const field_count = effectiveSortFieldCountForRequest(req);
     const field_classes = try alloc.alloc(?SortTupleScalarClass, field_count);
     defer alloc.free(field_classes);
     @memset(field_classes, null);
@@ -4875,7 +4886,7 @@ fn validateDistributedSortedHitTuple(
         return error.InvalidQueryRequest;
     }
     for (0..field_count) |i| {
-        const field = effectiveSortFieldAt(req.order_by, i);
+        const field = effectiveSortFieldAtForRequest(req, i);
         const sort_value = sortValueFromSortJson(plan, field, hit.sort_values[i]) catch |err| {
             if (err == error.InvalidQueryRequest) recordDistributedSortTupleRejection(field.field, "invalid_doc_value_type");
             return err;
@@ -11668,12 +11679,16 @@ fn planTextNativeSortFields(
     snapshot: *const index_mod.IndexSnapshot,
     runtime_schema: ?runtime_schema_mod.TableSchema,
 ) !SortExecutionPlan {
-    try validateSortPageOptions(req);
-    if (req.order_by.len == 0) return .{ .kind = .none };
-    const cursor = activeSortCursor(req);
-    try validateScoreSortHasScoreBearingTextSource(req);
-    if (!requestNeedsNativeSortValues(req)) return .{
-        .kind = if (requestHasScoreSort(req)) .score_top_k else .id_only,
+    var effective = try effectiveSortRequestAlloc(snapshot.alloc, req);
+    defer effective.deinit(snapshot.alloc);
+    const effective_req = effective.req;
+
+    try validateSortPageOptions(effective_req);
+    if (effective_req.order_by.len == 0) return .{ .kind = .none };
+    const cursor = activeSortCursor(effective_req);
+    try validateScoreSortHasScoreBearingTextSource(effective_req);
+    if (!requestNeedsNativeSortValues(effective_req)) return .{
+        .kind = if (requestHasScoreSort(effective_req)) .score_top_k else .id_only,
         .source = .candidate_collector,
         .cursor_support = .comparator,
     };
@@ -11685,7 +11700,7 @@ fn planTextNativeSortFields(
         );
         return error.UnsupportedExactSort;
     };
-    for (req.order_by, 0..) |field, i| {
+    for (effective_req.order_by, 0..) |field, i| {
         if (std.mem.eql(u8, field.field, "_id") or std.mem.eql(u8, field.field, "_score")) continue;
         const mapping = sortFieldMapping(schema, field.field) orelse {
             logNativeSortPlanRejection(
@@ -11737,7 +11752,7 @@ fn planTextNativeSortFields(
             }
         }
     }
-    const exact_index_sort_match = sortRequestMatchesIndexSort(req, schema);
+    const exact_index_sort_match = sortRequestMatchesIndexSort(effective_req, schema);
     const index_sort_coverage = try snapshotIndexSortCoverageStatusAlloc(snapshot.alloc, snapshot, schema, exact_index_sort_match);
     const sorted_segment_available = indexSortCoverageHasExecutor(index_sort_coverage);
     const sorted_segment_bounds_available = indexSortCoverageHasBounds(index_sort_coverage);
@@ -15341,6 +15356,24 @@ test "native text sort validation rejects fields without typed doc values" {
     }, snapshot, null);
     try std.testing.expectEqual(SortExecutionPlanKind.id_only, id_plan.kind);
     try std.testing.expect(!id_plan.require_native);
+
+    const id_cursor = [_]std.json.Value{.{ .string = "doc:a" }};
+    try validateTextNativeSortFields(.{
+        .search_after = &id_cursor,
+        .limit = 10,
+    }, snapshot, null);
+    const cursor_only_plan = try planTextNativeSortFields(.{
+        .search_after = &id_cursor,
+        .limit = 10,
+    }, snapshot, null);
+    try std.testing.expectEqual(SortExecutionPlanKind.id_only, cursor_only_plan.kind);
+    try std.testing.expect(!cursor_only_plan.require_native);
+
+    const bad_id_cursor = [_]std.json.Value{.{ .integer = 7 }};
+    try std.testing.expectError(error.InvalidQueryRequest, validateTextNativeSortFields(.{
+        .search_after = &bad_id_cursor,
+        .limit = 10,
+    }, snapshot, null));
 
     const score_order_by = [_]types.SortField{.{ .field = "_score", .desc = true }};
     try std.testing.expectError(error.UnsupportedQueryRequest, planTextNativeSortFields(.{
