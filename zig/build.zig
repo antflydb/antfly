@@ -159,6 +159,12 @@ fn dependOnAll(step: *std.Build.Step, dependencies: []const *std.Build.Step) voi
     }
 }
 
+fn addRuntimeTestFilters(run: *std.Build.Step.Run, filters: []const []const u8) void {
+    for (filters) |filter| {
+        run.addArgs(&.{ "--test-filter", filter });
+    }
+}
+
 fn addDelegatedPackageStep(
     b: *std.Build,
     package_step_prefix: []const u8,
@@ -2896,15 +2902,17 @@ pub fn build(b: *std.Build) void {
         "retrieval agent requires filter and aggregate tools for filtered aggregations",
         "retrieval agent ignores empty map-valued tool fields for policy and strategy",
     };
+    const lib_unit_filters = selectTestFilters(b, &lib_unit_default_filters);
     const lib_unit_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &lib_unit_default_filters),
+        .filters = lib_unit_filters,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
     });
     const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
+    addRuntimeTestFilters(run_lib_unit_tests, lib_unit_filters);
     for (root_test_skip_filters) |filter| {
         run_lib_unit_tests.addArgs(&.{ "--skip-test-filter", filter });
     }
@@ -3326,57 +3334,63 @@ pub fn build(b: *std.Build) void {
     const lib_db_enrichment_merge_cutover_reopen_step = b.step("lib-db-enrichment-merge-cutover-reopen-test", "Run root-module DB merge cutover reopen test");
     lib_db_enrichment_merge_cutover_reopen_step.dependOn(&run_lib_db_enrichment_merge_cutover_reopen_tests.step);
 
+    const lib_db_query_default_filters = [_][]const u8{
+        "storage.db.db.test.db full-text",
+        "storage.db.db.test.db dense ",
+        "storage.db.db.test.db sparse ",
+        "storage.db.db.test.db graph ",
+        "storage.db.db.test.db search ",
+        "storage.db.db.test.db document _edges",
+        "storage.db.db.test.db document _embeddings",
+        "sort execution plan dimension names are stable for profiles",
+        "sort cursor contract classifies arity separately from type",
+        "json sort values reject non-replayable numeric values at API boundaries",
+        "score sort source detection rejects non-scoring text queries",
+        "score sort source detection treats vector sources as score-bearing for public validation",
+        "score sort rejects hits without finite scores",
+        "match_all rejects score sort without score-bearing source",
+        "match_all candidate sort rejects direct score sort execution",
+        "distributed sorted hit merge uses typed sort tuple ordering and cursors",
+        "distributed merge rejects provably incomplete exact shard windows",
+        "distributed merge uses runtime schema for typed date cursors",
+        "vector score top k sort profile uses common sort vocabulary",
+        "native sort planner classifies mapping and cursor rejection reasons",
+        "text score query exposes score top k sort profile",
+        "native text sort planner requires live segment index sort coverage for sorted executor",
+        "native text sort planner ignores fully deleted legacy segments for index sort coverage",
+        "match_all sorted segment seek merges sorted segments and applies cursors",
+        "match_all sorted segment seek uses cursor seek within each segment",
+        "match_all sorted segment seek rejects cursor when segment bounds are unavailable",
+        "text field sort uses sorted segment membership path when index sort matches",
+        "native numeric sort rejects non-finite doc values",
+        "document mapper emits schema keyword typed doc values",
+        "document mapper omits multi-valued schema keyword typed doc values",
+        "document mapper omits multi-valued schema numeric typed doc values",
+        "document mapper preserves integer numeric doc values as i64",
+        "document mapper preserves unsigned numeric doc values beyond i64 as u64",
+        "document mapper omits mixed numeric typed doc value domains",
+        "document mapper omits non-finite numeric doc values",
+        "document mapper flushes schema index_sort segments in physical sort order",
+        "document mapper rejects mixed native value types for index_sort field",
+        "document mapper validates schema index_sort field capabilities",
+        "merge preserves common sorted segment index_sort metadata",
+        "sort planner rejects non-finite numeric index sort bounds",
+        "schema keyword doc values back native sort planner",
+        "schema link doc values back native sort planner",
+        "schema numeric u64 doc values back native sort planner without rounding",
+        "schema numeric i64 doc values back native sort planner",
+        "schema boolean doc values back native sort planner",
+    };
     const lib_db_query_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{
-            "storage.db.db.test.db full-text",
-            "storage.db.db.test.db dense ",
-            "storage.db.db.test.db sparse ",
-            "storage.db.db.test.db graph ",
-            "storage.db.db.test.db search ",
-            "storage.db.db.test.db document _edges",
-            "storage.db.db.test.db document _embeddings",
-            "sort execution plan dimension names are stable for profiles",
-            "sort cursor contract classifies arity separately from type",
-            "json sort values reject non-replayable numeric values at API boundaries",
-            "score sort source detection rejects non-scoring text queries",
-            "score sort source detection treats vector sources as score-bearing for public validation",
-            "score sort rejects hits without finite scores",
-            "match_all rejects score sort without score-bearing source",
-            "match_all candidate sort rejects direct score sort execution",
-            "distributed sorted hit merge uses typed sort tuple ordering and cursors",
-            "distributed merge rejects provably incomplete exact shard windows",
-            "distributed merge uses runtime schema for typed date cursors",
-            "vector score top k sort profile uses common sort vocabulary",
-            "native sort planner classifies mapping and cursor rejection reasons",
-            "text score query exposes score top k sort profile",
-            "native text sort planner requires live segment index sort coverage for sorted executor",
-            "native text sort planner ignores fully deleted legacy segments for index sort coverage",
-            "match_all sorted segment seek merges sorted segments and applies cursors",
-            "match_all sorted segment seek uses cursor seek within each segment",
-            "match_all sorted segment seek ignores unavailable segment bounds",
-            "text field sort uses sorted segment membership path when index sort matches",
-            "native numeric sort rejects non-finite doc values",
-            "document mapper emits schema keyword typed doc values",
-            "document mapper omits multi-valued schema keyword typed doc values",
-            "document mapper omits multi-valued schema numeric typed doc values",
-            "document mapper preserves integer numeric doc values as i64",
-            "document mapper preserves unsigned numeric doc values beyond i64 as u64",
-            "document mapper omits mixed numeric typed doc value domains",
-            "document mapper omits non-finite numeric doc values",
-            "document mapper flushes schema index_sort segments in physical sort order",
-            "document mapper rejects mixed native value types for index_sort field",
-            "document mapper validates schema index_sort field capabilities",
-            "merge preserves common sorted segment index_sort metadata",
-            "sort planner rejects non-finite numeric index sort bounds",
-            "schema keyword doc values back native sort planner",
-            "schema link doc values back native sort planner",
-            "schema numeric u64 doc values back native sort planner without rounding",
-            "schema numeric i64 doc values back native sort planner",
-            "schema boolean doc values back native sort planner",
+        .filters = &lib_db_query_default_filters,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
         },
     });
     const run_lib_db_query_tests = b.addRunArtifact(lib_db_query_tests);
+    addRuntimeTestFilters(run_lib_db_query_tests, &lib_db_query_default_filters);
     const lib_db_query_step = b.step("lib-db-query-test", "Run root-module DB query/indexing tests");
     lib_db_query_step.dependOn(&run_lib_db_query_tests.step);
 
@@ -3966,7 +3980,7 @@ pub fn build(b: *std.Build) void {
             "segment sorted merge rejects non-finite f64 index sort values",
             "match_all sorted segment seek merges sorted segments and applies cursors",
             "match_all sorted segment seek uses cursor seek within each segment",
-            "match_all sorted segment seek ignores unavailable segment bounds",
+            "match_all sorted segment seek rejects cursor when segment bounds are unavailable",
             "document mapper flushes schema index_sort segments in physical sort order",
             "document mapper validates schema index_sort field capabilities",
             "merge preserves common sorted segment index_sort metadata",
