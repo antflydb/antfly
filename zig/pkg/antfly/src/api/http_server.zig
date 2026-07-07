@@ -4911,10 +4911,8 @@ pub const ApiHttpServer = struct {
                 try appendQueryBuilderFieldCapability(self.alloc, &out, .{
                     .field = field,
                     .field_type = capability.field_type,
-                    .doc_values = capability.doc_values,
+                    .query_modes = queryBuilderQueryModesForFieldCapability(capability),
                     .sortable = capability.sortable,
-                    .doc_value_coverage = capability.doc_value_coverage,
-                    .queryability_state = capability.queryability_state,
                     .sort_lifecycle_state = capability.sort_lifecycle_state,
                     .provenance = capability.provenance,
                     .index_sort_position = if (capability.index_sort) |membership| membership.position else null,
@@ -4928,10 +4926,8 @@ pub const ApiHttpServer = struct {
                 try appendQueryBuilderFieldCapability(self.alloc, &out, .{
                     .field = field,
                     .field_type = capability.field_type,
-                    .doc_values = capability.doc_values,
+                    .query_modes = queryBuilderQueryModesForFieldCapability(capability),
                     .sortable = capability.sortable,
-                    .doc_value_coverage = capability.doc_value_coverage,
-                    .queryability_state = capability.queryability_state,
                     .sort_lifecycle_state = capability.sort_lifecycle_state,
                     .provenance = capability.provenance,
                     .index_sort_position = if (capability.index_sort) |membership| membership.position else null,
@@ -8543,11 +8539,37 @@ fn freeQueryBuilderFieldCapability(
     capability: query_builder_agent.QueryBuilderFieldCapability,
 ) void {
     alloc.free(@constCast(capability.field));
-    alloc.free(@constCast(capability.doc_value_coverage));
-    alloc.free(@constCast(capability.queryability_state));
+    freeOwnedStrings(alloc, capability.query_modes);
     alloc.free(@constCast(capability.sort_lifecycle_state));
     alloc.free(@constCast(capability.provenance));
     if (capability.index_sort_order) |value| alloc.free(@constCast(value));
+}
+
+fn queryBuilderQueryModesForFieldCapability(capability: storage_schema.FieldCapability) []const []const u8 {
+    return switch (capability.field_type) {
+        .text, .html => if (capability.searchable) &.{"full_text"} else &.{},
+        .search_as_you_type => if (capability.searchable) &.{ "full_text", "autocomplete" } else &.{"autocomplete"},
+        .keyword, .link => if (capability.filterable) &.{"exact"} else &.{},
+        .numeric, .datetime => if (capability.filterable) &.{ "exact", "range" } else &.{},
+        .boolean => if (capability.filterable) &.{"exact"} else &.{},
+        .geopoint, .geoshape => if (capability.filterable) &.{"geo"} else &.{},
+        .embedding, .blob => &.{},
+    };
+}
+
+fn dupeOwnedStringSlice(alloc: std.mem.Allocator, values: []const []const u8) ![]const []const u8 {
+    if (values.len == 0) return &.{};
+    const out = try alloc.alloc([]const u8, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |value| alloc.free(@constCast(value));
+        alloc.free(out);
+    }
+    for (values, 0..) |value, i| {
+        out[i] = try alloc.dupe(u8, value);
+        initialized += 1;
+    }
+    return out;
 }
 
 fn appendQueryBuilderFieldCapability(
@@ -8557,10 +8579,8 @@ fn appendQueryBuilderFieldCapability(
 ) !void {
     const owned_field = try alloc.dupe(u8, capability.field);
     errdefer alloc.free(owned_field);
-    const owned_coverage = try alloc.dupe(u8, capability.doc_value_coverage);
-    errdefer alloc.free(owned_coverage);
-    const owned_queryability = try alloc.dupe(u8, capability.queryability_state);
-    errdefer alloc.free(owned_queryability);
+    const owned_query_modes = try dupeOwnedStringSlice(alloc, capability.query_modes);
+    errdefer freeOwnedStrings(alloc, owned_query_modes);
     const owned_lifecycle = try alloc.dupe(u8, capability.sort_lifecycle_state);
     errdefer alloc.free(owned_lifecycle);
     const owned_provenance = try alloc.dupe(u8, capability.provenance);
@@ -8570,10 +8590,8 @@ fn appendQueryBuilderFieldCapability(
     const item = query_builder_agent.QueryBuilderFieldCapability{
         .field = owned_field,
         .field_type = capability.field_type,
-        .doc_values = capability.doc_values,
+        .query_modes = owned_query_modes,
         .sortable = capability.sortable,
-        .doc_value_coverage = owned_coverage,
-        .queryability_state = owned_queryability,
         .sort_lifecycle_state = owned_lifecycle,
         .provenance = owned_provenance,
         .index_sort_position = capability.index_sort_position,
