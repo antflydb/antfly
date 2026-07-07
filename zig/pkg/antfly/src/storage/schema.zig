@@ -529,6 +529,7 @@ pub const RelationalIndexGenerationRecord = struct {
     lag: u64 = 0,
     failure_reason: ?[]const u8 = null,
     ready_watermark: u64 = 0,
+    rebuild_cursor: ?[]const u8 = null,
 };
 
 pub const RelationalIndexPlannerCapabilities = struct {
@@ -957,7 +958,7 @@ pub const TableSchema = struct {
 
 const schema_key = "\x00\x00__metadata__:schema";
 const schema_version_prefix = "\x00\x00__metadata__:schema_v";
-const schema_format_version = 56;
+const schema_format_version = 57;
 
 // ============================================================================
 // Serialization
@@ -1799,7 +1800,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
             errdefer if (schema_fingerprint) |fingerprint| alloc.free(fingerprint);
             const owner_ranges = try readRelationalIndexOwnerRangeSliceAlloc(alloc, data, &pos);
             errdefer freeRelationalIndexOwnerRangeSlice(alloc, owner_ranges);
-            const generation_record = try readRelationalIndexGenerationRecordAlloc(alloc, data, &pos);
+            const generation_record = try readRelationalIndexGenerationRecordAlloc(alloc, data, &pos, fmt_version);
             errdefer if (generation_record) |record| freeRelationalIndexGenerationRecord(alloc, record);
             const planner_capabilities = readRelationalIndexPlannerCapabilities(data, &pos);
             const where = try readUniquePredicateSliceAlloc(alloc, data, &pos);
@@ -2134,6 +2135,7 @@ fn freeRelationalIndex(alloc: Allocator, index: RelationalIndex) void {
 pub fn freeRelationalIndexGenerationRecord(alloc: Allocator, record: RelationalIndexGenerationRecord) void {
     freeRelationalIndexOwnerRangeSlice(alloc, record.owner_ranges);
     if (record.failure_reason) |reason| alloc.free(reason);
+    if (record.rebuild_cursor) |cursor| alloc.free(cursor);
 }
 
 fn freeRelationalIndexOwnerRangeSlice(alloc: Allocator, ranges: []const RelationalIndexOwnerRange) void {
@@ -2365,6 +2367,36 @@ pub const SchemaMetadataPut = struct {
     value: []const u8,
 };
 
+pub const RelationalIndexGenerationProgress = struct {
+    lifecycle: RelationalIndexLifecycle,
+    lag: u64,
+    ready_watermark: u64,
+    rebuild_cursor: ?[]const u8 = null,
+    failure_reason: ?[]const u8 = null,
+};
+
+pub const RelationalIndexRangePromotion = struct {
+    access_method: RelationalIndexAccessMethod,
+    index_name: []const u8,
+    expected_generation: u64,
+    owner_ranges: []const RelationalIndexOwnerRange = &.{},
+    ready_watermark: u64,
+    expected_lifecycle: ?RelationalIndexLifecycle = null,
+};
+
+pub const RelationalIndexRangePromotionResult = enum {
+    promoted,
+    already_ready,
+    schema_missing,
+    non_relational_schema,
+    index_not_found,
+    wrong_access_method,
+    generation_mismatch,
+    malformed_record,
+    stale_record,
+    owner_ranges_mismatch,
+};
+
 /// Save a schema to DocStore.
 pub fn saveSchema(store: anytype, alloc: Allocator, schema: TableSchema) !void {
     try saveSchemaWithMetadata(store, alloc, schema, &.{});
@@ -2407,6 +2439,141 @@ pub fn saveSchemaWithMetadata(store: anytype, alloc: Allocator, schema: TableSch
         try txn.put(entry.key, entry.value);
     }
     try txn.commit();
+}
+
+pub fn updateRelationalIndexGenerationRecord(
+    store: anytype,
+    alloc: Allocator,
+    access_method: RelationalIndexAccessMethod,
+    index_name: []const u8,
+    progress: RelationalIndexGenerationProgress,
+) !bool {
+    const maybe_schema = try loadSchema(store, alloc);
+    const schema = maybe_schema orelse return false;
+    defer freeSchema(alloc, schema);
+    if (schema.storage_mode != .relational) return false;
+
+    const mutable_indexes = @constCast(schema.relational_indexes);
+    for (mutable_indexes) |*index| {
+        if (index.access_method != access_method) continue;
+        if (!std.mem.eql(u8, index.name, index_name)) continue;
+        if (index.generation == 0) return false;
+
+        const record = try relationalIndexGenerationRecordFromProgressAlloc(alloc, index.*, progress);
+        errdefer freeRelationalIndexGenerationRecord(alloc, record);
+        if (index.generation_record) |old_record| freeRelationalIndexGenerationRecord(alloc, old_record);
+        index.generation_record = record;
+        index.lifecycle = progress.lifecycle;
+        try saveSchema(store, alloc, schema);
+        return true;
+    }
+    return false;
+}
+
+pub fn promoteRelationalIndexRangesReady(
+    store: anytype,
+    alloc: Allocator,
+    promotion: RelationalIndexRangePromotion,
+) !RelationalIndexRangePromotionResult {
+    const maybe_schema = try loadSchema(store, alloc);
+    const schema = maybe_schema orelse return .schema_missing;
+    defer freeSchema(alloc, schema);
+    if (schema.storage_mode != .relational) return .non_relational_schema;
+
+    var saw_name = false;
+    const mutable_indexes = @constCast(schema.relational_indexes);
+    for (mutable_indexes) |*index| {
+        if (!std.mem.eql(u8, index.name, promotion.index_name)) continue;
+        saw_name = true;
+        if (index.access_method != promotion.access_method) continue;
+        if (index.generation != promotion.expected_generation) return .generation_mismatch;
+
+        const record = index.generation_record orelse return .malformed_record;
+        if (record.generation != promotion.expected_generation) return .generation_mismatch;
+        if (record.lifecycle != index.lifecycle) return .malformed_record;
+        if (index.owner_ranges.len != 0 and !relationalIndexOwnerRangeSlicesEqual(index.owner_ranges, record.owner_ranges)) return .malformed_record;
+
+        const target_ranges = promotion.owner_ranges;
+        if (record.lifecycle == .ready and record.lag == 0) {
+            if (relationalIndexOwnerRangeSlicesEqual(record.owner_ranges, target_ranges)) return .already_ready;
+            return .owner_ranges_mismatch;
+        }
+        if (promotion.expected_lifecycle) |expected| {
+            if (record.lifecycle != expected) return .stale_record;
+        }
+        switch (record.lifecycle) {
+            .building, .catching_up => {},
+            .ready => return .stale_record,
+            .invalid, .dropping, .stale, .rebuild_required, .failed => return .stale_record,
+        }
+
+        const index_ranges = try cloneRelationalIndexOwnerRangeSlice(alloc, target_ranges);
+        var index_ranges_owned_by_schema = false;
+        errdefer if (!index_ranges_owned_by_schema) freeRelationalIndexOwnerRangeSlice(alloc, index_ranges);
+        const record_ranges = try cloneRelationalIndexOwnerRangeSlice(alloc, target_ranges);
+        var record_ranges_owned_by_schema = false;
+        errdefer if (!record_ranges_owned_by_schema) freeRelationalIndexOwnerRangeSlice(alloc, record_ranges);
+        const new_record = RelationalIndexGenerationRecord{
+            .generation = index.generation,
+            .owner_ranges = record_ranges,
+            .lifecycle = .ready,
+            .lag = 0,
+            .ready_watermark = promotion.ready_watermark,
+            .rebuild_cursor = null,
+        };
+        if (index.generation_record) |old_record| freeRelationalIndexGenerationRecord(alloc, old_record);
+        freeRelationalIndexOwnerRangeSlice(alloc, index.owner_ranges);
+        index.owner_ranges = index_ranges;
+        index_ranges_owned_by_schema = true;
+        index.generation_record = new_record;
+        record_ranges_owned_by_schema = true;
+        index.lifecycle = .ready;
+        try saveSchema(store, alloc, schema);
+        return .promoted;
+    }
+    return if (saw_name) .wrong_access_method else .index_not_found;
+}
+
+fn relationalIndexGenerationRecordFromProgressAlloc(
+    alloc: Allocator,
+    index: RelationalIndex,
+    progress: RelationalIndexGenerationProgress,
+) !RelationalIndexGenerationRecord {
+    const owner_ranges = try cloneRelationalIndexOwnerRangeSlice(alloc, index.owner_ranges);
+    errdefer freeRelationalIndexOwnerRangeSlice(alloc, owner_ranges);
+    const failure_reason = if (progress.failure_reason) |reason| try alloc.dupe(u8, reason) else null;
+    errdefer if (failure_reason) |reason| alloc.free(reason);
+    const rebuild_cursor = if (progress.rebuild_cursor) |cursor| try alloc.dupe(u8, cursor) else null;
+    errdefer if (rebuild_cursor) |cursor| alloc.free(cursor);
+    return .{
+        .generation = index.generation,
+        .owner_ranges = owner_ranges,
+        .lifecycle = progress.lifecycle,
+        .lag = progress.lag,
+        .failure_reason = failure_reason,
+        .ready_watermark = progress.ready_watermark,
+        .rebuild_cursor = rebuild_cursor,
+    };
+}
+
+fn cloneRelationalIndexOwnerRangeSlice(alloc: Allocator, ranges: []const RelationalIndexOwnerRange) ![]const RelationalIndexOwnerRange {
+    if (ranges.len == 0) return &.{};
+    const out = try alloc.alloc(RelationalIndexOwnerRange, ranges.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |range| freeRelationalIndexOwnerRange(alloc, range);
+        alloc.free(out);
+    }
+    for (ranges) |range| {
+        out[initialized] = .{
+            .start = try alloc.dupe(u8, range.start),
+            .end = try alloc.dupe(u8, range.end),
+            .range_id = if (range.range_id) |range_id| try alloc.dupe(u8, range_id) else null,
+            .placement_generation = range.placement_generation,
+        };
+        initialized += 1;
+    }
+    return out;
 }
 
 /// Load a schema from DocStore. Returns null if no schema exists.
@@ -2740,6 +2907,7 @@ fn appendRelationalIndexGenerationRecord(
         try appendU64(buf, alloc, value.lag);
         try appendOptStr(buf, alloc, value.failure_reason);
         try appendU64(buf, alloc, value.ready_watermark);
+        try appendOptStr(buf, alloc, value.rebuild_cursor);
     } else {
         try buf.append(alloc, 0);
     }
@@ -3047,6 +3215,7 @@ fn readRelationalIndexGenerationRecordAlloc(
     alloc: Allocator,
     data: []const u8,
     pos: *usize,
+    fmt_version: u32,
 ) !?RelationalIndexGenerationRecord {
     if (data[pos.*] == 0) {
         pos.* += 1;
@@ -3062,6 +3231,8 @@ fn readRelationalIndexGenerationRecordAlloc(
     const failure_reason = try readOptStrAlloc(alloc, data, pos);
     errdefer if (failure_reason) |reason| alloc.free(reason);
     const ready_watermark = readU64(data, pos);
+    const rebuild_cursor = if (fmt_version >= 57) try readOptStrAlloc(alloc, data, pos) else null;
+    errdefer if (rebuild_cursor) |cursor| alloc.free(cursor);
     return .{
         .generation = generation,
         .owner_ranges = owner_ranges,
@@ -3069,6 +3240,7 @@ fn readRelationalIndexGenerationRecordAlloc(
         .lag = lag,
         .failure_reason = failure_reason,
         .ready_watermark = ready_watermark,
+        .rebuild_cursor = rebuild_cursor,
     };
 }
 
@@ -3486,6 +3658,7 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
                     .lag = 12,
                     .failure_reason = "catch-up lag",
                     .ready_watermark = 9876,
+                    .rebuild_cursor = "row:k",
                 },
                 .planner_capabilities = .{
                     .equality = true,
@@ -3565,7 +3738,7 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
 
     const data = try serializeSchema(alloc, schema);
     defer alloc.free(data);
-    try std.testing.expectEqual(@as(u32, 56), std.mem.readInt(u32, data[4..8], .little));
+    try std.testing.expectEqual(@as(u32, 57), std.mem.readInt(u32, data[4..8], .little));
 
     var downgraded = try alloc.dupe(u8, data);
     defer alloc.free(downgraded);
@@ -3711,6 +3884,7 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
     try std.testing.expectEqual(@as(u64, 12), generation_record.lag);
     try std.testing.expectEqualStrings("catch-up lag", generation_record.failure_reason.?);
     try std.testing.expectEqual(@as(u64, 9876), generation_record.ready_watermark);
+    try std.testing.expectEqualStrings("row:k", generation_record.rebuild_cursor.?);
     try std.testing.expectEqual(@as(usize, 2), generation_record.owner_ranges.len);
     try std.testing.expectEqualStrings("row:a", generation_record.owner_ranges[0].start);
     try std.testing.expectEqualStrings("row:m", generation_record.owner_ranges[0].end);
@@ -3823,6 +3997,220 @@ test "schema save/load via DocStore" {
     const loaded_v7 = (try loadSchemaVersion(&store, alloc, 7)).?;
     defer freeSchema(alloc, loaded_v7);
     try std.testing.expectEqual(@as(u32, 7), loaded_v7.version);
+}
+
+test "schema updates relational text-search generation records by case" {
+    const alloc = std.testing.allocator;
+    const Case = struct {
+        name: []const u8,
+        access_method: RelationalIndexAccessMethod = .text_search,
+        generation: u64 = 7,
+        existing_record: ?RelationalIndexGenerationRecord = null,
+        expected_updated: bool = true,
+    };
+    const ranges = [_]RelationalIndexOwnerRange{.{
+        .start = "row:a",
+        .end = "row:z",
+        .range_id = "range-a",
+        .placement_generation = 3,
+    }};
+    const cases = [_]Case{
+        .{ .name = "missing record" },
+        .{ .name = "current ready record", .existing_record = .{ .generation = 7, .owner_ranges = &ranges, .lifecycle = .ready, .lag = 0, .ready_watermark = 4 } },
+        .{ .name = "stale record", .existing_record = .{ .generation = 7, .owner_ranges = &ranges, .lifecycle = .stale, .lag = 5, .ready_watermark = 3, .rebuild_cursor = "row:m" } },
+        .{ .name = "mismatched generation record", .existing_record = .{ .generation = 6, .owner_ranges = &ranges, .lifecycle = .ready, .lag = 0, .ready_watermark = 2 } },
+        .{ .name = "malformed missing generation", .generation = 0, .expected_updated = false },
+        .{ .name = "wrong access method", .access_method = .ordered_tuple, .expected_updated = false },
+    };
+
+    for (cases, 0..) |case, i| {
+        const path_name = try std.fmt.allocPrint(alloc, "schema-generation-record-{d}", .{i});
+        defer alloc.free(path_name);
+        const path = try tempTestPath(alloc, path_name);
+        defer alloc.free(path);
+        cleanupTestDir(path);
+        var store = try DocStore.open(alloc, path, .{});
+        defer store.close();
+        defer cleanupTestDir(path);
+
+        const index = RelationalIndex{
+            .name = "body_text_idx",
+            .owner_kind = .relational_column,
+            .owner_name = "body",
+            .access_method = case.access_method,
+            .columns = &.{"body"},
+            .lifecycle = .ready,
+            .generation = case.generation,
+            .schema_fingerprint = "secondary-index-v1:body",
+            .owner_ranges = &ranges,
+            .generation_record = case.existing_record,
+        };
+        try saveSchema(&store, alloc, .{
+            .version = 1,
+            .storage_mode = .relational,
+            .relational_indexes = &[_]RelationalIndex{index},
+        });
+
+        const updated = try updateRelationalIndexGenerationRecord(&store, alloc, .text_search, "body_text_idx", .{
+            .lifecycle = .building,
+            .lag = 9,
+            .ready_watermark = 11,
+            .rebuild_cursor = "row:k",
+            .failure_reason = "catching up",
+        });
+        try std.testing.expectEqual(case.expected_updated, updated);
+
+        const loaded = (try loadSchema(&store, alloc)).?;
+        defer freeSchema(alloc, loaded);
+        const loaded_index = loaded.relational_indexes[0];
+        if (!case.expected_updated) {
+            try std.testing.expectEqual(case.access_method, loaded_index.access_method);
+            if (case.existing_record) |record| {
+                try std.testing.expectEqual(record.generation, loaded_index.generation_record.?.generation);
+            } else {
+                try std.testing.expect(loaded_index.generation_record == null);
+            }
+            continue;
+        }
+
+        try std.testing.expectEqual(RelationalIndexLifecycle.building, loaded_index.lifecycle);
+        const record = loaded_index.generation_record orelse return error.TestExpectedEqual;
+        try std.testing.expectEqual(@as(u64, 7), record.generation);
+        try std.testing.expectEqual(RelationalIndexLifecycle.building, record.lifecycle);
+        try std.testing.expectEqual(@as(u64, 9), record.lag);
+        try std.testing.expectEqual(@as(u64, 11), record.ready_watermark);
+        try std.testing.expectEqualStrings("row:k", record.rebuild_cursor.?);
+        try std.testing.expectEqualStrings("catching up", record.failure_reason.?);
+        try std.testing.expectEqual(@as(usize, 1), record.owner_ranges.len);
+        try std.testing.expectEqualStrings("row:a", record.owner_ranges[0].start);
+        try std.testing.expectEqualStrings("row:z", record.owner_ranges[0].end);
+        try std.testing.expectEqualStrings("range-a", record.owner_ranges[0].range_id.?);
+    }
+}
+
+test "schema promotes relational text-search ranges ready by generation case" {
+    const alloc = std.testing.allocator;
+    const Case = struct {
+        name: []const u8,
+        access_method: RelationalIndexAccessMethod = .text_search,
+        index_generation: u64 = 7,
+        expected_generation: u64 = 7,
+        lifecycle: RelationalIndexLifecycle = .catching_up,
+        existing_record: ?RelationalIndexGenerationRecord = null,
+        expected_result: RelationalIndexRangePromotionResult,
+    };
+    const ranges = [_]RelationalIndexOwnerRange{.{
+        .start = "row:a",
+        .end = "row:z",
+        .range_id = "range-a",
+        .placement_generation = 3,
+    }};
+    const cases = [_]Case{
+        .{
+            .name = "current record",
+            .existing_record = .{ .generation = 7, .owner_ranges = &ranges, .lifecycle = .catching_up, .lag = 5, .ready_watermark = 2, .rebuild_cursor = "row:m" },
+            .expected_result = .promoted,
+        },
+        .{
+            .name = "stale record",
+            .lifecycle = .stale,
+            .existing_record = .{ .generation = 7, .owner_ranges = &ranges, .lifecycle = .stale, .lag = 5, .ready_watermark = 2, .rebuild_cursor = "row:m" },
+            .expected_result = .stale_record,
+        },
+        .{
+            .name = "wrong generation",
+            .index_generation = 8,
+            .existing_record = .{ .generation = 8, .owner_ranges = &ranges, .lifecycle = .catching_up, .lag = 5, .ready_watermark = 2, .rebuild_cursor = "row:m" },
+            .expected_result = .generation_mismatch,
+        },
+        .{
+            .name = "concurrently promoted",
+            .lifecycle = .ready,
+            .existing_record = .{ .generation = 7, .owner_ranges = &ranges, .lifecycle = .ready, .lag = 0, .ready_watermark = 11 },
+            .expected_result = .already_ready,
+        },
+        .{
+            .name = "malformed missing record",
+            .expected_result = .malformed_record,
+        },
+        .{
+            .name = "wrong access method",
+            .access_method = .ordered_tuple,
+            .existing_record = .{ .generation = 7, .owner_ranges = &ranges, .lifecycle = .catching_up, .lag = 5, .ready_watermark = 2, .rebuild_cursor = "row:m" },
+            .expected_result = .wrong_access_method,
+        },
+    };
+
+    for (cases, 0..) |case, i| {
+        const path_name = try std.fmt.allocPrint(alloc, "schema-promote-text-range-{d}", .{i});
+        defer alloc.free(path_name);
+        const path = try tempTestPath(alloc, path_name);
+        defer alloc.free(path);
+        cleanupTestDir(path);
+        var store = try DocStore.open(alloc, path, .{});
+        defer store.close();
+        defer cleanupTestDir(path);
+
+        const index = RelationalIndex{
+            .name = "body_text_idx",
+            .owner_kind = .relational_column,
+            .owner_name = "body",
+            .access_method = case.access_method,
+            .columns = &.{"body"},
+            .lifecycle = case.lifecycle,
+            .generation = case.index_generation,
+            .schema_fingerprint = "secondary-index-v1:body",
+            .owner_ranges = &ranges,
+            .generation_record = case.existing_record,
+        };
+        try saveSchema(&store, alloc, .{
+            .version = 1,
+            .storage_mode = .relational,
+            .relational_indexes = &[_]RelationalIndex{index},
+        });
+
+        const result = try promoteRelationalIndexRangesReady(&store, alloc, .{
+            .access_method = .text_search,
+            .index_name = "body_text_idx",
+            .expected_generation = case.expected_generation,
+            .owner_ranges = &ranges,
+            .ready_watermark = 13,
+            .expected_lifecycle = .catching_up,
+        });
+        try std.testing.expectEqual(case.expected_result, result);
+
+        const loaded = (try loadSchema(&store, alloc)).?;
+        defer freeSchema(alloc, loaded);
+        const loaded_index = loaded.relational_indexes[0];
+        if (case.expected_result != .promoted) {
+            try std.testing.expectEqual(case.lifecycle, loaded_index.lifecycle);
+            if (case.existing_record) |record| {
+                const loaded_record = loaded_index.generation_record orelse return error.TestExpectedEqual;
+                try std.testing.expectEqual(record.generation, loaded_record.generation);
+                try std.testing.expectEqual(record.lifecycle, loaded_record.lifecycle);
+                try std.testing.expectEqual(record.lag, loaded_record.lag);
+            } else {
+                try std.testing.expect(loaded_index.generation_record == null);
+            }
+            continue;
+        }
+
+        try std.testing.expectEqual(RelationalIndexLifecycle.ready, loaded_index.lifecycle);
+        try std.testing.expectEqual(@as(usize, 1), loaded_index.owner_ranges.len);
+        try std.testing.expectEqualStrings("row:a", loaded_index.owner_ranges[0].start);
+        try std.testing.expectEqualStrings("row:z", loaded_index.owner_ranges[0].end);
+        const record = loaded_index.generation_record orelse return error.TestExpectedEqual;
+        try std.testing.expectEqual(@as(u64, 7), record.generation);
+        try std.testing.expectEqual(RelationalIndexLifecycle.ready, record.lifecycle);
+        try std.testing.expectEqual(@as(u64, 0), record.lag);
+        try std.testing.expectEqual(@as(u64, 13), record.ready_watermark);
+        try std.testing.expect(record.rebuild_cursor == null);
+        try std.testing.expect(record.failure_reason == null);
+        try std.testing.expectEqual(@as(usize, 1), record.owner_ranges.len);
+        try std.testing.expectEqualStrings("row:a", record.owner_ranges[0].start);
+        try std.testing.expectEqualStrings("row:z", record.owner_ranges[0].end);
+        try std.testing.expectEqualStrings("range-a", record.owner_ranges[0].range_id.?);
+    }
 }
 
 test "schema preserves versioned history in DocStore" {

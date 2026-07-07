@@ -128,6 +128,7 @@ fn buildTextSegmentIntoSink(ctx_any: *anyopaque, sink: *segment_mod.SegmentSink)
 const text_backfill_batch_size: usize = 1024;
 const text_merge_scheduler_default_steps: usize = 1;
 const text_merge_quarantine_backoff_ns: u64 = 30 * std.time.ns_per_s;
+pub var test_text_backfill_batch_size: ?usize = null;
 pub var test_abort_text_backfill_after_batches: ?usize = null;
 pub var test_inject_index_open_error: ?anyerror = null;
 const sparse_backfill_batch_size: usize = 1024;
@@ -6796,6 +6797,26 @@ pub const IndexManager = struct {
         var identity_txn = try runtime_store.store.beginProbe();
         defer identity_txn.abort();
 
+        const ready_watermark = try self.backfilledAppliedSequenceForConfig(store, entry.config);
+        const total_visible_docs = try self.countTextBackfillVisibleDocs(entry, docs, resume_from);
+        try self.updateTextSearchGenerationRecord(store, entry, .{
+            .lifecycle = .building,
+            .lag = total_visible_docs,
+            .ready_watermark = ready_watermark,
+            .rebuild_cursor = resume_from,
+        });
+        var last_progress_cursor: ?[]const u8 = resume_from;
+        var last_progress_lag = total_visible_docs;
+        errdefer |err| {
+            self.updateTextSearchGenerationRecord(store, entry, .{
+                .lifecycle = .failed,
+                .lag = last_progress_lag,
+                .ready_watermark = ready_watermark,
+                .rebuild_cursor = last_progress_cursor,
+                .failure_reason = @errorName(err),
+            }) catch {};
+        }
+
         var mapped_docs = std.ArrayListUnmanaged(mapper.MapperDoc).empty;
         defer mapped_docs.deinit(self.alloc);
         var owned_doc_ids = std.ArrayListUnmanaged([]u8).empty;
@@ -6807,6 +6828,7 @@ pub const IndexManager = struct {
         var flushed_batches: usize = 0;
         var saw_visible_doc = false;
         var max_flushed_key: ?[]const u8 = null;
+        const backfill_batch_size = if (builtin.is_test) test_text_backfill_batch_size orelse text_backfill_batch_size else text_backfill_batch_size;
 
         const flush_batch = struct {
             fn run(
@@ -6816,6 +6838,10 @@ pub const IndexManager = struct {
                 rebuild: backfill_state_mod.RebuildState,
                 docs_buf: *std.ArrayListUnmanaged(mapper.MapperDoc),
                 last_doc_key: []const u8,
+                processed_visible_docs: u64,
+                visible_doc_total: u64,
+                target_ready_watermark: u64,
+                progress_lag: *u64,
                 flush_count: *usize,
             ) !void {
                 var built = try mapper.buildTextSegmentsFromDocumentsWithMetadata(manager.alloc, docs_buf.items, text_entry.text_analysis, text_entry.runtime_schema, .{
@@ -6831,6 +6857,13 @@ pub const IndexManager = struct {
                     try text_entry.persistent.indexSegmentOwned(owned);
                 }
                 try rebuild.update(last_doc_key);
+                try manager.updateTextSearchGenerationRecord(doc_store, text_entry, .{
+                    .lifecycle = .building,
+                    .lag = visible_doc_total -| processed_visible_docs,
+                    .ready_watermark = target_ready_watermark,
+                    .rebuild_cursor = last_doc_key,
+                });
+                progress_lag.* = visible_doc_total -| processed_visible_docs;
                 docs_buf.clearRetainingCapacity();
                 flush_count.* += 1;
                 if (@import("builtin").is_test) {
@@ -6845,24 +6878,29 @@ pub const IndexManager = struct {
             if (isMetadataKey(doc.key)) continue;
             if (!self.visibleBaseDocumentRowKey(doc.key)) continue;
             const doc_id = (try internal_keys.decodeStoredDocumentRowKeyAlloc(self.alloc, doc.key)) orelse continue;
-            errdefer self.alloc.free(doc_id);
+            var doc_id_retained = false;
+            errdefer if (!doc_id_retained) self.alloc.free(doc_id);
             if (!self.keyInRange(doc_id)) {
                 self.alloc.free(doc_id);
+                doc_id_retained = true;
                 continue;
             }
             if (!try textIndexShouldConsumeDoc(self, entry, doc.key)) {
                 self.alloc.free(doc_id);
+                doc_id_retained = true;
                 continue;
             }
             if (resume_from) |resume_key| {
                 if (resume_key.len > 0 and std.mem.order(u8, doc.key, resume_key) != .gt) {
                     self.alloc.free(doc_id);
+                    doc_id_retained = true;
                     continue;
                 }
             }
 
             saw_visible_doc = true;
             try owned_doc_ids.append(self.alloc, doc_id);
+            doc_id_retained = true;
             try mapped_docs.append(self.alloc, .{
                 .key = doc_id,
                 .value = doc.value,
@@ -6872,17 +6910,62 @@ pub const IndexManager = struct {
                 max_flushed_key = doc.key;
             }
 
-            if (mapped_docs.items.len >= text_backfill_batch_size) {
-                try flush_batch(self, store, entry, rebuild_state, &mapped_docs, max_flushed_key.?, &flushed_batches);
+            if (mapped_docs.items.len >= backfill_batch_size) {
+                last_progress_cursor = max_flushed_key;
+                try flush_batch(self, store, entry, rebuild_state, &mapped_docs, max_flushed_key.?, @intCast(owned_doc_ids.items.len), total_visible_docs, ready_watermark, &last_progress_lag, &flushed_batches);
             }
         }
 
         if (mapped_docs.items.len > 0) {
-            try flush_batch(self, store, entry, rebuild_state, &mapped_docs, max_flushed_key.?, &flushed_batches);
+            last_progress_cursor = max_flushed_key;
+            try flush_batch(self, store, entry, rebuild_state, &mapped_docs, max_flushed_key.?, @intCast(owned_doc_ids.items.len), total_visible_docs, ready_watermark, &last_progress_lag, &flushed_batches);
         }
 
         if (!saw_visible_doc or flushed_batches > 0) try rebuild_state.clear();
+        try self.updateTextSearchGenerationRecord(store, entry, .{
+            .lifecycle = .ready,
+            .lag = 0,
+            .ready_watermark = ready_watermark,
+            .rebuild_cursor = null,
+        });
         if (flushed_batches > 0) try entry.persistent.checkpointLsmWalAfterDurableBoundary();
+    }
+
+    fn countTextBackfillVisibleDocs(
+        self: *const IndexManager,
+        entry: *const TextIndex,
+        docs: []const backend_scan.OwnedKVPair,
+        resume_from: ?[]const u8,
+    ) !u64 {
+        var visible_count: u64 = 0;
+        for (docs) |doc| {
+            if (isMetadataKey(doc.key)) continue;
+            if (!self.visibleBaseDocumentRowKey(doc.key)) continue;
+            const doc_id = (try internal_keys.decodeStoredDocumentRowKeyAlloc(self.alloc, doc.key)) orelse continue;
+            defer self.alloc.free(doc_id);
+            if (!self.keyInRange(doc_id)) continue;
+            if (!try textIndexShouldConsumeDoc(self, entry, doc.key)) continue;
+            if (resume_from) |resume_key| {
+                if (resume_key.len > 0 and std.mem.order(u8, doc.key, resume_key) != .gt) continue;
+            }
+            visible_count += 1;
+        }
+        return visible_count;
+    }
+
+    fn updateTextSearchGenerationRecord(
+        self: *IndexManager,
+        store: *docstore_mod.DocStore,
+        entry: *const TextIndex,
+        progress: schema_mod.RelationalIndexGenerationProgress,
+    ) !void {
+        _ = try schema_mod.updateRelationalIndexGenerationRecord(
+            store,
+            self.alloc,
+            .text_search,
+            entry.config.name,
+            progress,
+        );
     }
 
     fn indexPath(self: *const IndexManager, name: []const u8) ![]u8 {
@@ -6921,10 +7004,7 @@ pub const IndexManager = struct {
         // saving that alone regresses the checkpoint below the marker and
         // traps startup catch-up in a permanent-debt loop that re-backfills
         // and re-regresses forever.
-        var backfilled_sequence = store.lastReplaySequence(0);
-        if (comptime storeSupportsLatestReplaySequenceForHint(@TypeOf(store))) {
-            backfilled_sequence = try store.latestReplaySequenceForHint(replayHintForIndexKind(cfg.kind), backfilled_sequence);
-        }
+        const backfilled_sequence = try self.backfilledAppliedSequenceForConfig(store, cfg);
         try apply_state.saveAppliedSequenceWithCheckpoint(
             self.alloc,
             store,
@@ -6932,6 +7012,15 @@ pub const IndexManager = struct {
             cfg.name,
             backfilled_sequence,
         );
+    }
+
+    fn backfilledAppliedSequenceForConfig(self: *IndexManager, store: anytype, cfg: types.IndexConfig) !u64 {
+        _ = self;
+        var backfilled_sequence = store.lastReplaySequence(0);
+        if (comptime storeSupportsLatestReplaySequenceForHint(@TypeOf(store))) {
+            backfilled_sequence = try store.latestReplaySequenceForHint(replayHintForIndexKind(cfg.kind), backfilled_sequence);
+        }
+        return backfilled_sequence;
     }
 
     fn storeSupportsLatestReplaySequenceForHint(comptime T: type) bool {

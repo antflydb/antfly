@@ -1570,7 +1570,8 @@ fn validateRelationalIndexGenerationRecord(value: std.json.Value) !void {
             !std.mem.eql(u8, entry.key_ptr.*, "lifecycle") and
             !std.mem.eql(u8, entry.key_ptr.*, "lag") and
             !std.mem.eql(u8, entry.key_ptr.*, "failure_reason") and
-            !std.mem.eql(u8, entry.key_ptr.*, "ready_watermark"))
+            !std.mem.eql(u8, entry.key_ptr.*, "ready_watermark") and
+            !std.mem.eql(u8, entry.key_ptr.*, "rebuild_cursor"))
         {
             return error.InvalidSchemaUpdateRequest;
         }
@@ -1588,6 +1589,9 @@ fn validateRelationalIndexGenerationRecord(value: std.json.Value) !void {
     }
     const ready_watermark = object.get("ready_watermark") orelse return error.InvalidSchemaUpdateRequest;
     if (ready_watermark != .integer or ready_watermark.integer < 0) return error.InvalidSchemaUpdateRequest;
+    if (object.get("rebuild_cursor")) |cursor| {
+        if (cursor != .string) return error.InvalidSchemaUpdateRequest;
+    }
 }
 
 fn validateRelationalIndexOwnerRanges(value: std.json.Value) !void {
@@ -6027,6 +6031,7 @@ fn parseRelationalIndexGenerationRecordAlloc(
         .lag = @intCast(object.get("lag").?.integer),
         .failure_reason = if (object.get("failure_reason")) |reason| try alloc.dupe(u8, reason.string) else null,
         .ready_watermark = @intCast(object.get("ready_watermark").?.integer),
+        .rebuild_cursor = if (object.get("rebuild_cursor")) |cursor| try alloc.dupe(u8, cursor.string) else null,
     };
 }
 

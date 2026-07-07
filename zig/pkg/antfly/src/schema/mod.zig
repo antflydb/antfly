@@ -427,6 +427,7 @@ fn cloneRelationalIndexGenerationRecord(
         .lag = record.lag,
         .failure_reason = if (record.failure_reason) |reason| try alloc.dupe(u8, reason) else null,
         .ready_watermark = record.ready_watermark,
+        .rebuild_cursor = if (record.rebuild_cursor) |cursor| try alloc.dupe(u8, cursor) else null,
     };
 }
 
@@ -436,6 +437,7 @@ fn freeRelationalIndexGenerationRecord(
 ) void {
     freeRelationalIndexOwnerRanges(alloc, record.owner_ranges);
     if (record.failure_reason) |reason| alloc.free(reason);
+    if (record.rebuild_cursor) |cursor| alloc.free(cursor);
 }
 
 fn cloneRelationalIndexOwnerRanges(

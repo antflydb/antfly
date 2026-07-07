@@ -17,10 +17,6 @@ Keep this ordered by largest runtime/product gaps first.
 
 ## Shared Lifecycle Model
 
-- [ ] Persist text-search rebuild progress in the shared generation record:
-  cursor, lag, ready watermark, and lifecycle for create and rebuild jobs. Cover
-  fresh, stale, missing, malformed, and generation-mismatch records with a
-  data-driven fixture.
 - [ ] Promote text-search ranges to ready with compare-and-swap generation
   checks. Cover current, stale, wrong-generation, and concurrently-promoted
   records with deterministic diagnostics.

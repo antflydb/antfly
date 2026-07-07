@@ -511,7 +511,7 @@ test "relational table full-text backfill indexes committed base rows" {
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["title"],"additionalProperties":false}}}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["title"],"additionalProperties":false}}},"relational_indexes":[{"name":"ft_backfill","owner_kind":"relational_column","owner_name":"title","access_method":"text_search","method_config":{"type":"full_text","field":"title"},"columns":["title"],"lifecycle":"building","generation":3,"schema_fingerprint":"secondary-index-v1:title","generation_record":{"generation":3,"owner_ranges":[],"lifecycle":"building","lag":1,"ready_watermark":0,"rebuild_cursor":""}}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -537,6 +537,15 @@ test "relational table full-text backfill indexes committed base rows" {
         .config_json = "{}",
     });
 
+    const durable_schema = (try schema_mod.loadSchema(db.core.store, alloc)) orelse return error.TestUnexpectedResult;
+    defer schema_mod.freeSchema(alloc, durable_schema);
+    const text_generation_record = durable_schema.relational_indexes[0].generation_record orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(schema_mod.RelationalIndexLifecycle.ready, text_generation_record.lifecycle);
+    try std.testing.expectEqual(@as(u64, 3), text_generation_record.generation);
+    try std.testing.expectEqual(@as(u64, 0), text_generation_record.lag);
+    try std.testing.expect(text_generation_record.ready_watermark > 0);
+    try std.testing.expect(text_generation_record.rebuild_cursor == null);
+
     var result = try db.search(alloc, .{
         .index_name = "ft_backfill",
         .query = .{ .match = .{ .field = "title", .text = "backfill" } },
@@ -552,6 +561,68 @@ test "relational table full-text backfill indexes committed base rows" {
     defer parsed.deinit();
     try std.testing.expectEqualStrings("packed row backfill", parsed.value.object.get("title").?.string);
     try std.testing.expectEqualStrings("ready", parsed.value.object.get("status").?.string);
+}
+
+test "relational table full-text interrupted backfill persists generation progress" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const DB = @import("mod.zig").DB;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["title"],"additionalProperties":false}}},"relational_indexes":[{"name":"ft_backfill","owner_kind":"relational_column","owner_name":"title","access_method":"text_search","method_config":{"type":"full_text","field":"title"},"columns":["title"],"lifecycle":"building","generation":3,"schema_fingerprint":"secondary-index-v1:title","generation_record":{"generation":3,"owner_ranges":[],"lifecycle":"building","lag":300,"ready_watermark":0,"rebuild_cursor":""}}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
+    defer {
+        for (writes.items) |item| {
+            alloc.free(@constCast(item.key));
+            alloc.free(@constCast(item.value));
+        }
+        writes.deinit(alloc);
+    }
+    for (0..300) |i| {
+        try writes.append(alloc, .{
+            .key = try std.fmt.allocPrint(alloc, "row:{d:0>4}", .{i}),
+            .value = try std.fmt.allocPrint(alloc, "{{\"title\":\"packed row backfill\",\"status\":\"ready\",\"amount\":{d}}}", .{i}),
+        });
+    }
+    try db.batch(.{
+        .writes = writes.items,
+        .sync_level = .write,
+    });
+
+    index_manager_mod.test_abort_text_backfill_after_batches = 1;
+    defer index_manager_mod.test_abort_text_backfill_after_batches = null;
+    index_manager_mod.test_text_backfill_batch_size = 64;
+    defer index_manager_mod.test_text_backfill_batch_size = null;
+    try std.testing.expectError(error.TestInjectedBackfillFailure, db.addIndex(.{
+        .name = "ft_backfill",
+        .kind = .full_text,
+        .config_json = "{}",
+    }));
+
+    const durable_schema = (try schema_mod.loadSchema(db.core.store, alloc)) orelse return error.TestUnexpectedResult;
+    defer schema_mod.freeSchema(alloc, durable_schema);
+    const text_generation_record = durable_schema.relational_indexes[0].generation_record orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(schema_mod.RelationalIndexLifecycle.failed, text_generation_record.lifecycle);
+    try std.testing.expectEqual(@as(u64, 3), text_generation_record.generation);
+    try std.testing.expect(text_generation_record.ready_watermark > 0);
+    try std.testing.expect(text_generation_record.lag < 300);
+    try std.testing.expect(text_generation_record.lag > 0);
+    try std.testing.expect(text_generation_record.rebuild_cursor != null);
+    try std.testing.expectEqualStrings("TestInjectedBackfillFailure", text_generation_record.failure_reason.?);
 }
 
 test "relational column filter pushdown declines stale identity generations" {
