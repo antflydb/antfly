@@ -1744,75 +1744,9 @@ pub const Node = struct {
         self.metrics.incRequest("chunk");
         defer self.metrics.decActive();
 
-        const input: lib_chunker.Input = blk: {
-            switch (body.input) {
-                .string => |s| {
-                    if (s.len == 0) return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "missing 'input' field" });
-                    break :blk .{ .text = s };
-                },
-                .object => |obj| {
-                    const type_val = obj.get("type") orelse return ctx.status(400).json(.{
-                        .@"error" = "INVALID_REQUEST",
-                        .message = "input content part type must be 'text' or 'media'",
-                    });
-                    if (type_val != .string) return ctx.status(400).json(.{
-                        .@"error" = "INVALID_REQUEST",
-                        .message = "content part 'type' must be a string",
-                    });
-                    if (std.mem.eql(u8, type_val.string, "text")) {
-                        const text_val = obj.get("text") orelse return ctx.status(400).json(.{
-                            .@"error" = "INVALID_REQUEST",
-                            .message = "text content part missing 'text' field",
-                        });
-                        if (text_val != .string) return ctx.status(400).json(.{
-                            .@"error" = "INVALID_REQUEST",
-                            .message = "text content part 'text' must be a string",
-                        });
-                        break :blk .{ .text = text_val.string };
-                    }
-                    if (!std.mem.eql(u8, type_val.string, "media")) return ctx.status(400).json(.{
-                        .@"error" = "INVALID_REQUEST",
-                        .message = "input content part type must be 'text' or 'media'",
-                    });
-
-                    const data_val = obj.get("data") orelse return ctx.status(400).json(.{
-                        .@"error" = "INVALID_REQUEST",
-                        .message = "media content part missing 'data' field",
-                    });
-                    if (data_val != .string) return ctx.status(400).json(.{
-                        .@"error" = "INVALID_REQUEST",
-                        .message = "media 'data' must be a base64 string",
-                    });
-                    const mime_val = obj.get("mime_type") orelse return ctx.status(400).json(.{
-                        .@"error" = "INVALID_REQUEST",
-                        .message = "media content part missing 'mime_type' field",
-                    });
-                    if (mime_val != .string) return ctx.status(400).json(.{
-                        .@"error" = "INVALID_REQUEST",
-                        .message = "media 'mime_type' must be a string",
-                    });
-                    const decoded_payload = decodeMediaData(ctx.allocator, data_val.string) catch
-                        return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid base64 data" });
-                    const decoded = decoded_payload.data;
-                    errdefer ctx.allocator.free(decoded);
-                    if (!mediaMimeMatches(mime_val.string, decoded_payload.mime_type)) {
-                        ctx.allocator.free(decoded);
-                        return ctx.status(400).json(.{
-                            .@"error" = "INVALID_REQUEST",
-                            .message = "media data URI mime_type does not match content part mime_type",
-                        });
-                    }
-                    break :blk .{ .binary = .{
-                        .mime_type = mime_val.string,
-                        .data = decoded,
-                    } };
-                },
-                else => return ctx.status(400).json(.{
-                    .@"error" = "INVALID_REQUEST",
-                    .message = "'input' must be a string or content part object",
-                }),
-            }
-        };
+        const input = parseChunkRequestInput(ctx.allocator, body.input) catch |err|
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = chunkInputParseErrorMessage(err) });
+        defer deinitChunkRequestInput(ctx.allocator, input);
 
         var config = lib_chunker.FixedChunkConfig{};
         if (body.config) |cfg| {
@@ -6008,6 +5942,106 @@ test "download remote content blocks hosts outside allowlist" {
     try std.testing.expectError(error.HostNotAllowed, downloadRemoteContent(&node, alloc, "https://example.com/a.png"));
 }
 
+test "chunk request requires input in generated schema" {
+    try std.testing.expectError(
+        error.MissingField,
+        std.json.parseFromSlice(api.ChunkRequest, std.testing.allocator, "{}", .{ .ignore_unknown_fields = true }),
+    );
+}
+
+test "chunk request input parser rejects invalid content parts" {
+    const cases = [_]struct {
+        name: []const u8,
+        input_json: []const u8,
+        expected_error: anyerror,
+        expected_message: []const u8,
+    }{
+        .{
+            .name = "empty text input",
+            .input_json = "\"\"",
+            .expected_error = error.ChunkInputRequired,
+            .expected_message = "missing 'input' field",
+        },
+        .{
+            .name = "missing content part type",
+            .input_json = "{\"text\":\"hello\"}",
+            .expected_error = error.UnsupportedChunkInputContentPartType,
+            .expected_message = "input content part type must be 'text' or 'media'",
+        },
+        .{
+            .name = "unsupported content part type",
+            .input_json = "{\"type\":\"image_url\",\"image_url\":{\"url\":\"https://example.test/a.png\"}}",
+            .expected_error = error.UnsupportedChunkInputContentPartType,
+            .expected_message = "input content part type must be 'text' or 'media'",
+        },
+        .{
+            .name = "missing text",
+            .input_json = "{\"type\":\"text\"}",
+            .expected_error = error.ChunkTextContentPartMissingText,
+            .expected_message = "text content part missing 'text' field",
+        },
+        .{
+            .name = "empty text",
+            .input_json = "{\"type\":\"text\",\"text\":\"\"}",
+            .expected_error = error.ChunkTextContentPartMissingText,
+            .expected_message = "text content part missing 'text' field",
+        },
+        .{
+            .name = "missing media data",
+            .input_json = "{\"type\":\"media\",\"mime_type\":\"audio/wav\"}",
+            .expected_error = error.ChunkMediaContentPartMissingData,
+            .expected_message = "media content part missing 'data' field",
+        },
+        .{
+            .name = "empty media data",
+            .input_json = "{\"type\":\"media\",\"data\":\"\",\"mime_type\":\"audio/wav\"}",
+            .expected_error = error.ChunkMediaContentPartMissingData,
+            .expected_message = "media content part missing 'data' field",
+        },
+        .{
+            .name = "empty media data uri payload",
+            .input_json = "{\"type\":\"media\",\"data\":\"data:audio/wav;base64,\",\"mime_type\":\"audio/wav\"}",
+            .expected_error = error.ChunkMediaContentPartMissingData,
+            .expected_message = "media content part missing 'data' field",
+        },
+        .{
+            .name = "missing media mime",
+            .input_json = "{\"type\":\"media\",\"data\":\"AA==\"}",
+            .expected_error = error.ChunkMediaContentPartMissingMimeType,
+            .expected_message = "media content part missing 'mime_type' field",
+        },
+        .{
+            .name = "blank media mime",
+            .input_json = "{\"type\":\"media\",\"data\":\"AA==\",\"mime_type\":\"  \"}",
+            .expected_error = error.ChunkMediaContentPartMissingMimeType,
+            .expected_message = "media content part missing 'mime_type' field",
+        },
+    };
+
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, case.input_json, .{});
+        defer parsed.deinit();
+
+        try std.testing.expectError(case.expected_error, parseChunkRequestInput(std.testing.allocator, parsed.value));
+        try std.testing.expectEqualStrings(case.expected_message, chunkInputParseErrorMessage(case.expected_error));
+    }
+}
+
+test "chunk request input parser accepts valid text and media" {
+    var text_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"type\":\"text\",\"text\":\"hello\"}", .{});
+    defer text_parsed.deinit();
+    const text_input = try parseChunkRequestInput(std.testing.allocator, text_parsed.value);
+    defer deinitChunkRequestInput(std.testing.allocator, text_input);
+    try std.testing.expectEqualStrings("hello", text_input.text);
+
+    var media_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"type\":\"media\",\"data\":\"aGVsbG8=\",\"mime_type\":\"audio/wav\"}", .{});
+    defer media_parsed.deinit();
+    const media_input = try parseChunkRequestInput(std.testing.allocator, media_parsed.value);
+    defer deinitChunkRequestInput(std.testing.allocator, media_input);
+    try std.testing.expectEqualStrings("audio/wav", media_input.binary.mime_type);
+    try std.testing.expectEqualStrings("hello", media_input.binary.data);
+}
+
 fn dirContainsModel(path: []const u8) bool {
     var buf: [4096]u8 = undefined;
     inline for ([_][]const u8{ "/tokenizer.json", "/config.json", "/genai_config.json", "/model.onnx", "/model_i8.onnx", "/onnx/model.onnx" }) |suffix| {
@@ -6080,6 +6114,67 @@ fn jsonBytesResponse(ctx: *httpx.Context, body: []const u8) !httpx.Response {
     try ctx.setHeader("Content-Type", "application/json");
     _ = ctx.response.body(body);
     return ctx.response.build();
+}
+
+fn parseChunkRequestInput(allocator: std.mem.Allocator, input: std.json.Value) !lib_chunker.Input {
+    return switch (input) {
+        .string => |s| blk: {
+            if (s.len == 0) return error.ChunkInputRequired;
+            break :blk .{ .text = s };
+        },
+        .object => |obj| blk: {
+            const type_val = obj.get("type") orelse return error.UnsupportedChunkInputContentPartType;
+            if (type_val != .string) return error.ChunkContentPartTypeMustBeString;
+            if (std.mem.eql(u8, type_val.string, "text")) {
+                const text_val = obj.get("text") orelse return error.ChunkTextContentPartMissingText;
+                if (text_val != .string or text_val.string.len == 0) return error.ChunkTextContentPartMissingText;
+                break :blk .{ .text = text_val.string };
+            }
+            if (!std.mem.eql(u8, type_val.string, "media")) return error.UnsupportedChunkInputContentPartType;
+
+            const data_val = obj.get("data") orelse return error.ChunkMediaContentPartMissingData;
+            if (data_val != .string) return error.ChunkMediaDataMustBeBase64String;
+            if (data_val.string.len == 0) return error.ChunkMediaContentPartMissingData;
+            const mime_val = obj.get("mime_type") orelse return error.ChunkMediaContentPartMissingMimeType;
+            if (mime_val != .string) return error.ChunkMediaMimeTypeMustBeString;
+            if (std.mem.trim(u8, mime_val.string, &std.ascii.whitespace).len == 0) return error.ChunkMediaContentPartMissingMimeType;
+
+            const decoded_payload = decodeMediaData(allocator, data_val.string) catch return error.ChunkInvalidBase64Data;
+            const decoded = decoded_payload.data;
+            errdefer allocator.free(decoded);
+            if (decoded.len == 0) return error.ChunkMediaContentPartMissingData;
+            if (!mediaMimeMatches(mime_val.string, decoded_payload.mime_type)) return error.ChunkMediaDataMimeTypeMismatch;
+            break :blk .{ .binary = .{
+                .mime_type = mime_val.string,
+                .data = decoded,
+            } };
+        },
+        else => error.ChunkInputMustBeStringOrContentPartObject,
+    };
+}
+
+fn deinitChunkRequestInput(allocator: std.mem.Allocator, input: lib_chunker.Input) void {
+    switch (input) {
+        .binary => |binary| allocator.free(binary.data),
+        .text => {},
+    }
+}
+
+fn chunkInputParseErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.ChunkInputRequired => "missing 'input' field",
+        error.UnsupportedChunkInputContentPartType => "input content part type must be 'text' or 'media'",
+        error.ChunkContentPartTypeMustBeString => "content part 'type' must be a string",
+        error.ChunkTextContentPartMissingText => "text content part missing 'text' field",
+        error.ChunkMediaContentPartMissingData => "media content part missing 'data' field",
+        error.ChunkMediaDataMustBeBase64String => "media 'data' must be a base64 string",
+        error.ChunkMediaContentPartMissingMimeType => "media content part missing 'mime_type' field",
+        error.ChunkMediaMimeTypeMustBeString => "media 'mime_type' must be a string",
+        error.ChunkInvalidBase64Data => "invalid base64 data",
+        error.ChunkMediaDataMimeTypeMismatch => "media data URI mime_type does not match content part mime_type",
+        error.ChunkInputMustBeStringOrContentPartObject => "'input' must be a string or content part object",
+        else => "invalid chunk input",
+    };
 }
 
 fn validateEmbeddingEncodingFormat(encoding_format: ?[]const u8) !void {
