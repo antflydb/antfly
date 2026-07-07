@@ -4009,8 +4009,8 @@ test "distributed sorted hit merge uses typed sort tuple ordering and cursors" {
     };
     defer testDeinitFixedHits(alloc, &asc_right);
     const asc_shards = [_]DistributedSortedShard{
-        .{ .hits = &asc_left },
-        .{ .hits = &asc_right },
+        .{ .hits = &asc_left, .total_hits = asc_left.len },
+        .{ .hits = &asc_right, .total_hits = asc_right.len },
     };
     const rank_asc = [_]types.SortField{.{ .field = "rank" }};
     try std.testing.expectEqual(@as(u32, 5), distributedShardWindowCandidateCount(&asc_shards));
@@ -4033,8 +4033,8 @@ test "distributed sorted hit merge uses typed sort tuple ordering and cursors" {
         .{ .string = "doc:b" },
     };
     const after_shards = [_]DistributedSortedShard{
-        .{ .hits = asc_left[1..] },
-        .{ .hits = asc_right[1..] },
+        .{ .hits = asc_left[1..], .total_hits = asc_left[1..].len },
+        .{ .hits = asc_right[1..], .total_hits = asc_right[1..].len },
     };
     const after_page = try mergeDistributedSortedHitsAlloc(alloc, .{
         .order_by = &rank_asc,
@@ -4075,8 +4075,8 @@ test "distributed sorted hit merge uses typed sort tuple ordering and cursors" {
 
     {
         const after_shards_limit_one = [_]DistributedSortedShard{
-            .{ .hits = asc_left[1..2] },
-            .{ .hits = asc_right[1..2] },
+            .{ .hits = asc_left[1..2], .total_hits = asc_left[1..2].len },
+            .{ .hits = asc_right[1..2], .total_hits = asc_right[1..2].len },
         };
         bench_query_profile_every_cache.store(2, .monotonic);
         bench_query_profile_counter.store(1, .monotonic);
@@ -4099,9 +4099,15 @@ test "distributed sorted hit merge uses typed sort tuple ordering and cursors" {
         try std.testing.expectEqual(@as(usize, 2), internal_sort_profile.distributed_shard_count);
     }
 
+    var asc_right_with_tail = [_]types.SearchHit{
+        try testSortedHitAlloc(alloc, "doc:b", 2),
+        try testSortedHitAlloc(alloc, "doc:d", 4),
+        try testSortedHitAlloc(alloc, "doc:f", 6),
+    };
+    defer testDeinitFixedHits(alloc, &asc_right_with_tail);
     const gte_shards = [_]DistributedSortedShard{
-        .{ .hits = &asc_left },
-        .{ .hits = &asc_right, .total_hits_relation = .gte },
+        .{ .hits = &asc_left, .total_hits = asc_left.len },
+        .{ .hits = &asc_right_with_tail, .total_hits = asc_right_with_tail.len, .total_hits_relation = .gte },
     };
     const gte_page = try mergeDistributedSortedHitsWithProfileAlloc(alloc, .{
         .order_by = &rank_asc,
@@ -4119,8 +4125,8 @@ test "distributed sorted hit merge uses typed sort tuple ordering and cursors" {
         .{ .string = "doc:e" },
     };
     const before_shards = [_]DistributedSortedShard{
-        .{ .hits = asc_left[0..2] },
-        .{ .hits = &asc_right },
+        .{ .hits = asc_left[0..2], .total_hits = asc_left[0..2].len },
+        .{ .hits = &asc_right, .total_hits = asc_right.len },
     };
     const before_page = try mergeDistributedSortedHitsAlloc(alloc, .{
         .order_by = &rank_asc,
@@ -4143,8 +4149,8 @@ test "distributed sorted hit merge uses typed sort tuple ordering and cursors" {
     };
     defer testDeinitFixedHits(alloc, &desc_right);
     const desc_shards = [_]DistributedSortedShard{
-        .{ .hits = &desc_left },
-        .{ .hits = &desc_right },
+        .{ .hits = &desc_left, .total_hits = desc_left.len },
+        .{ .hits = &desc_right, .total_hits = desc_right.len },
     };
     const rank_desc = [_]types.SortField{.{ .field = "rank", .desc = true }};
     const desc_page = try mergeDistributedSortedHitsAlloc(alloc, .{
@@ -4339,6 +4345,24 @@ test "distributed merge rejects provably incomplete exact shard windows" {
 
     var hits = [_]types.SearchHit{try testSortedHitAlloc(alloc, "doc:a", 1)};
     defer testDeinitFixedHits(alloc, &hits);
+    const missing_total_shards = [_]DistributedSortedShard{
+        .{ .hits = &hits },
+    };
+
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeDistributedSortedHitsAlloc(alloc, .{
+        .order_by = &order_by,
+        .offset = 1,
+        .limit = 1,
+    }, .{
+        .kind = .distributed_k_way_merge,
+        .runtime_schema = schema,
+    }, &missing_total_shards));
+    var diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", diagnostic.reason);
+    try std.testing.expectEqualStrings("distributed_shard_window_incomplete", diagnostic.detail);
+
     const incomplete = types.SearchResult{
         .alloc = alloc,
         .hits = &hits,
@@ -4352,7 +4376,7 @@ test "distributed merge rejects provably incomplete exact shard windows" {
         .offset = 1,
         .limit = 1,
     }, &.{incomplete}, schema));
-    var diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("*", diagnostic.field);
     try std.testing.expectEqualStrings("unsupported_exact_sort", diagnostic.reason);
     try std.testing.expectEqualStrings("distributed_shard_window_incomplete", diagnostic.detail);
@@ -5190,16 +5214,15 @@ fn validateDistributedShardWindowsCompleteForRequestedPage(
     for (shards) |shard| {
         const returned_window: u64 = @intCast(shard.hits.len);
         if (returned_window >= required_window) continue;
-        if (shard.total_hits) |total_hits| {
-            if (shard.total_hits_relation == .exact and @as(u64, total_hits) > returned_window) {
-                logNativeSortPlanRejection("*", "unsupported_exact_sort", "distributed_shard_window_incomplete");
-                return error.UnsupportedQueryRequest;
-            }
-            if (shard.total_hits_relation == .gte) {
-                logNativeSortPlanRejection("*", "unsupported_exact_sort", "distributed_shard_window_incomplete");
-                return error.UnsupportedQueryRequest;
-            }
+        const total_hits = shard.total_hits orelse {
+            logNativeSortPlanRejection("*", "unsupported_exact_sort", "distributed_shard_window_incomplete");
+            return error.UnsupportedQueryRequest;
+        };
+        if (shard.total_hits_relation == .exact and @as(u64, total_hits) <= returned_window) {
+            continue;
         }
+        logNativeSortPlanRejection("*", "unsupported_exact_sort", "distributed_shard_window_incomplete");
+        return error.UnsupportedQueryRequest;
     }
 }
 
