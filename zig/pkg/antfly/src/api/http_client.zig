@@ -1546,6 +1546,7 @@ pub const ApiHttpClient = struct {
             200, 202 => return .{ .body = try self.alloc.dupe(u8, resp.body) },
             404 => return error.NotFound,
             409 => return remoteGroupConflictError(resp.body),
+            503 => if (std.mem.eql(u8, resp.body, "repair cancel unavailable")) return error.RepairCancelUnavailable else return error.UnexpectedHttpStatus,
             else => return error.UnexpectedHttpStatus,
         }
     }

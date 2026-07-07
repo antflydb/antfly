@@ -2364,6 +2364,7 @@ pub fn build(b: *std.Build) void {
             "repair job store applies running cancellation at pass boundary",
             "repair job store records cancel requested across stale queued token",
             "repair job store does not expire future live running heartbeat",
+            "internal group artifact repair rejects callback token without cancel executor",
             "table repair job records bounded pass and continuation",
         },
         .test_runner = .{

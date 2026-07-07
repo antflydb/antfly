@@ -350,37 +350,36 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8) !?ht
             const job_id = parsed.value.repair_job_id orelse return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid repair cancel token");
             const attempt_id = parsed.value.repair_attempt_id orelse return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid repair cancel token");
             if (parsed.value.repair_cancel_base_uri) |base_uri| {
-                if (ctx.repair_cancel_executor) |executor| {
-                    var probe = RemoteRepairJobCancelProbe{
-                        .alloc = ctx.alloc,
-                        .executor = executor,
-                        .base_uri = base_uri,
-                        .table_name = repair_route.table_name,
-                        .job_id = job_id,
-                        .attempt_id = attempt_id,
-                    };
-                    var result = (writes.repairArtifactIssuesGroupLocalControlled(
-                        ctx.alloc,
-                        repair_route.group_id,
-                        repair_route.table_name,
-                        parsed.value,
-                        .{
-                            .cancel_check = .{
-                                .ptr = &probe,
-                                .is_requested = RemoteRepairJobCancelProbe.check,
-                            },
+                const executor = ctx.repair_cancel_executor orelse return try http_route_helpers.textResponse(ctx.alloc, 503, "repair cancel unavailable");
+                var probe = RemoteRepairJobCancelProbe{
+                    .alloc = ctx.alloc,
+                    .executor = executor,
+                    .base_uri = base_uri,
+                    .table_name = repair_route.table_name,
+                    .job_id = job_id,
+                    .attempt_id = attempt_id,
+                };
+                var result = (writes.repairArtifactIssuesGroupLocalControlled(
+                    ctx.alloc,
+                    repair_route.group_id,
+                    repair_route.table_name,
+                    parsed.value,
+                    .{
+                        .cancel_check = .{
+                            .ptr = &probe,
+                            .is_requested = RemoteRepairJobCancelProbe.check,
                         },
-                    ) catch |err| switch (err) {
-                        error.Canceled => return try http_route_helpers.textResponse(ctx.alloc, 409, "repair cancelled"),
-                        error.InvalidArgument => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid artifact repair request"),
-                        error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
-                        error.UnsupportedOperation => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
-                        error.UnknownGroup, error.TableNotFound, error.NotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
-                        else => return err,
-                    }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
-                    defer result.deinit(ctx.alloc);
-                    return try http_route_helpers.jsonResponseWithStatus(ctx.alloc, 202, result);
-                }
+                    },
+                ) catch |err| switch (err) {
+                    error.Canceled => return try http_route_helpers.textResponse(ctx.alloc, 409, "repair cancelled"),
+                    error.InvalidArgument => return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid artifact repair request"),
+                    error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(ctx.alloc, 409, "doc identity namespace mismatch"),
+                    error.UnsupportedOperation => return try http_route_helpers.textResponse(ctx.alloc, 405, "method not allowed"),
+                    error.UnknownGroup, error.TableNotFound, error.NotFound => return try http_route_helpers.textResponse(ctx.alloc, 404, "not found"),
+                    else => return err,
+                }) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+                defer result.deinit(ctx.alloc);
+                return try http_route_helpers.jsonResponseWithStatus(ctx.alloc, 202, result);
             } else {
                 const store = ctx.repair_job_store orelse return try http_route_helpers.textResponse(ctx.alloc, 503, "repair cancel unavailable");
                 var probe = RepairJobCancelProbe{
@@ -934,6 +933,30 @@ test "internal group write routes apply document artifact child range batch" {
 
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"sequence\":44") != null);
+}
+
+pub fn expectRejectsCallbackTokenWithoutCancelExecutorForTest() !void {
+    const alloc = std.testing.allocator;
+
+    var resp = (try handle(.{
+        .alloc = alloc,
+        .shard_ops = null,
+        .writes = TestWriteSource.source(),
+        .batch_validator = TestWriteSource.batchValidator(),
+        .txn_validator = TestWriteSource.txnValidator(),
+    }, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/tables/docs/repair/run",
+        .body = "{\"target\":\"index\",\"index_name\":\"semantic\",\"repair_job_id\":42,\"repair_attempt_id\":3,\"repair_cancel_base_uri\":\"http://node-a\"}",
+    }, "/internal/v1/groups/7/tables/docs/repair/run")).?;
+    defer resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 503), resp.status);
+    try std.testing.expectEqualStrings("repair cancel unavailable", resp.body);
+}
+
+test "internal group artifact repair rejects callback token without cancel executor" {
+    try expectRejectsCallbackTokenWithoutCancelExecutorForTest();
 }
 
 test "internal group write routes reject mismatched shard execute requests" {
