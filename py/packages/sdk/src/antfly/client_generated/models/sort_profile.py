@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.sort_profile_candidate_source import SortProfileCandidateSource
 from ..models.sort_profile_native_filter_mode import SortProfileNativeFilterMode
 from ..models.sort_profile_sort_lifecycle_state import SortProfileSortLifecycleState
 from ..types import UNSET, Unset
@@ -35,7 +36,9 @@ class SortProfile:
                 applicable.
             cursor (str | Unset): Cursor mode for this request.
             exactness (str | Unset): Exactness class for the selected plan.
-            source (str | Unset): Candidate source used by the selected plan.
+            source (str | Unset): Sort execution primitive used by the selected plan.
+            candidate_source (SortProfileCandidateSource | Unset): Exact candidate source consumed by the selected sort
+                primitive.
             cursor_support (str | Unset): Cursor support level for the selected plan.
             source_load (str | Unset): Stored source load strategy.
             distributed_behavior (str | Unset): Distributed sort behavior.
@@ -148,6 +151,7 @@ class SortProfile:
     cursor: str | Unset = UNSET
     exactness: str | Unset = UNSET
     source: str | Unset = UNSET
+    candidate_source: SortProfileCandidateSource | Unset = UNSET
     cursor_support: str | Unset = UNSET
     source_load: str | Unset = UNSET
     distributed_behavior: str | Unset = UNSET
@@ -208,6 +212,10 @@ class SortProfile:
         exactness = self.exactness
 
         source = self.source
+
+        candidate_source: str | Unset = UNSET
+        if not isinstance(self.candidate_source, Unset):
+            candidate_source = self.candidate_source.value
 
         cursor_support = self.cursor_support
 
@@ -312,6 +320,8 @@ class SortProfile:
             field_dict["exactness"] = exactness
         if source is not UNSET:
             field_dict["source"] = source
+        if candidate_source is not UNSET:
+            field_dict["candidate_source"] = candidate_source
         if cursor_support is not UNSET:
             field_dict["cursor_support"] = cursor_support
         if source_load is not UNSET:
@@ -423,6 +433,13 @@ class SortProfile:
 
         source = d.pop("source", UNSET)
 
+        _candidate_source = d.pop("candidate_source", UNSET)
+        candidate_source: SortProfileCandidateSource | Unset
+        if isinstance(_candidate_source, Unset):
+            candidate_source = UNSET
+        else:
+            candidate_source = SortProfileCandidateSource(_candidate_source)
+
         cursor_support = d.pop("cursor_support", UNSET)
 
         source_load = d.pop("source_load", UNSET)
@@ -525,6 +542,7 @@ class SortProfile:
             cursor=cursor,
             exactness=exactness,
             source=source,
+            candidate_source=candidate_source,
             cursor_support=cursor_support,
             source_load=source_load,
             distributed_behavior=distributed_behavior,

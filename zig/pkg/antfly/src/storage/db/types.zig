@@ -1490,6 +1490,7 @@ pub const SortProfile = struct {
     plan: []const u8 = "",
     exactness: []const u8 = "",
     source: []const u8 = "",
+    candidate_source: []const u8 = "none",
     cursor_support: []const u8 = "",
     source_load: []const u8 = "",
     distributed_behavior: []const u8 = "",

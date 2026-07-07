@@ -2821,6 +2821,7 @@ fn expectSortProfileDiagnosticsSerializationForTest() !void {
             .plan = "sorted_segment_seek",
             .exactness = "exact",
             .source = "sorted_segment_scan",
+            .candidate_source = "native_filter",
             .cursor_support = "segment_seek",
             .source_load = "projected_source_after_page",
             .distributed_behavior = "shard_local_only",
@@ -2894,6 +2895,7 @@ fn expectSortProfileDiagnosticsSerializationForTest() !void {
     try std.testing.expectEqualStrings("after", sort.get("cursor").?.string);
     try std.testing.expectEqualStrings("exact", sort.get("exactness").?.string);
     try std.testing.expectEqualStrings("sorted_segment_scan", sort.get("source").?.string);
+    try std.testing.expectEqualStrings("native_filter", sort.get("candidate_source").?.string);
     try std.testing.expectEqualStrings("segment_seek", sort.get("cursor_support").?.string);
     try std.testing.expectEqualStrings("projected_source_after_page", sort.get("source_load").?.string);
     try std.testing.expectEqualStrings("shard_local_only", sort.get("distributed_behavior").?.string);
@@ -4305,6 +4307,7 @@ fn buildSortProfileValue(
     try sort.put(alloc, "cursor", .{ .string = sortProfileCursorMode(req) });
     try sort.put(alloc, "exactness", .{ .string = profile.exactness });
     try sort.put(alloc, "source", .{ .string = profile.source });
+    try sort.put(alloc, "candidate_source", .{ .string = profile.candidate_source });
     try sort.put(alloc, "cursor_support", .{ .string = profile.cursor_support });
     try sort.put(alloc, "source_load", .{ .string = profile.source_load });
     try sort.put(alloc, "distributed_behavior", .{ .string = profile.distributed_behavior });

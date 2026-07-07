@@ -5504,8 +5504,10 @@ pub const SortProfile = struct {
     cursor: ?[]const u8 = null,
     /// Exactness class for the selected plan.
     exactness: ?[]const u8 = null,
-    /// Candidate source used by the selected plan.
+    /// Sort execution primitive used by the selected plan.
     source: ?[]const u8 = null,
+    /// Exact candidate source consumed by the selected sort primitive.
+    candidate_source: ?[]const u8 = null,
     /// Cursor support level for the selected plan.
     cursor_support: ?[]const u8 = null,
     /// Stored source load strategy.

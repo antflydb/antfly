@@ -1308,6 +1308,7 @@ fn composedExactSortProfileOrFallback(
     return sortResultProfile(req, .{
         .kind = .unsupported_exact_sort,
     }, false, .{
+        .candidate_source = "composed",
         .candidate_count = @intCast(candidate_count),
         .selected_count = @intCast(selected_count),
         .total_ns = total_ns,
@@ -1326,6 +1327,7 @@ fn composedScoreTopKSortProfile(
         .kind = .score_top_k,
         .exactness = if (composedEmbeddingSourceCount(req) > 0) .approximate else .exact,
     }, false, .{
+        .candidate_source = "composed",
         .candidate_count = @intCast(candidate_count),
         .admitted_count = @intCast(candidate_count),
         .selected_count = @intCast(selected_count),
@@ -3263,6 +3265,7 @@ const SortCollectorProfile = struct {
     stored_json_load_count: u64 = 0,
     final_sort_ns: u64 = 0,
     total_ns: u64 = 0,
+    candidate_source: []const u8 = "none",
     sorted_segment_scanned_count: u64 = 0,
     sorted_segment_scan_budget: u64 = 0,
     window_capacity: usize = 0,
@@ -3278,6 +3281,22 @@ const SortCollectorProfile = struct {
 
 fn observeSortCollectorHeap(profile: ?*SortCollectorProfile, heap_len: usize) void {
     if (profile) |p| p.collector_heap_peak = @max(p.collector_heap_peak, heap_len);
+}
+
+fn observeSortCandidateSource(profile: ?*SortCollectorProfile, source: []const u8) void {
+    if (profile) |p| p.candidate_source = source;
+}
+
+fn matchAllCandidateSourceForConstraints(constraints: ?*const NativeDocIdConstraints) []const u8 {
+    const c = constraints orelse return "match_all";
+    if (c.positive_filter or nativeFilterExclusionCount(c) > 0) return "native_filter";
+    return "match_all";
+}
+
+fn sortedSegmentCandidateSourceForConstraints(constraints: *const NativeDocIdConstraints, membership: ?*const SortedSegmentDocMembership) []const u8 {
+    if (membership != null) return "sorted_segment_membership";
+    if (constraints.positive_filter or nativeFilterExclusionCount(constraints) > 0) return "native_filter";
+    return "match_all";
 }
 
 fn nativeFilterConstraintCount(constraints: *const NativeDocIdConstraints) u64 {
@@ -3378,6 +3397,7 @@ fn sortResultProfile(
         .plan = sortExecutionPlanKindName(plan.kind),
         .exactness = sortPlanExactnessName(sortExecutionPlanExactness(plan)),
         .source = sortPlanSourceName(sortExecutionPlanSource(plan)),
+        .candidate_source = profile.candidate_source,
         .cursor_support = sortPlanCursorSupportName(sortExecutionPlanCursorSupport(plan)),
         .source_load = sortPlanSourceLoadName(sortExecutionPlanSourceLoadForRequest(plan, req)),
         .distributed_behavior = sortPlanDistributedBehaviorName(sortExecutionPlanDistributedBehavior(plan)),
@@ -3462,6 +3482,7 @@ fn vectorScoreTopKSortProfile(
         .kind = .score_top_k,
         .exactness = exactness,
     }, false, .{
+        .candidate_source = "vector_top_k",
         .candidate_count = @intCast(candidate_count),
         .admitted_count = @intCast(candidate_count),
         .selected_count = @intCast(selected_count),
@@ -4010,6 +4031,7 @@ test "distributed sorted hit merge uses typed sort tuple ordering and cursors" {
     try std.testing.expectEqual(types.TotalHitsRelation.exact, profiled_page.total_hits_relation);
     const sort_profile = profiled_page.sort_profile orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("distributed_k_way_merge", sort_profile.plan);
+    try std.testing.expectEqualStrings("distributed_shards", sort_profile.candidate_source);
     try std.testing.expectEqualStrings("queryable", sort_profile.sort_lifecycle_state);
     try std.testing.expectEqualStrings("distributed_merge", sort_profile.source);
     try std.testing.expectEqualStrings("distributed_seek", sort_profile.cursor_support);
@@ -5449,6 +5471,7 @@ fn mergeDistributedSortedHitsWithProfileAlloc(
     const merge_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
     var profile = SortCollectorProfile{};
     if (collect_sort_profile) {
+        profile.candidate_source = "distributed_shards";
         profile.window_capacity = if (effective_req.search_after.len > 0 or effective_req.search_before.len > 0)
             @intCast(effective_req.limit)
         else
@@ -6531,6 +6554,7 @@ fn sortAndPageSearchResultInPlace(
         if (result.hits.len > 0) alloc.free(result.hits);
         result.hits = &.{};
         var profile = SortCollectorProfile{};
+        observeSortCandidateSource(if (collect_sort_profile) &profile else null, "existing_hits");
         if (collect_sort_profile) {
             profile.candidate_count = @intCast(@min(candidate_count, @as(usize, std.math.maxInt(u64))));
             profile.window_capacity = 0;
@@ -6557,6 +6581,7 @@ fn sortAndPageSearchResultInPlace(
 
     const sort_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
     var profile = SortCollectorProfile{};
+    observeSortCandidateSource(if (collect_sort_profile) &profile else null, "existing_hits");
     const alloc = result.alloc;
     const input_hits = result.hits;
     result.hits = &.{};
@@ -6683,6 +6708,7 @@ fn sortAndPageMatchAllCandidatesAlloc(
     if (effective_req.limit == 0) {
         const zero_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
         var profile = SortCollectorProfile{};
+        observeSortCandidateSource(if (collect_sort_profile) &profile else null, "match_all");
         if (collect_sort_profile) {
             profile.candidate_count = @intCast(@min(candidates.items.len, @as(usize, std.math.maxInt(u64))));
             profile.window_capacity = 0;
@@ -6717,6 +6743,7 @@ fn sortAndPageMatchAllCandidatesAlloc(
 
     const sort_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
     var profile = SortCollectorProfile{};
+    observeSortCandidateSource(if (collect_sort_profile) &profile else null, "match_all");
     const window_capacity = sortWindowCapacity(effective_req);
     if (collect_sort_profile) profile.window_capacity = window_capacity;
     const keep_previous_page = effective_req.search_before.len > 0;
@@ -6941,6 +6968,7 @@ fn sortAndPageMatchAllCandidateStreamAlloc(
         try checkSearchRequestDeadline(effective_req);
         const total_hits = boundedU32(count_ctx.accepted_count);
         var profile = SortCollectorProfile{};
+        observeSortCandidateSource(if (collect_sort_profile) &profile else null, matchAllCandidateSourceForConstraints(options.constraints));
         observeNativeFilterConstraints(if (collect_sort_profile) &profile else null, options.constraints);
         if (collect_sort_profile) {
             profile.candidate_count = @intCast(@min(count_ctx.accepted_count, @as(usize, std.math.maxInt(u64))));
@@ -6963,6 +6991,7 @@ fn sortAndPageMatchAllCandidateStreamAlloc(
 
     const sort_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
     var profile = SortCollectorProfile{};
+    observeSortCandidateSource(if (collect_sort_profile) &profile else null, matchAllCandidateSourceForConstraints(options.constraints));
     observeNativeFilterConstraints(if (collect_sort_profile) &profile else null, options.constraints);
     const window_capacity = sortWindowCapacity(effective_req);
     if (collect_sort_profile) profile.window_capacity = window_capacity;
@@ -7138,6 +7167,7 @@ fn sortAndPageMatchAllIdSeekAlloc(
         }, &count_ctx, countMatchAllSortCandidate);
         try checkSearchRequestDeadline(effective_req);
         var profile = SortCollectorProfile{};
+        observeSortCandidateSource(if (collect_sort_profile) &profile else null, "primary_key");
         observeNativeFilterConstraints(if (collect_sort_profile) &profile else null, constraints);
         if (collect_sort_profile) {
             profile.candidate_count = @intCast(@min(count_ctx.accepted_count, @as(usize, std.math.maxInt(u64))));
@@ -7161,6 +7191,7 @@ fn sortAndPageMatchAllIdSeekAlloc(
     const sort_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
     const stop_after = if (reverse) requested_limit else skip_count +| requested_limit;
     var profile = SortCollectorProfile{};
+    observeSortCandidateSource(if (collect_sort_profile) &profile else null, "primary_key");
     observeNativeFilterConstraints(if (collect_sort_profile) &profile else null, constraints);
     if (collect_sort_profile) profile.window_capacity = stop_after;
     var seek_ctx = MatchAllIdSeekContext{
@@ -7741,6 +7772,7 @@ fn sortAndPageMatchAllSortedSegmentsAlloc(
     if (effective_req.limit == 0) {
         const zero_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
         var zero_profile = SortCollectorProfile{};
+        observeSortCandidateSource(if (collect_sort_profile) &zero_profile else null, sortedSegmentCandidateSourceForConstraints(constraints, membership));
         observeNativeFilterConstraints(if (collect_sort_profile) &zero_profile else null, constraints);
         zero_profile.window_capacity = 0;
         zero_profile.sorted_segment_scan_budget = sortedSegmentScanBudget();
@@ -7775,6 +7807,7 @@ fn sortAndPageMatchAllSortedSegmentsAlloc(
     const reverse = effective_req.search_before.len > 0;
     const sort_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
     var profile = SortCollectorProfile{};
+    observeSortCandidateSource(if (collect_sort_profile) &profile else null, sortedSegmentCandidateSourceForConstraints(constraints, membership));
     observeNativeFilterConstraints(if (collect_sort_profile) &profile else null, constraints);
     const scan_budget = sortedSegmentScanBudget();
     var scanned_count: u64 = 0;
@@ -7926,7 +7959,7 @@ fn logBenchSortCollectorProfile(
 ) void {
     const rejection = peekLastSortRejectionDiagnostic();
     std.log.info(
-        "antfly_bench_sort_collector total_us={d} decorate_us={d} native_doc_value_load_us={d} native_doc_value_hits={d} native_doc_value_misses={d} stored_json_load_us={d} stored_json_loads={d} final_sort_us={d} candidates={d} cursor_rejected={d} admitted={d} replaced={d} discarded={d} selected={d} window_capacity={d} window_len={d} collector_heap_peak={d} order_fields={d} cursor={s} plan={s} exactness={s} source={s} cursor_support={s} source_load={s} distributed={s} selection_reason={s} require_native={} native_loader={} index_sort_match={} sorted_segment_executor_available={} sorted_segment_bounds_available={}",
+        "antfly_bench_sort_collector total_us={d} decorate_us={d} native_doc_value_load_us={d} native_doc_value_hits={d} native_doc_value_misses={d} stored_json_load_us={d} stored_json_loads={d} final_sort_us={d} candidates={d} cursor_rejected={d} admitted={d} replaced={d} discarded={d} selected={d} window_capacity={d} window_len={d} collector_heap_peak={d} order_fields={d} cursor={s} plan={s} exactness={s} source={s} candidate_source={s} cursor_support={s} source_load={s} distributed={s} selection_reason={s} require_native={} native_loader={} index_sort_match={} sorted_segment_executor_available={} sorted_segment_bounds_available={}",
         .{
             nsToUs(profile.total_ns),
             nsToUs(profile.decorate_ns),
@@ -7950,6 +7983,7 @@ fn logBenchSortCollectorProfile(
             sortExecutionPlanKindName(plan.kind),
             sortPlanExactnessName(sortExecutionPlanExactness(plan)),
             sortPlanSourceName(sortExecutionPlanSource(plan)),
+            profile.candidate_source,
             sortPlanCursorSupportName(sortExecutionPlanCursorSupport(plan)),
             sortPlanSourceLoadName(sortExecutionPlanSourceLoadForRequest(plan, req)),
             sortPlanDistributedBehaviorName(sortExecutionPlanDistributedBehavior(plan)),
@@ -9814,6 +9848,7 @@ fn sortAndPageTextDocValueDocNumsAlloc(
         const zero_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
         const visible_total = try visibleTextDocNumCount(alloc, effective_req, snapshot, doc_nums, executor);
         var profile = SortCollectorProfile{};
+        observeSortCandidateSource(if (collect_sort_profile) &profile else null, "text_postings");
         if (collect_sort_profile) {
             profile.candidate_count = @intCast(@min(visible_total, @as(usize, std.math.maxInt(u64))));
             profile.window_capacity = 0;
@@ -9849,6 +9884,7 @@ fn sortAndPageTextDocValueDocNumsAlloc(
 
     const sort_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
     var profile = SortCollectorProfile{};
+    observeSortCandidateSource(if (collect_sort_profile) &profile else null, "text_postings");
     const window_capacity = sortWindowCapacity(effective_req);
     if (collect_sort_profile) profile.window_capacity = window_capacity;
     const keep_previous_page = effective_req.search_before.len > 0;
@@ -10078,6 +10114,7 @@ pub fn searchTextQuery(
         const score_profile = if (collect_score_profile) sortResultProfile(effective_req, .{
             .kind = .score_top_k,
         }, false, .{
+            .candidate_source = "native_filter",
             .window_capacity = @intCast(paging.limit),
             .window_len = 0,
             .total_ns = platform_time.monotonicNs() - total_start_ns,
@@ -10387,6 +10424,7 @@ pub fn searchTextQuery(
         }
         if (!requires_field_sort and !effective_req.count_only and collect_score_profile) {
             out.sort_profile = sortResultProfile(effective_req, .{ .kind = .score_top_k }, false, .{
+                .candidate_source = "text_postings",
                 .candidate_count = @intCast(result.hits.len),
                 .admitted_count = @intCast(result.hits.len),
                 .selected_count = @intCast(out.hits.len),
@@ -13125,6 +13163,7 @@ fn sortAndPageMatchAllOrdinalDocValueCandidatesAlloc(
             ordinal_to_text_doc_id,
         );
         var profile = SortCollectorProfile{};
+        observeSortCandidateSource(if (collect_sort_profile) &profile else null, "native_filter");
         observeNativeFilterConstraints(if (collect_sort_profile) &profile else null, constraints);
         if (collect_sort_profile) {
             profile.candidate_count = @intCast(@min(visible_total, @as(usize, std.math.maxInt(u64))));
@@ -13161,6 +13200,7 @@ fn sortAndPageMatchAllOrdinalDocValueCandidatesAlloc(
 
     const sort_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
     var profile = SortCollectorProfile{};
+    observeSortCandidateSource(if (collect_sort_profile) &profile else null, "native_filter");
     observeNativeFilterConstraints(if (collect_sort_profile) &profile else null, constraints);
     const window_capacity = sortWindowCapacity(effective_req);
     if (collect_sort_profile) profile.window_capacity = window_capacity;
@@ -19172,6 +19212,7 @@ test "match_all sorted segment seek merges sorted segments and applies cursors" 
     const first_profile = first_page.sort_profile orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("sorted_segment_seek", first_profile.plan);
     try std.testing.expectEqualStrings("sorted_segment_scan", first_profile.source);
+    try std.testing.expectEqualStrings("match_all", first_profile.candidate_source);
     try std.testing.expectEqual(@as(usize, 2), first_profile.collector_heap_peak);
 
     const after_cursor = [_]std.json.Value{
@@ -19686,6 +19727,7 @@ test "match_all index sort uses doc values collector for selective native filter
     const profile = result.sort_profile orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("native_doc_values_top_n", profile.plan);
     try std.testing.expectEqualStrings("doc_values_collector", profile.source);
+    try std.testing.expectEqualStrings("native_filter", profile.candidate_source);
     try std.testing.expectEqualStrings("selective_filter_doc_values_collector", profile.selection_reason);
     try std.testing.expect(profile.selective_filter_doc_values_preferred);
     try std.testing.expectEqualStrings("doc_nums", profile.native_filter_mode);

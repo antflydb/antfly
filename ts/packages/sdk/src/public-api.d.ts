@@ -5940,8 +5940,13 @@ export interface components {
             cursor?: string;
             /** @description Exactness class for the selected plan. */
             exactness?: string;
-            /** @description Candidate source used by the selected plan. */
+            /** @description Sort execution primitive used by the selected plan. */
             source?: string;
+            /**
+             * @description Exact candidate source consumed by the selected sort primitive.
+             * @enum {string}
+             */
+            candidate_source?: "none" | "existing_hits" | "match_all" | "primary_key" | "native_filter" | "sorted_segment_membership" | "text_postings" | "distributed_shards" | "vector_top_k" | "composed";
             /** @description Cursor support level for the selected plan. */
             cursor_support?: string;
             /** @description Stored source load strategy. */
