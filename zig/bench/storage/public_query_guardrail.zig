@@ -79,6 +79,7 @@ const QueryShape = enum {
     exact_sort_datetime,
     exact_sort_boolean,
     exact_sort_index_sort,
+    exact_sort_index_sort_filter,
     exact_sort_full_text,
     exact_sort_filter,
 
@@ -101,6 +102,7 @@ const QueryShape = enum {
         if (std.mem.eql(u8, raw, "exact-sort-datetime")) return .exact_sort_datetime;
         if (std.mem.eql(u8, raw, "exact-sort-boolean")) return .exact_sort_boolean;
         if (std.mem.eql(u8, raw, "exact-sort-index-sort")) return .exact_sort_index_sort;
+        if (std.mem.eql(u8, raw, "exact-sort-index-sort-filter")) return .exact_sort_index_sort_filter;
         if (std.mem.eql(u8, raw, "exact-sort-full-text")) return .exact_sort_full_text;
         if (std.mem.eql(u8, raw, "exact-sort-filter")) return .exact_sort_filter;
         return null;
@@ -126,6 +128,7 @@ const QueryShape = enum {
             .exact_sort_datetime => "exact-sort-datetime",
             .exact_sort_boolean => "exact-sort-boolean",
             .exact_sort_index_sort => "exact-sort-index-sort",
+            .exact_sort_index_sort_filter => "exact-sort-index-sort-filter",
             .exact_sort_full_text => "exact-sort-full-text",
             .exact_sort_filter => "exact-sort-filter",
         };
@@ -133,14 +136,14 @@ const QueryShape = enum {
 
     fn usesFullText(self: QueryShape) bool {
         return switch (self) {
-            .dense, .dense_filter, .sparse_filter, .graph_expand, .algebraic_filter, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_boolean, .exact_sort_index_sort, .exact_sort_filter => false,
+            .dense, .dense_filter, .sparse_filter, .graph_expand, .algebraic_filter, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_boolean, .exact_sort_index_sort, .exact_sort_index_sort_filter, .exact_sort_filter => false,
             .full_text, .hybrid_composed, .hybrid, .hybrid_filter, .hybrid_filter_exclude, .hybrid_filter_exclude_project, .exact_sort_full_text => true,
         };
     }
 
     fn usesDense(self: QueryShape) bool {
         return switch (self) {
-            .full_text, .sparse_filter, .graph_expand, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_boolean, .exact_sort_index_sort, .exact_sort_full_text, .exact_sort_filter => false,
+            .full_text, .sparse_filter, .graph_expand, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_boolean, .exact_sort_index_sort, .exact_sort_index_sort_filter, .exact_sort_full_text, .exact_sort_filter => false,
             .dense, .dense_filter, .algebraic_filter, .hybrid_composed, .hybrid, .hybrid_filter, .hybrid_filter_exclude, .hybrid_filter_exclude_project => true,
         };
     }
@@ -157,13 +160,13 @@ const QueryShape = enum {
         return switch (self) {
             .dense, .full_text, .graph_expand, .hybrid, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_boolean, .exact_sort_index_sort, .exact_sort_full_text => false,
             .dense_filter, .sparse_filter, .algebraic_filter, .hybrid_composed => true,
-            .hybrid_filter, .hybrid_filter_exclude, .hybrid_filter_exclude_project, .exact_sort_filter => true,
+            .hybrid_filter, .hybrid_filter_exclude, .hybrid_filter_exclude_project, .exact_sort_index_sort_filter, .exact_sort_filter => true,
         };
     }
 
     fn usesExclusion(self: QueryShape) bool {
         return switch (self) {
-            .dense, .full_text, .dense_filter, .sparse_filter, .graph_expand, .algebraic_filter, .hybrid_composed, .hybrid, .hybrid_filter, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_boolean, .exact_sort_index_sort, .exact_sort_full_text, .exact_sort_filter => false,
+            .dense, .full_text, .dense_filter, .sparse_filter, .graph_expand, .algebraic_filter, .hybrid_composed, .hybrid, .hybrid_filter, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_boolean, .exact_sort_index_sort, .exact_sort_index_sort_filter, .exact_sort_full_text, .exact_sort_filter => false,
             .hybrid_filter_exclude, .hybrid_filter_exclude_project => true,
         };
     }
@@ -178,7 +181,7 @@ const QueryShape = enum {
 
     fn usesExactSort(self: QueryShape) bool {
         return switch (self) {
-            .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_boolean, .exact_sort_index_sort, .exact_sort_full_text, .exact_sort_filter => true,
+            .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_boolean, .exact_sort_index_sort, .exact_sort_index_sort_filter, .exact_sort_full_text, .exact_sort_filter => true,
             else => false,
         };
     }
@@ -353,7 +356,10 @@ const VisibilitySnapshot = struct {
 };
 
 fn benchmarkSchemaJson(cfg: Config) []const u8 {
-    return if (cfg.query_shape == .exact_sort_index_sort) benchmark_index_sort_schema_json else benchmark_schema_json;
+    return switch (cfg.query_shape) {
+        .exact_sort_index_sort, .exact_sort_index_sort_filter => benchmark_index_sort_schema_json,
+        else => benchmark_schema_json,
+    };
 }
 
 const MemoryBreakdown = struct {
@@ -465,6 +471,11 @@ const QueryBenchStats = struct {
     profile_sort_sorted_segment_count: u64 = 0,
     profile_sort_index_sort_reason_count: u64 = 0,
     profile_sort_index_sort_covered_count: u64 = 0,
+    profile_sort_native_filter_count: u64 = 0,
+    profile_sort_native_filter_doc_nums_count: u64 = 0,
+    profile_sort_selective_filter_doc_values_count: u64 = 0,
+    profile_sort_native_filter_candidate_count: u64 = 0,
+    profile_sort_native_filter_exclusion_count: u64 = 0,
     profile_sort_source_isolated_count: u64 = 0,
     profile_sort_candidate_count: u64 = 0,
     profile_sort_selected_count: u64 = 0,
@@ -579,8 +590,13 @@ const QueryResponseWire = struct {
                 plan: []const u8 = "",
                 exactness: []const u8 = "",
                 source: []const u8 = "",
+                candidate_source: []const u8 = "",
                 source_load: []const u8 = "",
                 selection_reason: []const u8 = "",
+                native_filter_mode: []const u8 = "",
+                native_filter_candidate_count: u64 = 0,
+                native_filter_exclusion_count: u64 = 0,
+                selective_filter_doc_values_preferred: bool = false,
                 native_doc_values_coverage: []const u8 = "",
                 index_sort_coverage: []const u8 = "",
                 index_sort_match: bool = false,
@@ -2135,6 +2151,11 @@ fn accumulateParsedResponse(stats: *QueryBenchStats, parsed: QueryResponseWire, 
             if (std.mem.eql(u8, sort.plan, "sorted_segment_seek")) stats.profile_sort_sorted_segment_count += 1;
             if (std.mem.eql(u8, sort.selection_reason, "index_sort_sorted_segment_seek")) stats.profile_sort_index_sort_reason_count += 1;
             if (sort.index_sort_match and std.mem.eql(u8, sort.index_sort_coverage, "covered_with_bounds")) stats.profile_sort_index_sort_covered_count += 1;
+            if (std.mem.eql(u8, sort.candidate_source, "native_filter")) stats.profile_sort_native_filter_count += 1;
+            if (std.mem.eql(u8, sort.native_filter_mode, "doc_nums")) stats.profile_sort_native_filter_doc_nums_count += 1;
+            if (std.mem.eql(u8, sort.selection_reason, "selective_filter_doc_values_collector") and sort.selective_filter_doc_values_preferred) {
+                stats.profile_sort_selective_filter_doc_values_count += 1;
+            }
             if (std.mem.eql(u8, sort.source_load, "source_free") or
                 std.mem.eql(u8, sort.source_load, "projected_source_after_page"))
             {
@@ -2147,6 +2168,8 @@ fn accumulateParsedResponse(stats: *QueryBenchStats, parsed: QueryResponseWire, 
             stats.profile_sort_native_doc_value_miss_count += sort.native_doc_value_miss_count;
             stats.profile_sort_stored_json_load_count += sort.stored_json_load_count;
             stats.profile_sort_projected_source_load_count += sort.projected_source_load_count;
+            stats.profile_sort_native_filter_candidate_count += sort.native_filter_candidate_count;
+            stats.profile_sort_native_filter_exclusion_count += sort.native_filter_exclusion_count;
         }
         if (profile.dense_search) |dense| {
             stats.profile_dense_search_count += 1;
@@ -2249,6 +2272,18 @@ fn enforceExactSortGuardrail(cfg: Config, stats: QueryBenchStats) !void {
         std.debug.print(
             "public-query guardrail failed: exact sort did not use native_doc_values_top_n for every query native_count={d} queries={d}\n",
             .{ stats.profile_sort_native_doc_values_count, stats.queries },
+        );
+        return error.ExactSortGuardrailFailed;
+    }
+    if (cfg.query_shape == .exact_sort_index_sort_filter and
+        (stats.profile_sort_native_filter_count != stats.queries or
+            stats.profile_sort_native_filter_doc_nums_count != stats.queries or
+            stats.profile_sort_selective_filter_doc_values_count != stats.queries or
+            stats.profile_sort_native_filter_candidate_count == 0))
+    {
+        std.debug.print(
+            "public-query guardrail failed: filtered index_sort exact sort did not use selective native-filter doc-values collector native_filter_count={d} doc_nums_count={d} selective_count={d} native_filter_candidates={d} queries={d}\n",
+            .{ stats.profile_sort_native_filter_count, stats.profile_sort_native_filter_doc_nums_count, stats.profile_sort_selective_filter_doc_values_count, stats.profile_sort_native_filter_candidate_count, stats.queries },
         );
         return error.ExactSortGuardrailFailed;
     }
