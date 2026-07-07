@@ -70,6 +70,7 @@ const QueryShape = enum {
     hybrid_filter_exclude_project,
     exact_sort_match_all,
     exact_sort_cursor,
+    exact_sort_before_cursor,
     exact_sort_full_text,
     exact_sort_filter,
 
@@ -87,6 +88,7 @@ const QueryShape = enum {
         if (std.mem.eql(u8, raw, "hybrid-filter-exclude-project")) return .hybrid_filter_exclude_project;
         if (std.mem.eql(u8, raw, "exact-sort-match-all")) return .exact_sort_match_all;
         if (std.mem.eql(u8, raw, "exact-sort-cursor")) return .exact_sort_cursor;
+        if (std.mem.eql(u8, raw, "exact-sort-before-cursor")) return .exact_sort_before_cursor;
         if (std.mem.eql(u8, raw, "exact-sort-full-text")) return .exact_sort_full_text;
         if (std.mem.eql(u8, raw, "exact-sort-filter")) return .exact_sort_filter;
         return null;
@@ -107,6 +109,7 @@ const QueryShape = enum {
             .hybrid_filter_exclude_project => "hybrid-filter-exclude-project",
             .exact_sort_match_all => "exact-sort-match-all",
             .exact_sort_cursor => "exact-sort-cursor",
+            .exact_sort_before_cursor => "exact-sort-before-cursor",
             .exact_sort_full_text => "exact-sort-full-text",
             .exact_sort_filter => "exact-sort-filter",
         };
@@ -114,14 +117,14 @@ const QueryShape = enum {
 
     fn usesFullText(self: QueryShape) bool {
         return switch (self) {
-            .dense, .dense_filter, .sparse_filter, .graph_expand, .algebraic_filter, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_filter => false,
+            .dense, .dense_filter, .sparse_filter, .graph_expand, .algebraic_filter, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_filter => false,
             .full_text, .hybrid_composed, .hybrid, .hybrid_filter, .hybrid_filter_exclude, .hybrid_filter_exclude_project, .exact_sort_full_text => true,
         };
     }
 
     fn usesDense(self: QueryShape) bool {
         return switch (self) {
-            .full_text, .sparse_filter, .graph_expand, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_full_text, .exact_sort_filter => false,
+            .full_text, .sparse_filter, .graph_expand, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_full_text, .exact_sort_filter => false,
             .dense, .dense_filter, .algebraic_filter, .hybrid_composed, .hybrid, .hybrid_filter, .hybrid_filter_exclude, .hybrid_filter_exclude_project => true,
         };
     }
@@ -136,7 +139,7 @@ const QueryShape = enum {
 
     fn usesFilter(self: QueryShape) bool {
         return switch (self) {
-            .dense, .full_text, .graph_expand, .hybrid, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_full_text => false,
+            .dense, .full_text, .graph_expand, .hybrid, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_full_text => false,
             .dense_filter, .sparse_filter, .algebraic_filter, .hybrid_composed => true,
             .hybrid_filter, .hybrid_filter_exclude, .hybrid_filter_exclude_project, .exact_sort_filter => true,
         };
@@ -144,7 +147,7 @@ const QueryShape = enum {
 
     fn usesExclusion(self: QueryShape) bool {
         return switch (self) {
-            .dense, .full_text, .dense_filter, .sparse_filter, .graph_expand, .algebraic_filter, .hybrid_composed, .hybrid, .hybrid_filter, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_full_text, .exact_sort_filter => false,
+            .dense, .full_text, .dense_filter, .sparse_filter, .graph_expand, .algebraic_filter, .hybrid_composed, .hybrid, .hybrid_filter, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_full_text, .exact_sort_filter => false,
             .hybrid_filter_exclude, .hybrid_filter_exclude_project => true,
         };
     }
@@ -159,13 +162,17 @@ const QueryShape = enum {
 
     fn usesExactSort(self: QueryShape) bool {
         return switch (self) {
-            .exact_sort_match_all, .exact_sort_cursor, .exact_sort_full_text, .exact_sort_filter => true,
+            .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_full_text, .exact_sort_filter => true,
             else => false,
         };
     }
 
     fn usesExactSortCursor(self: QueryShape) bool {
-        return self == .exact_sort_cursor;
+        return self == .exact_sort_cursor or self == .exact_sort_before_cursor;
+    }
+
+    fn usesExactSortBeforeCursor(self: QueryShape) bool {
+        return self == .exact_sort_before_cursor;
     }
 
     fn requiresSchema(self: QueryShape) bool {
@@ -1816,7 +1823,7 @@ const ProfiledDenseBenchQuery = struct {
 fn profiledDenseBenchQuery(req: db_mod.types.SearchRequest, query_shape: QueryShape) ?ProfiledDenseBenchQuery {
     switch (query_shape) {
         .dense, .dense_filter, .algebraic_filter => {},
-        .full_text, .sparse_filter, .graph_expand, .hybrid_composed, .hybrid, .hybrid_filter, .hybrid_filter_exclude, .hybrid_filter_exclude_project, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_full_text, .exact_sort_filter => return null,
+        .full_text, .sparse_filter, .graph_expand, .hybrid_composed, .hybrid, .hybrid_filter, .hybrid_filter_exclude, .hybrid_filter_exclude_project, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_full_text, .exact_sort_filter => return null,
     }
     if (req.sparse != null or req.sparse_queries.len > 0) return null;
     if (req.graph_queries.len > 0) return null;
@@ -3571,7 +3578,7 @@ fn encodeQueryJson(alloc: std.mem.Allocator, vector: []const f32, source_doc_idx
         try out.appendSlice(alloc, ",\"order_by\":[{\"field\":\"score\",\"desc\":true}]");
         if (cfg.query_shape.usesExactSortCursor()) {
             const cursor_doc_idx = exactSortCursorDocIndex(source_doc_idx, cfg);
-            try out.appendSlice(alloc, ",\"search_after\":[");
+            try out.appendSlice(alloc, if (cfg.query_shape.usesExactSortBeforeCursor()) ",\"search_before\":[" else ",\"search_after\":[");
             try out.print(alloc, "{d},\"doc:{d:0>8}\"]", .{ docScore(cursor_doc_idx), cursor_doc_idx });
         }
     }

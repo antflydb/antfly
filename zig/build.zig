@@ -6637,6 +6637,7 @@ pub fn build(b: *std.Build) void {
     const public_query_sort_guardrail_shapes = [_][]const u8{
         "exact-sort-match-all",
         "exact-sort-cursor",
+        "exact-sort-before-cursor",
         "exact-sort-full-text",
         "exact-sort-filter",
     };
