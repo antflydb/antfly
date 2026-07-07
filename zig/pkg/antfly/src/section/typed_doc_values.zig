@@ -907,10 +907,21 @@ test "typed doc values bytes round-trip" {
     const data = try writer.build();
     defer alloc.free(data);
 
-    // Just verify it builds without error — bytes getters would need
-    // a separate API since they're variable length
-    try std.testing.expect(data.len > 5);
-    const reader = try TypedDocValuesReader.init(alloc, data);
+    var reader = try TypedDocValuesReader.init(alloc, data);
     try std.testing.expectEqual(ValueType.bytes_val, reader.value_type);
     try std.testing.expectEqual(@as(u32, 1), reader.num_chunks);
+
+    const doc0 = (try reader.getBytesAlloc(0)).?;
+    defer alloc.free(doc0);
+    try std.testing.expectEqualStrings("hello", doc0);
+
+    const doc1 = (try reader.getBytesAlloc(1)).?;
+    defer alloc.free(doc1);
+    try std.testing.expectEqualStrings("world", doc1);
+
+    try std.testing.expect((try reader.getBytesAlloc(2)) == null);
+
+    const doc_ids = try reader.readValidatedChunkDocIds(0);
+    defer alloc.free(doc_ids);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1 }, doc_ids);
 }

@@ -2870,6 +2870,7 @@ pub fn build(b: *std.Build) void {
         "document mapper flushes schema index_sort segments in physical sort order",
         "document mapper validates schema index_sort field capabilities",
         "document mapper emits schema geo point typed doc values",
+        "typed doc values bytes round-trip",
         "cover bounding box enforces budget with hashed deduplication",
         "cover bounding box rejects invalid bounds",
         "geo distance filter",
