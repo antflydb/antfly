@@ -443,7 +443,8 @@ pub const Store = struct {
             const key = try jobKey(self.alloc, job_id);
             defer self.alloc.free(key);
             if (next_job_id) |next| {
-                const next_raw = try encodeNextJobId(self.alloc, next);
+                const durable_next = @max(next, self.next_job_id);
+                const next_raw = try encodeNextJobId(self.alloc, durable_next);
                 defer self.alloc.free(next_raw);
                 const writes = [_]docstore_mod.KVPair{
                     .{ .key = key, .value = encoded },
@@ -740,6 +741,88 @@ test "artifact reprocess job store recovers durable jobs and reseeds ids" {
         defer parsed_first.deinit();
         try std.testing.expectEqual(@as(u64, 1), parsed_first.value.job_id);
         try std.testing.expectEqualStrings("queued", parsed_first.value.phase);
+    }
+}
+
+test "artifact reprocess job store persists monotonic next id across stale durable writes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/artifact-reprocess-jobs-monotonic-next-id", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    {
+        const opened = try alloc.create(OpenedStore);
+        errdefer alloc.destroy(opened);
+        opened.* = try OpenedStore.open(alloc, path);
+        var store = Store.init(alloc, .{});
+        defer store.deinit();
+        try store.attachOpenedStore(opened);
+
+        const first = store.reserveJobId();
+        const second = store.reserveJobId();
+        try std.testing.expectEqual(@as(u64, 1), first.job_id);
+        try std.testing.expectEqual(@as(u64, 2), second.job_id);
+
+        const now_ms = nowMillis();
+        const encoded_second = try encodeState(alloc, .{
+            .job_id = second.job_id,
+            .table_name = "docs",
+            .artifact_name = "document_units_v1",
+            .phase = phaseString(.queued),
+            .reprocess_status = "in_progress",
+            .from_key = "",
+            .to_key = "",
+            .limit = 1,
+            .created_at_millis = now_ms,
+            .last_updated_at_millis = now_ms,
+            .expires_at_millis = now_ms + store.retentionMillis(),
+        });
+        defer alloc.free(encoded_second);
+        try store.storeEncoded(second.job_id, encoded_second, second.next_job_id);
+
+        const encoded_first = try encodeState(alloc, .{
+            .job_id = first.job_id,
+            .table_name = "docs",
+            .artifact_name = "document_units_v1",
+            .phase = phaseString(.queued),
+            .reprocess_status = "in_progress",
+            .from_key = "",
+            .to_key = "",
+            .limit = 1,
+            .created_at_millis = now_ms,
+            .last_updated_at_millis = now_ms,
+            .expires_at_millis = now_ms + store.retentionMillis(),
+        });
+        defer alloc.free(encoded_first);
+        try store.storeEncoded(first.job_id, encoded_first, first.next_job_id);
+    }
+
+    {
+        const opened = try alloc.create(OpenedStore);
+        errdefer alloc.destroy(opened);
+        opened.* = try OpenedStore.open(alloc, path);
+        var store = Store.init(alloc, .{});
+        defer store.deinit();
+        try store.attachOpenedStore(opened);
+
+        const third = try store.startJob(alloc, "docs", "document_units_v1", .{ .limit = 1 });
+        defer alloc.free(third);
+        var parsed_third = try std.json.parseFromSlice(JobState, alloc, third, .{ .ignore_unknown_fields = true });
+        defer parsed_third.deinit();
+        try std.testing.expectEqual(@as(u64, 3), parsed_third.value.job_id);
+
+        const first = (try store.loadJobAlloc(alloc, 1)) orelse return error.TestUnexpectedResult;
+        defer alloc.free(first);
+        var parsed_first = try std.json.parseFromSlice(JobState, alloc, first, .{ .ignore_unknown_fields = true });
+        defer parsed_first.deinit();
+        try std.testing.expectEqual(@as(u64, 1), parsed_first.value.job_id);
+
+        const second = (try store.loadJobAlloc(alloc, 2)) orelse return error.TestUnexpectedResult;
+        defer alloc.free(second);
+        var parsed_second = try std.json.parseFromSlice(JobState, alloc, second, .{ .ignore_unknown_fields = true });
+        defer parsed_second.deinit();
+        try std.testing.expectEqual(@as(u64, 2), parsed_second.value.job_id);
     }
 }
 

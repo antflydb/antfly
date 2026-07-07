@@ -2357,6 +2357,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "artifact reprocess job store starts and updates a job",
             "artifact reprocess job store recovers durable jobs and reseeds ids",
+            "artifact reprocess job store persists monotonic next id across stale durable writes",
             "artifact reprocess job cleanup removes recovered durable expired jobs",
             "artifact reprocess job store applies running cancellation at pass boundary",
             "artifact reprocess job store records cancel requested across stale queued token",
@@ -2364,6 +2365,7 @@ pub fn build(b: *std.Build) void {
             "repair job store applies running cancellation at pass boundary",
             "repair job store records cancel requested across stale queued token",
             "repair job store does not expire future live running heartbeat",
+            "table repair job store persists monotonic next id across stale durable writes",
             "api http client maps remote repair cancel unavailable",
             "internal group artifact repair rejects callback token without cancel executor",
             "table repair job records bounded pass and continuation",
