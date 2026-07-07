@@ -3430,6 +3430,7 @@ pub fn build(b: *std.Build) void {
         "schema numeric u64 doc values back native sort planner without rounding",
         "schema numeric i64 doc values back native sort planner",
         "schema boolean doc values back native sort planner",
+        "db exact sort resolves mapped geo metadata filters from typed doc values",
     };
     const lib_db_query_tests = b.addTest(.{
         .root_module = lib_test_mod,

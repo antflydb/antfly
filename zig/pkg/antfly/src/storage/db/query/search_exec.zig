@@ -8388,7 +8388,7 @@ fn searchQueryCanUseMappedDocValues(
     const schema = runtime_schema orelse return false;
     const mapping = runtime_schema_mod.resolveDeclaredFieldType(schema, field) orelse return false;
     if (mapping.field_type != expected_type) return false;
-    if (!runtime_schema_mod.mappingIsAggregatable(mapping)) return false;
+    if (!runtime_schema_mod.mappingHasNativeDocValues(mapping)) return false;
     return try snapshotTypedDocValuesCoverageForMapping(snapshot, field, mapping) == .covered;
 }
 
@@ -8400,7 +8400,7 @@ fn searchQueryCanUseMappedGeoDocValues(
     const schema = runtime_schema orelse return false;
     const mapping = runtime_schema_mod.resolveDeclaredFieldType(schema, field) orelse return false;
     if (mapping.field_type != .geopoint) return false;
-    if (!mapping.doc_values) return false;
+    if (!runtime_schema_mod.mappingHasNativeDocValues(mapping)) return false;
     return try snapshotGeoPointDocValuesCoverage(snapshot, field) == .covered;
 }
 
