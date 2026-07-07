@@ -6,15 +6,40 @@ const std = @import("std");
 /// Stable HA node or slot identifier. Identifiers are 1-128 ASCII bytes and may contain letters, digits, `_`, `-`, `.`, and `:`.
 pub const HAIdentifier = []const u8;
 
-/// Stable standby replication slot name.
-pub const HASlotName = []const u8;
-
 pub const HAIdentity = struct {
     cluster_id: i64,
     shard_id: i64,
     table_id: i64,
     timeline_id: i64,
     epoch: i64,
+};
+
+pub const HAPayloadCodec = enum {
+    raw,
+    json,
+    binary,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .raw => "raw",
+            .json => "json",
+            .binary => "binary",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "raw", .raw },
+            .{ "json", .json },
+            .{ "binary", .binary },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 pub const HARecordKind = enum {
@@ -63,32 +88,22 @@ pub const HARecordKind = enum {
     }
 };
 
-pub const HAPayloadCodec = enum {
-    raw,
-    json,
-    binary,
+/// Stable standby replication slot name.
+pub const HASlotName = []const u8;
 
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .raw => "raw",
-            .json => "json",
-            .binary => "binary",
-        };
-        try jw.write(s);
-    }
+pub const HAIdentifySystemResponse = struct {
+    identity: HAIdentity,
+    current_lsn: i64,
+    next_lsn: i64,
+    record_format_version: i64,
+};
 
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "raw", .raw },
-            .{ "json", .json },
-            .{ "binary", .binary },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
+pub const HAReplicationFrame = struct {
+    lsn: i64,
+    kind: HARecordKind,
+    payload_codec: HAPayloadCodec,
+    /// Base64-encoded complete replication record envelope.
+    encoded: []const u8,
 };
 
 pub const HACreateReplicationSlotRequest = struct {
@@ -110,15 +125,6 @@ pub const HAReplicationSlotResponse = struct {
     current_lsn: i64,
 };
 
-pub const HAStartReplicationRequest = struct {
-    slot_name: HASlotName,
-    from_lsn: i64,
-    /// Optional maximum record count. Zero means no record-count limit.
-    max_records: ?i64 = null,
-    /// Optional encoded byte budget. Zero means no byte limit.
-    max_encoded_bytes: ?i64 = null,
-};
-
 pub const HAStandbyStatusUpdateRequest = struct {
     slot_name: HASlotName,
     timeline_id: i64,
@@ -128,32 +134,13 @@ pub const HAStandbyStatusUpdateRequest = struct {
     safe_read_lsn: ?i64 = null,
 };
 
-pub const HAIdentifySystemResponse = struct {
-    identity: HAIdentity,
-    current_lsn: i64,
-    next_lsn: i64,
-    record_format_version: i64,
-};
-
-pub const HAReplicationFrame = struct {
-    lsn: i64,
-    kind: HARecordKind,
-    payload_codec: HAPayloadCodec,
-    /// Base64-encoded complete replication record envelope.
-    encoded: []const u8,
-};
-
-pub const HAStandbyStatusUpdateResponse = struct {
+pub const HAStartReplicationRequest = struct {
     slot_name: HASlotName,
-    timeline_id: i64,
-    restart_lsn: i64,
-    received_lsn: i64,
-    applied_lsn: i64,
-    safe_read_lsn: i64,
-    active: bool,
-    reseed_required: bool,
-    last_error: ?[]const u8 = null,
-    current_lsn: i64,
+    from_lsn: i64,
+    /// Optional maximum record count. Zero means no record-count limit.
+    max_records: ?i64 = null,
+    /// Optional encoded byte budget. Zero means no byte limit.
+    max_encoded_bytes: ?i64 = null,
 };
 
 pub const HAStartReplicationResponse = struct {
@@ -168,4 +155,17 @@ pub const HAStartReplicationResponse = struct {
     end_of_wal: bool,
     encoded_bytes: i64,
     records: []const HAReplicationFrame,
+};
+
+pub const HAStandbyStatusUpdateResponse = struct {
+    slot_name: HASlotName,
+    timeline_id: i64,
+    restart_lsn: i64,
+    received_lsn: i64,
+    applied_lsn: i64,
+    safe_read_lsn: i64,
+    active: bool,
+    reseed_required: bool,
+    last_error: ?[]const u8 = null,
+    current_lsn: i64,
 };
