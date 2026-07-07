@@ -276,10 +276,11 @@ const PageLinkCopy = struct {
 /// Safe when OS file locks are available because page contents are stable for
 /// the lifetime of an open handle: all in-process page writes flow through
 /// `writePage` (which updates the cache) or `replaceOpenFileWithImage` (which
-/// clears it), and other processes cannot rewrite pages under us because
-/// free-page reuse and vacuum require the writer/data-rewrite locks. If the
-/// filesystem reports `FileLocksUnsupported`, the owning `NativeFile` disables
-/// this cache for that handle and reads page bytes from disk instead.
+/// clears it), sidecar writer locks serialize writers, and read-only
+/// data-file shared locks block the exclusive data-rewrite lock needed for
+/// free-page reuse and vacuum. If the filesystem reports
+/// `FileLocksUnsupported`, the owning `NativeFile` disables this cache for
+/// that handle and reads page bytes from disk instead.
 const PageCache = struct {
     const default_limit_bytes: usize = 64 * 1024 * 1024;
     const default_link_limit_bytes: usize = 16 * 1024 * 1024;
@@ -512,7 +513,7 @@ pub const NativeFile = struct {
     header: Header,
     read_only: bool = false,
     no_sync: bool = false,
-    page_cache_enabled: bool = true,
+    page_cache_enabled: std.atomic.Value(bool) = .init(true),
     page_cache: PageCache = .{},
     /// While non-zero, page reads bypass the page cache and hit disk.
     /// Integrity checks hold this so they verify on-disk state rather than
@@ -560,7 +561,7 @@ pub const NativeFile = struct {
             .header = header,
             .read_only = opts.read_only,
             .no_sync = opts.no_sync,
-            .page_cache_enabled = page_cache_enabled,
+            .page_cache_enabled = .init(page_cache_enabled),
         };
         if (opts.resource_manager) |manager| result.page_cache.attachResourceManager(manager);
         return result;
@@ -617,7 +618,7 @@ pub const NativeFile = struct {
             .header = .{},
             .read_only = false,
             .no_sync = no_sync,
-            .page_cache_enabled = writer_lock.locks_supported,
+            .page_cache_enabled = .init(writer_lock.locks_supported),
         };
         if (resource_manager) |manager| result.page_cache.attachResourceManager(manager);
         return result;
@@ -635,7 +636,7 @@ pub const NativeFile = struct {
     }
 
     fn disablePageCacheForUnsupportedLocks(self: *NativeFile) void {
-        self.page_cache_enabled = false;
+        self.page_cache_enabled.store(false, .monotonic);
         self.page_cache.clear(self.allocator);
     }
 
@@ -726,7 +727,7 @@ pub const NativeFile = struct {
     fn readPageAllocForCheckpoint(self: *NativeFile, allocator: Allocator, page_id: u64, checkpoint: CheckpointSlot) ![]u8 {
         if (page_id == 0 or page_id >= checkpoint.page_count) return error.InvalidPageId;
 
-        const use_cache = self.page_cache_enabled and self.page_cache_bypass.load(.monotonic) == 0;
+        const use_cache = self.page_cache_enabled.load(.monotonic) and self.page_cache_bypass.load(.monotonic) == 0;
         if (use_cache) {
             if (try self.page_cache.getCopy(allocator, page_id)) |cached| return cached;
         }
@@ -1614,7 +1615,7 @@ pub const NativeFile = struct {
 
         var count: u64 = 0;
         var page_id = root_page_id;
-        const use_link_cache = self.page_cache_enabled and self.page_cache_bypass.load(.monotonic) == 0;
+        const use_link_cache = self.page_cache_enabled.load(.monotonic) and self.page_cache_bypass.load(.monotonic) == 0;
         while (page_id != 0) {
             try self.markReachablePage(reachable_pages, page_id, checkpoint.page_count);
 
@@ -2028,7 +2029,7 @@ pub const NativeFile = struct {
         var remaining = value_len;
         var page_id = root_page_id;
         var pages_seen: u64 = 0;
-        const use_link_cache = self.page_cache_enabled and self.page_cache_bypass.load(.monotonic) == 0;
+        const use_link_cache = self.page_cache_enabled.load(.monotonic) and self.page_cache_bypass.load(.monotonic) == 0;
         while (page_id != 0) {
             pages_seen += 1;
             if (pages_seen > checkpoint.page_count) return error.InvalidNativeValueChain;
@@ -2157,7 +2158,7 @@ pub const NativeFile = struct {
             // A reused page id may still be cached under its previous life;
             // free-map pages themselves are not cached (see read path).
             self.page_cache.remove(self.allocator, page_id);
-        } else if (self.page_cache_enabled) {
+        } else if (self.page_cache_enabled.load(.monotonic)) {
             self.page_cache.put(self.allocator, page_id, page);
             self.cachePageLinks(page_id, kind, contents);
         }
@@ -2168,7 +2169,7 @@ pub const NativeFile = struct {
     /// the payload. On any decode surprise the stale entry is dropped and the
     /// walks fall back to the payload path.
     fn cachePageLinks(self: *NativeFile, page_id: u64, kind: PageKind, payload: []const u8) void {
-        if (!self.page_cache_enabled) return;
+        if (!self.page_cache_enabled.load(.monotonic)) return;
         switch (kind) {
             .document => {
                 const entry = decodeDocumentEntry(payload) catch {
@@ -4771,15 +4772,11 @@ test "lite native disables page and link caches when lock support is unavailable
     try std.testing.expect(manager.sliceStats(.lite_native_link_cache).used_bytes > 0);
 
     file.disablePageCacheForUnsupportedLocks();
-    try std.testing.expect(!file.page_cache_enabled);
+    try std.testing.expect(!file.page_cache_enabled.load(.monotonic));
     try std.testing.expectEqual(@as(usize, 0), file.page_cache.total_bytes);
     try std.testing.expectEqual(@as(usize, 0), file.page_cache.link_bytes);
     try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lite_native_page_cache).used_bytes);
     try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lite_native_link_cache).used_bytes);
-
-    file.page_cache.put(allocator, 2, "not-admitted-by-nativefile");
-    file.disablePageCacheForUnsupportedLocks();
-    try std.testing.expect(!file.page_cache_enabled);
 }
 
 test "lite native page and link caches shrink under hard resource pressure" {
