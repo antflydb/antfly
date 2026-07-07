@@ -3,15 +3,13 @@ SHELL := /bin/bash
 ZIG ?= zig
 ZIG_BUILD_FLAGS ?=
 UV ?= uv
+GIT ?= git
 SCRIPTS_PY := $(UV) run --project ../scripts --locked python
 INFERENCE_BIN ?= ./zig-out/bin/antfly
-OPENAPI_CODEGEN_SOURCES := build.zig build.zig.zon $(wildcard lib/openapi/src/*.zig)
-OPENAPI_CODEGEN_CACHE_KEY := $(shell git hash-object $(OPENAPI_CODEGEN_SOURCES) | git hash-object --stdin)
-ifeq ($(strip $(OPENAPI_CODEGEN_CACHE_KEY)),)
-$(error failed to compute OPENAPI_CODEGEN_CACHE_KEY; ensure git is available)
-endif
+OPENAPI_CODEGEN_SOURCES = build.zig build.zig.zon $(wildcard lib/openapi/src/*.zig)
+OPENAPI_CODEGEN_CACHE_KEY = $(strip $(shell $(GIT) hash-object $(OPENAPI_CODEGEN_SOURCES) 2>/dev/null | $(GIT) hash-object --stdin 2>/dev/null))
 OPENAPI_CODEGEN_CACHE_DIR ?= .zig-cache/openapi-generate-$(OPENAPI_CODEGEN_CACHE_KEY)
-OPENAPI_ZIG_BUILD := $(ZIG) build --cache-dir $(OPENAPI_CODEGEN_CACHE_DIR)
+OPENAPI_ZIG_BUILD = $(if $(OPENAPI_CODEGEN_CACHE_KEY),$(ZIG) build --cache-dir $(OPENAPI_CODEGEN_CACHE_DIR),$(error failed to compute OPENAPI_CODEGEN_CACHE_KEY; ensure git is available))
 
 # ====================================================================================
 # Build
