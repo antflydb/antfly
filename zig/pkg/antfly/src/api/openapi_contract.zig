@@ -65,8 +65,8 @@ test "public openapi contract module is generated and wired" {
     try std.testing.expect(@hasField(client_generated.FieldCapability, "index_sort_position"));
     try std.testing.expect(@hasField(client_generated.FieldCapability, "index_sort_order"));
     try std.testing.expect(@hasDecl(generated, "IndexStatus"));
-    try std.testing.expect(@hasDecl(generated, "IndexStats"));
-    try std.testing.expect(@hasDecl(generated, "FullTextIndexStats"));
+    try std.testing.expect(@FieldType(generated.IndexStatus, "status") == indexes_generated.IndexStats);
+    try std.testing.expect(@FieldType(generated.IndexStatus, "shard_status") == std.json.ArrayHashMap(indexes_generated.IndexStats));
     try std.testing.expect(@hasDecl(generated, "TableMigration"));
     try std.testing.expect(@hasDecl(generated, "QueryRequest"));
     try std.testing.expect(@hasField(generated.QueryRequest, "order_by"));
@@ -388,9 +388,12 @@ test "public index contract exposes runtime status metadata" {
 
 test "indexes openapi parses algebraic status as algebraic stats" {
     const alloc = std.testing.allocator;
-    var parsed = try std.json.parseFromSlice(indexes_generated.IndexStats, alloc,
+    var source = try std.json.parseFromSlice(std.json.Value, alloc,
         \\{"index_type":"algebraic","total_indexed":3,"healthy":true,"parse_error_count":0,"planner_last_decision":"fallback","planner_last_fallback_reason":"no_materialization","planner_last_estimated_scan_rows":61,"planner_last_estimated_result_buckets":8,"planner_lifecycle_ready":false,"planner_lifecycle_blocking_reason":"capability_lifecycle_not_ready","capability_lifecycle_status":"stale","recommendation_count":4,"adaptive_backfilling_count":1,"adaptive_ready_count":2,"adaptive_stale_count":0,"adaptive_cleanup_recommended_count":1,"active_progress_lifecycle":"backfilling","active_progress_rows_processed":7,"active_progress_target_rows":14}
     , .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+    defer source.deinit();
+
+    var parsed = try std.json.parseFromValue(indexes_generated.IndexStats, alloc, source.value, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
     defer parsed.deinit();
 
     switch (parsed.value) {
@@ -432,12 +435,17 @@ test "indexes openapi concrete stats reject wrong discriminator" {
 
 test "indexes openapi rejects stats without discriminator" {
     const alloc = std.testing.allocator;
-    try std.testing.expectError(error.MissingField, std.json.parseFromSlice(indexes_generated.IndexStats, alloc,
+    var missing_discriminator = try std.json.parseFromSlice(std.json.Value, alloc,
         \\{"total_indexed":3,"healthy":true}
-    , .{ .allocate = .alloc_always, .ignore_unknown_fields = true }));
-    try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSlice(indexes_generated.IndexStats, alloc,
+    , .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+    defer missing_discriminator.deinit();
+    try std.testing.expectError(error.MissingField, std.json.parseFromValue(indexes_generated.IndexStats, alloc, missing_discriminator.value, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }));
+
+    var unknown_discriminator = try std.json.parseFromSlice(std.json.Value, alloc,
         \\{"index_type":"unknown","total_indexed":3,"healthy":true}
-    , .{ .allocate = .alloc_always, .ignore_unknown_fields = true }));
+    , .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+    defer unknown_discriminator.deinit();
+    try std.testing.expectError(error.UnexpectedToken, std.json.parseFromValue(indexes_generated.IndexStats, alloc, unknown_discriminator.value, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }));
 }
 
 test "generated extractors: path param structs exist" {
@@ -824,16 +832,16 @@ test "metadata openapi module generates extractor surface for routed endpoints" 
     try std.testing.expect(found_delete_artifact_enrichment);
 }
 
-test "public chunker config keeps flattened provider-specific fields" {
-    try std.testing.expect(@hasField(generated.ChunkerConfig, "provider"));
-    try std.testing.expect(@hasField(generated.ChunkerConfig, "max_chunks"));
-    try std.testing.expect(@hasField(generated.ChunkerConfig, "threshold"));
-    try std.testing.expect(@hasField(generated.ChunkerConfig, "text"));
-    try std.testing.expect(@hasField(generated.ChunkerConfig, "audio"));
-    try std.testing.expect(@hasField(generated.ChunkerConfig, "api_url"));
-    try std.testing.expect(@hasField(generated.ChunkerConfig, "model"));
-    try std.testing.expect(@hasField(generated.ChunkerConfig, "store_chunks"));
-    try std.testing.expect(@hasField(generated.ChunkerConfig, "full_text_index"));
+test "client chunker config keeps flattened provider-specific fields" {
+    try std.testing.expect(@hasField(client_generated.ChunkerConfig, "provider"));
+    try std.testing.expect(@hasField(client_generated.ChunkerConfig, "max_chunks"));
+    try std.testing.expect(@hasField(client_generated.ChunkerConfig, "threshold"));
+    try std.testing.expect(@hasField(client_generated.ChunkerConfig, "text"));
+    try std.testing.expect(@hasField(client_generated.ChunkerConfig, "audio"));
+    try std.testing.expect(@hasField(client_generated.ChunkerConfig, "api_url"));
+    try std.testing.expect(@hasField(client_generated.ChunkerConfig, "model"));
+    try std.testing.expect(@hasField(client_generated.ChunkerConfig, "store_chunks"));
+    try std.testing.expect(@hasField(client_generated.ChunkerConfig, "full_text_index"));
 }
 
 test "public bundled root still exposes foreign-owned shared contract types" {
@@ -855,8 +863,9 @@ test "public openapi module resolves shared refs through owner modules" {
     try std.testing.expect(@FieldType(generated.Table, "schema") == ?schema_generated.TableSchema);
     try std.testing.expect(@FieldType(generated.QueryRequest, "pruner") == ?indexes_generated.Pruner);
     try std.testing.expect(@FieldType(generated.QueryRequest, "reranker") == ?reranking_generated.RerankerConfig);
-    try std.testing.expect(@FieldType(generated.RetrievalAgentRequest, "generation") == ?generating_api_generated.GenerationStepConfig);
-    try std.testing.expect(@FieldType(generated.RetrievalAgentRequest, "evaluators") == ?[]const eval_generated.EvaluatorName);
+    try std.testing.expect(@FieldType(generated.RetrievalAgentRequest, "steps") == ?generated.RetrievalAgentSteps);
+    try std.testing.expect(@FieldType(generated.RetrievalAgentSteps, "generation") == ?generating_api_generated.GenerationStepConfig);
+    try std.testing.expect(@FieldType(generated.RetrievalAgentSteps, "eval") == ?eval_generated.EvalConfig);
 }
 
 test "client openapi module resolves shared refs through owner modules" {
@@ -889,9 +898,10 @@ test "client openapi module resolves shared refs through owner modules" {
     try std.testing.expect(@hasDecl(client_generated.Client, "retrievalAgent"));
     try std.testing.expect(@hasField(client_generated.TableStatus, "artifact_enrichments"));
     try std.testing.expect(@hasField(client_generated.EnrichmentConfig, "full_text_index"));
-    try std.testing.expect(@FieldType(client_generated.CreateTableRequest, "schema") == ?schema_generated.TableSchema);
-    try std.testing.expect(@FieldType(client_generated.QueryRequest, "pruner") == ?indexes_generated.Pruner);
-    try std.testing.expect(@FieldType(client_generated.QueryRequest, "reranker") == ?reranking_generated.RerankerConfig);
-    try std.testing.expect(@FieldType(client_generated.RetrievalAgentRequest, "generation") == ?generating_api_generated.GenerationStepConfig);
-    try std.testing.expect(@FieldType(client_generated.RetrievalAgentRequest, "evaluators") == ?[]const eval_generated.EvaluatorName);
+    try std.testing.expect(@FieldType(client_generated.CreateTableRequest, "schema") == ?client_generated.TableSchema);
+    try std.testing.expect(@FieldType(client_generated.QueryRequest, "pruner") == ?client_generated.Pruner);
+    try std.testing.expect(@FieldType(client_generated.QueryRequest, "reranker") == ?client_generated.RerankerConfig);
+    try std.testing.expect(@FieldType(client_generated.RetrievalAgentRequest, "steps") == ?client_generated.RetrievalAgentSteps);
+    try std.testing.expect(@FieldType(client_generated.RetrievalAgentSteps, "generation") == ?client_generated.GenerationStepConfig);
+    try std.testing.expect(@FieldType(client_generated.RetrievalAgentSteps, "eval") == ?client_generated.EvalConfig);
 }

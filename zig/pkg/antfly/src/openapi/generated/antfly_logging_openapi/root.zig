@@ -3,6 +3,6 @@
 
 pub const types = @import("types.zig");
 
+pub const Config = types.Config;
 pub const Level = types.Level;
 pub const Style = types.Style;
-pub const Config = types.Config;

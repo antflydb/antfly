@@ -613,7 +613,7 @@ pub const TypeGenerator = struct {
             for (variants.items) |v| {
                 try self.w.line("if (std.mem.eql(u8, disc_str, \"{s}\")) {{", .{v.disc_value});
                 self.w.indent();
-                try self.w.line("return .{{ .{s} = try std.json.parseFromValue({s}, allocator, source, options) }};", .{ v.field, v.zig_type });
+                try self.w.line("return .{{ .{s} = try std.json.parseFromValueLeaky({s}, allocator, source, options) }};", .{ v.field, v.zig_type });
                 self.w.dedent();
                 try self.w.line("}}", .{});
             }
@@ -721,14 +721,14 @@ pub const TypeGenerator = struct {
 
         try self.w.line("fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {{", .{});
         self.w.indent();
-        try self.w.line("const parsed = std.json.parseFromValue(T, allocator, source, options) catch |err| switch (err) {{", .{});
+        try self.w.line("const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {{", .{});
         self.w.indent();
         try self.w.line("error.OutOfMemory => return err,", .{});
         try self.w.line("else => return null,", .{});
         self.w.dedent();
         try self.w.line("}};", .{});
         try self.w.line("const value = try allocator.create(T);", .{});
-        try self.w.line("value.* = parsed.value;", .{});
+        try self.w.line("value.* = parsed;", .{});
         try self.w.line("return value;", .{});
         self.w.dedent();
         try self.w.line("}}", .{});
