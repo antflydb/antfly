@@ -331,6 +331,7 @@ export type JoinType = components["schemas"]["JoinType"];
 
 // Query profiling types
 export type QueryProfile = components["schemas"]["QueryProfile"];
+export type SortProfile = components["schemas"]["SortProfile"];
 export type ShardsProfile = components["schemas"]["ShardsProfile"];
 export type RerankerProfile = components["schemas"]["RerankerProfile"];
 export type MergeProfile = components["schemas"]["MergeProfile"];

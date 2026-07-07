@@ -226,6 +226,7 @@ export type {
   QueryOptions,
   QueryProfile,
   QueryRequest,
+  SortProfile,
   // Core types
   QueryResponses,
   QueryResult,

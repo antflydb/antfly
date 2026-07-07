@@ -14,6 +14,7 @@ import type {
   QueryRequest,
   QueryResult,
   QueryStringQuery,
+  SortProfile,
   TermQuery,
 } from "../src/types.js";
 import {
@@ -81,6 +82,23 @@ describe("Antfly Query Type Integration", () => {
 
       expect(query.exclusion_query).toBeDefined();
       expectTypeOf(query.exclusion_query).toMatchTypeOf<AntflyQuery | undefined>();
+    });
+  });
+
+  describe("SortProfile diagnostics", () => {
+    it("keeps stable fields typed while allowing additive diagnostics", () => {
+      const profile: SortProfile = {
+        plan: "native_doc_values_top_n",
+        candidate_count: 7,
+        native_doc_value_load_us: 13,
+        collector_heap_peak: 5,
+      };
+
+      expect(profile.plan).toBe("native_doc_values_top_n");
+      expect(profile["native_doc_value_load_us"]).toBe(13);
+      expectTypeOf(profile.plan).toEqualTypeOf<string | undefined>();
+      expectTypeOf(profile.candidate_count).toEqualTypeOf<number | undefined>();
+      expectTypeOf(profile["native_doc_value_load_us"]).toEqualTypeOf<unknown>();
     });
   });
 
