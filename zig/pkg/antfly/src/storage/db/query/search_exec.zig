@@ -3061,8 +3061,8 @@ const SortExecutionPlan = struct {
 fn defaultSortPlanExactness(kind: SortExecutionPlanKind) SortPlanExactness {
     return switch (kind) {
         .none => .none,
-        .id_only, .id_seek, .sorted_segment_seek, .score_top_k, .native_doc_values_top_n, .distributed_k_way_merge => .exact,
-        .stored_json_debug => .bounded_exact,
+        .id_only, .id_seek, .score_top_k, .native_doc_values_top_n, .distributed_k_way_merge => .exact,
+        .sorted_segment_seek, .stored_json_debug => .bounded_exact,
         .unsupported_exact_sort => .unsupported,
     };
 }
@@ -3149,6 +3149,7 @@ test "sort execution plan dimensions default from kind unless explicit" {
     try std.testing.expectEqual(SortPlanCursorSupport.segment_seek, sortExecutionPlanCursorSupport(match_all_id_plan));
 
     const sorted_seek_plan = SortExecutionPlan{ .kind = .sorted_segment_seek };
+    try std.testing.expectEqual(SortPlanExactness.bounded_exact, sortExecutionPlanExactness(sorted_seek_plan));
     try std.testing.expectEqual(SortPlanSource.sorted_segment_scan, sortExecutionPlanSource(sorted_seek_plan));
     try std.testing.expectEqual(SortPlanCursorSupport.segment_seek, sortExecutionPlanCursorSupport(sorted_seek_plan));
     try std.testing.expectEqual(SortPlanDistributedBehavior.shard_local_only, sortExecutionPlanDistributedBehavior(sorted_seek_plan));
@@ -10348,6 +10349,7 @@ pub fn searchTextQuery(
             var sorted_plan = field_sort_plan;
             applySortCostModelDecision(&sorted_plan, cost_decision);
             sorted_plan.kind = .sorted_segment_seek;
+            sorted_plan.exactness = .bounded_exact;
             sorted_plan.source = .sorted_segment_scan;
             sorted_plan.cursor_support = .segment_seek;
             sorted_plan.source_load = .projected_source_after_page;
@@ -13696,7 +13698,7 @@ fn planMatchAllSortBeforeCandidatesAlloc(
         return .{
             .kind = .sorted_segment_seek,
             .require_native = true,
-            .exactness = .exact,
+            .exactness = .bounded_exact,
             .source = .sorted_segment_scan,
             .cursor_support = .segment_seek,
             .source_load = .projected_source_after_page,
@@ -19704,6 +19706,7 @@ test "match_all sorted segment seek merges sorted segments and applies cursors" 
     try std.testing.expectEqualStrings("doc:a", first_page.hits[0].sort_values[1].string);
     const first_profile = first_page.sort_profile orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("sorted_segment_seek", first_profile.plan);
+    try std.testing.expectEqualStrings("bounded_exact", first_profile.exactness);
     try std.testing.expectEqualStrings("sorted_segment_scan", first_profile.source);
     try std.testing.expectEqualStrings("match_all", first_profile.candidate_source);
     try std.testing.expectEqual(@as(usize, 2), first_profile.collector_heap_peak);
@@ -19736,6 +19739,7 @@ test "match_all sorted segment seek merges sorted segments and applies cursors" 
     try std.testing.expectEqual(types.TotalHitsRelation.exact, after_zero.total_hits_relation);
     const after_zero_profile = after_zero.sort_profile orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("sorted_segment_seek", after_zero_profile.plan);
+    try std.testing.expectEqualStrings("bounded_exact", after_zero_profile.exactness);
     try std.testing.expect(after_zero_profile.sorted_segment_scanned_count > 0);
 
     const before_cursor = [_]std.json.Value{
@@ -20041,6 +20045,7 @@ test "match_all sorted segment seek honors deleted old sort values after upsert"
 
     const profile = page.sort_profile orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("sorted_segment_seek", profile.plan);
+    try std.testing.expectEqualStrings("bounded_exact", profile.exactness);
     try std.testing.expectEqualStrings("sorted_segment_scan", profile.source);
     try std.testing.expectEqualStrings("source_free", profile.source_load);
     try std.testing.expectEqual(@as(u64, 0), profile.stored_json_load_count);
@@ -20070,6 +20075,7 @@ test "match_all sorted segment seek honors deleted old sort values after upsert"
     try std.testing.expectEqual(@as(usize, 2), harness.projected_load_count);
     const stored_profile = stored_page.sort_profile orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("sorted_segment_seek", stored_profile.plan);
+    try std.testing.expectEqualStrings("bounded_exact", stored_profile.exactness);
     try std.testing.expectEqualStrings("projected_source_after_page", stored_profile.source_load);
     try std.testing.expectEqual(@as(u64, 0), stored_profile.stored_json_load_count);
     try std.testing.expectEqual(@as(u64, 2), stored_profile.projected_source_load_count);
@@ -21042,6 +21048,7 @@ test "text field sort uses sorted segment membership path when index sort matche
     try std.testing.expectEqual(types.TotalHitsRelation.exact, zero_limit_result.total_hits_relation);
     const zero_limit_profile = zero_limit_result.sort_profile orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("sorted_segment_seek", zero_limit_profile.plan);
+    try std.testing.expectEqualStrings("bounded_exact", zero_limit_profile.exactness);
     try std.testing.expectEqual(@as(u64, 3), zero_limit_profile.candidate_count);
     try std.testing.expectEqual(@as(u64, 0), zero_limit_profile.window_capacity);
     try std.testing.expectEqual(@as(u64, 0), zero_limit_profile.window_len);
@@ -21413,6 +21420,7 @@ test "match_all sorted segment seek uses cursor seek within each segment" {
     try std.testing.expectEqualStrings("doc:001", first_page.hits[1].id);
     try std.testing.expectEqual(@as(usize, 2), counter.count);
     const first_profile = first_page.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("bounded_exact", first_profile.exactness);
     try std.testing.expectEqual(@as(u64, 2), first_profile.candidate_count);
     try std.testing.expectEqual(@as(u64, 2), first_profile.selected_count);
     try std.testing.expectEqual(@as(usize, 1), first_profile.collector_heap_peak);
@@ -21447,6 +21455,7 @@ test "match_all sorted segment seek uses cursor seek within each segment" {
     try std.testing.expect(counter.count < 16);
     const before_profile = before_page.sort_profile orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("sorted_segment_seek", before_profile.plan);
+    try std.testing.expectEqualStrings("bounded_exact", before_profile.exactness);
     try std.testing.expectEqualStrings("sorted_segment_scan", before_profile.source);
     try std.testing.expectEqual(@as(u64, 2), before_profile.candidate_count);
     try std.testing.expectEqual(@as(u64, 2), before_profile.selected_count);
