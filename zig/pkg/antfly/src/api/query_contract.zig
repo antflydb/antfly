@@ -110,19 +110,24 @@ pub fn publicExactSortReason(reason: []const u8, detail: []const u8) []const u8 
     {
         return "unsupported_sort_field";
     }
-    if (std.mem.eql(u8, reason, "invalid_cursor_arity")) return reason;
-    if (std.mem.eql(u8, reason, "invalid_cursor_type")) return reason;
-    if (std.mem.eql(u8, reason, "invalid_sort_tuple")) return reason;
-    if (std.mem.eql(u8, reason, "approximate_candidate_source")) return reason;
-    if (std.mem.eql(u8, reason, "candidate_budget_exceeded")) return reason;
-    if (std.mem.eql(u8, reason, "missing_null_policy")) return reason;
-    if (std.mem.eql(u8, reason, "non_score_bearing_source")) return reason;
-    if (std.mem.eql(u8, reason, "invalid_score_value")) return reason;
-    if (std.mem.eql(u8, reason, "count_only_ordered_page")) return reason;
-    if (std.mem.eql(u8, reason, "stored_json_sort_disabled")) return reason;
-    if (std.mem.eql(u8, reason, "unsupported_exact_sort")) return reason;
-    if (std.mem.eql(u8, reason, "distributed_merge_unsupported")) return reason;
+    if (std.mem.eql(u8, reason, "unsupported_exact_sort") and publicExactSortReasonIsStable(detail)) return detail;
+    if (publicExactSortReasonIsStable(reason)) return reason;
     return "unsupported_exact_sort";
+}
+
+fn publicExactSortReasonIsStable(reason: []const u8) bool {
+    return std.mem.eql(u8, reason, "invalid_cursor_arity") or
+        std.mem.eql(u8, reason, "invalid_cursor_type") or
+        std.mem.eql(u8, reason, "invalid_sort_tuple") or
+        std.mem.eql(u8, reason, "approximate_candidate_source") or
+        std.mem.eql(u8, reason, "candidate_budget_exceeded") or
+        std.mem.eql(u8, reason, "missing_null_policy") or
+        std.mem.eql(u8, reason, "non_score_bearing_source") or
+        std.mem.eql(u8, reason, "invalid_score_value") or
+        std.mem.eql(u8, reason, "count_only_ordered_page") or
+        std.mem.eql(u8, reason, "stored_json_sort_disabled") or
+        std.mem.eql(u8, reason, "unsupported_exact_sort") or
+        std.mem.eql(u8, reason, "distributed_merge_unsupported");
 }
 
 fn publicExactSortDetail(public_reason: []const u8, detail: []const u8) []const u8 {
@@ -146,6 +151,10 @@ fn expectPublicExactSortRejectionMappingForTest() !void {
     const public_reason = publicExactSortRejection("invalid_cursor_arity", "sort_tuple_arity");
     try std.testing.expectEqualStrings("invalid_cursor_arity", public_reason.reason);
     try std.testing.expectEqualStrings("invalid_cursor_arity", public_reason.detail);
+
+    const count_only = publicExactSortRejection("unsupported_exact_sort", "count_only_ordered_page");
+    try std.testing.expectEqualStrings("count_only_ordered_page", count_only.reason);
+    try std.testing.expectEqualStrings("count_only_ordered_page", count_only.detail);
 
     const unknown_internal = publicExactSortRejection("missing_private_planner_state", "private_detail");
     try std.testing.expectEqualStrings("unsupported_exact_sort", unknown_internal.reason);

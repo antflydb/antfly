@@ -11300,6 +11300,39 @@ test "api http unsupported sorted query response surfaces exact sort diagnostics
     try std.testing.expectEqualStrings("created_at", parsed.value.sort_rejection_field);
 }
 
+test "api http unsupported count ordered page response exposes stable sort reason" {
+    const alloc = std.testing.allocator;
+    db_mod.testing.recordSortRejectionDiagnostic(
+        "*",
+        "unsupported_exact_sort",
+        "count_only_ordered_page",
+    );
+    var resp = try unsupportedPublicQueryResponse(alloc,
+        \\{"count":true,"order_by":[{"field":"created_at"}]}
+    );
+    defer resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 422), resp.status);
+    try std.testing.expectEqualStrings("application/json", resp.content_type.?);
+
+    var parsed = try std.json.parseFromSlice(struct {
+        status: u16,
+        @"error": []const u8,
+        reason: []const u8,
+        sort_rejection_reason: []const u8,
+        sort_rejection_detail: []const u8,
+        sort_rejection_field: []const u8,
+    }, alloc, resp.body, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(u16, 422), parsed.value.status);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", parsed.value.@"error");
+    try std.testing.expectEqualStrings("count_only_ordered_page", parsed.value.reason);
+    try std.testing.expectEqualStrings("count_only_ordered_page", parsed.value.sort_rejection_reason);
+    try std.testing.expectEqualStrings("count_only_ordered_page", parsed.value.sort_rejection_detail);
+    try std.testing.expectEqualStrings("*", parsed.value.sort_rejection_field);
+}
+
 test "api http invalid query with sort diagnostic returns exact sort response" {
     const alloc = std.testing.allocator;
     db_mod.resetLastSortRejectionDiagnostic();
