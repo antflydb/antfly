@@ -690,18 +690,6 @@ pub const IPRangeFilter = struct {
             }
         }
 
-        // Default text indexing may analyze string fields in a way that loses exact dotted-quad
-        // terms. Fall back to stored JSON field inspection when the inverted path yields nothing.
-        if (result.isEmpty()) {
-            for (0..seg.reader.doc_count) |doc_id| {
-                const stored = (try seg.reader.storedDocDecompressed(@intCast(doc_id))) orelse continue;
-                defer alloc.free(stored.data);
-                if (try storedDocMatchesIPRange(alloc, stored.data, self.field, parsed, exact_ip)) {
-                    try result.add(@intCast(doc_id));
-                }
-            }
-        }
-
         return result;
     }
 
@@ -751,24 +739,6 @@ pub const IPRangeFilter = struct {
             (ip[1] & mask[1]) == network[1] and
             (ip[2] & mask[2]) == network[2] and
             (ip[3] & mask[3]) == network[3];
-    }
-
-    fn storedDocMatchesIPRange(
-        alloc: Allocator,
-        stored: []const u8,
-        field: []const u8,
-        parsed: ?CIDRParsed,
-        exact_ip: ?[4]u8,
-    ) !bool {
-        const doc = std.json.parseFromSlice(std.json.Value, alloc, stored, .{}) catch return false;
-        defer doc.deinit();
-        if (doc.value != .object) return false;
-        const field_value = doc.value.object.get(field) orelse return false;
-        if (field_value != .string) return false;
-        const ip = parseIPv4(field_value.string) orelse return false;
-        if (parsed) |cidr| return ipInRange(ip, cidr.network, cidr.prefix_len);
-        if (exact_ip) |wanted| return std.mem.eql(u8, wanted[0..], ip[0..]);
-        return false;
     }
 };
 
@@ -2996,6 +2966,30 @@ test "IP range filter /32 single host" {
 
     try testing.expect(bm.contains(0)); // exact match
     try testing.expect(!bm.contains(1)); // different host
+}
+
+test "IP range filter does not scan stored JSON when native terms are absent" {
+    const alloc = testing.allocator;
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    _ = try seg_writer.addField("ip");
+    try seg_writer.addStoredDoc("doc:1", "{\"ip\":\"10.0.0.1\"}");
+    const seg_bytes = try seg_writer.build();
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+
+    const snap = writer.snapshot();
+    const seg = &snap.segments[0];
+
+    const filter = Filter{ .ip_range = .{ .field = "ip", .cidr = "10.0.0.1/32" } };
+    var bm = try filter.execute(alloc, seg);
+    defer bm.deinit();
+
+    try testing.expect(bm.isEmpty());
 }
 
 test "geo shape filter point in polygon" {

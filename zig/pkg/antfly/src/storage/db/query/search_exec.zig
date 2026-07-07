@@ -8399,7 +8399,8 @@ fn searchQueryCanUseSnapshot(
         .geo_distance => |item| try searchQueryCanUseMappedGeoDocValues(snapshot, item.field, runtime_schema),
         .geo_bbox => |item| try searchQueryCanUseMappedGeoDocValues(snapshot, item.field, runtime_schema),
         .term_range => |item| try snapshot.hasInvertedField(item.field),
-        .ip_range => |item| try snapshot.hasInvertedField(item.field),
+        .ip_range => |item| (try queryFieldUsesKeywordAnalyzer(item.field, text_analysis, runtime_schema)) and
+            try snapshot.hasInvertedField(item.field),
         .geo_shape => |item| try searchQueryCanUseMappedGeoDocValues(snapshot, item.field, runtime_schema),
         .prefix => |item| try snapshot.hasInvertedField(item.field),
         .wildcard => |item| try snapshot.hasInvertedField(item.field),
@@ -9175,6 +9176,75 @@ test "pattern typed structured filters reject malformed and unbounded ranges" {
         \\{"date_range":{"path":"created_at","start_ns":1767398400000000000,"inclusive_start":"yes"}}
     , .{});
     try std.testing.expectError(error.InvalidArgument, patternFilterValueToSearchQuery(alloc, malformed_date_flag.value, .{}, null));
+}
+
+test "native ip range filters require exact keyword-style postings coverage" {
+    const alloc = std.testing.allocator;
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+
+    const keyword_schema = runtime_schema_mod.TableSchema{
+        .dynamic_templates = &.{
+            .{
+                .name = "client_ip",
+                .path_match = "client_ip",
+                .mapping = .{
+                    .field_type = .keyword,
+                    .do_index = true,
+                    .analyzer = "keyword",
+                },
+            },
+        },
+    };
+    const keyword_segment = (try mapper_mod.buildTextSegmentFromDocuments(alloc, &.{
+        .{ .key = "doc:1", .value = "{\"client_ip\":\"10.1.2.3\"}" },
+    }, text_analysis, keyword_schema)).?;
+    defer alloc.free(keyword_segment);
+
+    var keyword_writer = try index_mod.IndexWriter.init(alloc);
+    defer keyword_writer.deinit();
+    try keyword_writer.addSegment(keyword_segment);
+    const keyword_snapshot = keyword_writer.snapshot();
+
+    const ip_query = search_mod.SearchQuery{ .ip_range = .{
+        .field = "client_ip",
+        .cidr = "10.1.0.0/16",
+    } };
+    try std.testing.expect(try searchQueryCanUseSnapshot(
+        keyword_snapshot,
+        ip_query,
+        text_analysis,
+        keyword_schema,
+    ));
+
+    const text_schema = runtime_schema_mod.TableSchema{
+        .dynamic_templates = &.{
+            .{
+                .name = "client_ip",
+                .path_match = "client_ip",
+                .mapping = .{
+                    .field_type = .text,
+                    .do_index = true,
+                    .analyzer = "standard",
+                },
+            },
+        },
+    };
+    const text_segment = (try mapper_mod.buildTextSegmentFromDocuments(alloc, &.{
+        .{ .key = "doc:1", .value = "{\"client_ip\":\"10.1.2.3\"}" },
+    }, text_analysis, text_schema)).?;
+    defer alloc.free(text_segment);
+
+    var text_writer = try index_mod.IndexWriter.init(alloc);
+    defer text_writer.deinit();
+    try text_writer.addSegment(text_segment);
+    const text_snapshot = text_writer.snapshot();
+
+    try std.testing.expect(!(try searchQueryCanUseSnapshot(
+        text_snapshot,
+        ip_query,
+        text_analysis,
+        text_schema,
+    )));
 }
 
 test "pattern geo structured filters reject invalid coordinates" {
