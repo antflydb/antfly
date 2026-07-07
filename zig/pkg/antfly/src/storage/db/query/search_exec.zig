@@ -8366,17 +8366,35 @@ fn resolveFilterTextIndexEntry(
 }
 
 fn dupeDocIdSliceAlloc(alloc: Allocator, doc_ids: []const []const u8) ![]const []const u8 {
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(alloc);
+
     var out = std.ArrayListUnmanaged([]const u8).empty;
     errdefer freeDocIdArrayList(alloc, &out);
-    for (doc_ids) |doc_id| try appendOwnedDocId(alloc, &out, doc_id);
+    for (doc_ids) |doc_id| {
+        if (seen.contains(doc_id)) continue;
+        try seen.put(alloc, doc_id, {});
+        try appendOwnedDocIdUnchecked(alloc, &out, doc_id);
+    }
     return try out.toOwnedSlice(alloc);
 }
 
 fn unionDocIdsAlloc(alloc: Allocator, left: []const []const u8, right: []const []const u8) ![]const []const u8 {
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(alloc);
+
     var out = std.ArrayListUnmanaged([]const u8).empty;
     errdefer freeDocIdArrayList(alloc, &out);
-    for (left) |id| try appendOwnedDocId(alloc, &out, id);
-    for (right) |id| try appendOwnedDocId(alloc, &out, id);
+    for (left) |id| {
+        if (seen.contains(id)) continue;
+        try seen.put(alloc, id, {});
+        try appendOwnedDocIdUnchecked(alloc, &out, id);
+    }
+    for (right) |id| {
+        if (seen.contains(id)) continue;
+        try seen.put(alloc, id, {});
+        try appendOwnedDocIdUnchecked(alloc, &out, id);
+    }
     return try out.toOwnedSlice(alloc);
 }
 
@@ -8455,7 +8473,33 @@ fn appendOwnedDocId(alloc: Allocator, out: *std.ArrayListUnmanaged([]const u8), 
     for (out.items) |existing| {
         if (std.mem.eql(u8, existing, id)) return;
     }
+    try appendOwnedDocIdUnchecked(alloc, out, id);
+}
+
+fn appendOwnedDocIdUnchecked(alloc: Allocator, out: *std.ArrayListUnmanaged([]const u8), id: []const u8) !void {
     try out.append(alloc, try alloc.dupe(u8, id));
+}
+
+test "doc id slice helpers preserve first-seen unique order" {
+    const alloc = std.testing.allocator;
+
+    const source = [_][]const u8{ "doc:b", "doc:a", "doc:b", "doc:c", "doc:a" };
+    const duped = try dupeDocIdSliceAlloc(alloc, &source);
+    defer freeDocIdSlice(alloc, duped);
+    try std.testing.expectEqual(@as(usize, 3), duped.len);
+    try std.testing.expectEqualStrings("doc:b", duped[0]);
+    try std.testing.expectEqualStrings("doc:a", duped[1]);
+    try std.testing.expectEqualStrings("doc:c", duped[2]);
+
+    const left = [_][]const u8{ "doc:c", "doc:a", "doc:c" };
+    const right = [_][]const u8{ "doc:b", "doc:a", "doc:d" };
+    const unioned = try unionDocIdsAlloc(alloc, &left, &right);
+    defer freeDocIdSlice(alloc, unioned);
+    try std.testing.expectEqual(@as(usize, 4), unioned.len);
+    try std.testing.expectEqualStrings("doc:c", unioned[0]);
+    try std.testing.expectEqualStrings("doc:a", unioned[1]);
+    try std.testing.expectEqualStrings("doc:b", unioned[2]);
+    try std.testing.expectEqualStrings("doc:d", unioned[3]);
 }
 
 fn freeDocIdArrayList(alloc: Allocator, out: *std.ArrayListUnmanaged([]const u8)) void {
