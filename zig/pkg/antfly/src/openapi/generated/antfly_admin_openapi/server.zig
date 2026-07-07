@@ -6,36 +6,6 @@ const httpx = @import("httpx");
 const types = @import("types.zig");
 
 /// --- Extractors (framework-agnostic) ---
-/// Parse the JSON request body for beginHABaseBackup.
-pub fn parseBeginHABaseBackupBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.BaseBackupStartRequest) {
-    return std.json.parseFromSlice(types.BaseBackupStartRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Parse the JSON request body for finishHABaseBackup.
-pub fn parseFinishHABaseBackupBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.BaseBackupManifestPathRequest) {
-    return std.json.parseFromSlice(types.BaseBackupManifestPathRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Parse the JSON request body for appendHACommit.
-pub fn parseAppendHACommitBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.CommitAppendRequest) {
-    return std.json.parseFromSlice(types.CommitAppendRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Parse the JSON request body for checkHACommit.
-pub fn parseCheckHACommitBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.CommitCheckRequest) {
-    return std.json.parseFromSlice(types.CommitCheckRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Parse the JSON request body for acquireHAFence.
-pub fn parseAcquireHAFenceBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.FenceAcquireRequest) {
-    return std.json.parseFromSlice(types.FenceAcquireRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Parse the JSON request body for checkHAOwnerJob.
-pub fn parseCheckHAOwnerJobBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.OwnerJobCheckRequest) {
-    return std.json.parseFromSlice(types.OwnerJobCheckRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
 pub const GetHAPrimaryStatusParams = struct {
     /// Mark slots reseed-recommended after this many retained LSNs.
     max_lag_lsn: ?[]const u8 = null,
@@ -55,14 +25,19 @@ pub const GetHAPrimaryStatusParams = struct {
     sync_failure: ?[]const u8 = null,
 };
 
-/// Parse the JSON request body for promoteHA.
-pub fn parsePromoteHABody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.FenceAcquireRequest) {
-    return std.json.parseFromSlice(types.FenceAcquireRequest, allocator, body, .{ .ignore_unknown_fields = true });
+pub const GetHAStandbyStatusParams = struct {
+    /// Current upstream primary LSN used to compute standby lag.
+    upstream_lsn: ?[]const u8 = null,
+};
+
+/// Parse the JSON request body for checkHACommit.
+pub fn parseCheckHACommitBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.CommitCheckRequest) {
+    return std.json.parseFromSlice(types.CommitCheckRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
-/// Parse the JSON request body for assessHAPromotion.
-pub fn parseAssessHAPromotionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.PromotionAssessRequest) {
-    return std.json.parseFromSlice(types.PromotionAssessRequest, allocator, body, .{ .ignore_unknown_fields = true });
+/// Parse the JSON request body for appendHACommit.
+pub fn parseAppendHACommitBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.CommitAppendRequest) {
+    return std.json.parseFromSlice(types.CommitAppendRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// Parse the JSON request body for checkHARead.
@@ -70,19 +45,14 @@ pub fn parseCheckHAReadBody(allocator: std.mem.Allocator, body: []const u8) !std
     return std.json.parseFromSlice(types.ReadCheckRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
-/// Parse the JSON request body for assessHARejoin.
-pub fn parseAssessHARejoinBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RejoinAssessRequest) {
-    return std.json.parseFromSlice(types.RejoinAssessRequest, allocator, body, .{ .ignore_unknown_fields = true });
+/// Parse the JSON request body for checkHAWrite.
+pub fn parseCheckHAWriteBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.WriteCheckRequest) {
+    return std.json.parseFromSlice(types.WriteCheckRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
-/// Parse the JSON request body for reseedHARejoin.
-pub fn parseReseedHARejoinBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RejoinAssessRequest) {
-    return std.json.parseFromSlice(types.RejoinAssessRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Parse the JSON request body for rewindHARejoin.
-pub fn parseRewindHARejoinBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RejoinAssessRequest) {
-    return std.json.parseFromSlice(types.RejoinAssessRequest, allocator, body, .{ .ignore_unknown_fields = true });
+/// Parse the JSON request body for checkHAOwnerJob.
+pub fn parseCheckHAOwnerJobBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.OwnerJobCheckRequest) {
+    return std.json.parseFromSlice(types.OwnerJobCheckRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// Parse the JSON request body for createHAReplicationSlot.
@@ -108,19 +78,49 @@ pub const ResumeHAReplicationSlotPathParams = struct {
     slot_name: []const u8,
 };
 
+/// Parse the JSON request body for beginHABaseBackup.
+pub fn parseBeginHABaseBackupBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.BaseBackupStartRequest) {
+    return std.json.parseFromSlice(types.BaseBackupStartRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Parse the JSON request body for finishHABaseBackup.
+pub fn parseFinishHABaseBackupBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.BaseBackupManifestPathRequest) {
+    return std.json.parseFromSlice(types.BaseBackupManifestPathRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Parse the JSON request body for bootstrapHAStandby.
 pub fn parseBootstrapHAStandbyBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.StandbyBootstrapRequest) {
     return std.json.parseFromSlice(types.StandbyBootstrapRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
-pub const GetHAStandbyStatusParams = struct {
-    /// Current upstream primary LSN used to compute standby lag.
-    upstream_lsn: ?[]const u8 = null,
-};
+/// Parse the JSON request body for acquireHAFence.
+pub fn parseAcquireHAFenceBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.FenceAcquireRequest) {
+    return std.json.parseFromSlice(types.FenceAcquireRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
 
-/// Parse the JSON request body for checkHAWrite.
-pub fn parseCheckHAWriteBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.WriteCheckRequest) {
-    return std.json.parseFromSlice(types.WriteCheckRequest, allocator, body, .{ .ignore_unknown_fields = true });
+/// Parse the JSON request body for assessHAPromotion.
+pub fn parseAssessHAPromotionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.PromotionAssessRequest) {
+    return std.json.parseFromSlice(types.PromotionAssessRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Parse the JSON request body for promoteHA.
+pub fn parsePromoteHABody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.FenceAcquireRequest) {
+    return std.json.parseFromSlice(types.FenceAcquireRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Parse the JSON request body for assessHARejoin.
+pub fn parseAssessHARejoinBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RejoinAssessRequest) {
+    return std.json.parseFromSlice(types.RejoinAssessRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Parse the JSON request body for rewindHARejoin.
+pub fn parseRewindHARejoinBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RejoinAssessRequest) {
+    return std.json.parseFromSlice(types.RejoinAssessRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Parse the JSON request body for reseedHARejoin.
+pub fn parseReseedHARejoinBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RejoinAssessRequest) {
+    return std.json.parseFromSlice(types.RejoinAssessRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// Route metadata for all operations.
@@ -131,29 +131,29 @@ pub const Route = struct {
 };
 
 pub const routes = [_]Route{
-    .{ .method = "POST", .path = "/ha/base-backups", .operation_id = "beginHABaseBackup" },
-    .{ .method = "POST", .path = "/ha/base-backups/finish", .operation_id = "finishHABaseBackup" },
-    .{ .method = "POST", .path = "/ha/commit/append", .operation_id = "appendHACommit" },
-    .{ .method = "POST", .path = "/ha/commit/check", .operation_id = "checkHACommit" },
-    .{ .method = "POST", .path = "/ha/fence", .operation_id = "acquireHAFence" },
-    .{ .method = "GET", .path = "/ha/fence/current", .operation_id = "getHACurrentFence" },
-    .{ .method = "POST", .path = "/ha/owner-jobs/check", .operation_id = "checkHAOwnerJob" },
     .{ .method = "GET", .path = "/ha/primary/status", .operation_id = "getHAPrimaryStatus" },
-    .{ .method = "POST", .path = "/ha/promotion", .operation_id = "promoteHA" },
-    .{ .method = "POST", .path = "/ha/promotion/assess", .operation_id = "assessHAPromotion" },
-    .{ .method = "POST", .path = "/ha/promotion/current-fence", .operation_id = "promoteHAWithCurrentFence" },
+    .{ .method = "GET", .path = "/ha/standby/status", .operation_id = "getHAStandbyStatus" },
+    .{ .method = "POST", .path = "/ha/commit/check", .operation_id = "checkHACommit" },
+    .{ .method = "POST", .path = "/ha/commit/append", .operation_id = "appendHACommit" },
     .{ .method = "POST", .path = "/ha/read/check", .operation_id = "checkHARead" },
-    .{ .method = "POST", .path = "/ha/rejoin/assess", .operation_id = "assessHARejoin" },
-    .{ .method = "POST", .path = "/ha/rejoin/reseed", .operation_id = "reseedHARejoin" },
-    .{ .method = "POST", .path = "/ha/rejoin/rewind", .operation_id = "rewindHARejoin" },
+    .{ .method = "POST", .path = "/ha/write/check", .operation_id = "checkHAWrite" },
+    .{ .method = "POST", .path = "/ha/owner-jobs/check", .operation_id = "checkHAOwnerJob" },
     .{ .method = "GET", .path = "/ha/replication-slots", .operation_id = "listHAReplicationSlots" },
     .{ .method = "POST", .path = "/ha/replication-slots", .operation_id = "createHAReplicationSlot" },
     .{ .method = "DELETE", .path = "/ha/replication-slots/{slot_name}", .operation_id = "dropHAReplicationSlot" },
     .{ .method = "PUT", .path = "/ha/replication-slots/{slot_name}/pause", .operation_id = "pauseHAReplicationSlot" },
     .{ .method = "PUT", .path = "/ha/replication-slots/{slot_name}/resume", .operation_id = "resumeHAReplicationSlot" },
+    .{ .method = "POST", .path = "/ha/base-backups", .operation_id = "beginHABaseBackup" },
+    .{ .method = "POST", .path = "/ha/base-backups/finish", .operation_id = "finishHABaseBackup" },
     .{ .method = "POST", .path = "/ha/standby/bootstrap", .operation_id = "bootstrapHAStandby" },
-    .{ .method = "GET", .path = "/ha/standby/status", .operation_id = "getHAStandbyStatus" },
-    .{ .method = "POST", .path = "/ha/write/check", .operation_id = "checkHAWrite" },
+    .{ .method = "POST", .path = "/ha/fence", .operation_id = "acquireHAFence" },
+    .{ .method = "GET", .path = "/ha/fence/current", .operation_id = "getHACurrentFence" },
+    .{ .method = "POST", .path = "/ha/promotion/assess", .operation_id = "assessHAPromotion" },
+    .{ .method = "POST", .path = "/ha/promotion/current-fence", .operation_id = "promoteHAWithCurrentFence" },
+    .{ .method = "POST", .path = "/ha/promotion", .operation_id = "promoteHA" },
+    .{ .method = "POST", .path = "/ha/rejoin/assess", .operation_id = "assessHARejoin" },
+    .{ .method = "POST", .path = "/ha/rejoin/rewind", .operation_id = "rewindHARejoin" },
+    .{ .method = "POST", .path = "/ha/rejoin/reseed", .operation_id = "reseedHARejoin" },
 };
 
 /// Generated server router for httpx. Register routes on an httpx.Server
@@ -167,29 +167,29 @@ pub const routes = [_]Route{
 ///   try router.register(&server);
 pub fn ServerRouter(comptime Impl: type) type {
     comptime {
-        if (!@hasDecl(Impl, "beginHABaseBackup")) @compileError("ServerRouter: Impl missing required method 'beginHABaseBackup'");
-        if (!@hasDecl(Impl, "finishHABaseBackup")) @compileError("ServerRouter: Impl missing required method 'finishHABaseBackup'");
-        if (!@hasDecl(Impl, "appendHACommit")) @compileError("ServerRouter: Impl missing required method 'appendHACommit'");
-        if (!@hasDecl(Impl, "checkHACommit")) @compileError("ServerRouter: Impl missing required method 'checkHACommit'");
-        if (!@hasDecl(Impl, "acquireHAFence")) @compileError("ServerRouter: Impl missing required method 'acquireHAFence'");
-        if (!@hasDecl(Impl, "getHACurrentFence")) @compileError("ServerRouter: Impl missing required method 'getHACurrentFence'");
-        if (!@hasDecl(Impl, "checkHAOwnerJob")) @compileError("ServerRouter: Impl missing required method 'checkHAOwnerJob'");
         if (!@hasDecl(Impl, "getHAPrimaryStatus")) @compileError("ServerRouter: Impl missing required method 'getHAPrimaryStatus'");
-        if (!@hasDecl(Impl, "promoteHA")) @compileError("ServerRouter: Impl missing required method 'promoteHA'");
-        if (!@hasDecl(Impl, "assessHAPromotion")) @compileError("ServerRouter: Impl missing required method 'assessHAPromotion'");
-        if (!@hasDecl(Impl, "promoteHAWithCurrentFence")) @compileError("ServerRouter: Impl missing required method 'promoteHAWithCurrentFence'");
+        if (!@hasDecl(Impl, "getHAStandbyStatus")) @compileError("ServerRouter: Impl missing required method 'getHAStandbyStatus'");
+        if (!@hasDecl(Impl, "checkHACommit")) @compileError("ServerRouter: Impl missing required method 'checkHACommit'");
+        if (!@hasDecl(Impl, "appendHACommit")) @compileError("ServerRouter: Impl missing required method 'appendHACommit'");
         if (!@hasDecl(Impl, "checkHARead")) @compileError("ServerRouter: Impl missing required method 'checkHARead'");
-        if (!@hasDecl(Impl, "assessHARejoin")) @compileError("ServerRouter: Impl missing required method 'assessHARejoin'");
-        if (!@hasDecl(Impl, "reseedHARejoin")) @compileError("ServerRouter: Impl missing required method 'reseedHARejoin'");
-        if (!@hasDecl(Impl, "rewindHARejoin")) @compileError("ServerRouter: Impl missing required method 'rewindHARejoin'");
+        if (!@hasDecl(Impl, "checkHAWrite")) @compileError("ServerRouter: Impl missing required method 'checkHAWrite'");
+        if (!@hasDecl(Impl, "checkHAOwnerJob")) @compileError("ServerRouter: Impl missing required method 'checkHAOwnerJob'");
         if (!@hasDecl(Impl, "listHAReplicationSlots")) @compileError("ServerRouter: Impl missing required method 'listHAReplicationSlots'");
         if (!@hasDecl(Impl, "createHAReplicationSlot")) @compileError("ServerRouter: Impl missing required method 'createHAReplicationSlot'");
         if (!@hasDecl(Impl, "dropHAReplicationSlot")) @compileError("ServerRouter: Impl missing required method 'dropHAReplicationSlot'");
         if (!@hasDecl(Impl, "pauseHAReplicationSlot")) @compileError("ServerRouter: Impl missing required method 'pauseHAReplicationSlot'");
         if (!@hasDecl(Impl, "resumeHAReplicationSlot")) @compileError("ServerRouter: Impl missing required method 'resumeHAReplicationSlot'");
+        if (!@hasDecl(Impl, "beginHABaseBackup")) @compileError("ServerRouter: Impl missing required method 'beginHABaseBackup'");
+        if (!@hasDecl(Impl, "finishHABaseBackup")) @compileError("ServerRouter: Impl missing required method 'finishHABaseBackup'");
         if (!@hasDecl(Impl, "bootstrapHAStandby")) @compileError("ServerRouter: Impl missing required method 'bootstrapHAStandby'");
-        if (!@hasDecl(Impl, "getHAStandbyStatus")) @compileError("ServerRouter: Impl missing required method 'getHAStandbyStatus'");
-        if (!@hasDecl(Impl, "checkHAWrite")) @compileError("ServerRouter: Impl missing required method 'checkHAWrite'");
+        if (!@hasDecl(Impl, "acquireHAFence")) @compileError("ServerRouter: Impl missing required method 'acquireHAFence'");
+        if (!@hasDecl(Impl, "getHACurrentFence")) @compileError("ServerRouter: Impl missing required method 'getHACurrentFence'");
+        if (!@hasDecl(Impl, "assessHAPromotion")) @compileError("ServerRouter: Impl missing required method 'assessHAPromotion'");
+        if (!@hasDecl(Impl, "promoteHAWithCurrentFence")) @compileError("ServerRouter: Impl missing required method 'promoteHAWithCurrentFence'");
+        if (!@hasDecl(Impl, "promoteHA")) @compileError("ServerRouter: Impl missing required method 'promoteHA'");
+        if (!@hasDecl(Impl, "assessHARejoin")) @compileError("ServerRouter: Impl missing required method 'assessHARejoin'");
+        if (!@hasDecl(Impl, "rewindHARejoin")) @compileError("ServerRouter: Impl missing required method 'rewindHARejoin'");
+        if (!@hasDecl(Impl, "reseedHARejoin")) @compileError("ServerRouter: Impl missing required method 'reseedHARejoin'");
     }
 
     return struct {
@@ -204,78 +204,29 @@ pub fn ServerRouter(comptime Impl: type) type {
         /// Register all routes on the server and activate the impl.
         pub fn register(self: *const @This(), server: anytype) !void {
             active_impl = self.impl;
-            try server.post("/ha/base-backups", beginHABaseBackup);
-            try server.post("/ha/base-backups/finish", finishHABaseBackup);
-            try server.post("/ha/commit/append", appendHACommit);
-            try server.post("/ha/commit/check", checkHACommit);
-            try server.post("/ha/fence", acquireHAFence);
-            try server.get("/ha/fence/current", getHACurrentFence);
-            try server.post("/ha/owner-jobs/check", checkHAOwnerJob);
             try server.get("/ha/primary/status", getHAPrimaryStatus);
-            try server.post("/ha/promotion", promoteHA);
-            try server.post("/ha/promotion/assess", assessHAPromotion);
-            try server.post("/ha/promotion/current-fence", promoteHAWithCurrentFence);
+            try server.get("/ha/standby/status", getHAStandbyStatus);
+            try server.post("/ha/commit/check", checkHACommit);
+            try server.post("/ha/commit/append", appendHACommit);
             try server.post("/ha/read/check", checkHARead);
-            try server.post("/ha/rejoin/assess", assessHARejoin);
-            try server.post("/ha/rejoin/reseed", reseedHARejoin);
-            try server.post("/ha/rejoin/rewind", rewindHARejoin);
+            try server.post("/ha/write/check", checkHAWrite);
+            try server.post("/ha/owner-jobs/check", checkHAOwnerJob);
             try server.get("/ha/replication-slots", listHAReplicationSlots);
             try server.post("/ha/replication-slots", createHAReplicationSlot);
             try server.delete("/ha/replication-slots/:slot_name", dropHAReplicationSlot);
             try server.put("/ha/replication-slots/:slot_name/pause", pauseHAReplicationSlot);
             try server.put("/ha/replication-slots/:slot_name/resume", resumeHAReplicationSlot);
+            try server.post("/ha/base-backups", beginHABaseBackup);
+            try server.post("/ha/base-backups/finish", finishHABaseBackup);
             try server.post("/ha/standby/bootstrap", bootstrapHAStandby);
-            try server.get("/ha/standby/status", getHAStandbyStatus);
-            try server.post("/ha/write/check", checkHAWrite);
-        }
-
-        /// Begin an HA base backup and reserve its replication slot
-        /// POST /ha/base-backups
-        fn beginHABaseBackup(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            return impl.beginHABaseBackup(ctx);
-        }
-
-        /// Finish an HA base backup from a local manifest path
-        /// POST /ha/base-backups/finish
-        fn finishHABaseBackup(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            return impl.finishHABaseBackup(ctx);
-        }
-
-        /// Append a primary WAL/effects record and evaluate synchronous commit durability
-        /// POST /ha/commit/append
-        fn appendHACommit(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            return impl.appendHACommit(ctx);
-        }
-
-        /// Evaluate synchronous commit durability for an existing LSN
-        /// POST /ha/commit/check
-        fn checkHACommit(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            return impl.checkHACommit(ctx);
-        }
-
-        /// Acquire a durable HA promotion fence
-        /// POST /ha/fence
-        fn acquireHAFence(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            return impl.acquireHAFence(ctx);
-        }
-
-        /// Get the current durable HA promotion fence
-        /// GET /ha/fence/current
-        fn getHACurrentFence(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            return impl.getHACurrentFence(ctx);
-        }
-
-        /// Evaluate whether an owner-only background job may run
-        /// POST /ha/owner-jobs/check
-        fn checkHAOwnerJob(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            return impl.checkHAOwnerJob(ctx);
+            try server.post("/ha/fence", acquireHAFence);
+            try server.get("/ha/fence/current", getHACurrentFence);
+            try server.post("/ha/promotion/assess", assessHAPromotion);
+            try server.post("/ha/promotion/current-fence", promoteHAWithCurrentFence);
+            try server.post("/ha/promotion", promoteHA);
+            try server.post("/ha/rejoin/assess", assessHARejoin);
+            try server.post("/ha/rejoin/rewind", rewindHARejoin);
+            try server.post("/ha/rejoin/reseed", reseedHARejoin);
         }
 
         /// Get primary HA status
@@ -295,25 +246,28 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.getHAPrimaryStatus(ctx, query_params);
         }
 
-        /// Acquire a fence and promote this standby
-        /// POST /ha/promotion
-        fn promoteHA(ctx: *httpx.Context) anyerror!httpx.Response {
+        /// Get standby HA status
+        /// GET /ha/standby/status
+        fn getHAStandbyStatus(ctx: *httpx.Context) anyerror!httpx.Response {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            return impl.promoteHA(ctx);
+            const query_params = GetHAStandbyStatusParams{
+                .upstream_lsn = ctx.query("upstream_lsn"),
+            };
+            return impl.getHAStandbyStatus(ctx, query_params);
         }
 
-        /// Assess whether this standby can be promoted
-        /// POST /ha/promotion/assess
-        fn assessHAPromotion(ctx: *httpx.Context) anyerror!httpx.Response {
+        /// Evaluate synchronous commit durability for an existing LSN
+        /// POST /ha/commit/check
+        fn checkHACommit(ctx: *httpx.Context) anyerror!httpx.Response {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            return impl.assessHAPromotion(ctx);
+            return impl.checkHACommit(ctx);
         }
 
-        /// Promote this standby using the current durable fence receipt
-        /// POST /ha/promotion/current-fence
-        fn promoteHAWithCurrentFence(ctx: *httpx.Context) anyerror!httpx.Response {
+        /// Append a primary WAL/effects record and evaluate synchronous commit durability
+        /// POST /ha/commit/append
+        fn appendHACommit(ctx: *httpx.Context) anyerror!httpx.Response {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            return impl.promoteHAWithCurrentFence(ctx);
+            return impl.appendHACommit(ctx);
         }
 
         /// Evaluate standby read freshness and routing
@@ -323,25 +277,18 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.checkHARead(ctx);
         }
 
-        /// Assess whether a former primary can safely rejoin
-        /// POST /ha/rejoin/assess
-        fn assessHARejoin(ctx: *httpx.Context) anyerror!httpx.Response {
+        /// Evaluate whether this node can accept writes
+        /// POST /ha/write/check
+        fn checkHAWrite(ctx: *httpx.Context) anyerror!httpx.Response {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            return impl.assessHARejoin(ctx);
+            return impl.checkHAWrite(ctx);
         }
 
-        /// Reseed a fenced former primary when rewind is unsafe
-        /// POST /ha/rejoin/reseed
-        fn reseedHARejoin(ctx: *httpx.Context) anyerror!httpx.Response {
+        /// Evaluate whether an owner-only background job may run
+        /// POST /ha/owner-jobs/check
+        fn checkHAOwnerJob(ctx: *httpx.Context) anyerror!httpx.Response {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            return impl.reseedHARejoin(ctx);
-        }
-
-        /// Rewind a fenced former primary onto the promoted timeline
-        /// POST /ha/rejoin/rewind
-        fn rewindHARejoin(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            return impl.rewindHARejoin(ctx);
+            return impl.checkHAOwnerJob(ctx);
         }
 
         /// List HA replication slots
@@ -382,6 +329,20 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.resumeHAReplicationSlot(ctx, slot_name);
         }
 
+        /// Begin an HA base backup and reserve its replication slot
+        /// POST /ha/base-backups
+        fn beginHABaseBackup(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            return impl.beginHABaseBackup(ctx);
+        }
+
+        /// Finish an HA base backup from a local manifest path
+        /// POST /ha/base-backups/finish
+        fn finishHABaseBackup(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            return impl.finishHABaseBackup(ctx);
+        }
+
         /// Bootstrap this standby from a local base-backup manifest and copied files
         /// POST /ha/standby/bootstrap
         fn bootstrapHAStandby(ctx: *httpx.Context) anyerror!httpx.Response {
@@ -389,47 +350,86 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.bootstrapHAStandby(ctx);
         }
 
-        /// Get standby HA status
-        /// GET /ha/standby/status
-        fn getHAStandbyStatus(ctx: *httpx.Context) anyerror!httpx.Response {
+        /// Acquire a durable HA promotion fence
+        /// POST /ha/fence
+        fn acquireHAFence(ctx: *httpx.Context) anyerror!httpx.Response {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            const query_params = GetHAStandbyStatusParams{
-                .upstream_lsn = ctx.query("upstream_lsn"),
-            };
-            return impl.getHAStandbyStatus(ctx, query_params);
+            return impl.acquireHAFence(ctx);
         }
 
-        /// Evaluate whether this node can accept writes
-        /// POST /ha/write/check
-        fn checkHAWrite(ctx: *httpx.Context) anyerror!httpx.Response {
+        /// Get the current durable HA promotion fence
+        /// GET /ha/fence/current
+        fn getHACurrentFence(ctx: *httpx.Context) anyerror!httpx.Response {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            return impl.checkHAWrite(ctx);
+            return impl.getHACurrentFence(ctx);
+        }
+
+        /// Assess whether this standby can be promoted
+        /// POST /ha/promotion/assess
+        fn assessHAPromotion(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            return impl.assessHAPromotion(ctx);
+        }
+
+        /// Promote this standby using the current durable fence receipt
+        /// POST /ha/promotion/current-fence
+        fn promoteHAWithCurrentFence(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            return impl.promoteHAWithCurrentFence(ctx);
+        }
+
+        /// Acquire a fence and promote this standby
+        /// POST /ha/promotion
+        fn promoteHA(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            return impl.promoteHA(ctx);
+        }
+
+        /// Assess whether a former primary can safely rejoin
+        /// POST /ha/rejoin/assess
+        fn assessHARejoin(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            return impl.assessHARejoin(ctx);
+        }
+
+        /// Rewind a fenced former primary onto the promoted timeline
+        /// POST /ha/rejoin/rewind
+        fn rewindHARejoin(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            return impl.rewindHARejoin(ctx);
+        }
+
+        /// Reseed a fenced former primary when rewind is unsafe
+        /// POST /ha/rejoin/reseed
+        fn reseedHARejoin(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            return impl.reseedHARejoin(ctx);
         }
     };
 }
 
 // Handler interface. Implement these methods on your Impl struct:
 //
-//   fn beginHABaseBackup(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn finishHABaseBackup(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn appendHACommit(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn checkHACommit(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn acquireHAFence(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn getHACurrentFence(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn checkHAOwnerJob(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn getHAPrimaryStatus(self: *Impl, ctx: *httpx.Context, params: GetHAPrimaryStatusParams) !httpx.Response
-//   fn promoteHA(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn assessHAPromotion(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn promoteHAWithCurrentFence(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn getHAStandbyStatus(self: *Impl, ctx: *httpx.Context, params: GetHAStandbyStatusParams) !httpx.Response
+//   fn checkHACommit(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn appendHACommit(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn checkHARead(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn assessHARejoin(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn reseedHARejoin(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn rewindHARejoin(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn checkHAWrite(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn checkHAOwnerJob(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listHAReplicationSlots(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn createHAReplicationSlot(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn dropHAReplicationSlot(self: *Impl, ctx: *httpx.Context, slot_name: []const u8) !httpx.Response
 //   fn pauseHAReplicationSlot(self: *Impl, ctx: *httpx.Context, slot_name: []const u8) !httpx.Response
 //   fn resumeHAReplicationSlot(self: *Impl, ctx: *httpx.Context, slot_name: []const u8) !httpx.Response
+//   fn beginHABaseBackup(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn finishHABaseBackup(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn bootstrapHAStandby(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn getHAStandbyStatus(self: *Impl, ctx: *httpx.Context, params: GetHAStandbyStatusParams) !httpx.Response
-//   fn checkHAWrite(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn acquireHAFence(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn getHACurrentFence(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn assessHAPromotion(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn promoteHAWithCurrentFence(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn promoteHA(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn assessHARejoin(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn rewindHARejoin(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn reseedHARejoin(self: *Impl, ctx: *httpx.Context) !httpx.Response
