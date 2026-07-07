@@ -3640,6 +3640,11 @@ fn boundedCandidateCollectorSortPlanForUnavailableStream(plan: SortExecutionPlan
             .native_doc_values_coverage = plan.native_doc_values_coverage,
             .index_sort_coverage = plan.index_sort_coverage,
         },
+        .native_doc_values_top_n => blk: {
+            var out = plan;
+            out.exactness = .bounded_exact;
+            break :blk out;
+        },
         else => plan,
     };
 }
@@ -13946,6 +13951,9 @@ pub fn searchMatchAll(
     if (exec_req.order_by.len > 0 and planned_sort.kind == .id_seek and executor.collect_candidates_stream == null) {
         planned_sort = boundedCandidateCollectorSortPlanForUnavailableStream(planned_sort);
     }
+    if (exec_req.order_by.len > 0 and planned_sort.kind == .native_doc_values_top_n and executor.collect_candidates_stream == null) {
+        planned_sort = boundedCandidateCollectorSortPlanForUnavailableStream(planned_sort);
+    }
 
     if (exec_req.order_by.len > 0 and planned_sort.kind == .native_doc_values_top_n and !unresolved_stored_filters and executor.collect_candidates_stream != null) {
         const text_entry = (try executor.text_index_entry(executor.ctx, exec_req.index_name)) orelse {
@@ -14041,8 +14049,12 @@ pub fn searchMatchAll(
     var native_sort_loader: ?NativeSortValueLoader = null;
     var sort_plan = planned_sort;
     if (try buildMatchAllNativeSortContextAlloc(alloc, postprocess_req, executor, candidates.items, &ordinal_to_text_doc_id)) |planned| {
+        const preserve_bounded_exact = sortExecutionPlanExactness(sort_plan) == .bounded_exact;
         native_sort_ctx = planned.ctx;
         sort_plan = planned.plan;
+        if (preserve_bounded_exact and sort_plan.kind == .native_doc_values_top_n) {
+            sort_plan.exactness = .bounded_exact;
+        }
         native_sort_loader = .{
             .ctx = &native_sort_ctx,
             .require_native = planned.plan.require_native,
@@ -23695,6 +23707,132 @@ test "match_all id-only sort without stream reports bounded candidate collector"
     try std.testing.expectEqualStrings("source_free", profile.source_load);
     try std.testing.expectEqual(@as(u64, 3), profile.candidate_count);
     try std.testing.expectEqual(@as(u64, 1), profile.selected_count);
+}
+
+test "match_all native doc values without stream reports bounded exact collector" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/match-all-native-no-stream", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    const docs = [_]TestSortedPriceDoc{
+        .{ .id = "doc:a", .price = 3.0, .ordinal = 1003 },
+        .{ .id = "doc:b", .price = 1.0, .ordinal = 1001 },
+        .{ .id = "doc:c", .price = 2.0, .ordinal = 1002 },
+    };
+    var persistent = try persistent_mod.PersistentIndex.open(alloc, .{
+        .path = path_z.ptr,
+        .main_backend = .lsm_memory,
+    });
+    var persistent_owned = true;
+    errdefer if (persistent_owned) persistent.close();
+
+    const segment = try buildTestSortedPriceSegmentAlloc(alloc, &docs);
+    defer alloc.free(segment);
+    try persistent.writer.addSegment(segment);
+
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "price",
+        .path_match = "price",
+        .mapping = .{
+            .field_type = .numeric,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
+        .chunk_name = null,
+        .text_analysis = .{},
+        .runtime_schema = schema,
+        .rebuild_root_path = "",
+        .persistent = persistent,
+    };
+    persistent_owned = false;
+    defer text_entry.persistent.close();
+
+    const Harness = struct {
+        match_ctx: TestMatchAllCtx,
+        text_entry: *index_manager_mod.IndexManager.TextIndex,
+
+        fn collectCandidates(
+            ctx: ?*anyopaque,
+            collect_alloc: Allocator,
+            req: types.SearchRequest,
+            options: MatchAllCandidateCollectOptions,
+        ) anyerror!MatchAllCandidates {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return testCollectMatchAllCandidatesCallback(&self.match_ctx, collect_alloc, req, options);
+        }
+
+        fn textIndexEntry(
+            ctx: ?*anyopaque,
+            _: ?[]const u8,
+        ) anyerror!?*index_manager_mod.IndexManager.TextIndex {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return self.text_entry;
+        }
+
+        fn loadProjectedDocument(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: []const u8,
+        ) anyerror![]u8 {
+            return error.UnexpectedTestCall;
+        }
+    };
+
+    var collect_count: usize = 0;
+    var stream_collect_count: usize = 0;
+    var harness = Harness{
+        .match_ctx = .{
+            .ids = &.{ "doc:a", "doc:b", "doc:c" },
+            .ordinals = &.{ 1003, 1001, 1002 },
+            .collect_count = &collect_count,
+            .stream_collect_count = &stream_collect_count,
+        },
+        .text_entry = &text_entry,
+    };
+    const order_by = [_]types.SortField{.{ .field = "price" }};
+    var result = try searchMatchAll(alloc, .{
+        .index_name = "ft",
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 2,
+        .profile = true,
+    }, .{
+        .ctx = &harness,
+        .collect_candidates = Harness.collectCandidates,
+        .collect_candidates_stream = null,
+        .text_index_entry = Harness.textIndexEntry,
+        .load_projected_document = Harness.loadProjectedDocument,
+        .load_stored = testUnexpectedLoadStoredCallback,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), collect_count);
+    try std.testing.expectEqual(@as(usize, 0), stream_collect_count);
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+    try std.testing.expectEqualStrings("doc:c", result.hits[1].id);
+
+    const profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", profile.plan);
+    try std.testing.expectEqualStrings("bounded_exact", profile.exactness);
+    try std.testing.expectEqualStrings("doc_values_collector", profile.source);
+    try std.testing.expectEqualStrings("match_all", profile.candidate_source);
+    try std.testing.expectEqual(@as(u64, 3), profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 2), profile.selected_count);
+    try std.testing.expectEqual(@as(u64, 3), profile.native_doc_value_hit_count);
 }
 
 test "match_all id seek rejects missing primary key stream with diagnostic" {
