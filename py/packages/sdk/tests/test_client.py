@@ -8,10 +8,33 @@ from httpx import Timeout
 
 from antfly import AntflyClient, AntflyException  # noqa: E402
 from antfly.client import normalize_base_url  # noqa: E402
+from antfly.client_generated.models.sort_profile import SortProfile  # noqa: E402
 
 
 class TestAntflyClient:
     """Test cases for AntflyClient."""
+
+    def test_sort_profile_preserves_additive_diagnostics(self) -> None:
+        """SortProfile keeps stable fields typed and passes through diagnostic counters."""
+        profile = SortProfile.from_dict(
+            {
+                "plan": "native_doc_values_top_n",
+                "candidate_count": 7,
+                "native_doc_value_load_us": 13,
+                "collector_heap_peak": 5,
+            }
+        )
+
+        assert profile.plan == "native_doc_values_top_n"
+        assert profile.candidate_count == 7
+        assert "plan" not in profile.additional_properties
+        assert profile["native_doc_value_load_us"] == 13
+
+        profile["sorted_segment_scan_budget"] = 100
+        encoded = profile.to_dict()
+
+        assert encoded["collector_heap_peak"] == 5
+        assert encoded["sorted_segment_scan_budget"] == 100
 
     @patch("antfly.client.Client")
     def test_client_initialization(self, mock_client: MagicMock) -> None:
