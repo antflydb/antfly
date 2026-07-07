@@ -8398,7 +8398,8 @@ fn searchQueryCanUseSnapshot(
         .bool_field => |item| try searchQueryCanUseMappedDocValues(snapshot, item.field, runtime_schema, .boolean),
         .geo_distance => |item| try searchQueryCanUseMappedGeoDocValues(snapshot, item.field, runtime_schema),
         .geo_bbox => |item| try searchQueryCanUseMappedGeoDocValues(snapshot, item.field, runtime_schema),
-        .term_range => |item| try snapshot.hasInvertedField(item.field),
+        .term_range => |item| (try queryFieldUsesKeywordAnalyzer(item.field, text_analysis, runtime_schema)) and
+            try snapshot.hasInvertedField(item.field),
         .ip_range => |item| (try queryFieldUsesKeywordAnalyzer(item.field, text_analysis, runtime_schema)) and
             try snapshot.hasInvertedField(item.field),
         .geo_shape => |item| try searchQueryCanUseMappedGeoDocValues(snapshot, item.field, runtime_schema),
@@ -9178,7 +9179,7 @@ test "pattern typed structured filters reject malformed and unbounded ranges" {
     try std.testing.expectError(error.InvalidArgument, patternFilterValueToSearchQuery(alloc, malformed_date_flag.value, .{}, null));
 }
 
-test "native ip range filters require exact keyword-style postings coverage" {
+test "native string range filters require exact keyword-style postings coverage" {
     const alloc = std.testing.allocator;
     const text_analysis = introducer_mod.TextAnalysisConfig{};
 
@@ -9209,9 +9210,20 @@ test "native ip range filters require exact keyword-style postings coverage" {
         .field = "client_ip",
         .cidr = "10.1.0.0/16",
     } };
+    const term_range_query = search_mod.SearchQuery{ .term_range = .{
+        .field = "client_ip",
+        .min = "10.1",
+        .max = "10.2",
+    } };
     try std.testing.expect(try searchQueryCanUseSnapshot(
         keyword_snapshot,
         ip_query,
+        text_analysis,
+        keyword_schema,
+    ));
+    try std.testing.expect(try searchQueryCanUseSnapshot(
+        keyword_snapshot,
+        term_range_query,
         text_analysis,
         keyword_schema,
     ));
@@ -9242,6 +9254,12 @@ test "native ip range filters require exact keyword-style postings coverage" {
     try std.testing.expect(!(try searchQueryCanUseSnapshot(
         text_snapshot,
         ip_query,
+        text_analysis,
+        text_schema,
+    )));
+    try std.testing.expect(!(try searchQueryCanUseSnapshot(
+        text_snapshot,
+        term_range_query,
         text_analysis,
         text_schema,
     )));
