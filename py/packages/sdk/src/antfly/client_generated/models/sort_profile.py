@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.sort_profile_native_filter_mode import SortProfileNativeFilterMode
 from ..models.sort_profile_sort_lifecycle_state import SortProfileSortLifecycleState
 from ..types import UNSET, Unset
 
@@ -44,6 +45,14 @@ class SortProfile:
             sort_lifecycle_state (SortProfileSortLifecycleState | Unset): Conservative lifecycle state for the requested
                 sort path. Queryable fields are accepted by public exact sort; accelerated fields are queryable and have an
                 index_sort-compatible physical path.
+            native_filter_mode (SortProfileNativeFilterMode | Unset): Native filter constraint shape available to sort
+                planning for this request.
+            native_filter_candidate_count (int | Unset): Number of resolved native positive-filter candidates available to
+                the sort executor.
+            native_filter_exclusion_count (int | Unset): Number of resolved native exclusion candidates available to the
+                sort executor.
+            selective_filter_doc_values_preferred (bool | Unset): Whether the planner preferred candidate-first doc-values
+                collection over sorted-segment scanning because a native filter was selective.
             native_doc_values_coverage (str | Unset): Native typed doc-values coverage status for mapped sort fields.
             index_sort_coverage (str | Unset): Physical index_sort coverage status for the requested order.
             index_sort_match (bool | Unset): Whether the requested order matched the configured physical index_sort prefix.
@@ -146,6 +155,10 @@ class SortProfile:
     require_native: bool | Unset = UNSET
     native_loader: bool | Unset = UNSET
     sort_lifecycle_state: SortProfileSortLifecycleState | Unset = UNSET
+    native_filter_mode: SortProfileNativeFilterMode | Unset = UNSET
+    native_filter_candidate_count: int | Unset = UNSET
+    native_filter_exclusion_count: int | Unset = UNSET
+    selective_filter_doc_values_preferred: bool | Unset = UNSET
     native_doc_values_coverage: str | Unset = UNSET
     index_sort_coverage: str | Unset = UNSET
     index_sort_match: bool | Unset = UNSET
@@ -211,6 +224,16 @@ class SortProfile:
         sort_lifecycle_state: str | Unset = UNSET
         if not isinstance(self.sort_lifecycle_state, Unset):
             sort_lifecycle_state = self.sort_lifecycle_state.value
+
+        native_filter_mode: str | Unset = UNSET
+        if not isinstance(self.native_filter_mode, Unset):
+            native_filter_mode = self.native_filter_mode.value
+
+        native_filter_candidate_count = self.native_filter_candidate_count
+
+        native_filter_exclusion_count = self.native_filter_exclusion_count
+
+        selective_filter_doc_values_preferred = self.selective_filter_doc_values_preferred
 
         native_doc_values_coverage = self.native_doc_values_coverage
 
@@ -303,6 +326,14 @@ class SortProfile:
             field_dict["native_loader"] = native_loader
         if sort_lifecycle_state is not UNSET:
             field_dict["sort_lifecycle_state"] = sort_lifecycle_state
+        if native_filter_mode is not UNSET:
+            field_dict["native_filter_mode"] = native_filter_mode
+        if native_filter_candidate_count is not UNSET:
+            field_dict["native_filter_candidate_count"] = native_filter_candidate_count
+        if native_filter_exclusion_count is not UNSET:
+            field_dict["native_filter_exclusion_count"] = native_filter_exclusion_count
+        if selective_filter_doc_values_preferred is not UNSET:
+            field_dict["selective_filter_doc_values_preferred"] = selective_filter_doc_values_preferred
         if native_doc_values_coverage is not UNSET:
             field_dict["native_doc_values_coverage"] = native_doc_values_coverage
         if index_sort_coverage is not UNSET:
@@ -411,6 +442,19 @@ class SortProfile:
         else:
             sort_lifecycle_state = SortProfileSortLifecycleState(_sort_lifecycle_state)
 
+        _native_filter_mode = d.pop("native_filter_mode", UNSET)
+        native_filter_mode: SortProfileNativeFilterMode | Unset
+        if isinstance(_native_filter_mode, Unset):
+            native_filter_mode = UNSET
+        else:
+            native_filter_mode = SortProfileNativeFilterMode(_native_filter_mode)
+
+        native_filter_candidate_count = d.pop("native_filter_candidate_count", UNSET)
+
+        native_filter_exclusion_count = d.pop("native_filter_exclusion_count", UNSET)
+
+        selective_filter_doc_values_preferred = d.pop("selective_filter_doc_values_preferred", UNSET)
+
         native_doc_values_coverage = d.pop("native_doc_values_coverage", UNSET)
 
         index_sort_coverage = d.pop("index_sort_coverage", UNSET)
@@ -488,6 +532,10 @@ class SortProfile:
             require_native=require_native,
             native_loader=native_loader,
             sort_lifecycle_state=sort_lifecycle_state,
+            native_filter_mode=native_filter_mode,
+            native_filter_candidate_count=native_filter_candidate_count,
+            native_filter_exclusion_count=native_filter_exclusion_count,
+            selective_filter_doc_values_preferred=selective_filter_doc_values_preferred,
             native_doc_values_coverage=native_doc_values_coverage,
             index_sort_coverage=index_sort_coverage,
             index_sort_match=index_sort_match,

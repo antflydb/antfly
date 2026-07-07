@@ -2564,6 +2564,14 @@ pub const SortProfile = struct {
     native_loader: ?bool = null,
     /// Conservative lifecycle state for the requested sort path. Queryable fields are accepted by public exact sort; accelerated fields are queryable and have an index_sort-compatible physical path.
     sort_lifecycle_state: ?[]const u8 = null,
+    /// Native filter constraint shape available to sort planning for this request.
+    native_filter_mode: ?[]const u8 = null,
+    /// Number of resolved native positive-filter candidates available to the sort executor.
+    native_filter_candidate_count: ?i64 = null,
+    /// Number of resolved native exclusion candidates available to the sort executor.
+    native_filter_exclusion_count: ?i64 = null,
+    /// Whether the planner preferred candidate-first doc-values collection over sorted-segment scanning because a native filter was selective.
+    selective_filter_doc_values_preferred: ?bool = null,
     /// Native typed doc-values coverage status for mapped sort fields.
     native_doc_values_coverage: ?[]const u8 = null,
     /// Physical index_sort coverage status for the requested order.

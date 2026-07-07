@@ -3268,6 +3268,9 @@ const SortCollectorProfile = struct {
     window_capacity: usize = 0,
     window_len: usize = 0,
     collector_heap_peak: usize = 0,
+    native_filter_mode: []const u8 = "none",
+    native_filter_candidate_count: u64 = 0,
+    native_filter_exclusion_count: u64 = 0,
     distributed_shard_count: usize = 0,
     distributed_shard_window: usize = 0,
     budget_rejection_reason: []const u8 = "",
@@ -3275,6 +3278,35 @@ const SortCollectorProfile = struct {
 
 fn observeSortCollectorHeap(profile: ?*SortCollectorProfile, heap_len: usize) void {
     if (profile) |p| p.collector_heap_peak = @max(p.collector_heap_peak, heap_len);
+}
+
+fn nativeFilterConstraintCount(constraints: *const NativeDocIdConstraints) u64 {
+    return @as(u64, @intCast(constraints.filter_doc_ids.len)) +| @as(u64, @intCast(constraints.filter_doc_nums.len));
+}
+
+fn nativeFilterExclusionCount(constraints: *const NativeDocIdConstraints) u64 {
+    return @as(u64, @intCast(constraints.exclude_doc_ids.len)) +| @as(u64, @intCast(constraints.exclude_doc_nums.len));
+}
+
+fn nativeFilterModeForConstraints(constraints: *const NativeDocIdConstraints) []const u8 {
+    const has_doc_ids = constraints.filter_doc_ids.len > 0;
+    const has_doc_nums = constraints.filter_doc_nums.len > 0;
+    const has_exclusions = nativeFilterExclusionCount(constraints) > 0;
+    if (constraints.positive_filter) {
+        if (!has_doc_ids and !has_doc_nums) return "empty";
+        if (has_doc_ids and has_doc_nums) return "mixed";
+        if (has_doc_nums) return "doc_nums";
+        return "doc_ids";
+    }
+    return if (has_exclusions) "exclusion_only" else "none";
+}
+
+fn observeNativeFilterConstraints(profile: ?*SortCollectorProfile, constraints: ?*const NativeDocIdConstraints) void {
+    const p = profile orelse return;
+    const c = constraints orelse return;
+    p.native_filter_mode = nativeFilterModeForConstraints(c);
+    p.native_filter_candidate_count = nativeFilterConstraintCount(c);
+    p.native_filter_exclusion_count = nativeFilterExclusionCount(c);
 }
 
 fn sortPlanSelectionReason(plan: SortExecutionPlan) []const u8 {
@@ -3353,6 +3385,10 @@ fn sortResultProfile(
         .require_native = plan.require_native,
         .native_loader = native_loader_enabled,
         .sort_lifecycle_state = sortExecutionPlanLifecycleState(plan),
+        .native_filter_mode = profile.native_filter_mode,
+        .native_filter_candidate_count = profile.native_filter_candidate_count,
+        .native_filter_exclusion_count = profile.native_filter_exclusion_count,
+        .selective_filter_doc_values_preferred = plan.selective_filter_doc_values_preferred,
         .native_doc_values_coverage = plan.native_doc_values_coverage,
         .index_sort_coverage = plan.index_sort_coverage,
         .index_sort_match = plan.index_sort_match,
@@ -6905,6 +6941,7 @@ fn sortAndPageMatchAllCandidateStreamAlloc(
         try checkSearchRequestDeadline(effective_req);
         const total_hits = boundedU32(count_ctx.accepted_count);
         var profile = SortCollectorProfile{};
+        observeNativeFilterConstraints(if (collect_sort_profile) &profile else null, options.constraints);
         if (collect_sort_profile) {
             profile.candidate_count = @intCast(@min(count_ctx.accepted_count, @as(usize, std.math.maxInt(u64))));
             profile.window_capacity = 0;
@@ -6926,6 +6963,7 @@ fn sortAndPageMatchAllCandidateStreamAlloc(
 
     const sort_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
     var profile = SortCollectorProfile{};
+    observeNativeFilterConstraints(if (collect_sort_profile) &profile else null, options.constraints);
     const window_capacity = sortWindowCapacity(effective_req);
     if (collect_sort_profile) profile.window_capacity = window_capacity;
     const keep_previous_page = effective_req.search_before.len > 0;
@@ -7100,6 +7138,7 @@ fn sortAndPageMatchAllIdSeekAlloc(
         }, &count_ctx, countMatchAllSortCandidate);
         try checkSearchRequestDeadline(effective_req);
         var profile = SortCollectorProfile{};
+        observeNativeFilterConstraints(if (collect_sort_profile) &profile else null, constraints);
         if (collect_sort_profile) {
             profile.candidate_count = @intCast(@min(count_ctx.accepted_count, @as(usize, std.math.maxInt(u64))));
             profile.window_capacity = 0;
@@ -7122,6 +7161,7 @@ fn sortAndPageMatchAllIdSeekAlloc(
     const sort_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
     const stop_after = if (reverse) requested_limit else skip_count +| requested_limit;
     var profile = SortCollectorProfile{};
+    observeNativeFilterConstraints(if (collect_sort_profile) &profile else null, constraints);
     if (collect_sort_profile) profile.window_capacity = stop_after;
     var seek_ctx = MatchAllIdSeekContext{
         .alloc = alloc,
@@ -7701,6 +7741,7 @@ fn sortAndPageMatchAllSortedSegmentsAlloc(
     if (effective_req.limit == 0) {
         const zero_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
         var zero_profile = SortCollectorProfile{};
+        observeNativeFilterConstraints(if (collect_sort_profile) &zero_profile else null, constraints);
         zero_profile.window_capacity = 0;
         zero_profile.sorted_segment_scan_budget = sortedSegmentScanBudget();
         const visible_total = try countSortedSegmentVisibleCandidatesAlloc(
@@ -7734,6 +7775,7 @@ fn sortAndPageMatchAllSortedSegmentsAlloc(
     const reverse = effective_req.search_before.len > 0;
     const sort_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
     var profile = SortCollectorProfile{};
+    observeNativeFilterConstraints(if (collect_sort_profile) &profile else null, constraints);
     const scan_budget = sortedSegmentScanBudget();
     var scanned_count: u64 = 0;
     if (collect_sort_profile) {
@@ -7929,9 +7971,13 @@ fn logBenchSortCollectorProfile(
         );
     }
     std.log.info(
-        "antfly_bench_sort_collector_plan sort_lifecycle_state={s} native_doc_values_coverage={s} index_sort_coverage={s} index_sort_match={} sorted_segment_executor_available={} sorted_segment_bounds_available={}",
+        "antfly_bench_sort_collector_plan sort_lifecycle_state={s} native_filter_mode={s} native_filter_candidate_count={d} native_filter_exclusion_count={d} selective_filter_doc_values_preferred={} native_doc_values_coverage={s} index_sort_coverage={s} index_sort_match={} sorted_segment_executor_available={} sorted_segment_bounds_available={}",
         .{
             sortExecutionPlanLifecycleState(plan),
+            profile.native_filter_mode,
+            profile.native_filter_candidate_count,
+            profile.native_filter_exclusion_count,
+            plan.selective_filter_doc_values_preferred,
             plan.native_doc_values_coverage,
             plan.index_sort_coverage,
             plan.index_sort_match,
@@ -13079,6 +13125,7 @@ fn sortAndPageMatchAllOrdinalDocValueCandidatesAlloc(
             ordinal_to_text_doc_id,
         );
         var profile = SortCollectorProfile{};
+        observeNativeFilterConstraints(if (collect_sort_profile) &profile else null, constraints);
         if (collect_sort_profile) {
             profile.candidate_count = @intCast(@min(visible_total, @as(usize, std.math.maxInt(u64))));
             profile.window_capacity = 0;
@@ -13114,6 +13161,7 @@ fn sortAndPageMatchAllOrdinalDocValueCandidatesAlloc(
 
     const sort_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
     var profile = SortCollectorProfile{};
+    observeNativeFilterConstraints(if (collect_sort_profile) &profile else null, constraints);
     const window_capacity = sortWindowCapacity(effective_req);
     if (collect_sort_profile) profile.window_capacity = window_capacity;
     const keep_previous_page = effective_req.search_before.len > 0;
@@ -19639,6 +19687,10 @@ test "match_all index sort uses doc values collector for selective native filter
     try std.testing.expectEqualStrings("native_doc_values_top_n", profile.plan);
     try std.testing.expectEqualStrings("doc_values_collector", profile.source);
     try std.testing.expectEqualStrings("selective_filter_doc_values_collector", profile.selection_reason);
+    try std.testing.expect(profile.selective_filter_doc_values_preferred);
+    try std.testing.expectEqualStrings("doc_nums", profile.native_filter_mode);
+    try std.testing.expectEqual(@as(u64, 2), profile.native_filter_candidate_count);
+    try std.testing.expectEqual(@as(u64, 0), profile.native_filter_exclusion_count);
     try std.testing.expectEqual(@as(u64, 2), profile.candidate_count);
     try std.testing.expectEqual(@as(u64, 2), profile.selected_count);
     try std.testing.expectEqual(@as(u64, 2), profile.native_doc_value_hit_count);
@@ -19668,6 +19720,10 @@ test "match_all index sort uses doc values collector for selective native filter
     try std.testing.expectEqualStrings("doc:010", expired_result.hits[0].id);
     const expired_profile = expired_result.sort_profile orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("selective_filter_doc_values_collector", expired_profile.selection_reason);
+    try std.testing.expect(expired_profile.selective_filter_doc_values_preferred);
+    try std.testing.expectEqualStrings("doc_nums", expired_profile.native_filter_mode);
+    try std.testing.expectEqual(@as(u64, 2), expired_profile.native_filter_candidate_count);
+    try std.testing.expectEqual(@as(u64, 0), expired_profile.native_filter_exclusion_count);
     try std.testing.expectEqual(@as(u64, 1), expired_profile.candidate_count);
     try std.testing.expectEqual(@as(u64, 1), expired_profile.selected_count);
     try std.testing.expectEqual(@as(u64, 1), expired_profile.native_doc_value_hit_count);

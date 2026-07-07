@@ -5959,6 +5959,23 @@ export interface components {
              * @enum {string}
              */
             sort_lifecycle_state?: "unsupported" | "declared" | "indexed" | "covered" | "queryable" | "accelerated";
+            /**
+             * @description Native filter constraint shape available to sort planning for this request.
+             * @enum {string}
+             */
+            native_filter_mode?: "none" | "empty" | "doc_nums" | "doc_ids" | "mixed" | "exclusion_only";
+            /**
+             * Format: int64
+             * @description Number of resolved native positive-filter candidates available to the sort executor.
+             */
+            native_filter_candidate_count?: number;
+            /**
+             * Format: int64
+             * @description Number of resolved native exclusion candidates available to the sort executor.
+             */
+            native_filter_exclusion_count?: number;
+            /** @description Whether the planner preferred candidate-first doc-values collection over sorted-segment scanning because a native filter was selective. */
+            selective_filter_doc_values_preferred?: boolean;
             /** @description Native typed doc-values coverage status for mapped sort fields. */
             native_doc_values_coverage?: string;
             /** @description Physical index_sort coverage status for the requested order. */
