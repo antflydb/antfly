@@ -39,6 +39,7 @@ const Entry = struct {
     sort_plan: []u8,
     sort_exactness: []u8,
     sort_source: []u8,
+    sort_candidate_source: []u8,
     sort_selection_reason: []u8,
     sort_rejection_reason: []u8,
     budget_rejection_reason: []u8,
@@ -51,6 +52,7 @@ pub const SortMetricLabels = struct {
     plan: []const u8 = "",
     exactness: []const u8 = "",
     source: []const u8 = "",
+    candidate_source: []const u8 = "",
     selection_reason: []const u8 = "",
     sort_rejection_reason: []const u8 = "",
     budget_rejection_reason: []const u8 = "",
@@ -70,6 +72,7 @@ pub const Collector = struct {
             self.alloc.free(item.sort_plan);
             self.alloc.free(item.sort_exactness);
             self.alloc.free(item.sort_source);
+            self.alloc.free(item.sort_candidate_source);
             self.alloc.free(item.sort_selection_reason);
             self.alloc.free(item.sort_rejection_reason);
             self.alloc.free(item.budget_rejection_reason);
@@ -119,6 +122,7 @@ pub const Collector = struct {
                 std.mem.eql(u8, existing.sort_plan, sort.plan) and
                 std.mem.eql(u8, existing.sort_exactness, sort.exactness) and
                 std.mem.eql(u8, existing.sort_source, sort.source) and
+                std.mem.eql(u8, existing.sort_candidate_source, sort.candidate_source) and
                 std.mem.eql(u8, existing.sort_selection_reason, sort.selection_reason) and
                 std.mem.eql(u8, existing.sort_rejection_reason, sort.sort_rejection_reason) and
                 std.mem.eql(u8, existing.budget_rejection_reason, sort.budget_rejection_reason))
@@ -135,6 +139,8 @@ pub const Collector = struct {
         errdefer self.alloc.free(owned_sort_exactness);
         const owned_sort_source = try self.alloc.dupe(u8, sort.source);
         errdefer self.alloc.free(owned_sort_source);
+        const owned_sort_candidate_source = try self.alloc.dupe(u8, sort.candidate_source);
+        errdefer self.alloc.free(owned_sort_candidate_source);
         const owned_sort_selection_reason = try self.alloc.dupe(u8, sort.selection_reason);
         errdefer self.alloc.free(owned_sort_selection_reason);
         const owned_sort_rejection_reason = try self.alloc.dupe(u8, sort.sort_rejection_reason);
@@ -147,6 +153,7 @@ pub const Collector = struct {
             .sort_plan = owned_sort_plan,
             .sort_exactness = owned_sort_exactness,
             .sort_source = owned_sort_source,
+            .sort_candidate_source = owned_sort_candidate_source,
             .sort_selection_reason = owned_sort_selection_reason,
             .sort_rejection_reason = owned_sort_rejection_reason,
             .budget_rejection_reason = owned_budget_rejection_reason,
@@ -180,6 +187,7 @@ pub fn observeSortProfile(name: ?[]const u8, query_type: QueryType, duration_ns:
         .plan = profile.plan,
         .exactness = profile.exactness,
         .source = profile.source,
+        .candidate_source = profile.candidate_source,
         .selection_reason = profile.selection_reason,
         .sort_rejection_reason = profile.sort_rejection_reason,
         .budget_rejection_reason = profile.budget_rejection_reason,
@@ -232,6 +240,8 @@ fn writeHistogramBucket(
     try writePromLabelValue(writer, entry.sort_exactness);
     try writer.print("\",sort_source=\"", .{});
     try writePromLabelValue(writer, entry.sort_source);
+    try writer.print("\",sort_candidate_source=\"", .{});
+    try writePromLabelValue(writer, entry.sort_candidate_source);
     try writer.print("\",sort_selection_reason=\"", .{});
     try writePromLabelValue(writer, entry.sort_selection_reason);
     try writer.print("\",sort_rejection_reason=\"", .{});
@@ -259,6 +269,8 @@ fn writeHistogramSample(
     try writePromLabelValue(writer, entry.sort_exactness);
     try writer.print("\",sort_source=\"", .{});
     try writePromLabelValue(writer, entry.sort_source);
+    try writer.print("\",sort_candidate_source=\"", .{});
+    try writePromLabelValue(writer, entry.sort_candidate_source);
     try writer.print("\",sort_selection_reason=\"", .{});
     try writePromLabelValue(writer, entry.sort_selection_reason);
     try writer.print("\",sort_rejection_reason=\"", .{});
@@ -288,6 +300,7 @@ test "collector writes Prometheus histogram for index query latency" {
         .plan = "native_doc_values_top_n",
         .exactness = "exact",
         .source = "doc_values_collector",
+        .candidate_source = "native_filter",
         .selection_reason = "doc_values_collector",
         .sort_rejection_reason = "missing_doc_values_coverage",
         .budget_rejection_reason = "match_all_candidate_collect_limit",
@@ -300,10 +313,10 @@ test "collector writes Prometheus histogram for index query latency" {
     const output = writer.buffered();
 
     try std.testing.expect(std.mem.indexOf(u8, output, "# TYPE antfly_indexes_query_duration_seconds histogram") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_indexes_query_duration_seconds_bucket{Name=\"docs\",query_type=\"search\",sort_plan=\"\",sort_exactness=\"\",sort_source=\"\",sort_selection_reason=\"\",sort_rejection_reason=\"\",budget_rejection_reason=\"\",le=\"0.001\"} 1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_indexes_query_duration_seconds_count{Name=\"docs\",query_type=\"search\",sort_plan=\"\",sort_exactness=\"\",sort_source=\"\",sort_selection_reason=\"\",sort_rejection_reason=\"\",budget_rejection_reason=\"\"} 1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_indexes_query_duration_seconds_bucket{Name=\"docs\",query_type=\"search\",sort_plan=\"native_doc_values_top_n\",sort_exactness=\"exact\",sort_source=\"doc_values_collector\",sort_selection_reason=\"doc_values_collector\",sort_rejection_reason=\"missing_doc_values_coverage\",budget_rejection_reason=\"match_all_candidate_collect_limit\",le=\"0.005\"} 1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_indexes_query_duration_seconds_bucket{Name=\"vec\\\"tors\",query_type=\"vector\",sort_plan=\"\",sort_exactness=\"\",sort_source=\"\",sort_selection_reason=\"\",sort_rejection_reason=\"\",budget_rejection_reason=\"\",le=\"2.5\"} 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_indexes_query_duration_seconds_bucket{Name=\"docs\",query_type=\"search\",sort_plan=\"\",sort_exactness=\"\",sort_source=\"\",sort_candidate_source=\"\",sort_selection_reason=\"\",sort_rejection_reason=\"\",budget_rejection_reason=\"\",le=\"0.001\"} 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_indexes_query_duration_seconds_count{Name=\"docs\",query_type=\"search\",sort_plan=\"\",sort_exactness=\"\",sort_source=\"\",sort_candidate_source=\"\",sort_selection_reason=\"\",sort_rejection_reason=\"\",budget_rejection_reason=\"\"} 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_indexes_query_duration_seconds_bucket{Name=\"docs\",query_type=\"search\",sort_plan=\"native_doc_values_top_n\",sort_exactness=\"exact\",sort_source=\"doc_values_collector\",sort_candidate_source=\"native_filter\",sort_selection_reason=\"doc_values_collector\",sort_rejection_reason=\"missing_doc_values_coverage\",budget_rejection_reason=\"match_all_candidate_collect_limit\",le=\"0.005\"} 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_indexes_query_duration_seconds_bucket{Name=\"vec\\\"tors\",query_type=\"vector\",sort_plan=\"\",sort_exactness=\"\",sort_source=\"\",sort_candidate_source=\"\",sort_selection_reason=\"\",sort_rejection_reason=\"\",budget_rejection_reason=\"\",le=\"2.5\"} 1") != null);
 }
 
 test "sort rejection metrics use stable unsupported exact-sort labels" {
@@ -329,5 +342,5 @@ test "sort rejection metrics use stable unsupported exact-sort labels" {
     try collector.writePrometheus(&writer);
     const output = writer.buffered();
 
-    try std.testing.expect(std.mem.indexOf(u8, output, "sort_plan=\"unsupported_exact_sort\",sort_exactness=\"unsupported\",sort_source=\"unsupported\",sort_selection_reason=\"unsupported_exact_sort\",sort_rejection_reason=\"candidate_budget_exceeded\",budget_rejection_reason=\"match_all_candidate_collect_limit\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "sort_plan=\"unsupported_exact_sort\",sort_exactness=\"unsupported\",sort_source=\"unsupported\",sort_candidate_source=\"\",sort_selection_reason=\"unsupported_exact_sort\",sort_rejection_reason=\"candidate_budget_exceeded\",budget_rejection_reason=\"match_all_candidate_collect_limit\"") != null);
 }
