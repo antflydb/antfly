@@ -117,6 +117,44 @@ pub fn publicExactSortRejection(reason: []const u8, detail: []const u8) PublicEx
     };
 }
 
+pub fn validatePublicQuerySortTupleContract(alloc: std.mem.Allocator, body: []const u8) !void {
+    if (std.mem.indexOf(u8, body, "\"order_by\"") == null) return;
+
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |object| object,
+        else => return,
+    };
+    const order_by = object.get("order_by") orelse return;
+    if (order_by == .null) return;
+    if (order_by != .array) return recordInvalidSortTuple("*");
+
+    for (order_by.array.items) |item| {
+        if (item != .object) return recordInvalidSortTuple("*");
+        const field = publicSortTupleFieldName(item.object) orelse "*";
+        var it = item.object.iterator();
+        while (it.next()) |entry| {
+            const key = entry.key_ptr.*;
+            if (std.mem.eql(u8, key, "field") or std.mem.eql(u8, key, "desc")) continue;
+            return recordInvalidSortTuple(field);
+        }
+    }
+}
+
+fn publicSortTupleFieldName(object: std.json.ObjectMap) ?[]const u8 {
+    const field = object.get("field") orelse return null;
+    return switch (field) {
+        .string => |value| value,
+        else => null,
+    };
+}
+
+fn recordInvalidSortTuple(field: []const u8) error{InvalidQueryRequest} {
+    recordUnsupportedExactSortDiagnostic(field, "invalid_sort_tuple", "invalid_sort_tuple");
+    return error.InvalidQueryRequest;
+}
+
 pub fn publicExactSortReason(reason: []const u8, detail: []const u8) []const u8 {
     if (std.mem.eql(u8, reason, "missing_doc_values_coverage")) return "field_not_sort_ready";
     if (std.mem.eql(u8, reason, "missing_native_filter_coverage")) return "filter_not_queryable";
@@ -189,6 +227,30 @@ fn expectPublicExactSortRejectionMappingForTest() !void {
     const unknown_internal = publicExactSortRejection("missing_private_planner_state", "private_detail");
     try std.testing.expectEqualStrings("unsupported_exact_sort", unknown_internal.reason);
     try std.testing.expectEqualStrings("unsupported_exact_sort", unknown_internal.detail);
+}
+
+test "public query sort tuple contract rejects unknown order_by properties" {
+    const alloc = std.testing.allocator;
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.InvalidQueryRequest, validatePublicQuerySortTupleContract(
+        alloc,
+        "{\"order_by\":[{\"field\":\"created_at\",\"descc\":true}]}",
+    ));
+
+    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("created_at", diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_sort_tuple", diagnostic.reason);
+    try std.testing.expectEqualStrings("invalid_sort_tuple", diagnostic.detail);
+}
+
+test "public query sort tuple contract accepts known order_by properties" {
+    const alloc = std.testing.allocator;
+    db_mod.resetLastSortRejectionDiagnostic();
+    try validatePublicQuerySortTupleContract(
+        alloc,
+        "{\"order_by\":[{\"field\":\"created_at\",\"desc\":true}]}",
+    );
+    try std.testing.expect(db_mod.peekLastSortRejectionDiagnostic() == null);
 }
 
 pub fn parseTotalHitsRelation(value: []const u8) !db_mod.types.TotalHitsRelation {

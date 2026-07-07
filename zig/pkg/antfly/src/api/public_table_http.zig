@@ -571,6 +571,12 @@ pub fn handleTableQueryRequest(
     }
 
     db_mod.resetLastSortRejectionDiagnostic();
+    query_contract.validatePublicQuerySortTupleContract(alloc, body) catch |err| switch (err) {
+        error.InvalidQueryRequest => {
+            std.log.warn("public table query invalid exact sort table={s} err={}", .{ table_name, err });
+            return .{ .status = 422, .body = try unsupportedExactSortBody(alloc) };
+        },
+    };
     const response_body = api.executeTableQueryRequest(alloc, table_name, body, row_filter_json) catch |err| {
         switch (err) {
             error.InvalidQueryRequest => {
@@ -1862,6 +1868,59 @@ test "public table query handler maps invalid exact sort diagnostics" {
     try std.testing.expectEqualStrings("invalid_sort_tuple", parsed.value.sort_rejection_reason);
     try std.testing.expectEqualStrings("invalid_sort_tuple", parsed.value.sort_rejection_detail);
     try std.testing.expectEqualStrings("_score", parsed.value.sort_rejection_field);
+}
+
+test "public table query handler rejects unknown sort tuple properties before dispatch" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute_table_batch = unsupportedBatch,
+                    .execute_table_query_request = executeTableQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableQueryRequest(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: ?[]const u8,
+        ) TableApi.ExecuteQueryError![]u8 {
+            return error.InternalFailure;
+        }
+    };
+
+    var resp = try handleTableQueryRequest(std.testing.allocator, "docs",
+        \\{"query":{"match_all":{}},"order_by":[{"field":"created_at","descc":true}]}
+    , null, Backend.iface());
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 422), resp.status);
+    var parsed = try std.json.parseFromSlice(struct {
+        status: u16,
+        @"error": []const u8,
+        reason: []const u8,
+        sort_rejection_reason: []const u8,
+        sort_rejection_detail: []const u8,
+        sort_rejection_field: []const u8,
+    }, std.testing.allocator, resp.body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("unsupported_exact_sort", parsed.value.@"error");
+    try std.testing.expectEqualStrings("invalid_sort_tuple", parsed.value.reason);
+    try std.testing.expectEqualStrings("invalid_sort_tuple", parsed.value.sort_rejection_reason);
+    try std.testing.expectEqualStrings("invalid_sort_tuple", parsed.value.sort_rejection_detail);
+    try std.testing.expectEqualStrings("created_at", parsed.value.sort_rejection_field);
 }
 
 test "public table query handler maps candidate budget exhaustion" {

@@ -108,12 +108,22 @@ const ParsedGlobalQueryTable = struct {
 };
 
 fn parseGlobalQueryTable(alloc: std.mem.Allocator, body: []const u8) !ParsedGlobalQueryTable {
-    var parsed = metadata_openapi.server.parseGlobalQueryBody(alloc, body) catch return error.InvalidQueryRequest;
+    var parsed = parsePublicGlobalQueryBody(alloc, body) catch return error.InvalidQueryRequest;
     errdefer parsed.deinit();
     return .{
         .parsed = parsed,
         .table_name = parsed.value.table orelse "",
     };
+}
+
+fn parsePublicGlobalQueryBody(alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(metadata_openapi.QueryRequest) {
+    try query_contract.validatePublicQuerySortTupleContract(alloc, body);
+    return metadata_openapi.server.parseGlobalQueryBody(alloc, body);
+}
+
+fn parsePublicTableQueryBody(alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(metadata_openapi.QueryRequest) {
+    try query_contract.validatePublicQuerySortTupleContract(alloc, body);
+    return metadata_openapi.server.parseQueryTableBody(alloc, body);
 }
 
 fn isNdjsonContentType(content_type: ?[]const u8) bool {
@@ -6008,7 +6018,7 @@ pub const ApiHttpServer = struct {
             return try alloc.dupe(u8, result.json);
         }
 
-        var contract_req = metadata_openapi.server.parseQueryTableBody(alloc, body) catch return error.InvalidQueryRequest;
+        var contract_req = parsePublicTableQueryBody(alloc, body) catch return error.InvalidQueryRequest;
         defer contract_req.deinit();
 
         if (self.executeForeignPublicTableQueryIfAny(alloc, source, table_name, body, row_filter_json, authenticated_identity) catch |err| switch (err) {
@@ -6109,7 +6119,7 @@ pub const ApiHttpServer = struct {
         row_filter_json: ?[]const u8,
         authenticated_identity: ?AuthenticatedIdentity,
     ) anyerror!?[]u8 {
-        var parsed_request = metadata_openapi.server.parseQueryTableBody(alloc, body) catch return error.InvalidQueryRequest;
+        var parsed_request = parsePublicTableQueryBody(alloc, body) catch return error.InvalidQueryRequest;
         defer parsed_request.deinit();
         const request = &parsed_request.value;
         if (row_filter_json) |value| {
@@ -6260,7 +6270,7 @@ pub const ApiHttpServer = struct {
         join: SupportedJoinRequest,
         foreign_sources: foreign_mod.PostgresSourceMap,
     ) anyerror![]u8 {
-        var contract_request = metadata_openapi.server.parseQueryTableBody(alloc, body) catch return error.InvalidQueryRequest;
+        var contract_request = parsePublicTableQueryBody(alloc, body) catch return error.InvalidQueryRequest;
         defer contract_request.deinit();
         const requested_left_fields = contract_request.value.fields orelse &.{};
         if (contract_request.value.count == true) return error.InvalidQueryRequest;
@@ -6269,7 +6279,7 @@ pub const ApiHttpServer = struct {
         const primary_body = rewrite.body;
         defer alloc.free(primary_body);
 
-        var primary_request = try metadata_openapi.server.parseQueryTableBody(alloc, primary_body);
+        var primary_request = try parsePublicTableQueryBody(alloc, primary_body);
         defer primary_request.deinit();
         if (row_filter_json) |value| {
             try injectRowFilterIntoOpenApiQueryRequest(alloc, &primary_request.value, value);
