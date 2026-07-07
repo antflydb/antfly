@@ -13793,7 +13793,7 @@ fn overlayRuntimeStatusReplayTargetFromDb(status: *runtime_status.LocalTableRunt
     for (status.stats.indexes) |*item| {
         const prior_backfill_active = item.backfill_active;
         const prior_backfill_progress = item.backfill_progress;
-        const prior_replay_backfill_only = runtimeStatusBackfillLooksReplayOnly(item.*);
+        const preserve_non_replay_backfill = runtimeStatusHasNonReplayBackfillSignal(item.*);
         if (db.executor.appliedSequence(item.name)) |live_applied| {
             item.replay_applied_sequence = @max(item.replay_applied_sequence, live_applied);
             item.replay_target_sequence = @max(item.replay_target_sequence, live_applied);
@@ -13818,7 +13818,7 @@ fn overlayRuntimeStatusReplayTargetFromDb(status: *runtime_status.LocalTableRunt
                         @as(f64, @floatFromInt(item.replay_target_sequence)),
                 );
             }
-        } else if (prior_backfill_active and !prior_replay_backfill_only) {
+        } else if (prior_backfill_active and preserve_non_replay_backfill) {
             item.backfill_active = true;
             item.backfill_progress = prior_backfill_progress;
         } else {
@@ -13828,25 +13828,16 @@ fn overlayRuntimeStatusReplayTargetFromDb(status: *runtime_status.LocalTableRunt
     }
 }
 
-fn runtimeStatusBackfillLooksReplayOnly(item: db_mod.types.DBIndexStats) bool {
+fn runtimeStatusHasNonReplayBackfillSignal(item: db_mod.types.DBIndexStats) bool {
     if (!item.backfill_active) return false;
-    if (!item.replay_catch_up_required) return false;
-    if (item.catch_up_active) return false;
-    if (item.catch_up_phase != .idle) return false;
-    if (item.replay_target_sequence == 0) return false;
-    if (item.catch_up_applied_sequence != 0 and item.catch_up_applied_sequence != item.replay_applied_sequence) return false;
-    if (item.catch_up_target_sequence != 0 and item.catch_up_target_sequence != item.replay_target_sequence) return false;
-
-    const replay_progress = @min(
-        1.0,
-        @as(f64, @floatFromInt(item.replay_applied_sequence)) /
-            @as(f64, @floatFromInt(item.replay_target_sequence)),
-    );
-    const delta = if (item.backfill_progress > replay_progress)
-        item.backfill_progress - replay_progress
-    else
-        replay_progress - item.backfill_progress;
-    return delta <= 0.000001;
+    if (item.load_error != null) return true;
+    if (item.enrichment_failed) return true;
+    if (item.repair_degraded or item.repair_issue_count != 0) return true;
+    if (!item.repair_summary_ready) return true;
+    if (!std.mem.eql(u8, item.projection_checkpoint_status, "clean")) return true;
+    if (item.algebraic_active_progress != null) return true;
+    if (item.algebraic_adaptive_backfilling_count != 0) return true;
+    return false;
 }
 
 fn startupCatchUpStatsForPhase(
@@ -22691,6 +22682,124 @@ test "provisioned runtime status overlays live writer replay target without repu
     try std.testing.expect(!statuses.items[0].stats.indexes[0].backfill_active);
 }
 
+test "provisioned runtime status live replay overlay clears ambiguous replay-only backfill" {
+    const alloc = std.testing.allocator;
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = "{\"indexes\":[{\"name\":\"dv_v1\",\"type\":\"embeddings\",\"config\":{\"field\":\"embedding\",\"dims\":2}}]}",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-live-replay-clear-ambiguous-backfill", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
+    defer alloc.free(path);
+
+    {
+        var seeded = try openManagedDbWithIndexesJsonAndCacheMode(
+            alloc,
+            path,
+            "{\"indexes\":[{\"name\":\"dv_v1\",\"type\":\"embeddings\",\"config\":{\"field\":\"embedding\",\"dims\":2}}]}",
+            null,
+            null,
+            0,
+            null,
+            .writer_no_replay,
+        );
+        defer seeded.close();
+        _ = try seeded.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"embedding\":[1,2]}" }},
+            .sync_level = .write,
+        });
+    }
+
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    source.write_cache = &write_cache;
+    source.runtime_status_cache = &snapshot_cache;
+
+    {
+        var initial = try openManagedDbWithIndexesJsonAndCacheMode(
+            alloc,
+            path,
+            "{\"indexes\":[{\"name\":\"dv_v1\",\"type\":\"embeddings\",\"config\":{\"field\":\"embedding\",\"dims\":2}}]}",
+            null,
+            null,
+            0,
+            null,
+            .writer_no_replay,
+        );
+        defer initial.close();
+        try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, &initial));
+    }
+
+    {
+        var cached_statuses = (try snapshot_cache.snapshot(alloc, "docs")).?;
+        defer cached_statuses.deinit(alloc);
+        cached_statuses.items[0].stats.indexes[0].replay_applied_sequence = 1;
+        cached_statuses.items[0].stats.indexes[0].replay_target_sequence = 2;
+        cached_statuses.items[0].stats.indexes[0].replay_catch_up_required = true;
+        cached_statuses.items[0].stats.indexes[0].catch_up_active = false;
+        cached_statuses.items[0].stats.indexes[0].catch_up_phase = .idle;
+        cached_statuses.items[0].stats.indexes[0].catch_up_applied_sequence = 1;
+        cached_statuses.items[0].stats.indexes[0].catch_up_target_sequence = 2;
+        cached_statuses.items[0].stats.indexes[0].backfill_active = true;
+        cached_statuses.items[0].stats.indexes[0].backfill_progress = 0.256;
+        try snapshot_cache.upsertGroupStatus("docs", cached_statuses.items[0]);
+    }
+
+    var cached = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 0, "docs");
+    defer cached.deinit(alloc);
+    _ = try cached.db.batch(.{
+        .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\",\"embedding\":[2,3]}" }},
+        .sync_level = .write,
+    });
+    try cached.db.runDerivedUntil(cached.db.core.nextDerivedSequence());
+
+    var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
+    defer statuses.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 2), statuses.items[0].stats.indexes[0].replay_target_sequence);
+    try std.testing.expectEqual(@as(u64, 2), statuses.items[0].stats.indexes[0].replay_applied_sequence);
+    try std.testing.expect(!statuses.items[0].stats.indexes[0].replay_catch_up_required);
+    try std.testing.expect(!statuses.items[0].stats.indexes[0].backfill_active);
+    try std.testing.expectEqual(@as(f64, 1.0), statuses.items[0].stats.indexes[0].backfill_progress);
+}
+
 test "provisioned runtime status live replay overlay preserves non-replay backfill" {
     const alloc = std.testing.allocator;
 
@@ -22789,6 +22898,7 @@ test "provisioned runtime status live replay overlay preserves non-replay backfi
         cached_statuses.items[0].stats.indexes[0].catch_up_target_sequence = 1;
         cached_statuses.items[0].stats.indexes[0].backfill_active = true;
         cached_statuses.items[0].stats.indexes[0].backfill_progress = 0.42;
+        cached_statuses.items[0].stats.indexes[0].projection_checkpoint_status = "rebuilding";
         try snapshot_cache.upsertGroupStatus("docs", cached_statuses.items[0]);
     }
 
