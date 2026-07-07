@@ -2268,22 +2268,23 @@ fn enforceExactSortGuardrail(cfg: Config, stats: QueryBenchStats) !void {
             );
             return error.ExactSortGuardrailFailed;
         }
+    } else if (cfg.query_shape == .exact_sort_index_sort_filter) {
+        const exact_native_executor_count = stats.profile_sort_native_doc_values_count + stats.profile_sort_sorted_segment_count;
+        if (exact_native_executor_count != stats.queries or
+            stats.profile_sort_native_filter_count != stats.queries or
+            stats.profile_sort_native_filter_doc_nums_count != stats.queries or
+            stats.profile_sort_native_filter_candidate_count == 0)
+        {
+            std.debug.print(
+                "public-query guardrail failed: filtered index_sort exact sort did not use native filter before an exact native executor native_count={d} sorted_segment_count={d} native_filter_count={d} doc_nums_count={d} native_filter_candidates={d} queries={d}\n",
+                .{ stats.profile_sort_native_doc_values_count, stats.profile_sort_sorted_segment_count, stats.profile_sort_native_filter_count, stats.profile_sort_native_filter_doc_nums_count, stats.profile_sort_native_filter_candidate_count, stats.queries },
+            );
+            return error.ExactSortGuardrailFailed;
+        }
     } else if (stats.profile_sort_native_doc_values_count != stats.queries) {
         std.debug.print(
             "public-query guardrail failed: exact sort did not use native_doc_values_top_n for every query native_count={d} queries={d}\n",
             .{ stats.profile_sort_native_doc_values_count, stats.queries },
-        );
-        return error.ExactSortGuardrailFailed;
-    }
-    if (cfg.query_shape == .exact_sort_index_sort_filter and
-        (stats.profile_sort_native_filter_count != stats.queries or
-            stats.profile_sort_native_filter_doc_nums_count != stats.queries or
-            stats.profile_sort_selective_filter_doc_values_count != stats.queries or
-            stats.profile_sort_native_filter_candidate_count == 0))
-    {
-        std.debug.print(
-            "public-query guardrail failed: filtered index_sort exact sort did not use selective native-filter doc-values collector native_filter_count={d} doc_nums_count={d} selective_count={d} native_filter_candidates={d} queries={d}\n",
-            .{ stats.profile_sort_native_filter_count, stats.profile_sort_native_filter_doc_nums_count, stats.profile_sort_selective_filter_doc_values_count, stats.profile_sort_native_filter_candidate_count, stats.queries },
         );
         return error.ExactSortGuardrailFailed;
     }

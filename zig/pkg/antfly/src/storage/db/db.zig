@@ -13638,16 +13638,19 @@ pub const DB = struct {
             AlgebraicDocFilterRequest{ .req = req };
         defer algebraic_filter.deinit();
         var execution_req = algebraic_filter.req;
-        var resolved_text_filter = try db_query_search.resolveStructuredTextDocNumFilterForComposedAlloc(alloc, execution_req, .{
-            .ctx = self,
-            .text_index_entry = textIndexEntryCallback,
-            .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
-            .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
-            .live_filter_doc_set = liveFilterDocSetCallback,
-            .all_docs_visible = allDocsVisibleCallback,
-            .project_ordinals_to_doc_ids = false,
-            .identity_read_generation = execution_req.identity_read_generation,
-        });
+        var resolved_text_filter = if (text_query == .match_all)
+            null
+        else
+            try db_query_search.resolveStructuredTextDocNumFilterForComposedAlloc(alloc, execution_req, .{
+                .ctx = self,
+                .text_index_entry = textIndexEntryCallback,
+                .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
+                .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+                .live_filter_doc_set = liveFilterDocSetCallback,
+                .all_docs_visible = allDocsVisibleCallback,
+                .project_ordinals_to_doc_ids = false,
+                .identity_read_generation = execution_req.identity_read_generation,
+            });
         defer if (resolved_text_filter) |*filter| filter.deinit(alloc);
         if (resolved_text_filter) |*filter| {
             execution_req.resolved_text_doc_filter = filter;
@@ -50104,6 +50107,45 @@ test "db full text count_only applies stored filters" {
 
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
     try std.testing.expectEqual(@as(usize, 0), result.hits.len);
+}
+
+test "db full text match_all applies stored filters" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"status\":\"active\",\"body\":\"alpha\"}" },
+            .{ .key = "doc:b", .value = "{\"status\":\"draft\",\"body\":\"beta\"}" },
+            .{ .key = "doc:c", .value = "{\"status\":\"active\",\"body\":\"gamma\"}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    var result = try waitForSearchResult(alloc, &db, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match_all = {} },
+        .filter_query_json = "{\"term\":{\"status\":\"active\"}}",
+        .limit = 10,
+    }, 2);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+    try std.testing.expectEqualStrings("doc:c", result.hits[1].id);
 }
 
 test "db full_index delete waits for full text visibility" {
