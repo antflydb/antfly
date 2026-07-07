@@ -2833,6 +2833,9 @@ fn expectSortProfileDiagnosticsSerializationForTest() !void {
             .native_filter_candidate_count = 3,
             .native_filter_exclusion_count = 1,
             .selective_filter_doc_values_preferred = true,
+            .cost_model_live_docs = 1000,
+            .cost_model_candidate_count = 3,
+            .cost_model_selective_limit = 4096,
             .native_doc_values_coverage = "covered",
             .index_sort_coverage = "covered_with_bounds",
             .index_sort_match = true,
@@ -2907,6 +2910,9 @@ fn expectSortProfileDiagnosticsSerializationForTest() !void {
     try std.testing.expectEqual(@as(i64, 3), sort.get("native_filter_candidate_count").?.integer);
     try std.testing.expectEqual(@as(i64, 1), sort.get("native_filter_exclusion_count").?.integer);
     try std.testing.expect(sort.get("selective_filter_doc_values_preferred").?.bool);
+    try std.testing.expectEqual(@as(i64, 1000), sort.get("cost_model_live_docs").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), sort.get("cost_model_candidate_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 4096), sort.get("cost_model_selective_limit").?.integer);
     try std.testing.expectEqualStrings("covered", sort.get("native_doc_values_coverage").?.string);
     try std.testing.expectEqualStrings("covered_with_bounds", sort.get("index_sort_coverage").?.string);
     try std.testing.expect(sort.get("index_sort_match").?.bool);
@@ -4319,6 +4325,9 @@ fn buildSortProfileValue(
     try sort.put(alloc, "native_filter_candidate_count", try buildProfileUnsignedValue(alloc, profile.native_filter_candidate_count));
     try sort.put(alloc, "native_filter_exclusion_count", try buildProfileUnsignedValue(alloc, profile.native_filter_exclusion_count));
     try sort.put(alloc, "selective_filter_doc_values_preferred", .{ .bool = profile.selective_filter_doc_values_preferred });
+    try sort.put(alloc, "cost_model_live_docs", try buildProfileUnsignedValue(alloc, profile.cost_model_live_docs));
+    try sort.put(alloc, "cost_model_candidate_count", try buildProfileUnsignedValue(alloc, profile.cost_model_candidate_count));
+    try sort.put(alloc, "cost_model_selective_limit", try buildProfileUnsignedValue(alloc, profile.cost_model_selective_limit));
     try sort.put(alloc, "native_doc_values_coverage", .{ .string = profile.native_doc_values_coverage });
     try sort.put(alloc, "index_sort_coverage", .{ .string = profile.index_sort_coverage });
     try sort.put(alloc, "index_sort_match", .{ .bool = profile.index_sort_match });

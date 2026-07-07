@@ -2574,6 +2574,12 @@ pub const SortProfile = struct {
     native_filter_exclusion_count: ?i64 = null,
     /// Whether the planner preferred candidate-first doc-values collection over sorted-segment scanning because a native filter was selective.
     selective_filter_doc_values_preferred: ?bool = null,
+    /// Live document count used by the sort planner cost model for the selected execution decision.
+    cost_model_live_docs: ?i64 = null,
+    /// Candidate count used by the sort planner cost model for the selected execution decision.
+    cost_model_candidate_count: ?i64 = null,
+    /// Candidate-count threshold under which the sort planner considers a filter selective.
+    cost_model_selective_limit: ?i64 = null,
     /// Native typed doc-values coverage status for mapped sort fields.
     native_doc_values_coverage: ?[]const u8 = null,
     /// Physical index_sort coverage status for the requested order.

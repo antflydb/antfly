@@ -5981,6 +5981,21 @@ export interface components {
             native_filter_exclusion_count?: number;
             /** @description Whether the planner preferred candidate-first doc-values collection over sorted-segment scanning because a native filter was selective. */
             selective_filter_doc_values_preferred?: boolean;
+            /**
+             * Format: int64
+             * @description Live document count used by the sort planner cost model for the selected execution decision.
+             */
+            cost_model_live_docs?: number;
+            /**
+             * Format: int64
+             * @description Candidate count used by the sort planner cost model for the selected execution decision.
+             */
+            cost_model_candidate_count?: number;
+            /**
+             * Format: int64
+             * @description Candidate-count threshold under which the sort planner considers a filter selective.
+             */
+            cost_model_selective_limit?: number;
             /** @description Native typed doc-values coverage status for mapped sort fields. */
             native_doc_values_coverage?: string;
             /** @description Physical index_sort coverage status for the requested order. */

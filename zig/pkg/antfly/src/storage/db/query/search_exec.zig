@@ -3053,6 +3053,9 @@ const SortExecutionPlan = struct {
     sorted_segment_executor_available: bool = false,
     sorted_segment_bounds_available: bool = false,
     selective_filter_doc_values_preferred: bool = false,
+    cost_model_live_docs: u64 = 0,
+    cost_model_candidate_count: u64 = 0,
+    cost_model_selective_limit: u64 = 0,
 };
 
 fn defaultSortPlanExactness(kind: SortExecutionPlanKind) SortPlanExactness {
@@ -3381,6 +3384,19 @@ test "sort execution plan selection reasons are stable for diagnostics" {
     try std.testing.expectEqualStrings("distributed_k_way_merge", sortPlanSelectionReason(.{ .kind = .distributed_k_way_merge }));
 }
 
+const SortCostModelDecision = struct {
+    live_docs: usize = 0,
+    candidate_count: usize = 0,
+    selective_limit: usize = 0,
+    prefer_doc_values: bool = false,
+};
+
+fn applySortCostModelDecision(plan: *SortExecutionPlan, decision: SortCostModelDecision) void {
+    plan.cost_model_live_docs = @intCast(@min(decision.live_docs, @as(usize, std.math.maxInt(u64))));
+    plan.cost_model_candidate_count = @intCast(@min(decision.candidate_count, @as(usize, std.math.maxInt(u64))));
+    plan.cost_model_selective_limit = @intCast(@min(decision.selective_limit, @as(usize, std.math.maxInt(u64))));
+}
+
 fn sortResultProfile(
     req: types.SearchRequest,
     plan: SortExecutionPlan,
@@ -3409,6 +3425,9 @@ fn sortResultProfile(
         .native_filter_candidate_count = profile.native_filter_candidate_count,
         .native_filter_exclusion_count = profile.native_filter_exclusion_count,
         .selective_filter_doc_values_preferred = plan.selective_filter_doc_values_preferred,
+        .cost_model_live_docs = plan.cost_model_live_docs,
+        .cost_model_candidate_count = plan.cost_model_candidate_count,
+        .cost_model_selective_limit = plan.cost_model_selective_limit,
         .native_doc_values_coverage = plan.native_doc_values_coverage,
         .index_sort_coverage = plan.index_sort_coverage,
         .index_sort_match = plan.index_sort_match,
@@ -8013,13 +8032,16 @@ fn logBenchSortCollectorProfile(
         );
     }
     std.log.info(
-        "antfly_bench_sort_collector_plan sort_lifecycle_state={s} native_filter_mode={s} native_filter_candidate_count={d} native_filter_exclusion_count={d} selective_filter_doc_values_preferred={} native_doc_values_coverage={s} index_sort_coverage={s} index_sort_match={} sorted_segment_executor_available={} sorted_segment_bounds_available={}",
+        "antfly_bench_sort_collector_plan sort_lifecycle_state={s} native_filter_mode={s} native_filter_candidate_count={d} native_filter_exclusion_count={d} selective_filter_doc_values_preferred={} cost_model_live_docs={d} cost_model_candidate_count={d} cost_model_selective_limit={d} native_doc_values_coverage={s} index_sort_coverage={s} index_sort_match={} sorted_segment_executor_available={} sorted_segment_bounds_available={}",
         .{
             sortExecutionPlanLifecycleState(plan),
             profile.native_filter_mode,
             profile.native_filter_candidate_count,
             profile.native_filter_exclusion_count,
             plan.selective_filter_doc_values_preferred,
+            plan.cost_model_live_docs,
+            plan.cost_model_candidate_count,
+            plan.cost_model_selective_limit,
             plan.native_doc_values_coverage,
             plan.index_sort_coverage,
             plan.index_sort_match,
@@ -10307,20 +10329,24 @@ pub fn searchTextQuery(
             var membership = try buildSortedSegmentDocMembershipAlloc(alloc, snapshot, filter);
             defer membership.deinit(alloc);
 
-            if (sortedSegmentSelectiveCandidateDocValuesPlan(effective_req, membership.candidate_count, snapshot)) {
+            const cost_decision = sortedSegmentSelectiveCandidateDocValuesDecision(effective_req, membership.candidate_count, snapshot);
+            if (cost_decision.prefer_doc_values) {
                 const doc_nums = try sortedSegmentDocMembershipDocNumsAlloc(alloc, snapshot, &membership);
                 defer alloc.free(doc_nums);
+                var doc_values_plan = docValuesCollectorPlanForSelectiveFilter(field_sort_plan);
+                applySortCostModelDecision(&doc_values_plan, cost_decision);
                 return try sortAndPageTextDocValueDocNumsAlloc(
                     alloc,
                     effective_req,
                     snapshot,
                     doc_nums,
                     executor,
-                    docValuesCollectorPlanForSelectiveFilter(field_sort_plan),
+                    doc_values_plan,
                 );
             }
 
             var sorted_plan = field_sort_plan;
+            applySortCostModelDecision(&sorted_plan, cost_decision);
             sorted_plan.kind = .sorted_segment_seek;
             sorted_plan.source = .sorted_segment_scan;
             sorted_plan.cursor_support = .segment_seek;
@@ -13687,25 +13713,32 @@ fn planMatchAllSortBeforeCandidatesAlloc(
     return plan;
 }
 
-fn sortedSegmentSelectiveCandidateDocValuesPlan(req: types.SearchRequest, candidate_count: usize, snapshot: *const index_mod.IndexSnapshot) bool {
+fn sortedSegmentSelectiveCandidateDocValuesDecision(req: types.SearchRequest, candidate_count: usize, snapshot: *const index_mod.IndexSnapshot) SortCostModelDecision {
     var live_docs: usize = 0;
     for (snapshot.segments) |*segment| live_docs +|= segment.liveDocCount();
-    if (live_docs == 0) return false;
-
-    if (candidate_count == 0) return false;
-    if (candidate_count >= live_docs) return false;
 
     const window = @max(sortWindowCapacity(req), @as(usize, 1));
     const page_selective_limit = window *| 8;
     const absolute_selective_limit: usize = 4096;
     const selective_limit = @max(page_selective_limit, absolute_selective_limit);
-    return candidate_count <= selective_limit and candidate_count *| 16 <= live_docs;
+    const prefer_doc_values =
+        live_docs > 0 and
+        candidate_count > 0 and
+        candidate_count < live_docs and
+        candidate_count <= selective_limit and
+        candidate_count *| 16 <= live_docs;
+    return .{
+        .live_docs = live_docs,
+        .candidate_count = candidate_count,
+        .selective_limit = selective_limit,
+        .prefer_doc_values = prefer_doc_values,
+    };
 }
 
-fn sortedSegmentSelectiveFilterDocValuesPlan(req: types.SearchRequest, constraints: *const NativeDocIdConstraints, snapshot: *const index_mod.IndexSnapshot) bool {
-    if (!constraints.positive_filter) return false;
-    if (constraints.filter_doc_nums.len == 0 or constraints.filter_doc_ids.len > 0) return false;
-    return sortedSegmentSelectiveCandidateDocValuesPlan(req, constraints.filter_doc_nums.len, snapshot);
+fn sortedSegmentSelectiveFilterDocValuesDecision(req: types.SearchRequest, constraints: *const NativeDocIdConstraints, snapshot: *const index_mod.IndexSnapshot) ?SortCostModelDecision {
+    if (!constraints.positive_filter) return null;
+    if (constraints.filter_doc_nums.len == 0 or constraints.filter_doc_ids.len > 0) return null;
+    return sortedSegmentSelectiveCandidateDocValuesDecision(req, constraints.filter_doc_nums.len, snapshot);
 }
 
 fn docValuesCollectorPlanForSelectiveFilter(plan: SortExecutionPlan) SortExecutionPlan {
@@ -13857,9 +13890,14 @@ pub fn searchMatchAll(
             );
             return error.UnsupportedQueryRequest;
         };
-        if (sortedSegmentSelectiveFilterDocValuesPlan(postprocess_req, &native_constraints, text_entry.persistent.snapshot())) {
-            planned_sort = docValuesCollectorPlanForSelectiveFilter(planned_sort);
-        } else {
+        if (sortedSegmentSelectiveFilterDocValuesDecision(postprocess_req, &native_constraints, text_entry.persistent.snapshot())) |cost_decision| {
+            applySortCostModelDecision(&planned_sort, cost_decision);
+            if (cost_decision.prefer_doc_values) {
+                planned_sort = docValuesCollectorPlanForSelectiveFilter(planned_sort);
+                applySortCostModelDecision(&planned_sort, cost_decision);
+            }
+        }
+        if (planned_sort.kind == .sorted_segment_seek) {
             var native_sort_ctx = TextDocValueSortContext{
                 .snapshot = text_entry.persistent.snapshot(),
             };
@@ -20188,6 +20226,9 @@ test "match_all index sort uses doc values collector for selective native filter
     try std.testing.expectEqualStrings("doc_nums", profile.native_filter_mode);
     try std.testing.expectEqual(@as(u64, 2), profile.native_filter_candidate_count);
     try std.testing.expectEqual(@as(u64, 0), profile.native_filter_exclusion_count);
+    try std.testing.expectEqual(@as(u64, 128), profile.cost_model_live_docs);
+    try std.testing.expectEqual(@as(u64, 2), profile.cost_model_candidate_count);
+    try std.testing.expectEqual(@as(u64, 4096), profile.cost_model_selective_limit);
     try std.testing.expectEqual(@as(u64, 2), profile.candidate_count);
     try std.testing.expectEqual(@as(u64, 2), profile.selected_count);
     try std.testing.expectEqual(@as(u64, 2), profile.native_doc_value_hit_count);
@@ -21231,6 +21272,9 @@ test "text index sort uses doc values collector for selective term filters" {
     try std.testing.expectEqualStrings("native_doc_values_top_n", profile.plan);
     try std.testing.expectEqualStrings("doc_values_collector", profile.source);
     try std.testing.expectEqualStrings("selective_filter_doc_values_collector", profile.selection_reason);
+    try std.testing.expectEqual(@as(u64, 128), profile.cost_model_live_docs);
+    try std.testing.expectEqual(@as(u64, 2), profile.cost_model_candidate_count);
+    try std.testing.expectEqual(@as(u64, 4096), profile.cost_model_selective_limit);
     try std.testing.expectEqual(@as(u64, 2), profile.candidate_count);
     try std.testing.expectEqual(@as(u64, 2), profile.selected_count);
     try std.testing.expectEqual(@as(u64, 2), profile.native_doc_value_hit_count);

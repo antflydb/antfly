@@ -56,6 +56,12 @@ class SortProfile:
                 sort executor.
             selective_filter_doc_values_preferred (bool | Unset): Whether the planner preferred candidate-first doc-values
                 collection over sorted-segment scanning because a native filter was selective.
+            cost_model_live_docs (int | Unset): Live document count used by the sort planner cost model for the selected
+                execution decision.
+            cost_model_candidate_count (int | Unset): Candidate count used by the sort planner cost model for the selected
+                execution decision.
+            cost_model_selective_limit (int | Unset): Candidate-count threshold under which the sort planner considers a
+                filter selective.
             native_doc_values_coverage (str | Unset): Native typed doc-values coverage status for mapped sort fields.
             index_sort_coverage (str | Unset): Physical index_sort coverage status for the requested order.
             index_sort_match (bool | Unset): Whether the requested order matched the configured physical index_sort prefix.
@@ -163,6 +169,9 @@ class SortProfile:
     native_filter_candidate_count: int | Unset = UNSET
     native_filter_exclusion_count: int | Unset = UNSET
     selective_filter_doc_values_preferred: bool | Unset = UNSET
+    cost_model_live_docs: int | Unset = UNSET
+    cost_model_candidate_count: int | Unset = UNSET
+    cost_model_selective_limit: int | Unset = UNSET
     native_doc_values_coverage: str | Unset = UNSET
     index_sort_coverage: str | Unset = UNSET
     index_sort_match: bool | Unset = UNSET
@@ -242,6 +251,12 @@ class SortProfile:
         native_filter_exclusion_count = self.native_filter_exclusion_count
 
         selective_filter_doc_values_preferred = self.selective_filter_doc_values_preferred
+
+        cost_model_live_docs = self.cost_model_live_docs
+
+        cost_model_candidate_count = self.cost_model_candidate_count
+
+        cost_model_selective_limit = self.cost_model_selective_limit
 
         native_doc_values_coverage = self.native_doc_values_coverage
 
@@ -344,6 +359,12 @@ class SortProfile:
             field_dict["native_filter_exclusion_count"] = native_filter_exclusion_count
         if selective_filter_doc_values_preferred is not UNSET:
             field_dict["selective_filter_doc_values_preferred"] = selective_filter_doc_values_preferred
+        if cost_model_live_docs is not UNSET:
+            field_dict["cost_model_live_docs"] = cost_model_live_docs
+        if cost_model_candidate_count is not UNSET:
+            field_dict["cost_model_candidate_count"] = cost_model_candidate_count
+        if cost_model_selective_limit is not UNSET:
+            field_dict["cost_model_selective_limit"] = cost_model_selective_limit
         if native_doc_values_coverage is not UNSET:
             field_dict["native_doc_values_coverage"] = native_doc_values_coverage
         if index_sort_coverage is not UNSET:
@@ -472,6 +493,12 @@ class SortProfile:
 
         selective_filter_doc_values_preferred = d.pop("selective_filter_doc_values_preferred", UNSET)
 
+        cost_model_live_docs = d.pop("cost_model_live_docs", UNSET)
+
+        cost_model_candidate_count = d.pop("cost_model_candidate_count", UNSET)
+
+        cost_model_selective_limit = d.pop("cost_model_selective_limit", UNSET)
+
         native_doc_values_coverage = d.pop("native_doc_values_coverage", UNSET)
 
         index_sort_coverage = d.pop("index_sort_coverage", UNSET)
@@ -554,6 +581,9 @@ class SortProfile:
             native_filter_candidate_count=native_filter_candidate_count,
             native_filter_exclusion_count=native_filter_exclusion_count,
             selective_filter_doc_values_preferred=selective_filter_doc_values_preferred,
+            cost_model_live_docs=cost_model_live_docs,
+            cost_model_candidate_count=cost_model_candidate_count,
+            cost_model_selective_limit=cost_model_selective_limit,
             native_doc_values_coverage=native_doc_values_coverage,
             index_sort_coverage=index_sort_coverage,
             index_sort_match=index_sort_match,
