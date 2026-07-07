@@ -6633,9 +6633,10 @@ pub fn build(b: *std.Build) void {
     build_public_query_guardrail_step.dependOn(&public_query_guardrail.step);
     const public_query_guardrail_step = b.step("public-query-guardrail", "Benchmark the public /db/v1/tables/<table>/query path against direct DB search and health responsiveness");
     public_query_guardrail_step.dependOn(&run_public_query_guardrail.step);
-    const public_query_sort_guardrail_step = b.step("public-query-sort-guardrail", "Run CI-sized public exact-sort benchmark guardrails over match-all, full-text, and selective filters");
+    const public_query_sort_guardrail_step = b.step("public-query-sort-guardrail", "Run CI-sized public exact-sort benchmark guardrails over match-all, cursor, full-text, and selective filters");
     const public_query_sort_guardrail_shapes = [_][]const u8{
         "exact-sort-match-all",
+        "exact-sort-cursor",
         "exact-sort-full-text",
         "exact-sort-filter",
     };
