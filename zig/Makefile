@@ -5,8 +5,11 @@ ZIG_BUILD_FLAGS ?=
 UV ?= uv
 SCRIPTS_PY := $(UV) run --project ../scripts --locked python
 INFERENCE_BIN ?= ./zig-out/bin/antfly
-OPENAPI_CODEGEN_SOURCES := build.zig $(wildcard lib/openapi/src/*.zig)
-OPENAPI_CODEGEN_CACHE_KEY := $(shell cat $(OPENAPI_CODEGEN_SOURCES) | shasum | cut -d ' ' -f 1)
+OPENAPI_CODEGEN_SOURCES := build.zig build.zig.zon $(wildcard lib/openapi/src/*.zig)
+OPENAPI_CODEGEN_CACHE_KEY := $(shell git hash-object $(OPENAPI_CODEGEN_SOURCES) | git hash-object --stdin)
+ifeq ($(strip $(OPENAPI_CODEGEN_CACHE_KEY)),)
+$(error failed to compute OPENAPI_CODEGEN_CACHE_KEY; ensure git is available)
+endif
 OPENAPI_CODEGEN_CACHE_DIR ?= .zig-cache/openapi-generate-$(OPENAPI_CODEGEN_CACHE_KEY)
 OPENAPI_ZIG_BUILD := $(ZIG) build --cache-dir $(OPENAPI_CODEGEN_CACHE_DIR)
 
