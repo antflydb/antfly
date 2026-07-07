@@ -1399,6 +1399,22 @@ The current implementation should expose at least `none`, `id_only`, `id_seek`,
 unimplemented physical/distributed plans should be visible to diagnostics but
 rejected at runtime until their executors exist.
 
+Sort should not need a dedicated dashboard. It should add concise labels and
+alerts to the existing query/search observability surface:
+
+- query latency/count by sort plan, exactness, source, candidate source, and
+  selection reason
+- rejection counts by stable sort rejection reason and budget rejection reason
+- native coverage failure counts for missing doc values, missing index-sort
+  coverage, and blocked stored-JSON debug fallback
+- sampled logs/profiles for detailed executor counters when deeper diagnosis is
+  needed
+
+The primary operational signals are abnormal exact-sort rejection rates,
+budget failures, or native coverage failures after a rollout. Those should be
+actionable from the existing query metrics and logs without a separate sort
+dashboard.
+
 The most important invariant is that telemetry must distinguish "native path
 was selected and succeeded" from "native path was unavailable." A public sorted
 query must not quietly move from native doc values to stored JSON. If native
@@ -1493,8 +1509,9 @@ durable physical layout choice.
 2. Keep compatibility/debug hooks only where they are explicitly named.
 3. Update SDKs, OpenAPI examples, and docs so supported sort behavior matches
    runtime mappings.
-4. Add production dashboards for sort plan selection, budget failures, doc-value
-   coverage failures, and source-load counts.
+4. Add concise sort labels and alert rules to existing query metrics for plan
+   selection, budget failures, doc-value coverage failures, and source-load
+   behavior.
 
 ## Testing Requirements
 
@@ -1537,6 +1554,7 @@ Performance coverage:
 
 ## Related Docs
 
+- `SORT_SLICES.md`
 - `SCHEMA.md`
 - `FULL_TEXT.md`
 - `DOCID.md`
