@@ -10002,7 +10002,6 @@ pub fn searchTextQuery(
         !late_visibility_paginate and
         !unresolved_stored_filters and
         !effective_req.count_only and
-        effective_req.limit > 0 and
         !requestHasPostprocessPageTransforms(effective_req) and
         effective_req.aggregations_json.len == 0 and
         effective_req.graph_queries.len == 0 and
@@ -20330,6 +20329,35 @@ test "text field sort uses sorted segment membership path when index sort matche
     try std.testing.expectApproxEqAbs(@as(f64, 1.0), result.hits[0].sort_values[0].float, 0.001);
     try std.testing.expectEqualStrings("doc:c", result.hits[1].id);
     try std.testing.expectApproxEqAbs(@as(f64, 3.0), result.hits[1].sort_values[0].float, 0.001);
+
+    var zero_limit_result = try searchTextQuery(alloc, .{
+        .index_name = "ft",
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 0,
+    }, .{ .term = .{ .field = "body", .term = "alpha" } }, .{
+        .ctx = &harness,
+        .text_index_entry = Harness.textIndexEntry,
+        .text_index_is_chunk_backed = Harness.textIndexIsChunkBacked,
+        .search_match_all = Harness.searchMatchAll,
+        .project_stored_search = Harness.projectStoredSearch,
+        .load_stored = Harness.loadStored,
+        .is_expired_key = Harness.isExpiredKey,
+        .postprocess = Harness.postprocess,
+    });
+    defer zero_limit_result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), zero_limit_result.hits.len);
+    try std.testing.expectEqual(@as(u32, 3), zero_limit_result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, zero_limit_result.total_hits_relation);
+    const zero_limit_profile = zero_limit_result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("sorted_segment_seek", zero_limit_profile.plan);
+    try std.testing.expectEqual(@as(u64, 3), zero_limit_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 0), zero_limit_profile.window_capacity);
+    try std.testing.expectEqual(@as(u64, 0), zero_limit_profile.window_len);
+    try std.testing.expectEqual(@as(u64, 0), zero_limit_profile.stored_json_load_count);
+    try std.testing.expectEqual(@as(usize, 0), harness.postprocess_count);
 
     var transformed_result = try searchTextQuery(alloc, .{
         .index_name = "ft",
