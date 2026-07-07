@@ -6921,7 +6921,7 @@ components:
         - error
     ExactSortError:
       type: object
-      additionalProperties: true
+      additionalProperties: false
       required:
         - error
         - message
@@ -6988,11 +6988,11 @@ components:
         sort_rejection_detail:
           type: string
           description: >
-            Stable user-facing exact-sort rejection detail. For internal
+            Stable user-facing exact-sort rejection detail. Internal storage
 
-            storage and planner details, enable query profiling and inspect
+            and planner details are reserved for logs, traces, and explicit
 
-            `profile.sort.sort_rejection_detail`.
+            debug surfaces.
           example: field_not_sort_ready
         sort_rejection_field:
           type: string
@@ -12415,21 +12415,19 @@ components:
             profiling was enabled).
     SortProfile:
       type: object
-      additionalProperties: true
+      additionalProperties: false
       description: >
-        Sort execution profile. The fields below are the stable public
+        Sort execution profile. These fields are the stable public diagnostic
 
-        diagnostic surface; profiling responses may include additional
+        surface. Low-level implementation counters such as doc-value load
 
-        implementation counters. Additional properties may include low-level
+        timings, stored-source loads, collector/window internals, cost-model
 
-        implementation details such as doc-value load timings, stored-source
+        inputs, native-filter modes, and index-sort availability flags are kept
 
-        loads, collector/window internals, cost-model inputs, native-filter
+        out of normal SDK-facing query responses and may appear only in
 
-        modes, and index-sort availability flags; treat those properties as
-
-        diagnostic and not as a frozen SDK contract.
+        internal debug logs or explicit debug surfaces.
       properties:
         plan:
           type: string

@@ -8,6 +8,7 @@ const antfly_generating_openapi = @import("antfly_generating_openapi");
 const antfly_indexes_openapi = @import("antfly_indexes_openapi");
 const antfly_reranking_openapi = @import("antfly_reranking_openapi");
 const antfly_schema_openapi = @import("antfly_schema_openapi");
+const antfly_sort_openapi = @import("antfly_sort_openapi");
 const antfly_usermgr_openapi = @import("antfly_usermgr_openapi");
 
 pub const AgentDecision = struct {
@@ -1242,7 +1243,7 @@ pub const ExactSortError = struct {
     sort_rejection_reason: []const u8,
     /// Stable budget rejection reason when the rejection was budget-driven. Known values include `text_exact_late_visibility_totals`, `text_field_sort_candidate_window`, `match_all_candidate_collect_limit`, `match_all_exact_candidate_window`, `sorted_segment_scan_window`, and `distributed_merge_shard_window`.
     budget_rejection_reason: ?[]const u8 = null,
-    /// Stable user-facing exact-sort rejection detail. For internal storage and planner details, enable query profiling and inspect `profile.sort.sort_rejection_detail`.
+    /// Stable user-facing exact-sort rejection detail. Internal storage and planner details are reserved for logs, traces, and explicit debug surfaces.
     sort_rejection_detail: []const u8,
     /// Sort field associated with the rejection when safe to expose.
     sort_rejection_field: []const u8,
@@ -2609,11 +2610,11 @@ pub const SignificanceAlgorithm = enum {
     }
 };
 
-pub const SortDirection = antfly_indexes_openapi.SortDirection;
+pub const SortDirection = antfly_sort_openapi.SortDirection;
 
-pub const SortField = antfly_indexes_openapi.SortField;
+pub const SortField = antfly_sort_openapi.SortField;
 
-/// Sort execution profile. The fields below are the stable public diagnostic surface; profiling responses may include additional implementation counters. Additional properties may include low-level implementation details such as doc-value load timings, stored-source loads, collector/window internals, cost-model inputs, native-filter modes, and index-sort availability flags; treat those properties as diagnostic and not as a frozen SDK contract.
+/// Sort execution profile. These fields are the stable public diagnostic surface. Low-level implementation counters such as doc-value load timings, stored-source loads, collector/window internals, cost-model inputs, native-filter modes, and index-sort availability flags are kept out of normal SDK-facing query responses and may appear only in internal debug logs or explicit debug surfaces.
 pub const SortProfile = struct {
     /// Stable physical sort plan name. Known values include `none`, `id_only`, `id_seek`, `sorted_segment_seek`, `native_doc_values_top_n`, `score_top_k`, `distributed_k_way_merge`, `stored_json_debug`, and `unsupported_exact_sort`. Public exact sort requests must not silently move from native plans to `stored_json_debug`; missing native coverage is reported through the rejection fields instead.
     plan: ?[]const u8 = null,

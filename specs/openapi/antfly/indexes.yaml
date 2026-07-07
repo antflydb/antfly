@@ -6,21 +6,9 @@ info:
 components:
   schemas:
     SortDirection:
-      type: boolean
-      description: "Sort direction for a single field. true = descending, false = ascending."
+      $ref: "sort.yaml#/components/schemas/SortDirection"
     SortField:
-      type: object
-      description: "A single sort field with direction."
-      required:
-        - field
-      properties:
-        field:
-          type: string
-          description: "The field name to sort by."
-        desc:
-          type: boolean
-          default: false
-          description: "Sort direction. true = descending, false = ascending."
+      $ref: "sort.yaml#/components/schemas/SortField"
     IndexType:
       # FIXME (ajr) Looks like a bug in oapi-codegen where it doesn't respect
       # the x-go-type-skip-optional-pointer when the schema is referenced from

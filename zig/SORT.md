@@ -1358,37 +1358,39 @@ look like performance fallbacks. Operators should be able to answer, for any
 slow or rejected query, which physical plan ran and why the planner did not
 choose a better one.
 
-Every sorted query profile should include:
+Every sorted query profile should include a compact stable public surface:
 
 - selected sort plan name
 - requested order fields after implicit `_id` normalization
 - exactness class
+- sort source, cursor support, source-load strategy, distributed behavior, and
+  selection reason
+- whether the selected public plan requires native typed sort values
 - candidate count
 - cursor-rejected count
-- doc-value load count and latency
-- doc-value miss or physical coverage failure count
-- stored-source load count and latency
-- collector window size
-- final sort/merge latency
-- distributed shard window size, when applicable
+- selected count
+- distributed shard count, when applicable
+- total sort latency
 - budget rejection reason, when rejected
+- stable public sort rejection reason, detail, and field
 
 The request profile should expose these under `profile.sort` so they are
-available through the normal API response, not only logs. The stable public
-fields should stay compact and operationally meaningful: `plan`, `order_by`,
-`cursor`, `exactness`, `source`, `cursor_support`, `source_load`,
-`distributed_behavior`, `require_native`, candidate/selected/cursor-rejected
-counts, distributed shard count, total sort time, and bounded rejection fields
-such as `budget_rejection_reason`, `sort_rejection_reason`,
-`sort_rejection_detail`, and `sort_rejection_field`.
+available through the normal API response. The stable public fields stay
+compact and operationally meaningful: `plan`, `order_by`, `cursor`,
+`exactness`, `source`, `candidate_source`, `cursor_support`, `source_load`,
+`distributed_behavior`, `selection_reason`, `require_native`,
+`sort_lifecycle_state`, `index_sort_coverage`,
+candidate/selected/cursor-rejected counts, distributed shard count, total sort
+time, and bounded rejection fields such as `budget_rejection_reason`,
+`sort_rejection_reason`, `sort_rejection_detail`, and `sort_rejection_field`.
 
 Lower-level executor counters such as doc-value load timings, stored-source
 load counts, collector heap peaks, index-sort availability flags, and
 implementation-specific window counters are still useful diagnostics, but they
-should be treated as additive profile properties rather than a frozen SDK
-contract. Logs and traces can carry the richer internal detail; OpenAPI and the
-base SDKs should stabilize only the fields that operators can rely on across
-executor rewrites.
+should not be part of the normal SDK-facing query response. Logs, traces,
+benchmark telemetry, and explicit debug surfaces can carry the richer internal
+detail; OpenAPI and the base SDKs stabilize only the fields that operators can
+rely on across executor rewrites.
 
 The stable plan names should be suitable for logs, traces, metrics, and tests.
 The current implementation should expose at least `none`, `id_only`, `id_seek`,

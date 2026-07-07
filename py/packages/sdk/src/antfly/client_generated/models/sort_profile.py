@@ -4,7 +4,6 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
-from attrs import field as _attrs_field
 
 from ..models.sort_profile_candidate_source import SortProfileCandidateSource
 from ..models.sort_profile_sort_lifecycle_state import SortProfileSortLifecycleState
@@ -19,13 +18,12 @@ T = TypeVar("T", bound="SortProfile")
 
 @_attrs_define
 class SortProfile:
-    """Sort execution profile. The fields below are the stable public
-    diagnostic surface; profiling responses may include additional
-    implementation counters. Additional properties may include low-level
-    implementation details such as doc-value load timings, stored-source
-    loads, collector/window internals, cost-model inputs, native-filter
-    modes, and index-sort availability flags; treat those properties as
-    diagnostic and not as a frozen SDK contract.
+    """Sort execution profile. These fields are the stable public diagnostic
+    surface. Low-level implementation counters such as doc-value load
+    timings, stored-source loads, collector/window internals, cost-model
+    inputs, native-filter modes, and index-sort availability flags are kept
+    out of normal SDK-facing query responses and may appear only in
+    internal debug logs or explicit debug surfaces.
 
         Attributes:
             plan (str | Unset): Stable physical sort plan name. Known values include `none`,
@@ -156,7 +154,6 @@ class SortProfile:
     sort_rejection_reason: str | Unset = UNSET
     sort_rejection_detail: str | Unset = UNSET
     sort_rejection_field: str | Unset = UNSET
-    additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         plan = self.plan
@@ -213,7 +210,7 @@ class SortProfile:
         sort_rejection_field = self.sort_rejection_field
 
         field_dict: dict[str, Any] = {}
-        field_dict.update(self.additional_properties)
+
         field_dict.update({})
         if plan is not UNSET:
             field_dict["plan"] = plan
@@ -353,21 +350,4 @@ class SortProfile:
             sort_rejection_field=sort_rejection_field,
         )
 
-        sort_profile.additional_properties = d
         return sort_profile
-
-    @property
-    def additional_keys(self) -> list[str]:
-        return list(self.additional_properties.keys())
-
-    def __getitem__(self, key: str) -> Any:
-        return self.additional_properties[key]
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        self.additional_properties[key] = value
-
-    def __delitem__(self, key: str) -> None:
-        del self.additional_properties[key]
-
-    def __contains__(self, key: str) -> bool:
-        return key in self.additional_properties

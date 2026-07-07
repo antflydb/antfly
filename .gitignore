@@ -55,6 +55,9 @@ go/e2e/test_results/*.md
 go/e2e/models/
 
 # Python SDK local caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
 py/.ruff_cache/
 py/.venv/
 

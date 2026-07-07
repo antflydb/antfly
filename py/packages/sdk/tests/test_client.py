@@ -15,8 +15,8 @@ from antfly.client_generated.types import Unset  # noqa: E402
 class TestAntflyClient:
     """Test cases for AntflyClient."""
 
-    def test_sort_profile_preserves_additive_diagnostics(self) -> None:
-        """SortProfile keeps stable fields typed and passes through diagnostic counters."""
+    def test_sort_profile_uses_closed_public_diagnostic_shape(self) -> None:
+        """SortProfile keeps stable fields typed and drops internal counters."""
         profile = SortProfile.from_dict(
             {
                 "plan": "native_doc_values_top_n",
@@ -28,14 +28,10 @@ class TestAntflyClient:
 
         assert profile.plan == "native_doc_values_top_n"
         assert profile.candidate_count == 7
-        assert "plan" not in profile.additional_properties
-        assert profile["native_doc_value_load_us"] == 13
-
-        profile["sorted_segment_scan_budget"] = 100
         encoded = profile.to_dict()
 
-        assert encoded["collector_heap_peak"] == 5
-        assert encoded["sorted_segment_scan_budget"] == 100
+        assert "native_doc_value_load_us" not in encoded
+        assert "collector_heap_peak" not in encoded
 
     @patch("antfly.client.Client")
     def test_client_initialization(self, mock_client: MagicMock) -> None:

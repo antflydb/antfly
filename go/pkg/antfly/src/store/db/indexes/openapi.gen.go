@@ -20,7 +20,8 @@ import (
 
 	externalRef0 "github.com/antflydb/antfly/go/pkg/antfly/lib/chunking"
 	externalRef1 "github.com/antflydb/antfly/go/pkg/antfly/lib/embeddings"
-	externalRef2 "github.com/antflydb/antfly/go/pkg/generating"
+	externalRef2 "github.com/antflydb/antfly/go/pkg/antfly/src/store/db/sorttypes"
+	externalRef3 "github.com/antflydb/antfly/go/pkg/generating"
 	"github.com/getkin/kin-openapi/openapi3"
 	"github.com/oapi-codegen/runtime"
 )
@@ -543,7 +544,7 @@ type EmbeddingsIndexConfig struct {
 	Sparse bool `json:"sparse,omitempty"`
 
 	// Summarizer A unified configuration for a generative AI provider.
-	Summarizer *externalRef2.GeneratorConfig `json:"summarizer,omitempty"`
+	Summarizer *externalRef3.GeneratorConfig `json:"summarizer,omitempty"`
 
 	// Template Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
 	Template string `json:"template,omitempty"`
@@ -825,7 +826,7 @@ type GraphIndexConfig struct {
 	MaxEdgesPerDocument int `json:"max_edges_per_document,omitempty"`
 
 	// Summarizer A unified configuration for a generative AI provider.
-	Summarizer *externalRef2.GeneratorConfig `json:"summarizer,omitempty"`
+	Summarizer *externalRef3.GeneratorConfig `json:"summarizer,omitempty"`
 
 	// Template Handlebars template for generating summarizer input text.
 	// Uses document fields as template variables.
@@ -1303,16 +1304,10 @@ type Pruner struct {
 }
 
 // SortDirection Sort direction for a single field. true = descending, false = ascending.
-type SortDirection = bool
+type SortDirection = externalRef2.SortDirection
 
 // SortField A single sort field with direction.
-type SortField struct {
-	// Desc Sort direction. true = descending, false = ascending.
-	Desc *bool `json:"desc,omitempty"`
-
-	// Field The field name to sort by.
-	Field string `json:"field"`
-}
+type SortField = externalRef2.SortField
 
 // TraversalResult A single result from graph traversal
 type TraversalResult struct {
@@ -2145,28 +2140,29 @@ var swaggerSpec = []string{
 	"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",
-	"D++rylRl2J2aoxbyl50ZphYYpdbYq7OPH/56cnyxriRcm2cvL412ZPhQpT7agpf/VfEgnRY2+SMUDZmv",
-	"xuvrlMSO9btnqGoD20bEN8I6MCxJmIJI8FiFetKl2cohKr0FVOFe5l0690/2/deFU2MVIiyQ5V+Kray4",
-	"ElrY6zVDcv/g01h+EGcgOy6xvSFnIhwGOUpc4LUN7wzm0A75DaQ4ECnTRvnBqDOb2ODqcnljZcOr2Lj8",
-	"VakhD0W1+2q1rLuVz/o4FNCi5HyGIkKnGR187ZzHQ34Bt7oO+JIK5Kj0xFj6I7QqUo5qdfLIXq/b6xx2",
-	"e1WD8DgRVM+/wv1wlJqDfS36tmlqK8nb1xyae2gknFgRlOf6ND4iYc+1S+xzGT780ofsERpJoVw1PTIS",
-	"OY8pxl2RD6HO1mg2V8/OXCEbEaJUUW2+eLEPjrN81lY5zBLns/ZycTDggwF/5uJRJcXiuWr/QQCVcmqr",
-	"BZwWPctY39PMF+LaiPd4XTIUe/ve/iA2rdlUKKlG/pYsBq0vrqLOyno59Hbh6cwzqQLlPZNaebNcpsNM",
-	"/HlY9lG76HF+K3OuWQoH30Oa0s7Lzof37/+zEc0gzcxIuWws2OBKvEnKY5FyUFhor1TxCvnUi0V8Kjzk",
-	"+qL0dlhvjn+1Wy44v+Htk4uLsxDW62P48RGYkkiuokBEk0SteDgfK31nw6uGjRZZ54oos5Vo06KSpqBB",
-	"LpAiIhtmTZwuSiBXC4ZZvE2HS7dpM+WuStJTKTIWPZ6qbf8HkvNCE1ExoLcQ7YLgimxei05rm3aihOYx",
-	"dJTgHHTnVeerzovei696//7i3xvvGpj0GErQOIItlrj4qrF0np1Q7uFKyj1cRbm/CxltC/p1BEwVOYOA",
-	"2Z5dfhW5ukIIjyXWUmWz9cn1swu3BaWbqgRC/VF0F5NK5/qw39t+aabuEwl+gZLMxk4+kjJcGZwtybBa",
-	"/aImdBlL+wrKbGgWlOhZ020eP1gYMesodNoWuvx+YlSkKeVxR3ayJFfrVilaIi7r4zXY5EAZvfAh++37",
-	"bI06n8T0htBvjVs08ImH1nhaOQVaeusTrSo6tGpUa7He9qg27GrbozbbCzaGFUMtdjGq9cBue+QFOtsW",
-	"Nrf55rbpwM2CtKnY1boVgdYmxu3XCVoq0stxmyVJ+KL36puSYzPTnVfdw8b4sBpL73X/fP8Q3rM8daIZ",
-	"8u2mTwQtupxKEYrKY05FUyrF41jfwxIsFizfJ108WCmrpQw06Qjbi7n/XYyENU/oi+5XnXFC1XSlelXa",
-	"6pXOz/Ko24rI737B1sg/3IXq0ZkJn9GM0axuPCwL4Qs2YKwIxq/SFX5/2X3Z/3Nv9M9qlS9F9f/TmuTX",
-	"o7um/IbPSHeNqvPDkhO2ZCOpBcvvwkZi0N6Q3MOwv/NiB4aS9WV30DY3DJEvBtqyKWSLu/rliPgvjUs0",
-	"pBt8Xi7RfBV+eErAFrlFLXD8n5xjPNi0WolSsY+910PJwxOd9kNR4zjNlSajUHU5bgwWX8JR7DANL5Jg",
-	"fSsxnoPExc/RJBnR6IqYmylGpq0LH+LPmi8tP3G8jTne1oy3D+ZFzebOx6cR1K+6qokVbSvmfLWNYWsR",
-	"2V9WlMSDLRDFWnZngHgyPnyBnpp7fJJlLBpkB7dq0NlpCDytPEGI9G4ALzIDfTWr8P7B6+9wT5hGBDrF",
-	"+k8VVmGNpjaro9Xr9rr43phjR61+62W3131p+IN9e5/nSXL/fwMAAP//noaWlm9bAQA=",
+	"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",
+	"/5OfoVYgXQEA",
 }
 
 // GetSwagger returns the content of the embedded swagger specification file
@@ -2206,7 +2202,7 @@ func PathToRawSpec(pathToFile string) map[string]func() ([]byte, error) {
 		res[pathToFile] = rawSpec
 	}
 
-	for rawPath, rawFunc := range externalRef2.PathToRawSpec(path.Join(path.Dir(pathToFile), "../shared/generating.yaml")) {
+	for rawPath, rawFunc := range externalRef3.PathToRawSpec(path.Join(path.Dir(pathToFile), "../shared/generating.yaml")) {
 		if _, ok := res[rawPath]; ok {
 			// it is not possible to compare functions in golang, so always overwrite the old value
 		}
@@ -2219,6 +2215,12 @@ func PathToRawSpec(pathToFile string) map[string]func() ([]byte, error) {
 		res[rawPath] = rawFunc
 	}
 	for rawPath, rawFunc := range externalRef1.PathToRawSpec(path.Join(path.Dir(pathToFile), "embeddings.yaml")) {
+		if _, ok := res[rawPath]; ok {
+			// it is not possible to compare functions in golang, so always overwrite the old value
+		}
+		res[rawPath] = rawFunc
+	}
+	for rawPath, rawFunc := range externalRef2.PathToRawSpec(path.Join(path.Dir(pathToFile), "sort.yaml")) {
 		if _, ok := res[rawPath]; ok {
 			// it is not possible to compare functions in golang, so always overwrite the old value
 		}

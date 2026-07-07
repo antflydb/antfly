@@ -39,7 +39,7 @@ func TestModelDirUsesAntflyInferenceLayout(t *testing.T) {
 	}
 }
 
-func TestSortProfilePreservesAdditionalDiagnostics(t *testing.T) {
+func TestSortProfileUsesClosedPublicDiagnosticShape(t *testing.T) {
 	payload := []byte(`{
 		"plan": "native_doc_values_top_n",
 		"cursor": "after",
@@ -58,16 +58,7 @@ func TestSortProfilePreservesAdditionalDiagnostics(t *testing.T) {
 	if got, want := profile.CandidateCount, int64(7); got != want {
 		t.Fatalf("CandidateCount = %d, want %d", got, want)
 	}
-	if _, found := profile.Get("plan"); found {
-		t.Fatalf("stable field plan should not be duplicated in additional properties")
-	}
-	gotDiagnostic, found := profile.Get("native_doc_value_load_us")
-	gotDiagnosticNumber, ok := gotDiagnostic.(float64)
-	if !found || !ok || gotDiagnosticNumber != 13 {
-		t.Fatalf("native_doc_value_load_us additional property = (%v, %v), want (13, true)", gotDiagnostic, found)
-	}
 
-	profile.Set("sorted_segment_scan_budget", 100)
 	encoded, err := json.Marshal(profile)
 	if err != nil {
 		t.Fatalf("marshal SortProfile: %v", err)
@@ -76,11 +67,11 @@ func TestSortProfilePreservesAdditionalDiagnostics(t *testing.T) {
 	if err := json.Unmarshal(encoded, &roundTrip); err != nil {
 		t.Fatalf("unmarshal encoded SortProfile: %v", err)
 	}
-	if _, found := roundTrip["collector_heap_peak"]; !found {
-		t.Fatalf("collector_heap_peak diagnostic was not preserved: %s", encoded)
+	if _, found := roundTrip["native_doc_value_load_us"]; found {
+		t.Fatalf("internal native_doc_value_load_us diagnostic leaked into public model: %s", encoded)
 	}
-	if _, found := roundTrip["sorted_segment_scan_budget"]; !found {
-		t.Fatalf("sorted_segment_scan_budget diagnostic was not preserved: %s", encoded)
+	if _, found := roundTrip["collector_heap_peak"]; found {
+		t.Fatalf("internal collector_heap_peak diagnostic leaked into public model: %s", encoded)
 	}
 }
 

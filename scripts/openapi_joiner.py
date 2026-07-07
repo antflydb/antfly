@@ -39,6 +39,7 @@ PATH_REWRITES = {
     "../shared/generating.yaml": "specs/openapi/shared/generating.yaml",
     "schema.yaml": "specs/openapi/antfly/schema.yaml",
     "indexes.yaml": "specs/openapi/antfly/indexes.yaml",
+    "sort.yaml": "specs/openapi/antfly/sort.yaml",
     "generating.yaml": "specs/openapi/antfly/generating.yaml",
     "eval.yaml": "specs/openapi/antfly/eval.yaml",
     "reranking.yaml": "specs/openapi/antfly/reranking.yaml",

@@ -1435,7 +1435,7 @@ components:
       $ref: "../auth/api.yaml#/components/schemas/Error"
     ExactSortError:
       type: object
-      additionalProperties: true
+      additionalProperties: false
       required:
         - error
         - message
@@ -1486,9 +1486,9 @@ components:
         sort_rejection_detail:
           type: string
           description: |
-            Stable user-facing exact-sort rejection detail. For internal
-            storage and planner details, enable query profiling and inspect
-            `profile.sort.sort_rejection_detail`.
+            Stable user-facing exact-sort rejection detail. Internal storage
+            and planner details are reserved for logs, traces, and explicit
+            debug surfaces.
           example: field_not_sort_ready
         sort_rejection_field:
           type: string
@@ -1499,9 +1499,9 @@ components:
           format: int32
           example: 422
     SortDirection:
-      $ref: "indexes.yaml#/components/schemas/SortDirection"
+      $ref: "sort.yaml#/components/schemas/SortDirection"
     SortField:
-      $ref: "indexes.yaml#/components/schemas/SortField"
+      $ref: "sort.yaml#/components/schemas/SortField"
     ClusterHealth:
       type: string
       enum:
@@ -6333,15 +6333,14 @@ components:
           description: Sort execution statistics (present when the query used ordered page options and profiling was enabled).
     SortProfile:
       type: object
-      additionalProperties: true
+      additionalProperties: false
       description: |
-        Sort execution profile. The fields below are the stable public
-        diagnostic surface; profiling responses may include additional
-        implementation counters. Additional properties may include low-level
-        implementation details such as doc-value load timings, stored-source
-        loads, collector/window internals, cost-model inputs, native-filter
-        modes, and index-sort availability flags; treat those properties as
-        diagnostic and not as a frozen SDK contract.
+        Sort execution profile. These fields are the stable public diagnostic
+        surface. Low-level implementation counters such as doc-value load
+        timings, stored-source loads, collector/window internals, cost-model
+        inputs, native-filter modes, and index-sort availability flags are kept
+        out of normal SDK-facing query responses and may appear only in
+        internal debug logs or explicit debug surfaces.
       properties:
         plan:
           type: string

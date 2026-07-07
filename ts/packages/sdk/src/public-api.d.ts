@@ -2527,9 +2527,9 @@ export interface components {
              */
             budget_rejection_reason?: string;
             /**
-             * @description Stable user-facing exact-sort rejection detail. For internal
-             *     storage and planner details, enable query profiling and inspect
-             *     `profile.sort.sort_rejection_detail`.
+             * @description Stable user-facing exact-sort rejection detail. Internal storage
+             *     and planner details are reserved for logs, traces, and explicit
+             *     debug surfaces.
              * @example field_not_sort_ready
              */
             sort_rejection_detail: string;
@@ -2543,8 +2543,6 @@ export interface components {
              * @example 422
              */
             status: number;
-        } & {
-            [key: string]: unknown;
         };
         /** @description Sort direction for a single field. true = descending, false = ascending. */
         SortDirection: boolean;
@@ -6095,13 +6093,12 @@ export interface components {
             sort?: components["schemas"]["SortProfile"];
         };
         /**
-         * @description Sort execution profile. The fields below are the stable public
-         *     diagnostic surface; profiling responses may include additional
-         *     implementation counters. Additional properties may include low-level
-         *     implementation details such as doc-value load timings, stored-source
-         *     loads, collector/window internals, cost-model inputs, native-filter
-         *     modes, and index-sort availability flags; treat those properties as
-         *     diagnostic and not as a frozen SDK contract.
+         * @description Sort execution profile. These fields are the stable public diagnostic
+         *     surface. Low-level implementation counters such as doc-value load
+         *     timings, stored-source loads, collector/window internals, cost-model
+         *     inputs, native-filter modes, and index-sort availability flags are kept
+         *     out of normal SDK-facing query responses and may appear only in
+         *     internal debug logs or explicit debug surfaces.
          */
         SortProfile: {
             /**
@@ -6269,8 +6266,6 @@ export interface components {
             sort_rejection_detail?: string;
             /** @description Sort field associated with the rejection when safe to expose. */
             sort_rejection_field?: string;
-        } & {
-            [key: string]: unknown;
         };
         /** @description Shard-level execution statistics. */
         ShardsProfile: {

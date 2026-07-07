@@ -5,6 +5,7 @@ const std = @import("std");
 const antfly_chunking_openapi = @import("antfly_chunking_openapi");
 const antfly_embeddings_openapi = @import("antfly_embeddings_openapi");
 const antfly_generating_openapi = @import("antfly_generating_openapi");
+const antfly_sort_openapi = @import("antfly_sort_openapi");
 
 /// Schema-derived algebraic sidecar configuration. Public requests may opt into schema derivation, while materializations remain engine-owned.
 pub const AlgebraicIndexConfig = struct {
@@ -1228,16 +1229,9 @@ pub const Pruner = struct {
     std_dev_threshold: ?f64 = null,
 };
 
-/// Sort direction for a single field. true = descending, false = ascending.
-pub const SortDirection = bool;
+pub const SortDirection = antfly_sort_openapi.SortDirection;
 
-/// A single sort field with direction.
-pub const SortField = struct {
-    /// The field name to sort by.
-    field: []const u8,
-    /// Sort direction. true = descending, false = ascending.
-    desc: ?bool = null,
-};
+pub const SortField = antfly_sort_openapi.SortField;
 
 /// A single result from graph traversal
 pub const TraversalResult = struct {
