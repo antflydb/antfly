@@ -30,6 +30,7 @@ const db_core = @import("core.zig");
 const db_internal = @import("internal.zig");
 const doc_identity = @import("doc_identity.zig");
 const docstore_mod = @import("../docstore.zig");
+const derived_async_mod = @import("derived_async.zig");
 const derived_executor_mod = @import("derived/derived_executor.zig");
 const derived_types = @import("derived/derived_types.zig");
 const enrichment_runtime_mod = @import("enrichment/enrichment_runtime.zig");
@@ -1882,10 +1883,13 @@ pub fn Impl(comptime DB: type) type {
                 }
             }
 
-            return .{
+            var targets = ManagedSyncTargets{
                 .full_text_indexes = try full_text_indexes.toOwnedSlice(self.alloc),
                 .all_indexes = try all_indexes.toOwnedSlice(self.alloc),
             };
+            errdefer targets.deinit(self.alloc);
+            try derived_async_mod.filterManagedSyncTargetsForRelationalTextSearchMaintenance(self.alloc, self.core.schema, &targets);
+            return targets;
         }
 
         pub fn runUntilIdle(self: *DB) !void {

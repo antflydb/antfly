@@ -22,8 +22,6 @@ completed work; remove the checkbox once the patch lands.
   generation record during create and rebuild jobs.
 - [ ] Promote text-search ranges to ready with compare-and-swap generation
   checks and deterministic stale-generation diagnostics.
-- [ ] Gate text-search query and write maintenance on generation-record
-  readiness instead of method-local readiness state.
 - [ ] Write algebraic dictionary rebuild cursor, lag, and ready watermark into
   the shared generation record during create and rebuild jobs.
 - [ ] Write algebraic fact, path, and postings rebuild cursor, lag, and ready

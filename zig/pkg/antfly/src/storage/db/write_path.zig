@@ -6700,6 +6700,11 @@ pub fn Impl(comptime DB: type) type {
             DB.WritePathCallbacks.mirror_ha_replay_payload_best_effort_context(ctx.log_mutex, ctx.ha_async_effect_mirror, replay_payload);
             var sync_targets = try DB.WritePathCallbacks.collect_managed_sync_targets(ctx.alloc, ctx.index_manager, derived_batch);
             defer sync_targets.deinit(ctx.alloc);
+            if (ctx.relational_base_rows) {
+                const loaded_schema = try schema_mod.loadSchema(ctx.store, ctx.alloc);
+                defer if (loaded_schema) |schema| schema_mod.freeSchema(ctx.alloc, schema);
+                try DB.WritePathCallbacks.filter_managed_sync_targets_for_relational_text_search_maintenance(ctx.alloc, loaded_schema, &sync_targets);
+            }
             ctx.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
             try DB.WritePathCallbacks.mark_precomputed_enrichment_applied_for_sync_context(ctx, sync_level, sequence);
             try DB.WritePathCallbacks.apply_derived_backlog_pressure_context(ctx, sequence, sync_level, sync_targets);
@@ -7465,7 +7470,7 @@ pub fn Impl(comptime DB: type) type {
             defer derived_types.deinitDerivedBatch(self.alloc, &derived_batch);
             derived_batch.sequence = sequence;
 
-            var sync_targets = try DB.WritePathCallbacks.collect_managed_sync_targets(self.alloc, self.core.index_manager, derived_batch);
+            var sync_targets = try DB.WritePathCallbacks.collect_managed_sync_targets_for_db(self, self.alloc, derived_batch);
             defer sync_targets.deinit(self.alloc);
             const replay_payload = try DB.WritePathCallbacks.encode_change_record_payload(self, derived_batch, sequence);
             defer self.alloc.free(replay_payload);
@@ -8537,7 +8542,7 @@ pub fn Impl(comptime DB: type) type {
                 if (profile) |active_profile| DB.WritePathCallbacks.record_profile_ns(profile, &active_profile.apply_shadow_ns, apply_shadow_start_ns);
 
                 const collect_sync_targets_start_ns = DB.WritePathCallbacks.monotonic_time_ns();
-                sync_targets = try DB.WritePathCallbacks.collect_managed_sync_targets(self.alloc, self.core.index_manager, materialized_derived_batch.?);
+                sync_targets = try DB.WritePathCallbacks.collect_managed_sync_targets_for_db(self, self.alloc, materialized_derived_batch.?);
                 if (profile) |active_profile| DB.WritePathCallbacks.record_profile_ns(profile, &active_profile.collect_sync_targets_ns, collect_sync_targets_start_ns);
                 break :blk payload;
             };
