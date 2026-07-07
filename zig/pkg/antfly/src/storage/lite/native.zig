@@ -180,6 +180,11 @@ pub const PathWriterLock = struct {
     }
 };
 
+const LockFile = struct {
+    file: std.Io.File,
+    locks_supported: bool = true,
+};
+
 pub const CreateOptions = struct {
     exclusive: bool = false,
     no_sync: bool = false,
@@ -240,17 +245,6 @@ pub const OwnedCatalogKey = struct {
     key: []u8,
 };
 
-/// In-memory cache of encoded pages, keyed by page id.
-///
-/// Safe because page contents are stable for the lifetime of an open handle:
-/// all in-process page writes flow through `writePage` (which updates the
-/// cache) or `replaceOpenFileWithImage` (which clears it), and other
-/// processes cannot rewrite pages under us — free-page reuse and vacuum
-/// require the exclusive data-rewrite lock, which both our writer-mode
-/// `.lock = .none` read-write handle plus `.aflite.lock` and read-only
-/// shared-lock handles block. Pages appended by another writer sit beyond
-/// this handle's pinned `page_count` and are rejected by the existing bounds
-/// check before the cache is consulted.
 /// Decoded chain-navigation metadata for a page, cached so reachability
 /// walks can traverse chains without re-reading and re-decoding page
 /// payloads. Mirrors exactly the fields the walks consume.
@@ -277,6 +271,15 @@ const PageLinkCopy = struct {
     key: ?[]u8,
 };
 
+/// In-memory cache of encoded pages, keyed by page id.
+///
+/// Safe when OS file locks are available because page contents are stable for
+/// the lifetime of an open handle: all in-process page writes flow through
+/// `writePage` (which updates the cache) or `replaceOpenFileWithImage` (which
+/// clears it), and other processes cannot rewrite pages under us because
+/// free-page reuse and vacuum require the writer/data-rewrite locks. If the
+/// filesystem reports `FileLocksUnsupported`, the owning `NativeFile` disables
+/// this cache for that handle and reads page bytes from disk instead.
 const PageCache = struct {
     const default_limit_bytes: usize = 64 * 1024 * 1024;
     const default_link_limit_bytes: usize = 16 * 1024 * 1024;
@@ -509,6 +512,7 @@ pub const NativeFile = struct {
     header: Header,
     read_only: bool = false,
     no_sync: bool = false,
+    page_cache_enabled: bool = true,
     page_cache: PageCache = .{},
     /// While non-zero, page reads bypass the page cache and hit disk.
     /// Integrity checks hold this so they verify on-disk state rather than
@@ -528,13 +532,18 @@ pub const NativeFile = struct {
         errdefer allocator.free(owned_path);
 
         var writer_lock_file: ?std.Io.File = null;
+        var page_cache_enabled = true;
         if (!opts.read_only) {
-            writer_lock_file = try acquireWriterLock(allocator, io, path);
+            const writer_lock = try acquireWriterLock(allocator, io, path);
+            writer_lock_file = writer_lock.file;
+            page_cache_enabled = writer_lock.locks_supported;
         }
         errdefer if (writer_lock_file) |lock_file| lock_file.close(io);
 
-        const file = try openDataFile(io, path, if (opts.read_only) .reader else .writer);
+        const opened_file = try openDataFile(io, path, if (opts.read_only) .reader else .writer);
+        const file = opened_file.file;
         errdefer file.close(io);
+        page_cache_enabled = page_cache_enabled and opened_file.locks_supported;
 
         var header_bytes: [header_size]u8 = undefined;
         try readHeaderExactAt(file, io, &header_bytes);
@@ -551,6 +560,7 @@ pub const NativeFile = struct {
             .header = header,
             .read_only = opts.read_only,
             .no_sync = opts.no_sync,
+            .page_cache_enabled = page_cache_enabled,
         };
         if (opts.resource_manager) |manager| result.page_cache.attachResourceManager(manager);
         return result;
@@ -582,7 +592,8 @@ pub const NativeFile = struct {
         const owned_path = try allocator.dupe(u8, path);
         errdefer allocator.free(owned_path);
 
-        var writer_lock_file = try acquireWriterLock(allocator, io, path);
+        const writer_lock = try acquireWriterLock(allocator, io, path);
+        var writer_lock_file = writer_lock.file;
         errdefer writer_lock_file.close(io);
 
         var encoded: [header_size]u8 = undefined;
@@ -606,6 +617,7 @@ pub const NativeFile = struct {
             .header = .{},
             .read_only = false,
             .no_sync = no_sync,
+            .page_cache_enabled = writer_lock.locks_supported,
         };
         if (resource_manager) |manager| result.page_cache.attachResourceManager(manager);
         return result;
@@ -620,6 +632,11 @@ pub const NativeFile = struct {
         self.allocator.free(self.path);
         self.io_impl.deinit();
         self.* = undefined;
+    }
+
+    fn disablePageCacheForUnsupportedLocks(self: *NativeFile) void {
+        self.page_cache_enabled = false;
+        self.page_cache.clear(self.allocator);
     }
 
     pub fn activeCheckpoint(self: *const NativeFile) CheckpointSlot {
@@ -709,8 +726,8 @@ pub const NativeFile = struct {
     fn readPageAllocForCheckpoint(self: *NativeFile, allocator: Allocator, page_id: u64, checkpoint: CheckpointSlot) ![]u8 {
         if (page_id == 0 or page_id >= checkpoint.page_count) return error.InvalidPageId;
 
-        const bypass_cache = self.page_cache_bypass.load(.monotonic) != 0;
-        if (!bypass_cache) {
+        const use_cache = self.page_cache_enabled and self.page_cache_bypass.load(.monotonic) == 0;
+        if (use_cache) {
             if (try self.page_cache.getCopy(allocator, page_id)) |cached| return cached;
         }
 
@@ -722,7 +739,7 @@ pub const NativeFile = struct {
         // Free-map pages are rewritten every commit and read once, so caching
         // them buys nothing; skipping them also keeps free-map validation
         // reading disk truth before any pages are handed out for reuse.
-        if (!bypass_cache and page.len > 4 and page[4] != @intFromEnum(PageKind.free_map)) {
+        if (use_cache and page.len > 4 and page[4] != @intFromEnum(PageKind.free_map)) {
             self.page_cache.put(self.allocator, page_id, page);
         }
         return page;
@@ -1315,8 +1332,9 @@ pub const NativeFile = struct {
     pub fn vacuum(self: *NativeFile) !VacuumReport {
         if (self.read_only) return error.ReadOnly;
 
-        var data_lock_file = try acquireDataRewriteLock(self.io_impl.io(), self.path);
-        defer data_lock_file.close(self.io_impl.io());
+        var data_lock = try acquireDataRewriteLock(self.io_impl.io(), self.path);
+        defer data_lock.file.close(self.io_impl.io());
+        if (!data_lock.locks_supported) self.disablePageCacheForUnsupportedLocks();
 
         const before_size = (try self.file.stat(self.io_impl.io())).size;
         const previous = self.activeCheckpoint();
@@ -1596,7 +1614,7 @@ pub const NativeFile = struct {
 
         var count: u64 = 0;
         var page_id = root_page_id;
-        const use_link_cache = self.page_cache_bypass.load(.monotonic) == 0;
+        const use_link_cache = self.page_cache_enabled and self.page_cache_bypass.load(.monotonic) == 0;
         while (page_id != 0) {
             try self.markReachablePage(reachable_pages, page_id, checkpoint.page_count);
 
@@ -1824,7 +1842,7 @@ pub const NativeFile = struct {
         try self.validateFreePagesSafeForCheckpointSlots(free_pages);
         var data_lock_file: ?std.Io.File = null;
         if (free_pages.len > 0) {
-            data_lock_file = acquireDataRewriteLock(self.io_impl.io(), self.path) catch |err| switch (err) {
+            const data_lock = acquireDataRewriteLock(self.io_impl.io(), self.path) catch |err| switch (err) {
                 error.WouldBlock => blk: {
                     self.allocator.free(free_pages);
                     free_pages = try self.allocator.alloc(u64, 0);
@@ -1832,6 +1850,10 @@ pub const NativeFile = struct {
                 },
                 else => return err,
             };
+            if (data_lock) |lock| {
+                if (!lock.locks_supported) self.disablePageCacheForUnsupportedLocks();
+                data_lock_file = lock.file;
+            }
         }
         return .{
             .file = self,
@@ -2006,7 +2028,7 @@ pub const NativeFile = struct {
         var remaining = value_len;
         var page_id = root_page_id;
         var pages_seen: u64 = 0;
-        const use_link_cache = self.page_cache_bypass.load(.monotonic) == 0;
+        const use_link_cache = self.page_cache_enabled and self.page_cache_bypass.load(.monotonic) == 0;
         while (page_id != 0) {
             pages_seen += 1;
             if (pages_seen > checkpoint.page_count) return error.InvalidNativeValueChain;
@@ -2135,7 +2157,7 @@ pub const NativeFile = struct {
             // A reused page id may still be cached under its previous life;
             // free-map pages themselves are not cached (see read path).
             self.page_cache.remove(self.allocator, page_id);
-        } else {
+        } else if (self.page_cache_enabled) {
             self.page_cache.put(self.allocator, page_id, page);
             self.cachePageLinks(page_id, kind, contents);
         }
@@ -2146,6 +2168,7 @@ pub const NativeFile = struct {
     /// the payload. On any decode surprise the stale entry is dropped and the
     /// walks fall back to the payload path.
     fn cachePageLinks(self: *NativeFile, page_id: u64, kind: PageKind, payload: []const u8) void {
+        if (!self.page_cache_enabled) return;
         switch (kind) {
             .document => {
                 const entry = decodeDocumentEntry(payload) catch {
@@ -2224,13 +2247,15 @@ pub const NativeFile = struct {
 
         try renameFilePath(io, tmp_path, self.path);
         errdefer {
-            self.file = openDataFile(io, self.path, .writer) catch self.file;
+            if (openDataFile(io, self.path, .writer)) |reopened| {
+                self.file = reopened.file;
+            } else |_| {}
         }
 
         self.page_cache.clear(self.allocator);
         const replacement = try openDataFile(io, self.path, .writer);
         self.file.close(io);
-        self.file = replacement;
+        self.file = replacement.file;
     }
 };
 
@@ -2312,7 +2337,7 @@ fn setCatalogRootPage(slot: *CheckpointSlot, root: CatalogRoot, page_id: u64) vo
 }
 
 pub fn create(io: std.Io, path: []const u8) !void {
-    var writer_lock_file = try acquireWriterLock(std.heap.page_allocator, io, path);
+    var writer_lock_file = (try acquireWriterLock(std.heap.page_allocator, io, path)).file;
     defer writer_lock_file.close(io);
 
     var encoded: [header_size]u8 = undefined;
@@ -2329,7 +2354,7 @@ pub fn lockWriterPath(allocator: Allocator, path: []const u8) !PathWriterLock {
     var io_impl = std.Io.Threaded.init(allocator, .{});
     errdefer io_impl.deinit();
 
-    const file = try acquireWriterLock(allocator, io_impl.io(), path);
+    const file = (try acquireWriterLock(allocator, io_impl.io(), path)).file;
     errdefer file.close(io_impl.io());
 
     return .{
@@ -2338,17 +2363,23 @@ pub fn lockWriterPath(allocator: Allocator, path: []const u8) !PathWriterLock {
     };
 }
 
-fn openDataFile(io: std.Io, path: []const u8, lock_mode: LockMode) !std.Io.File {
-    return std.Io.Dir.cwd().openFile(io, path, .{
+fn openDataFile(io: std.Io, path: []const u8, lock_mode: LockMode) !LockFile {
+    const file = std.Io.Dir.cwd().openFile(io, path, .{
         .mode = if (lock_mode == .reader) .read_only else .read_write,
         .lock = if (lock_mode == .reader) .shared else .none,
         .lock_nonblocking = true,
     }) catch |err| switch (err) {
-        error.FileLocksUnsupported => try std.Io.Dir.cwd().openFile(io, path, .{
-            .mode = if (lock_mode == .reader) .read_only else .read_write,
-        }),
+        error.FileLocksUnsupported => {
+            return .{
+                .file = try std.Io.Dir.cwd().openFile(io, path, .{
+                    .mode = if (lock_mode == .reader) .read_only else .read_write,
+                }),
+                .locks_supported = false,
+            };
+        },
         else => return err,
     };
+    return .{ .file = file };
 }
 
 const CreateDataFileOptions = struct {
@@ -2364,21 +2395,27 @@ fn createDataFile(io: std.Io, path: []const u8, opts: CreateDataFileOptions) !st
     });
 }
 
-fn acquireWriterLock(allocator: Allocator, io: std.Io, path: []const u8) !std.Io.File {
+fn acquireWriterLock(allocator: Allocator, io: std.Io, path: []const u8) !LockFile {
     const lock_path = try writerLockPathAlloc(allocator, io, path);
     defer allocator.free(lock_path);
-    return std.Io.Dir.cwd().createFile(io, lock_path, .{
+    const file = std.Io.Dir.cwd().createFile(io, lock_path, .{
         .read = true,
         .truncate = false,
         .lock = .exclusive,
         .lock_nonblocking = true,
     }) catch |err| switch (err) {
-        error.FileLocksUnsupported => try std.Io.Dir.cwd().createFile(io, lock_path, .{
-            .read = true,
-            .truncate = false,
-        }),
+        error.FileLocksUnsupported => {
+            return .{
+                .file = try std.Io.Dir.cwd().createFile(io, lock_path, .{
+                    .read = true,
+                    .truncate = false,
+                }),
+                .locks_supported = false,
+            };
+        },
         else => return err,
     };
+    return .{ .file = file };
 }
 
 fn writerLockPathAlloc(allocator: Allocator, io: std.Io, path: []const u8) ![]u8 {
@@ -2427,17 +2464,23 @@ fn appendLockSuffix(allocator: Allocator, path: []const u8) ![]u8 {
     return try std.fmt.allocPrint(allocator, "{s}.lock", .{path});
 }
 
-fn acquireDataRewriteLock(io: std.Io, path: []const u8) !std.Io.File {
-    return std.Io.Dir.cwd().openFile(io, path, .{
+fn acquireDataRewriteLock(io: std.Io, path: []const u8) !LockFile {
+    const file = std.Io.Dir.cwd().openFile(io, path, .{
         .mode = .read_write,
         .lock = .exclusive,
         .lock_nonblocking = true,
     }) catch |err| switch (err) {
-        error.FileLocksUnsupported => try std.Io.Dir.cwd().openFile(io, path, .{
-            .mode = .read_write,
-        }),
+        error.FileLocksUnsupported => {
+            return .{
+                .file = try std.Io.Dir.cwd().openFile(io, path, .{
+                    .mode = .read_write,
+                }),
+                .locks_supported = false,
+            };
+        },
         else => return err,
     };
+    return .{ .file = file };
 }
 
 fn pathExists(io: std.Io, path: []const u8) bool {
@@ -2473,7 +2516,7 @@ fn deleteFilePath(io: std.Io, path: []const u8) !void {
 }
 
 pub fn inspect(_: Allocator, io: std.Io, path: []const u8) !InspectReport {
-    var file = try openDataFile(io, path, .reader);
+    var file = (try openDataFile(io, path, .reader)).file;
     defer file.close(io);
 
     var header_bytes: [header_size]u8 = undefined;
@@ -2486,7 +2529,7 @@ pub fn checkFile(allocator: Allocator, path: []const u8) !CheckReport {
     defer io_impl.deinit();
     const io = io_impl.io();
 
-    var file = try openDataFile(io, path, .reader);
+    var file = (try openDataFile(io, path, .reader)).file;
     defer file.close(io);
 
     const file_size = (try file.stat(io)).size;
@@ -4701,6 +4744,42 @@ test "lite native page and link caches report usage to resource manager" {
     link_stats = manager.sliceStats(.lite_native_link_cache);
     try std.testing.expectEqual(@as(u64, 0), page_stats.used_bytes);
     try std.testing.expectEqual(@as(u64, 0), link_stats.used_bytes);
+}
+
+test "lite native disables page and link caches when lock support is unavailable" {
+    const allocator = std.testing.allocator;
+
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    var file = NativeFile{
+        .allocator = allocator,
+        .io_impl = undefined,
+        .path = &.{},
+        .file = undefined,
+        .header = .{},
+    };
+    defer file.page_cache.deinit(allocator);
+    file.page_cache.attachResourceManager(&manager);
+
+    file.page_cache.put(allocator, 1, "0123456789ab");
+    file.page_cache.putLinks(allocator, 1, .{
+        .kind = .document,
+        .link_page = 0,
+        .external_value_root_page = 7,
+        .external_value_len = 128,
+    });
+    try std.testing.expect(manager.sliceStats(.lite_native_page_cache).used_bytes > 0);
+    try std.testing.expect(manager.sliceStats(.lite_native_link_cache).used_bytes > 0);
+
+    file.disablePageCacheForUnsupportedLocks();
+    try std.testing.expect(!file.page_cache_enabled);
+    try std.testing.expectEqual(@as(usize, 0), file.page_cache.total_bytes);
+    try std.testing.expectEqual(@as(usize, 0), file.page_cache.link_bytes);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lite_native_page_cache).used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lite_native_link_cache).used_bytes);
+
+    file.page_cache.put(allocator, 2, "not-admitted-by-nativefile");
+    file.disablePageCacheForUnsupportedLocks();
+    try std.testing.expect(!file.page_cache_enabled);
 }
 
 test "lite native page and link caches shrink under hard resource pressure" {
