@@ -45,6 +45,9 @@ pub const Slice = enum(u8) {
     text_merge_buffers,
     algebraic_tensor_accumulators,
     sparse_apply_working_set,
+    lite_native_page_cache,
+    lite_native_link_cache,
+    lite_docstore_snapshot_cache,
 
     pub fn name(self: Slice) []const u8 {
         return switch (self) {
@@ -67,6 +70,9 @@ pub const Slice = enum(u8) {
             .text_merge_buffers => "text_merge.buffers",
             .algebraic_tensor_accumulators => "algebraic.tensor_accumulators",
             .sparse_apply_working_set => "sparse.apply_working_set",
+            .lite_native_page_cache => "lite.native_page_cache",
+            .lite_native_link_cache => "lite.native_link_cache",
+            .lite_docstore_snapshot_cache => "lite.docstore_snapshot_cache",
         };
     }
 };
@@ -132,6 +138,9 @@ pub const Options = struct {
             .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 192 * 1024 * 1024 },
             .{ .soft_limit_bytes = 96 * 1024 * 1024, .hard_limit_bytes = 160 * 1024 * 1024 },
             .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
+            .{ .soft_limit_bytes = 48 * 1024 * 1024, .hard_limit_bytes = 64 * 1024 * 1024 },
+            .{ .soft_limit_bytes = 12 * 1024 * 1024, .hard_limit_bytes = 16 * 1024 * 1024 },
+            .{ .soft_limit_bytes = 192 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
         };
     }
 
@@ -156,6 +165,9 @@ pub const Options = struct {
             .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
             .{ .soft_action = .throttle_writes, .hard_action = .reject_work },
             .{ .soft_action = .report, .hard_action = .throttle_writes },
+            .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
+            .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
+            .{ .soft_action = .shrink_cache, .hard_action = .shrink_cache },
         };
     }
 };
@@ -287,7 +299,7 @@ pub const ResourceManager = struct {
         defer self.mutex.unlock();
 
         var stats: [slice_count]SliceStats = undefined;
-        inline for (.{ Slice.lsm_block_table_cache, Slice.lsm_compaction_work, Slice.lsm_table_builder_working_set, Slice.lsm_in_memory_state, Slice.lsm_wal_write_working_set, Slice.lsm_wal_retention, Slice.lsm_recovery_working_set, Slice.hbc_node_metadata_cache, Slice.dense_search_working_set, Slice.dense_apply_working_set, Slice.dense_routing_working_set, Slice.derived_replay_window, Slice.full_text_pending_segments, Slice.full_text_build_working_set, Slice.document_extraction_working_set, Slice.derived_backlog, Slice.text_merge_buffers, Slice.algebraic_tensor_accumulators, Slice.sparse_apply_working_set }, 0..) |slice, i| {
+        inline for (.{ Slice.lsm_block_table_cache, Slice.lsm_compaction_work, Slice.lsm_table_builder_working_set, Slice.lsm_in_memory_state, Slice.lsm_wal_write_working_set, Slice.lsm_wal_retention, Slice.lsm_recovery_working_set, Slice.hbc_node_metadata_cache, Slice.dense_search_working_set, Slice.dense_apply_working_set, Slice.dense_routing_working_set, Slice.derived_replay_window, Slice.full_text_pending_segments, Slice.full_text_build_working_set, Slice.document_extraction_working_set, Slice.derived_backlog, Slice.text_merge_buffers, Slice.algebraic_tensor_accumulators, Slice.sparse_apply_working_set, Slice.lite_native_page_cache, Slice.lite_native_link_cache, Slice.lite_docstore_snapshot_cache }, 0..) |slice, i| {
             const state = self.slices[i];
             stats[i] = .{
                 .name = slice.name(),

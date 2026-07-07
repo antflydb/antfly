@@ -21,6 +21,7 @@ const std = @import("std");
 const antfly_platform = @import("antfly_platform");
 const platform_sync = antfly_platform.sync;
 const fs_paths = @import("../../common/fs_paths.zig");
+const resource_manager_mod = @import("../resource_manager.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -165,6 +166,7 @@ pub const LockMode = enum {
 pub const OpenOptions = struct {
     read_only: bool = false,
     no_sync: bool = false,
+    resource_manager: ?*resource_manager_mod.ResourceManager = null,
 };
 
 pub const PathWriterLock = struct {
@@ -181,6 +183,7 @@ pub const PathWriterLock = struct {
 pub const CreateOptions = struct {
     exclusive: bool = false,
     no_sync: bool = false,
+    resource_manager: ?*resource_manager_mod.ResourceManager = null,
 };
 
 pub const Header = struct {
@@ -284,6 +287,9 @@ const PageCache = struct {
     links: std.AutoHashMapUnmanaged(u64, PageLinkInfo) = .empty,
     total_bytes: usize = 0,
     link_bytes: usize = 0,
+    resource_manager: ?*resource_manager_mod.ResourceManager = null,
+    resource_page_accounted_bytes: u64 = 0,
+    resource_link_accounted_bytes: u64 = 0,
     /// Page-bytes cap. Eviction is wholesale: overflow clears the page bytes
     /// and starts over, which keeps the bookkeeping trivially correct and is
     /// cheap to rebuild at Lite's target file sizes. Link entries are
@@ -300,26 +306,43 @@ const PageCache = struct {
         return try allocator.dupe(u8, cached);
     }
 
+    fn attachResourceManager(self: *PageCache, manager: *resource_manager_mod.ResourceManager) void {
+        platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        self.resource_manager = manager;
+        self.refreshPageResourceUsageLocked();
+        self.refreshLinkResourceUsageLocked();
+    }
+
     fn put(self: *PageCache, allocator: Allocator, page_id: u64, page: []const u8) void {
         platform_sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
+        if (self.clearPagesForHardPressureLocked(allocator)) return;
         if (self.pages.getEntry(page_id)) |entry| {
             self.total_bytes -= entry.value_ptr.len;
             allocator.free(entry.value_ptr.*);
             entry.value_ptr.* = allocator.dupe(u8, page) catch {
                 std.debug.assert(self.pages.remove(page_id));
+                self.refreshPageResourceUsageLocked();
                 return;
             };
             self.total_bytes += page.len;
+            self.refreshPageResourceUsageLocked();
+            _ = self.clearPagesForHardPressureLocked(allocator);
             return;
         }
-        if (self.total_bytes + page.len > self.limit_bytes) self.clearPagesLocked(allocator);
+        if (self.total_bytes + page.len > self.limit_bytes) {
+            self.clearPagesLocked(allocator);
+            self.refreshPageResourceUsageLocked();
+        }
         const owned = allocator.dupe(u8, page) catch return;
         self.pages.put(allocator, page_id, owned) catch {
             allocator.free(owned);
             return;
         };
         self.total_bytes += page.len;
+        self.refreshPageResourceUsageLocked();
+        _ = self.clearPagesForHardPressureLocked(allocator);
     }
 
     fn getLinksCopy(self: *PageCache, allocator: Allocator, page_id: u64) !?PageLinkCopy {
@@ -343,11 +366,17 @@ const PageCache = struct {
 
         platform_sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
+        if (self.clearLinksForHardPressureLocked(allocator)) {
+            if (owned.key.len > 0) allocator.free(owned.key);
+            return;
+        }
         if (self.links.getEntry(page_id)) |entry| {
             self.link_bytes -= entry.value_ptr.key.len + link_entry_overhead;
             if (entry.value_ptr.key.len > 0) allocator.free(entry.value_ptr.key);
             entry.value_ptr.* = owned;
             self.link_bytes += owned.key.len + link_entry_overhead;
+            self.refreshLinkResourceUsageLocked();
+            _ = self.clearLinksForHardPressureLocked(allocator);
             return;
         }
         if (self.link_bytes + owned.key.len + link_entry_overhead > self.link_limit_bytes) {
@@ -362,6 +391,8 @@ const PageCache = struct {
             return;
         };
         self.link_bytes += owned.key.len + link_entry_overhead;
+        self.refreshLinkResourceUsageLocked();
+        _ = self.clearLinksForHardPressureLocked(allocator);
     }
 
     fn remove(self: *PageCache, allocator: Allocator, page_id: u64) void {
@@ -376,18 +407,25 @@ const PageCache = struct {
         if (self.links.fetchRemove(page_id)) |entry| {
             self.link_bytes -= entry.value.key.len + link_entry_overhead;
             if (entry.value.key.len > 0) allocator.free(entry.value.key);
+            self.refreshLinkResourceUsageLocked();
         }
     }
 
     fn removeLocked(self: *PageCache, allocator: Allocator, page_id: u64) void {
+        var removed_page = false;
+        var removed_links = false;
         if (self.pages.fetchRemove(page_id)) |entry| {
             self.total_bytes -= entry.value.len;
             allocator.free(entry.value);
+            removed_page = true;
         }
         if (self.links.fetchRemove(page_id)) |entry| {
             self.link_bytes -= entry.value.key.len + link_entry_overhead;
             if (entry.value.key.len > 0) allocator.free(entry.value.key);
+            removed_links = true;
         }
+        if (removed_page) self.refreshPageResourceUsageLocked();
+        if (removed_links) self.refreshLinkResourceUsageLocked();
     }
 
     fn clear(self: *PageCache, allocator: Allocator) void {
@@ -399,6 +437,8 @@ const PageCache = struct {
     fn clearLocked(self: *PageCache, allocator: Allocator) void {
         self.clearPagesLocked(allocator);
         self.clearLinksLocked(allocator);
+        self.refreshPageResourceUsageLocked();
+        self.refreshLinkResourceUsageLocked();
     }
 
     fn clearPagesLocked(self: *PageCache, allocator: Allocator) void {
@@ -419,8 +459,44 @@ const PageCache = struct {
 
     fn deinit(self: *PageCache, allocator: Allocator) void {
         self.clearLocked(allocator);
+        self.releaseResourceUsageLocked();
         self.pages.deinit(allocator);
         self.links.deinit(allocator);
+    }
+
+    fn refreshPageResourceUsageLocked(self: *PageCache) void {
+        const manager = self.resource_manager orelse return;
+        manager.observeUsage(.lite_native_page_cache, &self.resource_page_accounted_bytes, @intCast(self.total_bytes));
+    }
+
+    fn refreshLinkResourceUsageLocked(self: *PageCache) void {
+        const manager = self.resource_manager orelse return;
+        manager.observeUsage(.lite_native_link_cache, &self.resource_link_accounted_bytes, @intCast(self.link_bytes));
+    }
+
+    fn releaseResourceUsageLocked(self: *PageCache) void {
+        const manager = self.resource_manager orelse return;
+        manager.observeUsage(.lite_native_page_cache, &self.resource_page_accounted_bytes, 0);
+        manager.observeUsage(.lite_native_link_cache, &self.resource_link_accounted_bytes, 0);
+        self.resource_manager = null;
+    }
+
+    fn clearPagesForHardPressureLocked(self: *PageCache, allocator: Allocator) bool {
+        const manager = self.resource_manager orelse return false;
+        const stats = manager.sliceStats(.lite_native_page_cache);
+        if (stats.pressure != .hard or stats.hard_action != .shrink_cache) return false;
+        self.clearPagesLocked(allocator);
+        self.refreshPageResourceUsageLocked();
+        return true;
+    }
+
+    fn clearLinksForHardPressureLocked(self: *PageCache, allocator: Allocator) bool {
+        const manager = self.resource_manager orelse return false;
+        const stats = manager.sliceStats(.lite_native_link_cache);
+        if (stats.pressure != .hard or stats.hard_action != .shrink_cache) return false;
+        self.clearLinksLocked(allocator);
+        self.refreshLinkResourceUsageLocked();
+        return true;
     }
 };
 
@@ -466,7 +542,7 @@ pub const NativeFile = struct {
         const file_size = (try file.stat(io)).size;
         header.active_checkpoint = try selectCompleteCheckpointForFile(header, file_size);
 
-        return .{
+        var result = NativeFile{
             .allocator = allocator,
             .io_impl = io_impl,
             .path = owned_path,
@@ -476,21 +552,29 @@ pub const NativeFile = struct {
             .read_only = opts.read_only,
             .no_sync = opts.no_sync,
         };
+        if (opts.resource_manager) |manager| result.page_cache.attachResourceManager(manager);
+        return result;
     }
 
     pub fn create(allocator: Allocator, path: []const u8) !NativeFile {
-        return try createWithMode(allocator, path, false, false);
+        return try createWithMode(allocator, path, false, false, null);
     }
 
     pub fn createNew(allocator: Allocator, path: []const u8) !NativeFile {
-        return try createWithMode(allocator, path, true, false);
+        return try createWithMode(allocator, path, true, false, null);
     }
 
     pub fn createWithOptions(allocator: Allocator, path: []const u8, opts: CreateOptions) !NativeFile {
-        return try createWithMode(allocator, path, opts.exclusive, opts.no_sync);
+        return try createWithMode(allocator, path, opts.exclusive, opts.no_sync, opts.resource_manager);
     }
 
-    fn createWithMode(allocator: Allocator, path: []const u8, exclusive: bool, no_sync: bool) !NativeFile {
+    fn createWithMode(
+        allocator: Allocator,
+        path: []const u8,
+        exclusive: bool,
+        no_sync: bool,
+        resource_manager: ?*resource_manager_mod.ResourceManager,
+    ) !NativeFile {
         var io_impl = std.Io.Threaded.init(allocator, .{});
         errdefer io_impl.deinit();
         const io = io_impl.io();
@@ -513,7 +597,7 @@ pub const NativeFile = struct {
         try file.writePositionalAll(io, &encoded, 0);
         if (!no_sync) try file.sync(io);
 
-        return .{
+        var result = NativeFile{
             .allocator = allocator,
             .io_impl = io_impl,
             .path = owned_path,
@@ -523,6 +607,8 @@ pub const NativeFile = struct {
             .read_only = false,
             .no_sync = no_sync,
         };
+        if (resource_manager) |manager| result.page_cache.attachResourceManager(manager);
+        return result;
     }
 
     pub fn close(self: *NativeFile) void {
@@ -4587,6 +4673,64 @@ test "lite native page cache tracks put remove and wholesale eviction" {
     const survivor = (try cache.getCopy(allocator, 5)) orelse return error.TestUnexpectedResult;
     defer allocator.free(survivor);
     try std.testing.expectEqual(@as(usize, 32), survivor.len);
+}
+
+test "lite native page and link caches report usage to resource manager" {
+    const allocator = std.testing.allocator;
+
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    var cache = PageCache{ .limit_bytes = 128, .link_limit_bytes = 256 };
+    defer cache.deinit(allocator);
+    cache.attachResourceManager(&manager);
+
+    cache.put(allocator, 1, "0123456789ab");
+    var page_stats = manager.sliceStats(.lite_native_page_cache);
+    try std.testing.expectEqual(@as(u64, 12), page_stats.used_bytes);
+
+    cache.putLinks(allocator, 1, .{
+        .kind = .document,
+        .link_page = 0,
+        .external_value_root_page = 7,
+        .external_value_len = 128,
+    });
+    var link_stats = manager.sliceStats(.lite_native_link_cache);
+    try std.testing.expect(link_stats.used_bytes > 0);
+
+    cache.remove(allocator, 1);
+    page_stats = manager.sliceStats(.lite_native_page_cache);
+    link_stats = manager.sliceStats(.lite_native_link_cache);
+    try std.testing.expectEqual(@as(u64, 0), page_stats.used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), link_stats.used_bytes);
+}
+
+test "lite native page and link caches shrink under hard resource pressure" {
+    const allocator = std.testing.allocator;
+
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.lite_native_page_cache)] = .{
+        .soft_limit_bytes = 4,
+        .hard_limit_bytes = 8,
+    };
+    budgets[@intFromEnum(resource_manager_mod.Slice.lite_native_link_cache)] = .{
+        .soft_limit_bytes = 4,
+        .hard_limit_bytes = 8,
+    };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    var cache = PageCache{ .limit_bytes = 128, .link_limit_bytes = 256 };
+    defer cache.deinit(allocator);
+    cache.attachResourceManager(&manager);
+
+    cache.put(allocator, 1, "0123456789ab");
+    const page_stats = manager.sliceStats(.lite_native_page_cache);
+    try std.testing.expectEqual(@as(usize, 0), cache.total_bytes);
+    try std.testing.expectEqual(@as(u64, 0), page_stats.used_bytes);
+    try std.testing.expect(page_stats.hard_limit_rejections > 0);
+
+    cache.putLinks(allocator, 2, .{ .kind = .value, .link_page = 0, .chunk_len = 1 });
+    const link_stats = manager.sliceStats(.lite_native_link_cache);
+    try std.testing.expectEqual(@as(usize, 0), cache.link_bytes);
+    try std.testing.expectEqual(@as(u64, 0), link_stats.used_bytes);
+    try std.testing.expect(link_stats.hard_limit_rejections > 0);
 }
 
 test "lite native page cache serves updated documents after page reuse and vacuum" {

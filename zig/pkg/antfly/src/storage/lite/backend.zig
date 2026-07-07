@@ -23,6 +23,7 @@ const bridge = @import("bridge.zig");
 const capabilities = @import("capabilities.zig");
 const docstore = @import("docstore.zig");
 const index_storage = @import("index_storage.zig");
+const resource_manager_mod = @import("../resource_manager.zig");
 
 const Allocator = std.mem.Allocator;
 const native_index_base_path = "__antfly_lite";
@@ -63,11 +64,13 @@ pub const OpenOptions = struct {
     engine: EngineSelection = .auto,
     read_only: bool = false,
     no_sync: bool = false,
+    resource_manager: ?*resource_manager_mod.ResourceManager = null,
 };
 
 pub const CreateOptions = struct {
     exclusive: bool = false,
     no_sync: bool = false,
+    resource_manager: ?*resource_manager_mod.ResourceManager = null,
 };
 
 pub fn isAflitePath(path: []const u8) bool {
@@ -297,6 +300,7 @@ fn openNativeSingleFile(allocator: Allocator, path: []const u8, opts: OpenOption
     var initial_store = try docstore.Store.openWithOptions(allocator, path, .{
         .read_only = opts.read_only,
         .no_sync = opts.no_sync,
+        .resource_manager = opts.resource_manager,
     });
     errdefer initial_store.close();
     return try initNativeSingleFile(allocator, &initial_store);
@@ -306,6 +310,7 @@ fn createNativeSingleFile(allocator: Allocator, path: []const u8, opts: CreateOp
     var initial_store = try docstore.Store.createWithOptions(allocator, path, .{
         .exclusive = opts.exclusive,
         .no_sync = opts.no_sync,
+        .resource_manager = opts.resource_manager,
     });
     errdefer initial_store.close();
     return try initNativeSingleFile(allocator, &initial_store);
