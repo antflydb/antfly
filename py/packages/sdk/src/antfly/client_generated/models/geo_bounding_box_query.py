@@ -13,13 +13,16 @@ T = TypeVar("T", bound="GeoBoundingBoxQuery")
 
 @_attrs_define
 class GeoBoundingBoxQuery:
-    """
-    Attributes:
-        top_left (list[float]): [lon, lat]
-        bottom_right (list[float]): [lon, lat]
-        field (str | Unset):
-        boost (float | None | Unset): A floating-point number used to decrease or increase the relevance scores of a
-            query.
+    """Geographic bounding box filter. Longitude ranges may cross the antimeridian by specifying a western/min longitude
+    that is greater than the eastern/max longitude; for example, 179.5 to -179.5 matches points near +/-180 degrees
+    longitude.
+
+        Attributes:
+            top_left (list[float]): [lon, lat]
+            bottom_right (list[float]): [lon, lat]
+            field (str | Unset):
+            boost (float | None | Unset): A floating-point number used to decrease or increase the relevance scores of a
+                query.
     """
 
     top_left: list[float]

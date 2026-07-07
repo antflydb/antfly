@@ -6425,6 +6425,18 @@ fn sortAndPageSearchResultInPlace(
     if (plan.kind == .none) return;
     try validateSortExecutionPlanForRuntime(effective_req, plan, native_loader);
     try checkSearchRequestDeadline(effective_req);
+    const bench_query_profile = shouldLogBenchQueryProfile();
+    const collect_sort_profile = bench_query_profile or effective_req.profile;
+    if (effective_req.limit == 0) {
+        const alloc = result.alloc;
+        for (result.hits) |*hit| hit.deinit(alloc);
+        if (result.hits.len > 0) alloc.free(result.hits);
+        result.hits = &.{};
+        if (collect_sort_profile) {
+            result.sort_profile = sortResultProfile(effective_req, plan, native_loader != null, .{ .window_capacity = 0 });
+        }
+        return;
+    }
     const exact_candidate_budget = lateVisibilityExactCandidateBudget();
     const candidate_count = boundedU32(result.hits.len);
     enforceLateVisibilityExactCandidateBudget(candidate_count, exact_candidate_budget) catch |err| {
@@ -6437,8 +6449,6 @@ fn sortAndPageSearchResultInPlace(
         return err;
     };
 
-    const bench_query_profile = shouldLogBenchQueryProfile();
-    const collect_sort_profile = bench_query_profile or effective_req.profile;
     const sort_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
     var profile = SortCollectorProfile{};
     const alloc = result.alloc;
@@ -6562,6 +6572,18 @@ fn sortAndPageMatchAllCandidatesAlloc(
     try validateMatchAllSortDoesNotUseScore(effective_req);
     try validateSortExecutionPlanForRuntime(effective_req, plan, native_loader);
     try checkSearchRequestDeadline(effective_req);
+    const bench_query_profile = shouldLogBenchQueryProfile();
+    const collect_sort_profile = bench_query_profile or effective_req.profile;
+    if (effective_req.limit == 0) {
+        return .{
+            .alloc = alloc,
+            .hits = &.{},
+            .total_hits = @intCast(@min(candidates.items.len, @as(usize, std.math.maxInt(u32)))),
+            .total_hits_relation = .exact,
+            .sort_profile = if (collect_sort_profile) sortResultProfile(effective_req, plan, native_loader != null, .{ .window_capacity = 0 }) else null,
+            .graph_results = &.{},
+        };
+    }
     const exact_candidate_budget = lateVisibilityExactCandidateBudget();
     const candidate_count = boundedU32(candidates.items.len);
     enforceLateVisibilityExactCandidateBudget(candidate_count, exact_candidate_budget) catch |err| {
@@ -6576,8 +6598,6 @@ fn sortAndPageMatchAllCandidatesAlloc(
         return err;
     };
 
-    const bench_query_profile = shouldLogBenchQueryProfile();
-    const collect_sort_profile = bench_query_profile or effective_req.profile;
     const sort_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
     var profile = SortCollectorProfile{};
     const window_capacity = sortWindowCapacity(effective_req);
@@ -10996,15 +11016,10 @@ fn searchDenseInternal(
                 !(chunk_backed and group_chunk_parents) and
                 !unresolved_stored_filters;
             if (load_stored_before_postprocess) {
-                const load_start = platform_time.monotonicNs();
-                projected_source_profile.requested_count += 1;
-                stored_data = try executor.load_projected_document(executor.ctx, alloc, postprocess_req, doc_key);
+                const load_profile_total_before = projected_source_profile.total_ns;
+                stored_data = try loadProjectedDenseDocumentWithProfile(alloc, postprocess_req, executor, doc_key, &projected_source_profile);
                 stored_data_owned = true;
-                const load_ns = platform_time.monotonicNs() - load_start;
-                profile.load_projected_document_ns += load_ns;
-                projected_source_profile.loaded_count += 1;
-                projected_source_profile.batch_count += 1;
-                projected_source_profile.total_ns +|= load_ns;
+                profile.load_projected_document_ns += projected_source_profile.total_ns - load_profile_total_before;
             }
             try hit_vector_ids.append(alloc, hit.vector_id);
             try hits.append(alloc, .{
@@ -11230,13 +11245,28 @@ fn loadMissingProjectedDenseHitDocuments(
     for (hits, 0..) |*hit, i| {
         if (hit.stored_data != null) continue;
         if (i % 1024 == 0) try checkSearchRequestDeadline(req);
-        profile.requested_count += 1;
-        hit.stored_data = try executor.load_projected_document(executor.ctx, alloc, req, hit.id);
-        profile.loaded_count += 1;
-        profile.batch_count += 1;
+        hit.stored_data = try loadProjectedDenseDocumentWithProfile(alloc, req, executor, hit.id, &profile);
     }
     profile.total_ns = platform_time.monotonicNs() - start_ns;
     return profile;
+}
+
+fn loadProjectedDenseDocumentWithProfile(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: DenseSearchExecutor,
+    id: []const u8,
+    profile: *ProjectedSourceLoadProfile,
+) ![]u8 {
+    try checkSearchRequestDeadline(req);
+    const load_start = platform_time.monotonicNs();
+    profile.requested_count += 1;
+    const data = try executor.load_projected_document(executor.ctx, alloc, req, id);
+    const load_ns = platform_time.monotonicNs() - load_start;
+    profile.loaded_count += 1;
+    profile.batch_count += 1;
+    profile.total_ns +|= load_ns;
+    return data;
 }
 
 fn lookupDenseHitDocOrdinals(
@@ -14401,6 +14431,16 @@ test "dense and sparse search reject unsupported exact sort page options" {
     try std.testing.expectEqualStrings("*", sparse_diagnostic.field);
     try std.testing.expectEqualStrings("approximate_candidate_source", sparse_diagnostic.reason);
     try std.testing.expectEqualStrings("approximate_candidate_source", sparse_diagnostic.detail);
+}
+
+test "dense projected source load rejects expired deadline before load" {
+    var profile = ProjectedSourceLoadProfile{};
+    try std.testing.expectError(error.Timeout, loadProjectedDenseDocumentWithProfile(std.testing.allocator, .{
+        .execution_deadline_ns = 0,
+    }, testDenseConstraintExecutor(), "doc:a", &profile));
+    try std.testing.expectEqual(@as(usize, 0), profile.requested_count);
+    try std.testing.expectEqual(@as(usize, 0), profile.loaded_count);
+    try std.testing.expectEqual(@as(usize, 0), profile.batch_count);
 }
 
 test "sparse score search fetches offset plus limit candidates" {
@@ -17701,6 +17741,69 @@ test "stored json debug sort rejects non-scalar sort values" {
     }, null, callbacks.loadStored, .{ .kind = .stored_json_debug }, null));
 }
 
+test "native sort zero limit avoids generic collector decoration" {
+    const alloc = std.testing.allocator;
+
+    const Loader = struct {
+        load_count: usize = 0,
+
+        fn load(ctx: ?*anyopaque, _: Allocator, _: types.SearchHit, field: []const u8) anyerror!?SortValue {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.load_count += 1;
+            try std.testing.expectEqualStrings("rank", field);
+            return error.UnexpectedTestCall;
+        }
+    };
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "rank",
+        .path_match = "rank",
+        .mapping = .{
+            .field_type = .numeric,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+
+    var hits = try alloc.alloc(types.SearchHit, 2);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .score = 1.0 };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:b"), .score = 1.0 };
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 2,
+        .graph_results = &.{},
+    };
+    defer result.deinit();
+
+    var loader = Loader{};
+    const order_by = [_]types.SortField{.{ .field = "rank", .desc = false }};
+    try sortAndPageSearchResultInPlace(&result, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 0,
+    }, null, testUnexpectedLoadStoredCallback, .{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .runtime_schema = schema,
+    }, .{
+        .ctx = &loader,
+        .require_native = true,
+        .load = Loader.load,
+    });
+
+    try std.testing.expectEqual(@as(usize, 0), result.hits.len);
+    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 0), loader.load_count);
+    const profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", profile.plan);
+    try std.testing.expectEqual(@as(u64, 0), profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 0), profile.native_doc_value_hit_count);
+    try std.testing.expectEqual(@as(u64, 0), profile.native_doc_value_miss_count);
+}
+
 test "score sort uses hit score and implicit id cursor" {
     const alloc = std.testing.allocator;
 
@@ -20989,6 +21092,67 @@ test "match_all projected source load rejects expired deadline before batch load
     }, testMatchAllExecutor(&ctx), result.hits));
     try std.testing.expectEqual(@as(usize, 0), projected_batch_count);
     try std.testing.expectEqual(@as(usize, 0), projected_batch_doc_count);
+}
+
+test "match_all native candidate sort zero limit avoids decoration" {
+    const alloc = std.testing.allocator;
+
+    const Loader = struct {
+        load_count: usize = 0,
+
+        fn load(ctx: ?*anyopaque, _: Allocator, _: types.SearchHit, field: []const u8) anyerror!?SortValue {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.load_count += 1;
+            try std.testing.expectEqualStrings("rank", field);
+            return error.UnexpectedTestCall;
+        }
+    };
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "rank",
+        .path_match = "rank",
+        .mapping = .{
+            .field_type = .numeric,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+
+    var candidates = MatchAllCandidates{
+        .items = try alloc.alloc(MatchAllCandidate, 2),
+    };
+    candidates.items[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .ordinal = 1 };
+    candidates.items[1] = .{ .id = try alloc.dupe(u8, "doc:b"), .ordinal = 2 };
+    defer candidates.deinit(alloc);
+
+    var loader = Loader{};
+    const order_by = [_]types.SortField{.{ .field = "rank", .desc = false }};
+    var result = try sortAndPageMatchAllCandidatesAlloc(alloc, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 0,
+    }, &candidates, null, testUnexpectedLoadStoredCallback, .{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .runtime_schema = schema,
+    }, .{
+        .ctx = &loader,
+        .require_native = true,
+        .load = Loader.load,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), result.hits.len);
+    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, result.total_hits_relation);
+    try std.testing.expectEqual(@as(usize, 0), loader.load_count);
+    const profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", profile.plan);
+    try std.testing.expectEqual(@as(u64, 0), profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 0), profile.native_doc_value_hit_count);
+    try std.testing.expectEqual(@as(u64, 0), profile.native_doc_value_miss_count);
 }
 
 test "match_all applies explicit doc id constraints before paging" {

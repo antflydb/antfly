@@ -11390,6 +11390,13 @@ components:
             - Date ranges: `"created_at:>2023-01-01"`
 
             - Category filtering: `"+category:technology +language:en"`
+
+            - Geo bounding boxes: `{"geo_bbox":{"field":"location","min_lat":-1,"min_lon":179.5,"max_lat":1,"max_lon":-179.5}}`
+
+
+            For structured `geo_bbox`, `min_lon > max_lon` intentionally
+
+            represents a bounding box that crosses the antimeridian.
           example:
             query: +category:technology +year:>2020
             boost: 1.0

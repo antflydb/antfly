@@ -5403,6 +5403,10 @@ export interface components {
              *     - Status filtering: `"status:published"`
              *     - Date ranges: `"created_at:>2023-01-01"`
              *     - Category filtering: `"+category:technology +language:en"`
+             *     - Geo bounding boxes: `{"geo_bbox":{"field":"location","min_lat":-1,"min_lon":179.5,"max_lat":1,"max_lon":-179.5}}`
+             *
+             *     For structured `geo_bbox`, `min_lon > max_lon` intentionally
+             *     represents a bounding box that crosses the antimeridian.
              * @example {
              *       "query": "+category:technology +year:>2020",
              *       "boost": 1
@@ -8441,6 +8445,7 @@ export interface components {
             field?: string;
             boost?: components["schemas"]["Boost"];
         };
+        /** @description Geographic bounding box filter. Longitude ranges may cross the antimeridian by specifying a western/min longitude that is greater than the eastern/max longitude; for example, 179.5 to -179.5 matches points near +/-180 degrees longitude. */
         GeoBoundingBoxQuery: {
             /** @description [lon, lat] */
             top_left: number[];

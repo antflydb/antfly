@@ -984,7 +984,13 @@ const GeoCandidateProfile = struct {
     cells: usize = 0,
     direct_lookups: usize = 0,
     prefix_range_scans: usize = 0,
+    expanded_terms: usize = 0,
+    candidate_doc_budget: usize = 0,
 };
+
+const geo_filter_max_expanded_terms: usize = 8192;
+const geo_filter_min_candidate_doc_budget: usize = 4096;
+const geo_filter_max_candidate_doc_budget: usize = 262_144;
 
 fn geoCandidateBitmapForBBoxAlloc(
     alloc: Allocator,
@@ -1057,6 +1063,7 @@ fn geoCandidateBitmapForRangesAlloc(
     errdefer result.deinit();
 
     var profile = GeoCandidateProfile{};
+    profile.candidate_doc_budget = geoCandidateExpansionCandidateBudget(seg.reader.doc_count);
     var remaining_cells = geo.max_filter_geohash_cells;
     for (lon_ranges.items[0..lon_ranges.len]) |range| {
         const cells = (try geo.coverBoundingBoxBudgeted(alloc, min_lat, range.min, max_lat, range.max, precision, remaining_cells)) orelse return null;
@@ -1064,11 +1071,29 @@ fn geoCandidateBitmapForRangesAlloc(
         remaining_cells -= cells.len;
         profile.cells += cells.len;
         for (cells) |cell| {
-            try addGeoCellCandidatesToBitmap(alloc, &inv_reader, &result, cell[0..precision], &profile);
+            if (!(try addGeoCellCandidatesToBitmap(alloc, &inv_reader, &result, cell[0..precision], &profile))) {
+                const candidates = result.cardinality();
+                std.log.debug(
+                    "antfly_geo_filter_candidates field={s} precision={d} ranges={d} cells={d} direct_lookups={d} prefix_range_scans={d} expanded_terms={d} candidate_doc_budget={d} candidates={d} fallback=typed_doc_values",
+                    .{
+                        field,
+                        precision,
+                        lon_ranges.len,
+                        profile.cells,
+                        profile.direct_lookups,
+                        profile.prefix_range_scans,
+                        profile.expanded_terms,
+                        profile.candidate_doc_budget,
+                        candidates,
+                    },
+                );
+                result.deinit();
+                return null;
+            }
         }
     }
     std.log.debug(
-        "antfly_geo_filter_candidates field={s} precision={d} ranges={d} cells={d} direct_lookups={d} prefix_range_scans={d} candidates={d}",
+        "antfly_geo_filter_candidates field={s} precision={d} ranges={d} cells={d} direct_lookups={d} prefix_range_scans={d} expanded_terms={d} candidate_doc_budget={d} candidates={d} fallback=none",
         .{
             field,
             precision,
@@ -1076,10 +1101,20 @@ fn geoCandidateBitmapForRangesAlloc(
             profile.cells,
             profile.direct_lookups,
             profile.prefix_range_scans,
+            profile.expanded_terms,
+            profile.candidate_doc_budget,
             result.cardinality(),
         },
     );
     return result;
+}
+
+fn geoCandidateExpansionCandidateBudget(doc_count: u32) usize {
+    const half_segment = @as(usize, doc_count) / 2;
+    return @min(
+        geo_filter_max_candidate_doc_budget,
+        @max(geo_filter_min_candidate_doc_budget, half_segment),
+    );
 }
 
 fn geoSplitLongitudeRanges(min_lon: f64, max_lon: f64) GeoLongitudeRanges {
@@ -1124,13 +1159,13 @@ fn addGeoCellCandidatesToBitmap(
     result: *roaring.RoaringBitmap,
     cell_prefix: []const u8,
     profile: *GeoCandidateProfile,
-) FilterError!void {
+) FilterError!bool {
     if (cell_prefix.len >= geo.index_geohash_precision) {
         profile.direct_lookups += 1;
         if (inv_reader.lookup(cell_prefix[0..geo.index_geohash_precision])) |lookup_result| {
             try addLookupResultToBitmap(alloc, result, lookup_result);
         }
-        return;
+        return result.cardinality() <= profile.candidate_doc_budget;
     }
 
     profile.prefix_range_scans += 1;
@@ -1144,8 +1179,12 @@ fn addGeoCellCandidatesToBitmap(
 
     while (try term_iter.next()) |entry| {
         if (!std.mem.startsWith(u8, entry.term, cell_prefix)) break;
+        profile.expanded_terms += 1;
+        if (profile.expanded_terms > geo_filter_max_expanded_terms) return false;
         try addLookupResultToBitmap(alloc, result, entry.result);
+        if (result.cardinality() > profile.candidate_doc_budget) return false;
     }
+    return true;
 }
 
 /// Multi-phrase filter: like PhraseFilter but allows alternative terms at each position.
@@ -2135,6 +2174,46 @@ test "geo bbox coarse candidates expand max precision geohash terms" {
     try testing.expect(candidates.contains(0));
     try testing.expect(!candidates.contains(1));
     try testing.expect(candidates.contains(2));
+}
+
+test "geo bbox dense coarse candidates fall back to exact doc values" {
+    const alloc = testing.allocator;
+
+    const point_count = geo_filter_min_candidate_doc_budget + 1;
+    const points = try alloc.alloc(typed_dv.GeoPoint, point_count);
+    defer alloc.free(points);
+    for (points, 0..) |*point, i| {
+        const offset = @as(f64, @floatFromInt(i % 16)) * 0.000001;
+        point.* = .{ .lat = 37.7749 + offset, .lon = -122.4194 - offset };
+    }
+
+    const seg_bytes = try buildGeoTestSegment(alloc, points);
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+
+    const snap = writer.snapshot();
+    const seg = &snap.segments[0];
+    const ranges = geoSplitLongitudeRanges(-123.0, -121.0);
+    const precision = geoCandidatePrecisionForBBox(37.0, 38.0, ranges) orelse return error.TestExpectedEqual;
+    try testing.expect(precision < geo.index_geohash_precision);
+
+    var maybe_candidates = try geoCandidateBitmapForRangesAlloc(alloc, seg, "location", 37.0, 38.0, ranges, precision);
+    defer if (maybe_candidates) |*candidates| candidates.deinit();
+    try testing.expect(maybe_candidates == null);
+
+    const filter = Filter{ .geo_bbox = .{
+        .field = "location",
+        .min_lat = 37.0,
+        .min_lon = -123.0,
+        .max_lat = 38.0,
+        .max_lon = -121.0,
+    } };
+    var bm = try filter.execute(alloc, seg);
+    defer bm.deinit();
+    try testing.expectEqual(point_count, bm.cardinality());
 }
 
 test "geo bbox filter supports antimeridian wrapped longitude ranges" {
