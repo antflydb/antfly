@@ -587,6 +587,15 @@ pub const TypeGenerator = struct {
         if (variants.items.len == 0) {
             try self.generateEmptyUnionJsonStubs();
         } else {
+            try self.w.line("pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {{", .{});
+            self.w.indent();
+            try self.w.line("const value = try std.json.innerParse(std.json.Value, allocator, source, options);", .{});
+            try self.w.line("return try jsonParseFromValue(allocator, value, options);", .{});
+            self.w.dedent();
+            try self.w.line("}}", .{});
+
+            try self.w.blank();
+
             try self.w.line("pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {{", .{});
             self.w.indent();
             try self.w.line("if (source != .object) return error.UnexpectedToken;", .{});
@@ -602,7 +611,7 @@ pub const TypeGenerator = struct {
             for (variants.items) |v| {
                 try self.w.line("if (std.mem.eql(u8, disc_str, \"{s}\")) {{", .{v.disc_value});
                 self.w.indent();
-                try self.w.line("return .{{ .{s} = try std.json.parseFromValue({s}, allocator, source, options) }};", .{ v.field, v.zig_type });
+                try self.w.line("return .{{ .{s} = try std.json.parseFromValueLeaky({s}, allocator, source, options) }};", .{ v.field, v.zig_type });
                 self.w.dedent();
                 try self.w.line("}}", .{});
             }

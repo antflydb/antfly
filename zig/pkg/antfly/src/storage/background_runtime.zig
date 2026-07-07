@@ -39,6 +39,8 @@ pub const DurableJobLane = struct {
         poll: *const fn (ptr: *anyopaque, max_jobs: usize) anyerror!usize,
     };
 
+    /// On success, the lane owns `job` and will call `job.deinit`.
+    /// On error, ownership remains with the caller.
     pub fn submit(self: DurableJobLane, job: Job) !void {
         return try self.vtable.submit(self.ptr, job);
     }
@@ -235,8 +237,8 @@ const InlineDurableJobLane = struct {
     }
 
     fn submit(_: *anyopaque, job: Job) !void {
-        defer job.deinit(job.ptr);
-        return try job.run(job.ptr);
+        try job.run(job.ptr);
+        job.deinit(job.ptr);
     }
 
     fn drainOwner(_: *anyopaque, _: u64) void {}
@@ -349,13 +351,9 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         if (self.ownerIsClosingLocked(job.owner_id)) return error.BackgroundOwnerClosing;
+        try self.entries.ensureUnusedCapacity(self.alloc, 1);
         entry.future = try self.io_impl.io().concurrent(runEntry, .{entry});
-        errdefer {
-            _ = entry.future.await(self.io_impl.io());
-            entry.deinitJobOnce();
-        }
-
-        try self.entries.append(self.alloc, entry);
+        self.entries.appendAssumeCapacity(entry);
     }
 
     fn drainOwner(ptr: *anyopaque, owner_id: u64) void {
@@ -538,6 +536,42 @@ test "backend runtime durable lane runs inline jobs" {
     });
 
     try std.testing.expect(ctx.ran);
+    try std.testing.expect(ctx.deinit_called);
+}
+
+test "backend runtime durable lane leaves inline failed jobs owned by caller" {
+    const Ctx = struct {
+        ran: bool = false,
+        deinit_called: bool = false,
+    };
+    const Fns = struct {
+        fn run(ptr: *anyopaque) !void {
+            const ctx: *Ctx = @ptrCast(@alignCast(ptr));
+            ctx.ran = true;
+            return error.ExpectedFailure;
+        }
+
+        fn deinit(ptr: *anyopaque) void {
+            const ctx: *Ctx = @ptrCast(@alignCast(ptr));
+            ctx.deinit_called = true;
+        }
+    };
+
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .manual });
+    defer handle.deinit();
+
+    var ctx = Ctx{};
+    try std.testing.expectError(error.ExpectedFailure, handle.ptr().durable_jobs.submit(.{
+        .owner_id = 1,
+        .class = .maintenance,
+        .ptr = &ctx,
+        .run = Fns.run,
+        .deinit = Fns.deinit,
+    }));
+
+    try std.testing.expect(ctx.ran);
+    try std.testing.expect(!ctx.deinit_called);
+    Fns.deinit(&ctx);
     try std.testing.expect(ctx.deinit_called);
 }
 

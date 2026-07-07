@@ -1491,9 +1491,10 @@ pub const MetadataService = struct {
             error.FileNotFound, error.WriterLocked, error.LmdbUnexpected, error.Corrupted => {},
             else => return err,
         };
+        try self.refreshLocalTransitions();
+        _ = try self.raft.stepTransitions();
         if (!try runReplicationBackfillIfLeaseHeld(self)) return;
         try self.refreshLocalPlacementIntents();
-        try self.refreshLocalTransitions();
         _ = self.refreshLocalTableProvisioning() catch |err| switch (err) {
             error.FileNotFound, error.WriterLocked, error.LmdbUnexpected, error.Corrupted => .{},
             else => return err,
@@ -1519,9 +1520,10 @@ pub const MetadataService = struct {
             error.FileNotFound, error.WriterLocked, error.LmdbUnexpected, error.Corrupted => {},
             else => return err,
         };
+        try self.refreshLocalTransitions();
+        _ = try self.raft.stepTransitions();
         if (!try runReplicationBackfillIfLeaseHeld(self)) return;
         try self.refreshLocalPlacementIntents();
-        try self.refreshLocalTransitions();
         _ = self.refreshLocalTableProvisioning() catch |err| switch (err) {
             error.FileNotFound, error.WriterLocked, error.LmdbUnexpected, error.Corrupted => .{},
             else => return err,
@@ -2755,6 +2757,21 @@ pub const MetadataHttpService = struct {
         if (!self.observe_local_replica_root) return;
 
         phase_start_ns = platform_time.monotonicNs();
+        var local_transition_inputs = try captureLocalTransitionInputs(self);
+        defer {
+            const cleanup_phase_start_ns = platform_time.monotonicNs();
+            freeLocalTransitionInputs(self, &local_transition_inputs);
+            run_round_trace.recordSince("free_transition_inputs", cleanup_phase_start_ns);
+        }
+        run_round_trace.recordSince("capture_transition_inputs", phase_start_ns);
+        phase_start_ns = platform_time.monotonicNs();
+        try self.refreshLocalTransitions(&local_transition_inputs);
+        run_round_trace.recordSince("refresh_local_transitions", phase_start_ns);
+        phase_start_ns = platform_time.monotonicNs();
+        _ = try self.raft.stepTransitions();
+        run_round_trace.recordSince("step_committed_transitions", phase_start_ns);
+
+        phase_start_ns = platform_time.monotonicNs();
         const has_reconcile_lease = try self.ensureReconcileLease();
         run_round_trace.recordSince("ensure_reconcile_lease", phase_start_ns);
         if (!has_reconcile_lease) return;
@@ -2795,19 +2812,8 @@ pub const MetadataHttpService = struct {
         }
         run_round_trace.recordSince("capture_placement_inputs", phase_start_ns);
         phase_start_ns = platform_time.monotonicNs();
-        var local_transition_inputs = try captureLocalTransitionInputs(self);
-        defer {
-            const cleanup_phase_start_ns = platform_time.monotonicNs();
-            freeLocalTransitionInputs(self, &local_transition_inputs);
-            run_round_trace.recordSince("free_transition_inputs", cleanup_phase_start_ns);
-        }
-        run_round_trace.recordSince("capture_transition_inputs", phase_start_ns);
-        phase_start_ns = platform_time.monotonicNs();
         try self.refreshLocalPlacementIntents(&local_placement_inputs);
         run_round_trace.recordSince("refresh_local_placement_intents", phase_start_ns);
-        phase_start_ns = platform_time.monotonicNs();
-        try self.refreshLocalTransitions(&local_transition_inputs);
-        run_round_trace.recordSince("refresh_local_transitions", phase_start_ns);
         phase_start_ns = platform_time.monotonicNs();
         _ = self.refreshLocalTableProvisioning(&local_projection_inputs) catch |err| switch (err) {
             error.FileNotFound, error.WriterLocked, error.LmdbUnexpected, error.Corrupted => .{},
@@ -2825,7 +2831,7 @@ pub const MetadataHttpService = struct {
         run_round_trace.recordSince("run_lifecycle_reconcile_hook", phase_start_ns);
         phase_start_ns = platform_time.monotonicNs();
         _ = try self.raft.stepTransitions();
-        run_round_trace.recordSince("step_transitions", phase_start_ns);
+        run_round_trace.recordSince("step_post_reconcile_transitions", phase_start_ns);
     }
 
     pub fn probeReady(self: *const MetadataHttpService) bool {
@@ -2855,6 +2861,11 @@ pub const MetadataHttpService = struct {
         }
         if (!self.observe_local_replica_root) return;
 
+        var local_transition_inputs = try captureLocalTransitionInputs(self);
+        defer freeLocalTransitionInputs(self, &local_transition_inputs);
+        try self.refreshLocalTransitions(&local_transition_inputs);
+        _ = try self.raft.stepTransitions();
+
         const has_reconcile_lease = try self.ensureReconcileLease();
         if (!has_reconcile_lease) return;
 
@@ -2874,10 +2885,7 @@ pub const MetadataHttpService = struct {
         };
         var local_placement_inputs = try captureLocalPlacementInputs(self);
         defer freeLocalPlacementInputs(self, &local_placement_inputs);
-        var local_transition_inputs = try captureLocalTransitionInputs(self);
-        defer freeLocalTransitionInputs(self, &local_transition_inputs);
         try self.refreshLocalPlacementIntents(&local_placement_inputs);
-        try self.refreshLocalTransitions(&local_transition_inputs);
         _ = self.refreshLocalTableProvisioning(&local_projection_inputs) catch |err| switch (err) {
             error.FileNotFound, error.WriterLocked, error.LmdbUnexpected, error.Corrupted => .{},
             else => return err,

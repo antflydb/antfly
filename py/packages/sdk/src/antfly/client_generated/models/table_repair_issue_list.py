@@ -10,14 +10,14 @@ from ..models.repair_target import RepairTarget
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.artifact_repair_issue import ArtifactRepairIssue
+    from ..models.table_repair_issue import TableRepairIssue
 
 
-T = TypeVar("T", bound="ArtifactRepairIssueList")
+T = TypeVar("T", bound="TableRepairIssueList")
 
 
 @_attrs_define
-class ArtifactRepairIssueList:
+class TableRepairIssueList:
     """Bounded page of table repair issues.
 
     Attributes:
@@ -27,7 +27,7 @@ class ArtifactRepairIssueList:
         scanned (int): Number of repair records scanned while building this page.
         groups_scanned (int): Number of table groups touched while building this page.
         has_more (bool): Whether another page is available.
-        issues (list[ArtifactRepairIssue]):
+        issues (list[TableRepairIssue]):
         next_cursor (None | str | Unset): Opaque cursor for the next page when has_more is true.
     """
 
@@ -37,7 +37,7 @@ class ArtifactRepairIssueList:
     scanned: int
     groups_scanned: int
     has_more: bool
-    issues: list[ArtifactRepairIssue]
+    issues: list[TableRepairIssue]
     next_cursor: None | str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -85,7 +85,7 @@ class ArtifactRepairIssueList:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.artifact_repair_issue import ArtifactRepairIssue
+        from ..models.table_repair_issue import TableRepairIssue
 
         d = dict(src_dict)
         table = d.pop("table")
@@ -103,7 +103,7 @@ class ArtifactRepairIssueList:
         issues = []
         _issues = d.pop("issues")
         for issues_item_data in _issues:
-            issues_item = ArtifactRepairIssue.from_dict(issues_item_data)
+            issues_item = TableRepairIssue.from_dict(issues_item_data)
 
             issues.append(issues_item)
 
@@ -116,7 +116,7 @@ class ArtifactRepairIssueList:
 
         next_cursor = _parse_next_cursor(d.pop("next_cursor", UNSET))
 
-        artifact_repair_issue_list = cls(
+        table_repair_issue_list = cls(
             table=table,
             target=target,
             limit=limit,
@@ -127,8 +127,8 @@ class ArtifactRepairIssueList:
             next_cursor=next_cursor,
         )
 
-        artifact_repair_issue_list.additional_properties = d
-        return artifact_repair_issue_list
+        table_repair_issue_list.additional_properties = d
+        return table_repair_issue_list
 
     @property
     def additional_keys(self) -> list[str]:

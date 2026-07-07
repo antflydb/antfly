@@ -976,16 +976,27 @@ fn appendIndexRuntimeStatus(
     }
 
     const aggregate = if (local_statuses) |runtime|
-        aggregateIndexStatus(runtime.items, index_name, expected_group_ids)
+        aggregateIndexStatus(runtime.items, index_name, expected_group_ids) orelse
+            if (expected_group_ids.len > 0) missingAggregateIndexStatus(expected_group_ids.len) else null
     else if (expected_group_ids.len > 0)
         missingAggregateIndexStatus(expected_group_ids.len)
     else
         null;
     const item = aggregate orelse {
-        try out.appendSlice(alloc, "{}");
+        try appendMinimalIndexRuntimeStatus(alloc, out, index_type);
         return;
     };
     try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, item.table_doc_count, embeddings_require_table_coverage, embeddings_sparse, graph_source_status, item.async_indexing, if (index_type == .embeddings) item.enrichment else null, item.resolution, item.promotion, item.resolver_replay, null, item.runtime_present);
+}
+
+fn appendMinimalIndexRuntimeStatus(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    index_type: ApiIndexType,
+) !void {
+    try out.appendSlice(alloc, "{\"index_type\":");
+    try appendJsonString(alloc, out, indexTypeName(index_type));
+    try out.append(alloc, '}');
 }
 
 const AggregatedIndexStatus = struct {

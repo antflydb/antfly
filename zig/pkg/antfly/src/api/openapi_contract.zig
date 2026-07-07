@@ -191,7 +191,7 @@ test "indexes openapi parses algebraic status as algebraic stats" {
     const alloc = std.testing.allocator;
     var parsed = try std.json.parseFromSlice(indexes_generated.IndexStats, alloc,
         \\{"index_type":"algebraic","total_indexed":3,"healthy":true,"parse_error_count":0,"planner_last_decision":"fallback","planner_last_fallback_reason":"no_materialization","planner_last_estimated_scan_rows":61,"planner_last_estimated_result_buckets":8,"planner_lifecycle_ready":false,"planner_lifecycle_blocking_reason":"capability_lifecycle_not_ready","capability_lifecycle_status":"stale","recommendation_count":4,"adaptive_backfilling_count":1,"adaptive_ready_count":2,"adaptive_stale_count":0,"adaptive_cleanup_recommended_count":1,"active_progress_lifecycle":"backfilling","active_progress_rows_processed":7,"active_progress_target_rows":14}
-    , .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+    , .{ .allocate = .alloc_always });
     defer parsed.deinit();
 
     switch (parsed.value) {

@@ -1054,7 +1054,7 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * List artifact repair issues
+         * List table repair issues
          * @description Lists durable repair debt for a table. This operator-facing endpoint
          *     returns exact document keys, artifact keys, index names, and repair
          *     errors, and therefore requires table admin permission when authentication
@@ -1062,7 +1062,7 @@ export interface paths {
          *     supports `target=artifact` for durable artifact queue entries and
          *     `target=index` for index repair candidates.
          */
-        post: operations["listArtifactRepairIssues"];
+        post: operations["listTableRepairIssues"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1083,17 +1083,119 @@ export interface paths {
         put?: never;
         /**
          * Run a bounded table repair pass
-         * @description Attempts to repair queued table issues. `target=artifact` reprocesses
+         * @description Synchronously attempts to repair queued table issues. `target=artifact` reprocesses
          *     supported artifact kinds and replays derived state; it is bounded by
          *     `limit` and returns an opaque continuation cursor when another artifact
-         *     repair page is available. `target=index` repairs one named index after
-         *     resetting its derived index storage; healthy indexes are skipped unless
-         *     `force=true` is supplied, and any positive `limit` permits that single
-         *     named index repair. The response reports unresolved debt separately, and
-         *     the endpoint requires table admin permission when authentication is
-         *     enabled.
+         *     repair page is available. `target=index` repairs one named index by
+         *     building a shadow replacement, catching it up to the current derived
+         *     replay sequence, and atomically swapping it into service; healthy
+         *     indexes are skipped unless `force=true` is supplied, and any positive
+         *     `limit` permits that single named index repair. The response reports
+         *     unresolved debt separately, and the endpoint requires table admin
+         *     permission when authentication is enabled.
          */
         post: operations["runTableRepair"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/repair/jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start a durable table repair job
+         * @description Creates a durable table repair job for large or long-running repair work.
+         *     The job stores progress and accumulated counters across bounded advance
+         *     calls. Use this endpoint instead of synchronous `runTableRepair` when
+         *     repairing large indexes or when clients need retryable progress.
+         */
+        post: operations["startTableRepairJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/repair/jobs/{jobId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Repair job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        /** Get a table repair job */
+        get: operations["getTableRepairJob"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/repair/jobs/{jobId}/advance": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Repair job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Advance a table repair job
+         * @description Runs at most one bounded repair pass for the job. Concurrent advances use the job lease and return the current running state.
+         */
+        post: operations["advanceTableRepairJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/repair/jobs/{jobId}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Repair job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Cancel a table repair job
+         * @description Cancels a queued table repair job. If a repair pass is already running,
+         *     the response returns the current running state; cancellation is applied
+         *     only at pass boundaries so the API never reports a committed in-flight
+         *     pass as cancelled.
+         */
+        post: operations["cancelTableRepairJob"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1260,7 +1362,13 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Cancel a derived document artifact reprocess job */
+        /**
+         * Cancel a derived document artifact reprocess job
+         * @description Cancels a queued document artifact reprocess job. If a reprocess pass is
+         *     already running, the response returns the current running state;
+         *     cancellation is applied only at pass boundaries so the API never reports
+         *     a committed in-flight pass as cancelled.
+         */
         post: operations["cancelDocumentArtifactReprocessJob"];
         delete?: never;
         options?: never;
@@ -2737,7 +2845,7 @@ export interface components {
          * @description Kind of stored artifact tracked by the repair queue.
          * @enum {string}
          */
-        ArtifactRepairKind: "embedding" | "asset" | "chunk" | "graph" | "full_text";
+        ArtifactRepairKind: "embedding" | "asset" | "chunk" | "graph" | "full_text" | "algebraic";
         /**
          * @description Reason an artifact was added to the repair queue.
          * @enum {string}
@@ -2748,8 +2856,8 @@ export interface components {
          * @enum {string}
          */
         RepairTarget: "artifact" | "index";
-        /** @description Durable repair debt for a derived artifact. This is an operator-facing record and includes exact source and artifact identifiers. */
-        ArtifactRepairIssue: {
+        /** @description Durable table repair debt. Artifact targets include exact source and artifact identifiers; index targets include the affected index and repair status. */
+        TableRepairIssue: {
             artifact_kind: components["schemas"]["ArtifactRepairKind"];
             /** @description Index whose replay or derived state observed the artifact problem. */
             index_name: string;
@@ -2799,7 +2907,7 @@ export interface components {
             last_error?: string;
         };
         /** @description Bounded page of table repair issues. */
-        ArtifactRepairIssueList: {
+        TableRepairIssueList: {
             /** @description Table whose repair queue was listed. */
             table: string;
             target: components["schemas"]["RepairTarget"];
@@ -2822,7 +2930,7 @@ export interface components {
             has_more: boolean;
             /** @description Opaque cursor for the next page when has_more is true. */
             next_cursor?: string | null;
-            issues: components["schemas"]["ArtifactRepairIssue"][];
+            issues: components["schemas"]["TableRepairIssue"][];
         };
         /** @description Bounded request to list table repair issues. */
         RepairIssueListRequest: {
@@ -2863,8 +2971,8 @@ export interface components {
              */
             limit?: number;
         };
-        /** @description Result of one bounded artifact repair pass. */
-        ArtifactRepairRunResult: {
+        /** @description Result of one bounded table repair pass. */
+        TableRepairRunResult: {
             /**
              * Format: uint64
              * @description Number of repair records attempted by this pass.
@@ -2897,7 +3005,7 @@ export interface components {
             failed: number;
             /**
              * Format: uint64
-             * @description Number of repair records skipped because no reprocessor exists for the artifact kind.
+             * @description Number of repair records skipped because no automated repair exists for the selected target.
              */
             unsupported: number;
             /**
@@ -2905,6 +3013,11 @@ export interface components {
              * @description Number of attempted repair records that remained queued after this pass.
              */
             unresolved: number;
+            /**
+             * Format: uint64
+             * @description Number of selected repair records or indexes skipped because another repair pass already owns them.
+             */
+            in_progress: number;
             /**
              * Format: uint64
              * @description Number of indexes rebuilt by this pass when target is index.
@@ -2922,13 +3035,13 @@ export interface components {
             limit: number;
             /** @description Opaque cursor for the next artifact repair pass when has_more is true. Index repair currently repairs one named index per request and does not return a continuation cursor. */
             next_cursor?: string | null;
-            /** @description Whether another artifact scan page is available via next_cursor. */
+            /** @description Whether another repair scan page is available via next_cursor. */
             has_more: boolean;
             /** @description Whether repair debt remains after this bounded pass. If true and next_cursor is absent, rerun repair from the beginning after addressing failed or unsupported records. */
             debt_remaining: boolean;
         };
         /** @description Response for a bounded table repair pass. */
-        ArtifactRepairRunResponse: {
+        TableRepairRunResponse: {
             /** @description Table whose repair queue was processed. */
             table: string;
             target: components["schemas"]["RepairTarget"];
@@ -2937,7 +3050,91 @@ export interface components {
              * @description Effective repair limit.
              */
             limit: number;
-            result: components["schemas"]["ArtifactRepairRunResult"];
+            result: components["schemas"]["TableRepairRunResult"];
+        };
+        /** @description Starts a durable table repair job. The job advances in bounded passes using the same repair request shape as runTableRepair. */
+        TableRepairJobStartRequest: {
+            /** @default artifact */
+            target?: components["schemas"]["RepairTarget"];
+            kind?: components["schemas"]["ArtifactRepairKind"];
+            /** @description Restrict repair attempts to one index name. */
+            index?: string;
+            /** @description Opaque cursor returned by a prior repair response. */
+            cursor?: string;
+            /**
+             * @description Force a named index rebuild even when no repair debt is currently recorded. Only applies to target=index.
+             * @default false
+             */
+            force?: boolean;
+            /**
+             * Format: uint32
+             * @description Maximum artifact repair records to attempt per pass. For target=index, any positive value permits one named index repair.
+             * @default 100
+             */
+            limit?: number;
+            /**
+             * @description When true, the server immediately attempts the first bounded repair pass before returning the job.
+             * @default true
+             */
+            advance?: boolean;
+        };
+        /** @description Durable table repair job state. */
+        TableRepairJob: {
+            /**
+             * Format: uint64
+             * @description Server-assigned durable repair job identifier.
+             */
+            job_id: number;
+            /**
+             * Format: uint64
+             * @description Monotonic execution attempt token for the current running pass.
+             */
+            attempt_id: number;
+            /** @description Table being repaired. */
+            table_name: string;
+            /**
+             * @description Lifecycle phase of the repair job.
+             * @enum {string}
+             */
+            phase: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+            /**
+             * @description User-facing repair progress state. `debt_remaining` means the bounded job stopped because unsupported or failed debt still requires operator action.
+             * @enum {string}
+             */
+            repair_status: "in_progress" | "complete" | "debt_remaining" | "stopped";
+            target: components["schemas"]["RepairTarget"];
+            kind?: components["schemas"]["ArtifactRepairKind"];
+            /** @description Index name when the job is restricted to one index. */
+            index?: string;
+            /** @description Opaque continuation cursor for the next bounded repair pass. */
+            cursor?: string | null;
+            /**
+             * Format: uint32
+             * @description Effective per-pass repair limit.
+             */
+            limit: number;
+            /** @description Whether the job forces a named index rebuild. */
+            force: boolean;
+            result: components["schemas"]["TableRepairRunResult"];
+            /** @description Last stable job-level error code. */
+            last_error?: string | null;
+            /** @description Whether cancellation has been requested for a running pass. Running passes finish at a bounded repair boundary before the job transitions to cancelled. */
+            cancel_requested: boolean;
+            /**
+             * Format: uint64
+             * @description Unix epoch milliseconds when the job was created.
+             */
+            created_at_millis: number;
+            /**
+             * Format: uint64
+             * @description Unix epoch milliseconds when the job state was last updated.
+             */
+            last_updated_at_millis: number;
+            /**
+             * Format: uint64
+             * @description Unix epoch milliseconds when the job is eligible for cleanup.
+             */
+            expires_at_millis: number;
         };
         DocumentArtifactReprocessResponse: {
             /**
@@ -3059,6 +3256,11 @@ export interface components {
              * @description Server-assigned durable repair job identifier.
              */
             job_id: number;
+            /**
+             * Format: uint64
+             * @description Monotonic execution attempt token for the current running pass.
+             */
+            attempt_id: number;
             /** @description Table containing the source documents being repaired. */
             table_name: string;
             /** @description Name of the derived artifact being repaired. */
@@ -3100,19 +3302,21 @@ export interface components {
             shard_cursors: components["schemas"]["DocumentArtifactReprocessShardCursor"][];
             /** @description Last terminal or transient job error, when available. */
             last_error?: string | null;
+            /** @description Whether cancellation has been requested for a running pass. Running passes finish at a bounded reprocess boundary before the job transitions to cancelled. */
+            cancel_requested: boolean;
             /**
              * Format: uint64
-             * @description Monotonic server timestamp when the job was created.
+             * @description Unix epoch milliseconds when the job was created.
              */
             created_at_millis: number;
             /**
              * Format: uint64
-             * @description Monotonic server timestamp when the job was last updated.
+             * @description Unix epoch milliseconds when the job was last updated.
              */
             last_updated_at_millis: number;
             /**
              * Format: uint64
-             * @description Monotonic server timestamp after which the retained job status may be removed.
+             * @description Unix epoch milliseconds after which the retained job status may be removed.
              */
             expires_at_millis: number;
         };
@@ -8108,6 +8312,66 @@ export interface components {
              * @description Repair issues found by explicit repair-scan accounting for this projection.
              */
             repair_scan_issue_count?: number;
+            /** @description Whether this index currently has derived indexing work in progress. */
+            backfill_active?: boolean;
+            /** @description Compact lifecycle state for derived indexing work. */
+            backfill_state?: string;
+            /** Format: uint64 */
+            doc_count?: number;
+            /** Format: uint64 */
+            term_count?: number;
+            /** Format: uint64 */
+            edge_count?: number;
+            /** Format: uint64 */
+            node_count?: number;
+            /** Format: uint64 */
+            replay_applied_sequence?: number;
+            /** Format: uint64 */
+            replay_target_sequence?: number;
+            replay_catch_up_required?: boolean;
+            repair_degraded?: boolean;
+            /** Format: uint64 */
+            repair_issue_count?: number;
+            repair_summary_ready?: boolean;
+            repair_issue_count_estimated?: boolean;
+            runtime_present?: boolean;
+            runtime_fresh?: boolean;
+            runtime_source?: string;
+            runtime_freshness?: string;
+            catch_up_active?: boolean;
+            catch_up_phase?: string;
+            /** Format: uint64 */
+            catch_up_applied_sequence?: number;
+            /** Format: uint64 */
+            catch_up_target_sequence?: number;
+            /** Format: uint64 */
+            expected_groups?: number;
+            /** Format: uint64 */
+            reported_groups?: number;
+            /** Format: uint64 */
+            fresh_groups?: number;
+            /** Format: uint64 */
+            stale_groups?: number;
+            /** Format: uint64 */
+            missing_groups?: number;
+            /** Format: uint64 */
+            unknown_remote_groups?: number;
+            /** @description Full-text merge runtime diagnostics. */
+            text_merge?: {
+                [key: string]: unknown;
+            };
+            /** @description Artifact resolution replay diagnostics. */
+            resolution?: {
+                [key: string]: unknown;
+            };
+            /** @description Artifact promotion replay diagnostics. */
+            promotion?: {
+                [key: string]: unknown;
+            };
+            /** @description Derived-index background indexing diagnostics. */
+            async_indexing?: {
+                [key: string]: unknown;
+            };
         };
         /** @description Statistics for an embeddings index (dense or sparse) */
         EmbeddingsIndexStats: {
@@ -8182,6 +8446,89 @@ export interface components {
              * @description Repair issues found by explicit repair-scan accounting for this projection.
              */
             repair_scan_issue_count?: number;
+            /** @description Whether this index currently has derived indexing work in progress. */
+            backfill_active?: boolean;
+            /** @description Compact lifecycle state for derived indexing work. */
+            backfill_state?: string;
+            /** Format: uint64 */
+            doc_count?: number;
+            /** Format: uint64 */
+            term_count?: number;
+            /** Format: uint64 */
+            edge_count?: number;
+            /** Format: uint64 */
+            node_count?: number;
+            /** Format: uint64 */
+            query_visible_doc_count?: number;
+            /** Format: uint64 */
+            published_doc_count?: number;
+            /** Format: uint64 */
+            published_node_count?: number;
+            /** Format: uint64 */
+            root_node?: number;
+            /** Format: uint64 */
+            published_root_node?: number;
+            /** Format: uint64 */
+            dense_replay_applied_sequence?: number;
+            /** Format: uint64 */
+            dense_replay_target_sequence?: number;
+            dense_publish_pending?: boolean;
+            /** Format: uint64 */
+            replay_applied_sequence?: number;
+            /** Format: uint64 */
+            replay_target_sequence?: number;
+            replay_catch_up_required?: boolean;
+            repair_degraded?: boolean;
+            /** Format: uint64 */
+            repair_issue_count?: number;
+            repair_summary_ready?: boolean;
+            repair_issue_count_estimated?: boolean;
+            runtime_present?: boolean;
+            runtime_fresh?: boolean;
+            runtime_source?: string;
+            runtime_freshness?: string;
+            catch_up_active?: boolean;
+            catch_up_phase?: string;
+            /** Format: uint64 */
+            catch_up_applied_sequence?: number;
+            /** Format: uint64 */
+            catch_up_target_sequence?: number;
+            /** Format: uint64 */
+            expected_groups?: number;
+            /** Format: uint64 */
+            reported_groups?: number;
+            /** Format: uint64 */
+            fresh_groups?: number;
+            /** Format: uint64 */
+            stale_groups?: number;
+            /** Format: uint64 */
+            missing_groups?: number;
+            /** Format: uint64 */
+            unknown_remote_groups?: number;
+            /** @description Artifact resolution replay diagnostics. */
+            resolution?: {
+                [key: string]: unknown;
+            };
+            /** @description Artifact promotion replay diagnostics. */
+            promotion?: {
+                [key: string]: unknown;
+            };
+            /** @description Dense-vector cache diagnostics. */
+            hbc_cache?: {
+                [key: string]: unknown;
+            };
+            /** @description Dense-vector posting diagnostics. */
+            hbc_posting?: {
+                [key: string]: unknown;
+            };
+            /** @description Managed enrichment runtime diagnostics. */
+            enrichment_runtime?: {
+                [key: string]: unknown;
+            };
+            /** @description Derived-index background indexing diagnostics. */
+            async_indexing?: {
+                [key: string]: unknown;
+            };
         };
         /** @description Statistics for graph index */
         GraphIndexStats: {
@@ -8240,6 +8587,62 @@ export interface components {
              * @description Repair issues found by explicit repair-scan accounting for this projection.
              */
             repair_scan_issue_count?: number;
+            /** @description Whether this index currently has derived indexing work in progress. */
+            backfill_active?: boolean;
+            /** @description Compact lifecycle state for derived indexing work. */
+            backfill_state?: string;
+            /** Format: uint64 */
+            doc_count?: number;
+            /** Format: uint64 */
+            term_count?: number;
+            /** Format: uint64 */
+            edge_count?: number;
+            /** Format: uint64 */
+            node_count?: number;
+            /** Format: uint64 */
+            replay_applied_sequence?: number;
+            /** Format: uint64 */
+            replay_target_sequence?: number;
+            replay_catch_up_required?: boolean;
+            repair_degraded?: boolean;
+            /** Format: uint64 */
+            repair_issue_count?: number;
+            repair_summary_ready?: boolean;
+            repair_issue_count_estimated?: boolean;
+            runtime_present?: boolean;
+            runtime_fresh?: boolean;
+            runtime_source?: string;
+            runtime_freshness?: string;
+            catch_up_active?: boolean;
+            catch_up_phase?: string;
+            /** Format: uint64 */
+            catch_up_applied_sequence?: number;
+            /** Format: uint64 */
+            catch_up_target_sequence?: number;
+            /** Format: uint64 */
+            expected_groups?: number;
+            /** Format: uint64 */
+            reported_groups?: number;
+            /** Format: uint64 */
+            fresh_groups?: number;
+            /** Format: uint64 */
+            stale_groups?: number;
+            /** Format: uint64 */
+            missing_groups?: number;
+            /** Format: uint64 */
+            unknown_remote_groups?: number;
+            /** @description Artifact resolution replay diagnostics. */
+            resolution?: {
+                [key: string]: unknown;
+            };
+            /** @description Artifact promotion replay diagnostics. */
+            promotion?: {
+                [key: string]: unknown;
+            };
+            /** @description Derived-index background indexing diagnostics. */
+            async_indexing?: {
+                [key: string]: unknown;
+            };
             /** @description Algebraic graph execution health for bounded semiring traversal. */
             algebraic_graph?: {
                 traversal?: {
@@ -8361,6 +8764,70 @@ export interface components {
              * @description Repair issues found by explicit repair-scan accounting for this projection.
              */
             repair_scan_issue_count?: number;
+            /** @description Whether this index currently has derived indexing work in progress. */
+            backfill_active?: boolean;
+            /** @description Compact lifecycle state for derived indexing work. */
+            backfill_state?: string;
+            /** Format: uint64 */
+            doc_count?: number;
+            /** Format: uint64 */
+            term_count?: number;
+            /** Format: uint64 */
+            edge_count?: number;
+            /** Format: uint64 */
+            node_count?: number;
+            /** Format: uint64 */
+            replay_applied_sequence?: number;
+            /** Format: uint64 */
+            replay_target_sequence?: number;
+            replay_catch_up_required?: boolean;
+            repair_degraded?: boolean;
+            /** Format: uint64 */
+            repair_issue_count?: number;
+            repair_summary_ready?: boolean;
+            repair_issue_count_estimated?: boolean;
+            runtime_present?: boolean;
+            runtime_fresh?: boolean;
+            runtime_source?: string;
+            runtime_freshness?: string;
+            catch_up_active?: boolean;
+            catch_up_phase?: string;
+            /** Format: uint64 */
+            catch_up_applied_sequence?: number;
+            /** Format: uint64 */
+            catch_up_target_sequence?: number;
+            /** Format: uint64 */
+            expected_groups?: number;
+            /** Format: uint64 */
+            reported_groups?: number;
+            /** Format: uint64 */
+            fresh_groups?: number;
+            /** Format: uint64 */
+            stale_groups?: number;
+            /** Format: uint64 */
+            missing_groups?: number;
+            /** Format: uint64 */
+            unknown_remote_groups?: number;
+            /** @description Source artifact stream used to materialize graph edges. */
+            source_artifact?: {
+                [key: string]: unknown;
+            };
+            /** @description Graph resolver replay diagnostics. */
+            resolver_replay?: {
+                [key: string]: unknown;
+            };
+            /** @description Artifact resolution replay diagnostics. */
+            resolution?: {
+                [key: string]: unknown;
+            };
+            /** @description Artifact promotion replay diagnostics. */
+            promotion?: {
+                [key: string]: unknown;
+            };
+            /** @description Derived-index background indexing diagnostics. */
+            async_indexing?: {
+                [key: string]: unknown;
+            };
         };
         /** @description Statistics for an index */
         IndexStats: components["schemas"]["FullTextIndexStats"] | components["schemas"]["EmbeddingsIndexStats"] | components["schemas"]["GraphIndexStats"] | components["schemas"]["AlgebraicIndexStats"];
@@ -12540,7 +13007,7 @@ export interface operations {
             500: components["responses"]["InternalServerError"];
         };
     };
-    listArtifactRepairIssues: {
+    listTableRepairIssues: {
         parameters: {
             query?: never;
             header?: never;
@@ -12556,13 +13023,13 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Artifact repair issue page */
+            /** @description Table repair issue page */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ArtifactRepairIssueList"];
+                    "application/json": components["schemas"]["TableRepairIssueList"];
                 };
             };
             400: components["responses"]["BadRequest"];
@@ -12587,18 +13054,161 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Bounded table repair pass was accepted */
-            202: {
+            /** @description Bounded table repair pass completed */
+            200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ArtifactRepairRunResponse"];
+                    "application/json": components["schemas"]["TableRepairRunResponse"];
                 };
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             405: components["responses"]["MethodNotAllowed"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    startTableRepairJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["TableRepairJobStartRequest"];
+            };
+        };
+        responses: {
+            /** @description Job completed during the initial advance. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TableRepairJob"];
+                };
+            };
+            /** @description Repair job accepted or advanced but not terminal. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TableRepairJob"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    getTableRepairJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Repair job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Repair job state. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TableRepairJob"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    advanceTableRepairJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Repair job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Repair job reached a terminal phase. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TableRepairJob"];
+                };
+            };
+            /** @description Repair job remains queued or running. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TableRepairJob"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    cancelTableRepairJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Repair job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Repair job cancelled or already terminal. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TableRepairJob"];
+                };
+            };
+            /** @description Cancellation requested; the current running pass has not yet reached a cancellation boundary. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TableRepairJob"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
             500: components["responses"]["InternalServerError"];
         };
     };
@@ -12821,8 +13431,17 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Reprocess job was cancelled or already terminal */
+            /** @description Reprocess job cancelled or already terminal. */
             200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentArtifactReprocessJob"];
+                };
+            };
+            /** @description Cancellation requested; the current running pass has not yet reached a cancellation boundary. */
+            202: {
                 headers: {
                     [name: string]: unknown;
                 };

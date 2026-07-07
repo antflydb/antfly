@@ -12721,6 +12721,77 @@ test "lsm backend open manifest version refs pin obsolete files across handles" 
     try std.testing.expectError(error.FileNotFound, backing.storage().readFileAlloc(alloc, obsolete_path, 1024));
 }
 
+test "lsm backend reopen reclaim stress preserves manifest referenced runs" {
+    const alloc = std.testing.allocator;
+    var backing = storage_io.MemoryStorage.init(alloc);
+    defer backing.deinit();
+
+    const root_dir = "/memory/lsm-reopen-reclaim-stress";
+
+    for (0..8) |i| {
+        var writer = try Backend.open(alloc, root_dir, .{
+            .storage = backing.storage(),
+            .flush_threshold = 1,
+            .compact_threshold_runs = 1,
+            .foreground_soft_compaction = true,
+            .obsolete_retention_ns = 0,
+        });
+        var writer_open = true;
+        defer if (writer_open) writer.close();
+
+        {
+            var runtime = try writer.runtimeStore(alloc, .{ .name = "docs" });
+            defer runtime.deinit();
+            var seed_txn = try runtime.beginWrite();
+            const seed_value = try std.fmt.allocPrint(alloc, "value-{d}-seed", .{i});
+            defer alloc.free(seed_value);
+            try seed_txn.put("doc:stable", seed_value);
+            try seed_txn.commit();
+        }
+
+        var reader = try Backend.open(alloc, root_dir, .{
+            .storage = backing.storage(),
+            .backend = .{ .read_only = true },
+            .obsolete_retention_ns = 0,
+        });
+        var reader_open = true;
+        defer if (reader_open) reader.close();
+
+        {
+            var runtime = try writer.runtimeStore(alloc, .{ .name = "docs" });
+            defer runtime.deinit();
+            var update_txn = try runtime.beginWrite();
+            const update_value = try std.fmt.allocPrint(alloc, "value-{d}-updated", .{i});
+            defer alloc.free(update_value);
+            try update_txn.put("doc:stable", update_value);
+            try update_txn.commit();
+        }
+
+        const pinned = writer.snapshotMaintenanceStats();
+        try std.testing.expect(pinned.obsolete_paths == 0 or pinned.obsolete_paths_pinned_by_versions > 0);
+        reader.close();
+        reader_open = false;
+        while (try writer.runMaintenanceStep()) {}
+
+        const clean = writer.snapshotMaintenanceStats();
+        try std.testing.expectEqual(@as(u64, 0), clean.obsolete_paths_pinned_by_versions);
+        writer.close();
+        writer_open = false;
+    }
+
+    var final_reader = try Backend.open(alloc, root_dir, .{
+        .storage = backing.storage(),
+        .backend = .{ .read_only = true },
+        .obsolete_retention_ns = 0,
+    });
+    defer final_reader.close();
+    var runtime = try final_reader.runtimeStore(alloc, .{ .name = "docs" });
+    defer runtime.deinit();
+    var txn = try runtime.beginRead();
+    defer txn.abort();
+    try std.testing.expectEqualStrings("value-7-updated", try txn.get("doc:stable"));
+}
+
 test "lsm backend reader release reclaims expired clean obsolete paths" {
     const alloc = std.testing.allocator;
     var backing = storage_io.MemoryStorage.init(alloc);

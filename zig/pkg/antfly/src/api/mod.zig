@@ -49,7 +49,9 @@ pub const distributed_entity_sink = @import("distributed_entity_sink.zig");
 pub const distributed_join = @import("distributed_join.zig");
 pub const distributed_graph = @import("distributed_graph.zig");
 pub const artifact_reprocess_jobs = @import("artifact_reprocess_jobs.zig");
+pub const repair_jobs = @import("repair_jobs.zig");
 pub const http_internal_group_read_routes = @import("http_internal_group_read_routes.zig");
+pub const http_internal_group_write_routes = @import("http_internal_group_write_routes.zig");
 pub const http_internal_group_join_routes = @import("http_internal_group_join_routes.zig");
 pub const http_server = @import("http_server.zig");
 pub const http_client = @import("http_client.zig");
@@ -236,6 +238,7 @@ test "api module compiles" {
     _ = distributed_join;
     _ = distributed_graph;
     _ = http_internal_group_read_routes;
+    _ = http_internal_group_write_routes;
     _ = http_internal_group_join_routes;
     _ = http_server;
     _ = http_client;
