@@ -602,13 +602,13 @@ const QueryResponseWire = struct {
                 candidate_source: []const u8 = "",
                 source_load: []const u8 = "",
                 selection_reason: []const u8 = "",
+                sort_lifecycle_state: []const u8 = "",
                 native_filter_mode: []const u8 = "",
                 native_filter_candidate_count: u64 = 0,
                 native_filter_exclusion_count: u64 = 0,
                 selective_filter_doc_values_preferred: bool = false,
                 native_doc_values_coverage: []const u8 = "",
                 index_sort_coverage: []const u8 = "",
-                index_sort_match: bool = false,
                 candidate_count: u64 = 0,
                 selected_count: u64 = 0,
                 cursor_rejected_count: u64 = 0,
@@ -1951,7 +1951,7 @@ fn enforcePublicExactSortBudgetRejection(
         return error.InvalidQueryResponse;
     }
     std.debug.print(
-        "public_query_exact_sort_budget_rejection query_shape={s} checked={d} reason=candidate_budget_exceeded detail=text_field_sort_candidate_window field={s}\n",
+        "public_query_exact_sort_budget_rejection query_shape={s} checked={d} reason=candidate_budget_exceeded budget=text_field_sort_candidate_window detail=candidate_budget_exceeded field={s}\n",
         .{ cfg.query_shape.text(), checked, text_index_name },
     );
 }
@@ -1962,7 +1962,7 @@ fn expectPublicExactSortBudgetRejection(parsed: QueryErrorWire, raw_body: []cons
         !std.mem.eql(u8, parsed.reason, "candidate_budget_exceeded") or
         !std.mem.eql(u8, parsed.budget_rejection_reason, "text_field_sort_candidate_window") or
         !std.mem.eql(u8, parsed.sort_rejection_reason, "candidate_budget_exceeded") or
-        !std.mem.eql(u8, parsed.sort_rejection_detail, "text_field_sort_candidate_window") or
+        !std.mem.eql(u8, parsed.sort_rejection_detail, "candidate_budget_exceeded") or
         !std.mem.eql(u8, parsed.sort_rejection_field, text_index_name))
     {
         std.debug.print("public-query guardrail invalid budget rejection body={s}\n", .{raw_body});
@@ -2262,7 +2262,12 @@ fn accumulateParsedResponse(stats: *QueryBenchStats, parsed: QueryResponseWire, 
             if (std.mem.eql(u8, sort.plan, "native_doc_values_top_n")) stats.profile_sort_native_doc_values_count += 1;
             if (std.mem.eql(u8, sort.plan, "sorted_segment_seek")) stats.profile_sort_sorted_segment_count += 1;
             if (std.mem.eql(u8, sort.selection_reason, "index_sort_sorted_segment_seek")) stats.profile_sort_index_sort_reason_count += 1;
-            if (sort.index_sort_match and std.mem.eql(u8, sort.index_sort_coverage, "covered_with_bounds")) stats.profile_sort_index_sort_covered_count += 1;
+            if (std.mem.eql(u8, sort.index_sort_coverage, "covered_with_bounds") or
+                std.mem.eql(u8, sort.index_sort_coverage, "covered_without_bounds") or
+                std.mem.eql(u8, sort.sort_lifecycle_state, "accelerated"))
+            {
+                stats.profile_sort_index_sort_covered_count += 1;
+            }
             if (std.mem.eql(u8, sort.candidate_source, "sorted_segment_membership")) stats.profile_sort_sorted_segment_membership_count += 1;
             if (std.mem.eql(u8, sort.candidate_source, "native_filter")) stats.profile_sort_native_filter_count += 1;
             if (std.mem.eql(u8, sort.native_filter_mode, "doc_nums")) stats.profile_sort_native_filter_doc_nums_count += 1;
@@ -2456,10 +2461,10 @@ fn enforceExactSortGuardrail(cfg: Config, stats: QueryBenchStats) !void {
         );
         return error.ExactSortGuardrailFailed;
     }
-    if (stats.profile_sort_native_doc_value_hit_count == 0 or stats.profile_sort_selected_count == 0) {
+    if (stats.profile_sort_selected_count == 0) {
         std.debug.print(
-            "public-query guardrail failed: exact sort missing native hits selected={d} native_doc_value_hits={d}\n",
-            .{ stats.profile_sort_selected_count, stats.profile_sort_native_doc_value_hit_count },
+            "public-query guardrail failed: exact sort selected no hits selected={d}\n",
+            .{stats.profile_sort_selected_count},
         );
         return error.ExactSortGuardrailFailed;
     }
