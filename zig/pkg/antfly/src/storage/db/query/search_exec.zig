@@ -13128,6 +13128,78 @@ fn buildAllOrdinalTextDocIdMapAlloc(
     return !saw_live_doc or ordinal_to_text_doc_id.count() > 0;
 }
 
+fn matchAllDocOrdinalsForDocIdsAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    snapshot: *const index_mod.IndexSnapshot,
+    doc_ids: []const []const u8,
+) ![]const u32 {
+    var out = std.ArrayListUnmanaged(u32).empty;
+    errdefer out.deinit(alloc);
+    var scanned_count: u64 = 0;
+    for (snapshot.segments) |*segment| {
+        for (0..segment.reader.doc_count) |local_usize| {
+            scanned_count +|= 1;
+            if (scanned_count == 1 or scanned_count % 1024 == 0) try checkSearchRequestDeadline(req);
+            const local_doc: u32 = @intCast(local_usize);
+            if (segment.shared.deleted) |deleted| {
+                if (deleted.contains(local_doc)) continue;
+            }
+            const stored = segment.reader.storedDoc(local_doc) orelse continue;
+            if (!containsDocId(doc_ids, stored.id)) continue;
+            const ordinal = (try segment.reader.docOrdinal(local_doc)) orelse {
+                logNativeSortPlanRejection(
+                    "*",
+                    nativeSortPlanRejectionReasonName(.missing_doc_values_capability),
+                    "doc_ordinal_projection_unavailable",
+                );
+                return error.UnsupportedQueryRequest;
+            };
+            try appendDocNum(alloc, &out, ordinal);
+        }
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn convertNativeDocIdsToMatchAllDocOrdinalsAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    snapshot: *const index_mod.IndexSnapshot,
+    constraints: *NativeDocIdConstraints,
+) !void {
+    if (constraints.filter_doc_ids.len > 0) {
+        const mapped = try matchAllDocOrdinalsForDocIdsAlloc(alloc, req, snapshot, constraints.filter_doc_ids);
+        if (constraints.filter_doc_nums.len > 0) {
+            const intersected = try intersectDocNumsAlloc(alloc, constraints.filter_doc_nums, mapped);
+            if (constraints.filter_doc_nums_owned and constraints.filter_doc_nums.len > 0) alloc.free(@constCast(constraints.filter_doc_nums));
+            alloc.free(mapped);
+            constraints.filter_doc_nums = intersected;
+        } else {
+            constraints.filter_doc_nums = mapped;
+        }
+        constraints.filter_doc_nums_owned = true;
+        if (constraints.filter_doc_ids_owned) freeDocIdSlice(alloc, constraints.filter_doc_ids);
+        constraints.filter_doc_ids = &.{};
+        constraints.filter_doc_ids_owned = false;
+    }
+
+    if (constraints.exclude_doc_ids.len > 0) {
+        const mapped = try matchAllDocOrdinalsForDocIdsAlloc(alloc, req, snapshot, constraints.exclude_doc_ids);
+        if (constraints.exclude_doc_nums.len > 0) {
+            const merged = try unionDocNumsAlloc(alloc, constraints.exclude_doc_nums, mapped);
+            if (constraints.exclude_doc_nums_owned and constraints.exclude_doc_nums.len > 0) alloc.free(@constCast(constraints.exclude_doc_nums));
+            alloc.free(mapped);
+            constraints.exclude_doc_nums = merged;
+        } else {
+            constraints.exclude_doc_nums = mapped;
+        }
+        constraints.exclude_doc_nums_owned = true;
+        if (constraints.exclude_doc_ids_owned) freeDocIdSlice(alloc, constraints.exclude_doc_ids);
+        constraints.exclude_doc_ids = &.{};
+        constraints.exclude_doc_ids_owned = false;
+    }
+}
+
 fn sortAndPageMatchAllOrdinalDocValueCandidatesAlloc(
     alloc: Allocator,
     req: types.SearchRequest,
@@ -13567,6 +13639,22 @@ pub fn searchMatchAll(
         native_constraints.filter_query_json_resolved,
         native_constraints.exclusion_query_json_resolved,
     );
+
+    if (exec_req.order_by.len > 0 and
+        (planned_sort.kind == .sorted_segment_seek or planned_sort.kind == .native_doc_values_top_n) and
+        (native_constraints.filter_doc_ids.len > 0 or native_constraints.exclude_doc_ids.len > 0))
+    {
+        const text_entry = (try executor.text_index_entry(executor.ctx, exec_req.index_name)) orelse {
+            logNativeSortPlanRejection(
+                "*",
+                nativeSortPlanRejectionReasonName(.missing_doc_values_capability),
+                "text_index_entry_unavailable",
+            );
+            return error.UnsupportedQueryRequest;
+        };
+        try convertNativeDocIdsToMatchAllDocOrdinalsAlloc(alloc, exec_req, text_entry.persistent.snapshot(), &native_constraints);
+        try normalizeNativeDocNumConstraintsAlloc(alloc, &native_constraints);
+    }
 
     if (exec_req.order_by.len > 0 and planned_sort.kind == .sorted_segment_seek and !unresolved_stored_filters) {
         const text_entry = (try executor.text_index_entry(executor.ctx, exec_req.index_name)) orelse {
@@ -16563,6 +16651,42 @@ test "match_all native doc values sort consumes selective ordinal candidates dir
     try std.testing.expectEqual(@as(u64, 1), before_profile.cursor_rejected_count);
     try std.testing.expectEqual(@as(u64, 1), before_profile.selected_count);
     try std.testing.expectEqual(@as(usize, 1), before_profile.window_len);
+
+    const direct_filter_doc_ids = [_][]const u8{ "doc:a", "doc:d" };
+    const direct_exclude_doc_ids = [_][]const u8{"doc:d"};
+    var direct_id_page = try searchMatchAll(alloc, .{
+        .index_name = "ft",
+        .filter_doc_ids = &direct_filter_doc_ids,
+        .filter_doc_ids_positive = true,
+        .exclude_doc_ids = &direct_exclude_doc_ids,
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 10,
+    }, .{
+        .ctx = &harness,
+        .collect_candidates = Harness.collectCandidates,
+        .collect_candidates_stream = Harness.streamCandidates,
+        .text_index_entry = Harness.textIndexEntry,
+        .load_projected_document = Harness.loadProjectedDocument,
+        .load_stored = testUnexpectedLoadStoredCallback,
+    });
+    defer direct_id_page.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), harness.collect_count);
+    try std.testing.expectEqual(@as(usize, 0), harness.stream_count);
+    try std.testing.expectEqual(@as(u32, 1), direct_id_page.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), direct_id_page.hits.len);
+    try std.testing.expectEqualStrings("doc:a", direct_id_page.hits[0].id);
+    const direct_id_profile = direct_id_page.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", direct_id_profile.plan);
+    try std.testing.expectEqualStrings("native_filter", direct_id_profile.candidate_source);
+    try std.testing.expectEqualStrings("doc_nums", direct_id_profile.native_filter_mode);
+    try std.testing.expectEqual(@as(u64, 2), direct_id_profile.native_filter_candidate_count);
+    try std.testing.expectEqual(@as(u64, 1), direct_id_profile.native_filter_exclusion_count);
+    try std.testing.expectEqual(@as(u64, 1), direct_id_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 1), direct_id_profile.selected_count);
+    try std.testing.expectEqual(@as(u64, 1), direct_id_profile.native_doc_value_hit_count);
 
     const exclude_doc_ids = [_][]const u8{"doc:d"};
     var exclude_id_page = try searchMatchAll(alloc, .{
