@@ -71,6 +71,7 @@ const QueryShape = enum {
     exact_sort_match_all,
     exact_sort_cursor,
     exact_sort_before_cursor,
+    exact_sort_keyword,
     exact_sort_full_text,
     exact_sort_filter,
 
@@ -89,6 +90,7 @@ const QueryShape = enum {
         if (std.mem.eql(u8, raw, "exact-sort-match-all")) return .exact_sort_match_all;
         if (std.mem.eql(u8, raw, "exact-sort-cursor")) return .exact_sort_cursor;
         if (std.mem.eql(u8, raw, "exact-sort-before-cursor")) return .exact_sort_before_cursor;
+        if (std.mem.eql(u8, raw, "exact-sort-keyword")) return .exact_sort_keyword;
         if (std.mem.eql(u8, raw, "exact-sort-full-text")) return .exact_sort_full_text;
         if (std.mem.eql(u8, raw, "exact-sort-filter")) return .exact_sort_filter;
         return null;
@@ -110,6 +112,7 @@ const QueryShape = enum {
             .exact_sort_match_all => "exact-sort-match-all",
             .exact_sort_cursor => "exact-sort-cursor",
             .exact_sort_before_cursor => "exact-sort-before-cursor",
+            .exact_sort_keyword => "exact-sort-keyword",
             .exact_sort_full_text => "exact-sort-full-text",
             .exact_sort_filter => "exact-sort-filter",
         };
@@ -117,14 +120,14 @@ const QueryShape = enum {
 
     fn usesFullText(self: QueryShape) bool {
         return switch (self) {
-            .dense, .dense_filter, .sparse_filter, .graph_expand, .algebraic_filter, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_filter => false,
+            .dense, .dense_filter, .sparse_filter, .graph_expand, .algebraic_filter, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_filter => false,
             .full_text, .hybrid_composed, .hybrid, .hybrid_filter, .hybrid_filter_exclude, .hybrid_filter_exclude_project, .exact_sort_full_text => true,
         };
     }
 
     fn usesDense(self: QueryShape) bool {
         return switch (self) {
-            .full_text, .sparse_filter, .graph_expand, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_full_text, .exact_sort_filter => false,
+            .full_text, .sparse_filter, .graph_expand, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_full_text, .exact_sort_filter => false,
             .dense, .dense_filter, .algebraic_filter, .hybrid_composed, .hybrid, .hybrid_filter, .hybrid_filter_exclude, .hybrid_filter_exclude_project => true,
         };
     }
@@ -139,7 +142,7 @@ const QueryShape = enum {
 
     fn usesFilter(self: QueryShape) bool {
         return switch (self) {
-            .dense, .full_text, .graph_expand, .hybrid, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_full_text => false,
+            .dense, .full_text, .graph_expand, .hybrid, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_full_text => false,
             .dense_filter, .sparse_filter, .algebraic_filter, .hybrid_composed => true,
             .hybrid_filter, .hybrid_filter_exclude, .hybrid_filter_exclude_project, .exact_sort_filter => true,
         };
@@ -147,7 +150,7 @@ const QueryShape = enum {
 
     fn usesExclusion(self: QueryShape) bool {
         return switch (self) {
-            .dense, .full_text, .dense_filter, .sparse_filter, .graph_expand, .algebraic_filter, .hybrid_composed, .hybrid, .hybrid_filter, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_full_text, .exact_sort_filter => false,
+            .dense, .full_text, .dense_filter, .sparse_filter, .graph_expand, .algebraic_filter, .hybrid_composed, .hybrid, .hybrid_filter, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_full_text, .exact_sort_filter => false,
             .hybrid_filter_exclude, .hybrid_filter_exclude_project => true,
         };
     }
@@ -162,7 +165,7 @@ const QueryShape = enum {
 
     fn usesExactSort(self: QueryShape) bool {
         return switch (self) {
-            .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_full_text, .exact_sort_filter => true,
+            .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_full_text, .exact_sort_filter => true,
             else => false,
         };
     }
@@ -1814,7 +1817,7 @@ fn benchDirectHandler(
                 return err;
             };
             defer parsed.deinit();
-            try accumulateParsedResponse(&stats, parsed.value, elapsed, resp.body);
+            try accumulateParsedResponse(&stats, parsed.value, elapsed, resp.body, cfg);
         }
     }
     return stats;
@@ -1828,7 +1831,7 @@ const ProfiledDenseBenchQuery = struct {
 fn profiledDenseBenchQuery(req: db_mod.types.SearchRequest, query_shape: QueryShape) ?ProfiledDenseBenchQuery {
     switch (query_shape) {
         .dense, .dense_filter, .algebraic_filter => {},
-        .full_text, .sparse_filter, .graph_expand, .hybrid_composed, .hybrid, .hybrid_filter, .hybrid_filter_exclude, .hybrid_filter_exclude_project, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_full_text, .exact_sort_filter => return null,
+        .full_text, .sparse_filter, .graph_expand, .hybrid_composed, .hybrid, .hybrid_filter, .hybrid_filter_exclude, .hybrid_filter_exclude_project, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_full_text, .exact_sort_filter => return null,
     }
     if (req.sparse != null or req.sparse_queries.len > 0) return null;
     if (req.graph_queries.len > 0) return null;
@@ -1928,7 +1931,7 @@ fn benchHttpQuery(
                 return err;
             };
             defer parsed.deinit();
-            try accumulateParsedResponse(&stats, parsed.value, elapsed, resp.body);
+            try accumulateParsedResponse(&stats, parsed.value, elapsed, resp.body, cfg);
             if (repeat_index == 0) {
                 stats.first_pass_ns += elapsed;
                 stats.first_pass_queries += 1;
@@ -2076,7 +2079,7 @@ fn benchConcurrentHttpWithPolling(
     };
 }
 
-fn accumulateParsedResponse(stats: *QueryBenchStats, parsed: QueryResponseWire, elapsed_ns: u64, raw_body: []const u8) !void {
+fn accumulateParsedResponse(stats: *QueryBenchStats, parsed: QueryResponseWire, elapsed_ns: u64, raw_body: []const u8, cfg: Config) !void {
     _ = try accumulateParsedResponseNoProfile(parsed, raw_body);
     if (parsed.responses.len == 0) return error.InvalidQueryResponse;
     const first = parsed.responses[0];
@@ -2088,11 +2091,11 @@ fn accumulateParsedResponse(stats: *QueryBenchStats, parsed: QueryResponseWire, 
         for (hits) |hit| {
             if (hit._sort) |sort_tuple| {
                 stats.response_sort_tuple_count += 1;
-                if (publicExactSortTupleReplayable(hit._id, sort_tuple)) {
+                if (publicExactSortTupleReplayable(cfg, hit._id, sort_tuple)) {
                     stats.response_sort_tuple_valid_count += 1;
                     if (previous_sort_tuple) |previous| {
                         stats.response_sort_order_check_count += 1;
-                        if (!publicExactSortTuplesInOrder(previous, sort_tuple)) stats.response_sort_order_violation_count += 1;
+                        if (!publicExactSortTuplesInOrder(cfg, previous, sort_tuple)) stats.response_sort_order_violation_count += 1;
                     }
                     previous_sort_tuple = sort_tuple;
                 } else {
@@ -2271,17 +2274,29 @@ fn enforceExactSortGuardrail(cfg: Config, stats: QueryBenchStats) !void {
     }
 }
 
-fn publicExactSortTupleReplayable(doc_id: []const u8, sort_tuple: []const std.json.Value) bool {
+fn publicExactSortTupleReplayable(cfg: Config, doc_id: []const u8, sort_tuple: []const std.json.Value) bool {
     if (sort_tuple.len != 2) return false;
-    if (!jsonValueIsReplayableFiniteNumber(sort_tuple[0])) return false;
-    return sort_tuple[1] == .string and std.mem.eql(u8, sort_tuple[1].string, doc_id);
+    if (sort_tuple[1] != .string or !std.mem.eql(u8, sort_tuple[1].string, doc_id)) return false;
+    return switch (cfg.query_shape) {
+        .exact_sort_keyword => sort_tuple[0] == .string,
+        else => jsonValueIsReplayableFiniteNumber(sort_tuple[0]),
+    };
 }
 
-fn publicExactSortTuplesInOrder(previous: []const std.json.Value, current: []const std.json.Value) bool {
-    const previous_score = jsonFiniteNumberAsF64(previous[0]) orelse return false;
-    const current_score = jsonFiniteNumberAsF64(current[0]) orelse return false;
-    if (previous_score > current_score) return true;
-    if (previous_score < current_score) return false;
+fn publicExactSortTuplesInOrder(cfg: Config, previous: []const std.json.Value, current: []const std.json.Value) bool {
+    switch (cfg.query_shape) {
+        .exact_sort_keyword => {
+            const field_order = std.mem.order(u8, previous[0].string, current[0].string);
+            if (field_order == .lt) return true;
+            if (field_order == .gt) return false;
+        },
+        else => {
+            const previous_score = jsonFiniteNumberAsF64(previous[0]) orelse return false;
+            const current_score = jsonFiniteNumberAsF64(current[0]) orelse return false;
+            if (previous_score > current_score) return true;
+            if (previous_score < current_score) return false;
+        },
+    }
     return std.mem.order(u8, previous[1].string, current[1].string) != .gt;
 }
 
@@ -3632,7 +3647,10 @@ fn encodeQueryJson(alloc: std.mem.Allocator, vector: []const f32, source_doc_idx
         try out.appendSlice(alloc, "\"]},\"params\":{\"edge_types\":[\"cites\"]}}}");
         wrote_field = true;
     }
-    if (cfg.query_shape == .exact_sort_match_all or cfg.query_shape.usesExactSortCursor()) {
+    if (cfg.query_shape == .exact_sort_match_all or
+        cfg.query_shape == .exact_sort_keyword or
+        cfg.query_shape.usesExactSortCursor())
+    {
         if (wrote_field) try out.append(alloc, ',');
         try out.appendSlice(alloc, "\"query\":{\"match_all\":{}}");
         wrote_field = true;
@@ -3656,7 +3674,7 @@ fn encodeQueryJson(alloc: std.mem.Allocator, vector: []const f32, source_doc_idx
     try out.appendSlice(alloc, "\"limit\":");
     try out.print(alloc, "{d}", .{cfg.k});
     if (cfg.query_shape.usesExactSort()) {
-        try out.appendSlice(alloc, ",\"order_by\":[{\"field\":\"score\",\"desc\":true}]");
+        try appendExactSortOrderByJson(&out, alloc, cfg);
         if (cfg.query_shape.usesExactSortCursor()) {
             const cursor_doc_idx = exactSortCursorDocIndex(source_doc_idx, cfg);
             try out.appendSlice(alloc, if (cfg.query_shape.usesExactSortBeforeCursor()) ",\"search_before\":[" else ",\"search_after\":[");
@@ -3668,6 +3686,13 @@ fn encodeQueryJson(alloc: std.mem.Allocator, vector: []const f32, source_doc_idx
     }
     try out.append(alloc, '}');
     return out.toOwnedSlice(alloc);
+}
+
+fn appendExactSortOrderByJson(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, cfg: Config) !void {
+    switch (cfg.query_shape) {
+        .exact_sort_keyword => try out.appendSlice(alloc, ",\"order_by\":[{\"field\":\"category\",\"desc\":false}]"),
+        else => try out.appendSlice(alloc, ",\"order_by\":[{\"field\":\"score\",\"desc\":true}]"),
+    }
 }
 
 fn appendF32JsonArray(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, vector: []const f32) !void {
