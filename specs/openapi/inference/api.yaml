@@ -1060,11 +1060,6 @@ components:
               description: Text to chunk (backward compatible)
             - $ref: '../shared/generating.yaml#/components/schemas/ContentPart'
               description: Content part (text or media)
-        text:
-          type: string
-          deprecated: true
-          description: 'DEPRECATED: Use ''input'' instead. Text to chunk.'
-          example: This is a long document that needs to be split into smaller chunks...
         config:
           $ref: '#/components/schemas/ChunkConfig'
     ChunkResponse:

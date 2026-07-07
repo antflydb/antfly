@@ -504,6 +504,7 @@ fn queryCandidateBudgetExceededBody(alloc: std.mem.Allocator) ![]u8 {
         .reason = "candidate_budget_exceeded",
         .detail = "candidate_budget_exceeded",
     };
+    const public_rejection = query_contract.publicExactSortRejection(diagnostic.reason, diagnostic.detail);
     return try std.json.Stringify.valueAlloc(alloc, struct {
         @"error": []const u8 = "query_candidate_budget_exceeded",
         message: []const u8 = "query candidate budget exceeded",
@@ -514,10 +515,10 @@ fn queryCandidateBudgetExceededBody(alloc: std.mem.Allocator) ![]u8 {
         sort_rejection_field: []const u8,
         status: u16 = 422,
     }{
-        .reason = diagnostic.reason,
+        .reason = public_rejection.reason,
         .budget_rejection_reason = diagnostic.detail,
-        .sort_rejection_reason = diagnostic.reason,
-        .sort_rejection_detail = diagnostic.detail,
+        .sort_rejection_reason = public_rejection.reason,
+        .sort_rejection_detail = public_rejection.detail,
         .sort_rejection_field = diagnostic.field,
     }, .{});
 }
@@ -1859,7 +1860,7 @@ test "public table query handler maps invalid exact sort diagnostics" {
     try std.testing.expectEqualStrings("exact sort is unsupported for this query", parsed.value.message);
     try std.testing.expectEqualStrings("invalid_sort_tuple", parsed.value.reason);
     try std.testing.expectEqualStrings("invalid_sort_tuple", parsed.value.sort_rejection_reason);
-    try std.testing.expectEqualStrings("non_numeric_score", parsed.value.sort_rejection_detail);
+    try std.testing.expectEqualStrings("invalid_sort_tuple", parsed.value.sort_rejection_detail);
     try std.testing.expectEqualStrings("_score", parsed.value.sort_rejection_field);
 }
 
@@ -1922,7 +1923,7 @@ test "public table query handler maps candidate budget exhaustion" {
     try std.testing.expectEqualStrings("candidate_budget_exceeded", parsed.value.reason);
     try std.testing.expectEqualStrings("text_field_sort_candidate_window", parsed.value.budget_rejection_reason);
     try std.testing.expectEqualStrings("candidate_budget_exceeded", parsed.value.sort_rejection_reason);
-    try std.testing.expectEqualStrings("text_field_sort_candidate_window", parsed.value.sort_rejection_detail);
+    try std.testing.expectEqualStrings("candidate_budget_exceeded", parsed.value.sort_rejection_detail);
     try std.testing.expectEqualStrings("full_text_index_v0", parsed.value.sort_rejection_field);
 }
 

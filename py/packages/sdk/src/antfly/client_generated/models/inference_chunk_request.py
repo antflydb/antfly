@@ -27,14 +27,11 @@ class InferenceChunkRequest:
             - Text string: `"This is a long document..."` (backward compatible)
             - ContentPart: `{"type": "media", "data": "<base64>", "mime_type": "audio/wav"}`
             - ContentPart: `{"type": "text", "text": "..."}`
-        text (str | Unset): DEPRECATED: Use 'input' instead. Text to chunk. Example: This is a long document that needs
-            to be split into smaller chunks....
         config (InferenceChunkConfig | Unset): Configuration for chunking requests to Inference API.
             Combines shared text options with inference-specific audio/VAD options.
     """
 
     input_: ImageURLContentPart | MediaContentPart | str | TextContentPart | Unset = UNSET
-    text: str | Unset = UNSET
     config: InferenceChunkConfig | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -55,8 +52,6 @@ class InferenceChunkRequest:
         else:
             input_ = self.input_
 
-        text = self.text
-
         config: dict[str, Any] | Unset = UNSET
         if not isinstance(self.config, Unset):
             config = self.config.to_dict()
@@ -66,8 +61,6 @@ class InferenceChunkRequest:
         field_dict.update({})
         if input_ is not UNSET:
             field_dict["input"] = input_
-        if text is not UNSET:
-            field_dict["text"] = text
         if config is not UNSET:
             field_dict["config"] = config
 
@@ -113,8 +106,6 @@ class InferenceChunkRequest:
 
         input_ = _parse_input_(d.pop("input", UNSET))
 
-        text = d.pop("text", UNSET)
-
         _config = d.pop("config", UNSET)
         config: InferenceChunkConfig | Unset
         if isinstance(_config, Unset):
@@ -124,7 +115,6 @@ class InferenceChunkRequest:
 
         inference_chunk_request = cls(
             input_=input_,
-            text=text,
             config=config,
         )
 

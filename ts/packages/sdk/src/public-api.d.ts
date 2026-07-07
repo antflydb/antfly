@@ -10661,12 +10661,6 @@ export interface components {
              *     - ContentPart: `{"type": "text", "text": "..."}`
              */
             input?: string | components["schemas"]["ContentPart"];
-            /**
-             * @deprecated
-             * @description DEPRECATED: Use 'input' instead. Text to chunk.
-             * @example This is a long document that needs to be split into smaller chunks...
-             */
-            text?: string;
             config?: components["schemas"]["InferenceChunkConfig"];
         };
         /**

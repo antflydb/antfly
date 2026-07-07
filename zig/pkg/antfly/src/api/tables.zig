@@ -1048,11 +1048,14 @@ fn appendGeneratedFieldCapability(
     var owned_in_list = false;
     errdefer if (!owned_in_list) freeGeneratedFieldCapability(alloc, owned);
     const key = try generatedFieldCapabilityAggregationKeyAlloc(alloc, owned);
+    var key_owned = true;
+    errdefer if (key_owned) alloc.free(key);
     if (capability_index.get(key)) |existing_index| {
-        defer alloc.free(key);
         const existing = &out.items[existing_index];
         std.debug.assert(generatedFieldCapabilityAggregationKeyEqual(existing.*, owned));
         try mergeGeneratedFieldCapability(alloc, existing, owned);
+        alloc.free(key);
+        key_owned = false;
         freeGeneratedFieldCapability(alloc, owned);
         return;
     }
@@ -1062,6 +1065,7 @@ fn appendGeneratedFieldCapability(
         alloc.free(key);
     };
     try capability_index.put(alloc, key, out.items.len);
+    key_owned = false;
     key_in_index = true;
     try out.append(alloc, owned);
     owned_in_list = true;
@@ -1077,18 +1081,23 @@ fn appendRuntimeGeneratedFieldCapability(
     var owned_in_list = false;
     errdefer if (!owned_in_list) freeGeneratedFieldCapability(alloc, owned);
     const key = try generatedFieldCapabilityAggregationKeyAlloc(alloc, owned);
+    var key_owned = true;
+    errdefer if (key_owned) alloc.free(key);
     if (capability_index.get(key)) |existing_index| {
-        defer alloc.free(key);
         const existing = &out.items[existing_index];
         std.debug.assert(generatedFieldCapabilityAggregationKeyEqual(existing.*, owned));
         if (runtimeCapabilityCanPromoteSchemaDeclaration(existing.*, owned)) {
             try replaceOwnedStringIfDifferent(alloc, &existing.doc_value_coverage, owned.doc_value_coverage);
             try replaceOwnedStringIfDifferent(alloc, &existing.queryability_state, owned.queryability_state);
             try replaceOwnedStringIfDifferent(alloc, &existing.sort_lifecycle_state, owned.sort_lifecycle_state);
+            alloc.free(key);
+            key_owned = false;
             freeGeneratedFieldCapability(alloc, owned);
             return;
         }
         try mergeGeneratedFieldCapability(alloc, existing, owned);
+        alloc.free(key);
+        key_owned = false;
         freeGeneratedFieldCapability(alloc, owned);
         return;
     }
@@ -1098,6 +1107,7 @@ fn appendRuntimeGeneratedFieldCapability(
         alloc.free(key);
     };
     try capability_index.put(alloc, key, out.items.len);
+    key_owned = false;
     key_in_index = true;
     try out.append(alloc, owned);
     owned_in_list = true;

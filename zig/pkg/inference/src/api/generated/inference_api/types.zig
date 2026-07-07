@@ -1259,8 +1259,6 @@ pub const GenerateChunkChoice = struct {
 pub const ChunkRequest = struct {
     /// Input content to chunk. Supports two formats: - Text string: `"This is a long document..."` (backward compatible) - ContentPart: `{"type": "media", "data": "<base64>", "mime_type": "audio/wav"}` - ContentPart: `{"type": "text", "text": "..."}`
     input: ?std.json.Value = null,
-    /// DEPRECATED: Use 'input' instead. Text to chunk.
-    text: ?[]const u8 = null,
     config: ?ChunkConfig = null,
 };
 

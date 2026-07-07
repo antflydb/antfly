@@ -8578,15 +8578,20 @@ fn appendQueryBuilderFieldCapability(
     capability: query_builder_agent.QueryBuilderFieldCapability,
 ) !void {
     const owned_field = try alloc.dupe(u8, capability.field);
-    errdefer alloc.free(owned_field);
+    var field_owned = true;
+    errdefer if (field_owned) alloc.free(owned_field);
     const owned_query_modes = try dupeOwnedStringSlice(alloc, capability.query_modes);
-    errdefer freeOwnedStrings(alloc, owned_query_modes);
+    var query_modes_owned = true;
+    errdefer if (query_modes_owned) freeOwnedStrings(alloc, owned_query_modes);
     const owned_lifecycle = try alloc.dupe(u8, capability.sort_lifecycle_state);
-    errdefer alloc.free(owned_lifecycle);
+    var lifecycle_owned = true;
+    errdefer if (lifecycle_owned) alloc.free(owned_lifecycle);
     const owned_provenance = try alloc.dupe(u8, capability.provenance);
-    errdefer alloc.free(owned_provenance);
+    var provenance_owned = true;
+    errdefer if (provenance_owned) alloc.free(owned_provenance);
     const owned_index_sort_order = if (capability.index_sort_order) |value| try alloc.dupe(u8, value) else null;
-    errdefer if (owned_index_sort_order) |value| alloc.free(value);
+    var index_sort_order_owned = owned_index_sort_order != null;
+    errdefer if (index_sort_order_owned) alloc.free(owned_index_sort_order.?);
     const item = query_builder_agent.QueryBuilderFieldCapability{
         .field = owned_field,
         .field_type = capability.field_type,
@@ -8597,6 +8602,11 @@ fn appendQueryBuilderFieldCapability(
         .index_sort_position = capability.index_sort_position,
         .index_sort_order = owned_index_sort_order,
     };
+    field_owned = false;
+    query_modes_owned = false;
+    lifecycle_owned = false;
+    provenance_owned = false;
+    index_sort_order_owned = false;
     errdefer freeQueryBuilderFieldCapability(alloc, item);
     try out.append(alloc, item);
 }
@@ -9775,14 +9785,15 @@ fn queryCandidateBudgetExceededResponse(alloc: std.mem.Allocator) !http_common.H
         .reason = "candidate_budget_exceeded",
         .detail = "candidate_budget_exceeded",
     };
+    const public_rejection = query_contract.publicExactSortRejection(diagnostic.reason, diagnostic.detail);
     return try jsonResponseWithStatus(alloc, 422, .{
         .status = 422,
         .@"error" = "query_candidate_budget_exceeded",
         .message = "query candidate budget exceeded",
-        .reason = diagnostic.reason,
+        .reason = public_rejection.reason,
         .budget_rejection_reason = diagnostic.detail,
-        .sort_rejection_reason = diagnostic.reason,
-        .sort_rejection_detail = diagnostic.detail,
+        .sort_rejection_reason = public_rejection.reason,
+        .sort_rejection_detail = public_rejection.detail,
         .sort_rejection_field = diagnostic.field,
     });
 }
@@ -11252,7 +11263,7 @@ test "api http query budget rejection response exposes stable sort reason" {
     try std.testing.expectEqualStrings("candidate_budget_exceeded", parsed.value.reason);
     try std.testing.expectEqualStrings("text_field_sort_candidate_window", parsed.value.budget_rejection_reason);
     try std.testing.expectEqualStrings("candidate_budget_exceeded", parsed.value.sort_rejection_reason);
-    try std.testing.expectEqualStrings("text_field_sort_candidate_window", parsed.value.sort_rejection_detail);
+    try std.testing.expectEqualStrings("candidate_budget_exceeded", parsed.value.sort_rejection_detail);
     try std.testing.expectEqualStrings("full_text_index_v0", parsed.value.sort_rejection_field);
 }
 
@@ -11381,7 +11392,7 @@ test "api http invalid query with sort diagnostic returns exact sort response" {
     try std.testing.expectEqualStrings("exact sort is unsupported for this query", parsed.value.message);
     try std.testing.expectEqualStrings("invalid_sort_tuple", parsed.value.reason);
     try std.testing.expectEqualStrings("invalid_sort_tuple", parsed.value.sort_rejection_reason);
-    try std.testing.expectEqualStrings("non_numeric_score", parsed.value.sort_rejection_detail);
+    try std.testing.expectEqualStrings("invalid_sort_tuple", parsed.value.sort_rejection_detail);
     try std.testing.expectEqualStrings("_score", parsed.value.sort_rejection_field);
 }
 
