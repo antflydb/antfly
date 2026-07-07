@@ -15625,6 +15625,124 @@ components:
           type: integer
           format: uint64
           description: Repair issues found by explicit repair-scan accounting for this projection.
+        backfill_active:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: Whether this index currently has derived indexing work in progress.
+        backfill_state:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Compact lifecycle state for derived indexing work.
+        doc_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        term_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        edge_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        node_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        replay_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        replay_target_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        replay_catch_up_required:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_degraded:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_issue_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        repair_summary_ready:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_issue_count_estimated:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_present:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_fresh:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_source:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        runtime_freshness:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        catch_up_active:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        catch_up_phase:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        catch_up_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        catch_up_target_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        expected_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        reported_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        fresh_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        stale_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        missing_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        unknown_remote_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        text_merge:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Full-text merge runtime diagnostics.
+        resolution:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Artifact resolution replay diagnostics.
+        promotion:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Artifact promotion replay diagnostics.
+        async_indexing:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Derived-index background indexing diagnostics.
     EmbeddingsIndexStats:
       type: object
       description: Statistics for an embeddings index (dense or sparse)
@@ -15709,6 +15827,165 @@ components:
           type: integer
           format: uint64
           description: Repair issues found by explicit repair-scan accounting for this projection.
+        backfill_active:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: Whether this index currently has derived indexing work in progress.
+        backfill_state:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Compact lifecycle state for derived indexing work.
+        doc_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        term_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        edge_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        node_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        query_visible_doc_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        published_doc_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        published_node_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        root_node:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        published_root_node:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        dense_replay_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        dense_replay_target_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        dense_publish_pending:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        replay_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        replay_target_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        replay_catch_up_required:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_degraded:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_issue_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        repair_summary_ready:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_issue_count_estimated:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_present:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_fresh:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_source:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        runtime_freshness:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        catch_up_active:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        catch_up_phase:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        catch_up_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        catch_up_target_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        expected_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        reported_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        fresh_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        stale_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        missing_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        unknown_remote_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        resolution:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Artifact resolution replay diagnostics.
+        promotion:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Artifact promotion replay diagnostics.
+        hbc_cache:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Dense-vector cache diagnostics.
+        hbc_posting:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Dense-vector posting diagnostics.
+        enrichment_runtime:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Managed enrichment runtime diagnostics.
+        async_indexing:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Derived-index background indexing diagnostics.
     GraphIndexStats:
       type: object
       description: Statistics for graph index
@@ -15779,6 +16056,119 @@ components:
           type: integer
           format: uint64
           description: Repair issues found by explicit repair-scan accounting for this projection.
+        backfill_active:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: Whether this index currently has derived indexing work in progress.
+        backfill_state:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Compact lifecycle state for derived indexing work.
+        doc_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        term_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        edge_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        node_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        replay_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        replay_target_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        replay_catch_up_required:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_degraded:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_issue_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        repair_summary_ready:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_issue_count_estimated:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_present:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_fresh:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_source:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        runtime_freshness:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        catch_up_active:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        catch_up_phase:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        catch_up_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        catch_up_target_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        expected_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        reported_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        fresh_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        stale_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        missing_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        unknown_remote_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        resolution:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Artifact resolution replay diagnostics.
+        promotion:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Artifact promotion replay diagnostics.
+        async_indexing:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Derived-index background indexing diagnostics.
         algebraic_graph:
           x-go-type-skip-optional-pointer: true
           type: object
@@ -15960,6 +16350,129 @@ components:
           type: integer
           format: uint64
           description: Repair issues found by explicit repair-scan accounting for this projection.
+        backfill_active:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: Whether this index currently has derived indexing work in progress.
+        backfill_state:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Compact lifecycle state for derived indexing work.
+        doc_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        term_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        edge_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        node_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        replay_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        replay_target_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        replay_catch_up_required:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_degraded:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_issue_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        repair_summary_ready:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_issue_count_estimated:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_present:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_fresh:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        runtime_source:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        runtime_freshness:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        catch_up_active:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        catch_up_phase:
+          x-go-type-skip-optional-pointer: true
+          type: string
+        catch_up_applied_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        catch_up_target_sequence:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        expected_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        reported_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        fresh_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        stale_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        missing_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        unknown_remote_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        source_artifact:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Source artifact stream used to materialize graph edges.
+        resolver_replay:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Graph resolver replay diagnostics.
+        resolution:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Artifact resolution replay diagnostics.
+        promotion:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Artifact promotion replay diagnostics.
+        async_indexing:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Derived-index background indexing diagnostics.
     IndexStats:
       type: object
       description: Statistics for an index

@@ -8312,6 +8312,66 @@ export interface components {
              * @description Repair issues found by explicit repair-scan accounting for this projection.
              */
             repair_scan_issue_count?: number;
+            /** @description Whether this index currently has derived indexing work in progress. */
+            backfill_active?: boolean;
+            /** @description Compact lifecycle state for derived indexing work. */
+            backfill_state?: string;
+            /** Format: uint64 */
+            doc_count?: number;
+            /** Format: uint64 */
+            term_count?: number;
+            /** Format: uint64 */
+            edge_count?: number;
+            /** Format: uint64 */
+            node_count?: number;
+            /** Format: uint64 */
+            replay_applied_sequence?: number;
+            /** Format: uint64 */
+            replay_target_sequence?: number;
+            replay_catch_up_required?: boolean;
+            repair_degraded?: boolean;
+            /** Format: uint64 */
+            repair_issue_count?: number;
+            repair_summary_ready?: boolean;
+            repair_issue_count_estimated?: boolean;
+            runtime_present?: boolean;
+            runtime_fresh?: boolean;
+            runtime_source?: string;
+            runtime_freshness?: string;
+            catch_up_active?: boolean;
+            catch_up_phase?: string;
+            /** Format: uint64 */
+            catch_up_applied_sequence?: number;
+            /** Format: uint64 */
+            catch_up_target_sequence?: number;
+            /** Format: uint64 */
+            expected_groups?: number;
+            /** Format: uint64 */
+            reported_groups?: number;
+            /** Format: uint64 */
+            fresh_groups?: number;
+            /** Format: uint64 */
+            stale_groups?: number;
+            /** Format: uint64 */
+            missing_groups?: number;
+            /** Format: uint64 */
+            unknown_remote_groups?: number;
+            /** @description Full-text merge runtime diagnostics. */
+            text_merge?: {
+                [key: string]: unknown;
+            };
+            /** @description Artifact resolution replay diagnostics. */
+            resolution?: {
+                [key: string]: unknown;
+            };
+            /** @description Artifact promotion replay diagnostics. */
+            promotion?: {
+                [key: string]: unknown;
+            };
+            /** @description Derived-index background indexing diagnostics. */
+            async_indexing?: {
+                [key: string]: unknown;
+            };
         };
         /** @description Statistics for an embeddings index (dense or sparse) */
         EmbeddingsIndexStats: {
@@ -8386,6 +8446,89 @@ export interface components {
              * @description Repair issues found by explicit repair-scan accounting for this projection.
              */
             repair_scan_issue_count?: number;
+            /** @description Whether this index currently has derived indexing work in progress. */
+            backfill_active?: boolean;
+            /** @description Compact lifecycle state for derived indexing work. */
+            backfill_state?: string;
+            /** Format: uint64 */
+            doc_count?: number;
+            /** Format: uint64 */
+            term_count?: number;
+            /** Format: uint64 */
+            edge_count?: number;
+            /** Format: uint64 */
+            node_count?: number;
+            /** Format: uint64 */
+            query_visible_doc_count?: number;
+            /** Format: uint64 */
+            published_doc_count?: number;
+            /** Format: uint64 */
+            published_node_count?: number;
+            /** Format: uint64 */
+            root_node?: number;
+            /** Format: uint64 */
+            published_root_node?: number;
+            /** Format: uint64 */
+            dense_replay_applied_sequence?: number;
+            /** Format: uint64 */
+            dense_replay_target_sequence?: number;
+            dense_publish_pending?: boolean;
+            /** Format: uint64 */
+            replay_applied_sequence?: number;
+            /** Format: uint64 */
+            replay_target_sequence?: number;
+            replay_catch_up_required?: boolean;
+            repair_degraded?: boolean;
+            /** Format: uint64 */
+            repair_issue_count?: number;
+            repair_summary_ready?: boolean;
+            repair_issue_count_estimated?: boolean;
+            runtime_present?: boolean;
+            runtime_fresh?: boolean;
+            runtime_source?: string;
+            runtime_freshness?: string;
+            catch_up_active?: boolean;
+            catch_up_phase?: string;
+            /** Format: uint64 */
+            catch_up_applied_sequence?: number;
+            /** Format: uint64 */
+            catch_up_target_sequence?: number;
+            /** Format: uint64 */
+            expected_groups?: number;
+            /** Format: uint64 */
+            reported_groups?: number;
+            /** Format: uint64 */
+            fresh_groups?: number;
+            /** Format: uint64 */
+            stale_groups?: number;
+            /** Format: uint64 */
+            missing_groups?: number;
+            /** Format: uint64 */
+            unknown_remote_groups?: number;
+            /** @description Artifact resolution replay diagnostics. */
+            resolution?: {
+                [key: string]: unknown;
+            };
+            /** @description Artifact promotion replay diagnostics. */
+            promotion?: {
+                [key: string]: unknown;
+            };
+            /** @description Dense-vector cache diagnostics. */
+            hbc_cache?: {
+                [key: string]: unknown;
+            };
+            /** @description Dense-vector posting diagnostics. */
+            hbc_posting?: {
+                [key: string]: unknown;
+            };
+            /** @description Managed enrichment runtime diagnostics. */
+            enrichment_runtime?: {
+                [key: string]: unknown;
+            };
+            /** @description Derived-index background indexing diagnostics. */
+            async_indexing?: {
+                [key: string]: unknown;
+            };
         };
         /** @description Statistics for graph index */
         GraphIndexStats: {
@@ -8444,6 +8587,62 @@ export interface components {
              * @description Repair issues found by explicit repair-scan accounting for this projection.
              */
             repair_scan_issue_count?: number;
+            /** @description Whether this index currently has derived indexing work in progress. */
+            backfill_active?: boolean;
+            /** @description Compact lifecycle state for derived indexing work. */
+            backfill_state?: string;
+            /** Format: uint64 */
+            doc_count?: number;
+            /** Format: uint64 */
+            term_count?: number;
+            /** Format: uint64 */
+            edge_count?: number;
+            /** Format: uint64 */
+            node_count?: number;
+            /** Format: uint64 */
+            replay_applied_sequence?: number;
+            /** Format: uint64 */
+            replay_target_sequence?: number;
+            replay_catch_up_required?: boolean;
+            repair_degraded?: boolean;
+            /** Format: uint64 */
+            repair_issue_count?: number;
+            repair_summary_ready?: boolean;
+            repair_issue_count_estimated?: boolean;
+            runtime_present?: boolean;
+            runtime_fresh?: boolean;
+            runtime_source?: string;
+            runtime_freshness?: string;
+            catch_up_active?: boolean;
+            catch_up_phase?: string;
+            /** Format: uint64 */
+            catch_up_applied_sequence?: number;
+            /** Format: uint64 */
+            catch_up_target_sequence?: number;
+            /** Format: uint64 */
+            expected_groups?: number;
+            /** Format: uint64 */
+            reported_groups?: number;
+            /** Format: uint64 */
+            fresh_groups?: number;
+            /** Format: uint64 */
+            stale_groups?: number;
+            /** Format: uint64 */
+            missing_groups?: number;
+            /** Format: uint64 */
+            unknown_remote_groups?: number;
+            /** @description Artifact resolution replay diagnostics. */
+            resolution?: {
+                [key: string]: unknown;
+            };
+            /** @description Artifact promotion replay diagnostics. */
+            promotion?: {
+                [key: string]: unknown;
+            };
+            /** @description Derived-index background indexing diagnostics. */
+            async_indexing?: {
+                [key: string]: unknown;
+            };
             /** @description Algebraic graph execution health for bounded semiring traversal. */
             algebraic_graph?: {
                 traversal?: {
@@ -8565,6 +8764,70 @@ export interface components {
              * @description Repair issues found by explicit repair-scan accounting for this projection.
              */
             repair_scan_issue_count?: number;
+            /** @description Whether this index currently has derived indexing work in progress. */
+            backfill_active?: boolean;
+            /** @description Compact lifecycle state for derived indexing work. */
+            backfill_state?: string;
+            /** Format: uint64 */
+            doc_count?: number;
+            /** Format: uint64 */
+            term_count?: number;
+            /** Format: uint64 */
+            edge_count?: number;
+            /** Format: uint64 */
+            node_count?: number;
+            /** Format: uint64 */
+            replay_applied_sequence?: number;
+            /** Format: uint64 */
+            replay_target_sequence?: number;
+            replay_catch_up_required?: boolean;
+            repair_degraded?: boolean;
+            /** Format: uint64 */
+            repair_issue_count?: number;
+            repair_summary_ready?: boolean;
+            repair_issue_count_estimated?: boolean;
+            runtime_present?: boolean;
+            runtime_fresh?: boolean;
+            runtime_source?: string;
+            runtime_freshness?: string;
+            catch_up_active?: boolean;
+            catch_up_phase?: string;
+            /** Format: uint64 */
+            catch_up_applied_sequence?: number;
+            /** Format: uint64 */
+            catch_up_target_sequence?: number;
+            /** Format: uint64 */
+            expected_groups?: number;
+            /** Format: uint64 */
+            reported_groups?: number;
+            /** Format: uint64 */
+            fresh_groups?: number;
+            /** Format: uint64 */
+            stale_groups?: number;
+            /** Format: uint64 */
+            missing_groups?: number;
+            /** Format: uint64 */
+            unknown_remote_groups?: number;
+            /** @description Source artifact stream used to materialize graph edges. */
+            source_artifact?: {
+                [key: string]: unknown;
+            };
+            /** @description Graph resolver replay diagnostics. */
+            resolver_replay?: {
+                [key: string]: unknown;
+            };
+            /** @description Artifact resolution replay diagnostics. */
+            resolution?: {
+                [key: string]: unknown;
+            };
+            /** @description Artifact promotion replay diagnostics. */
+            promotion?: {
+                [key: string]: unknown;
+            };
+            /** @description Derived-index background indexing diagnostics. */
+            async_indexing?: {
+                [key: string]: unknown;
+            };
         };
         /** @description Statistics for an index */
         IndexStats: components["schemas"]["FullTextIndexStats"] | components["schemas"]["EmbeddingsIndexStats"] | components["schemas"]["GraphIndexStats"] | components["schemas"]["AlgebraicIndexStats"];

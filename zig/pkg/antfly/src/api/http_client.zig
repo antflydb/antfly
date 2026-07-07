@@ -2774,7 +2774,7 @@ test "api http client round-trips public table management routes" {
                 .description = "docs table",
                 .schema_json = "{\"kind\":\"demo\"}",
                 .indexes_json = self.indexes_json,
-                .replication_sources_json = "[\"seed\"]",
+                .replication_sources_json = "[]",
                 .placement_role = "data",
             };
             self.owns_created_table = false;
@@ -2870,8 +2870,11 @@ test "api http client round-trips public table management routes" {
     defer indexes.deinit(std.heap.page_allocator);
     var parsed_indexes = try parseJsonBody([]metadata_openapi.IndexStatus, std.testing.allocator, indexes.body);
     defer parsed_indexes.deinit();
-    try std.testing.expectEqual(@as(usize, 1), parsed_indexes.value.len);
+    try std.testing.expectEqual(@as(usize, 2), parsed_indexes.value.len);
+    try std.testing.expectEqualStrings("full_text_index_v0", parsed_indexes.value[0].config.name);
     try std.testing.expectEqual(.full_text, parsed_indexes.value[0].config.type);
+    try std.testing.expectEqualStrings("full_text_index_v1", parsed_indexes.value[1].config.name);
+    try std.testing.expectEqual(.full_text, parsed_indexes.value[1].config.type);
 
     var index = try client.fetchTableIndex(base_uri, "docs", "full_text_index_v0");
     defer index.deinit(std.heap.page_allocator);
