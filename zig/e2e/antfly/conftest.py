@@ -186,7 +186,7 @@ def _start_stateful_server_with_retry(binary: str, port: int) -> PublicAntflySer
     raise last_error
 
 
-def ready_index_status(index_info: dict[str, Any]) -> dict[str, Any] | None:
+def ready_index_status(index_info: dict[str, Any], *, require_query_fresh: bool = False) -> dict[str, Any] | None:
     status = index_info.get("status")
     if status is None:
         return None
@@ -202,16 +202,17 @@ def ready_index_status(index_info: dict[str, Any]) -> dict[str, Any] | None:
         return None
     if status.get("catch_up_active", False):
         return None
-    expected_groups = status.get("expected_groups")
-    fresh_groups = status.get("fresh_groups")
-    if isinstance(expected_groups, int) and expected_groups > 0:
-        if not isinstance(fresh_groups, int) or fresh_groups < expected_groups:
+    if require_query_fresh:
+        expected_groups = status.get("expected_groups")
+        fresh_groups = status.get("fresh_groups")
+        if isinstance(expected_groups, int) and expected_groups > 0:
+            if not isinstance(fresh_groups, int) or fresh_groups < expected_groups:
+                return None
+        stale_groups = status.get("stale_groups")
+        if isinstance(stale_groups, int) and stale_groups > 0:
             return None
-    stale_groups = status.get("stale_groups")
-    if isinstance(stale_groups, int) and stale_groups > 0:
-        return None
-    if status.get("runtime_fresh") is False:
-        return None
+        if status.get("runtime_fresh") is False:
+            return None
     return status
 
 
@@ -1397,14 +1398,22 @@ def serverless_api(serverless_runtime):
                     return created
                 time.sleep(0.1)
 
-        def wait_index_ready(self, table_name: str, index_name: str, *, timeout_s: float = 30.0, interval_s: float = 0.5) -> dict:
+        def wait_index_ready(
+            self,
+            table_name: str,
+            index_name: str,
+            *,
+            timeout_s: float = 30.0,
+            interval_s: float = 0.5,
+            require_query_fresh: bool = False,
+        ) -> dict:
             deadline = time.monotonic() + timeout_s
             last_info: dict[str, Any] | None = None
             last_error: BaseException | None = None
             while True:
                 try:
                     last_info = self.get(f"/tables/{table_name}/indexes/{index_name}")
-                    ready = ready_index_status(last_info)
+                    ready = ready_index_status(last_info, require_query_fresh=require_query_fresh)
                     if ready is not None:
                         return ready
                 except requests.RequestException as exc:
@@ -2266,14 +2275,22 @@ def backup_api():
                     return created
                 time.sleep(0.1)
 
-        def wait_index_ready(self, table_name: str, index_name: str, *, timeout_s: float = 30.0, interval_s: float = 0.5) -> dict:
+        def wait_index_ready(
+            self,
+            table_name: str,
+            index_name: str,
+            *,
+            timeout_s: float = 30.0,
+            interval_s: float = 0.5,
+            require_query_fresh: bool = False,
+        ) -> dict:
             deadline = time.monotonic() + timeout_s
             last_info: dict[str, Any] | None = None
             last_error: BaseException | None = None
             while True:
                 try:
                     last_info = self.get(f"/tables/{table_name}/indexes/{index_name}")
-                    ready = ready_index_status(last_info)
+                    ready = ready_index_status(last_info, require_query_fresh=require_query_fresh)
                     if ready is not None:
                         return ready
                 except requests.RequestException as exc:
