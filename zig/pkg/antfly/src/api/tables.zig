@@ -2331,14 +2331,12 @@ fn appendRuntimeFieldCapability(
     try appendJsonString(alloc, out, "type");
     try out.append(alloc, ':');
     try appendJsonString(alloc, out, antflyTypeName(capability.field_type));
-    try out.appendSlice(alloc, ",\"searchable\":");
-    try appendJsonBool(out, alloc, capability.searchable);
-    try out.appendSlice(alloc, ",\"filterable\":");
-    try appendJsonBool(out, alloc, capability.filterable);
-    try out.appendSlice(alloc, ",\"aggregatable\":");
-    try appendJsonBool(out, alloc, capability.aggregatable);
-    try out.appendSlice(alloc, ",\"doc_values\":");
-    try appendJsonBool(out, alloc, capability.doc_values);
+    try out.appendSlice(alloc, ",\"query_modes\":[");
+    for (queryModesForFieldCapability(capability), 0..) |mode, mode_idx| {
+        if (mode_idx > 0) try out.append(alloc, ',');
+        try appendJsonString(alloc, out, mode);
+    }
+    try out.append(alloc, ']');
     try out.appendSlice(alloc, ",\"sortable\":");
     try appendJsonBool(out, alloc, capability.sortable);
     try out.appendSlice(alloc, ",\"doc_value_coverage\":");
@@ -2998,6 +2996,10 @@ test "metadata.table status exposes stable field capabilities" {
     try std.testing.expectEqualStrings("dynamic_template", created.object.get("provenance").?.string);
     try std.testing.expectEqual(@as(i64, 0), created.object.get("index_sort_position").?.integer);
     try std.testing.expectEqualStrings("desc", created.object.get("index_sort_order").?.string);
+    try std.testing.expect(created.object.get("searchable") == null);
+    try std.testing.expect(created.object.get("filterable") == null);
+    try std.testing.expect(created.object.get("aggregatable") == null);
+    try std.testing.expect(created.object.get("doc_values") == null);
 
     try std.testing.expectEqualStrings("not_null", id_capability.object.get("missing_null_policy").?.string);
     try std.testing.expect(testJsonArrayContainsString(id_capability.object.get("query_modes").?, "exact"));
@@ -3322,11 +3324,17 @@ test "metadata.table debug encoder emits runtime schemas and index bindings" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"index_sort\":[{\"field\":\"created_at\",\"order\":\"desc\"},{\"field\":\"_id\",\"order\":\"asc\"}]") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"field_capabilities\":[{\"field\":\"_id\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"field\":\"created_at\",\"path_pattern\":\"created_at\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"query_modes\":[\"exact\",\"range\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"doc_value_coverage\":\"schema_declared\",\"provenance\":\"dynamic_template\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"queryability_state\":\"declared\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"index_sort_position\":0,\"index_sort_order\":\"desc\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"field\":\"title\",\"emitted_name\":\"title\",\"document_schema\":\"doc\",\"type\":\"text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"query_modes\":[\"full_text\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"queryability_state\":\"text_search_only\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"searchable\":") == null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"filterable\":") == null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"aggregatable\":") == null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"doc_values\":") == null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"algebraic_capabilities\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"capability_fingerprint\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"lifecycle_status\":\"rebuild_required\"") != null);
@@ -3380,6 +3388,7 @@ pub fn testRuntimeSchemaDebugEmitsObservedDynamicCapabilities() !void {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"index_name\":\"full_text_index_v1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"observed_dynamic_field_capabilities\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"field\":\"meta.status\",\"type\":\"keyword\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"query_modes\":[\"exact\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"doc_value_coverage\":\"observed_declared\",\"provenance\":\"observed_dynamic\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"queryability_state\":\"declared\"") != null);
 }
@@ -3410,13 +3419,16 @@ pub fn testRuntimeSchemaDebugEmitsSortCapabilities() !void {
 
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"field_capabilities\":[{\"field\":\"_id\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"field\":\"created_at\",\"path_pattern\":\"created_at\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"query_modes\":[\"exact\",\"range\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"doc_value_coverage\":\"schema_declared\",\"provenance\":\"dynamic_template\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"queryability_state\":\"declared\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"index_sort_position\":0,\"index_sort_order\":\"desc\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"field\":\"_id\",\"type\":\"keyword\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"index_sort_position\":1,\"index_sort_order\":\"asc\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"field\":\"title\",\"emitted_name\":\"title\",\"document_schema\":\"doc\",\"type\":\"text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"query_modes\":[\"full_text\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"queryability_state\":\"text_search_only\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"doc_values\":") == null);
 }
 
 test "create table parser preserves supported metadata fields" {

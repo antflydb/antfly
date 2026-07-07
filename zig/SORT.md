@@ -1213,25 +1213,35 @@ Recommended budget dimensions:
 - per-query deadline budget shared across candidate generation, sort, and
   source projection
 
-Rejections should use stable machine-readable reasons, such as:
+HTTP rejections should use stable user-facing machine-readable reasons, such as:
 
-- `unmapped_sort_field`
-- `non_sortable_sort_field`
-- `missing_doc_values_coverage`
-- `missing_native_filter_coverage`
+- `unmapped_field`
+- `non_sortable_field`
+- `unsupported_sort_field`
+- `mixed_field_type`
+- `field_not_sort_ready`
+- `filter_not_queryable`
 - `invalid_cursor_arity`
 - `invalid_cursor_type`
+- `invalid_sort_tuple`
 - `approximate_candidate_source`
 - `candidate_budget_exceeded`
+- `missing_null_policy`
+- `non_score_bearing_source`
+- `invalid_score_value`
 - `count_only_ordered_page`
 - `stored_json_sort_disabled`
+- `unsupported_exact_sort`
 - `distributed_merge_unsupported`
 
-Those reason strings should appear in API errors, logs, metrics, and
-`profile.sort.budget_rejection_reason` where a profile can be returned. They
-are part of the operations contract: an on-call should be able to tell whether
-the fix is schema, backfill/compaction, query shape, budget tuning, or a missing
-executor.
+Those public reason strings should appear in API errors and SDK-visible error
+models. Lower-level diagnostics such as `missing_doc_values_coverage`,
+`missing_doc_values_section`, `missing_native_filter_coverage`, or
+`invalid_doc_value_type` should remain in logs, metrics, and
+`profile.sort.sort_rejection_detail` where a profile can be returned. This
+keeps the public API stable while still giving operators enough detail to tell
+whether the fix is schema, backfill/compaction, query shape, budget tuning, or a
+missing executor.
 
 ## API Contract
 

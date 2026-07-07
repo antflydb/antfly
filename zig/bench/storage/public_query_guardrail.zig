@@ -81,6 +81,7 @@ const QueryShape = enum {
     exact_sort_index_sort,
     exact_sort_index_sort_filter,
     exact_sort_full_text,
+    exact_sort_full_text_budget_rejection,
     exact_sort_filter,
 
     fn parse(raw: []const u8) ?QueryShape {
@@ -104,6 +105,7 @@ const QueryShape = enum {
         if (std.mem.eql(u8, raw, "exact-sort-index-sort")) return .exact_sort_index_sort;
         if (std.mem.eql(u8, raw, "exact-sort-index-sort-filter")) return .exact_sort_index_sort_filter;
         if (std.mem.eql(u8, raw, "exact-sort-full-text")) return .exact_sort_full_text;
+        if (std.mem.eql(u8, raw, "exact-sort-full-text-budget-rejection")) return .exact_sort_full_text_budget_rejection;
         if (std.mem.eql(u8, raw, "exact-sort-filter")) return .exact_sort_filter;
         return null;
     }
@@ -130,6 +132,7 @@ const QueryShape = enum {
             .exact_sort_index_sort => "exact-sort-index-sort",
             .exact_sort_index_sort_filter => "exact-sort-index-sort-filter",
             .exact_sort_full_text => "exact-sort-full-text",
+            .exact_sort_full_text_budget_rejection => "exact-sort-full-text-budget-rejection",
             .exact_sort_filter => "exact-sort-filter",
         };
     }
@@ -137,13 +140,13 @@ const QueryShape = enum {
     fn usesFullText(self: QueryShape) bool {
         return switch (self) {
             .dense, .dense_filter, .sparse_filter, .graph_expand, .algebraic_filter, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_boolean, .exact_sort_index_sort, .exact_sort_index_sort_filter, .exact_sort_filter => false,
-            .full_text, .hybrid_composed, .hybrid, .hybrid_filter, .hybrid_filter_exclude, .hybrid_filter_exclude_project, .exact_sort_full_text => true,
+            .full_text, .hybrid_composed, .hybrid, .hybrid_filter, .hybrid_filter_exclude, .hybrid_filter_exclude_project, .exact_sort_full_text, .exact_sort_full_text_budget_rejection => true,
         };
     }
 
     fn usesDense(self: QueryShape) bool {
         return switch (self) {
-            .full_text, .sparse_filter, .graph_expand, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_boolean, .exact_sort_index_sort, .exact_sort_index_sort_filter, .exact_sort_full_text, .exact_sort_filter => false,
+            .full_text, .sparse_filter, .graph_expand, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_boolean, .exact_sort_index_sort, .exact_sort_index_sort_filter, .exact_sort_full_text, .exact_sort_full_text_budget_rejection, .exact_sort_filter => false,
             .dense, .dense_filter, .algebraic_filter, .hybrid_composed, .hybrid, .hybrid_filter, .hybrid_filter_exclude, .hybrid_filter_exclude_project => true,
         };
     }
@@ -158,7 +161,7 @@ const QueryShape = enum {
 
     fn usesFilter(self: QueryShape) bool {
         return switch (self) {
-            .dense, .full_text, .graph_expand, .hybrid, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_boolean, .exact_sort_index_sort, .exact_sort_full_text => false,
+            .dense, .full_text, .graph_expand, .hybrid, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_boolean, .exact_sort_index_sort, .exact_sort_full_text, .exact_sort_full_text_budget_rejection => false,
             .dense_filter, .sparse_filter, .algebraic_filter, .hybrid_composed => true,
             .hybrid_filter, .hybrid_filter_exclude, .hybrid_filter_exclude_project, .exact_sort_index_sort_filter, .exact_sort_filter => true,
         };
@@ -166,7 +169,7 @@ const QueryShape = enum {
 
     fn usesExclusion(self: QueryShape) bool {
         return switch (self) {
-            .dense, .full_text, .dense_filter, .sparse_filter, .graph_expand, .algebraic_filter, .hybrid_composed, .hybrid, .hybrid_filter, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_boolean, .exact_sort_index_sort, .exact_sort_index_sort_filter, .exact_sort_full_text, .exact_sort_filter => false,
+            .dense, .full_text, .dense_filter, .sparse_filter, .graph_expand, .algebraic_filter, .hybrid_composed, .hybrid, .hybrid_filter, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_boolean, .exact_sort_index_sort, .exact_sort_index_sort_filter, .exact_sort_full_text, .exact_sort_full_text_budget_rejection, .exact_sort_filter => false,
             .hybrid_filter_exclude, .hybrid_filter_exclude_project => true,
         };
     }
@@ -181,9 +184,13 @@ const QueryShape = enum {
 
     fn usesExactSort(self: QueryShape) bool {
         return switch (self) {
-            .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_boolean, .exact_sort_index_sort, .exact_sort_index_sort_filter, .exact_sort_full_text, .exact_sort_filter => true,
+            .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_boolean, .exact_sort_index_sort, .exact_sort_index_sort_filter, .exact_sort_full_text, .exact_sort_full_text_budget_rejection, .exact_sort_filter => true,
             else => false,
         };
+    }
+
+    fn expectsExactSortBudgetRejection(self: QueryShape) bool {
+        return self == .exact_sort_full_text_budget_rejection;
     }
 
     fn usesExactSortCursor(self: QueryShape) bool {
@@ -406,6 +413,7 @@ const QueryBenchStats = struct {
     later_pass_ns: u64 = 0,
     later_pass_queries: u64 = 0,
     response_hit_count: u64 = 0,
+    response_filter_match_count: u64 = 0,
     response_sort_tuple_count: u64 = 0,
     response_sort_tuple_valid_count: u64 = 0,
     response_sort_order_check_count: u64 = 0,
@@ -672,6 +680,17 @@ const QueryResponseWire = struct {
             };
         };
     };
+};
+
+const QueryErrorWire = struct {
+    status: u16,
+    @"error": []const u8,
+    message: []const u8,
+    reason: []const u8,
+    budget_rejection_reason: []const u8,
+    sort_rejection_reason: []const u8,
+    sort_rejection_detail: []const u8,
+    sort_rejection_field: []const u8,
 };
 
 const FakeStatusSource = struct {
@@ -1104,6 +1123,11 @@ fn runHandlerBench(
     );
     defer server.deinit();
 
+    if (cfg.query_shape.expectsExactSortBudgetRejection()) {
+        try enforcePublicExactSortBudgetRejection(alloc, server.executor(), query_bodies, cfg);
+        return;
+    }
+
     std.debug.print("public-query guardrail stage=db-search\n", .{});
     const db_stats: QueryBenchStats = if (cfg.query_shape.usesExactSort() and cfg.query_shape.usesFilter())
         .{}
@@ -1309,6 +1333,11 @@ fn runLocalBench(
     defer alloc.free(health_uri);
     const metrics_uri = try std.fmt.allocPrint(alloc, "{s}/metrics", .{health_base_uri});
     defer alloc.free(metrics_uri);
+
+    if (cfg.query_shape.expectsExactSortBudgetRejection()) {
+        try enforcePublicExactSortBudgetRejection(alloc, server.executor(), query_bodies, cfg);
+        return;
+    }
 
     std.debug.print("public-query guardrail stage=db-search\n", .{});
     const db_stats: QueryBenchStats = if (cfg.query_shape.usesExactSort() and cfg.query_shape.usesFilter())
@@ -1830,7 +1859,7 @@ fn benchDirectHandler(
     var stats: QueryBenchStats = .{};
     const uri = "/tables/" ++ table_name ++ "/query";
     for (0..cfg.repeats) |_| {
-        for (query_bodies) |body| {
+        for (query_bodies, 0..) |body, query_idx| {
             const started = nowNs();
             var resp = try executor.execute(alloc, .{
                 .method = .POST,
@@ -1856,10 +1885,89 @@ fn benchDirectHandler(
                 return err;
             };
             defer parsed.deinit();
-            try accumulateParsedResponse(&stats, parsed.value, elapsed, resp.body, cfg);
+            try accumulateParsedResponse(&stats, parsed.value, elapsed, resp.body, cfg, query_idx);
         }
     }
     return stats;
+}
+
+fn enforcePublicExactSortBudgetRejection(
+    alloc: std.mem.Allocator,
+    executor: http_common.RequestExecutor,
+    query_bodies: []const []const u8,
+    cfg: Config,
+) !void {
+    const Env = struct {
+        extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+        extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    const budget_env = "ANTFLY_TEXT_LATE_VISIBILITY_EXACT_CANDIDATE_BUDGET";
+    const previous = if (Env.getenv(budget_env)) |value| try alloc.dupeZ(u8, std.mem.span(value)) else null;
+    defer if (previous) |value| alloc.free(value);
+    if (Env.setenv(budget_env, "1", 1) != 0) return error.EnvironmentVariableSetFailed;
+    defer {
+        if (previous) |value| {
+            _ = Env.setenv(budget_env, value.ptr, 1);
+        } else {
+            _ = Env.unsetenv(budget_env);
+        }
+    }
+
+    const uri = "/tables/" ++ table_name ++ "/query";
+    var checked: usize = 0;
+    for (0..cfg.repeats) |_| {
+        for (query_bodies) |body| {
+            var resp = try executor.execute(alloc, .{
+                .method = .POST,
+                .uri = uri,
+                .content_type = "application/json",
+                .body = body,
+            });
+            defer resp.deinit(alloc);
+            if (resp.status != 422) {
+                std.debug.print("public-query guardrail expected budget rejection status=422 got={d} request={s} body={s}\n", .{
+                    resp.status,
+                    body,
+                    resp.body,
+                });
+                return error.UnexpectedHttpStatus;
+            }
+            var parsed = std.json.parseFromSlice(QueryErrorWire, alloc, resp.body, .{ .ignore_unknown_fields = true }) catch |err| {
+                std.debug.print("public-query guardrail budget rejection parse error={s} body={s}\n", .{
+                    @errorName(err),
+                    resp.body,
+                });
+                return err;
+            };
+            defer parsed.deinit();
+            try expectPublicExactSortBudgetRejection(parsed.value, resp.body);
+            checked += 1;
+        }
+    }
+    const expected: usize = cfg.queries * cfg.repeats;
+    if (checked != expected) {
+        std.debug.print("public-query guardrail budget rejection checked={d} expected={d}\n", .{ checked, expected });
+        return error.InvalidQueryResponse;
+    }
+    std.debug.print(
+        "public_query_exact_sort_budget_rejection query_shape={s} checked={d} reason=candidate_budget_exceeded detail=text_field_sort_candidate_window field={s}\n",
+        .{ cfg.query_shape.text(), checked, text_index_name },
+    );
+}
+
+fn expectPublicExactSortBudgetRejection(parsed: QueryErrorWire, raw_body: []const u8) !void {
+    if (parsed.status != 422 or
+        !std.mem.eql(u8, parsed.@"error", "query_candidate_budget_exceeded") or
+        !std.mem.eql(u8, parsed.reason, "candidate_budget_exceeded") or
+        !std.mem.eql(u8, parsed.budget_rejection_reason, "text_field_sort_candidate_window") or
+        !std.mem.eql(u8, parsed.sort_rejection_reason, "candidate_budget_exceeded") or
+        !std.mem.eql(u8, parsed.sort_rejection_detail, "text_field_sort_candidate_window") or
+        !std.mem.eql(u8, parsed.sort_rejection_field, text_index_name))
+    {
+        std.debug.print("public-query guardrail invalid budget rejection body={s}\n", .{raw_body});
+        return error.InvalidQueryResponse;
+    }
 }
 
 const ProfiledDenseBenchQuery = struct {
@@ -1870,7 +1978,7 @@ const ProfiledDenseBenchQuery = struct {
 fn profiledDenseBenchQuery(req: db_mod.types.SearchRequest, query_shape: QueryShape) ?ProfiledDenseBenchQuery {
     switch (query_shape) {
         .dense, .dense_filter, .algebraic_filter => {},
-        .full_text, .sparse_filter, .graph_expand, .hybrid_composed, .hybrid, .hybrid_filter, .hybrid_filter_exclude, .hybrid_filter_exclude_project, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_boolean, .exact_sort_index_sort, .exact_sort_index_sort_filter, .exact_sort_full_text, .exact_sort_filter => return null,
+        .full_text, .sparse_filter, .graph_expand, .hybrid_composed, .hybrid, .hybrid_filter, .hybrid_filter_exclude, .hybrid_filter_exclude_project, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_boolean, .exact_sort_index_sort, .exact_sort_index_sort_filter, .exact_sort_full_text, .exact_sort_full_text_budget_rejection, .exact_sort_filter => return null,
     }
     if (req.sparse != null or req.sparse_queries.len > 0) return null;
     if (req.graph_queries.len > 0) return null;
@@ -1952,7 +2060,7 @@ fn benchHttpQuery(
 
     var stats: QueryBenchStats = .{};
     for (0..cfg.repeats) |repeat_index| {
-        for (query_bodies) |body| {
+        for (query_bodies, 0..) |body, query_idx| {
             const started = nowNs();
             var resp = client.fetchQuery(base_uri, table_name, body) catch |err| retry: {
                 if (isRetryableQueryConnectionError(err)) {
@@ -1970,7 +2078,7 @@ fn benchHttpQuery(
                 return err;
             };
             defer parsed.deinit();
-            try accumulateParsedResponse(&stats, parsed.value, elapsed, resp.body, cfg);
+            try accumulateParsedResponse(&stats, parsed.value, elapsed, resp.body, cfg, query_idx);
             if (repeat_index == 0) {
                 stats.first_pass_ns += elapsed;
                 stats.first_pass_queries += 1;
@@ -2118,7 +2226,7 @@ fn benchConcurrentHttpWithPolling(
     };
 }
 
-fn accumulateParsedResponse(stats: *QueryBenchStats, parsed: QueryResponseWire, elapsed_ns: u64, raw_body: []const u8, cfg: Config) !void {
+fn accumulateParsedResponse(stats: *QueryBenchStats, parsed: QueryResponseWire, elapsed_ns: u64, raw_body: []const u8, cfg: Config, query_idx: usize) !void {
     _ = try accumulateParsedResponseNoProfile(parsed, raw_body);
     if (parsed.responses.len == 0) return error.InvalidQueryResponse;
     const first = parsed.responses[0];
@@ -2128,6 +2236,9 @@ fn accumulateParsedResponse(stats: *QueryBenchStats, parsed: QueryResponseWire, 
         stats.response_hit_count += @intCast(hits.len);
         var previous_sort_tuple: ?[]const std.json.Value = null;
         for (hits) |hit| {
+            if (try returnedHitMatchesGeneratedFilters(cfg, query_idx, hit._id)) {
+                stats.response_filter_match_count += 1;
+            }
             if (hit._sort) |sort_tuple| {
                 stats.response_sort_tuple_count += 1;
                 if (publicExactSortTupleReplayable(cfg, hit._id, sort_tuple)) {
@@ -2241,6 +2352,40 @@ fn accumulateParsedResponse(stats: *QueryBenchStats, parsed: QueryResponseWire, 
     }
 }
 
+fn returnedHitMatchesGeneratedFilters(cfg: Config, query_idx: usize, doc_key: []const u8) !bool {
+    if (!cfg.query_shape.usesFilter() and !cfg.query_shape.usesExclusion()) return false;
+    const doc_idx = benchmarkDocIndexFromKey(doc_key) orelse {
+        std.debug.print("public-query guardrail failed: cannot parse benchmark doc id={s}\n", .{doc_key});
+        return error.FilterGuardrailFailed;
+    };
+    const source_doc_idx = querySourceDocIndex(query_idx, cfg);
+    if (cfg.query_shape.usesFilter()) {
+        if (!std.mem.eql(u8, docStatus(doc_idx), docStatus(source_doc_idx)) or
+            !std.mem.eql(u8, docTenant(doc_idx), docTenant(source_doc_idx)))
+        {
+            std.debug.print(
+                "public-query guardrail failed: filtered hit does not match generated filter query_shape={s} query_idx={d} source_doc={d} hit_doc={d} expected_status={s} actual_status={s} expected_tenant={s} actual_tenant={s}\n",
+                .{ cfg.query_shape.text(), query_idx, source_doc_idx, doc_idx, docStatus(source_doc_idx), docStatus(doc_idx), docTenant(source_doc_idx), docTenant(doc_idx) },
+            );
+            return error.FilterGuardrailFailed;
+        }
+    }
+    if (cfg.query_shape.usesExclusion() and std.mem.eql(u8, docCategory(doc_idx), docExcludedCategory(source_doc_idx))) {
+        std.debug.print(
+            "public-query guardrail failed: excluded hit matched generated exclusion query_shape={s} query_idx={d} source_doc={d} hit_doc={d} excluded_category={s}\n",
+            .{ cfg.query_shape.text(), query_idx, source_doc_idx, doc_idx, docExcludedCategory(source_doc_idx) },
+        );
+        return error.FilterGuardrailFailed;
+    }
+    return true;
+}
+
+fn benchmarkDocIndexFromKey(doc_key: []const u8) ?usize {
+    const prefix = "doc:";
+    if (!std.mem.startsWith(u8, doc_key, prefix)) return null;
+    return std.fmt.parseInt(usize, doc_key[prefix.len..], 10) catch null;
+}
+
 fn enforceExactSortGuardrail(cfg: Config, stats: QueryBenchStats) !void {
     if (!cfg.query_shape.usesExactSort()) return;
 
@@ -2322,6 +2467,13 @@ fn enforceExactSortGuardrail(cfg: Config, stats: QueryBenchStats) !void {
         std.debug.print(
             "public-query guardrail failed: exact sort profile selected count diverged from returned hits selected={d} returned={d}\n",
             .{ stats.profile_sort_selected_count, stats.response_hit_count },
+        );
+        return error.ExactSortGuardrailFailed;
+    }
+    if ((cfg.query_shape.usesFilter() or cfg.query_shape.usesExclusion()) and stats.response_filter_match_count != stats.response_hit_count) {
+        std.debug.print(
+            "public-query guardrail failed: exact sort returned hits were not all validated against generated filters returned={d} filter_matches={d}\n",
+            .{ stats.response_hit_count, stats.response_filter_match_count },
         );
         return error.ExactSortGuardrailFailed;
     }

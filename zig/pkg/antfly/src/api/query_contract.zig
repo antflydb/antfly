@@ -4700,9 +4700,14 @@ fn appendCanonicalPublicQueryAlloc(
         }
     }
 
+    if (isCanonicalStructuredFilterValue(query)) {
+        try appendRawStructuredFilterClausesAlloc(alloc, filter_clauses, query);
+        return;
+    }
+
     appendScoringQueryClausesAlloc(alloc, scoring_must, query, limit) catch |err| switch (err) {
-        error.UnsupportedQueryRequest, error.InvalidQueryRequest, error.UnexpectedToken => {
-            if (!isStructuredFilterValue(query)) return err;
+        error.UnsupportedQueryRequest, error.InvalidQueryRequest => {
+            if (!isCanonicalStructuredFilterValue(query)) return err;
             try appendRawStructuredFilterClausesAlloc(alloc, filter_clauses, query);
         },
         else => return err,
@@ -4810,6 +4815,44 @@ fn isStructuredFilterValue(value: std.json.Value) bool {
     return false;
 }
 
+fn isCanonicalStructuredFilterValue(value: std.json.Value) bool {
+    if (value != .object) return false;
+    inline for ([_][]const u8{
+        "match_all",
+        "match_none",
+        "exists",
+        "terms",
+        "range",
+        "numeric_range",
+        "term_range",
+        "date_range",
+        "bool_field",
+        "ip_range",
+        "geo_distance",
+        "geo_bbox",
+        "geo_shape",
+        "ids",
+        "doc_id",
+        "doc_ids",
+        "docids",
+        "ref",
+        "conjuncts",
+        "disjuncts",
+        "bool",
+    }) |key| {
+        if (value.object.get(key) != null) return true;
+    }
+    inline for ([_][]const u8{ "term", "match", "prefix", "wildcard", "regexp", "fuzzy" }) |key| {
+        if (value.object.get(key)) |operator_value| {
+            if (operator_value != .object) return false;
+            if (operator_value.object.get("path") != null) return true;
+            if (operator_value.object.get("value") != null) return true;
+            if (operator_value.object.get("values") != null) return true;
+        }
+    }
+    return false;
+}
+
 fn isQueryStringValue(value: std.json.Value) bool {
     if (value != .object) return false;
     return value.object.get("query") != null;
@@ -4901,9 +4944,14 @@ fn appendBoolMustClausesAlloc(
         return;
     }
 
+    if (isCanonicalStructuredFilterValue(value)) {
+        try appendRawStructuredFilterClausesAlloc(alloc, filter_clauses, value);
+        return;
+    }
+
     appendScoringQueryClausesAlloc(alloc, scoring_must, value, limit) catch |err| switch (err) {
-        error.UnsupportedQueryRequest, error.InvalidQueryRequest, error.UnexpectedToken => {
-            if (!isStructuredFilterValue(value)) return err;
+        error.UnsupportedQueryRequest, error.InvalidQueryRequest => {
+            if (!isCanonicalStructuredFilterValue(value)) return err;
             try appendRawStructuredFilterClausesAlloc(alloc, filter_clauses, value);
         },
         else => return err,
@@ -6818,6 +6866,23 @@ test "api query contract parses public with document filter bindings" {
     try std.testing.expectEqualStrings("raft", parsed.req.full_text.?.match.text);
     try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"ref\":\"visible\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"ref\":\"published\"") != null);
+}
+
+test "api query contract rejects malformed scoring clauses before filter fallback" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{
+        \\  "query": {
+        \\    "bool": {
+        \\      "must": [
+        \\        {"match":{"field":"body"}}
+        \\      ]
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(alloc, null, "docs", body));
 }
 
 test "api query contract parses public hierarchy controls" {

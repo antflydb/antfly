@@ -6659,6 +6659,7 @@ pub fn build(b: *std.Build) void {
         "exact-sort-index-sort",
         "exact-sort-index-sort-filter",
         "exact-sort-full-text",
+        "exact-sort-full-text-budget-rejection",
         "exact-sort-filter",
     };
     for (public_query_sort_guardrail_shapes) |shape| {
