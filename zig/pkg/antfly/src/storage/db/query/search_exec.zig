@@ -10098,7 +10098,7 @@ pub fn searchTextQuery(
     }
     const resolved_filter_ns = if (bench_query_profile) platform_time.monotonicNs() - resolved_filter_start_ns else 0;
     const convert_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
-    try convertNativeDocIdsToTextDocNumsAlloc(alloc, snapshot, &native_constraints);
+    try convertNativeDocIdsToTextDocNumsAlloc(alloc, effective_req, snapshot, &native_constraints);
     try normalizeNativeDocNumConstraintsAlloc(alloc, &native_constraints);
     const convert_constraints_ns = if (bench_query_profile) platform_time.monotonicNs() - convert_start_ns else 0;
     const unresolved_stored_filters =
@@ -10520,11 +10520,12 @@ fn textSearchQueryWithNativeDocIdsAlloc(
 
 fn convertNativeDocIdsToTextDocNumsAlloc(
     alloc: Allocator,
+    req: types.SearchRequest,
     snapshot: *const index_mod.IndexSnapshot,
     constraints: *NativeDocIdConstraints,
 ) !void {
     if (constraints.filter_doc_ids.len > 0) {
-        const mapped = try textDocNumsForDocIdsAlloc(alloc, snapshot, constraints.filter_doc_ids);
+        const mapped = try textDocNumsForDocIdsAlloc(alloc, req, snapshot, constraints.filter_doc_ids);
         if (constraints.filter_doc_nums.len > 0) {
             const intersected = try intersectDocNumsAlloc(alloc, constraints.filter_doc_nums, mapped);
             if (constraints.filter_doc_nums_owned and constraints.filter_doc_nums.len > 0) alloc.free(@constCast(constraints.filter_doc_nums));
@@ -10540,7 +10541,7 @@ fn convertNativeDocIdsToTextDocNumsAlloc(
     }
 
     if (constraints.exclude_doc_ids.len > 0) {
-        const mapped = try textDocNumsForDocIdsAlloc(alloc, snapshot, constraints.exclude_doc_ids);
+        const mapped = try textDocNumsForDocIdsAlloc(alloc, req, snapshot, constraints.exclude_doc_ids);
         if (constraints.exclude_doc_nums.len > 0) {
             const merged = try unionDocNumsAlloc(alloc, constraints.exclude_doc_nums, mapped);
             if (constraints.exclude_doc_nums_owned and constraints.exclude_doc_nums.len > 0) alloc.free(@constCast(constraints.exclude_doc_nums));
@@ -10587,14 +10588,18 @@ fn normalizeNativeDocNumSliceAlloc(
 
 fn textDocNumsForDocIdsAlloc(
     alloc: Allocator,
+    req: types.SearchRequest,
     snapshot: *const index_mod.IndexSnapshot,
     doc_ids: []const []const u8,
 ) ![]const u32 {
     var out = std.ArrayListUnmanaged(u32).empty;
     errdefer out.deinit(alloc);
     var doc_offset: u32 = 0;
+    var scanned_count: u64 = 0;
     for (snapshot.segments) |*seg| {
         for (0..seg.reader.doc_count) |local_doc_usize| {
+            scanned_count +|= 1;
+            if (scanned_count == 1 or scanned_count % 1024 == 0) try checkSearchRequestDeadline(req);
             const local_doc: u32 = @intCast(local_doc_usize);
             if (seg.shared.deleted) |deleted| {
                 if (deleted.contains(local_doc)) continue;
@@ -10606,6 +10611,25 @@ fn textDocNumsForDocIdsAlloc(
         doc_offset += seg.reader.doc_count;
     }
     return try out.toOwnedSlice(alloc);
+}
+
+test "text doc id conversion checks deadline while scanning" {
+    const alloc = std.testing.allocator;
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    try seg_writer.addStoredDoc("doc:a", "{\"title\":\"alpha\"}");
+    const seg_bytes = try seg_writer.build();
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+    const snapshot = writer.snapshot();
+
+    try std.testing.expectError(error.Timeout, textDocNumsForDocIdsAlloc(alloc, .{
+        .execution_deadline_ns = 0,
+    }, snapshot, &.{"doc:a"}));
 }
 
 pub fn collectSearchRequestTextStats(
