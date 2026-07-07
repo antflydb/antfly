@@ -1547,11 +1547,21 @@ test "query merge applies distributed typed sort ordering and cursor paging" {
         .{ .integer = 2 },
         .{ .string = "doc:b" },
     };
+    var after_left_hits = try alloc.alloc(db_mod.types.SearchHit, 2);
+    after_left_hits[0] = try testSortedQueryHitAlloc(alloc, "doc:c", 3);
+    after_left_hits[1] = try testSortedQueryHitAlloc(alloc, "doc:e", 5);
+    var after_right_hits = try alloc.alloc(db_mod.types.SearchHit, 2);
+    after_right_hits[0] = try testSortedQueryHitAlloc(alloc, "doc:d", 4);
+    after_right_hits[1] = try testSortedQueryHitAlloc(alloc, "doc:f", 6);
+    var after_left = db_mod.types.SearchResult{ .alloc = alloc, .hits = after_left_hits, .total_hits = 2 };
+    defer after_left.deinit();
+    var after_right = db_mod.types.SearchResult{ .alloc = alloc, .hits = after_right_hits, .total_hits = 2 };
+    defer after_right.deinit();
     var after_page = try mergeSearchResultsWithRuntimeSchema(alloc, .{
         .order_by = &order_by,
         .search_after = &after_cursor,
         .profile = true,
-    }, &.{ left, right }, 0, 2, schema);
+    }, &.{ after_left, after_right }, 0, 2, schema);
     defer after_page.deinit();
     try std.testing.expectEqual(@as(usize, 2), after_page.hits.len);
     try std.testing.expectEqualStrings("doc:c", after_page.hits[0].id);
@@ -1562,16 +1572,26 @@ test "query merge applies distributed typed sort ordering and cursor paging" {
     try std.testing.expectEqualStrings("distributed_merge", sort_profile.source);
     try std.testing.expectEqualStrings("coordinator_merge", sort_profile.distributed_behavior);
     try std.testing.expectEqual(@as(usize, 2), sort_profile.distributed_shard_count);
-    try std.testing.expectEqual(@as(usize, 4), sort_profile.distributed_shard_window);
+    try std.testing.expectEqual(@as(usize, 2), sort_profile.distributed_shard_window);
 
     const before_cursor = [_]std.json.Value{
         .{ .integer = 5 },
         .{ .string = "doc:e" },
     };
+    var before_left_hits = try alloc.alloc(db_mod.types.SearchHit, 2);
+    before_left_hits[0] = try testSortedQueryHitAlloc(alloc, "doc:a", 1);
+    before_left_hits[1] = try testSortedQueryHitAlloc(alloc, "doc:c", 3);
+    var before_right_hits = try alloc.alloc(db_mod.types.SearchHit, 2);
+    before_right_hits[0] = try testSortedQueryHitAlloc(alloc, "doc:b", 2);
+    before_right_hits[1] = try testSortedQueryHitAlloc(alloc, "doc:d", 4);
+    var before_left = db_mod.types.SearchResult{ .alloc = alloc, .hits = before_left_hits, .total_hits = 2 };
+    defer before_left.deinit();
+    var before_right = db_mod.types.SearchResult{ .alloc = alloc, .hits = before_right_hits, .total_hits = 2 };
+    defer before_right.deinit();
     var before_page = try mergeSearchResultsWithRuntimeSchema(alloc, .{
         .order_by = &order_by,
         .search_before = &before_cursor,
-    }, &.{ left, right }, 0, 2, schema);
+    }, &.{ before_left, before_right }, 0, 2, schema);
     defer before_page.deinit();
     try std.testing.expectEqual(@as(usize, 2), before_page.hits.len);
     try std.testing.expectEqualStrings("doc:c", before_page.hits[0].id);
@@ -1708,11 +1728,18 @@ test "query merge applies runtime schema to distributed date cursors" {
     };
     defer alloc.free(after_cursor[0].number_string);
 
+    var after_left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    after_left_hits[0] = try testDateSortedQueryHitAlloc(alloc, "doc:c", ts_c);
+    const after_right_hits = try alloc.alloc(db_mod.types.SearchHit, 0);
+    var after_left = db_mod.types.SearchResult{ .alloc = alloc, .hits = after_left_hits, .total_hits = 1 };
+    defer after_left.deinit();
+    var after_right = db_mod.types.SearchResult{ .alloc = alloc, .hits = after_right_hits, .total_hits = 0 };
+    defer after_right.deinit();
     var after_page = try mergeSearchResultsWithRuntimeSchema(alloc, .{
         .order_by = &order_by,
         .search_after = &after_cursor,
         .profile = true,
-    }, &.{ left, right }, 0, 1, schema);
+    }, &.{ after_left, after_right }, 0, 1, schema);
     defer after_page.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), after_page.hits.len);

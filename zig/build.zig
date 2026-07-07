@@ -3903,6 +3903,8 @@ pub fn build(b: *std.Build) void {
             "api query contract rejects ordered hits with non replayable sort tuple",
             "api query contract defaults cursor pagination without sort to id order",
             "api query contract preflight rejects cursor pagination without sort when cursor is not id arity",
+            "create table parser rejects schemas that cannot derive runtime mappings",
+            "metadata.schema update rejects schemas that cannot derive runtime mappings",
             "api query contract preflight rejects cursor pagination over approximate vector source",
             "api query contract appends stable id sort tiebreaker for cursors",
             "api query contract rejects cursor width that omits stable id tiebreaker",

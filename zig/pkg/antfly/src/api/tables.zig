@@ -606,7 +606,18 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !Crea
                 else => return err,
             };
             defer alloc.free(validated_schema);
-            req.schema_json = try normalizeSchemaVersion(alloc, validated_schema, 0);
+            const normalized_schema = normalizeSchemaVersion(alloc, validated_schema, 0) catch |err| switch (err) {
+                error.InvalidSchemaUpdateRequest => return error.InvalidCreateTableRequest,
+                else => return err,
+            };
+            var normalized_schema_owned = true;
+            errdefer if (normalized_schema_owned) alloc.free(normalized_schema);
+            validateRuntimeDerivableSchemaJson(alloc, normalized_schema) catch |err| switch (err) {
+                error.InvalidSchemaUpdateRequest => return error.InvalidCreateTableRequest,
+                else => return err,
+            };
+            req.schema_json = normalized_schema;
+            normalized_schema_owned = false;
         }
     }
     if (root.get("replication_sources")) |value| {
@@ -3323,6 +3334,39 @@ test "create table parser preserves supported metadata fields" {
     try std.testing.expectEqualStrings("{\"version\":0,\"kind\":\"demo\"}", parsed.schema_json.?);
     try std.testing.expectEqualStrings("{\"default\":{}}", parsed.indexes_json.?);
     try std.testing.expectEqualStrings("[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"users\"}]", parsed.replication_sources_json.?);
+}
+
+test "create table parser rejects schemas that cannot derive runtime mappings" {
+    const invalid_index_sort =
+        \\{
+        \\  "schema": {
+        \\    "dynamic_templates": [
+        \\      {"name":"rank","path_match":"rank","mapping":{"type":"numeric","sortable":false}}
+        \\    ],
+        \\    "index_sort": [
+        \\      {"field":"rank","order":"asc"}
+        \\    ]
+        \\  }
+        \\}
+    ;
+    try std.testing.expectError(
+        error.InvalidCreateTableRequest,
+        parseCreateTableRequest(std.testing.allocator, invalid_index_sort),
+    );
+
+    const invalid_id_order =
+        \\{
+        \\  "schema": {
+        \\    "index_sort": [
+        \\      {"field":"_id","order":"desc"}
+        \\    ]
+        \\  }
+        \\}
+    ;
+    try std.testing.expectError(
+        error.InvalidCreateTableRequest,
+        parseCreateTableRequest(std.testing.allocator, invalid_id_order),
+    );
 }
 
 test "schema-derived algebraic indexes expand into explicit capability config" {
