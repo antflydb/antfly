@@ -3226,6 +3226,18 @@ test "sort result profile reports requested sort lifecycle state" {
     }, true, .{});
     try std.testing.expectEqualStrings("queryable", queryable.sort_lifecycle_state);
 
+    const index_sort_unavailable = sortResultProfile(.{
+        .order_by = &field_order,
+        .profile = true,
+    }, .{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .native_doc_values_coverage = "covered",
+        .index_sort_match = true,
+        .sorted_segment_executor_available = false,
+    }, true, .{});
+    try std.testing.expectEqualStrings("queryable", index_sort_unavailable.sort_lifecycle_state);
+
     const accelerated = sortResultProfile(.{
         .order_by = &field_order,
         .profile = true,
@@ -3234,8 +3246,31 @@ test "sort result profile reports requested sort lifecycle state" {
         .require_native = true,
         .native_doc_values_coverage = "covered",
         .index_sort_match = true,
+        .sorted_segment_executor_available = true,
     }, true, .{});
     try std.testing.expectEqualStrings("accelerated", accelerated.sort_lifecycle_state);
+
+    const unsupported = sortResultProfile(.{
+        .order_by = &field_order,
+        .profile = true,
+    }, .{
+        .kind = .unsupported_exact_sort,
+        .native_doc_values_coverage = "covered",
+        .index_sort_match = true,
+        .sorted_segment_executor_available = true,
+    }, false, .{});
+    try std.testing.expectEqualStrings("unsupported", unsupported.sort_lifecycle_state);
+
+    const debug = sortResultProfile(.{
+        .order_by = &field_order,
+        .profile = true,
+    }, .{
+        .kind = .stored_json_debug,
+        .native_doc_values_coverage = "covered",
+        .index_sort_match = true,
+        .sorted_segment_executor_available = true,
+    }, false, .{});
+    try std.testing.expectEqualStrings("unsupported", debug.sort_lifecycle_state);
 
     const score = vectorScoreTopKSortProfile(.{
         .profile = true,
@@ -3466,19 +3501,24 @@ fn sortResultProfile(
 }
 
 fn sortExecutionPlanLifecycleState(plan: SortExecutionPlan) []const u8 {
+    switch (plan.kind) {
+        .unsupported_exact_sort, .stored_json_debug => return "unsupported",
+        else => {},
+    }
     if (plan.sort_lifecycle_state.len > 0) return plan.sort_lifecycle_state;
     return switch (plan.kind) {
         .none, .score_top_k => "",
         .id_only, .id_seek => "queryable",
-        .sorted_segment_seek => if (plan.index_sort_match) "accelerated" else "queryable",
+        .sorted_segment_seek => if (plan.index_sort_match and plan.sorted_segment_executor_available) "accelerated" else "queryable",
         .distributed_k_way_merge => "queryable",
-        .native_doc_values_top_n, .stored_json_debug, .unsupported_exact_sort => sortLifecycleStateFromCoverage(plan),
+        .native_doc_values_top_n => sortLifecycleStateFromCoverage(plan),
+        .stored_json_debug, .unsupported_exact_sort => unreachable,
     };
 }
 
 fn sortLifecycleStateFromCoverage(plan: SortExecutionPlan) []const u8 {
     if (std.mem.eql(u8, plan.native_doc_values_coverage, "covered")) {
-        return if (plan.index_sort_match) "accelerated" else "queryable";
+        return if (plan.index_sort_match and plan.sorted_segment_executor_available) "accelerated" else "queryable";
     }
     if (std.mem.eql(u8, plan.native_doc_values_coverage, "identity_metadata")) return "queryable";
     if (std.mem.eql(u8, plan.native_doc_values_coverage, "observed_declared")) return "indexed";
@@ -13302,7 +13342,7 @@ fn planTextNativeSortFields(
         .source_load = .projected_source_after_page,
         .distributed_behavior = .shard_local_only,
         .runtime_schema = runtime_schema,
-        .sort_lifecycle_state = if (exact_index_sort_match) "accelerated" else "queryable",
+        .sort_lifecycle_state = if (sorted_segment_available) "accelerated" else "queryable",
         .native_doc_values_coverage = typedDocValuesCoverageStatusName(.covered),
         .index_sort_coverage = indexSortCoverageStatusName(index_sort_coverage),
         .index_sort_match = exact_index_sort_match,
@@ -17523,6 +17563,7 @@ test "native text sort validation uses runtime sortable mappings" {
     try std.testing.expect(native_plan.require_native);
     try std.testing.expect(native_plan.index_sort_match);
     try std.testing.expect(!native_plan.sorted_segment_executor_available);
+    try std.testing.expectEqualStrings("queryable", native_plan.sort_lifecycle_state);
     try std.testing.expectEqualStrings("covered", native_plan.native_doc_values_coverage);
     try std.testing.expectEqualStrings("missing_segment_index_sort", native_plan.index_sort_coverage);
 
@@ -17632,6 +17673,7 @@ test "native text sort planner requires live segment index sort coverage for sor
     try std.testing.expect(sorted_plan.index_sort_match);
     try std.testing.expect(sorted_plan.sorted_segment_executor_available);
     try std.testing.expect(!sorted_plan.sorted_segment_bounds_available);
+    try std.testing.expectEqualStrings("accelerated", sorted_plan.sort_lifecycle_state);
     try std.testing.expectEqualStrings("covered", sorted_plan.native_doc_values_coverage);
     try std.testing.expectEqualStrings("covered_without_bounds", sorted_plan.index_sort_coverage);
 
@@ -17668,6 +17710,7 @@ test "native text sort planner requires live segment index sort coverage for sor
     try std.testing.expect(bounded_plan.index_sort_match);
     try std.testing.expect(bounded_plan.sorted_segment_executor_available);
     try std.testing.expect(bounded_plan.sorted_segment_bounds_available);
+    try std.testing.expectEqualStrings("accelerated", bounded_plan.sort_lifecycle_state);
     try std.testing.expectEqualStrings("covered_with_bounds", bounded_plan.index_sort_coverage);
 
     var bad_bounds_seg_writer = segment_mod.SegmentWriter.init(alloc);
