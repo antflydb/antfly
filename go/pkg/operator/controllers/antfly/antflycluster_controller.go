@@ -7576,6 +7576,7 @@ func buildHAAdminJob(cluster *antflyv1.AntflyCluster, admin *antflyv1.HAAdminSpe
 						ImagePullPolicy: corev1.PullPolicy(cluster.Spec.ImagePullPolicy),
 						Command:         []string{"/antfly"},
 						Args:            args,
+						Env:             haAdminJobTokenEnv(cluster, admin),
 						EnvFrom:         append([]corev1.EnvFromSource{}, admin.EnvFrom...),
 						VolumeMounts:    append([]corev1.VolumeMount{}, admin.VolumeMounts...),
 					}},
@@ -7584,6 +7585,26 @@ func buildHAAdminJob(cluster *antflyv1.AntflyCluster, admin *antflyv1.HAAdminSpe
 			},
 		},
 	}
+}
+
+func haAdminJobTokenEnv(cluster *antflyv1.AntflyCluster, admin *antflyv1.HAAdminSpec) []corev1.EnvVar {
+	envVar := haAdminConfiguredTokenEnvVar(admin)
+	if envVar == "" || cluster == nil || cluster.Spec.HighAvailability == nil || cluster.Spec.HighAvailability.Runtime == nil {
+		return nil
+	}
+	secretRef := cluster.Spec.HighAvailability.Runtime.AdminTokenSecretRef
+	if secretRef == nil {
+		return nil
+	}
+	ref := secretRef.DeepCopy()
+	optional := false
+	ref.Optional = &optional
+	return []corev1.EnvVar{{
+		Name: envVar,
+		ValueFrom: &corev1.EnvVarSource{
+			SecretKeyRef: ref,
+		},
+	}}
 }
 
 func haAdminTokenEnvVar(admin *antflyv1.HAAdminSpec) string {

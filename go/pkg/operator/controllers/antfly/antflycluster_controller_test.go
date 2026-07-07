@@ -674,6 +674,13 @@ func TestReconcileHAAdminJobsFallsBackToCLIJobWhenConfiguredAdminTokenEnvVarCome
 						},
 					}},
 				},
+				Runtime: &antflyv1.HARuntimeSpec{
+					AdminTokenEnvVar: "MISSING_HA_ADMIN_TOKEN",
+					AdminTokenSecretRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"},
+						Key:                  "token",
+					},
+				},
 			},
 		},
 		Status: antflyv1.AntflyClusterStatus{
@@ -720,6 +727,14 @@ func TestReconcileHAAdminJobsFallsBackToCLIJobWhenConfiguredAdminTokenEnvVarCome
 		"slot", "resume", "--slot", "standby-a",
 	}))
 	g.Expect(container.EnvFrom).To(Equal(cluster.Spec.HighAvailability.Admin.EnvFrom))
+	g.Expect(container.Env).To(HaveLen(1))
+	g.Expect(container.Env[0].Name).To(Equal("MISSING_HA_ADMIN_TOKEN"))
+	g.Expect(container.Env[0].ValueFrom).NotTo(BeNil())
+	g.Expect(container.Env[0].ValueFrom.SecretKeyRef).NotTo(BeNil())
+	g.Expect(container.Env[0].ValueFrom.SecretKeyRef.Name).To(Equal("ha-admin-token"))
+	g.Expect(container.Env[0].ValueFrom.SecretKeyRef.Key).To(Equal("token"))
+	g.Expect(container.Env[0].ValueFrom.SecretKeyRef.Optional).NotTo(BeNil())
+	g.Expect(*container.Env[0].ValueFrom.SecretKeyRef.Optional).To(BeFalse())
 }
 
 func TestReconcileHAAdminJobsRecoversStaleDirectAPIMissingTokenFailureWithEnvFromFallback(t *testing.T) {
@@ -748,6 +763,13 @@ func TestReconcileHAAdminJobsRecoversStaleDirectAPIMissingTokenFailureWithEnvFro
 							LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"},
 						},
 					}},
+				},
+				Runtime: &antflyv1.HARuntimeSpec{
+					AdminTokenEnvVar: "MISSING_HA_ADMIN_TOKEN",
+					AdminTokenSecretRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"},
+						Key:                  "token",
+					},
 				},
 			},
 		},
@@ -783,6 +805,11 @@ func TestReconcileHAAdminJobsRecoversStaleDirectAPIMissingTokenFailureWithEnvFro
 	var jobs batchv1.JobList
 	g.Expect(reconciler.List(context.Background(), &jobs)).To(Succeed())
 	g.Expect(jobs.Items).To(HaveLen(1))
+	container := jobs.Items[0].Spec.Template.Spec.Containers[0]
+	g.Expect(container.Env).To(HaveLen(1))
+	g.Expect(container.Env[0].Name).To(Equal("MISSING_HA_ADMIN_TOKEN"))
+	g.Expect(container.Env[0].ValueFrom.SecretKeyRef.Name).To(Equal("ha-admin-token"))
+	g.Expect(container.Env[0].ValueFrom.SecretKeyRef.Key).To(Equal("token"))
 }
 
 func TestHAAdminSDKResponseHelpersPreserveTypedErrors(t *testing.T) {
