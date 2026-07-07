@@ -7619,7 +7619,6 @@ test "api query contract preflight rejects score sort without score-bearing sour
     var summary = try preflightQueryRequestAlloc(std.testing.allocator, parsed_match.value);
     defer summary.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u32, 1), summary.base_result_set_count);
-
 }
 
 test "api query contract appends stable id sort tiebreaker for cursors" {

@@ -5930,6 +5930,26 @@ fn ownedSortValueFromJson(alloc: Allocator, value: ?std.json.Value) !SortValue {
     };
 }
 
+fn ownedSortValueFromJsonForPlanFieldAlloc(
+    alloc: Allocator,
+    plan: SortExecutionPlan,
+    field: []const u8,
+    value: ?std.json.Value,
+) !SortValue {
+    if (plan.runtime_schema) |schema| {
+        if (sortFieldMapping(schema, field)) |mapping| {
+            if (mapping.field_type == .datetime) {
+                if (value) |actual| {
+                    if (actual != .null) {
+                        if (datetimeCursorValueAsNs(actual)) |ns| return .{ .u64_value = ns };
+                    }
+                }
+            }
+        }
+    }
+    return try ownedSortValueFromJson(alloc, value);
+}
+
 fn nativeSortValueMatchesMappedField(value: SortValue, mapping: runtime_schema_mod.FieldMapping) bool {
     if (nativeSortValueRejectionReason(mapping, value) != null) return false;
     return true;
@@ -5962,6 +5982,18 @@ fn nativeSortValueRejectionReasonForPlanField(plan: SortExecutionPlan, field: []
     const schema = plan.runtime_schema orelse return null;
     const mapping = sortFieldMapping(schema, field) orelse return .unmapped_field;
     return nativeSortValueRejectionReason(mapping, value);
+}
+
+fn validateSortValueForPlanField(plan: SortExecutionPlan, field: types.SortField, value: SortValue) !void {
+    if (!sortFieldNeedsNativeValue(field)) return;
+    if (nativeSortValueRejectionReasonForPlanField(plan, field.field, value)) |reason| {
+        logNativeSortPlanRejection(
+            field.field,
+            nativeSortPlanRejectionReasonName(reason),
+            nativeSortPlanRejectionDetailName(reason),
+        );
+        return error.UnsupportedExactSort;
+    }
 }
 
 fn sortValueAsU64(value: SortValue) ?u64 {
@@ -6690,19 +6722,7 @@ fn decorateSortHitAlloc(
                         p.native_doc_value_miss_count += 1;
                     }
                 }
-                if (loaded_native) |native_value| {
-                    if (nativeSortValueRejectionReasonForPlanField(plan, field.field, native_value)) |reason| {
-                        logNativeSortPlanRejection(
-                            field.field,
-                            nativeSortPlanRejectionReasonName(reason),
-                            nativeSortPlanRejectionDetailName(reason),
-                        );
-                        var owned_native = native_value;
-                        owned_native.deinit(alloc);
-                        return error.UnsupportedExactSort;
-                    }
-                    break :blk native_value;
-                }
+                if (loaded_native) |native_value| break :blk native_value;
                 if (plan.kind == .native_doc_values_top_n or plan.require_native or loader.require_native) {
                     logNativeSortPlanRejection(
                         field.field,
@@ -6720,7 +6740,11 @@ fn decorateSortHitAlloc(
                     p.stored_json_load_count += 1;
                 }
             }
-            break :blk try ownedSortValueFromJson(alloc, jsonFieldValue(parsed_doc.?.value, field.field));
+            break :blk try ownedSortValueFromJsonForPlanFieldAlloc(alloc, plan, field.field, jsonFieldValue(parsed_doc.?.value, field.field));
+        };
+        validateSortValueForPlanField(plan, field, sort_value) catch |err| {
+            sort_value.deinit(alloc);
+            return err;
         };
         keys[i] = sort_value;
         keys_initialized += 1;
@@ -19370,6 +19394,108 @@ test "stored json debug sort rejects non-scalar sort values" {
         .include_stored = false,
         .limit = 2,
     }, null, callbacks.loadStored, .{ .kind = .stored_json_debug }, null));
+}
+
+test "stored json debug sort honors runtime missing null policy" {
+    const alloc = std.testing.allocator;
+
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "status",
+        .path_match = "status",
+        .mapping = .{
+            .field_type = .keyword,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+
+    const callbacks = struct {
+        fn loadStored(_: ?*anyopaque, load_alloc: Allocator, key: []const u8) anyerror!?[]u8 {
+            if (!std.mem.eql(u8, key, "doc:a")) return null;
+            return try load_alloc.dupe(u8, "{\"status\":null}");
+        }
+    };
+
+    var hits = try alloc.alloc(types.SearchHit, 1);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .score = 1.0 };
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 1,
+        .graph_results = &.{},
+    };
+    defer result.deinit();
+
+    const order_by = [_]types.SortField{.{ .field = "status", .desc = false }};
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedExactSort, sortAndPageSearchResultInPlace(&result, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 1,
+    }, null, callbacks.loadStored, .{
+        .kind = .stored_json_debug,
+        .runtime_schema = schema,
+    }, null));
+    const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("status", diagnostic.field);
+    try std.testing.expectEqualStrings("missing_null_policy", diagnostic.reason);
+    try std.testing.expectEqualStrings("missing_null_policy", diagnostic.detail);
+}
+
+test "stored json debug sort normalizes runtime datetime values" {
+    const alloc = std.testing.allocator;
+
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "created_at",
+        .path_match = "created_at",
+        .mapping = .{
+            .field_type = .datetime,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+
+    const callbacks = struct {
+        fn loadStored(_: ?*anyopaque, load_alloc: Allocator, key: []const u8) anyerror!?[]u8 {
+            const json = if (std.mem.eql(u8, key, "doc:a"))
+                "{\"created_at\":\"1970-01-01T00:00:00.000000002Z\"}"
+            else if (std.mem.eql(u8, key, "doc:b"))
+                "{\"created_at\":\"1970-01-01T00:00:00.000000001Z\"}"
+            else
+                return null;
+            return try load_alloc.dupe(u8, json);
+        }
+    };
+
+    var hits = try alloc.alloc(types.SearchHit, 2);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .score = 1.0 };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:b"), .score = 1.0 };
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 2,
+        .graph_results = &.{},
+    };
+    defer result.deinit();
+
+    const order_by = [_]types.SortField{.{ .field = "created_at", .desc = false }};
+    try sortAndPageSearchResultInPlace(&result, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 2,
+    }, null, callbacks.loadStored, .{
+        .kind = .stored_json_debug,
+        .runtime_schema = schema,
+    }, null);
+
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+    try std.testing.expectEqualStrings("1970-01-01T00:00:00.000000001Z", result.hits[0].sort_values[0].string);
+    try std.testing.expectEqualStrings("doc:a", result.hits[1].id);
+    try std.testing.expectEqualStrings("1970-01-01T00:00:00.000000002Z", result.hits[1].sort_values[0].string);
 }
 
 test "native sort zero limit avoids generic collector decoration" {
