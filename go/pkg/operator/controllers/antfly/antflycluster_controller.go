@@ -3581,6 +3581,14 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 			}
 			continue
 		}
+		if action.AdminJobPhase == haAdminJobPhaseFailed &&
+			action.AdminJobName == haAdminDirectAPIName &&
+			haAdminActionMissingTokenCanFallbackFromStatus(ha.Admin, *action) {
+			action.AdminJobName = ""
+			action.AdminJobPhase = ""
+			action.AdminError = ""
+			action.AdminStatusCode = 0
+		}
 		if action.AdminJobPhase == haAdminJobPhaseSucceeded || action.AdminJobPhase == haAdminJobPhaseFailed {
 			if action.AdminJobPhase == haAdminJobPhaseSucceeded && action.AdminResult == nil {
 				r.updateHAAdminActionResultFromJobLogs(ctx, cluster, action)
@@ -3594,6 +3602,14 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 			continue
 		}
 		if handled, err := r.executeHAPlannedActionTyped(ctx, cluster, action); handled {
+			if err != nil && haAdminActionCanRunAsFallbackJob(ha.Admin, *action, err) {
+				action.AdminError = ""
+				action.AdminStatusCode = 0
+				if err := r.reconcileHAAdminJob(ctx, cluster, ha.Admin, action); err != nil {
+					return err
+				}
+				continue
+			}
 			action.AdminJobName = haAdminDirectAPIName
 			if err != nil {
 				if adminsdk.HAIsRetryable(err) {
@@ -3632,33 +3648,61 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 			continue
 		}
 
-		job := buildHAAdminJob(cluster, ha.Admin, *action)
-		action.AdminJobName = job.Name
-		if err := controllerutil.SetControllerReference(cluster, job, r.Scheme); err != nil {
+		if err := r.reconcileHAAdminJob(ctx, cluster, ha.Admin, action); err != nil {
 			return err
-		}
-
-		existing := &batchv1.Job{}
-		err := r.Get(ctx, types.NamespacedName{Name: job.Name, Namespace: job.Namespace}, existing)
-		if errors.IsNotFound(err) {
-			action.AdminJobPhase = haAdminJobPhasePending
-			return r.Create(ctx, job)
-		}
-		if err != nil {
-			return err
-		}
-		action.AdminJobPhase = haAdminJobPhase(existing)
-		if action.AdminJobPhase == haAdminJobPhaseSucceeded && action.AdminResult == nil {
-			r.updateHAAdminActionResultFromJobLogs(ctx, cluster, action)
-		}
-		if !haAdminJobComplete(existing) {
-			continue
 		}
 	}
 	return nil
 }
 
 const haAdminDirectAPIName = "direct-admin-api"
+
+var errHAAdminTokenEnvMissing = stderrors.New("configured HA admin token env var is empty or unset")
+
+func (r *AntflyClusterReconciler) reconcileHAAdminJob(ctx context.Context, cluster *antflyv1.AntflyCluster, admin *antflyv1.HAAdminSpec, action *antflyv1.HAPlannedActionStatus) error {
+	job := buildHAAdminJob(cluster, admin, *action)
+	action.AdminJobName = job.Name
+	if err := controllerutil.SetControllerReference(cluster, job, r.Scheme); err != nil {
+		return err
+	}
+
+	existing := &batchv1.Job{}
+	err := r.Get(ctx, types.NamespacedName{Name: job.Name, Namespace: job.Namespace}, existing)
+	if errors.IsNotFound(err) {
+		action.AdminJobPhase = haAdminJobPhasePending
+		return r.Create(ctx, job)
+	}
+	if err != nil {
+		return err
+	}
+	action.AdminJobPhase = haAdminJobPhase(existing)
+	if action.AdminJobPhase == haAdminJobPhaseSucceeded && action.AdminResult == nil {
+		r.updateHAAdminActionResultFromJobLogs(ctx, cluster, action)
+	}
+	return nil
+}
+
+func haAdminActionCanRunAsFallbackJob(admin *antflyv1.HAAdminSpec, action antflyv1.HAPlannedActionStatus, err error) bool {
+	if !stderrors.Is(err, errHAAdminTokenEnvMissing) {
+		return false
+	}
+	return haAdminActionHasEnvFromFallback(admin, action)
+}
+
+func haAdminActionMissingTokenCanFallbackFromStatus(admin *antflyv1.HAAdminSpec, action antflyv1.HAPlannedActionStatus) bool {
+	if !strings.Contains(action.AdminError, "configured HA admin token env var") ||
+		!strings.Contains(action.AdminError, "is empty or unset") {
+		return false
+	}
+	return haAdminActionHasEnvFromFallback(admin, action)
+}
+
+func haAdminActionHasEnvFromFallback(admin *antflyv1.HAAdminSpec, action antflyv1.HAPlannedActionStatus) bool {
+	return admin != nil &&
+		haAdminConfiguredTokenEnvVar(admin) != "" &&
+		len(admin.EnvFrom) > 0 &&
+		len(action.AdminCommand) > 0
+}
 
 func haPlannedActionRequiresAdminTarget(action antflyv1.HAPlannedActionStatus) bool {
 	if action.Executor == string(haActionExecutorAdminAPI) &&
@@ -3922,7 +3966,7 @@ func haAdminBearerToken(cluster *antflyv1.AntflyCluster) (string, error) {
 	envVar := haAdminTokenEnvVar(admin)
 	token := strings.TrimSpace(os.Getenv(envVar))
 	if haAdminConfiguredTokenEnvVar(admin) != "" && token == "" {
-		return "", fmt.Errorf("configured HA admin token env var %s is empty or unset", envVar)
+		return "", fmt.Errorf("configured HA admin token env var %s is empty or unset: %w", envVar, errHAAdminTokenEnvMissing)
 	}
 	return token, nil
 }

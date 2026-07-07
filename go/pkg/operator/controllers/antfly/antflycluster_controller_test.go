@@ -647,6 +647,144 @@ func TestReconcileHAAdminJobsFailsWhenConfiguredAdminTokenEnvVarMissing(t *testi
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(ContainSubstring("configured HA admin token env var MISSING_HA_ADMIN_TOKEN is empty or unset"))
 }
 
+func TestReconcileHAAdminJobsFallsBackToCLIJobWhenConfiguredAdminTokenEnvVarComesFromEnvFrom(t *testing.T) {
+	g := NewWithT(t)
+	t.Setenv("MISSING_HA_ADMIN_TOKEN", "")
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(batchv1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			Image: "antfly:test",
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode: antflyv1.HAModeHotStandby,
+				Admin: &antflyv1.HAAdminSpec{
+					PrimaryURL:            "http://primary-ha.default.svc:8081",
+					ExecutePlannedActions: true,
+					TokenEnvVar:           "MISSING_HA_ADMIN_TOKEN",
+					EnvFrom: []corev1.EnvFromSource{{
+						SecretRef: &corev1.SecretEnvSource{
+							LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"},
+						},
+					}},
+				},
+			},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				PlannedActions: []antflyv1.HAPlannedActionStatus{{
+					Kind:         string(haActionResumeSlot),
+					Executor:     string(haActionExecutorAdminAPI),
+					SlotName:     "standby-a",
+					AdminCommand: []string{"slot", "resume", "--slot", "standby-a"},
+					AdminURL:     "http://primary-ha.default.svc:8081",
+					AdminNodeID:  "primary-a",
+					AdminMethod:  "PUT",
+					AdminPath:    "/admin/v1/ha/replication-slots/standby-a/resume",
+				}},
+			},
+		},
+	}
+
+	called := false
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Scheme: s,
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			called = true
+			return nil, fmt.Errorf("unexpected direct admin request: %s %s", req.Method, req.URL.String())
+		})},
+	}
+
+	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(called).To(BeFalse())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).NotTo(Equal(haAdminDirectAPIName))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhasePending))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(BeEmpty())
+
+	var jobs batchv1.JobList
+	g.Expect(reconciler.List(context.Background(), &jobs)).To(Succeed())
+	g.Expect(jobs.Items).To(HaveLen(1))
+	container := jobs.Items[0].Spec.Template.Spec.Containers[0]
+	g.Expect(container.Args).To(Equal([]string{
+		"ha",
+		"--ha-url", "http://primary-ha.default.svc:8081",
+		"--ha-token-env", "MISSING_HA_ADMIN_TOKEN",
+		"--",
+		"slot", "resume", "--slot", "standby-a",
+	}))
+	g.Expect(container.EnvFrom).To(Equal(cluster.Spec.HighAvailability.Admin.EnvFrom))
+}
+
+func TestReconcileHAAdminJobsRecoversStaleDirectAPIMissingTokenFailureWithEnvFromFallback(t *testing.T) {
+	g := NewWithT(t)
+	t.Setenv("MISSING_HA_ADMIN_TOKEN", "")
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(batchv1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			Image: "antfly:test",
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Mode: antflyv1.HAModeHotStandby,
+				Admin: &antflyv1.HAAdminSpec{
+					PrimaryURL:            "http://primary-ha.default.svc:8081",
+					ExecutePlannedActions: true,
+					TokenEnvVar:           "MISSING_HA_ADMIN_TOKEN",
+					EnvFrom: []corev1.EnvFromSource{{
+						SecretRef: &corev1.SecretEnvSource{
+							LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"},
+						},
+					}},
+				},
+			},
+		},
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				PlannedActions: []antflyv1.HAPlannedActionStatus{{
+					Kind:          string(haActionResumeSlot),
+					Executor:      string(haActionExecutorAdminAPI),
+					SlotName:      "standby-a",
+					AdminCommand:  []string{"slot", "resume", "--slot", "standby-a"},
+					AdminURL:      "http://primary-ha.default.svc:8081",
+					AdminNodeID:   "primary-a",
+					AdminMethod:   "PUT",
+					AdminPath:     "/admin/v1/ha/replication-slots/standby-a/resume",
+					AdminJobName:  haAdminDirectAPIName,
+					AdminJobPhase: haAdminJobPhaseFailed,
+					AdminError:    "configured HA admin token env var MISSING_HA_ADMIN_TOKEN is empty or unset",
+				}},
+			},
+		},
+	}
+
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build(),
+		Scheme: s,
+	}
+
+	g.Expect(reconciler.reconcileHAAdminJobs(context.Background(), cluster)).To(Succeed())
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobName).NotTo(Equal(haAdminDirectAPIName))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase).To(Equal(haAdminJobPhasePending))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminError).To(BeEmpty())
+
+	var jobs batchv1.JobList
+	g.Expect(reconciler.List(context.Background(), &jobs)).To(Succeed())
+	g.Expect(jobs.Items).To(HaveLen(1))
+}
+
 func TestHAAdminSDKResponseHelpersPreserveTypedErrors(t *testing.T) {
 	g := NewWithT(t)
 
