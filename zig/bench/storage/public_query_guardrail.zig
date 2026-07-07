@@ -41,6 +41,10 @@ const benchmark_schema_json =
     \\{"version":1,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true,"properties":{"title":{"type":"text"},"body":{"type":"text"},"category":{"type":"string","x-antfly-field":{"type":"keyword","sortable":true}},"status":{"type":"string","x-antfly-field":{"type":"keyword","sortable":true}},"tenant":{"type":"string","x-antfly-field":{"type":"keyword","sortable":true}},"score":{"type":"number","x-antfly-field":{"type":"number","sortable":true}},"created_at":{"type":"string","format":"date-time","x-antfly-field":{"type":"date","sortable":true}},"active":{"type":"boolean","x-antfly-field":{"type":"boolean","sortable":true}}}}}}}
 ;
 
+const benchmark_index_sort_schema_json =
+    \\{"version":1,"default_type":"doc","enforce_types":false,"index_sort":[{"field":"created_at","order":"desc"}],"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true,"properties":{"title":{"type":"text"},"body":{"type":"text"},"category":{"type":"string","x-antfly-field":{"type":"keyword","sortable":true}},"status":{"type":"string","x-antfly-field":{"type":"keyword","sortable":true}},"tenant":{"type":"string","x-antfly-field":{"type":"keyword","sortable":true}},"score":{"type":"number","x-antfly-field":{"type":"number","sortable":true}},"created_at":{"type":"string","format":"date-time","x-antfly-field":{"type":"date","sortable":true}},"active":{"type":"boolean","x-antfly-field":{"type":"boolean","sortable":true}}}}}}}
+;
+
 const benchmark_algebraic_config_json =
     \\{"version":1,"table":"docs","group_fields":[{"name":"category","path":"category","type":"string"},{"name":"status","path":"status","type":"string"},{"name":"tenant","path":"tenant","type":"string"}],"measure_fields":[{"name":"score","path":"score","type":"number"}],"adaptive":{"observe":true,"lazy_materialization":true,"min_observations":2,"max_backfill_rows_per_tick":100000,"min_estimated_scan_rows_saved":1},"materializations":[]}
 ;
@@ -74,6 +78,7 @@ const QueryShape = enum {
     exact_sort_keyword,
     exact_sort_datetime,
     exact_sort_boolean,
+    exact_sort_index_sort,
     exact_sort_full_text,
     exact_sort_filter,
 
@@ -95,6 +100,7 @@ const QueryShape = enum {
         if (std.mem.eql(u8, raw, "exact-sort-keyword")) return .exact_sort_keyword;
         if (std.mem.eql(u8, raw, "exact-sort-datetime")) return .exact_sort_datetime;
         if (std.mem.eql(u8, raw, "exact-sort-boolean")) return .exact_sort_boolean;
+        if (std.mem.eql(u8, raw, "exact-sort-index-sort")) return .exact_sort_index_sort;
         if (std.mem.eql(u8, raw, "exact-sort-full-text")) return .exact_sort_full_text;
         if (std.mem.eql(u8, raw, "exact-sort-filter")) return .exact_sort_filter;
         return null;
@@ -119,6 +125,7 @@ const QueryShape = enum {
             .exact_sort_keyword => "exact-sort-keyword",
             .exact_sort_datetime => "exact-sort-datetime",
             .exact_sort_boolean => "exact-sort-boolean",
+            .exact_sort_index_sort => "exact-sort-index-sort",
             .exact_sort_full_text => "exact-sort-full-text",
             .exact_sort_filter => "exact-sort-filter",
         };
@@ -126,14 +133,14 @@ const QueryShape = enum {
 
     fn usesFullText(self: QueryShape) bool {
         return switch (self) {
-            .dense, .dense_filter, .sparse_filter, .graph_expand, .algebraic_filter, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_boolean, .exact_sort_filter => false,
+            .dense, .dense_filter, .sparse_filter, .graph_expand, .algebraic_filter, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_boolean, .exact_sort_index_sort, .exact_sort_filter => false,
             .full_text, .hybrid_composed, .hybrid, .hybrid_filter, .hybrid_filter_exclude, .hybrid_filter_exclude_project, .exact_sort_full_text => true,
         };
     }
 
     fn usesDense(self: QueryShape) bool {
         return switch (self) {
-            .full_text, .sparse_filter, .graph_expand, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_boolean, .exact_sort_full_text, .exact_sort_filter => false,
+            .full_text, .sparse_filter, .graph_expand, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_boolean, .exact_sort_index_sort, .exact_sort_full_text, .exact_sort_filter => false,
             .dense, .dense_filter, .algebraic_filter, .hybrid_composed, .hybrid, .hybrid_filter, .hybrid_filter_exclude, .hybrid_filter_exclude_project => true,
         };
     }
@@ -148,7 +155,7 @@ const QueryShape = enum {
 
     fn usesFilter(self: QueryShape) bool {
         return switch (self) {
-            .dense, .full_text, .graph_expand, .hybrid, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_boolean, .exact_sort_full_text => false,
+            .dense, .full_text, .graph_expand, .hybrid, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_boolean, .exact_sort_index_sort, .exact_sort_full_text => false,
             .dense_filter, .sparse_filter, .algebraic_filter, .hybrid_composed => true,
             .hybrid_filter, .hybrid_filter_exclude, .hybrid_filter_exclude_project, .exact_sort_filter => true,
         };
@@ -156,7 +163,7 @@ const QueryShape = enum {
 
     fn usesExclusion(self: QueryShape) bool {
         return switch (self) {
-            .dense, .full_text, .dense_filter, .sparse_filter, .graph_expand, .algebraic_filter, .hybrid_composed, .hybrid, .hybrid_filter, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_boolean, .exact_sort_full_text, .exact_sort_filter => false,
+            .dense, .full_text, .dense_filter, .sparse_filter, .graph_expand, .algebraic_filter, .hybrid_composed, .hybrid, .hybrid_filter, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_boolean, .exact_sort_index_sort, .exact_sort_full_text, .exact_sort_filter => false,
             .hybrid_filter_exclude, .hybrid_filter_exclude_project => true,
         };
     }
@@ -171,7 +178,7 @@ const QueryShape = enum {
 
     fn usesExactSort(self: QueryShape) bool {
         return switch (self) {
-            .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_boolean, .exact_sort_full_text, .exact_sort_filter => true,
+            .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_boolean, .exact_sort_index_sort, .exact_sort_full_text, .exact_sort_filter => true,
             else => false,
         };
     }
@@ -345,6 +352,10 @@ const VisibilitySnapshot = struct {
     }
 };
 
+fn benchmarkSchemaJson(cfg: Config) []const u8 {
+    return if (cfg.query_shape == .exact_sort_index_sort) benchmark_index_sort_schema_json else benchmark_schema_json;
+}
+
 const MemoryBreakdown = struct {
     process_resident_bytes: u64 = 0,
     process_footprint_bytes: u64 = 0,
@@ -451,6 +462,9 @@ const QueryBenchStats = struct {
     profile_lookup_doc_key_hits: u64 = 0,
     profile_sort_response_count: u64 = 0,
     profile_sort_native_doc_values_count: u64 = 0,
+    profile_sort_sorted_segment_count: u64 = 0,
+    profile_sort_index_sort_reason_count: u64 = 0,
+    profile_sort_index_sort_covered_count: u64 = 0,
     profile_sort_source_isolated_count: u64 = 0,
     profile_sort_candidate_count: u64 = 0,
     profile_sort_selected_count: u64 = 0,
@@ -568,6 +582,8 @@ const QueryResponseWire = struct {
                 source_load: []const u8 = "",
                 selection_reason: []const u8 = "",
                 native_doc_values_coverage: []const u8 = "",
+                index_sort_coverage: []const u8 = "",
+                index_sort_match: bool = false,
                 candidate_count: u64 = 0,
                 selected_count: u64 = 0,
                 cursor_rejected_count: u64 = 0,
@@ -656,7 +672,7 @@ const FakeStatusSource = struct {
                 .table_id = 1,
                 .name = table_name,
                 .description = "public query guardrail",
-                .schema_json = if (cfg.with_schema or cfg.query_shape.requiresSchema()) benchmark_schema_json else "",
+                .schema_json = if (cfg.with_schema or cfg.query_shape.requiresSchema()) benchmarkSchemaJson(cfg) else "",
                 .read_schema_json = "",
                 .indexes_json = indexes_json,
                 .replication_sources_json = "[]",
@@ -1603,7 +1619,7 @@ fn openAndSeedDb(
     errdefer db.close();
 
     if (cfg.with_schema or cfg.query_shape.requiresSchema()) {
-        var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, benchmark_schema_json);
+        var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, benchmarkSchemaJson(cfg));
         defer parsed_schema.deinit(alloc);
         const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
         defer schema_mod.freeSchema(alloc, runtime_schema);
@@ -1837,7 +1853,7 @@ const ProfiledDenseBenchQuery = struct {
 fn profiledDenseBenchQuery(req: db_mod.types.SearchRequest, query_shape: QueryShape) ?ProfiledDenseBenchQuery {
     switch (query_shape) {
         .dense, .dense_filter, .algebraic_filter => {},
-        .full_text, .sparse_filter, .graph_expand, .hybrid_composed, .hybrid, .hybrid_filter, .hybrid_filter_exclude, .hybrid_filter_exclude_project, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_boolean, .exact_sort_full_text, .exact_sort_filter => return null,
+        .full_text, .sparse_filter, .graph_expand, .hybrid_composed, .hybrid, .hybrid_filter, .hybrid_filter_exclude, .hybrid_filter_exclude_project, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_boolean, .exact_sort_index_sort, .exact_sort_full_text, .exact_sort_filter => return null,
     }
     if (req.sparse != null or req.sparse_queries.len > 0) return null;
     if (req.graph_queries.len > 0) return null;
@@ -2116,6 +2132,9 @@ fn accumulateParsedResponse(stats: *QueryBenchStats, parsed: QueryResponseWire, 
         if (profile.sort) |sort| {
             stats.profile_sort_response_count += 1;
             if (std.mem.eql(u8, sort.plan, "native_doc_values_top_n")) stats.profile_sort_native_doc_values_count += 1;
+            if (std.mem.eql(u8, sort.plan, "sorted_segment_seek")) stats.profile_sort_sorted_segment_count += 1;
+            if (std.mem.eql(u8, sort.selection_reason, "index_sort_sorted_segment_seek")) stats.profile_sort_index_sort_reason_count += 1;
+            if (sort.index_sort_match and std.mem.eql(u8, sort.index_sort_coverage, "covered_with_bounds")) stats.profile_sort_index_sort_covered_count += 1;
             if (std.mem.eql(u8, sort.source_load, "source_free") or
                 std.mem.eql(u8, sort.source_load, "projected_source_after_page"))
             {
@@ -2215,7 +2234,18 @@ fn enforceExactSortGuardrail(cfg: Config, stats: QueryBenchStats) !void {
         );
         return error.ExactSortGuardrailFailed;
     }
-    if (stats.profile_sort_native_doc_values_count != stats.queries) {
+    if (cfg.query_shape == .exact_sort_index_sort) {
+        if (stats.profile_sort_sorted_segment_count != stats.queries or
+            stats.profile_sort_index_sort_reason_count != stats.queries or
+            stats.profile_sort_index_sort_covered_count != stats.queries)
+        {
+            std.debug.print(
+                "public-query guardrail failed: index_sort exact sort did not use covered sorted_segment_seek for every query sorted_segment_count={d} index_sort_reason_count={d} index_sort_covered_count={d} queries={d}\n",
+                .{ stats.profile_sort_sorted_segment_count, stats.profile_sort_index_sort_reason_count, stats.profile_sort_index_sort_covered_count, stats.queries },
+            );
+            return error.ExactSortGuardrailFailed;
+        }
+    } else if (stats.profile_sort_native_doc_values_count != stats.queries) {
         std.debug.print(
             "public-query guardrail failed: exact sort did not use native_doc_values_top_n for every query native_count={d} queries={d}\n",
             .{ stats.profile_sort_native_doc_values_count, stats.queries },
@@ -2284,7 +2314,7 @@ fn publicExactSortTupleReplayable(cfg: Config, doc_id: []const u8, sort_tuple: [
     if (sort_tuple.len != 2) return false;
     if (sort_tuple[1] != .string or !std.mem.eql(u8, sort_tuple[1].string, doc_id)) return false;
     return switch (cfg.query_shape) {
-        .exact_sort_keyword, .exact_sort_datetime => sort_tuple[0] == .string,
+        .exact_sort_keyword, .exact_sort_datetime, .exact_sort_index_sort => sort_tuple[0] == .string,
         .exact_sort_boolean => sort_tuple[0] == .bool,
         else => jsonValueIsReplayableFiniteNumber(sort_tuple[0]),
     };
@@ -2297,7 +2327,7 @@ fn publicExactSortTuplesInOrder(cfg: Config, previous: []const std.json.Value, c
             if (field_order == .lt) return true;
             if (field_order == .gt) return false;
         },
-        .exact_sort_datetime => {
+        .exact_sort_datetime, .exact_sort_index_sort => {
             const field_order = std.mem.order(u8, previous[0].string, current[0].string);
             if (field_order == .gt) return true;
             if (field_order == .lt) return false;
@@ -2930,7 +2960,7 @@ fn seedSwarm(
     var client = api.ApiHttpClient.init(alloc, executor.executor());
 
     const create_table_body = if (cfg.with_schema or cfg.query_shape.requiresSchema())
-        try std.fmt.allocPrint(alloc, "{{\"num_shards\":1,\"description\":\"public query swarm guardrail\",\"schema\":{s}}}", .{benchmark_schema_json})
+        try std.fmt.allocPrint(alloc, "{{\"num_shards\":1,\"description\":\"public query swarm guardrail\",\"schema\":{s}}}", .{benchmarkSchemaJson(cfg)})
     else
         try std.fmt.allocPrint(alloc, "{{\"num_shards\":1,\"description\":\"public query swarm guardrail\"}}", .{});
     defer alloc.free(create_table_body);
@@ -3674,6 +3704,7 @@ fn encodeQueryJson(alloc: std.mem.Allocator, vector: []const f32, source_doc_idx
         cfg.query_shape == .exact_sort_keyword or
         cfg.query_shape == .exact_sort_datetime or
         cfg.query_shape == .exact_sort_boolean or
+        cfg.query_shape == .exact_sort_index_sort or
         cfg.query_shape.usesExactSortCursor())
     {
         if (wrote_field) try out.append(alloc, ',');
@@ -3716,7 +3747,7 @@ fn encodeQueryJson(alloc: std.mem.Allocator, vector: []const f32, source_doc_idx
 fn appendExactSortOrderByJson(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, cfg: Config) !void {
     switch (cfg.query_shape) {
         .exact_sort_keyword => try out.appendSlice(alloc, ",\"order_by\":[{\"field\":\"category\",\"desc\":false}]"),
-        .exact_sort_datetime => try out.appendSlice(alloc, ",\"order_by\":[{\"field\":\"created_at\",\"desc\":true}]"),
+        .exact_sort_datetime, .exact_sort_index_sort => try out.appendSlice(alloc, ",\"order_by\":[{\"field\":\"created_at\",\"desc\":true}]"),
         .exact_sort_boolean => try out.appendSlice(alloc, ",\"order_by\":[{\"field\":\"active\",\"desc\":false}]"),
         else => try out.appendSlice(alloc, ",\"order_by\":[{\"field\":\"score\",\"desc\":true}]"),
     }
@@ -3847,7 +3878,7 @@ fn printPublicQuerySymbolicFilterProfile(cfg: Config, stats: QueryBenchStats) vo
 fn printPublicQuerySortProfile(cfg: Config, stats: QueryBenchStats) void {
     if (!cfg.query_shape.usesExactSort() and stats.profile_sort_response_count == 0) return;
     std.debug.print(
-        "public_query_sort_profile query_shape={s} exact_sort={} profile_response_rate={d:.4} sort_profile_rate={d:.4} sort_tuple_rate={d:.4} sort_tuple_valid_rate={d:.4} sort_order_checks={d} sort_order_violations={d} native_doc_values_rate={d:.4} source_isolated_rate={d:.4} candidates={d:.2} selected={d:.2} cursor_rejected={d:.2} native_doc_value_hits={d:.2} native_doc_value_misses={d:.2} stored_json_loads={d:.2} projected_source_loads={d:.2}\n",
+        "public_query_sort_profile query_shape={s} exact_sort={} profile_response_rate={d:.4} sort_profile_rate={d:.4} sort_tuple_rate={d:.4} sort_tuple_valid_rate={d:.4} sort_order_checks={d} sort_order_violations={d} native_doc_values_rate={d:.4} sorted_segment_rate={d:.4} index_sort_covered_rate={d:.4} source_isolated_rate={d:.4} candidates={d:.2} selected={d:.2} cursor_rejected={d:.2} native_doc_value_hits={d:.2} native_doc_value_misses={d:.2} stored_json_loads={d:.2} projected_source_loads={d:.2}\n",
         .{
             cfg.query_shape.text(),
             cfg.query_shape.usesExactSort(),
@@ -3858,6 +3889,8 @@ fn printPublicQuerySortProfile(cfg: Config, stats: QueryBenchStats) void {
             stats.response_sort_order_check_count,
             stats.response_sort_order_violation_count,
             rate(stats.profile_sort_native_doc_values_count, stats.queries),
+            rate(stats.profile_sort_sorted_segment_count, stats.queries),
+            rate(stats.profile_sort_index_sort_covered_count, stats.queries),
             rate(stats.profile_sort_source_isolated_count, stats.queries),
             avgPerQuery(stats, stats.profile_sort_candidate_count),
             avgPerQuery(stats, stats.profile_sort_selected_count),
@@ -3869,7 +3902,7 @@ fn printPublicQuerySortProfile(cfg: Config, stats: QueryBenchStats) void {
         },
     );
     std.debug.print(
-        "{{\"event\":\"public_query_sort_profile\",\"query_shape\":\"{s}\",\"exact_sort\":{},\"profile_response_rate\":{d:.6},\"sort_profile_rate\":{d:.6},\"sort_tuple_rate\":{d:.6},\"sort_tuple_valid_rate\":{d:.6},\"sort_order_checks\":{d},\"sort_order_violations\":{d},\"native_doc_values_rate\":{d:.6},\"source_isolated_rate\":{d:.6},\"candidate_count_avg\":{d:.3},\"selected_count_avg\":{d:.3},\"cursor_rejected_avg\":{d:.3},\"native_doc_value_hits_avg\":{d:.3},\"native_doc_value_misses_avg\":{d:.3},\"stored_json_loads_avg\":{d:.3},\"projected_source_loads_avg\":{d:.3}}}\n",
+        "{{\"event\":\"public_query_sort_profile\",\"query_shape\":\"{s}\",\"exact_sort\":{},\"profile_response_rate\":{d:.6},\"sort_profile_rate\":{d:.6},\"sort_tuple_rate\":{d:.6},\"sort_tuple_valid_rate\":{d:.6},\"sort_order_checks\":{d},\"sort_order_violations\":{d},\"native_doc_values_rate\":{d:.6},\"sorted_segment_rate\":{d:.6},\"index_sort_covered_rate\":{d:.6},\"source_isolated_rate\":{d:.6},\"candidate_count_avg\":{d:.3},\"selected_count_avg\":{d:.3},\"cursor_rejected_avg\":{d:.3},\"native_doc_value_hits_avg\":{d:.3},\"native_doc_value_misses_avg\":{d:.3},\"stored_json_loads_avg\":{d:.3},\"projected_source_loads_avg\":{d:.3}}}\n",
         .{
             cfg.query_shape.text(),
             cfg.query_shape.usesExactSort(),
@@ -3880,6 +3913,8 @@ fn printPublicQuerySortProfile(cfg: Config, stats: QueryBenchStats) void {
             stats.response_sort_order_check_count,
             stats.response_sort_order_violation_count,
             rate(stats.profile_sort_native_doc_values_count, stats.queries),
+            rate(stats.profile_sort_sorted_segment_count, stats.queries),
+            rate(stats.profile_sort_index_sort_covered_count, stats.queries),
             rate(stats.profile_sort_source_isolated_count, stats.queries),
             avgPerQuery(stats, stats.profile_sort_candidate_count),
             avgPerQuery(stats, stats.profile_sort_selected_count),
