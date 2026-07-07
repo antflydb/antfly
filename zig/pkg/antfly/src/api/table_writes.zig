@@ -22627,27 +22627,6 @@ test "provisioned runtime status overlays live writer replay target without repu
     defer alloc.free(replica_root_dir);
     const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
     defer alloc.free(path);
-    const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, Catalog.iface(), "docs", 7001);
-
-    {
-        var seeded = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndIdentity(
-            alloc,
-            path,
-            "{\"indexes\":[{\"name\":\"dv_v1\",\"type\":\"embeddings\",\"config\":{\"field\":\"embedding\",\"dims\":2}}]}",
-            null,
-            null,
-            0,
-            null,
-            .writer_no_replay,
-            null,
-            identity_namespace,
-        );
-        defer seeded.close();
-        _ = try seeded.batch(.{
-            .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"embedding\":[1,2]}" }},
-            .sync_level = .write,
-        });
-    }
 
     var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
     defer snapshot_cache.deinit();
@@ -22658,25 +22637,15 @@ test "provisioned runtime status overlays live writer replay target without repu
     source.write_cache = &write_cache;
     source.runtime_status_cache = &snapshot_cache;
 
-    {
-        var initial = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndIdentity(
-            alloc,
-            path,
-            "{\"indexes\":[{\"name\":\"dv_v1\",\"type\":\"embeddings\",\"config\":{\"field\":\"embedding\",\"dims\":2}}]}",
-            null,
-            null,
-            0,
-            null,
-            .writer_no_replay,
-            null,
-            identity_namespace,
-        );
-        defer initial.close();
-        try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, &initial));
-    }
-
     var cached = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 0, "docs");
     defer cached.deinit(alloc);
+    _ = try cached.db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"embedding\":[1,2]}" }},
+        .sync_level = .write,
+    });
+    try cached.db.runDerivedUntil(cached.db.core.nextDerivedSequence());
+    try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, &cached.db));
+
     _ = try cached.db.batch(.{
         .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\",\"embedding\":[2,3]}" }},
         .sync_level = .write,
@@ -22726,7 +22695,7 @@ test "provisioned runtime status live replay overlay clears ambiguous replay-onl
                 .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
                 .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
                 .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
-                .merge_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
             };
         }
 
@@ -22740,27 +22709,6 @@ test "provisioned runtime status live replay overlay clears ambiguous replay-onl
     defer alloc.free(replica_root_dir);
     const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
     defer alloc.free(path);
-    const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, Catalog.iface(), "docs", 7001);
-
-    {
-        var seeded = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndIdentity(
-            alloc,
-            path,
-            "{\"indexes\":[{\"name\":\"dv_v1\",\"type\":\"embeddings\",\"config\":{\"field\":\"embedding\",\"dims\":2}}]}",
-            null,
-            null,
-            0,
-            null,
-            .writer_no_replay,
-            null,
-            identity_namespace,
-        );
-        defer seeded.close();
-        _ = try seeded.batch(.{
-            .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"embedding\":[1,2]}" }},
-            .sync_level = .write,
-        });
-    }
 
     var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
     defer snapshot_cache.deinit();
@@ -22771,22 +22719,14 @@ test "provisioned runtime status live replay overlay clears ambiguous replay-onl
     source.write_cache = &write_cache;
     source.runtime_status_cache = &snapshot_cache;
 
-    {
-        var initial = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndIdentity(
-            alloc,
-            path,
-            "{\"indexes\":[{\"name\":\"dv_v1\",\"type\":\"embeddings\",\"config\":{\"field\":\"embedding\",\"dims\":2}}]}",
-            null,
-            null,
-            0,
-            null,
-            .writer_no_replay,
-            null,
-            identity_namespace,
-        );
-        defer initial.close();
-        try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, &initial));
-    }
+    var cached = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 0, "docs");
+    defer cached.deinit(alloc);
+    _ = try cached.db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"embedding\":[1,2]}" }},
+        .sync_level = .write,
+    });
+    try cached.db.runDerivedUntil(cached.db.core.nextDerivedSequence());
+    try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, &cached.db));
 
     {
         var cached_statuses = (try snapshot_cache.snapshot(alloc, "docs")).?;
@@ -22803,8 +22743,6 @@ test "provisioned runtime status live replay overlay clears ambiguous replay-onl
         try snapshot_cache.upsertGroupStatus("docs", cached_statuses.items[0]);
     }
 
-    var cached = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 0, "docs");
-    defer cached.deinit(alloc);
     _ = try cached.db.batch(.{
         .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\",\"embedding\":[2,3]}" }},
         .sync_level = .write,
@@ -22849,7 +22787,7 @@ test "provisioned runtime status live replay overlay preserves non-replay backfi
                 .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
                 .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
                 .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
-                .merge_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
             };
         }
 
@@ -22863,27 +22801,6 @@ test "provisioned runtime status live replay overlay preserves non-replay backfi
     defer alloc.free(replica_root_dir);
     const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
     defer alloc.free(path);
-    const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, Catalog.iface(), "docs", 7001);
-
-    {
-        var seeded = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndIdentity(
-            alloc,
-            path,
-            "{\"indexes\":[{\"name\":\"dv_v1\",\"type\":\"embeddings\",\"config\":{\"field\":\"embedding\",\"dims\":2}}]}",
-            null,
-            null,
-            0,
-            null,
-            .writer_no_replay,
-            null,
-            identity_namespace,
-        );
-        defer seeded.close();
-        _ = try seeded.batch(.{
-            .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"embedding\":[1,2]}" }},
-            .sync_level = .write,
-        });
-    }
 
     var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
     defer snapshot_cache.deinit();
@@ -22894,22 +22811,14 @@ test "provisioned runtime status live replay overlay preserves non-replay backfi
     source.write_cache = &write_cache;
     source.runtime_status_cache = &snapshot_cache;
 
-    {
-        var initial = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndIdentity(
-            alloc,
-            path,
-            "{\"indexes\":[{\"name\":\"dv_v1\",\"type\":\"embeddings\",\"config\":{\"field\":\"embedding\",\"dims\":2}}]}",
-            null,
-            null,
-            0,
-            null,
-            .writer_no_replay,
-            null,
-            identity_namespace,
-        );
-        defer initial.close();
-        try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, &initial));
-    }
+    var cached = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 0, "docs");
+    defer cached.deinit(alloc);
+    _ = try cached.db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"embedding\":[1,2]}" }},
+        .sync_level = .write,
+    });
+    try cached.db.runDerivedUntil(cached.db.core.nextDerivedSequence());
+    try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, &cached.db));
 
     {
         var cached_statuses = (try snapshot_cache.snapshot(alloc, "docs")).?;
@@ -22927,8 +22836,6 @@ test "provisioned runtime status live replay overlay preserves non-replay backfi
         try snapshot_cache.upsertGroupStatus("docs", cached_statuses.items[0]);
     }
 
-    var cached = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 0, "docs");
-    defer cached.deinit(alloc);
     _ = try cached.db.batch(.{
         .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\",\"embedding\":[2,3]}" }},
         .sync_level = .write,
