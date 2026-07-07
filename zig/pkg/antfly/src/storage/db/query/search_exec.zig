@@ -7561,6 +7561,7 @@ fn nextSortedSegmentHeadAlloc(
     iterator_index: usize,
     iterators: []SortedSegmentIterator,
     constraints: *const NativeDocIdConstraints,
+    constraint_membership: ?*const NativeDocIdConstraintMembership,
     membership: ?*const SortedSegmentDocMembership,
     executor: MatchAllExecutor,
     native_loader: NativeSortValueLoader,
@@ -7608,7 +7609,7 @@ fn nextSortedSegmentHeadAlloc(
             .id = @constCast(stored.id),
             .ordinal = ordinal,
         };
-        if (!matchAllCandidateAllowed(candidate, constraints)) continue;
+        if (!matchAllCandidateAllowedWithMembership(candidate, constraints, constraint_membership)) continue;
         if (profile) |p| p.candidate_count += 1;
 
         var decorated = try decorateSortedSegmentDocAlloc(
@@ -7666,6 +7667,8 @@ fn countSortedSegmentVisibleCandidatesAlloc(
     const scan_budget = sortedSegmentScanBudget();
     var scanned_count: u64 = 0;
     if (profile) |p| p.sorted_segment_scan_budget = scan_budget;
+    var constraint_membership = try NativeDocIdConstraintMembership.initAlloc(alloc, constraints);
+    defer constraint_membership.deinit(alloc);
 
     var iterators = std.ArrayListUnmanaged(SortedSegmentIterator).empty;
     defer iterators.deinit(alloc);
@@ -7703,6 +7706,7 @@ fn countSortedSegmentVisibleCandidatesAlloc(
             iterator_index,
             iterators.items,
             constraints,
+            &constraint_membership,
             membership,
             executor,
             native_loader,
@@ -7815,6 +7819,8 @@ fn sortAndPageMatchAllSortedSegmentsAlloc(
         profile.window_capacity = sortWindowCapacity(effective_req);
         profile.sorted_segment_scan_budget = scan_budget;
     }
+    var constraint_membership = try NativeDocIdConstraintMembership.initAlloc(alloc, constraints);
+    defer constraint_membership.deinit(alloc);
 
     var iterators = std.ArrayListUnmanaged(SortedSegmentIterator).empty;
     defer iterators.deinit(alloc);
@@ -7858,6 +7864,7 @@ fn sortAndPageMatchAllSortedSegmentsAlloc(
             iterator_index,
             iterators.items,
             constraints,
+            &constraint_membership,
             membership,
             executor,
             native_loader,
@@ -7912,6 +7919,7 @@ fn sortAndPageMatchAllSortedSegmentsAlloc(
             iterator_index,
             iterators.items,
             constraints,
+            &constraint_membership,
             membership,
             executor,
             native_loader,
@@ -8484,6 +8492,71 @@ const BorrowedDocIdSet = struct {
 
     fn contains(self: *const BorrowedDocIdSet, doc_id: []const u8) bool {
         return self.map.contains(doc_id);
+    }
+};
+
+const BorrowedDocNumSet = struct {
+    map: std.AutoHashMapUnmanaged(u32, void) = .empty,
+
+    fn initAlloc(alloc: Allocator, doc_nums: []const u32) !BorrowedDocNumSet {
+        var out = BorrowedDocNumSet{};
+        errdefer out.deinit(alloc);
+        for (doc_nums) |doc_num| try out.map.put(alloc, doc_num, {});
+        return out;
+    }
+
+    fn deinit(self: *BorrowedDocNumSet, alloc: Allocator) void {
+        self.map.deinit(alloc);
+        self.* = undefined;
+    }
+
+    fn contains(self: *const BorrowedDocNumSet, doc_num: u32) bool {
+        return self.map.contains(doc_num);
+    }
+};
+
+const NativeDocIdConstraintMembership = struct {
+    filter_doc_ids: ?BorrowedDocIdSet = null,
+    exclude_doc_ids: ?BorrowedDocIdSet = null,
+    filter_doc_nums: ?BorrowedDocNumSet = null,
+    exclude_doc_nums: ?BorrowedDocNumSet = null,
+
+    fn initAlloc(alloc: Allocator, constraints: *const NativeDocIdConstraints) !NativeDocIdConstraintMembership {
+        var out = NativeDocIdConstraintMembership{};
+        errdefer out.deinit(alloc);
+        if (constraints.filter_doc_ids.len > 0) out.filter_doc_ids = try BorrowedDocIdSet.initAlloc(alloc, constraints.filter_doc_ids);
+        if (constraints.exclude_doc_ids.len > 0) out.exclude_doc_ids = try BorrowedDocIdSet.initAlloc(alloc, constraints.exclude_doc_ids);
+        if (constraints.filter_doc_nums.len > 0) out.filter_doc_nums = try BorrowedDocNumSet.initAlloc(alloc, constraints.filter_doc_nums);
+        if (constraints.exclude_doc_nums.len > 0) out.exclude_doc_nums = try BorrowedDocNumSet.initAlloc(alloc, constraints.exclude_doc_nums);
+        return out;
+    }
+
+    fn deinit(self: *NativeDocIdConstraintMembership, alloc: Allocator) void {
+        if (self.filter_doc_ids) |*set| set.deinit(alloc);
+        if (self.exclude_doc_ids) |*set| set.deinit(alloc);
+        if (self.filter_doc_nums) |*set| set.deinit(alloc);
+        if (self.exclude_doc_nums) |*set| set.deinit(alloc);
+        self.* = undefined;
+    }
+
+    fn containsFilterDocId(self: *const NativeDocIdConstraintMembership, id: []const u8) bool {
+        if (self.filter_doc_ids) |*set| return set.contains(id);
+        return false;
+    }
+
+    fn containsExcludeDocId(self: *const NativeDocIdConstraintMembership, id: []const u8) bool {
+        if (self.exclude_doc_ids) |*set| return set.contains(id);
+        return false;
+    }
+
+    fn containsFilterDocNum(self: *const NativeDocIdConstraintMembership, doc_num: u32) bool {
+        if (self.filter_doc_nums) |*set| return set.contains(doc_num);
+        return false;
+    }
+
+    fn containsExcludeDocNum(self: *const NativeDocIdConstraintMembership, doc_num: u32) bool {
+        if (self.exclude_doc_nums) |*set| return set.contains(doc_num);
+        return false;
     }
 };
 
@@ -13350,6 +13423,9 @@ fn sortAndPageMatchAllOrdinalDocValueCandidatesAlloc(
         .require_native = plan.require_native,
         .load = loadTextDocValueSortValue,
     };
+    var constraint_membership = try NativeDocIdConstraintMembership.initAlloc(alloc, constraints);
+    defer constraint_membership.deinit(alloc);
+
     var total_hits: u32 = 0;
     for (constraints.filter_doc_nums, 0..) |ordinal, i| {
         if (i % 1024 == 0) try checkSearchRequestDeadline(effective_req);
@@ -13366,7 +13442,7 @@ fn sortAndPageMatchAllOrdinalDocValueCandidatesAlloc(
             .id = @constCast(stored.id),
             .ordinal = ordinal,
         };
-        if (!matchAllCandidateAllowed(candidate, constraints)) continue;
+        if (!matchAllCandidateAllowedWithMembership(candidate, constraints, &constraint_membership)) continue;
         if (executor.is_expired_key) |is_expired| {
             if (try is_expired(executor.ctx, alloc, stored.id)) continue;
         }
@@ -13476,6 +13552,9 @@ fn visibleMatchAllOrdinalDocValueCandidateCount(
     ordinal_to_text_doc_id: *const std.AutoHashMapUnmanaged(doc_set.DocOrdinal, u32),
 ) !usize {
     var visible_count: usize = 0;
+    var constraint_membership = try NativeDocIdConstraintMembership.initAlloc(alloc, constraints);
+    defer constraint_membership.deinit(alloc);
+
     for (constraints.filter_doc_nums, 0..) |ordinal, i| {
         if (i % 1024 == 0) try checkSearchRequestDeadline(req);
         const doc_num = ordinal_to_text_doc_id.get(ordinal) orelse {
@@ -13491,7 +13570,7 @@ fn visibleMatchAllOrdinalDocValueCandidateCount(
             .id = @constCast(stored.id),
             .ordinal = ordinal,
         };
-        if (!matchAllCandidateAllowed(candidate, constraints)) continue;
+        if (!matchAllCandidateAllowedWithMembership(candidate, constraints, &constraint_membership)) continue;
         if (executor.is_expired_key) |is_expired| {
             if (try is_expired(executor.ctx, alloc, stored.id)) continue;
         }
@@ -13994,9 +14073,12 @@ fn applyMatchAllDocIdConstraintsAlloc(
 ) !void {
     if (!constraints.positive_filter and constraints.exclude_doc_ids.len == 0 and constraints.exclude_doc_nums.len == 0) return;
 
+    var membership = try NativeDocIdConstraintMembership.initAlloc(alloc, constraints);
+    defer membership.deinit(alloc);
+
     var keep_count: usize = 0;
     for (candidates.items) |candidate| {
-        if (matchAllCandidateAllowed(candidate, constraints)) keep_count += 1;
+        if (matchAllCandidateAllowedWithMembership(candidate, constraints, &membership)) keep_count += 1;
     }
     if (keep_count == candidates.items.len) return;
 
@@ -14008,7 +14090,7 @@ fn applyMatchAllDocIdConstraintsAlloc(
     }
 
     for (candidates.items) |*candidate| {
-        if (matchAllCandidateAllowed(candidate.*, constraints)) {
+        if (matchAllCandidateAllowedWithMembership(candidate.*, constraints, &membership)) {
             filtered[initialized] = candidate.*;
             candidate.id = @constCast(&[_]u8{});
             initialized += 1;
@@ -14025,19 +14107,79 @@ fn matchAllCandidateAllowed(
     candidate: MatchAllCandidate,
     constraints: *const NativeDocIdConstraints,
 ) bool {
+    return matchAllCandidateAllowedWithMembership(candidate, constraints, null);
+}
+
+fn matchAllCandidateAllowedWithMembership(
+    candidate: MatchAllCandidate,
+    constraints: *const NativeDocIdConstraints,
+    membership: ?*const NativeDocIdConstraintMembership,
+) bool {
     if (constraints.positive_filter) {
         if (constraints.filter_doc_ids.len == 0 and constraints.filter_doc_nums.len == 0) return false;
-        if (constraints.filter_doc_ids.len > 0 and !containsDocId(constraints.filter_doc_ids, candidate.id)) return false;
+        if (constraints.filter_doc_ids.len > 0) {
+            const contains = if (membership) |m|
+                m.containsFilterDocId(candidate.id)
+            else
+                containsDocId(constraints.filter_doc_ids, candidate.id);
+            if (!contains) return false;
+        }
         if (constraints.filter_doc_nums.len > 0) {
             const ordinal = candidate.ordinal orelse return false;
-            if (!containsDocNum(constraints.filter_doc_nums, ordinal)) return false;
+            const contains = if (membership) |m|
+                m.containsFilterDocNum(ordinal)
+            else
+                containsDocNum(constraints.filter_doc_nums, ordinal);
+            if (!contains) return false;
         }
     }
-    if (containsDocId(constraints.exclude_doc_ids, candidate.id)) return false;
+    if (constraints.exclude_doc_ids.len > 0) {
+        const excluded = if (membership) |m|
+            m.containsExcludeDocId(candidate.id)
+        else
+            containsDocId(constraints.exclude_doc_ids, candidate.id);
+        if (excluded) return false;
+    }
     if (candidate.ordinal) |ordinal| {
-        if (containsDocNum(constraints.exclude_doc_nums, ordinal)) return false;
+        if (constraints.exclude_doc_nums.len > 0) {
+            const excluded = if (membership) |m|
+                m.containsExcludeDocNum(ordinal)
+            else
+                containsDocNum(constraints.exclude_doc_nums, ordinal);
+            if (excluded) return false;
+        }
     }
     return true;
+}
+
+test "native doc id constraint membership matches candidate filtering semantics" {
+    const alloc = std.testing.allocator;
+
+    const filter_doc_ids = [_][]const u8{ "doc:a", "doc:c" };
+    const exclude_doc_ids = [_][]const u8{"doc:c"};
+    const filter_doc_nums = [_]u32{ 30, 10 };
+    const exclude_doc_nums = [_]u32{20};
+    const constraints = NativeDocIdConstraints{
+        .positive_filter = true,
+        .filter_doc_ids = &filter_doc_ids,
+        .exclude_doc_ids = &exclude_doc_ids,
+        .filter_doc_nums = &filter_doc_nums,
+        .exclude_doc_nums = &exclude_doc_nums,
+    };
+
+    var membership = try NativeDocIdConstraintMembership.initAlloc(alloc, &constraints);
+    defer membership.deinit(alloc);
+
+    const allowed = MatchAllCandidate{ .id = @constCast("doc:a"), .ordinal = 10 };
+    const excluded_by_id = MatchAllCandidate{ .id = @constCast("doc:c"), .ordinal = 30 };
+    const missing_id = MatchAllCandidate{ .id = @constCast("doc:b"), .ordinal = 10 };
+    const excluded_by_doc_num = MatchAllCandidate{ .id = @constCast("doc:a"), .ordinal = 20 };
+
+    try std.testing.expect(matchAllCandidateAllowed(allowed, &constraints));
+    try std.testing.expect(matchAllCandidateAllowedWithMembership(allowed, &constraints, &membership));
+    try std.testing.expect(!matchAllCandidateAllowedWithMembership(excluded_by_id, &constraints, &membership));
+    try std.testing.expect(!matchAllCandidateAllowedWithMembership(missing_id, &constraints, &membership));
+    try std.testing.expect(!matchAllCandidateAllowedWithMembership(excluded_by_doc_num, &constraints, &membership));
 }
 
 pub fn collectMatchAllCandidates(
@@ -14055,6 +14197,7 @@ pub fn collectMatchAllCandidatesWithOptions(
     options: MatchAllCandidateCollectOptions,
 ) !MatchAllCandidates {
     var state = try collectMatchAllCandidateStateWithOptions(alloc, req, collector, options, null, null);
+    defer state.constraint_membership.deinit(alloc);
     defer state.seen.deinit(alloc);
     defer state.deinitSeenKeyStorage();
     errdefer state.deinitCandidates();
@@ -14070,6 +14213,7 @@ pub fn streamMatchAllCandidatesWithOptions(
     consumer: MatchAllCandidateConsumer,
 ) !MatchAllCandidateStreamStats {
     var state = try collectMatchAllCandidateStateWithOptions(alloc, req, collector, options, consumer_ctx, consumer);
+    defer state.constraint_membership.deinit(alloc);
     defer state.seen.deinit(alloc);
     defer state.deinitSeenKeyStorage();
     state.deinitCandidates();
@@ -14110,8 +14254,12 @@ fn collectMatchAllCandidateStateWithOptions(
     };
     errdefer {
         state.seen.deinit(alloc);
+        state.constraint_membership.deinit(alloc);
         state.deinitSeenKeyStorage();
         state.deinitCandidates();
+    }
+    if (options.constraints) |constraints| {
+        state.constraint_membership = try NativeDocIdConstraintMembership.initAlloc(alloc, constraints);
     }
 
     if (collector.scan_store_range_with_context) |scan| {
@@ -14243,6 +14391,7 @@ const MatchAllCandidateCollectState = struct {
     candidates: std.ArrayListUnmanaged(MatchAllCandidate) = .empty,
     seen: std.StringHashMapUnmanaged(void) = .{},
     seen_key_storage: std.ArrayListUnmanaged([]u8) = .empty,
+    constraint_membership: NativeDocIdConstraintMembership = .{},
     consumer_ctx: ?*anyopaque = null,
     consumer: ?MatchAllCandidateConsumer = null,
     processed: usize = 0,
@@ -14303,7 +14452,7 @@ const MatchAllCandidateCollectState = struct {
         raw_key = @constCast(&[_]u8{});
 
         if (self.options.constraints) |constraints| {
-            if (!matchAllCandidateAllowed(candidate, constraints)) {
+            if (!matchAllCandidateAllowedWithMembership(candidate, constraints, &self.constraint_membership)) {
                 candidate.deinit(self.alloc);
                 return;
             }
@@ -21398,6 +21547,7 @@ test "match_all sorted segment seek checks deadline while scanning" {
         0,
         &iterators,
         &constraints,
+        null,
         null,
         executor,
         native_loader,
