@@ -8437,10 +8437,12 @@ fn searchQueryCanUseMappedGeoDocValues(
     field: []const u8,
     runtime_schema: ?runtime_schema_mod.TableSchema,
 ) !bool {
-    const schema = runtime_schema orelse return false;
-    const mapping = runtime_schema_mod.resolveDeclaredFieldType(schema, field) orelse return false;
-    if (mapping.field_type != .geopoint) return false;
-    if (!runtime_schema_mod.mappingHasNativeDocValues(mapping)) return false;
+    if (runtime_schema) |schema| {
+        if (runtime_schema_mod.resolveDeclaredFieldType(schema, field)) |mapping| {
+            if (mapping.field_type != .geopoint) return false;
+            if (!runtime_schema_mod.mappingHasNativeDocValues(mapping)) return false;
+        }
+    }
     return try snapshotGeoPointDocValuesCoverage(snapshot, field) == .covered;
 }
 
@@ -18512,6 +18514,72 @@ test "native sort coverage diagnostics classify physical doc value failures" {
             try snapshotTypedDocValuesCoverageForMapping(snapshot, "price", numeric_mapping),
         );
     }
+}
+
+test "geo structured filters require covered geo doc values for native filter planning" {
+    const alloc = std.testing.allocator;
+
+    var geo_writer = typed_dv.TypedDocValuesWriter.init(alloc, .geo_point, 1024);
+    defer geo_writer.deinit();
+    try geo_writer.add(0, .{ .geo_point = .{ .lat = 37.7749, .lon = -122.4194 } });
+    try geo_writer.add(1, .{ .geo_point = .{ .lat = 37.7750, .lon = -122.4195 } });
+    const geo_data = try geo_writer.build();
+    defer alloc.free(geo_data);
+
+    var geo_seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer geo_seg_writer.deinit();
+    const location_idx = try geo_seg_writer.addField("location");
+    try geo_seg_writer.addSection(location_idx, .typed_doc_values, geo_data);
+    try geo_seg_writer.addStoredDoc("doc:a", "{\"location\":{\"lat\":37.7749,\"lon\":-122.4194}}");
+    try geo_seg_writer.addStoredDoc("doc:b", "{\"location\":{\"lat\":37.7750,\"lon\":-122.4195}}");
+    const geo_seg_bytes = try geo_seg_writer.build();
+    defer alloc.free(geo_seg_bytes);
+
+    var geo_index = try index_mod.IndexWriter.init(alloc);
+    defer geo_index.deinit();
+    try geo_index.addSegment(geo_seg_bytes);
+    const geo_snapshot = geo_index.snapshot();
+
+    try std.testing.expectEqual(
+        TypedDocValuesCoverageStatus.covered,
+        try snapshotGeoPointDocValuesCoverage(geo_snapshot, "location"),
+    );
+    try std.testing.expect(try searchQueryCanUseMappedGeoDocValues(geo_snapshot, "location", null));
+
+    const geo_schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &[_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "location",
+        .path_match = "location",
+        .mapping = .{
+            .field_type = .geopoint,
+            .doc_values = true,
+            .sortable = false,
+            .analyzer = "standard",
+        },
+    }} };
+    try std.testing.expect(try searchQueryCanUseMappedGeoDocValues(geo_snapshot, "location", geo_schema));
+
+    const numeric_schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &[_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "location",
+        .path_match = "location",
+        .mapping = .{
+            .field_type = .numeric,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }} };
+    try std.testing.expect(!try searchQueryCanUseMappedGeoDocValues(geo_snapshot, "location", numeric_schema));
+
+    var missing_seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer missing_seg_writer.deinit();
+    try missing_seg_writer.addStoredDoc("doc:a", "{\"location\":{\"lat\":37.7749,\"lon\":-122.4194}}");
+    const missing_seg_bytes = try missing_seg_writer.build();
+    defer alloc.free(missing_seg_bytes);
+
+    var missing_index = try index_mod.IndexWriter.init(alloc);
+    defer missing_index.deinit();
+    try missing_index.addSegment(missing_seg_bytes);
+    try std.testing.expect(!try searchQueryCanUseMappedGeoDocValues(missing_index.snapshot(), "location", null));
 }
 
 test "native text sort validation rejects sparse typed doc values for live docs" {
