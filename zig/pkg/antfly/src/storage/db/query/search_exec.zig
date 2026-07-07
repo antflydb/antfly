@@ -6812,6 +6812,7 @@ fn sortAndPageMatchAllCandidateStreamAlloc(
     const bench_query_profile = shouldLogBenchQueryProfile();
     const collect_sort_profile = bench_query_profile or effective_req.profile;
     if (effective_req.limit == 0) {
+        const count_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
         var count_ctx = MatchAllCountStreamContext{
             .alloc = alloc,
             .req = effective_req,
@@ -6827,7 +6828,7 @@ fn sortAndPageMatchAllCandidateStreamAlloc(
             profile.candidate_count = @intCast(@min(count_ctx.accepted_count, @as(usize, std.math.maxInt(u64))));
             profile.window_capacity = 0;
             profile.window_len = 0;
-            profile.total_ns = 0;
+            profile.total_ns = platform_time.monotonicNs() - count_start_ns;
         }
         if (bench_query_profile) {
             logBenchSortCollectorProfile(effective_req, plan, native_loader != null, profile);
@@ -22254,6 +22255,135 @@ test "match_all stream sort enforces exact budget before decorating overflow can
     try std.testing.expectEqualStrings("ft", diagnostic.field);
     try std.testing.expectEqualStrings("candidate_budget_exceeded", diagnostic.reason);
     try std.testing.expectEqualStrings("match_all_exact_candidate_window", diagnostic.detail);
+}
+
+test "match_all native stream sort zero limit counts without decoration" {
+    const alloc = std.testing.allocator;
+
+    const Harness = struct {
+        ids: []const []const u8,
+        attempted_count: usize = 0,
+        accepted_count: usize = 0,
+
+        fn collectCandidates(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: MatchAllCandidateCollectOptions,
+        ) anyerror!MatchAllCandidates {
+            return error.UnexpectedTestCall;
+        }
+
+        fn collectStream(
+            ctx: ?*anyopaque,
+            collect_alloc: Allocator,
+            req: types.SearchRequest,
+            options: MatchAllCandidateCollectOptions,
+            consumer_ctx: ?*anyopaque,
+            consumer: MatchAllCandidateConsumer,
+        ) anyerror!MatchAllCandidateStreamStats {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            _ = req;
+            for (self.ids, 0..) |id, i| {
+                self.attempted_count += 1;
+                if (options.candidate_limit) |limit| {
+                    if (self.accepted_count >= limit) return error.QueryCandidateBudgetExceeded;
+                }
+                var candidate = MatchAllCandidate{
+                    .id = try collect_alloc.dupe(u8, id),
+                    .ordinal = @intCast(i + 1),
+                };
+                errdefer candidate.deinit(collect_alloc);
+                try consumer(consumer_ctx, candidate);
+                candidate.id = @constCast(&[_]u8{});
+                self.accepted_count += 1;
+            }
+            return .{ .accepted_count = self.accepted_count, .stopped_early = false };
+        }
+
+        fn textIndexEntry(
+            _: ?*anyopaque,
+            _: ?[]const u8,
+        ) anyerror!?*index_manager_mod.IndexManager.TextIndex {
+            return error.UnexpectedTestCall;
+        }
+
+        fn loadProjectedDocument(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: []const u8,
+        ) anyerror![]u8 {
+            return error.UnexpectedTestCall;
+        }
+    };
+
+    const Loader = struct {
+        load_count: usize = 0,
+
+        fn load(ctx: ?*anyopaque, _: Allocator, _: types.SearchHit, field: []const u8) anyerror!?SortValue {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.load_count += 1;
+            try std.testing.expectEqualStrings("rank", field);
+            return error.UnexpectedTestCall;
+        }
+    };
+
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "rank",
+        .path_match = "rank",
+        .mapping = .{
+            .field_type = .numeric,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+
+    var harness = Harness{ .ids = &.{ "doc:a", "doc:b", "doc:c" } };
+    var loader = Loader{};
+    const order_by = [_]types.SortField{.{ .field = "rank" }};
+    const executor = MatchAllExecutor{
+        .ctx = &harness,
+        .collect_candidates = Harness.collectCandidates,
+        .collect_candidates_stream = Harness.collectStream,
+        .text_index_entry = Harness.textIndexEntry,
+        .load_projected_document = Harness.loadProjectedDocument,
+        .load_stored = testUnexpectedLoadStoredCallback,
+    };
+
+    var result = try sortAndPageMatchAllCandidateStreamAlloc(alloc, .{
+        .index_name = "ft",
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 0,
+    }, executor, .{
+        .candidate_limit = 1,
+    }, .{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .runtime_schema = schema,
+    }, .{
+        .ctx = &loader,
+        .require_native = true,
+        .load = Loader.load,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), harness.attempted_count);
+    try std.testing.expectEqual(@as(usize, 3), harness.accepted_count);
+    try std.testing.expectEqual(@as(usize, 0), loader.load_count);
+    try std.testing.expectEqual(@as(usize, 0), result.hits.len);
+    try std.testing.expectEqual(@as(u32, 3), result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, result.total_hits_relation);
+    const profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", profile.plan);
+    try std.testing.expectEqual(@as(u64, 3), profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 0), profile.native_doc_value_hit_count);
+    try std.testing.expectEqual(@as(u64, 0), profile.native_doc_value_miss_count);
+    try std.testing.expectEqual(@as(u64, 0), profile.stored_json_load_count);
 }
 
 test "match_all supports id-only sort without native doc values" {
