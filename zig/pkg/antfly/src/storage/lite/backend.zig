@@ -23,6 +23,7 @@ const bridge = @import("bridge.zig");
 const capabilities = @import("capabilities.zig");
 const docstore = @import("docstore.zig");
 const index_storage = @import("index_storage.zig");
+const resource_manager_mod = @import("../resource_manager.zig");
 
 const Allocator = std.mem.Allocator;
 const native_index_base_path = "__antfly_lite";
@@ -63,11 +64,13 @@ pub const OpenOptions = struct {
     engine: EngineSelection = .auto,
     read_only: bool = false,
     no_sync: bool = false,
+    resource_manager: ?*resource_manager_mod.ResourceManager = null,
 };
 
 pub const CreateOptions = struct {
     exclusive: bool = false,
     no_sync: bool = false,
+    resource_manager: ?*resource_manager_mod.ResourceManager = null,
 };
 
 pub fn isAflitePath(path: []const u8) bool {
@@ -124,6 +127,7 @@ pub const Handle = struct {
     native_docstore: ?*docstore.Store = null,
     native_index_storage: ?*index_storage.Store = null,
     native_runtime_store: ?*backend_erased.Store = null,
+    owned_resource_manager: ?*resource_manager_mod.ResourceManager = null,
 
     pub fn open(allocator: Allocator, path: []const u8, opts: OpenOptions) !Handle {
         if (!isAflitePath(path)) return error.InvalidArgument;
@@ -173,6 +177,10 @@ pub const Handle = struct {
                     self.allocator.destroy(store);
                     self.native_docstore = null;
                 }
+                if (self.owned_resource_manager) |manager| {
+                    self.allocator.destroy(manager);
+                    self.owned_resource_manager = null;
+                }
             },
         }
         self.* = undefined;
@@ -190,6 +198,9 @@ pub const Handle = struct {
                 opts.external_derived_checkpoints = false;
             },
             .native_single_file => {
+                if (opts.resource_manager == null) {
+                    opts.resource_manager = self.native_docstore.?.resource_manager;
+                }
                 opts.primary_backend = .{ .mem = .{} };
                 opts.primary_runtime_store = self.native_runtime_store.?;
                 const storage = self.native_index_storage.?.storage();
@@ -294,29 +305,55 @@ fn openBridgeLsmContainer(allocator: Allocator, path: []const u8, opts: OpenOpti
 }
 
 fn openNativeSingleFile(allocator: Allocator, path: []const u8, opts: OpenOptions) !Handle {
-    var initial_store = try docstore.Store.openWithOptions(allocator, path, .{
+    var owned_resource_manager: ?*resource_manager_mod.ResourceManager = null;
+    const resource_manager = opts.resource_manager orelse blk: {
+        const manager = try allocator.create(resource_manager_mod.ResourceManager);
+        manager.* = resource_manager_mod.ResourceManager.init(.{});
+        owned_resource_manager = manager;
+        break :blk manager;
+    };
+    errdefer if (owned_resource_manager) |manager| allocator.destroy(manager);
+
+    const initial_store = try docstore.Store.openWithOptions(allocator, path, .{
         .read_only = opts.read_only,
         .no_sync = opts.no_sync,
+        .resource_manager = resource_manager,
     });
-    errdefer initial_store.close();
-    return try initNativeSingleFile(allocator, &initial_store);
+    return try initNativeSingleFile(allocator, initial_store, owned_resource_manager);
 }
 
 fn createNativeSingleFile(allocator: Allocator, path: []const u8, opts: CreateOptions) !Handle {
-    var initial_store = try docstore.Store.createWithOptions(allocator, path, .{
+    var owned_resource_manager: ?*resource_manager_mod.ResourceManager = null;
+    const resource_manager = opts.resource_manager orelse blk: {
+        const manager = try allocator.create(resource_manager_mod.ResourceManager);
+        manager.* = resource_manager_mod.ResourceManager.init(.{});
+        owned_resource_manager = manager;
+        break :blk manager;
+    };
+    errdefer if (owned_resource_manager) |manager| allocator.destroy(manager);
+
+    const initial_store = try docstore.Store.createWithOptions(allocator, path, .{
         .exclusive = opts.exclusive,
         .no_sync = opts.no_sync,
+        .resource_manager = resource_manager,
     });
-    errdefer initial_store.close();
-    return try initNativeSingleFile(allocator, &initial_store);
+    return try initNativeSingleFile(allocator, initial_store, owned_resource_manager);
 }
 
-fn initNativeSingleFile(allocator: Allocator, initial_store: *docstore.Store) !Handle {
+fn initNativeSingleFile(
+    allocator: Allocator,
+    initial_store: docstore.Store,
+    owned_resource_manager: ?*resource_manager_mod.ResourceManager,
+) !Handle {
+    var store_owner = initial_store;
+    var close_store_owner = true;
+    errdefer if (close_store_owner) store_owner.close();
+
     const store = try allocator.create(docstore.Store);
     errdefer allocator.destroy(store);
 
-    store.* = initial_store.*;
-    initial_store.* = undefined;
+    store.* = store_owner;
+    close_store_owner = false;
     errdefer store.close();
 
     const native_index_storage = try allocator.create(index_storage.Store);
@@ -335,6 +372,7 @@ fn initNativeSingleFile(allocator: Allocator, initial_store: *docstore.Store) !H
         .native_docstore = store,
         .native_index_storage = native_index_storage,
         .native_runtime_store = runtime_store,
+        .owned_resource_manager = owned_resource_manager,
     };
 }
 
@@ -619,6 +657,9 @@ test "lite backend native engine creates and checks aflite file" {
 
     var db_opts = db_mod.OpenOptions{};
     try handle.configureDbOpenOptions(&db_opts);
+    try std.testing.expect(handle.owned_resource_manager != null);
+    try std.testing.expect(handle.native_docstore.?.resource_manager == handle.owned_resource_manager.?);
+    try std.testing.expect(db_opts.resource_manager == handle.owned_resource_manager.?);
     try std.testing.expect(db_opts.primary_runtime_store != null);
     try std.testing.expect(db_opts.primary_backend == .mem);
     try std.testing.expectEqual(@as(@TypeOf(db_opts.index_backends.text_main_backend), .lsm), db_opts.index_backends.text_main_backend);
