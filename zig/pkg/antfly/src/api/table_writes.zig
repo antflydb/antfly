@@ -13791,6 +13791,10 @@ fn overlayRuntimeStatusReplayTargetFromDb(status: *runtime_status.LocalTableRunt
     const async_stats = db.snapshotAsyncIndexingStats();
     status.stats.async_indexing = async_stats;
     for (status.stats.indexes) |*item| {
+        if (db.executor.appliedSequence(item.name)) |live_applied| {
+            item.replay_applied_sequence = @max(item.replay_applied_sequence, live_applied);
+            item.replay_target_sequence = @max(item.replay_target_sequence, live_applied);
+        }
         if (target_sequence > item.replay_target_sequence) {
             item.replay_target_sequence = target_sequence;
             item.catch_up_target_sequence = target_sequence;
@@ -13798,10 +13802,23 @@ fn overlayRuntimeStatusReplayTargetFromDb(status: *runtime_status.LocalTableRunt
         if (item.catch_up_target_sequence < item.replay_target_sequence) {
             item.catch_up_target_sequence = item.replay_target_sequence;
         }
-        item.replay_catch_up_required = item.replay_applied_sequence < item.replay_target_sequence;
         item.catch_up_applied_sequence = item.replay_applied_sequence;
         item.catch_up_active = item.kind == .dense_vector and async_stats.dense_catch_up.active;
         item.catch_up_phase = if (item.kind == .dense_vector) async_stats.dense_catch_up.phase else .idle;
+        item.replay_catch_up_required = item.replay_applied_sequence < item.replay_target_sequence;
+        if (item.catch_up_active or item.replay_catch_up_required) {
+            item.backfill_active = true;
+            if (item.replay_target_sequence > 0) {
+                item.backfill_progress = @min(
+                    1.0,
+                    @as(f64, @floatFromInt(item.replay_applied_sequence)) /
+                        @as(f64, @floatFromInt(item.replay_target_sequence)),
+                );
+            }
+        } else {
+            item.backfill_active = false;
+            if (item.replay_target_sequence > 0) item.backfill_progress = 1.0;
+        }
     }
 }
 
@@ -22631,6 +22648,7 @@ test "provisioned runtime status overlays live writer replay target without repu
         .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\",\"embedding\":[2,3]}" }},
         .sync_level = .write,
     });
+    try cached.db.runDerivedUntil(cached.db.core.nextDerivedSequence());
 
     var cached_only = (try snapshot_cache.snapshot(alloc, "docs")).?;
     defer cached_only.deinit(alloc);
@@ -22641,7 +22659,9 @@ test "provisioned runtime status overlays live writer replay target without repu
     try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
     try std.testing.expectEqual(@as(usize, 1), statuses.items[0].stats.indexes.len);
     try std.testing.expectEqual(@as(u64, 2), statuses.items[0].stats.indexes[0].replay_target_sequence);
-    try std.testing.expect(statuses.items[0].stats.indexes[0].replay_catch_up_required);
+    try std.testing.expectEqual(@as(u64, 2), statuses.items[0].stats.indexes[0].replay_applied_sequence);
+    try std.testing.expect(!statuses.items[0].stats.indexes[0].replay_catch_up_required);
+    try std.testing.expect(!statuses.items[0].stats.indexes[0].backfill_active);
 }
 
 test "provisioned table read source serves profiled dense query without runtime status warmup" {

@@ -107,6 +107,7 @@ fn runtimeDynamicTemplateFromParsed(alloc: std.mem.Allocator, template: impl.Dyn
     const field_type = parseRuntimeFieldType(template.field_type orelse "text");
     const sortable = template.sortable orelse false;
     const do_index = template.do_index orelse true;
+    try validateRuntimeSortableMapping(field_type, sortable);
     return .{
         .name = try alloc.dupe(u8, template.name),
         .match_pattern = if (template.match_pattern) |value| try alloc.dupe(u8, value) else null,
@@ -199,6 +200,7 @@ fn runtimeDocumentFieldTemplateFromParsed(
     const field_type = parseRuntimeFieldType(mapping.field_type orelse "text");
     const sortable = mapping.sortable orelse false;
     const do_index = mapping.do_index orelse true;
+    try validateRuntimeSortableMapping(field_type, sortable);
     return .{
         .name = try alloc.dupe(u8, path),
         .path_match = try alloc.dupe(u8, path),
@@ -238,6 +240,12 @@ fn parseRuntimeFieldType(field_type: []const u8) storage_schema.AntflyType {
     if (std.mem.eql(u8, field_type, "html")) return .html;
     if (std.mem.eql(u8, field_type, "search_as_you_type")) return .search_as_you_type;
     return .text;
+}
+
+fn validateRuntimeSortableMapping(field_type: storage_schema.AntflyType, sortable: bool) !void {
+    if (sortable and !storage_schema.fieldTypeIsSortableScalar(field_type)) {
+        return error.InvalidSchemaUpdateRequest;
+    }
 }
 
 fn runtimeMappingUsesDocValues(
@@ -326,7 +334,7 @@ fn deriveRuntimeIndexSort(
     for (parsed_fields) |field| {
         if (!std.mem.eql(u8, field.field, "_id")) {
             const mapping = storage_schema.resolveDeclaredFieldType(validation_schema, field.field) orelse return error.InvalidSchemaUpdateRequest;
-            if (!mapping.sortable or !mapping.doc_values or !isRuntimeIndexSortScalar(mapping.field_type)) {
+            if (!mapping.sortable or !mapping.doc_values or !storage_schema.fieldTypeIsSortableScalar(mapping.field_type)) {
                 return error.InvalidSchemaUpdateRequest;
             }
         }
@@ -345,13 +353,6 @@ fn deriveRuntimeIndexSort(
         initialized += 1;
     }
     return fields;
-}
-
-fn isRuntimeIndexSortScalar(field_type: storage_schema.AntflyType) bool {
-    return switch (field_type) {
-        .keyword, .numeric, .boolean, .datetime, .link => true,
-        else => false,
-    };
 }
 
 fn deriveRuntimeFullTextDocuments(alloc: std.mem.Allocator, schema: ParsedTableSchema) ![]storage_schema.FullTextDocument {
@@ -937,6 +938,25 @@ test "runtime schema derives internal doc values from sortable scalar mappings" 
     try std.testing.expect(!runtime.dynamic_templates[4].mapping.sortable);
 }
 
+test "schema rejects sortable non-scalar dynamic mappings" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseValidatedTableSchema(alloc,
+        \\{
+        \\  "dynamic_templates": [
+        \\    {"name":"body","path_match":"body","mapping":{"type":"text","sortable":true}}
+        \\  ]
+        \\}
+    ));
+
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseValidatedTableSchema(alloc,
+        \\{
+        \\  "dynamic_templates": [
+        \\    {"name":"location","path_match":"location","mapping":{"type":"geo_point","sortable":true}}
+        \\  ]
+        \\}
+    ));
+}
+
 test "runtime schema lowers document field mappings to exact declared fields" {
     const alloc = std.testing.allocator;
     var parsed = try parseValidatedTableSchema(alloc,
@@ -1050,6 +1070,73 @@ test "runtime schema lowers document field mappings to exact declared fields" {
     try std.testing.expect(!location_capability.sortable);
     try std.testing.expectEqualStrings("schema_declared", location_capability.doc_value_coverage);
     try std.testing.expectEqualStrings("declared", location_capability.queryability_state);
+}
+
+test "schema rejects sortable non-scalar document field mappings" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseValidatedTableSchema(alloc,
+        \\{
+        \\  "document_schemas": {
+        \\    "doc": {
+        \\      "schema": {
+        \\        "type": "object",
+        \\        "properties": {
+        \\          "body": {
+        \\            "type": "string",
+        \\            "x-antfly-field": {"type":"text","sortable":true}
+        \\          }
+        \\        }
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ));
+
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseValidatedTableSchema(alloc,
+        \\{
+        \\  "document_schemas": {
+        \\    "doc": {
+        \\      "schema": {
+        \\        "type": "object",
+        \\        "properties": {
+        \\          "tags": {
+        \\            "type": "array",
+        \\            "items": {"type":"string"},
+        \\            "x-antfly-field": {"type":"keyword","sortable":true}
+        \\          }
+        \\        }
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ));
+
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseValidatedTableSchema(alloc,
+        \\{
+        \\  "document_schemas": {
+        \\    "doc": {
+        \\      "schema": {
+        \\        "type": "object",
+        \\        "properties": {
+        \\          "events": {
+        \\            "type": "array",
+        \\            "items": {
+        \\              "type": "object",
+        \\              "properties": {
+        \\                "created_at": {
+        \\                  "type": "string",
+        \\                  "format": "date-time",
+        \\                  "x-antfly-field": {"type":"date","sortable":true}
+        \\                }
+        \\              }
+        \\            }
+        \\          }
+        \\        }
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ));
 }
 
 test "runtime schema derives and validates index sort metadata" {

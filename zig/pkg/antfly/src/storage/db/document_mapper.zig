@@ -356,17 +356,10 @@ fn sortFieldIsReservedId(field: []const u8) bool {
     return std.mem.eql(u8, field, "_id");
 }
 
-fn mappedIndexSortFieldIsScalar(field_type: runtime_schema.AntflyType) bool {
-    return switch (field_type) {
-        .keyword, .numeric, .boolean, .datetime, .link => true,
-        else => false,
-    };
-}
-
 fn validateIndexSortField(schema: runtime_schema.TableSchema, field: runtime_schema.IndexSortField) !void {
     if (sortFieldIsReservedId(field.field)) return;
     const mapping = runtime_schema.resolveDeclaredFieldType(schema, field.field) orelse return error.UnsupportedQueryRequest;
-    if (!mappedIndexSortFieldIsScalar(mapping.field_type)) return error.UnsupportedQueryRequest;
+    if (!runtime_schema.fieldTypeIsSortableScalar(mapping.field_type)) return error.UnsupportedQueryRequest;
     if (!mapping.doc_values or !mapping.sortable) return error.UnsupportedQueryRequest;
 }
 

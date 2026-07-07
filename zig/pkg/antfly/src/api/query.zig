@@ -1072,6 +1072,17 @@ test "query parser rejects semantic cursor-only pagination as approximate source
     try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.detail);
 }
 
+test "query parser rejects semantic search_before pagination as approximate source" {
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, parseQueryRequest(std.testing.allocator, FakeSemanticResolver.iface(), "docs",
+        \\{"semantic_search":"alpha concept","indexes":["semantic_idx"],"search_before":["doc:a"],"limit":4}
+    ));
+    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("_id", diagnostic.field);
+    try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.reason);
+    try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.detail);
+}
+
 test "query parser rejects semantic score sort as approximate source" {
     const alloc = std.testing.allocator;
     db_mod.resetLastSortRejectionDiagnostic();

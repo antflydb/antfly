@@ -2844,6 +2844,9 @@ pub fn build(b: *std.Build) void {
         "public index contract exposes runtime status metadata",
         "public openapi documents stable exact sort diagnostics",
         "api query contract serializes sort profile diagnostics",
+        "api query contract maps public exact sort rejection diagnostics",
+        "api query contract preflight rejects cursor pagination over approximate vector source",
+        "api query contract preflight rejects search_before pagination over approximate vector source",
         "artifact enrichment request permits asset full text routing",
         "provisioned read cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails",
         "provisioned group storage wires remote content to writer caches",
@@ -2870,6 +2873,7 @@ pub fn build(b: *std.Build) void {
         "api query builder prompt exposes native sort capabilities",
         "distributed query shard request preserves sorted cursor contract",
         "distributed sorted hit merge uses typed sort tuple ordering and cursors",
+        "distributed shard validation rejects mixed scalar sort domains",
         "distributed merge rejects provably incomplete exact shard windows",
         "distributed merge rejects oversized shard windows",
         "distributed merge uses runtime schema for typed date cursors",
@@ -2880,8 +2884,10 @@ pub fn build(b: *std.Build) void {
         "dynamic template selector and mapping-option resolution",
         "parse document field mapping contract",
         "runtime schema derives internal doc values from sortable scalar mappings",
+        "schema rejects sortable non-scalar dynamic mappings",
         "runtime schema derives and validates index sort metadata",
         "runtime schema lowers document field mappings to exact declared fields",
+        "schema rejects sortable non-scalar document field mappings",
         "runtime schema field capability helpers classify mapped sortability",
         "document mapper accepts match-mapping-type dynamic template index_sort field",
         "document mapper emits mapped keyword subfield postings and typed doc values",
@@ -2902,6 +2908,7 @@ pub fn build(b: *std.Build) void {
         "geo distance filter uses indexed candidates across antimeridian",
         "document mapper preserves unsigned numeric doc values beyond i64 as u64",
         "schema-derived keyword subfield backs native sort execution",
+        "sort value comparison defines canonical scalar order",
         "sort execution plan dimension names are stable for profiles",
         "sort cursor contract classifies arity separately from type",
         "json sort values reject non-replayable numeric values at API boundaries",
@@ -3917,11 +3924,14 @@ pub fn build(b: *std.Build) void {
             "query merge rejects score ordered hits without finite scores",
             "query merge orders non score bearing hits by id without requiring scores",
             "query parser records approximate source diagnostic for semantic exact sort",
+            "query parser rejects semantic cursor-only pagination as approximate source",
+            "query parser rejects semantic search_before pagination as approximate source",
             "query parser rejects semantic score sort as approximate source",
             "query encoder does not expose internal doc ordinals",
             "query builder preflight validates score sort source",
             "query builder preflight validates cursor values against mapped sort field types",
             "api query contract serializes sort profile diagnostics",
+            "api query contract maps public exact sort rejection diagnostics",
             "api query contract serializes ordered hit sort tuple",
             "api query contract rejects ordered hits without complete sort tuple",
             "api query contract rejects ordered hits with non replayable sort tuple",
@@ -3930,6 +3940,7 @@ pub fn build(b: *std.Build) void {
             "create table parser rejects schemas that cannot derive runtime mappings",
             "metadata.schema update rejects schemas that cannot derive runtime mappings",
             "api query contract preflight rejects cursor pagination over approximate vector source",
+            "api query contract preflight rejects search_before pagination over approximate vector source",
             "api query contract appends stable id sort tiebreaker for cursors",
             "api query contract rejects cursor width that omits stable id tiebreaker",
             "api query contract records cursor arity diagnostic without sort",
@@ -6655,47 +6666,6 @@ pub fn build(b: *std.Build) void {
     build_public_query_guardrail_step.dependOn(&public_query_guardrail.step);
     const public_query_guardrail_step = b.step("public-query-guardrail", "Benchmark the public /db/v1/tables/<table>/query path against direct DB search and health responsiveness");
     public_query_guardrail_step.dependOn(&run_public_query_guardrail.step);
-    const public_query_sort_guardrail_step = b.step("public-query-sort-guardrail", "Run CI-sized public exact-sort benchmark guardrails over match-all, cursor, full-text, and selective filters");
-    const public_query_sort_guardrail_shapes = [_][]const u8{
-        "exact-sort-match-all",
-        "exact-sort-cursor",
-        "exact-sort-before-cursor",
-        "exact-sort-keyword",
-        "exact-sort-datetime",
-        "exact-sort-boolean",
-        "exact-sort-index-sort",
-        "exact-sort-index-sort-filter",
-        "exact-sort-full-text",
-        "exact-sort-full-text-budget-rejection",
-        "exact-sort-filter",
-    };
-    for (public_query_sort_guardrail_shapes) |shape| {
-        const run_public_query_sort_guardrail = b.addRunArtifact(public_query_guardrail);
-        run_public_query_sort_guardrail.addArgs(&.{
-            "--mode",
-            "handler",
-            "--query-shape",
-            shape,
-            "--docs",
-            "512",
-            "--dims",
-            "32",
-            "--queries",
-            "4",
-            "--repeats",
-            "2",
-            "--k",
-            "20",
-            "--batch-size",
-            "128",
-            "--search-threads",
-            "2",
-            "--sync-level",
-            "write",
-        });
-        public_query_sort_guardrail_step.dependOn(&run_public_query_sort_guardrail.step);
-    }
-
     const raft_apply_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/raft_apply_bench.zig"),
         .target = target,

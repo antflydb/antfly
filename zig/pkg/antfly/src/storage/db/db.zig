@@ -10252,6 +10252,13 @@ pub const DB = struct {
         return target_sequence;
     }
 
+    fn resolverReplayBlockedAfterRunnableDrain(self: *DB) bool {
+        const resolution_stats = self.resolutionStageStats();
+        if (resolution_stats.catch_up_required and !resolution_stats.blocked) return false;
+        const promotion_stats = self.promotionStageStats();
+        return promotion_stats.blocked;
+    }
+
     fn drainReplayStagesUntilStable(self: *DB) !void {
         var rounds: usize = 0;
         while (rounds < run_until_idle_max_replay_rounds) : (rounds += 1) {
@@ -10274,7 +10281,10 @@ pub const DB = struct {
                     try runtime.catchUp();
                 }
 
+                if (self.resolverReplayBlockedAfterRunnableDrain()) return;
+
                 try self.runMaintenanceUntil(self.currentMaintenanceTargetSequence(), .{});
+                if (self.resolverReplayBlockedAfterRunnableDrain()) return;
             }
 
             const resolution_advanced = if (self.resolution_runtime) |runtime|
@@ -24846,6 +24856,68 @@ fn batchAdvancesManagedIndexApplyStateForReplay(
     };
 }
 
+fn managedIndexRecordApplicability(
+    index_manager: *index_manager_mod.IndexManager,
+    record: change_journal_mod.Record,
+    index_ref: index_manager_mod.ManagedIndexRef,
+) ManagedIndexBatchApplicability {
+    switch (index_ref.kind) {
+        .full_text, .algebraic => {
+            if (record.changed_doc_keys.len > 0 or
+                record.deleted_doc_keys.len > 0 or
+                record.overwritten_doc_keys.len > 0) return .relevant;
+            return .irrelevant;
+        },
+        .dense_vector => {
+            if (record.changed_doc_keys.len > 0 or
+                record.deleted_doc_keys.len > 0 or
+                record.overwritten_doc_keys.len > 0) return .relevant;
+            if (batchHasEmbeddingArtifactForManagedIndex(index_manager, index_ref, record.changed_artifact_keys)) return .relevant;
+            return .irrelevant;
+        },
+        .sparse_vector => {
+            if (record.changed_doc_keys.len > 0 or
+                record.deleted_doc_keys.len > 0 or
+                record.overwritten_doc_keys.len > 0) return .relevant;
+            if (batchHasEmbeddingArtifactForManagedIndex(index_manager, index_ref, record.changed_artifact_keys)) return .relevant;
+            return .irrelevant;
+        },
+        .graph => {
+            if (record.deleted_doc_keys.len > 0) return .relevant;
+            for (record.changed_artifact_keys) |artifact_key| {
+                if (!internal_keys.isResolutionArtifactKey(artifact_key) and !internal_keys.isGraphEdgeArtifactKey(artifact_key)) {
+                    const source = index_manager.graphArtifactSource(index_ref.name) orelse continue;
+                    if (graphArtifactSourceConsumesArtifactKey(index_manager, source, artifact_key)) return .relevant;
+                    continue;
+                }
+                if (internal_keys.isResolutionArtifactKey(artifact_key)) {
+                    const source = index_manager.graphArtifactSource(index_ref.name) orelse continue;
+                    if (source.mention_edge_type.len == 0) continue;
+                    const parsed = (internal_keys.parseResolutionArtifactKeyAlloc(index_manager.alloc, artifact_key) catch continue) orelse continue;
+                    defer {
+                        index_manager.alloc.free(parsed.doc_key);
+                        index_manager.alloc.free(parsed.artifact_name);
+                    }
+                    if (resolverConfigForResolution(index_manager, source.artifact_name, parsed.artifact_name) != null) return .relevant;
+                    if (resolverConfigForResolutionArtifact(index_manager, parsed.artifact_name) != null) continue;
+                    return .missing_dependency;
+                }
+                if (internal_keys.isGraphEdgeArtifactKey(artifact_key)) {
+                    const parsed = (internal_keys.parseGraphEdgeArtifactKeyAlloc(index_manager.alloc, artifact_key) catch continue) orelse continue;
+                    defer {
+                        index_manager.alloc.free(parsed.doc_key);
+                        index_manager.alloc.free(parsed.index_name);
+                        index_manager.alloc.free(parsed.edge_type);
+                        index_manager.alloc.free(parsed.target_doc_key);
+                    }
+                    if (std.mem.eql(u8, parsed.index_name, index_ref.name)) return .relevant;
+                }
+            }
+            return .irrelevant;
+        },
+    }
+}
+
 const OwnedBatchWrites = struct {
     alloc: Allocator,
     items: []types.BatchWrite = &.{},
@@ -28458,6 +28530,53 @@ fn storeHasReplayRecordForHintAfter(
     return ctx.found or stats.matched_entries != 0;
 }
 
+fn replayRangeHasManagedIndexApplicableRecord(
+    ctx: *AsyncContext,
+    index_ref: index_manager_mod.ManagedIndexRef,
+    from_sequence: u64,
+    target_sequence: u64,
+) !bool {
+    const Context = struct {
+        alloc: Allocator,
+        index_manager: *index_manager_mod.IndexManager,
+        index_ref: index_manager_mod.ManagedIndexRef,
+        target_sequence: u64,
+        found: bool = false,
+
+        fn handle(self: *@This(), sequence: u64, payload: []const u8) !void {
+            if (sequence > self.target_sequence) return replay_source_mod.StopReplayChunk.StopReplayChunk;
+            var decoded = try change_journal_mod.decodeRecord(self.alloc, payload);
+            defer decoded.deinit();
+            switch (managedIndexRecordApplicability(self.index_manager, decoded.record, self.index_ref)) {
+                .irrelevant => {},
+                .relevant, .missing_dependency => {
+                    self.found = true;
+                    return replay_source_mod.StopReplayChunk.StopReplayChunk;
+                },
+            }
+        }
+    };
+
+    var scan_ctx = Context{
+        .alloc = ctx.alloc,
+        .index_manager = ctx.index_manager,
+        .index_ref = index_ref,
+        .target_sequence = target_sequence,
+    };
+    _ = ctx.store.forEachReplayLaneFrom(
+        @intCast(@intFromEnum(managedIndexReplayHint(index_ref.kind))),
+        from_sequence + 1,
+        0,
+        &scan_ctx,
+        Context.handle,
+    ) catch |err| switch (err) {
+        error.ReplayIndexUnavailable => return try storeHasReplayRecordForHintAfter(ctx.store, managedIndexReplayHint(index_ref.kind), from_sequence),
+        replay_source_mod.StopReplayChunk.StopReplayChunk => return scan_ctx.found,
+        else => return err,
+    };
+    return scan_ctx.found;
+}
+
 fn canAdvanceDerivedToTargetAsync(ctx_ptr: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, from_sequence: u64, target_sequence: u64) !bool {
     const ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
     const persisted_applied = try apply_state.loadAppliedSequenceWithCheckpoint(
@@ -28468,7 +28587,7 @@ fn canAdvanceDerivedToTargetAsync(ctx_ptr: *anyopaque, index_ref: index_manager_
     );
     if (persisted_applied >= target_sequence) return true;
 
-    if (try storeHasReplayRecordForHintAfter(ctx.store, managedIndexReplayHint(index_ref.kind), from_sequence)) return false;
+    if (try replayRangeHasManagedIndexApplicableRecord(ctx, index_ref, from_sequence, target_sequence)) return false;
     if (!ctx.index_manager.indexLoadComplete(index_ref.name)) return false;
     if (index_ref.kind != .dense_vector) return true;
 
@@ -37517,6 +37636,35 @@ test "db derived target advance does not skip unseen matching replay records" {
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
     defer db.close();
 
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation","mention_edge_type":"mentions"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addIndex(.{
+        .name = "plain_relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+
     const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
     defer alloc.free(resolution_key);
     const graph_payload = try change_journal_mod.encodeRecord(alloc, .{
@@ -37530,6 +37678,12 @@ test "db derived target advance does not skip unseen matching replay records" {
     try std.testing.expect(!try canAdvanceDerivedToTargetAsync(
         db.async_context,
         .{ .name = "relations_graph", .kind = .graph },
+        0,
+        1,
+    ));
+    try std.testing.expect(try canAdvanceDerivedToTargetAsync(
+        db.async_context,
+        .{ .name = "plain_relations_graph", .kind = .graph },
         0,
         1,
     ));

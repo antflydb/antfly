@@ -25,7 +25,9 @@ class FieldCapability:
             modes are derived from
             Antfly field types such as `text`, `keyword`, `datetime`, `geopoint`, and
             `search_as_you_type`; they are not separate schema toggles.
-        sortable (bool):
+        sortable (bool): Whether this concrete field is declared sortable in the effective
+            capability model. Public exact order_by accepts it only when
+            sort_lifecycle_state is queryable or accelerated.
         provenance (str): Capability source, such as reserved, document_schema, dynamic_template, or observed_dynamic.
         missing_null_policy (str): Current missing/null handling policy for this field.
         sort_lifecycle_state (FieldCapabilitySortLifecycleState): Operational lifecycle state for exact sort use.

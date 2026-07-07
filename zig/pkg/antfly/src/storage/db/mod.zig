@@ -135,6 +135,10 @@ pub fn searchRequestHasScoreBearingSource(req: types.SearchRequest) bool {
     return query_search.searchRequestHasScoreBearingSource(req);
 }
 
+pub fn requestHasVectorScoreOrderOnly(req: types.SearchRequest) bool {
+    return query_search.requestHasVectorScoreOrderOnly(req);
+}
+
 pub fn resetLastSortRejectionDiagnostic() void {
     query_search.resetLastSortRejectionDiagnostic();
 }

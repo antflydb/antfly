@@ -3630,6 +3630,11 @@ export interface components {
              *     `search_as_you_type`; they are not separate schema toggles.
              */
             query_modes: ("full_text" | "exact" | "range" | "geo" | "autocomplete")[];
+            /**
+             * @description Whether this concrete field is declared sortable in the effective
+             *     capability model. Public exact order_by accepts it only when
+             *     sort_lifecycle_state is queryable or accelerated.
+             */
             sortable: boolean;
             /** @description Capability source, such as reserved, document_schema, dynamic_template, or observed_dynamic. */
             provenance: string;
@@ -5692,9 +5697,12 @@ export interface components {
              * @description Sort order for results. Array of sort fields with direction.
              *     Antfly appends `_id` ascending as a stable tie-breaker when it is omitted.
              *     Supported for exact text-backed, match_all, and filter-only requests
-             *     when each non-`_id` field is a mapped scalar field with sortable native
-             *     doc-value coverage. Analyzed `text` fields are search-only; sort on
-             *     a keyword/scalar mapping such as `title.keyword` instead. Requests
+             *     when each non-`_id` field is a mapped exact scalar field with sortable
+             *     native doc-value coverage. Sortable mapping types are keyword,
+             *     numeric/number/integer, boolean/bool, datetime/date/timestamp, and
+             *     link. Analyzed `text` fields and `search_as_you_type`, geo, embedding,
+             *     blob, html, object, and array fields are not directly sortable; sort
+             *     on an exact scalar mapping such as `title.keyword` instead. Requests
              *     that cannot be executed through an exact native sort path return 422
              *     rather than falling back to stored JSON sorting. Semantic searches
              *     are always sorted by similarity score. Not supported when `count` is true.
@@ -8344,9 +8352,14 @@ export interface components {
              */
             include_in_all?: boolean;
             /**
-             * @description Whether this scalar field can be used in order_by. When true,
-             *     Antfly derives the internal typed doc-value structures required
-             *     for exact sorting; users should not configure doc_values directly.
+             * @description Whether this exact scalar field can be used in order_by. Supported
+             *     sortable mapping types are keyword, numeric/number/integer,
+             *     boolean/bool, datetime/date/timestamp, and link. Analyzed text,
+             *     search_as_you_type, geo, embedding, blob, html, object, and array
+             *     fields are not directly sortable; use an exact scalar subfield such
+             *     as title.keyword for sorted string pagination. When true, Antfly
+             *     derives the internal typed doc-value structures required for exact
+             *     sorting; users should not configure doc_values directly.
              * @default false
              */
             sortable?: boolean;

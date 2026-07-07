@@ -1430,6 +1430,34 @@ fn requestHasSortPageOptions(req: types.SearchRequest) bool {
     return req.order_by.len > 0 or req.search_after.len > 0 or req.search_before.len > 0;
 }
 
+pub fn requestHasVectorScoreOrderOnly(req: types.SearchRequest) bool {
+    if (req.search_after.len > 0 or req.search_before.len > 0) return false;
+    if (req.order_by.len == 0) return false;
+    var seen_score = false;
+    for (req.order_by, 0..) |field, i| {
+        if (sortFieldIsScore(field)) {
+            if (seen_score or !field.desc) return false;
+            seen_score = true;
+            continue;
+        }
+        if (sortFieldIsId(field)) {
+            if (i + 1 != req.order_by.len or field.desc) return false;
+            continue;
+        }
+        return false;
+    }
+    return seen_score;
+}
+
+fn approximateSortPageDiagnosticField(req: types.SearchRequest) []const u8 {
+    for (req.order_by) |field| {
+        if (sortFieldIsScore(field) or sortFieldIsId(field)) continue;
+        return field.field;
+    }
+    if (req.order_by.len > 0) return req.order_by[0].field;
+    return "*";
+}
+
 fn sortFieldIsId(field: types.SortField) bool {
     return std.mem.eql(u8, field.field, "_id");
 }
@@ -1530,8 +1558,9 @@ fn effectiveSortRequestAlloc(alloc: Allocator, req: types.SearchRequest) !Effect
 
 fn rejectApproximateSortPageOptions(req: types.SearchRequest) !void {
     if (requestHasSortPageOptions(req)) {
+        if (requestHasVectorScoreOrderOnly(req)) return;
         logNativeSortPlanRejection(
-            "*",
+            approximateSortPageDiagnosticField(req),
             nativeSortPlanRejectionReasonName(.approximate_candidate_source),
             nativeSortPlanRejectionDetailName(.approximate_candidate_source),
         );
@@ -3769,6 +3798,25 @@ fn validateSortExecutionPlanForRuntime(req: types.SearchRequest, plan: SortExecu
     try validateNativeDocValuesRuntimeMappings(plan, req);
 }
 
+fn rejectUnexpectedVectorScoreStoredSortLoad(_: ?*anyopaque, _: Allocator, _: []const u8) anyerror!?[]u8 {
+    return error.UnsupportedQueryRequest;
+}
+
+fn decorateVectorScoreOrderIfRequested(result: *types.SearchResult, req: types.SearchRequest) !void {
+    if (!requestHasVectorScoreOrderOnly(req)) return;
+    var sort_req = req;
+    sort_req.profile = false;
+    sort_req.offset = 0;
+    try sortAndPageSearchResultInPlace(
+        result,
+        sort_req,
+        null,
+        rejectUnexpectedVectorScoreStoredSortLoad,
+        .{ .kind = .score_top_k },
+        null,
+    );
+}
+
 fn logSearchResultExactCandidateBudgetRejection(
     req: types.SearchRequest,
     plan: SortExecutionPlan,
@@ -3923,6 +3971,25 @@ fn compareSortValues(a: SortValue, b: SortValue) std.math.Order {
         .integer, .u64_value, .number, .number_string => compareNumberSortValues(a, b),
         .string => |av| std.mem.order(u8, av, b.string),
     };
+}
+
+test "sort value comparison defines canonical scalar order" {
+    try std.testing.expectEqual(std.math.Order.eq, compareSortValues(.null_value, .null_value));
+    try std.testing.expectEqual(std.math.Order.lt, compareSortValues(.null_value, .{ .bool_value = false }));
+
+    try std.testing.expectEqual(std.math.Order.lt, compareSortValues(.{ .bool_value = false }, .{ .bool_value = true }));
+    try std.testing.expectEqual(std.math.Order.gt, compareSortValues(.{ .bool_value = true }, .{ .bool_value = false }));
+
+    try std.testing.expectEqual(std.math.Order.lt, compareSortValues(.{ .integer = -1 }, .{ .u64_value = 0 }));
+    try std.testing.expectEqual(std.math.Order.eq, compareSortValues(.{ .integer = 42 }, .{ .u64_value = 42 }));
+    try std.testing.expectEqual(std.math.Order.lt, compareSortValues(.{ .integer = std.math.maxInt(i64) }, .{ .u64_value = @as(u64, @intCast(std.math.maxInt(i64))) + 1 }));
+    try std.testing.expectEqual(std.math.Order.eq, compareSortValues(.{ .u64_value = std.math.maxInt(u64) }, .{ .number_string = "18446744073709551615" }));
+    try std.testing.expectEqual(std.math.Order.lt, compareSortValues(.{ .number_string = "10.25" }, .{ .number = 10.5 }));
+
+    try std.testing.expectEqual(std.math.Order.lt, compareSortValues(.{ .string = "alpha" }, .{ .string = "beta" }));
+    try std.testing.expectEqual(std.math.Order.gt, compareSortValues(.{ .string = "beta" }, .{ .string = "alpha" }));
+    try std.testing.expectEqual(std.math.Order.lt, compareSortValues(.{ .bool_value = true }, .{ .integer = 0 }));
+    try std.testing.expectEqual(std.math.Order.lt, compareSortValues(.{ .integer = 0 }, .{ .string = "" }));
 }
 
 test "sort value numeric comparison preserves integer precision and nan policy" {
@@ -4371,6 +4438,37 @@ test "distributed merge cursor-only request uses implicit id order" {
     try std.testing.expectEqualStrings("distributed_seek", profile.cursor_support);
     try std.testing.expectEqualStrings("distributed_merge", profile.source);
     try std.testing.expectEqual(@as(u64, 0), profile.cursor_rejected_count);
+}
+
+test "distributed shard validation rejects mixed scalar sort domains" {
+    const alloc = std.testing.allocator;
+    const order_by = [_]types.SortField{.{ .field = "opaque_rank" }};
+
+    var numeric = [_]types.SearchHit{try testSortedHitAlloc(alloc, "doc:a", 1)};
+    defer testDeinitFixedHits(alloc, &numeric);
+    var string_hit = types.SearchHit{
+        .id = try alloc.dupe(u8, "doc:b"),
+        .sort_values = try alloc.alloc(std.json.Value, 2),
+    };
+    string_hit.sort_values[0] = .{ .string = try alloc.dupe(u8, "two") };
+    string_hit.sort_values[1] = .{ .string = try alloc.dupe(u8, "doc:b") };
+    var string_hits = [_]types.SearchHit{string_hit};
+    defer testDeinitFixedHits(alloc, &string_hits);
+
+    const shards = [_]DistributedSortedShard{
+        .{ .hits = &numeric, .total_hits = numeric.len },
+        .{ .hits = &string_hits, .total_hits = string_hits.len },
+    };
+
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.InvalidQueryRequest, validateDistributedSortedShards(alloc, .{
+        .order_by = &order_by,
+        .limit = 10,
+    }, .{ .kind = .distributed_k_way_merge }, &shards));
+    const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("opaque_rank", diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_doc_value_type", diagnostic.reason);
+    try std.testing.expectEqualStrings("mixed_sort_value_domain", diagnostic.detail);
 }
 
 test "distributed field sort requires runtime mappings" {
@@ -11848,6 +11946,7 @@ fn searchDenseInternal(
         profile.total_ns = platform_time.monotonicNs() - total_start;
         result.sort_profile = vectorScoreTopKSortProfile(req, collect_sort_profile, score_exactness, raw_hits.len, result.hits.len, profile.total_ns);
         applyProjectedSourceLoadProfileToSortProfile(&result, projected_source_profile);
+        try decorateVectorScoreOrderIfRequested(&result, req);
         if (bench_query_profile) logBenchDenseQueryProfile(req, dense, index_stats, profile);
         return result;
     }
@@ -12489,6 +12588,7 @@ pub fn searchSparse(
         result.sort_profile = vectorScoreTopKSortProfile(req, collect_sort_profile, .exact, raw_hits.len, result.hits.len, platform_time.monotonicNs() - total_start_ns);
         applyProjectedSourceLoadProfileToSortProfile(&result, projected_source_profile);
     }
+    try decorateVectorScoreOrderIfRequested(&result, req);
     if (bench_query_profile) {
         std.log.info(
             "antfly_bench_sparse_query total_us={d} constraint_us={d} index_search_us={d} hit_build_us={d} postprocess_us={d} page_us={d} raw_hits={d} returned_hits={d} filter_doc_nums={d} exclude_doc_nums={d}",
@@ -12821,6 +12921,16 @@ test "score sort source detection rejects non-scoring text queries" {
 
 test "score sort source detection treats vector sources as score-bearing for public validation" {
     const score_order = [_]types.SortField{.{ .field = "_score", .desc = true }};
+    const effective_score_order = [_]types.SortField{
+        .{ .field = "_score", .desc = true },
+        .{ .field = "_id", .desc = false },
+    };
+    const ascending_score_order = [_]types.SortField{.{ .field = "_score", .desc = false }};
+    const field_order = [_]types.SortField{.{ .field = "created_at", .desc = true }};
+    const score_cursor = [_]std.json.Value{
+        .{ .float = 0.5 },
+        .{ .string = "doc:a" },
+    };
     const vector = [_]f32{ 0.1, 0.2 };
     const named_dense = [_]types.NamedDenseQuery{.{
         .name = "semantic",
@@ -12839,6 +12949,13 @@ test "score sort source detection treats vector sources as score-bearing for pub
     try std.testing.expect(!searchRequestHasScoreBearingSource(.{
         .order_by = &score_order,
         .full_text = .{ .match_all = {} },
+    }));
+    try std.testing.expect(requestHasVectorScoreOrderOnly(.{ .order_by = &effective_score_order }));
+    try std.testing.expect(!requestHasVectorScoreOrderOnly(.{ .order_by = &ascending_score_order }));
+    try std.testing.expect(!requestHasVectorScoreOrderOnly(.{ .order_by = &field_order }));
+    try std.testing.expect(!requestHasVectorScoreOrderOnly(.{
+        .order_by = &effective_score_order,
+        .search_after = &score_cursor,
     }));
 }
 
@@ -13369,8 +13486,11 @@ fn planTextNativeSortFields(
     try validateScoreSortHasScoreBearingTextSource(effective_req);
     if (!requestNeedsNativeSortValues(effective_req)) return .{
         .kind = if (requestHasScoreSort(effective_req)) .score_top_k else .id_only,
+        .exactness = .exact,
         .source = .candidate_collector,
         .cursor_support = .comparator,
+        .source_load = .projected_source_after_page,
+        .distributed_behavior = .shard_local_only,
     };
     const schema = runtime_schema orelse {
         logNativeSortPlanRejection(
@@ -13857,8 +13977,11 @@ fn planMatchAllSortBeforeCandidatesAlloc(
     try validateMatchAllSortDoesNotUseScore(effective_req);
     if (!requestNeedsNativeSortValues(effective_req)) return .{
         .kind = .id_seek,
+        .exactness = .exact,
         .source = .primary_key_scan,
-        .cursor_support = if (effective_req.search_before.len > 0) .segment_seek else .unspecified,
+        .cursor_support = .segment_seek,
+        .source_load = .projected_source_after_page,
+        .distributed_behavior = .shard_local_only,
     };
 
     const text_entry = (try executor.text_index_entry(executor.ctx, effective_req.index_name)) orelse {
@@ -13922,9 +14045,11 @@ fn sortedSegmentSelectiveFilterDocValuesDecision(req: types.SearchRequest, const
 fn docValuesCollectorPlanForSelectiveFilter(plan: SortExecutionPlan) SortExecutionPlan {
     var out = plan;
     out.kind = .native_doc_values_top_n;
+    out.exactness = .exact;
     out.source = .doc_values_collector;
     out.cursor_support = .comparator;
     out.source_load = .projected_source_after_page;
+    out.distributed_behavior = .shard_local_only;
     out.selective_filter_doc_values_preferred = true;
     return out;
 }
@@ -15451,7 +15576,7 @@ test "dense and sparse search reject unsupported exact sort page options" {
         .k = 10,
     }, testDenseConstraintExecutor()));
     const dense_diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("*", dense_diagnostic.field);
+    try std.testing.expectEqualStrings("created_at", dense_diagnostic.field);
     try std.testing.expectEqualStrings("approximate_candidate_source", dense_diagnostic.reason);
     try std.testing.expectEqualStrings("approximate_candidate_source", dense_diagnostic.detail);
 
@@ -17554,6 +17679,11 @@ test "native text sort validation rejects fields without typed doc values" {
     }, snapshot, null);
     try std.testing.expectEqual(SortExecutionPlanKind.id_only, id_plan.kind);
     try std.testing.expect(!id_plan.require_native);
+    try std.testing.expectEqual(SortPlanExactness.exact, id_plan.exactness);
+    try std.testing.expectEqual(SortPlanSource.candidate_collector, id_plan.source);
+    try std.testing.expectEqual(SortPlanCursorSupport.comparator, id_plan.cursor_support);
+    try std.testing.expectEqual(SortPlanSourceLoad.projected_source_after_page, id_plan.source_load);
+    try std.testing.expectEqual(SortPlanDistributedBehavior.shard_local_only, id_plan.distributed_behavior);
 
     const id_cursor = [_]std.json.Value{.{ .string = "doc:a" }};
     try validateTextNativeSortFields(.{
@@ -17566,6 +17696,11 @@ test "native text sort validation rejects fields without typed doc values" {
     }, snapshot, null);
     try std.testing.expectEqual(SortExecutionPlanKind.id_only, cursor_only_plan.kind);
     try std.testing.expect(!cursor_only_plan.require_native);
+    try std.testing.expectEqual(SortPlanExactness.exact, cursor_only_plan.exactness);
+    try std.testing.expectEqual(SortPlanSource.candidate_collector, cursor_only_plan.source);
+    try std.testing.expectEqual(SortPlanCursorSupport.comparator, cursor_only_plan.cursor_support);
+    try std.testing.expectEqual(SortPlanSourceLoad.projected_source_after_page, cursor_only_plan.source_load);
+    try std.testing.expectEqual(SortPlanDistributedBehavior.shard_local_only, cursor_only_plan.distributed_behavior);
 
     const bad_id_cursor = [_]std.json.Value{.{ .integer = 7 }};
     try std.testing.expectError(error.InvalidQueryRequest, validateTextNativeSortFields(.{
@@ -17592,6 +17727,11 @@ test "native text sort validation rejects fields without typed doc values" {
     }, snapshot, null);
     try std.testing.expectEqual(SortExecutionPlanKind.score_top_k, score_plan.kind);
     try std.testing.expect(!score_plan.require_native);
+    try std.testing.expectEqual(SortPlanExactness.exact, score_plan.exactness);
+    try std.testing.expectEqual(SortPlanSource.candidate_collector, score_plan.source);
+    try std.testing.expectEqual(SortPlanCursorSupport.comparator, score_plan.cursor_support);
+    try std.testing.expectEqual(SortPlanSourceLoad.projected_source_after_page, score_plan.source_load);
+    try std.testing.expectEqual(SortPlanDistributedBehavior.shard_local_only, score_plan.distributed_behavior);
 
     try std.testing.expectError(error.UnsupportedQueryRequest, validateTextNativeSortFields(.{
         .order_by = &id_order_by,
@@ -19063,6 +19203,42 @@ test "score sort uses hit score and implicit id cursor" {
     try std.testing.expectEqualStrings("doc:a", second_page.hits[0].sort_values[1].string);
 }
 
+test "vector score order decoration emits replayable score tuple" {
+    const alloc = std.testing.allocator;
+
+    var hits = try alloc.alloc(types.SearchHit, 3);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .score = 0.25 };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:b"), .score = 2.0 };
+    hits[2] = .{ .id = try alloc.dupe(u8, "doc:c"), .score = 1.0 };
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 3,
+        .graph_results = &.{},
+        .sort_profile = .{ .plan = "score_top_k" },
+    };
+    defer result.deinit();
+
+    const order_by = [_]types.SortField{
+        .{ .field = "_score", .desc = true },
+        .{ .field = "_id", .desc = false },
+    };
+    try decorateVectorScoreOrderIfRequested(&result, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 2,
+        .profile = true,
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+    try std.testing.expectEqualStrings("doc:c", result.hits[1].id);
+    try std.testing.expectEqual(@as(usize, 2), result.hits[0].sort_values.len);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), result.hits[0].sort_values[0].float, 0.001);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].sort_values[1].string);
+    try std.testing.expectEqualStrings("score_top_k", result.sort_profile.?.plan);
+}
+
 test "score sort rejects hits without finite scores" {
     const alloc = std.testing.allocator;
     const order_by = [_]types.SortField{.{ .field = "_score", .desc = true }};
@@ -20477,6 +20653,7 @@ test "match_all index sort uses doc values collector for selective native filter
 
     const profile = result.sort_profile orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("native_doc_values_top_n", profile.plan);
+    try std.testing.expectEqualStrings("exact", profile.exactness);
     try std.testing.expectEqualStrings("doc_values_collector", profile.source);
     try std.testing.expectEqualStrings("native_filter", profile.candidate_source);
     try std.testing.expectEqualStrings("selective_filter_doc_values_collector", profile.selection_reason);
@@ -20515,6 +20692,7 @@ test "match_all index sort uses doc values collector for selective native filter
     try std.testing.expectEqual(@as(usize, 1), expired_result.hits.len);
     try std.testing.expectEqualStrings("doc:010", expired_result.hits[0].id);
     const expired_profile = expired_result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("exact", expired_profile.exactness);
     try std.testing.expectEqualStrings("selective_filter_doc_values_collector", expired_profile.selection_reason);
     try std.testing.expect(expired_profile.selective_filter_doc_values_preferred);
     try std.testing.expectEqualStrings("doc_nums", expired_profile.native_filter_mode);
@@ -21529,6 +21707,7 @@ test "text index sort uses doc values collector for selective term filters" {
 
     const profile = result.sort_profile orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("native_doc_values_top_n", profile.plan);
+    try std.testing.expectEqualStrings("exact", profile.exactness);
     try std.testing.expectEqualStrings("doc_values_collector", profile.source);
     try std.testing.expectEqualStrings("selective_filter_doc_values_collector", profile.selection_reason);
     try std.testing.expectEqual(@as(u64, 128), profile.cost_model_live_docs);
@@ -21562,6 +21741,7 @@ test "text index sort uses doc values collector for selective term filters" {
     try std.testing.expectEqual(@as(usize, 1), expired_result.hits.len);
     try std.testing.expectEqualStrings("doc:010", expired_result.hits[0].id);
     const expired_profile = expired_result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("exact", expired_profile.exactness);
     try std.testing.expectEqualStrings("selective_filter_doc_values_collector", expired_profile.selection_reason);
     try std.testing.expectEqual(@as(u64, 1), expired_profile.candidate_count);
     try std.testing.expectEqual(@as(u64, 1), expired_profile.selected_count);
@@ -23728,6 +23908,11 @@ test "match_all supports id-only sort without native doc values" {
     };
     const plan = try planMatchAllSortBeforeCandidatesAlloc(alloc, req, executor);
     try std.testing.expectEqual(SortExecutionPlanKind.id_seek, plan.kind);
+    try std.testing.expectEqual(SortPlanExactness.exact, plan.exactness);
+    try std.testing.expectEqual(SortPlanSource.primary_key_scan, plan.source);
+    try std.testing.expectEqual(SortPlanCursorSupport.segment_seek, plan.cursor_support);
+    try std.testing.expectEqual(SortPlanSourceLoad.projected_source_after_page, plan.source_load);
+    try std.testing.expectEqual(SortPlanDistributedBehavior.shard_local_only, plan.distributed_behavior);
     try std.testing.expectEqual(SortPlanSource.primary_key_scan, sortExecutionPlanSource(plan));
     try std.testing.expectEqual(SortPlanCursorSupport.segment_seek, sortExecutionPlanCursorSupport(plan));
 

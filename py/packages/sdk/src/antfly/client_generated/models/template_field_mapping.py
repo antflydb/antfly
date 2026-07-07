@@ -23,9 +23,14 @@ class TemplateFieldMapping:
         index (bool | Unset): Whether to index the field (default true) Default: True.
         store (bool | Unset): Whether to store the field value (default false) Default: False.
         include_in_all (bool | Unset): Whether to include in the _all field for cross-field search Default: False.
-        sortable (bool | Unset): Whether this scalar field can be used in order_by. When true,
-            Antfly derives the internal typed doc-value structures required
-            for exact sorting; users should not configure doc_values directly.
+        sortable (bool | Unset): Whether this exact scalar field can be used in order_by. Supported
+            sortable mapping types are keyword, numeric/number/integer,
+            boolean/bool, datetime/date/timestamp, and link. Analyzed text,
+            search_as_you_type, geo, embedding, blob, html, object, and array
+            fields are not directly sortable; use an exact scalar subfield such
+            as title.keyword for sorted string pagination. When true, Antfly
+            derives the internal typed doc-value structures required for exact
+            sorting; users should not configure doc_values directly.
              Default: False.
         missing_null_policy (TemplateFieldMappingMissingNullPolicy | Unset): Missing/null sort policy for this mapped
             field. The current production

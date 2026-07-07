@@ -126,9 +126,12 @@ pub fn publicExactSortReason(reason: []const u8, detail: []const u8) []const u8 
         if (std.mem.eql(u8, detail, "mixed_field_type")) return "mixed_field_type";
         return "non_sortable_field";
     }
-    if (std.mem.eql(u8, reason, "invalid_doc_value_type") or
-        std.mem.eql(u8, reason, "missing_runtime_mapping"))
+    if (std.mem.eql(u8, reason, "invalid_doc_value_type") and
+        std.mem.eql(u8, detail, "mixed_sort_value_domain"))
     {
+        return "mixed_field_type";
+    }
+    if (std.mem.eql(u8, reason, "invalid_doc_value_type") or std.mem.eql(u8, reason, "missing_runtime_mapping")) {
         return "unsupported_sort_field";
     }
     if (std.mem.eql(u8, reason, "unsupported_exact_sort") and publicExactSortReasonIsStable(detail)) return detail;
@@ -160,6 +163,10 @@ fn expectPublicExactSortRejectionMappingForTest() !void {
     const non_sortable = publicExactSortRejection("non_sortable_sort_field", "non_scalar_field");
     try std.testing.expectEqualStrings("unsupported_sort_field", non_sortable.reason);
     try std.testing.expectEqualStrings("unsupported_sort_field", non_sortable.detail);
+
+    const mixed_sort_domain = publicExactSortRejection("invalid_doc_value_type", "mixed_sort_value_domain");
+    try std.testing.expectEqualStrings("mixed_field_type", mixed_sort_domain.reason);
+    try std.testing.expectEqualStrings("mixed_field_type", mixed_sort_domain.detail);
 
     const public_reason = publicExactSortRejection("invalid_cursor_arity", "sort_tuple_arity");
     try std.testing.expectEqualStrings("invalid_cursor_arity", public_reason.reason);
@@ -1903,7 +1910,7 @@ fn applyCommonSearchRequestOptions(
 
     const has_semantic = request.semantic_search != null or request.embeddings != null;
     if (has_semantic and req.offset > 0) return error.UnsupportedQueryRequest;
-    if (has_semantic and req.order_by.len > 0) {
+    if (has_semantic and req.order_by.len > 0 and !db_mod.requestHasVectorScoreOrderOnly(req.*)) {
         return unsupportedExactSort(approximateSemanticSortField(req.order_by), "approximate_candidate_source", "approximate_candidate_source");
     }
     if (req.order_by.len > 0 and req.offset > 0 and (req.search_after.len > 0 or req.search_before.len > 0)) {
@@ -7500,6 +7507,25 @@ test "api query contract preflight rejects cursor pagination over approximate ve
     try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.detail);
 }
 
+test "api query contract preflight rejects search_before pagination over approximate vector source" {
+    var parsed = try std.json.parseFromSlice(metadata_openapi.QueryRequest, std.testing.allocator,
+        \\{
+        \\  "embeddings": {"dense_idx":"AACAPwAAAEAAAEBA"},
+        \\  "indexes": ["dense_idx"],
+        \\  "search_before": ["doc-9"],
+        \\  "limit": 10
+        \\}
+    , .{});
+    defer parsed.deinit();
+
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, preflightQueryRequestAlloc(std.testing.allocator, parsed.value));
+    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("_id", diagnostic.field);
+    try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.reason);
+    try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.detail);
+}
+
 test "api query contract preflight rejects score sort without score-bearing source" {
     var parsed_match_all = try std.json.parseFromSlice(metadata_openapi.QueryRequest, std.testing.allocator,
         \\{
@@ -7516,6 +7542,21 @@ test "api query contract preflight rejects score sort without score-bearing sour
     try std.testing.expectEqualStrings("non_score_bearing_source", diagnostic.reason);
     try std.testing.expectEqualStrings("non_score_bearing_source", diagnostic.detail);
 
+    var parsed_filter_only = try std.json.parseFromSlice(metadata_openapi.QueryRequest, std.testing.allocator,
+        \\{
+        \\  "filter_query": {"term":{"field":"status","value":"active"}},
+        \\  "order_by": [{"field":"_score","desc":true}]
+        \\}
+    , .{});
+    defer parsed_filter_only.deinit();
+
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, preflightQueryRequestAlloc(std.testing.allocator, parsed_filter_only.value));
+    const filter_diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("_score", filter_diagnostic.field);
+    try std.testing.expectEqualStrings("non_score_bearing_source", filter_diagnostic.reason);
+    try std.testing.expectEqualStrings("non_score_bearing_source", filter_diagnostic.detail);
+
     var parsed_match = try std.json.parseFromSlice(metadata_openapi.QueryRequest, std.testing.allocator,
         \\{
         \\  "full_text_search": {"match":"raft","field":"body"},
@@ -7527,6 +7568,20 @@ test "api query contract preflight rejects score sort without score-bearing sour
     var summary = try preflightQueryRequestAlloc(std.testing.allocator, parsed_match.value);
     defer summary.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u32, 1), summary.base_result_set_count);
+
+    var parsed_vector_score = try std.json.parseFromSlice(metadata_openapi.QueryRequest, std.testing.allocator,
+        \\{
+        \\  "embeddings": {"dense_idx":"AACAPwAAAEAAAEBA"},
+        \\  "indexes": ["dense_idx"],
+        \\  "order_by": [{"field":"_score","desc":true}],
+        \\  "limit": 10
+        \\}
+    , .{});
+    defer parsed_vector_score.deinit();
+
+    var vector_summary = try preflightQueryRequestAlloc(std.testing.allocator, parsed_vector_score.value);
+    defer vector_summary.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 1), vector_summary.base_result_set_count);
 }
 
 test "api query contract appends stable id sort tiebreaker for cursors" {

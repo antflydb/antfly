@@ -8745,6 +8745,12 @@ components:
             `search_as_you_type`; they are not separate schema toggles.
         sortable:
           type: boolean
+          description: >
+            Whether this concrete field is declared sortable in the effective
+
+            capability model. Public exact order_by accepts it only when
+
+            sort_lifecycle_state is queryable or accelerated.
         provenance:
           type: string
           description: Capability source, such as reserved, document_schema, dynamic_template, or observed_dynamic.
@@ -11835,11 +11841,17 @@ components:
 
             Supported for exact text-backed, match_all, and filter-only requests
 
-            when each non-`_id` field is a mapped scalar field with sortable native
+            when each non-`_id` field is a mapped exact scalar field with sortable
 
-            doc-value coverage. Analyzed `text` fields are search-only; sort on
+            native doc-value coverage. Sortable mapping types are keyword,
 
-            a keyword/scalar mapping such as `title.keyword` instead. Requests
+            numeric/number/integer, boolean/bool, datetime/date/timestamp, and
+
+            link. Analyzed `text` fields and `search_as_you_type`, geo, embedding,
+
+            blob, html, object, and array fields are not directly sortable; sort
+
+            on an exact scalar mapping such as `title.keyword` instead. Requests
 
             that cannot be executed through an exact native sort path return 422
 
@@ -15573,11 +15585,21 @@ components:
           type: boolean
           default: false
           description: >
-            Whether this scalar field can be used in order_by. When true,
+            Whether this exact scalar field can be used in order_by. Supported
 
-            Antfly derives the internal typed doc-value structures required
+            sortable mapping types are keyword, numeric/number/integer,
 
-            for exact sorting; users should not configure doc_values directly.
+            boolean/bool, datetime/date/timestamp, and link. Analyzed text,
+
+            search_as_you_type, geo, embedding, blob, html, object, and array
+
+            fields are not directly sortable; use an exact scalar subfield such
+
+            as title.keyword for sorted string pagination. When true, Antfly
+
+            derives the internal typed doc-value structures required for exact
+
+            sorting; users should not configure doc_values directly.
         missing_null_policy:
           type: string
           enum:
