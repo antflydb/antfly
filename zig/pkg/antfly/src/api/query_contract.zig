@@ -2827,6 +2827,7 @@ fn expectSortProfileDiagnosticsSerializationForTest() !void {
             .selection_reason = "index_sort_sorted_segment_seek",
             .require_native = true,
             .native_loader = true,
+            .sort_lifecycle_state = "accelerated",
             .native_doc_values_coverage = "covered",
             .index_sort_coverage = "covered_with_bounds",
             .index_sort_match = true,
@@ -2895,6 +2896,7 @@ fn expectSortProfileDiagnosticsSerializationForTest() !void {
     try std.testing.expectEqualStrings("index_sort_sorted_segment_seek", sort.get("selection_reason").?.string);
     try std.testing.expect(sort.get("require_native").?.bool);
     try std.testing.expect(sort.get("native_loader").?.bool);
+    try std.testing.expectEqualStrings("accelerated", sort.get("sort_lifecycle_state").?.string);
     try std.testing.expectEqualStrings("covered", sort.get("native_doc_values_coverage").?.string);
     try std.testing.expectEqualStrings("covered_with_bounds", sort.get("index_sort_coverage").?.string);
     try std.testing.expect(sort.get("index_sort_match").?.bool);
@@ -4301,6 +4303,7 @@ fn buildSortProfileValue(
     try sort.put(alloc, "selection_reason", .{ .string = profile.selection_reason });
     try sort.put(alloc, "require_native", .{ .bool = profile.require_native });
     try sort.put(alloc, "native_loader", .{ .bool = profile.native_loader });
+    try sort.put(alloc, "sort_lifecycle_state", .{ .string = profile.sort_lifecycle_state });
     try sort.put(alloc, "native_doc_values_coverage", .{ .string = profile.native_doc_values_coverage });
     try sort.put(alloc, "index_sort_coverage", .{ .string = profile.index_sort_coverage });
     try sort.put(alloc, "index_sort_match", .{ .bool = profile.index_sort_match });

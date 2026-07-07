@@ -5954,6 +5954,11 @@ export interface components {
             require_native?: boolean;
             /** @description Whether a native typed sort value loader was active. */
             native_loader?: boolean;
+            /**
+             * @description Conservative lifecycle state for the requested sort path. Queryable fields are accepted by public exact sort; accelerated fields are queryable and have an index_sort-compatible physical path.
+             * @enum {string}
+             */
+            sort_lifecycle_state?: "unsupported" | "declared" | "indexed" | "covered" | "queryable" | "accelerated";
             /** @description Native typed doc-values coverage status for mapped sort fields. */
             native_doc_values_coverage?: string;
             /** @description Physical index_sort coverage status for the requested order. */

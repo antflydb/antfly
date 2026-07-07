@@ -1496,6 +1496,7 @@ pub const SortProfile = struct {
     selection_reason: []const u8 = "",
     require_native: bool = false,
     native_loader: bool = false,
+    sort_lifecycle_state: []const u8 = "",
     native_doc_values_coverage: []const u8 = "",
     index_sort_coverage: []const u8 = "",
     index_sort_match: bool = false,

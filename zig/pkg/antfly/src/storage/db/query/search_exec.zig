@@ -3044,6 +3044,7 @@ const SortExecutionPlan = struct {
     source_load: SortPlanSourceLoad = .unspecified,
     distributed_behavior: SortPlanDistributedBehavior = .unspecified,
     runtime_schema: ?runtime_schema_mod.TableSchema = null,
+    sort_lifecycle_state: []const u8 = "",
     native_doc_values_coverage: []const u8 = "",
     index_sort_coverage: []const u8 = "",
     index_sort_match: bool = false,
@@ -3192,6 +3193,7 @@ test "sort result profile preserves budget reason without stale rejection diagno
     });
 
     try std.testing.expectEqualStrings("id_seek", profile.plan);
+    try std.testing.expectEqualStrings("queryable", profile.sort_lifecycle_state);
     try std.testing.expectEqualStrings("match_all_candidate_collect_limit", profile.budget_rejection_reason);
     try std.testing.expectEqualStrings("", profile.sort_rejection_reason);
     try std.testing.expectEqualStrings("", profile.sort_rejection_detail);
@@ -3203,6 +3205,36 @@ test "sort result profile preserves budget reason without stale rejection diagno
         nativeSortPlanRejectionDetailName(.unmapped_field),
     );
     try std.testing.expectEqualStrings("", profile.sort_rejection_field.slice());
+}
+
+test "sort result profile reports requested sort lifecycle state" {
+    const field_order = [_]types.SortField{.{ .field = "created_at", .desc = true }};
+    const queryable = sortResultProfile(.{
+        .order_by = &field_order,
+        .profile = true,
+    }, .{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .native_doc_values_coverage = "covered",
+    }, true, .{});
+    try std.testing.expectEqualStrings("queryable", queryable.sort_lifecycle_state);
+
+    const accelerated = sortResultProfile(.{
+        .order_by = &field_order,
+        .profile = true,
+    }, .{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .native_doc_values_coverage = "covered",
+        .index_sort_match = true,
+    }, true, .{});
+    try std.testing.expectEqualStrings("accelerated", accelerated.sort_lifecycle_state);
+
+    const score = vectorScoreTopKSortProfile(.{
+        .profile = true,
+        .limit = 1,
+    }, true, .exact, 1, 1, 1_000) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("", score.sort_lifecycle_state);
 }
 
 const DecoratedSortHit = struct {
@@ -3320,6 +3352,7 @@ fn sortResultProfile(
         .selection_reason = sortPlanSelectionReason(plan),
         .require_native = plan.require_native,
         .native_loader = native_loader_enabled,
+        .sort_lifecycle_state = sortExecutionPlanLifecycleState(plan),
         .native_doc_values_coverage = plan.native_doc_values_coverage,
         .index_sort_coverage = plan.index_sort_coverage,
         .index_sort_match = plan.index_sort_match,
@@ -3353,6 +3386,31 @@ fn sortResultProfile(
         .sort_rejection_detail = if (rejection) |item| item.detail else "",
         .sort_rejection_field = if (rejection) |item| types.SortProfileField.init(item.field) else .{},
     };
+}
+
+fn sortExecutionPlanLifecycleState(plan: SortExecutionPlan) []const u8 {
+    if (plan.sort_lifecycle_state.len > 0) return plan.sort_lifecycle_state;
+    return switch (plan.kind) {
+        .none, .score_top_k => "",
+        .id_only, .id_seek => "queryable",
+        .sorted_segment_seek => if (plan.index_sort_match) "accelerated" else "queryable",
+        .distributed_k_way_merge => "queryable",
+        .native_doc_values_top_n, .stored_json_debug, .unsupported_exact_sort => sortLifecycleStateFromCoverage(plan),
+    };
+}
+
+fn sortLifecycleStateFromCoverage(plan: SortExecutionPlan) []const u8 {
+    if (std.mem.eql(u8, plan.native_doc_values_coverage, "covered")) {
+        return if (plan.index_sort_match) "accelerated" else "queryable";
+    }
+    if (std.mem.eql(u8, plan.native_doc_values_coverage, "identity_metadata")) return "queryable";
+    if (std.mem.eql(u8, plan.native_doc_values_coverage, "observed_declared")) return "indexed";
+    if (std.mem.eql(u8, plan.native_doc_values_coverage, "schema_declared") or
+        std.mem.eql(u8, plan.native_doc_values_coverage, "not_declared"))
+    {
+        return "declared";
+    }
+    return "";
 }
 
 fn vectorScoreTopKSortProfile(
@@ -3500,6 +3558,7 @@ fn boundedCandidateCollectorSortPlanForUnavailableStream(plan: SortExecutionPlan
             .source_load = plan.source_load,
             .distributed_behavior = plan.distributed_behavior,
             .runtime_schema = plan.runtime_schema,
+            .sort_lifecycle_state = plan.sort_lifecycle_state,
             .native_doc_values_coverage = plan.native_doc_values_coverage,
             .index_sort_coverage = plan.index_sort_coverage,
         },
@@ -3915,6 +3974,7 @@ test "distributed sorted hit merge uses typed sort tuple ordering and cursors" {
     try std.testing.expectEqual(types.TotalHitsRelation.exact, profiled_page.total_hits_relation);
     const sort_profile = profiled_page.sort_profile orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("distributed_k_way_merge", sort_profile.plan);
+    try std.testing.expectEqualStrings("queryable", sort_profile.sort_lifecycle_state);
     try std.testing.expectEqualStrings("distributed_merge", sort_profile.source);
     try std.testing.expectEqualStrings("distributed_seek", sort_profile.cursor_support);
     try std.testing.expectEqualStrings("coordinator_merge", sort_profile.distributed_behavior);
@@ -7869,8 +7929,9 @@ fn logBenchSortCollectorProfile(
         );
     }
     std.log.info(
-        "antfly_bench_sort_collector_plan native_doc_values_coverage={s} index_sort_coverage={s} index_sort_match={} sorted_segment_executor_available={} sorted_segment_bounds_available={}",
+        "antfly_bench_sort_collector_plan sort_lifecycle_state={s} native_doc_values_coverage={s} index_sort_coverage={s} index_sort_match={} sorted_segment_executor_available={} sorted_segment_bounds_available={}",
         .{
+            sortExecutionPlanLifecycleState(plan),
             plan.native_doc_values_coverage,
             plan.index_sort_coverage,
             plan.index_sort_match,
@@ -12917,6 +12978,7 @@ fn planTextNativeSortFields(
         .source_load = .projected_source_after_page,
         .distributed_behavior = .shard_local_only,
         .runtime_schema = runtime_schema,
+        .sort_lifecycle_state = if (exact_index_sort_match) "accelerated" else "queryable",
         .native_doc_values_coverage = typedDocValuesCoverageStatusName(.covered),
         .index_sort_coverage = indexSortCoverageStatusName(index_sort_coverage),
         .index_sort_match = exact_index_sort_match,
@@ -13254,6 +13316,7 @@ fn planMatchAllSortBeforeCandidatesAlloc(
             .source_load = .projected_source_after_page,
             .distributed_behavior = .shard_local_only,
             .runtime_schema = plan.runtime_schema,
+            .sort_lifecycle_state = plan.sort_lifecycle_state,
             .native_doc_values_coverage = plan.native_doc_values_coverage,
             .index_sort_coverage = plan.index_sort_coverage,
             .index_sort_match = plan.index_sort_match,

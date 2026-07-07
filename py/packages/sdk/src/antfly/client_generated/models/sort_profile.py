@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.sort_profile_sort_lifecycle_state import SortProfileSortLifecycleState
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -40,6 +41,9 @@ class SortProfile:
             selection_reason (str | Unset): Stable reason the planner selected this sort plan.
             require_native (bool | Unset): Whether exact execution required native typed sort values.
             native_loader (bool | Unset): Whether a native typed sort value loader was active.
+            sort_lifecycle_state (SortProfileSortLifecycleState | Unset): Conservative lifecycle state for the requested
+                sort path. Queryable fields are accepted by public exact sort; accelerated fields are queryable and have an
+                index_sort-compatible physical path.
             native_doc_values_coverage (str | Unset): Native typed doc-values coverage status for mapped sort fields.
             index_sort_coverage (str | Unset): Physical index_sort coverage status for the requested order.
             index_sort_match (bool | Unset): Whether the requested order matched the configured physical index_sort prefix.
@@ -141,6 +145,7 @@ class SortProfile:
     selection_reason: str | Unset = UNSET
     require_native: bool | Unset = UNSET
     native_loader: bool | Unset = UNSET
+    sort_lifecycle_state: SortProfileSortLifecycleState | Unset = UNSET
     native_doc_values_coverage: str | Unset = UNSET
     index_sort_coverage: str | Unset = UNSET
     index_sort_match: bool | Unset = UNSET
@@ -202,6 +207,10 @@ class SortProfile:
         require_native = self.require_native
 
         native_loader = self.native_loader
+
+        sort_lifecycle_state: str | Unset = UNSET
+        if not isinstance(self.sort_lifecycle_state, Unset):
+            sort_lifecycle_state = self.sort_lifecycle_state.value
 
         native_doc_values_coverage = self.native_doc_values_coverage
 
@@ -292,6 +301,8 @@ class SortProfile:
             field_dict["require_native"] = require_native
         if native_loader is not UNSET:
             field_dict["native_loader"] = native_loader
+        if sort_lifecycle_state is not UNSET:
+            field_dict["sort_lifecycle_state"] = sort_lifecycle_state
         if native_doc_values_coverage is not UNSET:
             field_dict["native_doc_values_coverage"] = native_doc_values_coverage
         if index_sort_coverage is not UNSET:
@@ -393,6 +404,13 @@ class SortProfile:
 
         native_loader = d.pop("native_loader", UNSET)
 
+        _sort_lifecycle_state = d.pop("sort_lifecycle_state", UNSET)
+        sort_lifecycle_state: SortProfileSortLifecycleState | Unset
+        if isinstance(_sort_lifecycle_state, Unset):
+            sort_lifecycle_state = UNSET
+        else:
+            sort_lifecycle_state = SortProfileSortLifecycleState(_sort_lifecycle_state)
+
         native_doc_values_coverage = d.pop("native_doc_values_coverage", UNSET)
 
         index_sort_coverage = d.pop("index_sort_coverage", UNSET)
@@ -469,6 +487,7 @@ class SortProfile:
             selection_reason=selection_reason,
             require_native=require_native,
             native_loader=native_loader,
+            sort_lifecycle_state=sort_lifecycle_state,
             native_doc_values_coverage=native_doc_values_coverage,
             index_sort_coverage=index_sort_coverage,
             index_sort_match=index_sort_match,

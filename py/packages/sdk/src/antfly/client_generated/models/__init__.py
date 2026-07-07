@@ -532,6 +532,7 @@ from .shards_profile import ShardsProfile
 from .significance_algorithm import SignificanceAlgorithm
 from .sort_field import SortField
 from .sort_profile import SortProfile
+from .sort_profile_sort_lifecycle_state import SortProfileSortLifecycleState
 from .sse_error import SSEError
 from .sse_event import SSEEvent
 from .sse_step_completed import SSEStepCompleted
@@ -1145,6 +1146,7 @@ __all__ = (
     "SignificanceAlgorithm",
     "SortField",
     "SortProfile",
+    "SortProfileSortLifecycleState",
     "SSEError",
     "SSEEvent",
     "SSEStepCompleted",
