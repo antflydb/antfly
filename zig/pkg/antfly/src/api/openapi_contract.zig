@@ -201,6 +201,37 @@ pub fn expectPublicOpenApiDocumentsStableExactSortDiagnostics() !void {
     };
     for (budget_reasons) |reason| try expectOpenApiDocumentsToken(reason);
 
+    const selection_reasons = [_][]const u8{
+        "`id_candidate_order`",
+        "`id_primary_key_seek`",
+        "`score_top_k`",
+        "`index_sort_sorted_segment_seek`",
+        "`sorted_segment_seek`",
+        "`doc_values_collector`",
+        "`index_sort_unavailable_doc_values_collector`",
+        "`caller_selected_doc_values_collector`",
+        "`selective_filter_doc_values_collector`",
+    };
+    for (selection_reasons) |reason| try expectOpenApiDocumentsToken(reason);
+
+    const native_doc_value_coverage_statuses = [_][]const u8{
+        "`covered`",
+        "`identity_metadata`",
+        "`schema_declared`",
+        "`observed_declared`",
+        "`not_declared`",
+    };
+    for (native_doc_value_coverage_statuses) |status| try expectOpenApiDocumentsToken(status);
+
+    const index_sort_coverage_statuses = [_][]const u8{
+        "`request_mismatch`",
+        "`no_live_segments`",
+        "`missing_segment_index_sort`",
+        "`covered_without_bounds`",
+        "`covered_with_bounds`",
+    };
+    for (index_sort_coverage_statuses) |status| try expectOpenApiDocumentsToken(status);
+
     const rejection_details = [_][]const u8{
         "`unmapped_field`",
         "`non_scalar_field`",

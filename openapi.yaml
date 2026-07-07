@@ -12198,7 +12198,22 @@ components:
           description: Distributed sort behavior.
         selection_reason:
           type: string
-          description: Stable reason the planner selected this sort plan.
+          description: >
+            Stable reason the planner selected this sort plan. Known values
+
+            include `none`, `unsupported_exact_sort`,
+
+            `distributed_k_way_merge`, `stored_json_debug`,
+
+            `id_candidate_order`, `id_primary_key_seek`, `score_top_k`,
+
+            `index_sort_sorted_segment_seek`, `sorted_segment_seek`,
+
+            `doc_values_collector`, `index_sort_unavailable_doc_values_collector`,
+
+            `caller_selected_doc_values_collector`, and
+
+            `selective_filter_doc_values_collector`.
         require_native:
           type: boolean
           description: Whether exact execution required native typed sort values.
@@ -12255,10 +12270,22 @@ components:
           description: Candidate-count threshold under which the sort planner considers a filter selective.
         native_doc_values_coverage:
           type: string
-          description: Native typed doc-values coverage status for mapped sort fields.
+          description: >
+            Native typed doc-values coverage status for mapped sort fields.
+
+            Known values include `covered`, `identity_metadata`,
+
+            `schema_declared`, `observed_declared`, and `not_declared`.
         index_sort_coverage:
           type: string
-          description: Physical index_sort coverage status for the requested order.
+          description: >
+            Physical index_sort coverage status for the requested order. Known
+
+            values include `request_mismatch`, `no_live_segments`,
+
+            `missing_segment_index_sort`, `covered_without_bounds`, and
+
+            `covered_with_bounds`.
         index_sort_match:
           type: boolean
           description: Whether the requested order matched the configured physical index_sort prefix.

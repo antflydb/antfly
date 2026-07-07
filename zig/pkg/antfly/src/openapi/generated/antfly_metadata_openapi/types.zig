@@ -2456,7 +2456,7 @@ pub const SortProfile = struct {
     source_load: ?[]const u8 = null,
     /// Distributed sort behavior.
     distributed_behavior: ?[]const u8 = null,
-    /// Stable reason the planner selected this sort plan.
+    /// Stable reason the planner selected this sort plan. Known values include `none`, `unsupported_exact_sort`, `distributed_k_way_merge`, `stored_json_debug`, `id_candidate_order`, `id_primary_key_seek`, `score_top_k`, `index_sort_sorted_segment_seek`, `sorted_segment_seek`, `doc_values_collector`, `index_sort_unavailable_doc_values_collector`, `caller_selected_doc_values_collector`, and `selective_filter_doc_values_collector`.
     selection_reason: ?[]const u8 = null,
     /// Whether exact execution required native typed sort values.
     require_native: ?bool = null,
@@ -2478,9 +2478,9 @@ pub const SortProfile = struct {
     cost_model_candidate_count: ?i64 = null,
     /// Candidate-count threshold under which the sort planner considers a filter selective.
     cost_model_selective_limit: ?i64 = null,
-    /// Native typed doc-values coverage status for mapped sort fields.
+    /// Native typed doc-values coverage status for mapped sort fields. Known values include `covered`, `identity_metadata`, `schema_declared`, `observed_declared`, and `not_declared`.
     native_doc_values_coverage: ?[]const u8 = null,
-    /// Physical index_sort coverage status for the requested order.
+    /// Physical index_sort coverage status for the requested order. Known values include `request_mismatch`, `no_live_segments`, `missing_segment_index_sort`, `covered_without_bounds`, and `covered_with_bounds`.
     index_sort_coverage: ?[]const u8 = null,
     /// Whether the requested order matched the configured physical index_sort prefix.
     index_sort_match: ?bool = null,
