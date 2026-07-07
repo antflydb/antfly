@@ -6661,10 +6661,10 @@ pub const ProvisionedTableWriteSource = struct {
         // only load query-visible index state when the cheap snapshot is
         // clearly missing dense visibility for existing primary documents.
         const snapshot_cache = self.runtime_status_cache orelse return null;
-        const cached = (try snapshot_cache.snapshot(alloc, table_name)) orelse return null;
+        var cached = (try snapshot_cache.snapshot(alloc, table_name)) orelse return null;
+        self.overlayManagedWriterReplayTargetsBestEffort(table_name, &cached);
         if (!runtimeStatusesNeedColdVisibilityRefresh(&cached)) return cached;
-        var owned_cached = cached;
-        owned_cached.deinit(alloc);
+        cached.deinit(alloc);
 
         var recovered = (try snapshotLocalTableRuntimeStatusesUncachedMode(alloc, self.catalog, self.replica_root_dir, self.backend_runtime, table_name, .status_only)) orelse return null;
         errdefer recovered.deinit(alloc);
@@ -6674,6 +6674,7 @@ pub const ProvisionedTableWriteSource = struct {
         }
         markRecoveredRuntimeStatuses(&recovered);
         for (recovered.items) |item| try snapshot_cache.upsertGroupStatusPreservingMetadata(table_name, item);
+        self.overlayManagedWriterReplayTargetsBestEffort(table_name, &recovered);
         return recovered;
     }
 
@@ -22644,7 +22645,7 @@ test "provisioned runtime status overlays live writer replay target without repu
         .sync_level = .write,
     });
     try cached.db.runDerivedUntil(cached.db.core.nextDerivedSequence());
-    try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, &cached.db));
+    try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, cached.db));
 
     _ = try cached.db.batch(.{
         .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\",\"embedding\":[2,3]}" }},
@@ -22726,7 +22727,7 @@ test "provisioned runtime status live replay overlay clears ambiguous replay-onl
         .sync_level = .write,
     });
     try cached.db.runDerivedUntil(cached.db.core.nextDerivedSequence());
-    try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, &cached.db));
+    try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, cached.db));
 
     {
         var cached_statuses = (try snapshot_cache.snapshot(alloc, "docs")).?;
@@ -22818,7 +22819,7 @@ test "provisioned runtime status live replay overlay preserves non-replay backfi
         .sync_level = .write,
     });
     try cached.db.runDerivedUntil(cached.db.core.nextDerivedSequence());
-    try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, &cached.db));
+    try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, cached.db));
 
     {
         var cached_statuses = (try snapshot_cache.snapshot(alloc, "docs")).?;
