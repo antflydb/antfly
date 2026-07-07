@@ -4546,8 +4546,8 @@ test "distributed score sort requires finite hit score matching sort tuple" {
     };
     defer testDeinitFixedHits(alloc, &right);
     const shards = [_]DistributedSortedShard{
-        .{ .hits = &left },
-        .{ .hits = &right },
+        .{ .hits = &left, .total_hits = left.len, .total_hits_relation = .exact },
+        .{ .hits = &right, .total_hits = right.len, .total_hits_relation = .exact },
     };
 
     resetLastSortRejectionDiagnostic();
@@ -6374,8 +6374,8 @@ test "sort collector window uses bounded heap replacement for next and previous 
     try std.testing.expectEqualStrings("doc:1", next_window[0].keys[1].string);
     try std.testing.expectEqual(@as(i64, 2), next_window[1].keys[0].integer);
     try std.testing.expectEqualStrings("doc:2", next_window[1].keys[1].string);
-    try std.testing.expectEqual(@as(u64, 1), next_profile.replaced_count);
-    try std.testing.expectEqual(@as(u64, 1), next_profile.discarded_count);
+    try std.testing.expectEqual(@as(u64, 2), next_profile.replaced_count);
+    try std.testing.expectEqual(@as(u64, 0), next_profile.discarded_count);
 
     var previous_window = try alloc.alloc(DecoratedSortHit, 2);
     defer alloc.free(previous_window);

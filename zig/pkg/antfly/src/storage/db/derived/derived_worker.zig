@@ -40,12 +40,13 @@ pub const CatchUpStats = struct {
     replay_scan_batches: usize = 0,
     replay_hint_filter_skips: usize = 0,
     last_sequence: u64 = 0,
+    last_applied_sequence: u64 = 0,
     window_collect_ns: u64 = 0,
     apply_ns: u64 = 0,
 
     pub fn appliedSequenceAdvance(self: @This(), from_sequence: u64) ?u64 {
-        if (self.last_sequence <= from_sequence) return null;
-        return self.last_sequence;
+        if (self.last_applied_sequence <= from_sequence) return null;
+        return self.last_applied_sequence;
     }
 
     pub fn shouldTryTargetAdvance(self: @This(), from_sequence: u64, target_sequence: u64) bool {
@@ -82,15 +83,16 @@ test "CatchUpStats target advance covers scanned zero-applied tail" {
         .applied_entries = 0,
         .last_sequence = target_sequence,
     }).appliedSequenceAdvance(target_sequence));
-    try std.testing.expectEqual(target_sequence, (CatchUpStats{
+    try std.testing.expectEqual(@as(?u64, null), (CatchUpStats{
         .scanned_entries = 13,
         .applied_entries = 0,
         .last_sequence = target_sequence,
-    }).appliedSequenceAdvance(applied).?);
+    }).appliedSequenceAdvance(applied));
     try std.testing.expectEqual(target_sequence, (CatchUpStats{
         .scanned_entries = 13,
         .applied_entries = 1,
         .last_sequence = target_sequence,
+        .last_applied_sequence = target_sequence,
     }).appliedSequenceAdvance(applied).?);
 }
 
@@ -296,6 +298,7 @@ pub fn catchUpIndexFromMatchingCursor(
         if (applied) {
             stats.apply_ns += monotonicTimeNs() - apply_started_ns;
             stats.applied_entries += 1;
+            stats.last_applied_sequence = chunk_stats.last_sequence;
         } else {
             stats.apply_ns += monotonicTimeNs() - apply_started_ns;
         }
