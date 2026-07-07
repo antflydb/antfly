@@ -205,6 +205,7 @@ release:
   # If set to true, will mark the release as not ready for production.
   # Default: false.
   prerelease: auto
+  make_latest: false
   footer: >-
 
     ---
@@ -324,7 +325,7 @@ blobs:
     region: auto  # Required for Cloudflare R2
     bucket: antfly-releases
     directory: "antfly/latest"
-    disable: "{{ if .Prerelease }}true{{ end }}"
+    disable: true
     extra_files:
       - glob: ./scripts/install.sh
       - glob: ./openapi.yaml

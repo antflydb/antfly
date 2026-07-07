@@ -96,9 +96,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ghcr.io/antflydb/antfly:latest
             ghcr.io/antflydb/antfly:${{ steps.version.outputs.version }}
-            ${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.GAR_PROJECT }}/${{ env.GAR_REPOSITORY }}/${{ env.GAR_IMAGE }}:latest
             ${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.GAR_PROJECT }}/${{ env.GAR_REPOSITORY }}/${{ env.GAR_IMAGE }}:${{ steps.version.outputs.version }}
 
           outputs: type=image,name=target,annotation-index.org.opencontainers.image.description=AntflyDB - Distributed document database with vector search for AI applications multi-arch image
@@ -114,9 +112,7 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ghcr.io/antflydb/antfly:omni
             ghcr.io/antflydb/antfly:omni-${{ steps.version.outputs.version }}
-            ${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.GAR_PROJECT }}/${{ env.GAR_REPOSITORY }}/${{ env.GAR_IMAGE }}:omni
             ${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.GAR_PROJECT }}/${{ env.GAR_REPOSITORY }}/${{ env.GAR_IMAGE }}:omni-${{ steps.version.outputs.version }}
           cache-from: type=gha,scope=antfly-omni
           cache-to: type=gha,mode=max,scope=antfly-omni
@@ -124,7 +120,7 @@ jobs:
       # Install cosign for container image signing
       - uses: sigstore/cosign-installer@v3
 
-      # Sign all image tags (latest and release version) with keyless OIDC
+      # Sign versioned image tags with keyless OIDC.
       # Uses GitHub's OIDC provider - no keys needed!
       # Annotations include repository, workflow, and commit information for verification
       - name: Sign container images with annotations (keyless)
@@ -132,7 +128,7 @@ jobs:
           VERSION="${{ steps.version.outputs.version }}"
 
           # Sign GHCR images
-          for tag in latest "${VERSION}"; do
+          for tag in "${VERSION}"; do
             cosign sign --yes \
               -a "repo=${{ github.repository }}" \
               -a "workflow=${{ github.workflow }}" \
@@ -141,7 +137,7 @@ jobs:
           done
 
           # Sign GHCR omni images
-          for tag in omni "omni-${VERSION}"; do
+          for tag in "omni-${VERSION}"; do
             cosign sign --yes \
               -a "repo=${{ github.repository }}" \
               -a "workflow=${{ github.workflow }}" \
@@ -150,7 +146,7 @@ jobs:
           done
 
           # Sign GAR images
-          for tag in latest "${VERSION}"; do
+          for tag in "${VERSION}"; do
             cosign sign --yes \
               -a "repo=${{ github.repository }}" \
               -a "workflow=${{ github.workflow }}" \
@@ -159,7 +155,7 @@ jobs:
           done
 
           # Sign GAR omni images
-          for tag in omni "omni-${VERSION}"; do
+          for tag in "omni-${VERSION}"; do
             cosign sign --yes \
               -a "repo=${{ github.repository }}" \
               -a "workflow=${{ github.workflow }}" \
