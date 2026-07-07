@@ -3589,6 +3589,14 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 			action.AdminError = ""
 			action.AdminStatusCode = 0
 		}
+		if reset, err := r.resetMissingFailedHAAdminJob(ctx, cluster, action); err != nil {
+			return err
+		} else if reset {
+			action.AdminJobName = ""
+			action.AdminJobPhase = ""
+			action.AdminError = ""
+			action.AdminStatusCode = 0
+		}
 		if action.AdminJobPhase == haAdminJobPhaseSucceeded || action.AdminJobPhase == haAdminJobPhaseFailed {
 			if action.AdminJobPhase == haAdminJobPhaseSucceeded && action.AdminResult == nil {
 				r.updateHAAdminActionResultFromJobLogs(ctx, cluster, action)
@@ -3658,6 +3666,22 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 const haAdminDirectAPIName = "direct-admin-api"
 
 var errHAAdminTokenEnvMissing = stderrors.New("configured HA admin token env var is empty or unset")
+
+func (r *AntflyClusterReconciler) resetMissingFailedHAAdminJob(ctx context.Context, cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus) (bool, error) {
+	if action == nil ||
+		action.AdminJobPhase != haAdminJobPhaseFailed ||
+		action.AdminJobName == "" ||
+		action.AdminJobName == haAdminDirectAPIName ||
+		action.AdminJobName != haAdminJobName(cluster, *action) {
+		return false, nil
+	}
+	existing := &batchv1.Job{}
+	err := r.Get(ctx, types.NamespacedName{Name: action.AdminJobName, Namespace: cluster.Namespace}, existing)
+	if errors.IsNotFound(err) {
+		return true, nil
+	}
+	return false, err
+}
 
 func (r *AntflyClusterReconciler) reconcileHAAdminJob(ctx context.Context, cluster *antflyv1.AntflyCluster, admin *antflyv1.HAAdminSpec, action *antflyv1.HAPlannedActionStatus) error {
 	job := buildHAAdminJob(cluster, admin, *action)
