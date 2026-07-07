@@ -15858,8 +15858,13 @@ test "bound table write source enforces string length and object cardinality" {
 
 test "bound table write source backs up and restores a local table" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-backup-restore";
-    const backup_root = "/tmp/antfly-api-table-backup-restore-out";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/api-table-backup-restore/table-db", .{tmp.sub_path});
+    defer alloc.free(path);
+    const backup_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/api-table-backup-restore/backup", .{tmp.sub_path});
+    defer alloc.free(backup_root);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -15916,8 +15921,13 @@ test "bound table write source backs up and restores a local table" {
 
 test "bound table write source backs up and restores a portable local table" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-portable-backup-restore";
-    const backup_root = "/tmp/antfly-api-table-portable-backup-restore-out";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/api-table-portable-backup-restore/table-db", .{tmp.sub_path});
+    defer alloc.free(path);
+    const backup_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/api-table-portable-backup-restore/backup", .{tmp.sub_path});
+    defer alloc.free(backup_root);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -22617,9 +22627,10 @@ test "provisioned runtime status overlays live writer replay target without repu
     defer alloc.free(replica_root_dir);
     const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
     defer alloc.free(path);
+    const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, Catalog.iface(), "docs", 7001);
 
     {
-        var seeded = try openManagedDbWithIndexesJsonAndCacheMode(
+        var seeded = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndIdentity(
             alloc,
             path,
             "{\"indexes\":[{\"name\":\"dv_v1\",\"type\":\"embeddings\",\"config\":{\"field\":\"embedding\",\"dims\":2}}]}",
@@ -22628,6 +22639,8 @@ test "provisioned runtime status overlays live writer replay target without repu
             0,
             null,
             .writer_no_replay,
+            null,
+            identity_namespace,
         );
         defer seeded.close();
         _ = try seeded.batch(.{
@@ -22646,7 +22659,7 @@ test "provisioned runtime status overlays live writer replay target without repu
     source.runtime_status_cache = &snapshot_cache;
 
     {
-        var initial = try openManagedDbWithIndexesJsonAndCacheMode(
+        var initial = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndIdentity(
             alloc,
             path,
             "{\"indexes\":[{\"name\":\"dv_v1\",\"type\":\"embeddings\",\"config\":{\"field\":\"embedding\",\"dims\":2}}]}",
@@ -22655,6 +22668,8 @@ test "provisioned runtime status overlays live writer replay target without repu
             0,
             null,
             .writer_no_replay,
+            null,
+            identity_namespace,
         );
         defer initial.close();
         try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, &initial));
@@ -22725,9 +22740,10 @@ test "provisioned runtime status live replay overlay clears ambiguous replay-onl
     defer alloc.free(replica_root_dir);
     const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
     defer alloc.free(path);
+    const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, Catalog.iface(), "docs", 7001);
 
     {
-        var seeded = try openManagedDbWithIndexesJsonAndCacheMode(
+        var seeded = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndIdentity(
             alloc,
             path,
             "{\"indexes\":[{\"name\":\"dv_v1\",\"type\":\"embeddings\",\"config\":{\"field\":\"embedding\",\"dims\":2}}]}",
@@ -22736,6 +22752,8 @@ test "provisioned runtime status live replay overlay clears ambiguous replay-onl
             0,
             null,
             .writer_no_replay,
+            null,
+            identity_namespace,
         );
         defer seeded.close();
         _ = try seeded.batch(.{
@@ -22754,7 +22772,7 @@ test "provisioned runtime status live replay overlay clears ambiguous replay-onl
     source.runtime_status_cache = &snapshot_cache;
 
     {
-        var initial = try openManagedDbWithIndexesJsonAndCacheMode(
+        var initial = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndIdentity(
             alloc,
             path,
             "{\"indexes\":[{\"name\":\"dv_v1\",\"type\":\"embeddings\",\"config\":{\"field\":\"embedding\",\"dims\":2}}]}",
@@ -22763,6 +22781,8 @@ test "provisioned runtime status live replay overlay clears ambiguous replay-onl
             0,
             null,
             .writer_no_replay,
+            null,
+            identity_namespace,
         );
         defer initial.close();
         try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, &initial));
@@ -22843,9 +22863,10 @@ test "provisioned runtime status live replay overlay preserves non-replay backfi
     defer alloc.free(replica_root_dir);
     const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
     defer alloc.free(path);
+    const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, Catalog.iface(), "docs", 7001);
 
     {
-        var seeded = try openManagedDbWithIndexesJsonAndCacheMode(
+        var seeded = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndIdentity(
             alloc,
             path,
             "{\"indexes\":[{\"name\":\"dv_v1\",\"type\":\"embeddings\",\"config\":{\"field\":\"embedding\",\"dims\":2}}]}",
@@ -22854,6 +22875,8 @@ test "provisioned runtime status live replay overlay preserves non-replay backfi
             0,
             null,
             .writer_no_replay,
+            null,
+            identity_namespace,
         );
         defer seeded.close();
         _ = try seeded.batch(.{
@@ -22872,7 +22895,7 @@ test "provisioned runtime status live replay overlay preserves non-replay backfi
     source.runtime_status_cache = &snapshot_cache;
 
     {
-        var initial = try openManagedDbWithIndexesJsonAndCacheMode(
+        var initial = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndIdentity(
             alloc,
             path,
             "{\"indexes\":[{\"name\":\"dv_v1\",\"type\":\"embeddings\",\"config\":{\"field\":\"embedding\",\"dims\":2}}]}",
@@ -22881,6 +22904,8 @@ test "provisioned runtime status live replay overlay preserves non-replay backfi
             0,
             null,
             .writer_no_replay,
+            null,
+            identity_namespace,
         );
         defer initial.close();
         try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, &initial));

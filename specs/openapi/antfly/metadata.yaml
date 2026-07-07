@@ -6413,12 +6413,6 @@ components:
           type: string
           enum: [unsupported, declared, indexed, covered, queryable, accelerated]
           description: Conservative lifecycle state for the requested sort path. Queryable fields are accepted by public exact sort; accelerated fields are queryable and have an index_sort-compatible physical path.
-        native_doc_values_coverage:
-          type: string
-          description: |
-            Native typed doc-values coverage status for mapped sort fields.
-            Known values include `covered`, `identity_metadata`,
-            `schema_declared`, `observed_declared`, and `not_declared`.
         index_sort_coverage:
           type: string
           description: |

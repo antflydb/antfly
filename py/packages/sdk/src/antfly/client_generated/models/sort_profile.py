@@ -67,9 +67,6 @@ class SortProfile:
             sort_lifecycle_state (SortProfileSortLifecycleState | Unset): Conservative lifecycle state for the requested
                 sort path. Queryable fields are accepted by public exact sort; accelerated fields are queryable and have an
                 index_sort-compatible physical path.
-            native_doc_values_coverage (str | Unset): Native typed doc-values coverage status for mapped sort fields.
-                Known values include `covered`, `identity_metadata`,
-                `schema_declared`, `observed_declared`, and `not_declared`.
             index_sort_coverage (str | Unset): Physical index_sort coverage status for the requested order. Known
                 values include `request_mismatch`, `no_live_segments`,
                 `missing_segment_index_sort`, `covered_without_bounds`, and
@@ -149,7 +146,6 @@ class SortProfile:
     selection_reason: str | Unset = UNSET
     require_native: bool | Unset = UNSET
     sort_lifecycle_state: SortProfileSortLifecycleState | Unset = UNSET
-    native_doc_values_coverage: str | Unset = UNSET
     index_sort_coverage: str | Unset = UNSET
     candidate_count: int | Unset = UNSET
     cursor_rejected_count: int | Unset = UNSET
@@ -195,8 +191,6 @@ class SortProfile:
         sort_lifecycle_state: str | Unset = UNSET
         if not isinstance(self.sort_lifecycle_state, Unset):
             sort_lifecycle_state = self.sort_lifecycle_state.value
-
-        native_doc_values_coverage = self.native_doc_values_coverage
 
         index_sort_coverage = self.index_sort_coverage
 
@@ -245,8 +239,6 @@ class SortProfile:
             field_dict["require_native"] = require_native
         if sort_lifecycle_state is not UNSET:
             field_dict["sort_lifecycle_state"] = sort_lifecycle_state
-        if native_doc_values_coverage is not UNSET:
-            field_dict["native_doc_values_coverage"] = native_doc_values_coverage
         if index_sort_coverage is not UNSET:
             field_dict["index_sort_coverage"] = index_sort_coverage
         if candidate_count is not UNSET:
@@ -316,8 +308,6 @@ class SortProfile:
         else:
             sort_lifecycle_state = SortProfileSortLifecycleState(_sort_lifecycle_state)
 
-        native_doc_values_coverage = d.pop("native_doc_values_coverage", UNSET)
-
         index_sort_coverage = d.pop("index_sort_coverage", UNSET)
 
         candidate_count = d.pop("candidate_count", UNSET)
@@ -351,7 +341,6 @@ class SortProfile:
             selection_reason=selection_reason,
             require_native=require_native,
             sort_lifecycle_state=sort_lifecycle_state,
-            native_doc_values_coverage=native_doc_values_coverage,
             index_sort_coverage=index_sort_coverage,
             candidate_count=candidate_count,
             cursor_rejected_count=cursor_rejected_count,

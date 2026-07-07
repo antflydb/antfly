@@ -49,7 +49,6 @@ fn expectStableSortProfileContract(comptime SortProfile: type) !void {
     try std.testing.expect(@hasField(SortProfile, "selection_reason"));
     try std.testing.expect(@hasField(SortProfile, "require_native"));
     try std.testing.expect(@hasField(SortProfile, "sort_lifecycle_state"));
-    try std.testing.expect(@hasField(SortProfile, "native_doc_values_coverage"));
     try std.testing.expect(@hasField(SortProfile, "index_sort_coverage"));
     try std.testing.expect(@hasField(SortProfile, "candidate_count"));
     try std.testing.expect(@hasField(SortProfile, "cursor_rejected_count"));
@@ -69,6 +68,7 @@ fn expectStableSortProfileContract(comptime SortProfile: type) !void {
     try std.testing.expect(!@hasField(SortProfile, "cost_model_live_docs"));
     try std.testing.expect(!@hasField(SortProfile, "cost_model_candidate_count"));
     try std.testing.expect(!@hasField(SortProfile, "cost_model_selective_limit"));
+    try std.testing.expect(!@hasField(SortProfile, "native_doc_values_coverage"));
     try std.testing.expect(!@hasField(SortProfile, "index_sort_match"));
     try std.testing.expect(!@hasField(SortProfile, "sorted_segment_executor_available"));
     try std.testing.expect(!@hasField(SortProfile, "sorted_segment_bounds_available"));
@@ -261,15 +261,6 @@ pub fn expectPublicOpenApiDocumentsStableExactSortDiagnostics() !void {
         "`selective_filter_doc_values_collector`",
     };
     for (selection_reasons) |reason| try expectOpenApiDocumentsToken(reason);
-
-    const native_doc_value_coverage_statuses = [_][]const u8{
-        "`covered`",
-        "`identity_metadata`",
-        "`schema_declared`",
-        "`observed_declared`",
-        "`not_declared`",
-    };
-    for (native_doc_value_coverage_statuses) |status| try expectOpenApiDocumentsToken(status);
 
     const index_sort_coverage_statuses = [_][]const u8{
         "`request_mismatch`",

@@ -7240,8 +7240,6 @@ pub const SortProfile = struct {
     require_native: ?bool = null,
     /// Conservative lifecycle state for the requested sort path. Queryable fields are accepted by public exact sort; accelerated fields are queryable and have an index_sort-compatible physical path.
     sort_lifecycle_state: ?[]const u8 = null,
-    /// Native typed doc-values coverage status for mapped sort fields. Known values include `covered`, `identity_metadata`, `schema_declared`, `observed_declared`, and `not_declared`.
-    native_doc_values_coverage: ?[]const u8 = null,
     /// Physical index_sort coverage status for the requested order. Known values include `request_mismatch`, `no_live_segments`, `missing_segment_index_sort`, `covered_without_bounds`, and `covered_with_bounds`.
     index_sort_coverage: ?[]const u8 = null,
     /// Candidate documents considered by sort execution.

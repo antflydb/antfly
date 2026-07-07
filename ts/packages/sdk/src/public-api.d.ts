@@ -6172,12 +6172,6 @@ export interface components {
              */
             sort_lifecycle_state?: "unsupported" | "declared" | "indexed" | "covered" | "queryable" | "accelerated";
             /**
-             * @description Native typed doc-values coverage status for mapped sort fields.
-             *     Known values include `covered`, `identity_metadata`,
-             *     `schema_declared`, `observed_declared`, and `not_declared`.
-             */
-            native_doc_values_coverage?: string;
-            /**
              * @description Physical index_sort coverage status for the requested order. Known
              *     values include `request_mismatch`, `no_live_segments`,
              *     `missing_segment_index_sort`, `covered_without_bounds`, and
