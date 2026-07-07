@@ -380,6 +380,8 @@ const QueryBenchStats = struct {
     later_pass_ns: u64 = 0,
     later_pass_queries: u64 = 0,
     response_hit_count: u64 = 0,
+    response_sort_tuple_count: u64 = 0,
+    response_sort_tuple_valid_count: u64 = 0,
     profile_response_count: u64 = 0,
     profile_dense_search_count: u64 = 0,
     profile_total_ns: u64 = 0,
@@ -540,6 +542,7 @@ const QueryResponseWire = struct {
 
             const Hit = struct {
                 _id: []const u8,
+                _sort: ?[]const std.json.Value = null,
             };
         };
 
@@ -2077,7 +2080,15 @@ fn accumulateParsedResponse(stats: *QueryBenchStats, parsed: QueryResponseWire, 
     const first = parsed.responses[0];
     stats.total_ns += elapsed_ns;
     stats.queries += 1;
-    if (first.hits.hits) |hits| stats.response_hit_count += @intCast(hits.len);
+    if (first.hits.hits) |hits| {
+        stats.response_hit_count += @intCast(hits.len);
+        for (hits) |hit| {
+            if (hit._sort) |sort_tuple| {
+                stats.response_sort_tuple_count += 1;
+                if (publicExactSortTupleReplayable(hit._id, sort_tuple)) stats.response_sort_tuple_valid_count += 1;
+            }
+        }
+    }
     if (graphResultHasNodes(raw_body)) stats.response_hit_count += 1;
     if (first.profile) |profile| {
         stats.profile_response_count += 1;
@@ -2211,6 +2222,20 @@ fn enforceExactSortGuardrail(cfg: Config, stats: QueryBenchStats) !void {
         );
         return error.ExactSortGuardrailFailed;
     }
+    if (stats.profile_sort_selected_count != stats.response_hit_count) {
+        std.debug.print(
+            "public-query guardrail failed: exact sort profile selected count diverged from returned hits selected={d} returned={d}\n",
+            .{ stats.profile_sort_selected_count, stats.response_hit_count },
+        );
+        return error.ExactSortGuardrailFailed;
+    }
+    if (stats.response_sort_tuple_count != stats.response_hit_count or stats.response_sort_tuple_valid_count != stats.response_hit_count) {
+        std.debug.print(
+            "public-query guardrail failed: exact sort missing or invalid _sort tuples returned={d} tuples={d} valid={d}\n",
+            .{ stats.response_hit_count, stats.response_sort_tuple_count, stats.response_sort_tuple_valid_count },
+        );
+        return error.ExactSortGuardrailFailed;
+    }
     if (cfg.query_shape.usesExactSortCursor() and stats.profile_sort_cursor_rejected_count == 0) {
         std.debug.print(
             "public-query guardrail failed: exact sort cursor path did not reject any candidates by cursor query_shape={s}\n",
@@ -2218,6 +2243,24 @@ fn enforceExactSortGuardrail(cfg: Config, stats: QueryBenchStats) !void {
         );
         return error.ExactSortGuardrailFailed;
     }
+}
+
+fn publicExactSortTupleReplayable(doc_id: []const u8, sort_tuple: []const std.json.Value) bool {
+    if (sort_tuple.len != 2) return false;
+    if (!jsonValueIsReplayableFiniteNumber(sort_tuple[0])) return false;
+    return sort_tuple[1] == .string and std.mem.eql(u8, sort_tuple[1].string, doc_id);
+}
+
+fn jsonValueIsReplayableFiniteNumber(value: std.json.Value) bool {
+    return switch (value) {
+        .integer => true,
+        .float => |number| std.math.isFinite(number),
+        .number_string => |number| blk: {
+            const parsed = std.fmt.parseFloat(f64, number) catch break :blk false;
+            break :blk std.math.isFinite(parsed);
+        },
+        else => false,
+    };
 }
 
 fn accumulateDenseProfile(stats: *QueryBenchStats, dense: anytype, raw_body: []const u8) !void {
@@ -3714,12 +3757,14 @@ fn printPublicQuerySymbolicFilterProfile(cfg: Config, stats: QueryBenchStats) vo
 fn printPublicQuerySortProfile(cfg: Config, stats: QueryBenchStats) void {
     if (!cfg.query_shape.usesExactSort() and stats.profile_sort_response_count == 0) return;
     std.debug.print(
-        "public_query_sort_profile query_shape={s} exact_sort={} profile_response_rate={d:.4} sort_profile_rate={d:.4} native_doc_values_rate={d:.4} source_isolated_rate={d:.4} candidates={d:.2} selected={d:.2} cursor_rejected={d:.2} native_doc_value_hits={d:.2} native_doc_value_misses={d:.2} stored_json_loads={d:.2} projected_source_loads={d:.2}\n",
+        "public_query_sort_profile query_shape={s} exact_sort={} profile_response_rate={d:.4} sort_profile_rate={d:.4} sort_tuple_rate={d:.4} sort_tuple_valid_rate={d:.4} native_doc_values_rate={d:.4} source_isolated_rate={d:.4} candidates={d:.2} selected={d:.2} cursor_rejected={d:.2} native_doc_value_hits={d:.2} native_doc_value_misses={d:.2} stored_json_loads={d:.2} projected_source_loads={d:.2}\n",
         .{
             cfg.query_shape.text(),
             cfg.query_shape.usesExactSort(),
             stats.profileResponseRate(),
             rate(stats.profile_sort_response_count, stats.queries),
+            rate(stats.response_sort_tuple_count, stats.response_hit_count),
+            rate(stats.response_sort_tuple_valid_count, stats.response_hit_count),
             rate(stats.profile_sort_native_doc_values_count, stats.queries),
             rate(stats.profile_sort_source_isolated_count, stats.queries),
             avgPerQuery(stats, stats.profile_sort_candidate_count),
@@ -3732,12 +3777,14 @@ fn printPublicQuerySortProfile(cfg: Config, stats: QueryBenchStats) void {
         },
     );
     std.debug.print(
-        "{{\"event\":\"public_query_sort_profile\",\"query_shape\":\"{s}\",\"exact_sort\":{},\"profile_response_rate\":{d:.6},\"sort_profile_rate\":{d:.6},\"native_doc_values_rate\":{d:.6},\"source_isolated_rate\":{d:.6},\"candidate_count_avg\":{d:.3},\"selected_count_avg\":{d:.3},\"cursor_rejected_avg\":{d:.3},\"native_doc_value_hits_avg\":{d:.3},\"native_doc_value_misses_avg\":{d:.3},\"stored_json_loads_avg\":{d:.3},\"projected_source_loads_avg\":{d:.3}}}\n",
+        "{{\"event\":\"public_query_sort_profile\",\"query_shape\":\"{s}\",\"exact_sort\":{},\"profile_response_rate\":{d:.6},\"sort_profile_rate\":{d:.6},\"sort_tuple_rate\":{d:.6},\"sort_tuple_valid_rate\":{d:.6},\"native_doc_values_rate\":{d:.6},\"source_isolated_rate\":{d:.6},\"candidate_count_avg\":{d:.3},\"selected_count_avg\":{d:.3},\"cursor_rejected_avg\":{d:.3},\"native_doc_value_hits_avg\":{d:.3},\"native_doc_value_misses_avg\":{d:.3},\"stored_json_loads_avg\":{d:.3},\"projected_source_loads_avg\":{d:.3}}}\n",
         .{
             cfg.query_shape.text(),
             cfg.query_shape.usesExactSort(),
             stats.profileResponseRate(),
             rate(stats.profile_sort_response_count, stats.queries),
+            rate(stats.response_sort_tuple_count, stats.response_hit_count),
+            rate(stats.response_sort_tuple_valid_count, stats.response_hit_count),
             rate(stats.profile_sort_native_doc_values_count, stats.queries),
             rate(stats.profile_sort_source_isolated_count, stats.queries),
             avgPerQuery(stats, stats.profile_sort_candidate_count),
