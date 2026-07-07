@@ -38,7 +38,7 @@ const graph_index_name = "graph_idx";
 const native_endian = builtin.target.cpu.arch.endian();
 
 const benchmark_schema_json =
-    \\{"version":1,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true,"properties":{"title":{"type":"text"},"body":{"type":"text"},"category":{"type":"string","x-antfly-field":{"type":"keyword","sortable":true}},"status":{"type":"string","x-antfly-field":{"type":"keyword","sortable":true}},"tenant":{"type":"string","x-antfly-field":{"type":"keyword","sortable":true}},"score":{"type":"number","x-antfly-field":{"type":"number","sortable":true}},"created_at":{"type":"string","format":"date-time","x-antfly-field":{"type":"date","sortable":true}}}}}}}
+    \\{"version":1,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true,"properties":{"title":{"type":"text"},"body":{"type":"text"},"category":{"type":"string","x-antfly-field":{"type":"keyword","sortable":true}},"status":{"type":"string","x-antfly-field":{"type":"keyword","sortable":true}},"tenant":{"type":"string","x-antfly-field":{"type":"keyword","sortable":true}},"score":{"type":"number","x-antfly-field":{"type":"number","sortable":true}},"created_at":{"type":"string","format":"date-time","x-antfly-field":{"type":"date","sortable":true}},"active":{"type":"boolean","x-antfly-field":{"type":"boolean","sortable":true}}}}}}}
 ;
 
 const benchmark_algebraic_config_json =
@@ -73,6 +73,7 @@ const QueryShape = enum {
     exact_sort_before_cursor,
     exact_sort_keyword,
     exact_sort_datetime,
+    exact_sort_boolean,
     exact_sort_full_text,
     exact_sort_filter,
 
@@ -93,6 +94,7 @@ const QueryShape = enum {
         if (std.mem.eql(u8, raw, "exact-sort-before-cursor")) return .exact_sort_before_cursor;
         if (std.mem.eql(u8, raw, "exact-sort-keyword")) return .exact_sort_keyword;
         if (std.mem.eql(u8, raw, "exact-sort-datetime")) return .exact_sort_datetime;
+        if (std.mem.eql(u8, raw, "exact-sort-boolean")) return .exact_sort_boolean;
         if (std.mem.eql(u8, raw, "exact-sort-full-text")) return .exact_sort_full_text;
         if (std.mem.eql(u8, raw, "exact-sort-filter")) return .exact_sort_filter;
         return null;
@@ -116,6 +118,7 @@ const QueryShape = enum {
             .exact_sort_before_cursor => "exact-sort-before-cursor",
             .exact_sort_keyword => "exact-sort-keyword",
             .exact_sort_datetime => "exact-sort-datetime",
+            .exact_sort_boolean => "exact-sort-boolean",
             .exact_sort_full_text => "exact-sort-full-text",
             .exact_sort_filter => "exact-sort-filter",
         };
@@ -123,14 +126,14 @@ const QueryShape = enum {
 
     fn usesFullText(self: QueryShape) bool {
         return switch (self) {
-            .dense, .dense_filter, .sparse_filter, .graph_expand, .algebraic_filter, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_filter => false,
+            .dense, .dense_filter, .sparse_filter, .graph_expand, .algebraic_filter, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_boolean, .exact_sort_filter => false,
             .full_text, .hybrid_composed, .hybrid, .hybrid_filter, .hybrid_filter_exclude, .hybrid_filter_exclude_project, .exact_sort_full_text => true,
         };
     }
 
     fn usesDense(self: QueryShape) bool {
         return switch (self) {
-            .full_text, .sparse_filter, .graph_expand, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_full_text, .exact_sort_filter => false,
+            .full_text, .sparse_filter, .graph_expand, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_boolean, .exact_sort_full_text, .exact_sort_filter => false,
             .dense, .dense_filter, .algebraic_filter, .hybrid_composed, .hybrid, .hybrid_filter, .hybrid_filter_exclude, .hybrid_filter_exclude_project => true,
         };
     }
@@ -145,7 +148,7 @@ const QueryShape = enum {
 
     fn usesFilter(self: QueryShape) bool {
         return switch (self) {
-            .dense, .full_text, .graph_expand, .hybrid, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_full_text => false,
+            .dense, .full_text, .graph_expand, .hybrid, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_boolean, .exact_sort_full_text => false,
             .dense_filter, .sparse_filter, .algebraic_filter, .hybrid_composed => true,
             .hybrid_filter, .hybrid_filter_exclude, .hybrid_filter_exclude_project, .exact_sort_filter => true,
         };
@@ -153,7 +156,7 @@ const QueryShape = enum {
 
     fn usesExclusion(self: QueryShape) bool {
         return switch (self) {
-            .dense, .full_text, .dense_filter, .sparse_filter, .graph_expand, .algebraic_filter, .hybrid_composed, .hybrid, .hybrid_filter, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_full_text, .exact_sort_filter => false,
+            .dense, .full_text, .dense_filter, .sparse_filter, .graph_expand, .algebraic_filter, .hybrid_composed, .hybrid, .hybrid_filter, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_boolean, .exact_sort_full_text, .exact_sort_filter => false,
             .hybrid_filter_exclude, .hybrid_filter_exclude_project => true,
         };
     }
@@ -168,7 +171,7 @@ const QueryShape = enum {
 
     fn usesExactSort(self: QueryShape) bool {
         return switch (self) {
-            .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_full_text, .exact_sort_filter => true,
+            .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_boolean, .exact_sort_full_text, .exact_sort_filter => true,
             else => false,
         };
     }
@@ -1834,7 +1837,7 @@ const ProfiledDenseBenchQuery = struct {
 fn profiledDenseBenchQuery(req: db_mod.types.SearchRequest, query_shape: QueryShape) ?ProfiledDenseBenchQuery {
     switch (query_shape) {
         .dense, .dense_filter, .algebraic_filter => {},
-        .full_text, .sparse_filter, .graph_expand, .hybrid_composed, .hybrid, .hybrid_filter, .hybrid_filter_exclude, .hybrid_filter_exclude_project, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_full_text, .exact_sort_filter => return null,
+        .full_text, .sparse_filter, .graph_expand, .hybrid_composed, .hybrid, .hybrid_filter, .hybrid_filter_exclude, .hybrid_filter_exclude_project, .exact_sort_match_all, .exact_sort_cursor, .exact_sort_before_cursor, .exact_sort_keyword, .exact_sort_datetime, .exact_sort_boolean, .exact_sort_full_text, .exact_sort_filter => return null,
     }
     if (req.sparse != null or req.sparse_queries.len > 0) return null;
     if (req.graph_queries.len > 0) return null;
@@ -2282,6 +2285,7 @@ fn publicExactSortTupleReplayable(cfg: Config, doc_id: []const u8, sort_tuple: [
     if (sort_tuple[1] != .string or !std.mem.eql(u8, sort_tuple[1].string, doc_id)) return false;
     return switch (cfg.query_shape) {
         .exact_sort_keyword, .exact_sort_datetime => sort_tuple[0] == .string,
+        .exact_sort_boolean => sort_tuple[0] == .bool,
         else => jsonValueIsReplayableFiniteNumber(sort_tuple[0]),
     };
 }
@@ -2297,6 +2301,12 @@ fn publicExactSortTuplesInOrder(cfg: Config, previous: []const std.json.Value, c
             const field_order = std.mem.order(u8, previous[0].string, current[0].string);
             if (field_order == .gt) return true;
             if (field_order == .lt) return false;
+        },
+        .exact_sort_boolean => {
+            const previous_value = previous[0].bool;
+            const current_value = current[0].bool;
+            if (!previous_value and current_value) return true;
+            if (previous_value and !current_value) return false;
         },
         else => {
             const previous_score = jsonFiniteNumberAsF64(previous[0]) orelse return false;
@@ -3205,6 +3215,8 @@ fn appendVectorDocJson(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocato
     try out.appendSlice(alloc, ",\"created_at\":\"");
     try appendDocCreatedAt(out, alloc, doc_idx);
     try out.append(alloc, '"');
+    try out.appendSlice(alloc, ",\"active\":");
+    try out.appendSlice(alloc, if (docActive(doc_idx)) "true" else "false");
     if (cfg.with_graph or cfg.query_shape.usesGraph()) {
         try out.appendSlice(alloc, ",\"_edges\":{\"" ++ graph_index_name ++ "\":{\"cites\":[{\"target\":\"");
         try out.print(alloc, "doc:{d:0>8}", .{(doc_idx + 1) % cfg.docs});
@@ -3661,6 +3673,7 @@ fn encodeQueryJson(alloc: std.mem.Allocator, vector: []const f32, source_doc_idx
     if (cfg.query_shape == .exact_sort_match_all or
         cfg.query_shape == .exact_sort_keyword or
         cfg.query_shape == .exact_sort_datetime or
+        cfg.query_shape == .exact_sort_boolean or
         cfg.query_shape.usesExactSortCursor())
     {
         if (wrote_field) try out.append(alloc, ',');
@@ -3704,6 +3717,7 @@ fn appendExactSortOrderByJson(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.A
     switch (cfg.query_shape) {
         .exact_sort_keyword => try out.appendSlice(alloc, ",\"order_by\":[{\"field\":\"category\",\"desc\":false}]"),
         .exact_sort_datetime => try out.appendSlice(alloc, ",\"order_by\":[{\"field\":\"created_at\",\"desc\":true}]"),
+        .exact_sort_boolean => try out.appendSlice(alloc, ",\"order_by\":[{\"field\":\"active\",\"desc\":false}]"),
         else => try out.appendSlice(alloc, ",\"order_by\":[{\"field\":\"score\",\"desc\":true}]"),
     }
 }
@@ -4054,6 +4068,10 @@ fn docBodyTerm(doc_idx: usize) []const u8 {
 
 fn docScore(doc_idx: usize) usize {
     return doc_idx % 1000;
+}
+
+fn docActive(doc_idx: usize) bool {
+    return doc_idx % 2 == 0;
 }
 
 fn appendDocCreatedAt(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, doc_idx: usize) !void {
