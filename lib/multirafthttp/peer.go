@@ -105,6 +105,8 @@ type Peer interface {
 type peer struct {
 	lg *zap.Logger
 
+	tr *Transport
+
 	localID types.ID
 	// id of the remote raft peer node
 	id types.ID
@@ -168,6 +170,7 @@ func startPeer(t *Transport, urls types.URLs, peerID types.ID, fs *stats.Followe
 
 	p := &peer{
 		lg:             t.Logger,
+		tr:             t,
 		localID:        t.ID,
 		id:             peerID,
 		r:              r,
@@ -345,6 +348,9 @@ func (p *peer) send(m multiMessage) {
 			)
 		}
 		sentFailures.WithLabelValues(types.ID(m.msg.To).String()).Inc()
+		if !p.status.isActive() && p.tr != nil {
+			p.tr.maybeRestartPeer(p.id, "send buffer full for inactive peer")
+		}
 	}
 }
 

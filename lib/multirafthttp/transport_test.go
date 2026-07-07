@@ -140,11 +140,27 @@ func TestTransportAdd(t *testing.T) {
 		t.Fatalf("senders[1] is nil, want exists")
 	}
 
-	// duplicate AddPeer is ignored
-	tr.AddPeer(shardID, 1, []string{"http://localhost:2380"})
+	// duplicate AddPeer keeps the same peer object but refreshes its URLs.
+	tr.AddPeer(shardID, 1, []string{"http://localhost:2381"})
 	ns := tr.peers[types.ID(1)]
 	if s != ns {
 		t.Errorf("sender = %v, want %v", ns, s)
+	}
+	peer := ns.(*peer)
+	gotURLs := peer.picker.urlsCopy()
+	if len(gotURLs) != 1 || gotURLs[0].String() != "http://localhost:2381" {
+		t.Fatalf("peer URLs = %v, want http://localhost:2381", gotURLs)
+	}
+	tr.maybeRestartPeer(1, "test")
+	restarted := tr.peers[types.ID(1)]
+	if restarted == ns {
+		t.Fatalf("peer was not restarted")
+	}
+	if tr.peerAdds[types.ID(1)] != 1 {
+		t.Fatalf("peer reference count = %d, want 1", tr.peerAdds[types.ID(1)])
+	}
+	if _, ok := tr.shardPeers[shardID][types.ID(1)]; !ok {
+		t.Fatalf("shard peer membership was not preserved")
 	}
 
 	tr.Stop(shardID)

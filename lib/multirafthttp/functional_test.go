@@ -154,6 +154,90 @@ func TestSendMessageWhenStreamIsBroken(t *testing.T) {
 	}
 }
 
+func TestRebuiltPeerSameIDReceivesSnapshotAfterURLRefresh(t *testing.T) {
+	shardID := types.ID(1)
+	nodeID1 := types.ID(1)
+	nodeID2 := types.ID(2)
+
+	tr := &Transport{
+		ID:               nodeID1,
+		MultiRaft:        &fakeMultiRaft{},
+		ServerStats:      stats.NewServerStats("", ""),
+		LeaderStats:      stats.NewLeaderStats(nodeID1.String()),
+		SnapStoreFactory: mockSnapStoreFactory,
+	}
+	tr.Start(shardID)
+	defer tr.Close()
+	srv := httptest.NewServer(tr.Handler())
+	defer srv.Close()
+
+	oldRecvC := make(chan raftpb.Message, 1)
+	oldRaft := &fakeMultiRaft{shards: map[types.ID]baseRaft{shardID: &fakeRaft{recvc: oldRecvC}}}
+	oldPeer := &Transport{
+		ID:               nodeID2,
+		MultiRaft:        oldRaft,
+		ServerStats:      stats.NewServerStats("", ""),
+		LeaderStats:      stats.NewLeaderStats(nodeID2.String()),
+		SnapStoreFactory: mockSnapStoreFactory,
+	}
+	oldPeer.Start(shardID)
+	oldSrv := httptest.NewServer(oldPeer.Handler())
+	defer oldSrv.Close()
+	defer oldPeer.Close()
+
+	tr.AddPeer(shardID, nodeID2, []string{oldSrv.URL})
+	oldPeer.AddPeer(shardID, nodeID1, []string{srv.URL})
+	if !waitStreamWorking(tr.Get(nodeID2).(*peer)) {
+		t.Fatalf("stream from 1 to old peer 2 is not in work as expected")
+	}
+
+	newRecvC := make(chan raftpb.Message, 1)
+	newRaft := &fakeMultiRaft{shards: map[types.ID]baseRaft{shardID: &fakeRaft{recvc: newRecvC}}}
+	newPeer := &Transport{
+		ID:               nodeID2,
+		MultiRaft:        newRaft,
+		ServerStats:      stats.NewServerStats("", ""),
+		LeaderStats:      stats.NewLeaderStats(nodeID2.String()),
+		SnapStoreFactory: mockSnapStoreFactory,
+	}
+	newPeer.Start(shardID)
+	newSrv := httptest.NewServer(newPeer.Handler())
+	defer newSrv.Close()
+	defer newPeer.Close()
+
+	// Same voter ID, new process/URL. This must refresh the existing peer
+	// rather than ignoring the duplicate AddPeer.
+	tr.AddPeer(shardID, nodeID2, []string{newSrv.URL})
+	newPeer.AddPeer(shardID, nodeID1, []string{srv.URL})
+
+	want := raftpb.Message{
+		Type: raftpb.MsgSnap,
+		From: uint64(nodeID1),
+		To:   uint64(nodeID2),
+		Term: 2,
+		Snapshot: &raftpb.Snapshot{
+			Metadata: raftpb.SnapshotMetadata{Index: 100, Term: 2},
+			Data:     []byte("rebuilt-peer-snapshot"),
+		},
+	}
+	tr.Send(shardID, []raftpb.Message{want})
+
+	select {
+	case got := <-newRecvC:
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("new peer received %+v, want %+v", got, want)
+		}
+	case got := <-oldRecvC:
+		t.Fatalf("old peer received snapshot after rebuild: %+v", got)
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for rebuilt peer to receive snapshot")
+	}
+
+	tr.Stop(shardID)
+	oldPeer.Stop(shardID)
+	newPeer.Stop(shardID)
+}
+
 func waitStreamWorking(p *peer) bool {
 	for range 1000 {
 		time.Sleep(time.Millisecond)

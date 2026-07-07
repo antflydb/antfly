@@ -128,10 +128,13 @@ type Transport struct {
 	peers      map[types.ID]Peer                  // peers map
 	shardPeers map[types.ID]map[types.ID]struct{} // shard peers map
 	peerAdds   map[types.ID]int
+	peerResets map[types.ID]time.Time
 
 	PipelineProber probing.Prober
 	StreamProber   probing.Prober
 }
+
+const inactivePeerResetBackoff = 30 * time.Second
 
 var ErrShardNotFound = errors.New("shard not found")
 
@@ -140,6 +143,7 @@ func (t *Transport) Init() error {
 	t.peers = make(map[types.ID]Peer)
 	t.shardPeers = make(map[types.ID]map[types.ID]struct{})
 	t.peerAdds = make(map[types.ID]int)
+	t.peerResets = make(map[types.ID]time.Time)
 
 	var err error
 	var h3Closer io.Closer
@@ -489,27 +493,38 @@ func (t *Transport) AddPeer(shardID, id types.ID, us []string) {
 		// conf changes that were committed before the transport was closed.
 		return
 	}
-	if _, ok := t.shardPeers[shardID][id]; ok {
-		return
-	}
 	if t.shardPeers[shardID] == nil {
 		t.shardPeers[shardID] = make(map[types.ID]struct{})
 	}
-	t.shardPeers[shardID][id] = struct{}{}
-	t.peerAdds[id]++
-	if _, ok := t.peers[id]; ok {
-		return
-	}
+
 	urls, err := types.NewURLs(us)
 	if err != nil {
 		if t.Logger != nil {
 			t.Logger.Panic("failed NewURLs", zap.Strings("urls", us), zap.Error(err))
 		}
+		return
+	}
+
+	if _, ok := t.shardPeers[shardID][id]; !ok {
+		t.shardPeers[shardID][id] = struct{}{}
+		t.peerAdds[id]++
+	}
+	if p, ok := t.peers[id]; ok {
+		p.update(urls)
+		t.refreshPeerProbers(id, us)
+		if t.Logger != nil {
+			t.Logger.Info(
+				"updated remote peer",
+				zap.Stringer("local-member-id", t.ID),
+				zap.Stringer("remote-peer-id", id),
+				zap.Strings("remote-peer-urls", us),
+			)
+		}
+		return
 	}
 	fs := t.LeaderStats.Follower(id.String())
 	t.peers[id] = startPeer(t, urls, id, fs)
-	addPeerToProber(t.Logger, t.PipelineProber, id.String(), us, RoundTripperNameSnapshot, rttSec)
-	addPeerToProber(t.Logger, t.StreamProber, id.String(), us, RoundTripperNameRaftMessage, rttSec)
+	t.refreshPeerProbers(id, us)
 
 	if t.Logger != nil {
 		t.Logger.Info(
@@ -519,6 +534,86 @@ func (t *Transport) AddPeer(shardID, id types.ID, us []string) {
 			zap.Strings("remote-peer-urls", us),
 		)
 	}
+}
+
+func (t *Transport) maybeRestartPeer(id types.ID, reason string) {
+	t.mu.Lock()
+
+	if t.peers == nil {
+		t.mu.Unlock()
+		return
+	}
+	lastReset := t.peerResets[id]
+	if !lastReset.IsZero() && time.Since(lastReset) < inactivePeerResetBackoff {
+		t.mu.Unlock()
+		return
+	}
+	p, ok := t.peers[id]
+	if !ok || !p.activeSince().IsZero() {
+		t.mu.Unlock()
+		return
+	}
+	realPeer, ok := p.(*peer)
+	if !ok {
+		t.mu.Unlock()
+		return
+	}
+	urls := realPeer.picker.urlsCopy()
+	us := urlsToStrings(urls)
+	if t.peerResets == nil {
+		t.peerResets = make(map[types.ID]time.Time)
+	}
+	t.peerResets[id] = time.Now()
+
+	if t.Logger != nil {
+		t.Logger.Warn(
+			"restarting inactive remote peer",
+			zap.Stringer("local-member-id", t.ID),
+			zap.Stringer("remote-peer-id", id),
+			zap.String("reason", reason),
+			zap.Strings("remote-peer-urls", us),
+		)
+	}
+
+	delete(t.peers, id)
+	delete(t.LeaderStats.Followers, id.String())
+	t.removePeerProbers(id)
+	t.mu.Unlock()
+
+	realPeer.stop()
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if t.peers == nil || t.peerAdds[id] == 0 {
+		return
+	}
+	if _, ok := t.peers[id]; ok {
+		return
+	}
+
+	fs := t.LeaderStats.Follower(id.String())
+	t.peers[id] = startPeer(t, urls, id, fs)
+	t.refreshPeerProbers(id, us)
+}
+
+func urlsToStrings(urls types.URLs) []string {
+	us := make([]string, len(urls))
+	for i := range urls {
+		us[i] = urls[i].String()
+	}
+	return us
+}
+
+func (t *Transport) refreshPeerProbers(id types.ID, us []string) {
+	t.removePeerProbers(id)
+	addPeerToProber(t.Logger, t.PipelineProber, id.String(), us, RoundTripperNameSnapshot, rttSec)
+	addPeerToProber(t.Logger, t.StreamProber, id.String(), us, RoundTripperNameRaftMessage, rttSec)
+}
+
+func (t *Transport) removePeerProbers(id types.ID) {
+	_ = t.PipelineProber.Remove(id.String())
+	_ = t.StreamProber.Remove(id.String())
 }
 
 func (t *Transport) RemovePeer(shardID, id types.ID) {

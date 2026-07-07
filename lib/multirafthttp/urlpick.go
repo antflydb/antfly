@@ -40,6 +40,14 @@ func (p *urlPicker) update(urls types.URLs) {
 	p.picked = 0
 }
 
+func (p *urlPicker) urlsCopy() types.URLs {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	urls := make(types.URLs, len(p.urls))
+	copy(urls, p.urls)
+	return urls
+}
+
 func (p *urlPicker) pick() url.URL {
 	p.mu.Lock()
 	defer p.mu.Unlock()
