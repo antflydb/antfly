@@ -3061,8 +3061,8 @@ const SortExecutionPlan = struct {
 fn defaultSortPlanExactness(kind: SortExecutionPlanKind) SortPlanExactness {
     return switch (kind) {
         .none => .none,
-        .id_only, .id_seek, .score_top_k, .native_doc_values_top_n, .distributed_k_way_merge => .exact,
-        .sorted_segment_seek, .stored_json_debug => .bounded_exact,
+        .id_only, .id_seek, .score_top_k, .native_doc_values_top_n => .exact,
+        .sorted_segment_seek, .distributed_k_way_merge, .stored_json_debug => .bounded_exact,
         .unsupported_exact_sort => .unsupported,
     };
 }
@@ -3175,6 +3175,7 @@ test "sort execution plan dimensions default from kind unless explicit" {
     try std.testing.expectEqual(SortPlanCursorSupport.comparator, sortExecutionPlanCursorSupport(score_plan));
 
     const distributed_plan = SortExecutionPlan{ .kind = .distributed_k_way_merge };
+    try std.testing.expectEqual(SortPlanExactness.bounded_exact, sortExecutionPlanExactness(distributed_plan));
     try std.testing.expectEqual(SortPlanSource.distributed_merge, sortExecutionPlanSource(distributed_plan));
     try std.testing.expectEqual(SortPlanCursorSupport.distributed_seek, sortExecutionPlanCursorSupport(distributed_plan));
     try std.testing.expectEqual(SortPlanDistributedBehavior.coordinator_merge, sortExecutionPlanDistributedBehavior(distributed_plan));
@@ -4051,6 +4052,7 @@ test "distributed sorted hit merge uses typed sort tuple ordering and cursors" {
     try std.testing.expectEqual(types.TotalHitsRelation.exact, profiled_page.total_hits_relation);
     const sort_profile = profiled_page.sort_profile orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("distributed_k_way_merge", sort_profile.plan);
+    try std.testing.expectEqualStrings("bounded_exact", sort_profile.exactness);
     try std.testing.expectEqualStrings("distributed_shards", sort_profile.candidate_source);
     try std.testing.expectEqualStrings("queryable", sort_profile.sort_lifecycle_state);
     try std.testing.expectEqualStrings("distributed_merge", sort_profile.source);
@@ -4087,6 +4089,7 @@ test "distributed sorted hit merge uses typed sort tuple ordering and cursors" {
         try std.testing.expectEqual(@as(usize, 1), internally_profiled_page.hits.len);
         const internal_sort_profile = internally_profiled_page.sort_profile orelse return error.TestUnexpectedResult;
         try std.testing.expectEqualStrings("distributed_k_way_merge", internal_sort_profile.plan);
+        try std.testing.expectEqualStrings("bounded_exact", internal_sort_profile.exactness);
         try std.testing.expectEqualStrings("distributed_merge", internal_sort_profile.source);
         try std.testing.expectEqual(@as(usize, 2), internal_sort_profile.distributed_shard_count);
     }
@@ -4300,6 +4303,7 @@ test "distributed merge cursor-only request uses implicit id order" {
     try std.testing.expectEqualStrings("doc:c", merged.hits[0].id);
     const profile = merged.sort_profile orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("distributed_k_way_merge", profile.plan);
+    try std.testing.expectEqualStrings("bounded_exact", profile.exactness);
     try std.testing.expectEqualStrings("distributed_seek", profile.cursor_support);
     try std.testing.expectEqualStrings("distributed_merge", profile.source);
     try std.testing.expectEqual(@as(u64, 0), profile.cursor_rejected_count);
@@ -4586,6 +4590,7 @@ test "distributed merge uses runtime schema for typed date cursors" {
     try std.testing.expectEqualStrings("doc:d", merged.hits[1].id);
     const sort_profile = merged.sort_profile orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("distributed_k_way_merge", sort_profile.plan);
+    try std.testing.expectEqualStrings("bounded_exact", sort_profile.exactness);
     try std.testing.expectEqualStrings("distributed_seek", sort_profile.cursor_support);
 
     const float_cursor = [_]std.json.Value{

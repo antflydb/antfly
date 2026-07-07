@@ -1558,6 +1558,7 @@ test "query merge applies distributed typed sort ordering and cursor paging" {
     try std.testing.expectEqualStrings("doc:d", after_page.hits[1].id);
     const sort_profile = after_page.sort_profile orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("distributed_k_way_merge", sort_profile.plan);
+    try std.testing.expectEqualStrings("bounded_exact", sort_profile.exactness);
     try std.testing.expectEqualStrings("distributed_merge", sort_profile.source);
     try std.testing.expectEqualStrings("coordinator_merge", sort_profile.distributed_behavior);
     try std.testing.expectEqual(@as(usize, 2), sort_profile.distributed_shard_count);
@@ -1605,6 +1606,7 @@ test "query merge applies default id cursor ordering without explicit order_by" 
     try std.testing.expectEqualStrings("doc:d", after_page.hits[1].id);
     const after_profile = after_page.sort_profile orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("distributed_k_way_merge", after_profile.plan);
+    try std.testing.expectEqualStrings("bounded_exact", after_profile.exactness);
     try std.testing.expectEqualStrings("distributed_merge", after_profile.source);
 
     const before_cursor = [_]std.json.Value{.{ .string = "doc:d" }};
@@ -1646,6 +1648,7 @@ test "query merge sort profile does not inherit stale rejection diagnostic" {
 
     const sort_profile = merged.sort_profile orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("distributed_k_way_merge", sort_profile.plan);
+    try std.testing.expectEqualStrings("bounded_exact", sort_profile.exactness);
     try std.testing.expectEqualStrings("", sort_profile.sort_rejection_reason);
     try std.testing.expectEqualStrings("", sort_profile.sort_rejection_detail);
     try std.testing.expectEqualStrings("", sort_profile.sort_rejection_field.slice());
@@ -1716,6 +1719,7 @@ test "query merge applies runtime schema to distributed date cursors" {
     try std.testing.expectEqualStrings("doc:c", after_page.hits[0].id);
     const sort_profile = after_page.sort_profile orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("distributed_k_way_merge", sort_profile.plan);
+    try std.testing.expectEqualStrings("bounded_exact", sort_profile.exactness);
     try std.testing.expectEqualStrings("distributed_merge", sort_profile.source);
 }
 
