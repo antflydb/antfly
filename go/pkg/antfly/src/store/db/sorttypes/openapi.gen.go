@@ -30,12 +30,12 @@ type SortField struct {
 // Base64 encoded, gzipped, json marshaled Swagger object
 var swaggerSpec = []string{
 
-	"H4sIAAAAAAAC/6SRQWvrMAzHv4rQOYQ+egu8Q+HxvsB6Gzs4sdxouLJrK9tCyXcfdpptsLLLTrYl+f//",
-	"SbriEM4xCIlm7K6Yh5HOpl4fQtJ/nGhQDlIClvKQOK7Pmga75cGFBAYyy8kTOCZvW9A0EfyF8o/Espwa",
-	"cMbnEjNbqMUGdY6EHfYheDKCS1PF/xeR776HzSQXgOoEr6zjJ0uRjClESsqUN4X1dGbyil3FaH7s6Df4",
-	"7j76cbyNBsScCTSsPfTzF5WsieWEy9JgosvEiSx2jzfFp4+y0D/ToLiUOhYX7uxnNIns6qBT9ASWHAuX",
-	"dIYpk4V+hoOo8zNcJkozGLHAYukNhiCazKC5krH64nmrrWM6zpEyNvhCKa9+f9pduyvNh0hiImOH+3bX",
-	"7ssyjI5lD8vyHgAA///cfSm4bwIAAA==",
+	"H4sIAAAAAAAC/6SRQW/bMAyF/wrBs2FkyM3ADgGGnQcst2EH2aJiDgqlSPRaI/B/LyTHbVK0p55sk/T7",
+	"3iOvOIRzDEKiGbsr5mGks6mvv0PSH5xoUA5SCpbykDiun7UNduuDCwkMZJaTJ3BM3ragaSL4DuU/Esty",
+	"asAZn0vNbKUWG9Q5EnbYh+DJCC5NFf9ZRArXWMuFYfyvFCIlZcrYVaXmnanD5iAXd9UGPLGOb0YLL97J",
+	"rLHWpzOT10+UH+N+JZvbcj0CjuNtbyDmTKBhzdDPdypZE8sJl6XBRJeJE1ns/twU/76Ohf4fDYpLmWNx",
+	"4YPjjSaRXQk6RU9gybHUNWeYMlnoZziIOj/DZaI0gxELLJaeYQiiyQyaqzNWX5i32bqm4xwpY4P/KeWV",
+	"963dtbsSPkQSExk73Le7dl+OYXQsd1iWlwAAAP//84hAkowCAAA=",
 }
 
 // GetSwagger returns the content of the embedded swagger specification file

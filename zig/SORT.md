@@ -1338,6 +1338,10 @@ strings and surface server validation errors. This avoids baking one tenant's
 schema into the global API while still letting managed workflows generate
 strongly typed helpers for known production indexes.
 
+The `order_by` tuple object itself should be closed: unknown properties such as
+a misspelled direction key must be rejected by schema-aware clients or by the
+server instead of silently defaulting to ascending order.
+
 Release tooling should validate that docs and generated clients describe the
 same behavior as the engine:
 

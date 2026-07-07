@@ -12,6 +12,7 @@ components:
     SortField:
       type: object
       description: "A single sort field with direction."
+      additionalProperties: false
       required:
         - field
       properties:
