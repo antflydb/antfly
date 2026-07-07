@@ -8373,10 +8373,13 @@ fn unionDocIdsAlloc(alloc: Allocator, left: []const []const u8, right: []const [
 }
 
 fn intersectDocIdsAlloc(alloc: Allocator, left: []const []const u8, right: []const []const u8) ![]const []const u8 {
+    var right_set = try BorrowedDocIdSet.initAlloc(alloc, right);
+    defer right_set.deinit(alloc);
+
     var out = std.ArrayListUnmanaged([]const u8).empty;
     errdefer freeDocIdArrayList(alloc, &out);
     for (left) |id| {
-        if (!containsDocId(right, id)) continue;
+        if (!right_set.contains(id)) continue;
         try appendOwnedDocId(alloc, &out, id);
     }
     return try out.toOwnedSlice(alloc);
@@ -8463,6 +8466,26 @@ fn containsDocId(doc_ids: []const []const u8, expected: []const u8) bool {
     }
     return false;
 }
+
+const BorrowedDocIdSet = struct {
+    map: std.StringHashMapUnmanaged(void) = .empty,
+
+    fn initAlloc(alloc: Allocator, doc_ids: []const []const u8) !BorrowedDocIdSet {
+        var out = BorrowedDocIdSet{};
+        errdefer out.deinit(alloc);
+        for (doc_ids) |doc_id| try out.map.put(alloc, doc_id, {});
+        return out;
+    }
+
+    fn deinit(self: *BorrowedDocIdSet, alloc: Allocator) void {
+        self.map.deinit(alloc);
+        self.* = undefined;
+    }
+
+    fn contains(self: *const BorrowedDocIdSet, doc_id: []const u8) bool {
+        return self.map.contains(doc_id);
+    }
+};
 
 fn containsDocNum(doc_nums: []const u32, expected: u32) bool {
     for (doc_nums) |doc_num| {
@@ -10592,6 +10615,9 @@ fn textDocNumsForDocIdsAlloc(
     snapshot: *const index_mod.IndexSnapshot,
     doc_ids: []const []const u8,
 ) ![]const u32 {
+    var doc_id_set = try BorrowedDocIdSet.initAlloc(alloc, doc_ids);
+    defer doc_id_set.deinit(alloc);
+
     var out = std.ArrayListUnmanaged(u32).empty;
     errdefer out.deinit(alloc);
     var doc_offset: u32 = 0;
@@ -10605,7 +10631,7 @@ fn textDocNumsForDocIdsAlloc(
                 if (deleted.contains(local_doc)) continue;
             }
             const stored = seg.reader.storedDoc(local_doc) orelse continue;
-            if (!containsDocId(doc_ids, stored.id)) continue;
+            if (!doc_id_set.contains(stored.id)) continue;
             try appendDocNum(alloc, &out, doc_offset + local_doc);
         }
         doc_offset += seg.reader.doc_count;
@@ -13158,6 +13184,9 @@ fn matchAllDocOrdinalsForDocIdsAlloc(
     snapshot: *const index_mod.IndexSnapshot,
     doc_ids: []const []const u8,
 ) ![]const u32 {
+    var doc_id_set = try BorrowedDocIdSet.initAlloc(alloc, doc_ids);
+    defer doc_id_set.deinit(alloc);
+
     var out = std.ArrayListUnmanaged(u32).empty;
     errdefer out.deinit(alloc);
     var scanned_count: u64 = 0;
@@ -13170,7 +13199,7 @@ fn matchAllDocOrdinalsForDocIdsAlloc(
                 if (deleted.contains(local_doc)) continue;
             }
             const stored = segment.reader.storedDoc(local_doc) orelse continue;
-            if (!containsDocId(doc_ids, stored.id)) continue;
+            if (!doc_id_set.contains(stored.id)) continue;
             const ordinal = (try segment.reader.docOrdinal(local_doc)) orelse {
                 logNativeSortPlanRejection(
                     "*",
