@@ -3129,11 +3129,19 @@ test "api query contract serializes cursor-only id sort tuple" {
         .score = 0.9,
         .sort_values = sort_values,
     };
+    result.sort_profile = .{
+        .plan = "id_seek",
+        .exactness = "exact",
+        .source = "primary_key_scan",
+        .cursor_support = "segment_seek",
+        .source_load = "source_free",
+        .distributed_behavior = "shard_local_only",
+        .sort_lifecycle_state = "queryable",
+    };
 
-    const order_by = [_]db_mod.types.SortField{.{ .field = "_id" }};
     const cursor = [_]std.json.Value{.{ .string = "doc:0" }};
     var response = try encodeQueryResponses(alloc, "docs", .{
-        .order_by = &order_by,
+        .profile = true,
         .search_after = &cursor,
     }, .{}, result);
     defer response.deinit(alloc);
@@ -3144,6 +3152,30 @@ test "api query contract serializes cursor-only id sort tuple" {
     const sort = hit.get("_sort").?.array.items;
     try std.testing.expectEqual(@as(usize, 1), sort.len);
     try std.testing.expectEqualStrings("doc:a", sort[0].string);
+
+    const profile_sort = parsed.value.object.get("responses").?.array.items[0].object.get("profile").?.object.get("sort").?.object;
+    const emitted_order = profile_sort.get("order_by").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), emitted_order.len);
+    try std.testing.expectEqualStrings("_id", emitted_order[0].object.get("field").?.string);
+    try std.testing.expect(!emitted_order[0].object.get("desc").?.bool);
+    try std.testing.expectEqualStrings("after", profile_sort.get("cursor").?.string);
+    try std.testing.expectEqualStrings("id_seek", profile_sort.get("plan").?.string);
+
+    var before_response = try encodeQueryResponses(alloc, "docs", .{
+        .profile = true,
+        .search_before = &cursor,
+    }, .{}, result);
+    defer before_response.deinit(alloc);
+
+    var before_parsed = try std.json.parseFromSlice(std.json.Value, alloc, before_response.json, .{});
+    defer before_parsed.deinit();
+    const before_profile_sort = before_parsed.value.object.get("responses").?.array.items[0].object.get("profile").?.object.get("sort").?.object;
+    const before_emitted_order = before_profile_sort.get("order_by").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), before_emitted_order.len);
+    try std.testing.expectEqualStrings("_id", before_emitted_order[0].object.get("field").?.string);
+    try std.testing.expect(!before_emitted_order[0].object.get("desc").?.bool);
+    try std.testing.expectEqualStrings("before", before_profile_sort.get("cursor").?.string);
+    try std.testing.expectEqualStrings("id_seek", before_profile_sort.get("plan").?.string);
 }
 
 test "api query contract validates cursor-only implicit id sort tuple" {
