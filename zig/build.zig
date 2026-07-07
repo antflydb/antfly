@@ -4791,6 +4791,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_db_unit_tests = b.addRunArtifact(db_unit_tests);
+    if (b.args) |args| run_db_unit_tests.addArgs(args);
     const db_test_step = b.step("db-test", "Run storage/db unit tests");
     db_test_step.dependOn(&run_db_unit_tests.step);
 
