@@ -8821,6 +8821,22 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_commo
         .POST => .admin,
         .GET, .PUT, .DELETE => return null,
     });
+    if (routes.Routes.matchTableRepairJobs(path)) |repair_job| return try tablePermission(alloc, repair_job.table_name, switch (method) {
+        .POST => .admin,
+        .GET, .PUT, .DELETE => return null,
+    });
+    if (routes.Routes.matchTableRepairJob(path)) |repair_job| return try tablePermission(alloc, repair_job.table_name, switch (method) {
+        .GET => .read,
+        .POST, .PUT, .DELETE => return null,
+    });
+    if (routes.Routes.matchTableRepairJobAdvance(path)) |repair_job| return try tablePermission(alloc, repair_job.table_name, switch (method) {
+        .POST => .admin,
+        .GET, .PUT, .DELETE => return null,
+    });
+    if (routes.Routes.matchTableRepairJobCancel(path)) |repair_job| return try tablePermission(alloc, repair_job.table_name, switch (method) {
+        .POST => .admin,
+        .GET, .PUT, .DELETE => return null,
+    });
     if (routes.Routes.matchTableArtifacts(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
         .GET => .read,
         .POST, .PUT, .DELETE => return null,
@@ -8925,6 +8941,34 @@ test "document artifact routes declare read and admin permissions" {
     }
     {
         const required = (try requiredPermissionForRequest(std.testing.allocator, .POST, "/tables/docs/repair/run")).?;
+        defer required.deinit(std.testing.allocator);
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqualStrings("docs", required.resource);
+        try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
+    }
+    {
+        const required = (try requiredPermissionForRequest(std.testing.allocator, .POST, "/tables/docs/repair/jobs")).?;
+        defer required.deinit(std.testing.allocator);
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqualStrings("docs", required.resource);
+        try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
+    }
+    {
+        const required = (try requiredPermissionForRequest(std.testing.allocator, .GET, "/tables/docs/repair/jobs/42")).?;
+        defer required.deinit(std.testing.allocator);
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqualStrings("docs", required.resource);
+        try std.testing.expectEqual(usermgr.PermissionType.read, required.permission_type);
+    }
+    {
+        const required = (try requiredPermissionForRequest(std.testing.allocator, .POST, "/tables/docs/repair/jobs/42/advance")).?;
+        defer required.deinit(std.testing.allocator);
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqualStrings("docs", required.resource);
+        try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
+    }
+    {
+        const required = (try requiredPermissionForRequest(std.testing.allocator, .POST, "/tables/docs/repair/jobs/42/cancel")).?;
         defer required.deinit(std.testing.allocator);
         try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
         try std.testing.expectEqualStrings("docs", required.resource);
