@@ -1971,7 +1971,8 @@ pub const ApiHttpServer = struct {
     pub fn handleInternalRoute(self: *ApiHttpServer, req: http_common.HttpRequest) !?http_common.HttpResponse {
         const uri_parts = splitTarget(req.uri);
         if (!std.mem.startsWith(u8, uri_parts.path, routes.Routes.internal_groups_prefix) and
-            routes.Routes.matchInternalTableCorruptEmbeddingArtifact(uri_parts.path) == null)
+            routes.Routes.matchInternalTableCorruptEmbeddingArtifact(uri_parts.path) == null and
+            routes.Routes.matchInternalTableRepairCancelState(uri_parts.path) == null)
         {
             return null;
         }

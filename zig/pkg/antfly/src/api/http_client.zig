@@ -1662,12 +1662,16 @@ pub const ApiHttpClient = struct {
         job_id: u64,
         attempt_id: u64,
     ) !bool {
-        const path = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{d}/attempts/{d}/cancel-state", .{
+        const escaped_table_name = try percentEncodePathComponent(self.alloc, table_name);
+        defer self.alloc.free(escaped_table_name);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{d}{s}{d}{s}", .{
             routes.Routes.internal_tables_prefix,
-            table_name,
+            escaped_table_name,
             routes.Routes.repair_jobs_marker,
             job_id,
+            routes.Routes.repair_attempts_marker,
             attempt_id,
+            routes.Routes.repair_cancel_state_suffix,
         });
         defer self.alloc.free(path);
         const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
@@ -2498,6 +2502,32 @@ pub fn expectGroupArtifactRepairRunMapsCancelUnavailableForTest() !void {
 
 test "api http client maps remote repair cancel unavailable" {
     try expectGroupArtifactRepairRunMapsCancelUnavailableForTest();
+}
+
+test "api http client encodes table name for repair cancel callback" {
+    const CancelExecutor = struct {
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .execute = execute,
+                },
+            };
+        }
+
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            try std.testing.expectEqual(http_common.Method.GET, req.method);
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, "/internal/v1/tables/docs%20table%2Ftenant/repair/jobs/42/attempts/3/cancel-state"));
+            return .{
+                .status = 200,
+                .body = try alloc.dupe(u8, "{\"cancel_requested\":false}"),
+            };
+        }
+    };
+
+    var executor = CancelExecutor{};
+    var client = ApiHttpClient.init(std.testing.allocator, executor.executor());
+    try std.testing.expect(!try client.fetchTableRepairCancelRequested("http://127.0.0.1:1", "docs table/tenant", 42, 3));
 }
 
 test "api http client preserves group doc identity conflicts" {

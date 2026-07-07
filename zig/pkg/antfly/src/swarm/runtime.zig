@@ -1952,10 +1952,12 @@ fn registerInternalGroupRoutes(server: anytype) !void {
     const group_prefix = routes.internal_groups_prefix ++ ":group_id";
     const table_prefix = group_prefix ++ "/tables/:table_name";
     const internal_table_prefix = routes.internal_tables_prefix ++ ":table_name";
+    const internal_table_repair_cancel_state = internal_table_prefix ++ routes.repair_jobs_marker ++ ":job_id" ++ routes.repair_attempts_marker ++ ":attempt_id" ++ routes.repair_cancel_state_suffix;
 
     const get_routes = [_][]const u8{
         group_prefix ++ routes.group_db_median_key_suffix,
         table_prefix ++ routes.documents_marker ++ ":key",
+        internal_table_repair_cancel_state,
     };
     inline for (get_routes) |path| {
         try server.get(path, internalBridgeHandler);
@@ -1991,7 +1993,8 @@ fn internalBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
     const path = ctx.request.uri.path;
     const routes = antfly.public_api.http_routes.Routes;
     if (!std.mem.startsWith(u8, path, routes.internal_groups_prefix) and
-        routes.matchInternalTableCorruptEmbeddingArtifact(path) == null)
+        routes.matchInternalTableCorruptEmbeddingArtifact(path) == null and
+        routes.matchInternalTableRepairCancelState(path) == null)
     {
         _ = ctx.status(404);
         return ctx.text("not found");
@@ -3137,6 +3140,7 @@ test "swarm runtime registers internal group routes explicitly" {
 
     try std.testing.expect(server.hasRoute(.get, group_prefix ++ routes.group_db_median_key_suffix));
     try std.testing.expect(server.hasRoute(.get, table_prefix ++ routes.documents_marker ++ ":key"));
+    try std.testing.expect(server.hasRoute(.get, internal_table_prefix ++ routes.repair_jobs_marker ++ ":job_id" ++ routes.repair_attempts_marker ++ ":attempt_id" ++ routes.repair_cancel_state_suffix));
 
     try std.testing.expect(server.hasRoute(.post, internal_table_prefix ++ routes.corrupt_embedding_artifact_suffix));
     try std.testing.expect(server.hasRoute(.post, group_prefix ++ routes.shard_ops_observe_split_suffix));

@@ -16,6 +16,7 @@ const std = @import("std");
 const docstore_mod = @import("../storage/docstore.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const platform_time = @import("../platform/time.zig");
+const platform_sync = @import("antfly_platform").sync;
 
 pub const StoreConfig = struct {
     repair_job_store_path: ?[]const u8 = null,
@@ -99,6 +100,8 @@ pub const Store = struct {
     mutex: std.atomic.Mutex = .unlocked,
     jobs: std.AutoHashMapUnmanaged(u64, []u8) = .{},
     next_job_id: u64 = 1,
+    last_durable_cleanup_ms: u64 = 0,
+    durable_cleanup_cursor: ?[]u8 = null,
 
     pub fn init(alloc: std.mem.Allocator, cfg: StoreConfig) Store {
         return .{
@@ -111,6 +114,7 @@ pub const Store = struct {
         var it = self.jobs.iterator();
         while (it.next()) |entry| self.alloc.free(entry.value_ptr.*);
         self.jobs.deinit(self.alloc);
+        if (self.durable_cleanup_cursor) |cursor| self.alloc.free(cursor);
         if (self.opened_store) |store| {
             store.deinit();
             self.alloc.destroy(store);
@@ -434,25 +438,59 @@ pub const Store = struct {
             if (parsed.value.expires_at_millis == 0 or parsed.value.expires_at_millis > now_ms) continue;
             expired.append(self.alloc, entry.key_ptr.*) catch continue;
         }
-        var durable_results: []docstore_mod.OwnedKVPair = &.{};
         var durable_delete_keys = std.ArrayListUnmanaged([]const u8).empty;
-        defer durable_delete_keys.deinit(self.alloc);
-        if (self.opened_store) |opened| {
-            durable_results = opened.docstore.scanPrefix(self.alloc, job_key_prefix) catch &.{};
+        defer {
+            for (durable_delete_keys.items) |key| self.alloc.free(key);
+            durable_delete_keys.deinit(self.alloc);
+        }
+        if (self.opened_store) |opened| durable_cleanup: {
+            if (!self.shouldRunDurableCleanupLocked(now_ms)) break :durable_cleanup;
+            self.last_durable_cleanup_ms = now_ms;
+
+            const durable_results = opened.docstore.scanPrefixPage(
+                self.alloc,
+                job_key_prefix,
+                self.durable_cleanup_cursor,
+                durable_cleanup_scan_limit,
+            ) catch break :durable_cleanup;
+            defer docstore_mod.DocStore.freeResults(self.alloc, durable_results);
+            defer self.advanceDurableCleanupCursorLocked(durable_results);
+
             for (durable_results) |kv| {
                 var parsed = std.json.parseFromSlice(JobState, self.alloc, kv.value, .{ .ignore_unknown_fields = true }) catch continue;
                 defer parsed.deinit();
                 if (parsed.value.expires_at_millis == 0 or parsed.value.expires_at_millis > now_ms) continue;
                 expired.append(self.alloc, parsed.value.job_id) catch continue;
-                durable_delete_keys.append(self.alloc, kv.key) catch continue;
+                const delete_key = self.alloc.dupe(u8, kv.key) catch continue;
+                durable_delete_keys.append(self.alloc, delete_key) catch {
+                    self.alloc.free(delete_key);
+                    continue;
+                };
             }
         }
-        defer if (durable_results.len > 0) docstore_mod.DocStore.freeResults(self.alloc, durable_results);
         if (durable_delete_keys.items.len > 0) {
             if (self.opened_store) |opened| opened.docstore.putBatch(&.{}, durable_delete_keys.items) catch {};
         }
         for (expired.items) |job_id| {
             if (self.jobs.fetchRemove(job_id)) |removed| self.alloc.free(removed.value);
+        }
+    }
+
+    fn shouldRunDurableCleanupLocked(self: *Store, now_ms: u64) bool {
+        return self.last_durable_cleanup_ms == 0 or
+            now_ms >= self.last_durable_cleanup_ms +| durable_cleanup_interval_ms;
+    }
+
+    fn advanceDurableCleanupCursorLocked(self: *Store, durable_results: []const docstore_mod.OwnedKVPair) void {
+        if (durable_results.len == durable_cleanup_scan_limit) {
+            const next = self.alloc.dupe(u8, durable_results[durable_results.len - 1].key) catch return;
+            if (self.durable_cleanup_cursor) |old| self.alloc.free(old);
+            self.durable_cleanup_cursor = next;
+            return;
+        }
+        if (self.durable_cleanup_cursor) |old| {
+            self.alloc.free(old);
+            self.durable_cleanup_cursor = null;
         }
     }
 
@@ -639,9 +677,7 @@ fn leaseExpired(now_ms: u64, last_updated_ms: u64, timeout_ms: u64) bool {
 }
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
-    while (mutex.tryLock() == false) {
-        std.atomic.spinLoopHint();
-    }
+    platform_sync.lockYielding(mutex);
 }
 
 fn jobKey(alloc: std.mem.Allocator, job_id: u64) ![]u8 {
@@ -676,6 +712,8 @@ fn persistNextJobId(store: *docstore_mod.DocStore, alloc: std.mem.Allocator, nex
 
 const job_key_prefix = "__api_table_repair_jobs__:";
 const next_job_id_key = "__api_table_repair_jobs_meta__:next_job_id";
+const durable_cleanup_interval_ms: u64 = 60_000;
+const durable_cleanup_scan_limit: usize = 128;
 
 test "table repair job records bounded pass and continuation" {
     const alloc = std.testing.allocator;
@@ -798,4 +836,54 @@ test "table repair job store persists monotonic next id across stale durable wri
         defer parsed_second.deinit();
         try std.testing.expectEqual(@as(u64, 2), parsed_second.value.job_id);
     }
+}
+
+test "table repair job cleanup pages durable expired jobs" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/repair-jobs-cleanup-page", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    const opened = try alloc.create(OpenedStore);
+    errdefer alloc.destroy(opened);
+    opened.* = try OpenedStore.open(alloc, path);
+    var store = Store.init(alloc, .{});
+    defer store.deinit();
+    try store.attachOpenedStore(opened);
+
+    const now_ms = nowMillis();
+    var id: u64 = 1;
+    while (id <= @as(u64, @intCast(durable_cleanup_scan_limit + 2))) : (id += 1) {
+        const encoded = try encodeState(alloc, .{
+            .job_id = id,
+            .table_name = "docs",
+            .phase = phaseString(.succeeded),
+            .repair_status = repairStatusForPhase(.succeeded, false, false),
+            .target = "artifact",
+            .limit = 1,
+            .result = .{ .limit = 1 },
+            .created_at_millis = now_ms - 2,
+            .last_updated_at_millis = now_ms - 2,
+            .expires_at_millis = now_ms - 1,
+        });
+        defer alloc.free(encoded);
+        try store.storeEncoded(id, encoded, null);
+    }
+
+    store.cleanupExpiredJobs();
+    const first_remaining = try store.opened_store.?.docstore.scanPrefix(alloc, job_key_prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, first_remaining);
+    try std.testing.expectEqual(@as(usize, 2), first_remaining.len);
+
+    store.cleanupExpiredJobs();
+    const throttled_remaining = try store.opened_store.?.docstore.scanPrefix(alloc, job_key_prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, throttled_remaining);
+    try std.testing.expectEqual(@as(usize, 2), throttled_remaining.len);
+
+    store.last_durable_cleanup_ms = 0;
+    store.cleanupExpiredJobs();
+    const final_remaining = try store.opened_store.?.docstore.scanPrefix(alloc, job_key_prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, final_remaining);
+    try std.testing.expectEqual(@as(usize, 0), final_remaining.len);
 }
