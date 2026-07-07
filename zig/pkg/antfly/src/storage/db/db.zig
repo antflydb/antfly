@@ -32697,13 +32697,17 @@ test "db non chunked search paths apply broad live doc filter" {
         .limit = 1,
         .offset = 1,
         .include_stored = false,
+        .profile = true,
     }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 });
     defer dense_live_page_two.result.deinit();
     try std.testing.expectEqual(@as(u32, 2), dense_live_page_two.result.total_hits);
-    try std.testing.expectEqual(types.TotalHitsRelation.gte, dense_live_page_two.result.total_hits_relation);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, dense_live_page_two.result.total_hits_relation);
     try std.testing.expectEqual(@as(usize, 1), dense_live_page_two.result.hits.len);
     try std.testing.expectEqualStrings("doc:c", dense_live_page_two.result.hits[0].id);
     try std.testing.expectEqual(@as(u32, 2), dense_live_page_two.profile.raw_hit_count);
+    const dense_live_page_two_profile = dense_live_page_two.result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("score_top_k", dense_live_page_two_profile.plan);
+    try std.testing.expectEqualStrings("exact", dense_live_page_two_profile.exactness);
 
     var sparse_live = try db.search(alloc, .{
         .index_name = "sp_v1",
