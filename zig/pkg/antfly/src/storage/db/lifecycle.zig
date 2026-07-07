@@ -2453,6 +2453,44 @@ pub fn Impl(comptime DB: type) type {
             }
         }
 
+        fn applyRelationalGenerationDiagnosticsForIndexStats(self: *DB, item: *types.DBIndexStats) void {
+            const active_schema = self.core.schema orelse return;
+            if (active_schema.storage_mode != .relational) return;
+            for (active_schema.relational_indexes) |index| {
+                if (!std.mem.eql(u8, index.name, item.name)) continue;
+                if (!relationalIndexAccessMethodMatchesStatsKind(index.access_method, item.kind)) return;
+                item.relational_generation_present = true;
+                item.relational_generation = index.generation;
+                if (schema_mod.relationalIndexGenerationRecordValid(index)) {
+                    const record = index.generation_record.?;
+                    item.relational_generation_record_valid = true;
+                    item.relational_generation = record.generation;
+                    item.relational_generation_lifecycle = record.lifecycle;
+                    item.relational_generation_lag = record.lag;
+                    item.relational_generation_ready_watermark = record.ready_watermark;
+                    item.relational_generation_catch_up_required = record.lifecycle != .ready or record.lag != 0;
+                } else {
+                    item.relational_generation_record_valid = false;
+                    item.relational_generation_lifecycle = .rebuild_required;
+                    item.relational_generation_lag = 0;
+                    item.relational_generation_ready_watermark = 0;
+                    item.relational_generation_catch_up_required = true;
+                }
+                return;
+            }
+        }
+
+        fn relationalIndexAccessMethodMatchesStatsKind(
+            access_method: schema_mod.RelationalIndexAccessMethod,
+            kind: types.IndexKind,
+        ) bool {
+            return switch (access_method) {
+                .text_search => kind == .full_text,
+                .algebraic_filter => kind == .algebraic,
+                .scalar_column, .ordered_tuple => false,
+            };
+        }
+
         pub fn statsLocked(self: *DB, alloc: Allocator) !types.DBStats {
             const configs = try self.core.listIndexes(alloc);
             defer types.freeIndexConfigs(alloc, configs);
@@ -2484,6 +2522,7 @@ pub fn Impl(comptime DB: type) type {
                     .catch_up_target_sequence = target_sequence,
                 };
                 errdefer freeDBIndexStatsItem(alloc, item);
+                Self.applyRelationalGenerationDiagnosticsForIndexStats(self, &item);
                 if (target_sequence > 0) {
                     item.backfill_progress = @min(
                         1.0,
@@ -2620,6 +2659,7 @@ pub fn Impl(comptime DB: type) type {
                     .kind = cfg.kind,
                 };
                 errdefer freeDBIndexStatsItem(alloc, item);
+                Self.applyRelationalGenerationDiagnosticsForIndexStats(self, &item);
                 for (replay_debt) |status| {
                     if (!std.mem.eql(u8, status.index_name, cfg.name)) continue;
                     item.replay_applied_sequence = status.applied_sequence;
@@ -2801,6 +2841,7 @@ pub fn Impl(comptime DB: type) type {
                     .catch_up_target_sequence = target_sequence,
                 };
                 errdefer freeDBIndexStatsItem(alloc, item);
+                Self.applyRelationalGenerationDiagnosticsForIndexStats(self, &item);
                 if (target_sequence > 0) {
                     item.backfill_progress = @min(
                         1.0,
@@ -3027,6 +3068,7 @@ pub fn Impl(comptime DB: type) type {
                     item.backfill_active = false;
                     if (item.replay_target_sequence > 0) item.backfill_progress = 1.0;
                 }
+                Self.applyRelationalGenerationDiagnosticsForIndexStats(self, item);
             }
         }
 
@@ -4133,6 +4175,91 @@ test "db lifecycle open query_readonly skips pending derived replay on reopen" {
         try std.testing.expectEqual(appended_sequence, replayed_stats.indexes[0].replay_applied_sequence);
         try std.testing.expectEqual(appended_sequence, replayed_stats.indexes[0].replay_target_sequence);
         try std.testing.expect(!replayed_stats.indexes[0].replay_catch_up_required);
+    }
+}
+
+test "db lifecycle diagnostics load relational generation records for derived access methods" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"body":{"type":"text"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"body_text_idx","owner_kind":"relational_column","owner_name":"body","access_method":"text_search","method_config":{"type":"full_text","field":"body","analyzer":"standard"},"columns":["body"],"lifecycle":"catching_up","generation":7,"schema_fingerprint":"secondary-index-v1:body_text","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"catching_up","lag":19,"ready_watermark":101}},{"name":"schema_alg_idx","owner_kind":"table","owner_name":"__antfly_table__","access_method":"algebraic_filter","method_config":{"type":"algebraic","derive_from_schema":true},"lifecycle":"building","generation":9,"schema_fingerprint":"secondary-index-v1:schema_alg","generation_record":{"generation":9,"owner_ranges":[],"lifecycle":"building","lag":23,"ready_watermark":144}}]}
+    ;
+    const algebraic_config =
+        \\{
+        \\  "version": 1,
+        \\  "schema_version": 1,
+        \\  "table": "docs",
+        \\  "group_fields": [{"name":"status","path":"status","type":"string"}],
+        \\  "materializations": []
+        \\}
+    ;
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.applyTableSchemaJson(alloc, schema_json, .{});
+    try db.addIndex(.{ .name = "body_text_idx", .kind = .full_text, .config_json = "{}" });
+    try db.addIndex(.{ .name = "schema_alg_idx", .kind = .algebraic, .config_json = algebraic_config });
+
+    const Expect = struct {
+        name: []const u8,
+        kind: types.IndexKind,
+        lifecycle: schema_mod.RelationalIndexLifecycle,
+        generation: u64,
+        lag: u64,
+        ready_watermark: u64,
+
+        fn assertInStats(self: @This(), stats: types.DBStats) !void {
+            for (stats.indexes) |item| {
+                if (!std.mem.eql(u8, item.name, self.name)) continue;
+                try std.testing.expectEqual(self.kind, item.kind);
+                try std.testing.expect(item.relational_generation_present);
+                try std.testing.expect(item.relational_generation_record_valid);
+                try std.testing.expectEqual(self.generation, item.relational_generation);
+                try std.testing.expectEqual(self.lifecycle, item.relational_generation_lifecycle);
+                try std.testing.expectEqual(self.lag, item.relational_generation_lag);
+                try std.testing.expectEqual(self.ready_watermark, item.relational_generation_ready_watermark);
+                try std.testing.expect(item.relational_generation_catch_up_required);
+                return;
+            }
+            return error.TestUnexpectedResult;
+        }
+    };
+    const expected = [_]Expect{
+        .{
+            .name = "body_text_idx",
+            .kind = .full_text,
+            .lifecycle = .catching_up,
+            .generation = 7,
+            .lag = 19,
+            .ready_watermark = 101,
+        },
+        .{
+            .name = "schema_alg_idx",
+            .kind = .algebraic,
+            .lifecycle = .building,
+            .generation = 9,
+            .lag = 23,
+            .ready_watermark = 144,
+        },
+    };
+
+    const live_stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, live_stats);
+    const diagnostic_stats = try db.diagnosticStats(alloc);
+    defer types.freeDBStats(alloc, diagnostic_stats);
+
+    for (expected) |case| {
+        try case.assertInStats(live_stats);
+        try case.assertInStats(diagnostic_stats);
     }
 }
 

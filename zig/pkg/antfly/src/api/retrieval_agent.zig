@@ -36,6 +36,7 @@ const RetrievalAgentRequest = metadata_openapi.RetrievalAgentRequest;
 const RetrievalAgentResult = metadata_openapi.RetrievalAgentResult;
 const RetrievalQueryRequest = metadata_openapi.RetrievalQueryRequest;
 const RetrievalStrategy = metadata_openapi.RetrievalStrategy;
+const IncompleteDetailsReason = metadata_openapi.IncompleteDetailsReason;
 const TreeSearchConfig = metadata_openapi.TreeSearchConfig;
 
 fn testChatMessageText(message: generating.ChatMessage) []const u8 {
@@ -44,6 +45,16 @@ fn testChatMessageText(message: generating.ChatMessage) []const u8 {
         .text => |text| text,
         .parts => "",
     };
+}
+
+fn incompleteDetailsReasonFromText(reason: []const u8) !IncompleteDetailsReason {
+    const map = std.StaticStringMap(IncompleteDetailsReason).initComptime(.{
+        .{ "max_internal_iterations", .max_internal_iterations },
+        .{ "max_tokens", .max_tokens },
+        .{ "no_tools", .no_tools },
+        .{ "clarification_required", .clarification_required },
+    });
+    return map.get(reason) orelse error.InvalidRetrievalAgentResponse;
 }
 
 const ToolPolicy = struct {
@@ -646,7 +657,7 @@ fn executeInternal(
             const result = RetrievalAgentResult{
                 .created_at = 0,
                 .status = .incomplete,
-                .incomplete_details = .{ .reason = reason },
+                .incomplete_details = .{ .reason = try incompleteDetailsReasonFromText(reason) },
                 .hits = &.{},
                 .steps = steps,
                 .strategy_used = null,
@@ -8253,7 +8264,7 @@ test "retrieval agent reports incomplete when a decision is required but clarifi
     defer parsed.deinit();
     try std.testing.expectEqual(AgentStatus.incomplete, parsed.value.status);
     try std.testing.expect(parsed.value.incomplete_details != null);
-    try std.testing.expectEqualStrings("clarification_required", parsed.value.incomplete_details.?.reason);
+    try std.testing.expectEqual(IncompleteDetailsReason.clarification_required, parsed.value.incomplete_details.?.reason);
 }
 
 test "retrieval agent can continue from a decision" {

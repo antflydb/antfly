@@ -51,6 +51,7 @@
     "multi_output_subquery_delete_selector",
     "multi_output_subquery_update_selector",
     "operator_catalog_plan",
+    "row_rewrite_expression_plan",
     "row_lock_mode_plan",
     "rule_catalog_plan",
     "session_setting",

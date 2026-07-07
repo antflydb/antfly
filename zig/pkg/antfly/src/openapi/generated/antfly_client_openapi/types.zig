@@ -21,9 +21,37 @@ pub const SqlStatementRequest = struct {
     read_only: ?bool = null,
 };
 
+pub const SqlStatementResponseKind = enum {
+    ddl,
+    read,
+    write,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .ddl => "ddl",
+            .read => "read",
+            .write => "write",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "ddl", .ddl },
+            .{ "read", .read },
+            .{ "write", .write },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Synchronous SQL statement result metadata. Catalog/session/control statements route through the typed DDL/session execution path. Read statements lower through the same typed row-plan executor used by the JSON relational rows APIs. Point write statements lower through the typed row-batch mutation path, and insert-from-source statements lower through the typed row-read plus row-batch mutation path.
 pub const SqlStatementResponse = struct {
-    kind: []const u8,
+    kind: SqlStatementResponseKind,
     session_id: i64,
     noop: ?bool = null,
     /// Applied DDL/session result record.
@@ -384,9 +412,32 @@ pub const DocumentArtifactChildRange = struct {
     text_bytes: ?i64 = null,
 };
 
+/// Indicates that reprocessing was accepted.
+pub const DocumentArtifactReprocessResponseReprocess = enum {
+    triggered,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .triggered => "triggered",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "triggered", .triggered },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const DocumentArtifactReprocessResponse = struct {
     /// Indicates that reprocessing was accepted.
-    reprocess: []const u8,
+    reprocess: DocumentArtifactReprocessResponseReprocess,
 };
 
 pub const DocumentArtifactReprocessFailure = struct {
@@ -903,11 +954,43 @@ pub const SignificanceAlgorithm = enum {
     }
 };
 
+/// Temporal join mode for the algebraic materialization
+pub const AlgebraicAggregationJoinKind = enum {
+    none,
+    bucket,
+    window,
+    bucket_window,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .none => "none",
+            .bucket => "bucket",
+            .window => "window",
+            .bucket_window => "bucket_window",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "none", .none },
+            .{ "bucket", .bucket },
+            .{ "window", .window },
+            .{ "bucket_window", .bucket_window },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const AlgebraicAggregationJoin = struct {
     /// Algebraic join materialization or capability name
     name: []const u8,
     /// Temporal join mode for the algebraic materialization
-    kind: ?[]const u8 = null,
+    kind: ?AlgebraicAggregationJoinKind = null,
     /// Join side that supplies grouping bucket values
     group_side: []const u8,
     /// Join side that supplies metric values
@@ -1092,19 +1175,78 @@ pub const RowsFieldPatch = struct {};
 /// Numeric increment map keyed by declared numeric columns.
 pub const RowsNumericIncrement = struct {};
 
+pub const RowsArrayUpdateTransformOp = enum {
+    append,
+    remove,
+    add_to_set,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .append => "append",
+            .remove => "remove",
+            .add_to_set => "add_to_set",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "append", .append },
+            .{ "remove", .remove },
+            .{ "add_to_set", .add_to_set },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Array transform for a declared `array` column.
 pub const RowsArrayUpdateTransform = struct {
     /// Declared `array` column to update.
     field: []const u8,
-    op: []const u8,
+    op: RowsArrayUpdateTransformOp,
     /// JSON value to append, remove, or add if absent.
     value: std.json.Value,
+};
+
+pub const RowsUniquePredicateOp = enum {
+    is_null,
+    is_not_null,
+    eq,
+    ne,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .is_null => "is_null",
+            .is_not_null => "is_not_null",
+            .eq => "eq",
+            .ne => "ne",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "is_null", .is_null },
+            .{ "is_not_null", .is_not_null },
+            .{ "eq", .eq },
+            .{ "ne", .ne },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// Predicate atom that must match a partial unique constraint definition.
 pub const RowsUniquePredicate = struct {
     field: []const u8,
-    op: []const u8,
+    op: RowsUniquePredicateOp,
     /// Predicate comparison value. Omit for null-test operators.
     value: ?std.json.Value = null,
 };
@@ -1137,12 +1279,38 @@ pub const RowsTemporalPortion = struct {
     to: std.json.Value,
 };
 
+/// Join side that supplies the source field. Must be the non-target side.
+pub const RowsJoinedMutationSourceAssignmentSide = enum {
+    left,
+    right,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .left => "left",
+            .right => "right",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "left", .left },
+            .{ "right", .right },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Source-side assignment for joined mutation-source updates.
 pub const RowsJoinedMutationSourceAssignment = struct {
     /// Declared target-side relational field to assign.
     target_field: []const u8,
     /// Join side that supplies the source field. Must be the non-target side.
-    side: []const u8,
+    side: RowsJoinedMutationSourceAssignmentSide,
     /// Declared relational field to copy from the source side.
     field: []const u8,
 };
@@ -1156,17 +1324,120 @@ pub const RowsMutationSourceResultSet = struct {
     returning: ?[]const std.json.Value = null,
 };
 
+pub const RowsQueryOrderFieldNullTest = enum {
+    is_null,
+    is_not_null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .is_null => "is_null",
+            .is_not_null => "is_not_null",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "is_null", .is_null },
+            .{ "is_not_null", .is_not_null },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const RowsQueryOrderFieldDirection = enum {
+    asc,
+    desc,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .asc => "asc",
+            .desc => "desc",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "asc", .asc },
+            .{ "desc", .desc },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const RowsQueryOrderField = struct {
     /// Output/base field to order by. Mutually exclusive with `expr`.
     field: []const u8,
-    null_test: ?[]const u8 = null,
-    direction: ?[]const u8 = null,
+    null_test: ?RowsQueryOrderFieldNullTest = null,
+    direction: ?RowsQueryOrderFieldDirection = null,
+};
+
+pub const RowsRowClaimMode = enum {
+    for_update,
+    for_no_key_update,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .for_update => "for_update",
+            .for_no_key_update => "for_no_key_update",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "for_update", .for_update },
+            .{ "for_no_key_update", .for_no_key_update },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const RowsRowClaimWaitPolicy = enum {
+    wait,
+    nowait,
+    skip_locked,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .wait => "wait",
+            .nowait => "nowait",
+            .skip_locked => "skip_locked",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "wait", .wait },
+            .{ "nowait", .nowait },
+            .{ "skip_locked", .skip_locked },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// Lockable base-row claim metadata. Public row-plan endpoints reject this field; it is only accepted by `rows/mutation-source` lockable base-row sources and internal/coordinator execution paths. `transaction_id` is the canonical field name.
 pub const RowsRowClaim = struct {
-    mode: ?[]const u8 = null,
-    wait_policy: ?[]const u8 = null,
+    mode: ?RowsRowClaimMode = null,
+    wait_policy: ?RowsRowClaimWaitPolicy = null,
     skip_locked: ?bool = null,
     lease_ms: ?i64 = null,
     owner_id: ?[]const u8 = null,
@@ -1195,9 +1466,40 @@ pub const RowsDocKeyRange = struct {
     }
 };
 
+pub const RowsExpressionFieldSource = enum {
+    row,
+    existing,
+    proposed,
+    source,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .row => "row",
+            .existing => "existing",
+            .proposed => "proposed",
+            .source => "source",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "row", .row },
+            .{ "existing", .existing },
+            .{ "proposed", .proposed },
+            .{ "source", .source },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const RowsExpressionField = struct {
     field: []const u8,
-    source: ?[]const u8 = null,
+    source: ?RowsExpressionFieldSource = null,
 };
 
 pub const RowsExpressionValue = struct {
@@ -1243,11 +1545,87 @@ pub const RowsFieldAliasProjection = struct {
     field: []const u8,
 };
 
+pub const RowsWhereAtomOp = enum {
+    is_null,
+    is_not_null,
+    is_distinct,
+    is_not_distinct,
+    eq,
+    ne,
+    gt,
+    gte,
+    lt,
+    lte,
+    array_any,
+    array_contains,
+    array_eq,
+    in,
+    not_in,
+    json_contains,
+    json_path_eq,
+    json_path_exists,
+    text_pattern,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .is_null => "is_null",
+            .is_not_null => "is_not_null",
+            .is_distinct => "is_distinct",
+            .is_not_distinct => "is_not_distinct",
+            .eq => "eq",
+            .ne => "ne",
+            .gt => "gt",
+            .gte => "gte",
+            .lt => "lt",
+            .lte => "lte",
+            .array_any => "array_any",
+            .array_contains => "array_contains",
+            .array_eq => "array_eq",
+            .in => "in",
+            .not_in => "not_in",
+            .json_contains => "json_contains",
+            .json_path_eq => "json_path_eq",
+            .json_path_exists => "json_path_exists",
+            .text_pattern => "text_pattern",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "is_null", .is_null },
+            .{ "is_not_null", .is_not_null },
+            .{ "is_distinct", .is_distinct },
+            .{ "is_not_distinct", .is_not_distinct },
+            .{ "eq", .eq },
+            .{ "ne", .ne },
+            .{ "gt", .gt },
+            .{ "gte", .gte },
+            .{ "lt", .lt },
+            .{ "lte", .lte },
+            .{ "array_any", .array_any },
+            .{ "array_contains", .array_contains },
+            .{ "array_eq", .array_eq },
+            .{ "in", .in },
+            .{ "not_in", .not_in },
+            .{ "json_contains", .json_contains },
+            .{ "json_path_eq", .json_path_eq },
+            .{ "json_path_exists", .json_path_exists },
+            .{ "text_pattern", .text_pattern },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Typed scalar, array, JSON, or text-pattern row predicate atom over a declared relational column. Null-test operators omit `value`; value operators carry one JSON value; `in` and `not_in` carry an array value; JSON path operators carry `path`; text-pattern operators carry `pattern` and optional flags. The server validates column type and operator-specific fields against the table schema.
 pub const RowsWhereAtom = struct {
     /// Declared relational column.
     field: []const u8,
-    op: []const u8,
+    op: RowsWhereAtomOp,
     /// JSON comparison value or array operand for operators that require one.
     value: ?std.json.Value = null,
     /// Non-empty JSON path for `json_path_eq` and `json_path_exists`, encoded as a dot path string or array of path components.
@@ -1260,10 +1638,86 @@ pub const RowsWhereAtom = struct {
     negated: ?bool = null,
 };
 
+pub const RowsWhereBranchAtomOp = enum {
+    is_null,
+    is_not_null,
+    is_distinct,
+    is_not_distinct,
+    eq,
+    ne,
+    gt,
+    gte,
+    lt,
+    lte,
+    array_any,
+    array_contains,
+    array_eq,
+    in,
+    not_in,
+    json_contains,
+    json_path_eq,
+    json_path_exists,
+    text_pattern,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .is_null => "is_null",
+            .is_not_null => "is_not_null",
+            .is_distinct => "is_distinct",
+            .is_not_distinct => "is_not_distinct",
+            .eq => "eq",
+            .ne => "ne",
+            .gt => "gt",
+            .gte => "gte",
+            .lt => "lt",
+            .lte => "lte",
+            .array_any => "array_any",
+            .array_contains => "array_contains",
+            .array_eq => "array_eq",
+            .in => "in",
+            .not_in => "not_in",
+            .json_contains => "json_contains",
+            .json_path_eq => "json_path_eq",
+            .json_path_exists => "json_path_exists",
+            .text_pattern => "text_pattern",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "is_null", .is_null },
+            .{ "is_not_null", .is_not_null },
+            .{ "is_distinct", .is_distinct },
+            .{ "is_not_distinct", .is_not_distinct },
+            .{ "eq", .eq },
+            .{ "ne", .ne },
+            .{ "gt", .gt },
+            .{ "gte", .gte },
+            .{ "lt", .lt },
+            .{ "lte", .lte },
+            .{ "array_any", .array_any },
+            .{ "array_contains", .array_contains },
+            .{ "array_eq", .array_eq },
+            .{ "in", .in },
+            .{ "not_in", .not_in },
+            .{ "json_contains", .json_contains },
+            .{ "json_path_eq", .json_path_eq },
+            .{ "json_path_exists", .json_path_exists },
+            .{ "text_pattern", .text_pattern },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const RowsWhereBranchAtom = struct {
     /// Declared relational column for a single-atom branch.
     field: []const u8,
-    op: []const u8,
+    op: RowsWhereBranchAtomOp,
     /// JSON comparison value or array operand for operators that require one.
     value: ?std.json.Value = null,
     /// Non-empty JSON path for `json_path_eq` and `json_path_exists`, encoded as a dot path string or array of path components.
@@ -1274,22 +1728,158 @@ pub const RowsWhereBranchAtom = struct {
     case_insensitive: ?bool = null,
     /// Negates `text_pattern`.
     negated: ?bool = null,
+};
+
+pub const RowsAggregateHavingPredicateOp = enum {
+    is_null,
+    is_not_null,
+    is_distinct,
+    is_not_distinct,
+    eq,
+    ne,
+    gt,
+    gte,
+    lt,
+    lte,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .is_null => "is_null",
+            .is_not_null => "is_not_null",
+            .is_distinct => "is_distinct",
+            .is_not_distinct => "is_not_distinct",
+            .eq => "eq",
+            .ne => "ne",
+            .gt => "gt",
+            .gte => "gte",
+            .lt => "lt",
+            .lte => "lte",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "is_null", .is_null },
+            .{ "is_not_null", .is_not_null },
+            .{ "is_distinct", .is_distinct },
+            .{ "is_not_distinct", .is_not_distinct },
+            .{ "eq", .eq },
+            .{ "ne", .ne },
+            .{ "gt", .gt },
+            .{ "gte", .gte },
+            .{ "lt", .lt },
+            .{ "lte", .lte },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// Predicate over emitted aggregate output fields, evaluated after grouping.
 pub const RowsAggregateHavingPredicate = struct {
     /// Emitted aggregate output field name, usually an aggregation `name`, group key, or expression group alias.
     field: []const u8,
-    op: []const u8,
+    op: RowsAggregateHavingPredicateOp,
     /// Comparison value. Omit for `is_null` and `is_not_null`.
     value: ?std.json.Value = null,
 };
 
+pub const RowsWindowFrameUnit = enum {
+    rows,
+    range,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .rows => "rows",
+            .range => "range",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "rows", .rows },
+            .{ "range", .range },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const RowsWindowFrameStart = enum {
+    unbounded_preceding,
+    offset_preceding,
+    current_row,
+    offset_following,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .unbounded_preceding => "unbounded_preceding",
+            .offset_preceding => "offset_preceding",
+            .current_row => "current_row",
+            .offset_following => "offset_following",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "unbounded_preceding", .unbounded_preceding },
+            .{ "offset_preceding", .offset_preceding },
+            .{ "current_row", .current_row },
+            .{ "offset_following", .offset_following },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const RowsWindowFrameEnd = enum {
+    offset_preceding,
+    current_row,
+    offset_following,
+    unbounded_following,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .offset_preceding => "offset_preceding",
+            .current_row => "current_row",
+            .offset_following => "offset_following",
+            .unbounded_following => "unbounded_following",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "offset_preceding", .offset_preceding },
+            .{ "current_row", .current_row },
+            .{ "offset_following", .offset_following },
+            .{ "unbounded_following", .unbounded_following },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const RowsWindowFrame = struct {
-    unit: []const u8,
-    start: []const u8,
+    unit: RowsWindowFrameUnit,
+    start: RowsWindowFrameStart,
     start_offset: ?i64 = null,
-    end: []const u8,
+    end: RowsWindowFrameEnd,
     end_offset: ?i64 = null,
 };
 
@@ -1298,9 +1888,34 @@ pub const RowsJoinOn = struct {
     right_field: []const u8,
 };
 
+pub const RowsJoinProjectionSide = enum {
+    left,
+    right,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .left => "left",
+            .right => "right",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "left", .left },
+            .{ "right", .right },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const RowsJoinProjection = struct {
     as: []const u8,
-    side: []const u8,
+    side: RowsJoinProjectionSide,
     field: []const u8,
 };
 
@@ -1449,13 +2064,65 @@ pub const TransactionSessionCleanupResponse = struct {
     cutoff_ns: ?i64 = null,
 };
 
+/// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
+pub const BackupRequestFormat = enum {
+    native,
+    portable,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .native => "native",
+            .portable => "portable",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "native", .native },
+            .{ "portable", .portable },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const BackupRequest = struct {
     /// Unique identifier for this backup. Used to reference the backup for restore operations. Choose a meaningful name that includes date/version information.
     backup_id: []const u8,
     /// Storage location for the backup. Supports multiple backends: - Local filesystem: `file:///path/to/backup` - Amazon S3: `s3://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata for the specified table.
     location: []const u8,
     /// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
-    format: ?[]const u8 = null,
+    format: ?BackupRequestFormat = null,
+};
+
+/// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
+pub const ClusterBackupRequestFormat = enum {
+    native,
+    portable,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .native => "native",
+            .portable => "portable",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "native", .native },
+            .{ "portable", .portable },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 pub const ClusterBackupRequest = struct {
@@ -1464,18 +2131,76 @@ pub const ClusterBackupRequest = struct {
     /// Storage location for the backup. Supports multiple backends: - Local filesystem: `file:///path/to/backup` - Amazon S3: `s3://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata.
     location: []const u8,
     /// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
-    format: ?[]const u8 = null,
+    format: ?ClusterBackupRequestFormat = null,
     /// Optional list of tables to backup. If omitted, all tables are backed up.
     table_names: ?[]const []const u8 = null,
+};
+
+/// Backup status for this table
+pub const TableBackupStatusStatus = enum {
+    completed,
+    failed,
+    skipped,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .completed => "completed",
+            .failed => "failed",
+            .skipped => "skipped",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "completed", .completed },
+            .{ "failed", .failed },
+            .{ "skipped", .skipped },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 pub const TableBackupStatus = struct {
     /// Table name
     name: []const u8,
     /// Backup status for this table
-    status: []const u8,
+    status: TableBackupStatusStatus,
     /// Error message if backup failed
     @"error": ?[]const u8 = null,
+};
+
+/// How to handle existing tables: - `fail_if_exists`: Abort if any table already exists (default) - `skip_if_exists`: Skip existing tables, restore others - `overwrite`: Drop and recreate existing tables
+pub const ClusterRestoreRequestRestoreMode = enum {
+    fail_if_exists,
+    skip_if_exists,
+    overwrite,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .fail_if_exists => "fail_if_exists",
+            .skip_if_exists => "skip_if_exists",
+            .overwrite => "overwrite",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "fail_if_exists", .fail_if_exists },
+            .{ "skip_if_exists", .skip_if_exists },
+            .{ "overwrite", .overwrite },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 pub const ClusterRestoreRequest = struct {
@@ -1486,16 +2211,71 @@ pub const ClusterRestoreRequest = struct {
     /// Optional list of tables to restore. If omitted, all tables in the backup are restored.
     table_names: ?[]const []const u8 = null,
     /// How to handle existing tables: - `fail_if_exists`: Abort if any table already exists (default) - `skip_if_exists`: Skip existing tables, restore others - `overwrite`: Drop and recreate existing tables
-    restore_mode: ?[]const u8 = null,
+    restore_mode: ?ClusterRestoreRequestRestoreMode = null,
+};
+
+/// Restore status for this table
+pub const TableRestoreStatusStatus = enum {
+    triggered,
+    skipped,
+    failed,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .triggered => "triggered",
+            .skipped => "skipped",
+            .failed => "failed",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "triggered", .triggered },
+            .{ "skipped", .skipped },
+            .{ "failed", .failed },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 pub const TableRestoreStatus = struct {
     /// Table name
     name: []const u8,
     /// Restore status for this table
-    status: []const u8,
+    status: TableRestoreStatusStatus,
     /// Error message if restore failed
     @"error": ?[]const u8 = null,
+};
+
+/// Backup format used
+pub const BackupInfoFormat = enum {
+    native,
+    portable,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .native => "native",
+            .portable => "portable",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "native", .native },
+            .{ "portable", .portable },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 pub const BackupInfo = struct {
@@ -1510,13 +2290,45 @@ pub const BackupInfo = struct {
     /// Antfly version that created the backup
     antfly_version: ?[]const u8 = null,
     /// Backup format used
-    format: ?[]const u8 = null,
+    format: ?BackupInfoFormat = null,
+};
+
+/// Why the agent stopped: - max_internal_iterations: Hit the configured max_internal_iterations limit - max_tokens: LLM output was truncated - no_tools: No tools were available for agentic mode - clarification_required: The agent needs a user decision before it can continue
+pub const IncompleteDetailsReason = enum {
+    max_internal_iterations,
+    max_tokens,
+    no_tools,
+    clarification_required,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .max_internal_iterations => "max_internal_iterations",
+            .max_tokens => "max_tokens",
+            .no_tools => "no_tools",
+            .clarification_required => "clarification_required",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "max_internal_iterations", .max_internal_iterations },
+            .{ "max_tokens", .max_tokens },
+            .{ "no_tools", .no_tools },
+            .{ "clarification_required", .clarification_required },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// Explains why the agent stopped before completion. Present when status is "incomplete".
 pub const IncompleteDetails = struct {
     /// Why the agent stopped: - max_internal_iterations: Hit the configured max_internal_iterations limit - max_tokens: LLM output was truncated - no_tools: No tools were available for agentic mode - clarification_required: The agent needs a user decision before it can continue
-    reason: []const u8,
+    reason: IncompleteDetailsReason,
 };
 
 /// Strategy for document retrieval: - semantic: Vector similarity search using embeddings - bm25: Full-text search using BM25 scoring - metadata: Structured query on document fields - tree: Iterative tree navigation with summarization - graph: Relationship-based traversal - hybrid: Combine multiple strategies with RRF or rerank
@@ -1777,10 +2589,36 @@ pub const SSEStepProgress = struct {
     name: []const u8,
 };
 
+/// Tool calling mode selected
+pub const SSEToolModeMode = enum {
+    native,
+    structured_output,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .native => "native",
+            .structured_output => "structured_output",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "native", .native },
+            .{ "structured_output", .structured_output },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Emitted when the agent selects a tool-calling mode
 pub const SSEToolMode = struct {
     /// Tool calling mode selected
-    mode: []const u8,
+    mode: SSEToolModeMode,
     /// Number of tools available (present for native mode)
     tools_count: ?i64 = null,
 };
@@ -1997,9 +2835,34 @@ pub const LinearMergePageStatus = enum {
     }
 };
 
+pub const FailedOperationOperation = enum {
+    upsert,
+    delete,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .upsert => "upsert",
+            .delete => "delete",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "upsert", .upsert },
+            .{ "delete", .delete },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const FailedOperation = struct {
     id: ?[]const u8 = null,
-    operation: ?[]const u8 = null,
+    operation: ?FailedOperationOperation = null,
     @"error": ?[]const u8 = null,
 };
 
@@ -2224,11 +3087,43 @@ pub const RoleAssignment = struct {
     role: []const u8,
 };
 
+/// Conservative subject classification inferred from user records and subject prefixes.
+pub const AuthSubjectKind = enum {
+    user,
+    role,
+    group,
+    subject,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .user => "user",
+            .role => "role",
+            .group => "group",
+            .subject => "subject",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "user", .user },
+            .{ "role", .role },
+            .{ "group", .group },
+            .{ "subject", .subject },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const AuthSubject = struct {
     /// Casbin subject name.
     subject: []const u8,
     /// Conservative subject classification inferred from user records and subject prefixes.
-    kind: []const u8,
+    kind: AuthSubjectKind,
 };
 
 pub const UpdatePasswordRequest = struct {
@@ -2390,6 +3285,67 @@ pub const BedrockEmbedderConfig = struct {
     batch_size: ?i64 = null,
 };
 
+/// Specifies the type of input for optimized embeddings.
+pub const CohereEmbedderConfigInputType = enum {
+    search_document,
+    search_query,
+    classification,
+    clustering,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .search_document => "search_document",
+            .search_query => "search_query",
+            .classification => "classification",
+            .clustering => "clustering",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "search_document", .search_document },
+            .{ "search_query", .search_query },
+            .{ "classification", .classification },
+            .{ "clustering", .clustering },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// How to handle inputs longer than the max token length.
+pub const CohereEmbedderConfigTruncate = enum {
+    none,
+    start,
+    end,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .none => "NONE",
+            .start => "START",
+            .end => "END",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "NONE", .none },
+            .{ "START", .start },
+            .{ "END", .end },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Configuration for the Cohere embedding provider. API key via `api_key` field or `COHERE_API_KEY` environment variable. **Example Models:** embed-english-v3.0 (default, 1024 dims), embed-multilingual-v3.0 **Docs:** https://docs.cohere.com/reference/embed
 pub const CohereEmbedderConfig = struct {
     /// The name of the Cohere embedding model to use.
@@ -2397,9 +3353,9 @@ pub const CohereEmbedderConfig = struct {
     /// The Cohere API key. Can also be set via COHERE_API_KEY environment variable.
     api_key: ?[]const u8 = null,
     /// Specifies the type of input for optimized embeddings.
-    input_type: ?[]const u8 = null,
+    input_type: ?CohereEmbedderConfigInputType = null,
     /// How to handle inputs longer than the max token length.
-    truncate: ?[]const u8 = null,
+    truncate: ?CohereEmbedderConfigTruncate = null,
 };
 
 /// Configuration for the Antfly inference embedding provider. Antfly inference is Antfly's built-in ML service for local embeddings using ONNX models. It provides embedding generation with multi-tier caching (memory + persistent). **Features:** - Local ONNX-based embedding generation - L1 memory cache with configurable TTL - L2 persistent Pebble database cache - Singleflight deduplication for concurrent identical requests **Example Models:** bge-base-en-v1.5 (768 dims), all-MiniLM-L6-v2 (384 dims) Models are loaded from the `models/embedders/{name}/` directory.
@@ -2723,6 +3679,32 @@ pub const ChunkerProvider = enum {
     }
 };
 
+/// Topology constraint for this edge type: - tree: Single parent per node, no cycles - graph: No constraints (default)
+pub const EdgeTypeConfigTopology = enum {
+    tree,
+    graph,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .tree => "tree",
+            .graph => "graph",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "tree", .tree },
+            .{ "graph", .graph },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Configuration for a specific edge type
 pub const EdgeTypeConfig = struct {
     /// Edge type name (e.g., 'cites', 'similar_to')
@@ -2730,7 +3712,7 @@ pub const EdgeTypeConfig = struct {
     /// Document field containing target node key(s) for automatic edge creation. Supports string (single target) or array of strings (multiple targets). When omitted, edges must be provided explicitly via _edges.
     field: ?[]const u8 = null,
     /// Topology constraint for this edge type: - tree: Single parent per node, no cycles - graph: No constraints (default)
-    topology: ?[]const u8 = null,
+    topology: ?EdgeTypeConfigTopology = null,
     /// Maximum allowed edge weight
     max_weight: ?f64 = null,
     /// Minimum allowed edge weight
@@ -2856,6 +3838,38 @@ pub const ForeignKeyReference = struct {
     period: ?[]const u8 = null,
 };
 
+/// Optional PostgreSQL range type that produced this period when lowering range-column temporal DDL.
+pub const RelationalPeriodRangeType = enum {
+    numrange,
+    daterange,
+    tsrange,
+    tstzrange,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .numrange => "numrange",
+            .daterange => "daterange",
+            .tsrange => "tsrange",
+            .tstzrange => "tstzrange",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "numrange", .numrange },
+            .{ "daterange", .daterange },
+            .{ "tsrange", .tsrange },
+            .{ "tstzrange", .tstzrange },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Application-time period over a start and end column.
 pub const RelationalPeriod = struct {
     /// Period name used by temporal constraints and `FOR PORTION OF` mutation-source plans.
@@ -2865,7 +3879,7 @@ pub const RelationalPeriod = struct {
     /// Exclusive period end column.
     end_column: []const u8,
     /// Optional PostgreSQL range type that produced this period when lowering range-column temporal DDL.
-    range_type: ?[]const u8 = null,
+    range_type: ?RelationalPeriodRangeType = null,
 };
 
 /// Relational primary-key constraint.
@@ -2878,14 +3892,83 @@ pub const PrimaryKey = struct {
     without_overlaps_period: ?[]const u8 = null,
 };
 
+/// Sort direction for ordered scans. Omitted defaults to asc.
+pub const RelationalIndexKeyDirection = enum {
+    asc,
+    desc,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .asc => "asc",
+            .desc => "desc",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "asc", .asc },
+            .{ "desc", .desc },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Null placement for ordered scans. Omitted uses method default.
+pub const RelationalIndexKeyNulls = enum {
+    default,
+    first,
+    last,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .default => "default",
+            .first => "first",
+            .last => "last",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "default", .default },
+            .{ "first", .first },
+            .{ "last", .last },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Ordered component of a relational ordered-tuple index key.
 pub const RelationalIndexKey = struct {
     /// Declared relational column used by this key component.
     column: []const u8,
+    /// Optional collation used by this ordered key component.
+    collation: ?[]const u8 = null,
     /// Sort direction for ordered scans. Omitted defaults to asc.
-    direction: ?[]const u8 = null,
+    direction: ?RelationalIndexKeyDirection = null,
     /// Null placement for ordered scans. Omitted uses method default.
-    nulls: ?[]const u8 = null,
+    nulls: ?RelationalIndexKeyNulls = null,
+};
+
+/// Owner-range coverage for a relational access-method generation.
+pub const RelationalIndexOwnerRange = struct {
+    /// Inclusive owner range start key.
+    start: []const u8,
+    /// Exclusive owner range end key; empty string means unbounded.
+    end: []const u8,
+    /// Optional stable range identifier.
+    range_id: ?[]const u8 = null,
+    /// Placement generation that produced this range assignment.
+    placement_generation: ?i64 = null,
 };
 
 /// A floating-point number used to decrease or increase the relevance scores of a query.
@@ -2992,10 +4075,41 @@ pub const EmbeddingsIndexStats = struct {
     backfill_items_processed: ?i64 = null,
 };
 
+pub const GraphMetricRuntimeStatsRole = enum {
+    combined,
+    coordinator,
+    worker,
+    worker_pool,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .combined => "combined",
+            .coordinator => "coordinator",
+            .worker => "worker",
+            .worker_pool => "worker_pool",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "combined", .combined },
+            .{ "coordinator", .coordinator },
+            .{ "worker", .worker },
+            .{ "worker_pool", .worker_pool },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Summarized graph metric maintenance runtime state. Identity fields are stable hashes, not raw process or owner identifiers.
 pub const GraphMetricRuntimeStats = struct {
     enabled: ?bool = null,
-    role: ?[]const u8 = null,
+    role: ?GraphMetricRuntimeStatsRole = null,
     runtime_id_hash: ?i64 = null,
     owner_id_hash: ?i64 = null,
     lease_key_hash: ?i64 = null,
@@ -3063,6 +4177,69 @@ pub const AlgebraicIndexStatsIndexType = enum {
     }
 };
 
+pub const AlgebraicIndexStatsPlannerLastDecision = enum {
+    selected,
+    fallback,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .selected => "selected",
+            .fallback => "fallback",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "selected", .selected },
+            .{ "fallback", .fallback },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Stable planner unsupported bucket for the latest fallback decision.
+pub const AlgebraicIndexStatsPlannerLastUnsupportedReason = enum {
+    unsupported_access_method,
+    index_not_ready,
+    stale_generation,
+    predicate_not_proven,
+    ordering_not_covered,
+    access_method_capability_mismatch,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .unsupported_access_method => "unsupported-access-method",
+            .index_not_ready => "index-not-ready",
+            .stale_generation => "stale-generation",
+            .predicate_not_proven => "predicate-not-proven",
+            .ordering_not_covered => "ordering-not-covered",
+            .access_method_capability_mismatch => "access-method-capability-mismatch",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "unsupported-access-method", .unsupported_access_method },
+            .{ "index-not-ready", .index_not_ready },
+            .{ "stale-generation", .stale_generation },
+            .{ "predicate-not-proven", .predicate_not_proven },
+            .{ "ordering-not-covered", .ordering_not_covered },
+            .{ "access-method-capability-mismatch", .access_method_capability_mismatch },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Compact public statistics for an algebraic sidecar index. Detailed runtime, adaptive, and materialization records remain internal diagnostics.
 pub const AlgebraicIndexStats = struct {
     /// Discriminator for the index stats variant.
@@ -3086,8 +4263,10 @@ pub const AlgebraicIndexStats = struct {
     capability_lifecycle_status: ?[]const u8 = null,
     planner_selected: ?i64 = null,
     planner_fallback_count: ?i64 = null,
-    planner_last_decision: ?[]const u8 = null,
+    planner_last_decision: ?AlgebraicIndexStatsPlannerLastDecision = null,
     planner_last_fallback_reason: ?[]const u8 = null,
+    /// Stable planner unsupported bucket for the latest fallback decision.
+    planner_last_unsupported_reason: ?AlgebraicIndexStatsPlannerLastUnsupportedReason = null,
     /// Latest algebraic planner scan-row estimate for the last selected or fallback decision.
     planner_last_estimated_scan_rows: ?i64 = null,
     /// Latest algebraic planner result-bucket estimate for the last selected or fallback decision.
@@ -3129,17 +4308,110 @@ pub const RelationalIndexRepairReport = struct {
     written_entries: ?i64 = null,
 };
 
+pub const GraphMetricEdgeFilterStatusMode = enum {
+    all,
+    types,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .all => "all",
+            .types => "types",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "all", .all },
+            .{ "types", .types },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const GraphMetricEdgeFilterStatus = struct {
-    mode: []const u8,
+    mode: GraphMetricEdgeFilterStatusMode,
     types: ?[]const []const u8 = null,
+};
+
+pub const GraphMetricBuildPageStatusState = enum {
+    pending,
+    leased,
+    complete,
+    failed,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .pending => "pending",
+            .leased => "leased",
+            .complete => "complete",
+            .failed => "failed",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "pending", .pending },
+            .{ "leased", .leased },
+            .{ "complete", .complete },
+            .{ "failed", .failed },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const GraphMetricBuildPageStatusRangeKind = enum {
+    full,
+    reverse_edges,
+    nodes,
+    scores,
+    contributions,
+    job_control,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .full => "full",
+            .reverse_edges => "reverse_edges",
+            .nodes => "nodes",
+            .scores => "scores",
+            .contributions => "contributions",
+            .job_control => "job_control",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "full", .full },
+            .{ "reverse_edges", .reverse_edges },
+            .{ "nodes", .nodes },
+            .{ "scores", .scores },
+            .{ "contributions", .contributions },
+            .{ "job_control", .job_control },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 pub const GraphMetricBuildPageStatus = struct {
     phase: []const u8,
     iteration: i64,
     page_id: i64,
-    state: []const u8,
-    range_kind: []const u8,
+    state: GraphMetricBuildPageStatusState,
+    range_kind: GraphMetricBuildPageStatusRangeKind,
     /// Worker id that owns or last failed this page.
     worker_id: ?[]const u8 = null,
     /// Unix epoch milliseconds when the page lease expires, or 0 when not leased.
@@ -3156,9 +4428,43 @@ pub const GraphMetricBuildPageStatus = struct {
     last_error: ?[]const u8 = null,
 };
 
+pub const GraphMetricEventKind = enum {
+    publish,
+    delete,
+    pause,
+    @"resume",
+    failed,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .publish => "publish",
+            .delete => "delete",
+            .pause => "pause",
+            .@"resume" => "resume",
+            .failed => "failed",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "publish", .publish },
+            .{ "delete", .delete },
+            .{ "pause", .pause },
+            .{ "resume", .@"resume" },
+            .{ "failed", .failed },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const GraphMetricEvent = struct {
     sequence: i64,
-    kind: []const u8,
+    kind: GraphMetricEventKind,
     at_ms: i64,
     target_edge_generation: i64,
     published_generation: i64,
@@ -3477,9 +4783,31 @@ pub const ChatMessageRole = enum {
     }
 };
 
+pub const TextContentPartType = enum {
+    text,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .text => "text",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "text", .text },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Text content for multimodal input.
 pub const TextContentPart = struct {
-    type: []const u8,
+    type: TextContentPartType,
     /// Text content.
     text: []const u8,
 };
@@ -3490,9 +4818,31 @@ pub const ImageURL = struct {
     url: []const u8,
 };
 
+pub const MediaContentPartType = enum {
+    media,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .media => "media",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "media", .media },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Inline binary media content (audio, image, etc.).
 pub const MediaContentPart = struct {
-    type: []const u8,
+    type: MediaContentPartType,
     /// Base64-encoded binary data.
     data: []const u8,
     /// MIME type (audio/wav, image/gif, image/png, etc.).
@@ -3507,12 +4857,62 @@ pub const ToolCallFunction = struct {
     arguments: []const u8,
 };
 
+/// Filter operator: - eq: Equals - ne: Not equals - gt/gte: Greater than (or equal) - lt/lte: Less than (or equal) - contains: Contains substring - prefix: Starts with - range: Between two values (value should be array [min, max]) - in: Value in list (value should be array)
+pub const FilterSpecOperator = enum {
+    eq,
+    ne,
+    gt,
+    gte,
+    lt,
+    lte,
+    contains,
+    prefix,
+    range,
+    in,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .eq => "eq",
+            .ne => "ne",
+            .gt => "gt",
+            .gte => "gte",
+            .lt => "lt",
+            .lte => "lte",
+            .contains => "contains",
+            .prefix => "prefix",
+            .range => "range",
+            .in => "in",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "eq", .eq },
+            .{ "ne", .ne },
+            .{ "gt", .gt },
+            .{ "gte", .gte },
+            .{ "lt", .lt },
+            .{ "lte", .lte },
+            .{ "contains", .contains },
+            .{ "prefix", .prefix },
+            .{ "range", .range },
+            .{ "in", .in },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// A filter specification to apply to search queries
 pub const FilterSpec = struct {
     /// Field name to filter on
     field: []const u8,
     /// Filter operator: - eq: Equals - ne: Not equals - gt/gte: Greater than (or equal) - lt/lte: Less than (or equal) - contains: Contains substring - prefix: Starts with - range: Between two values (value should be array [min, max]) - in: Value in list (value should be array)
-    operator: []const u8,
+    operator: FilterSpecOperator,
     /// Filter value (string, number, boolean, or array for range/in operators)
     value: std.json.Value,
 };
@@ -3668,6 +5068,32 @@ pub const VertexRerankerConfig = struct {
     top_n: ?i64 = null,
 };
 
+/// Whether stale published generations are acceptable or the metric must be fresh.
+pub const GraphMetricRerankMetricFreshness = enum {
+    published,
+    fresh,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .published => "published",
+            .fresh => "fresh",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "published", .published },
+            .{ "fresh", .fresh },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const GraphMetricRerank = struct {
     /// Graph index that owns the published metric.
     index: []const u8,
@@ -3680,7 +5106,7 @@ pub const GraphMetricRerank = struct {
     /// Metric feature value to use for hits that do not have a score in the published metric generation.
     missing_score: ?f64 = null,
     /// Whether stale published generations are acceptable or the metric must be fresh.
-    metric_freshness: ?[]const u8 = null,
+    metric_freshness: ?GraphMetricRerankMetricFreshness = null,
 };
 
 /// Type of graph query to execute
@@ -3755,15 +5181,111 @@ pub const PathWeightMode = enum {
     }
 };
 
+pub const GraphMetricOrderDirection = enum {
+    asc,
+    desc,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .asc => "asc",
+            .desc => "desc",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "asc", .asc },
+            .{ "desc", .desc },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const GraphMetricOrderNulls = enum {
+    first,
+    last,
+    nulls_first,
+    nulls_last,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .first => "first",
+            .last => "last",
+            .nulls_first => "nulls_first",
+            .nulls_last => "nulls_last",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "first", .first },
+            .{ "last", .last },
+            .{ "nulls_first", .nulls_first },
+            .{ "nulls_last", .nulls_last },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const GraphMetricOrder = struct {
     metric: []const u8,
-    direction: ?[]const u8 = null,
-    nulls: ?[]const u8 = null,
+    direction: ?GraphMetricOrderDirection = null,
+    nulls: ?GraphMetricOrderNulls = null,
+};
+
+pub const GraphMetricFilterOp = enum {
+    @">",
+    @">=",
+    @"<",
+    @"<=",
+    @"=",
+    @"==",
+    @"!=",
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .@">" => ">",
+            .@">=" => ">=",
+            .@"<" => "<",
+            .@"<=" => "<=",
+            .@"=" => "=",
+            .@"==" => "==",
+            .@"!=" => "!=",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ ">", .@">" },
+            .{ ">=", .@">=" },
+            .{ "<", .@"<" },
+            .{ "<=", .@"<=" },
+            .{ "=", .@"=" },
+            .{ "==", .@"==" },
+            .{ "!=", .@"!=" },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 pub const GraphMetricFilter = struct {
     metric: []const u8,
-    op: []const u8,
+    op: GraphMetricFilterOp,
     value: f64,
 };
 
@@ -3859,8 +5381,30 @@ pub const InferenceRerankRequest = struct {
     prompts: []const []const u8,
 };
 
+pub const InferenceRerankObjectObject = enum {
+    rerank_score,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .rerank_score => "rerank.score",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "rerank.score", .rerank_score },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const InferenceRerankObject = struct {
-    object: []const u8,
+    object: InferenceRerankObjectObject,
     /// Original prompt index.
     index: i64,
     /// Relevance score for this prompt.
@@ -3874,8 +5418,30 @@ pub const InferenceRewriteRequest = struct {
     inputs: []const []const u8,
 };
 
+pub const InferenceRewriteObjectObject = enum {
+    rewrite,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .rewrite => "rewrite",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "rewrite", .rewrite },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const InferenceRewriteObject = struct {
-    object: []const u8,
+    object: InferenceRewriteObjectObject,
     /// Original input text index.
     index: i64,
     /// Rewritten texts for this input, one per beam.
@@ -3902,8 +5468,30 @@ pub const InferenceTranscribeRequest = struct {
     language: ?[]const u8 = null,
 };
 
+pub const InferenceTranscribeObjectObject = enum {
+    transcription,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .transcription => "transcription",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "transcription", .transcription },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const InferenceTranscribeObject = struct {
-    object: []const u8,
+    object: InferenceTranscribeObjectObject,
     /// Input audio index.
     index: i64,
     /// Transcribed text from the audio
@@ -4362,8 +5950,39 @@ pub const ExtensionScopeKind = enum {
     }
 };
 
+pub const PackageArtifactKind = enum {
+    manifest,
+    wasm,
+    native_library,
+    asset,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .manifest => "manifest",
+            .wasm => "wasm",
+            .native_library => "native_library",
+            .asset => "asset",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "manifest", .manifest },
+            .{ "wasm", .wasm },
+            .{ "native_library", .native_library },
+            .{ "asset", .asset },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const PackageArtifact = struct {
-    kind: []const u8,
+    kind: PackageArtifactKind,
     path: []const u8,
     digest: ?[]const u8 = null,
 };
@@ -4502,8 +6121,33 @@ pub const UpdateExtensionRequest = struct {
     dry_run: ?bool = null,
 };
 
+pub const DropExtensionRequestMode = enum {
+    restrict,
+    cascade,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .restrict => "restrict",
+            .cascade => "cascade",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "restrict", .restrict },
+            .{ "cascade", .cascade },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const DropExtensionRequest = struct {
-    mode: ?[]const u8 = null,
+    mode: ?DropExtensionRequestMode = null,
     dry_run: ?bool = null,
 };
 
@@ -4652,11 +6296,60 @@ pub const DocumentArtifactTableReprocessRequest = struct {
     shard_cursors: ?[]const DocumentArtifactReprocessShardCursor = null,
 };
 
+/// Indicates that reprocessing was accepted.
+pub const DocumentArtifactTableReprocessResponseReprocess = enum {
+    triggered,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .triggered => "triggered",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "triggered", .triggered },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Completion state for this bounded pass. `in_progress` means the caller should persist the returned cursor(s) and schedule another pass; `complete` means no continuation cursor remains.
+pub const DocumentArtifactTableReprocessResponseReprocessStatus = enum {
+    in_progress,
+    complete,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .in_progress => "in_progress",
+            .complete => "complete",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "in_progress", .in_progress },
+            .{ "complete", .complete },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const DocumentArtifactTableReprocessResponse = struct {
     /// Indicates that reprocessing was accepted.
-    reprocess: []const u8,
+    reprocess: DocumentArtifactTableReprocessResponseReprocess,
     /// Completion state for this bounded pass. `in_progress` means the caller should persist the returned cursor(s) and schedule another pass; `complete` means no continuation cursor remains.
-    reprocess_status: []const u8,
+    reprocess_status: DocumentArtifactTableReprocessResponseReprocessStatus,
     /// Name of the derived artifact that was reprocessed.
     artifact_name: []const u8,
     /// Number of source rows scanned by this bounded pass.
@@ -4678,6 +6371,70 @@ pub const DocumentArtifactTableReprocessResponse = struct {
     shard_cursors: []const DocumentArtifactReprocessShardCursor,
 };
 
+/// Lifecycle phase of the repair job.
+pub const DocumentArtifactReprocessJobPhase = enum {
+    queued,
+    running,
+    succeeded,
+    failed,
+    cancelled,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .queued => "queued",
+            .running => "running",
+            .succeeded => "succeeded",
+            .failed => "failed",
+            .cancelled => "cancelled",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "queued", .queued },
+            .{ "running", .running },
+            .{ "succeeded", .succeeded },
+            .{ "failed", .failed },
+            .{ "cancelled", .cancelled },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// User-facing completion status derived from the phase and remaining cursors.
+pub const DocumentArtifactReprocessJobReprocessStatus = enum {
+    in_progress,
+    complete,
+    stopped,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .in_progress => "in_progress",
+            .complete => "complete",
+            .stopped => "stopped",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "in_progress", .in_progress },
+            .{ "complete", .complete },
+            .{ "stopped", .stopped },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const DocumentArtifactReprocessJob = struct {
     /// Server-assigned durable repair job identifier.
     job_id: i64,
@@ -4686,9 +6443,9 @@ pub const DocumentArtifactReprocessJob = struct {
     /// Name of the derived artifact being repaired.
     artifact_name: []const u8,
     /// Lifecycle phase of the repair job.
-    phase: []const u8,
+    phase: DocumentArtifactReprocessJobPhase,
     /// User-facing completion status derived from the phase and remaining cursors.
-    reprocess_status: []const u8,
+    reprocess_status: DocumentArtifactReprocessJobReprocessStatus,
     /// Original exclusive lower bound for the job.
     from_key: []const u8,
     /// Original inclusive upper bound for the job, or empty for the end of the table/range.
@@ -4791,10 +6548,36 @@ pub const MultiBatchResponse = struct {
     tables: ?std.json.ArrayHashMap(BatchResponse) = null,
 };
 
+/// Whether the transaction was committed or aborted due to a conflict
+pub const TransactionCommitResponseStatus = enum {
+    committed,
+    aborted,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .committed => "committed",
+            .aborted => "aborted",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "committed", .committed },
+            .{ "aborted", .aborted },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Result of an OCC transaction commit attempt.
 pub const TransactionCommitResponse = struct {
     /// Whether the transaction was committed or aborted due to a conflict
-    status: []const u8,
+    status: TransactionCommitResponseStatus,
     /// Details about the conflict that caused an abort (only present when status is "aborted")
     conflict: ?std.json.Value = null,
     /// Per-table batch results (only present when status is "committed")
@@ -4869,8 +6652,17 @@ pub const RowsCoalesceOperand = union(enum) {
     rows_coalesce_field_operand: *RowsCoalesceFieldOperand,
     rows_coalesce_value_operand: *RowsCoalesceValueOperand,
 
+    fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
+        const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
+        defer allocator.free(encoded);
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.UnexpectedToken,
+        };
+    }
+
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+        const parsed = parseUnionVariantFromValue(T, allocator, source, options) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return null,
         };
@@ -4932,6 +6724,8 @@ pub const RowsJoinStrategySelection = struct {
 
 pub const RowsQueryResultSet = struct {
     total: ?i64 = null,
+    /// False when `total` is a bounded or no-total value rather than an exact match count.
+    total_exact: ?bool = null,
     result_schema: ?[]const RowsResultColumn = null,
     rows: ?[]const std.json.Value = null,
 };
@@ -4977,13 +6771,68 @@ pub const TransactionSessionDetailsResponse = struct {
     savepoint_ids: ?[]const i64 = null,
 };
 
+/// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
+pub const RestoreRequestFormat = enum {
+    native,
+    portable,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .native => "native",
+            .portable => "portable",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "native", .native },
+            .{ "portable", .portable },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const RestoreRequest = struct {
     /// Unique identifier for this backup. Used to reference the backup for restore operations. Choose a meaningful name that includes date/version information.
     backup_id: []const u8,
     /// Storage location for the backup. Supports multiple backends: - Local filesystem: `file:///path/to/backup` - Amazon S3: `s3://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata for the specified table.
     location: []const u8,
     /// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
-    format: ?[]const u8 = null,
+    format: ?RestoreRequestFormat = null,
+};
+
+/// Overall backup status
+pub const ClusterBackupResponseStatus = enum {
+    completed,
+    partial,
+    failed,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .completed => "completed",
+            .partial => "partial",
+            .failed => "failed",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "completed", .completed },
+            .{ "partial", .partial },
+            .{ "failed", .failed },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 pub const ClusterBackupResponse = struct {
@@ -4992,14 +6841,43 @@ pub const ClusterBackupResponse = struct {
     /// Status of each table backup
     tables: []const TableBackupStatus,
     /// Overall backup status
-    status: []const u8,
+    status: ClusterBackupResponseStatus,
+};
+
+/// Overall restore status
+pub const ClusterRestoreResponseStatus = enum {
+    triggered,
+    partial,
+    failed,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .triggered => "triggered",
+            .partial => "partial",
+            .failed => "failed",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "triggered", .triggered },
+            .{ "partial", .partial },
+            .{ "failed", .failed },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 pub const ClusterRestoreResponse = struct {
     /// Status of each table restore
     tables: []const TableRestoreStatus,
     /// Overall restore status
-    status: []const u8,
+    status: ClusterRestoreResponseStatus,
 };
 
 pub const BackupListResponse = struct {
@@ -5240,9 +7118,32 @@ pub const GraphResultNode = struct {
     edges: ?[]const Edge = null,
 };
 
+/// Type of the foreign data source. Currently only "postgres" is supported.
+pub const ForeignSourceType = enum {
+    postgres,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .postgres => "postgres",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "postgres", .postgres },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const ForeignSource = struct {
     /// Type of the foreign data source. Currently only "postgres" is supported.
-    type: []const u8,
+    type: ForeignSourceType,
     /// Data source name (connection string) for the foreign database. Supports `${secret:key_name}` references that resolve from the Antfly keystore or environment variables.
     dsn: []const u8,
     /// Name of the table or view in the foreign PostgreSQL database to query.
@@ -5382,6 +7283,122 @@ pub const TemplateFieldMapping = struct {
     doc_values: ?bool = null,
 };
 
+/// Delete action. "no_action" is normalized to immediate restrictive behavior; "set_null" requires nullable child columns; "set_null" and "cascade" are bounded in local execution.
+pub const ForeignKeyOnDelete = enum {
+    restrict,
+    no_action,
+    set_null,
+    cascade,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .restrict => "restrict",
+            .no_action => "no_action",
+            .set_null => "set_null",
+            .cascade => "cascade",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "restrict", .restrict },
+            .{ "no_action", .no_action },
+            .{ "set_null", .set_null },
+            .{ "cascade", .cascade },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Update action. "restrict" and "no_action" are enforced as parent-key update checks; "set_null" and "cascade" are supported for bounded local/scheduled mutating FK action execution where owner topology is configured.
+pub const ForeignKeyOnUpdate = enum {
+    restrict,
+    no_action,
+    set_null,
+    cascade,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .restrict => "restrict",
+            .no_action => "no_action",
+            .set_null => "set_null",
+            .cascade => "cascade",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "restrict", .restrict },
+            .{ "no_action", .no_action },
+            .{ "set_null", .set_null },
+            .{ "cascade", .cascade },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Match mode. "simple" is the default and means any null or absent child component creates no reference. "full" requires all child components to be present or all absent. MATCH PARTIAL is reserved until row-subset parent matching is implemented.
+pub const ForeignKeyMatch = enum {
+    simple,
+    full,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .simple => "simple",
+            .full => "full",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "simple", .simple },
+            .{ "full", .full },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Constraint validation state. Public schema validation accepts enforced constraints and local unvalidated adoption entries; online job-owned states are reserved for hosted migration jobs.
+pub const ForeignKeyValidationState = enum {
+    enforced,
+    unvalidated,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .enforced => "enforced",
+            .unvalidated => "unvalidated",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "enforced", .enforced },
+            .{ "unvalidated", .unvalidated },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Relational foreign-key constraint.
 pub const ForeignKey = struct {
     /// Constraint name, unique within the table schema.
@@ -5392,17 +7409,77 @@ pub const ForeignKey = struct {
     period: ?[]const u8 = null,
     references: ?ForeignKeyReference = null,
     /// Delete action. "no_action" is normalized to immediate restrictive behavior; "set_null" requires nullable child columns; "set_null" and "cascade" are bounded in local execution.
-    on_delete: ?[]const u8 = null,
+    on_delete: ?ForeignKeyOnDelete = null,
     /// Update action. "restrict" and "no_action" are enforced as parent-key update checks; "set_null" and "cascade" are supported for bounded local/scheduled mutating FK action execution where owner topology is configured.
-    on_update: ?[]const u8 = null,
+    on_update: ?ForeignKeyOnUpdate = null,
     /// Constraint timing. Canonical values are "immediate" and "deferred"; SQL-shaped aliases such as "INITIALLY DEFERRED" and combined deferrability clauses are accepted and normalized by schema parsing.
     timing: ?[]const u8 = null,
     /// Whether transaction-level timing overrides may change this constraint's effective timing. Accepts JSON booleans and SQL-shaped strings such as "DEFERRABLE", "NOT DEFERRABLE", and "DEFERRABLE INITIALLY DEFERRED". Omitted defaults to false unless timing is "deferred" for compatibility.
     deferrable: ?std.json.Value = null,
     /// Match mode. "simple" is the default and means any null or absent child component creates no reference. "full" requires all child components to be present or all absent. MATCH PARTIAL is reserved until row-subset parent matching is implemented.
-    match: ?[]const u8 = null,
+    match: ?ForeignKeyMatch = null,
     /// Constraint validation state. Public schema validation accepts enforced constraints and local unvalidated adoption entries; online job-owned states are reserved for hosted migration jobs.
-    validation_state: ?[]const u8 = null,
+    validation_state: ?ForeignKeyValidationState = null,
+};
+
+/// Lifecycle state for this generation.
+pub const RelationalIndexGenerationRecordLifecycle = enum {
+    ready,
+    building,
+    catching_up,
+    stale,
+    rebuild_required,
+    failed,
+    invalid,
+    dropping,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .ready => "ready",
+            .building => "building",
+            .catching_up => "catching_up",
+            .stale => "stale",
+            .rebuild_required => "rebuild_required",
+            .failed => "failed",
+            .invalid => "invalid",
+            .dropping => "dropping",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "ready", .ready },
+            .{ "building", .building },
+            .{ "catching_up", .catching_up },
+            .{ "stale", .stale },
+            .{ "rebuild_required", .rebuild_required },
+            .{ "failed", .failed },
+            .{ "invalid", .invalid },
+            .{ "dropping", .dropping },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Shared lifecycle record for derived relational access-method generations.
+pub const RelationalIndexGenerationRecord = struct {
+    /// Monotonic physical access-method generation.
+    generation: i64,
+    /// Owner ranges covered by this generation.
+    owner_ranges: []const RelationalIndexOwnerRange,
+    /// Lifecycle state for this generation.
+    lifecycle: RelationalIndexGenerationRecordLifecycle,
+    /// Remaining catch-up lag for this generation.
+    lag: i64,
+    /// Typed or operator-facing failure reason when the lifecycle is not healthy.
+    failure_reason: ?[]const u8 = null,
+    /// Durable watermark that is ready for serving.
+    ready_watermark: i64,
 };
 
 pub const TermQuery = struct {
@@ -5411,10 +7488,32 @@ pub const TermQuery = struct {
     boost: ?Boost = null,
 };
 
+pub const MultiMatchBodyType = enum {
+    bool_prefix,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .bool_prefix => "bool_prefix",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "bool_prefix", .bool_prefix },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const MultiMatchBody = struct {
     query: []const u8,
     fields: []const []const u8,
-    type: []const u8,
+    type: MultiMatchBodyType,
     boost: ?Boost = null,
 };
 
@@ -5513,6 +7612,31 @@ pub const GeoDistanceQuery = struct {
     boost: ?Boost = null,
 };
 
+pub const MatchQueryOperator = enum {
+    @"or",
+    @"and",
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .@"or" => "or",
+            .@"and" => "and",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "or", .@"or" },
+            .{ "and", .@"and" },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const MatchQuery = struct {
     match: []const u8,
     field: ?[]const u8 = null,
@@ -5520,7 +7644,7 @@ pub const MatchQuery = struct {
     boost: ?Boost = null,
     prefix_length: ?i32 = null,
     fuzziness: ?Fuzziness = null,
-    operator: ?[]const u8 = null,
+    operator: ?MatchQueryOperator = null,
 };
 
 pub const MatchPhraseQuery = struct {
@@ -5559,9 +7683,37 @@ pub const GeoBoundingPolygonQuery = struct {
     boost: ?Boost = null,
 };
 
+pub const GeoShapeGeometryRelation = enum {
+    intersects,
+    contains,
+    within,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .intersects => "intersects",
+            .contains => "contains",
+            .within => "within",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "intersects", .intersects },
+            .{ "contains", .contains },
+            .{ "within", .within },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const GeoShapeGeometry = struct {
     shape: GeoShape,
-    relation: []const u8,
+    relation: GeoShapeGeometryRelation,
 };
 
 /// Discriminator for the index stats variant.
@@ -5619,9 +7771,70 @@ pub const RelationalIndexRepairLatest = struct {
     last_report: ?RelationalIndexRepairReport = null,
 };
 
+pub const GraphMetricStatusPhase = enum {
+    idle,
+    computing,
+    publishing,
+    complete,
+    prepare_generation,
+    scan_edges_and_out_degree,
+    initialize_ranks,
+    iterate_contributions,
+    reduce_ranks,
+    hits_hub_contributions,
+    hits_hub_reduce_ranks,
+    check_convergence,
+    publish_generation,
+    cleanup_old_generations,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .idle => "idle",
+            .computing => "computing",
+            .publishing => "publishing",
+            .complete => "complete",
+            .prepare_generation => "prepare_generation",
+            .scan_edges_and_out_degree => "scan_edges_and_out_degree",
+            .initialize_ranks => "initialize_ranks",
+            .iterate_contributions => "iterate_contributions",
+            .reduce_ranks => "reduce_ranks",
+            .hits_hub_contributions => "hits_hub_contributions",
+            .hits_hub_reduce_ranks => "hits_hub_reduce_ranks",
+            .check_convergence => "check_convergence",
+            .publish_generation => "publish_generation",
+            .cleanup_old_generations => "cleanup_old_generations",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "idle", .idle },
+            .{ "computing", .computing },
+            .{ "publishing", .publishing },
+            .{ "complete", .complete },
+            .{ "prepare_generation", .prepare_generation },
+            .{ "scan_edges_and_out_degree", .scan_edges_and_out_degree },
+            .{ "initialize_ranks", .initialize_ranks },
+            .{ "iterate_contributions", .iterate_contributions },
+            .{ "reduce_ranks", .reduce_ranks },
+            .{ "hits_hub_contributions", .hits_hub_contributions },
+            .{ "hits_hub_reduce_ranks", .hits_hub_reduce_ranks },
+            .{ "check_convergence", .check_convergence },
+            .{ "publish_generation", .publish_generation },
+            .{ "cleanup_old_generations", .cleanup_old_generations },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const GraphMetricStatus = struct {
     state: []const u8,
-    phase: []const u8,
+    phase: GraphMetricStatusPhase,
     edge_filter: ?GraphMetricEdgeFilterStatus = null,
     /// Version of the published graph metric metadata schema.
     metadata_version: ?i64 = null,
@@ -5723,9 +7936,31 @@ pub const InferenceRole = ChatMessageRole;
 
 pub const InferenceTextContentPart = TextContentPart;
 
+pub const ImageURLContentPartType = enum {
+    image_url,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .image_url => "image_url",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "image_url", .image_url },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Image content in OpenAI-compatible format.
 pub const ImageURLContentPart = struct {
-    type: []const u8,
+    type: ImageURLContentPartType,
     image_url: ImageURL,
 };
 
@@ -5733,11 +7968,33 @@ pub const InferenceImageURL = ImageURL;
 
 pub const InferenceMediaContentPart = MediaContentPart;
 
+pub const ToolCallType = enum {
+    function,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .function => "function",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "function", .function },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// OpenAI-compatible assistant tool call.
 pub const ToolCall = struct {
     /// Tool call identifier.
     id: []const u8,
-    type: []const u8,
+    type: ToolCallType,
     function: ToolCallFunction,
 };
 
@@ -5876,10 +8133,33 @@ pub const InferencePredictorInfo = struct {
     source_framework: ?[]const u8 = null,
 };
 
+/// Object type, always "embedding"
+pub const InferenceEmbeddingObjectObject = enum {
+    embedding,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .embedding => "embedding",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "embedding", .embedding },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// A single embedding result
 pub const InferenceEmbeddingObject = struct {
     /// Object type, always "embedding"
-    object: []const u8,
+    object: InferenceEmbeddingObjectObject,
     /// Dense float vector for dense models, or a sparse vector object for sparse-capable models
     embedding: ?std.json.Value = null,
     /// Index of the input this embedding corresponds to
@@ -5904,23 +8184,98 @@ pub const InferenceReadResult = struct {
     regions: ?[]const InferenceTextRegion = null,
 };
 
+/// The type of tool (currently only "function" is supported)
+pub const InferenceToolType = enum {
+    function,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .function => "function",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "function", .function },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// A tool (function) that the model can call
 pub const InferenceTool = struct {
     /// The type of tool (currently only "function" is supported)
-    type: []const u8,
+    type: InferenceToolType,
     function: InferenceFunctionDefinition,
+};
+
+/// Structured output mode
+pub const InferenceGenerateResponseFormatType = enum {
+    text,
+    json_object,
+    json_schema,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .text => "text",
+            .json_object => "json_object",
+            .json_schema => "json_schema",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "text", .text },
+            .{ "json_object", .json_object },
+            .{ "json_schema", .json_schema },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 pub const InferenceGenerateResponseFormat = struct {
     /// Structured output mode
-    type: []const u8,
+    type: InferenceGenerateResponseFormatType,
     /// Optional schema payload for `type=json_schema`. Enforced during native constrained decoding and validated after generation.
     json_schema: ?InferenceGenerateJsonSchemaConfig = null,
 };
 
+/// Object type, always "list"
+pub const InferenceRerankResponseObject = enum {
+    list,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .list => "list",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "list", .list },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const InferenceRerankResponse = struct {
     /// Object type, always "list"
-    object: []const u8,
+    object: InferenceRerankResponseObject,
     /// Rerank score objects, one per input prompt.
     data: []const InferenceRerankObject,
     /// Name of model used for reranking
@@ -5928,9 +8283,32 @@ pub const InferenceRerankResponse = struct {
     usage: InferenceGenerateUsage,
 };
 
+/// Object type, always "list"
+pub const InferenceRewriteResponseObject = enum {
+    list,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .list => "list",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "list", .list },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const InferenceRewriteResponse = struct {
     /// Object type, always "list"
-    object: []const u8,
+    object: InferenceRewriteResponseObject,
     /// Rewritten text objects, one per input.
     data: []const InferenceRewriteObject,
     /// Name of model used for rewriting
@@ -5938,14 +8316,60 @@ pub const InferenceRewriteResponse = struct {
     usage: InferenceGenerateUsage,
 };
 
+/// Object type, always "list"
+pub const InferenceTranscribeResponseObject = enum {
+    list,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .list => "list",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "list", .list },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const InferenceTranscribeResponse = struct {
     /// Object type, always "list"
-    object: []const u8,
+    object: InferenceTranscribeResponseObject,
     /// Transcription result objects.
     data: []const InferenceTranscribeObject,
     /// Name of model used for transcription
     model: []const u8,
     usage: InferenceGenerateUsage,
+};
+
+/// The type of tool call (only in first delta)
+pub const InferenceToolCallDeltaType = enum {
+    function,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .function => "function",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "function", .function },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// Incremental tool call data for streaming
@@ -5955,7 +8379,7 @@ pub const InferenceToolCallDelta = struct {
     /// Unique identifier (only in first delta for this index)
     id: ?[]const u8 = null,
     /// The type of tool call (only in first delta)
-    type: ?[]const u8 = null,
+    type: ?InferenceToolCallDeltaType = null,
     function: ?InferenceToolCallFunctionDelta = null,
 };
 
@@ -5969,9 +8393,32 @@ pub const InferenceModelRef = struct {
     quantization: ?InferenceModelQuantization = null,
 };
 
+/// OpenAI-compatible response object type.
+pub const InferenceModelsResponseObject = enum {
+    list,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .list => "list",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "list", .list },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const InferenceModelsResponse = struct {
     /// OpenAI-compatible response object type.
-    object: []const u8,
+    object: InferenceModelsResponseObject,
     /// OpenAI-compatible flat model list for generation/embedding models.
     data: []const std.json.Value,
     /// Whether clients should show model download commands.
@@ -6035,9 +8482,46 @@ pub const PackageDependency = struct {
     optional: ?bool = null,
 };
 
+pub const RuntimeDeclMode = enum {
+    manifest_only,
+    antfly_api_template,
+    workflow,
+    wasm,
+    sidecar,
+    native,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .manifest_only => "manifest_only",
+            .antfly_api_template => "antfly_api_template",
+            .workflow => "workflow",
+            .wasm => "wasm",
+            .sidecar => "sidecar",
+            .native => "native",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "manifest_only", .manifest_only },
+            .{ "antfly_api_template", .antfly_api_template },
+            .{ "workflow", .workflow },
+            .{ "wasm", .wasm },
+            .{ "sidecar", .sidecar },
+            .{ "native", .native },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const RuntimeDecl = struct {
     name: ExtensionIdentifier,
-    mode: ?[]const u8 = null,
+    mode: ?RuntimeDeclMode = null,
     artifact: ?[]const u8 = null,
     config_json: ?[]const u8 = null,
 };
@@ -6149,9 +8633,35 @@ pub const Transform = struct {
     upsert: ?bool = null,
 };
 
+/// Whether the transaction was committed or aborted due to a conflict
+pub const TransactionSessionCommitResponseStatus = enum {
+    committed,
+    aborted,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .committed => "committed",
+            .aborted => "aborted",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "committed", .committed },
+            .{ "aborted", .aborted },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const TransactionSessionCommitResponse = struct {
     /// Whether the transaction was committed or aborted due to a conflict
-    status: []const u8,
+    status: TransactionSessionCommitResponseStatus,
     /// Details about the conflict that caused an abort (only present when status is "aborted")
     conflict: ?std.json.Value = null,
     /// Per-table batch results (only present when status is "committed")
@@ -6195,8 +8705,17 @@ pub const RowsWhereBranch = union(enum) {
     rows_where_branch_atom: *RowsWhereBranchAtom,
     rows_where_branch_all: *RowsWhereBranchAll,
 
+    fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
+        const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
+        defer allocator.free(encoded);
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.UnexpectedToken,
+        };
+    }
+
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+        const parsed = parseUnionVariantFromValue(T, allocator, source, options) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return null,
         };
@@ -6449,6 +8968,41 @@ pub const AntflyChunkerConfig = struct {
     model: []const u8,
 };
 
+/// Filter by detected JSON type
+pub const DynamicTemplateMatchMappingType = enum {
+    string,
+    number,
+    boolean,
+    date,
+    object,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .string => "string",
+            .number => "number",
+            .boolean => "boolean",
+            .date => "date",
+            .object => "object",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "string", .string },
+            .{ "number", .number },
+            .{ "boolean", .boolean },
+            .{ "date", .date },
+            .{ "object", .object },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// A rule for mapping dynamically detected fields. Templates are checked in order and the first matching template's mapping is used.
 pub const DynamicTemplate = struct {
     /// Optional identifier for the template (useful for debugging)
@@ -6462,7 +9016,7 @@ pub const DynamicTemplate = struct {
     /// Path exclusion pattern. If it matches the full path, the template is skipped.
     path_unmatch: ?[]const u8 = null,
     /// Filter by detected JSON type
-    match_mapping_type: ?[]const u8 = null,
+    match_mapping_type: ?DynamicTemplateMatchMappingType = null,
     mapping: ?TemplateFieldMapping = null,
 };
 
@@ -6515,6 +9069,35 @@ pub const GraphMetricResult = struct {
     status: GraphMetricStatus,
 };
 
+/// Search mode to request from Exa
+pub const ExaSearchConfigSearchType = enum {
+    auto,
+    neural,
+    keyword,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .auto => "auto",
+            .neural => "neural",
+            .keyword => "keyword",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "auto", .auto },
+            .{ "neural", .neural },
+            .{ "keyword", .keyword },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Configuration for Exa neural/semantic web search. Exa is optimized for semantic web search, highlights, and retrieved page contents for RAG and agent workflows. **Setup:** 1. Sign up at https://exa.ai 2. Get API key from dashboard **Docs:** https://docs.exa.ai
 pub const ExaSearchConfig = struct {
     provider: WebSearchProvider,
@@ -6547,7 +9130,7 @@ pub const ExaSearchConfig = struct {
     /// Ask the provider to return highlighted passages when supported
     include_highlights: ?bool = null,
     /// Search mode to request from Exa
-    search_type: ?[]const u8 = null,
+    search_type: ?ExaSearchConfigSearchType = null,
     /// Provider-specific result count override
     num_results: ?i64 = null,
     /// ISO date/time lower bound for published date filtering
@@ -6558,6 +9141,73 @@ pub const ExaSearchConfig = struct {
     include_domains: ?[]const []const u8 = null,
     /// Exclude results from these domains
     exclude_domains: ?[]const []const u8 = null,
+};
+
+/// Type of search to perform
+pub const SerperSearchConfigSearchType = enum {
+    search,
+    news,
+    images,
+    places,
+    shopping,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .search => "search",
+            .news => "news",
+            .images => "images",
+            .places => "places",
+            .shopping => "shopping",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "search", .search },
+            .{ "news", .news },
+            .{ "images", .images },
+            .{ "places", .places },
+            .{ "shopping", .shopping },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Time period filter: d=day, w=week, m=month, y=year
+pub const SerperSearchConfigTimePeriod = enum {
+    d,
+    w,
+    m,
+    y,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .d => "d",
+            .w => "w",
+            .m => "m",
+            .y => "y",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "d", .d },
+            .{ "w", .w },
+            .{ "m", .m },
+            .{ "y", .y },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// Configuration for Serper.dev Google Search API. Serper provides a simpler alternative to Google Custom Search with competitive pricing and easy setup. **Setup:** 1. Sign up at https://serper.dev 2. Get API key from dashboard **Docs:** https://serper.dev/docs
@@ -6592,9 +9242,35 @@ pub const SerperSearchConfig = struct {
     /// Ask the provider to return highlighted passages when supported
     include_highlights: ?bool = null,
     /// Type of search to perform
-    search_type: ?[]const u8 = null,
+    search_type: ?SerperSearchConfigSearchType = null,
     /// Time period filter: d=day, w=week, m=month, y=year
-    time_period: ?[]const u8 = null,
+    time_period: ?SerperSearchConfigTimePeriod = null,
+};
+
+/// Search depth: - basic: Fast search with standard results - advanced: Deeper search with more comprehensive results
+pub const TavilySearchConfigSearchDepth = enum {
+    basic,
+    advanced,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .basic => "basic",
+            .advanced => "advanced",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "basic", .basic },
+            .{ "advanced", .advanced },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// Configuration for Tavily AI Search API. Tavily is optimized for RAG and AI applications, providing pre-processed results with summaries and relevance scoring. **Setup:** 1. Sign up at https://tavily.com 2. Get API key from dashboard **Docs:** https://docs.tavily.com
@@ -6629,7 +9305,7 @@ pub const TavilySearchConfig = struct {
     /// Ask the provider to return highlighted passages when supported
     include_highlights: ?bool = null,
     /// Search depth: - basic: Fast search with standard results - advanced: Deeper search with more comprehensive results
-    search_depth: ?[]const u8 = null,
+    search_depth: ?TavilySearchConfigSearchDepth = null,
     /// Include AI-generated answer summary
     include_answer: ?bool = null,
     /// Include raw HTML content of pages
@@ -6638,6 +9314,38 @@ pub const TavilySearchConfig = struct {
     include_domains: ?[]const []const u8 = null,
     /// Exclude results from these domains
     exclude_domains: ?[]const []const u8 = null,
+};
+
+/// Freshness filter: pd=day, pw=week, pm=month, py=year
+pub const BraveSearchConfigFreshness = enum {
+    pd,
+    pw,
+    pm,
+    py,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .pd => "pd",
+            .pw => "pw",
+            .pm => "pm",
+            .py => "py",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "pd", .pd },
+            .{ "pw", .pw },
+            .{ "pm", .pm },
+            .{ "py", .py },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// Configuration for Brave Search API. Brave Search provides privacy-focused search with its own independent index. **Setup:** 1. Sign up at https://brave.com/search/api/ 2. Get API key from dashboard **Docs:** https://api.search.brave.com/app/documentation
@@ -6672,7 +9380,7 @@ pub const BraveSearchConfig = struct {
     /// Ask the provider to return highlighted passages when supported
     include_highlights: ?bool = null,
     /// Freshness filter: pd=day, pw=week, pm=month, py=year
-    freshness: ?[]const u8 = null,
+    freshness: ?BraveSearchConfigFreshness = null,
     /// Include text decorations (bold, italic markers)
     text_decorations: ?bool = null,
     /// Enable spellcheck suggestions
@@ -6712,6 +9420,58 @@ pub const YouSearchConfig = struct {
     include_highlights: ?bool = null,
 };
 
+/// Search depth to request from Linkup
+pub const LinkupSearchConfigDepth = enum {
+    standard,
+    deep,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .standard => "standard",
+            .deep => "deep",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "standard", .standard },
+            .{ "deep", .deep },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Linkup response shape to request
+pub const LinkupSearchConfigOutputType = enum {
+    search_results,
+    sourced_answer,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .search_results => "searchResults",
+            .sourced_answer => "sourcedAnswer",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "searchResults", .search_results },
+            .{ "sourcedAnswer", .sourced_answer },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Configuration for Linkup Search API. Linkup is useful for web search, source retrieval, and structured research workflows. **Setup:** 1. Sign up at https://linkup.so 2. Get API key from dashboard **Docs:** https://docs.linkup.so
 pub const LinkupSearchConfig = struct {
     provider: WebSearchProvider,
@@ -6744,9 +9504,32 @@ pub const LinkupSearchConfig = struct {
     /// Ask the provider to return highlighted passages when supported
     include_highlights: ?bool = null,
     /// Search depth to request from Linkup
-    depth: ?[]const u8 = null,
+    depth: ?LinkupSearchConfigDepth = null,
     /// Linkup response shape to request
-    output_type: ?[]const u8 = null,
+    output_type: ?LinkupSearchConfigOutputType = null,
+};
+
+/// Google Cloud search service flavor
+pub const VertexSearchConfigService = enum {
+    agent_search,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .agent_search => "agent_search",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "agent_search", .agent_search },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// Configuration for Google Cloud Agent Search / Vertex AI Search. Use this for bounded Google Cloud search over configured data stores or verified websites. The provider token is `vertex` to match Antfly's existing Google Cloud provider convention. **Setup:** 1. Enable Discovery Engine API in Google Cloud 2. Create an Agent Search app/data store 3. Grant service account access to query the serving config **Docs:** https://cloud.google.com/generative-ai-app-builder/docs
@@ -6781,7 +9564,7 @@ pub const VertexSearchConfig = struct {
     /// Ask the provider to return highlighted passages when supported
     include_highlights: ?bool = null,
     /// Google Cloud search service flavor
-    service: ?[]const u8 = null,
+    service: ?VertexSearchConfigService = null,
 };
 
 /// Configuration for retrieval agent tools. If `enabled_tools` is empty/omitted, retrieval agents default to all retrieval tools available for the request. Explicit retrieval policies should use semantic_search for vector retrieval. For models that don't support native tool calling (e.g., Ollama), a prompt-based fallback is used with structured output parsing.
@@ -6804,8 +9587,17 @@ pub const ContentPart = union(enum) {
     image_url_content_part: *ImageURLContentPart,
     text_content_part: *TextContentPart,
 
+    fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
+        const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
+        defer allocator.free(encoded);
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.UnexpectedToken,
+        };
+    }
+
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+        const parsed = parseUnionVariantFromValue(T, allocator, source, options) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return null,
         };
@@ -6890,17 +9682,63 @@ pub const EvalResult = struct {
     duration_ms: ?i64 = null,
 };
 
+/// Response object type.
+pub const InferencePredictorsResponseObject = enum {
+    list,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .list => "list",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "list", .list },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const InferencePredictorsResponse = struct {
     /// Response object type.
-    object: []const u8,
+    object: InferencePredictorsResponseObject,
     /// Traditional ML predictors keyed by predictor name.
     predictors: std.json.ArrayHashMap(InferencePredictorInfo),
+};
+
+/// Object type, always "list"
+pub const InferenceEmbedResponseObject = enum {
+    list,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .list => "list",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "list", .list },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// OpenAI-compatible embedding response with a polymorphic `embedding` field for dense or sparse vectors
 pub const InferenceEmbedResponse = struct {
     /// Object type, always "list"
-    object: []const u8,
+    object: InferenceEmbedResponseObject,
     /// List of embedding objects
     data: []const InferenceEmbeddingObject,
     /// Model used for embedding generation
@@ -6920,6 +9758,28 @@ pub const InferenceChunkConfig = struct {
     audio: ?InferenceAudioChunkConfig = null,
 };
 
+pub const InferenceReadObjectObject = enum {
+    read,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .read => "read",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "read", .read },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const InferenceReadObject = struct {
     /// Extracted text from the image
     text: []const u8,
@@ -6927,7 +9787,7 @@ pub const InferenceReadObject = struct {
     fields: ?std.json.ArrayHashMap([]const u8) = null,
     /// Individual text regions with bounding boxes and recognized text. Populated by multi-stage OCR models (Surya, PaddleOCR).
     regions: ?[]const InferenceTextRegion = null,
-    object: []const u8,
+    object: InferenceReadObjectObject,
     /// Original input image index.
     index: i64,
 };
@@ -6939,6 +9799,28 @@ pub const InferenceGenerateDelta = struct {
     content: ?[]const u8 = null,
     /// Tool call deltas for streaming tool calls
     tool_calls: ?[]const InferenceToolCallDelta = null,
+};
+
+pub const InferenceChunkObjectObject = enum {
+    chunk,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .chunk => "chunk",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "chunk", .chunk },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// A chunk result object. Text chunks have mime_type text/plain.
@@ -6963,7 +9845,7 @@ pub const InferenceChunkObject = struct {
     id: ?i64 = null,
     /// MIME type: text/plain, audio/wav, image/png, etc.
     mime_type: ?[]const u8 = null,
-    object: []const u8,
+    object: InferenceChunkObjectObject,
     /// Position of this chunk object in the response data array.
     index: i64,
 };
@@ -7006,6 +9888,43 @@ pub const InferenceConfig = struct {
     log: ?InferenceschemasConfig = null,
 };
 
+pub const InstalledExtensionStatus = enum {
+    installing,
+    ready,
+    disabled,
+    updating,
+    dropping,
+    error_state,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .installing => "installing",
+            .ready => "ready",
+            .disabled => "disabled",
+            .updating => "updating",
+            .dropping => "dropping",
+            .error_state => "error_state",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "installing", .installing },
+            .{ "ready", .ready },
+            .{ "disabled", .disabled },
+            .{ "updating", .updating },
+            .{ "dropping", .dropping },
+            .{ "error_state", .error_state },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const InstalledExtension = struct {
     name: ExtensionIdentifier,
     package_name: ExtensionIdentifier,
@@ -7015,7 +9934,7 @@ pub const InstalledExtension = struct {
     config_json: ?[]const u8 = null,
     granted_capabilities: ?[]const Capability = null,
     installed_at_epoch_ms: ?i64 = null,
-    status: []const u8,
+    status: InstalledExtensionStatus,
 };
 
 pub const ExtensionMember = struct {
@@ -7082,8 +10001,17 @@ pub const RowsGetResultSet = struct {
 
 /// Canonical row predicate tree. A top-level `where` is one predicate atom, an `all` conjunction of atoms, `any` / `not` branch groups, or an `all` conjunction plus branch groups. Branches may contain scalar, membership, array, JSON, and text-pattern atoms; the server stores branches containing structured atoms in native mixed access predicate groups and keeps scalar-only branches in scalar predicate groups.
 pub const RowsWhere = union(enum) {
+    fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
+        const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
+        defer allocator.free(encoded);
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.UnexpectedToken,
+        };
+    }
+
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+        const parsed = parseUnionVariantFromValue(T, allocator, source, options) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return null,
         };
@@ -7121,6 +10049,32 @@ pub const QueryHits = struct {
     max_score: ?f32 = null,
 };
 
+/// Freshness mode for projected, ordered, and filtered graph metrics
+pub const GraphQueryMetricFreshness = enum {
+    published,
+    fresh,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .published => "published",
+            .fresh => "fresh",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "published", .published },
+            .{ "fresh", .fresh },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Declarative graph query to execute after full-text/vector searches
 pub const GraphQuery = struct {
     type: GraphQueryType,
@@ -7149,7 +10103,7 @@ pub const GraphQuery = struct {
     /// Filter graph result nodes by graph metric scores
     where_metric: ?[]const GraphMetricFilter = null,
     /// Freshness mode for projected, ordered, and filtered graph metrics
-    metric_freshness: ?[]const u8 = null,
+    metric_freshness: ?GraphQueryMetricFreshness = null,
     /// Include graph metric status metadata in the graph result
     include_metric_status: ?bool = null,
 };
@@ -7301,6 +10255,8 @@ pub const RelationalIndexStats = struct {
     lifecycle: ?[]const u8 = null,
     ready: ?bool = null,
     generation: ?i64 = null,
+    lag: ?i64 = null,
+    ready_watermark: ?i64 = null,
     schema_fingerprint: ?[]const u8 = null,
     rebuild: ?RelationalIndexRebuildStatus = null,
     repair: ?RelationalIndexRepairStatus = null,
@@ -7331,6 +10287,111 @@ pub const ChatMessageContent = std.json.Value;
 
 pub const InferenceContentPart = ContentPart;
 
+/// Encoding format for the embeddings (only "float" supported)
+pub const InferenceEmbedRequestEncodingFormat = enum {
+    float,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .float => "float",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "float", .float },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Optional embedding task type using Google embedding task-type names. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix.
+pub const InferenceEmbedRequestTaskType = enum {
+    retrieval_query,
+    retrieval_document,
+    question_answering,
+    fact_verification,
+    code_retrieval_query,
+    classification,
+    clustering,
+    semantic_similarity,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .retrieval_query => "RETRIEVAL_QUERY",
+            .retrieval_document => "RETRIEVAL_DOCUMENT",
+            .question_answering => "QUESTION_ANSWERING",
+            .fact_verification => "FACT_VERIFICATION",
+            .code_retrieval_query => "CODE_RETRIEVAL_QUERY",
+            .classification => "CLASSIFICATION",
+            .clustering => "CLUSTERING",
+            .semantic_similarity => "SEMANTIC_SIMILARITY",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "RETRIEVAL_QUERY", .retrieval_query },
+            .{ "RETRIEVAL_DOCUMENT", .retrieval_document },
+            .{ "QUESTION_ANSWERING", .question_answering },
+            .{ "FACT_VERIFICATION", .fact_verification },
+            .{ "CODE_RETRIEVAL_QUERY", .code_retrieval_query },
+            .{ "CLASSIFICATION", .classification },
+            .{ "CLUSTERING", .clustering },
+            .{ "SEMANTIC_SIMILARITY", .semantic_similarity },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Deprecated compatibility alias for task_type. search_query/query map to RETRIEVAL_QUERY; search_document/document map to RETRIEVAL_DOCUMENT; classification and clustering map to their Google task_type equivalents.
+pub const InferenceEmbedRequestInputType = enum {
+    search_query,
+    search_document,
+    query,
+    document,
+    classification,
+    clustering,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .search_query => "search_query",
+            .search_document => "search_document",
+            .query => "query",
+            .document => "document",
+            .classification => "classification",
+            .clustering => "clustering",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "search_query", .search_query },
+            .{ "search_document", .search_document },
+            .{ "query", .query },
+            .{ "document", .document },
+            .{ "classification", .classification },
+            .{ "clustering", .clustering },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// OpenAI-compatible embedding request with inference multimodal content-part extension
 pub const InferenceEmbedRequest = struct {
     /// Model name to use for embedding generation
@@ -7338,13 +10399,13 @@ pub const InferenceEmbedRequest = struct {
     /// Input content to embed. Supports: - a single string - an array of strings - an array of OpenAI-style content parts for multimodal embedding
     input: std.json.Value,
     /// Encoding format for the embeddings (only "float" supported)
-    encoding_format: ?[]const u8 = null,
+    encoding_format: ?InferenceEmbedRequestEncodingFormat = null,
     /// Optional truncation size for dense embeddings. Must be a positive integer no larger than the model embedding size. Not supported for sparse models.
     dimensions: ?i64 = null,
     /// Optional embedding task type using Google embedding task-type names. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix.
-    task_type: ?[]const u8 = null,
+    task_type: ?InferenceEmbedRequestTaskType = null,
     /// Deprecated compatibility alias for task_type. search_query/query map to RETRIEVAL_QUERY; search_document/document map to RETRIEVAL_DOCUMENT; classification and clustering map to their Google task_type equivalents.
-    input_type: ?[]const u8 = null,
+    input_type: ?InferenceEmbedRequestInputType = null,
 };
 
 pub const InferenceGenerateChoice = struct {
@@ -7364,9 +10425,32 @@ pub const InferenceChunkRequest = struct {
     config: ?InferenceChunkConfig = null,
 };
 
+/// Object type, always "list"
+pub const InferenceReadResponseObject = enum {
+    list,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .list => "list",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "list", .list },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const InferenceReadResponse = struct {
     /// Object type, always "list"
-    object: []const u8,
+    object: InferenceReadResponseObject,
     /// Read result objects, one per input image.
     data: []const InferenceReadObject,
     /// Name of model used for reading
@@ -7380,9 +10464,32 @@ pub const InferenceGenerateChunkChoice = struct {
     finish_reason: ?InferenceFinishReason = null,
 };
 
+/// Object type, always "list"
+pub const InferenceChunkResponseObject = enum {
+    list,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .list => "list",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "list", .list },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const InferenceChunkResponse = struct {
     /// Object type, always "list"
-    object: []const u8,
+    object: InferenceChunkResponseObject,
     /// Array of chunk objects
     data: []const InferenceChunkObject,
     /// Chunking model actually used (may differ from requested if fallback occurred)
@@ -7392,8 +10499,30 @@ pub const InferenceChunkResponse = struct {
     cache_hit: bool,
 };
 
+pub const PackageManifestManifestApiVersion = enum {
+    @"extensions/v1",
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .@"extensions/v1" => "extensions/v1",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "extensions/v1", .@"extensions/v1" },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const PackageManifest = struct {
-    manifest_api_version: []const u8,
+    manifest_api_version: PackageManifestManifestApiVersion,
     name: ExtensionIdentifier,
     version: []const u8,
     kind: PackageKind,
@@ -7410,8 +10539,30 @@ pub const PackageManifest = struct {
     updates: ?[]const UpdateManifestRef = null,
 };
 
+pub const ExtractionResponseObject = enum {
+    extraction,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .extraction => "extraction",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "extraction", .extraction },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const ExtractionResponse = struct {
-    object: []const u8,
+    object: ExtractionResponseObject,
     model: []const u8,
     data: []const ExtractionObject,
     usage: ?std.json.Value = null,
@@ -7486,6 +10637,15 @@ pub const IndexStats = union(enum) {
     algebraic_index_stats: AlgebraicIndexStats,
     relational_index_stats: RelationalIndexStats,
 
+    fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
+        const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
+        defer allocator.free(encoded);
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.UnexpectedToken,
+        };
+    }
+
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
         const disc_val = source.object.get("index_type") orelse return error.MissingField;
@@ -7494,19 +10654,19 @@ pub const IndexStats = union(enum) {
             else => return error.UnexpectedToken,
         };
         if (std.mem.eql(u8, disc_str, "full_text")) {
-            return .{ .full_text_index_stats = try std.json.parseFromValueLeaky(FullTextIndexStats, allocator, source, options) };
+            return .{ .full_text_index_stats = try parseUnionVariantFromValue(FullTextIndexStats, allocator, source, options) };
         }
         if (std.mem.eql(u8, disc_str, "embeddings")) {
-            return .{ .embeddings_index_stats = try std.json.parseFromValueLeaky(EmbeddingsIndexStats, allocator, source, options) };
+            return .{ .embeddings_index_stats = try parseUnionVariantFromValue(EmbeddingsIndexStats, allocator, source, options) };
         }
         if (std.mem.eql(u8, disc_str, "graph")) {
-            return .{ .graph_index_stats = try std.json.parseFromValueLeaky(GraphIndexStats, allocator, source, options) };
+            return .{ .graph_index_stats = try parseUnionVariantFromValue(GraphIndexStats, allocator, source, options) };
         }
         if (std.mem.eql(u8, disc_str, "algebraic")) {
-            return .{ .algebraic_index_stats = try std.json.parseFromValueLeaky(AlgebraicIndexStats, allocator, source, options) };
+            return .{ .algebraic_index_stats = try parseUnionVariantFromValue(AlgebraicIndexStats, allocator, source, options) };
         }
         if (std.mem.eql(u8, disc_str, "relational")) {
-            return .{ .relational_index_stats = try std.json.parseFromValueLeaky(RelationalIndexStats, allocator, source, options) };
+            return .{ .relational_index_stats = try parseUnionVariantFromValue(RelationalIndexStats, allocator, source, options) };
         }
         return error.UnexpectedToken;
     }
@@ -7577,12 +10737,35 @@ pub const ExtractionInput = struct {
     metadata: ?std.json.Value = null,
 };
 
+/// The object type, always "chat.completion"
+pub const InferenceGenerateResponseObject = enum {
+    chat_completion,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .chat_completion => "chat.completion",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "chat.completion", .chat_completion },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// OpenAI-compatible chat completion response
 pub const InferenceGenerateResponse = struct {
     /// A unique identifier for the chat completion
     id: []const u8,
     /// The object type, always "chat.completion"
-    object: []const u8,
+    object: InferenceGenerateResponseObject,
     /// Unix timestamp (seconds) when the completion was created
     created: i64,
     /// Model used for generation
@@ -7592,10 +10775,32 @@ pub const InferenceGenerateResponse = struct {
     usage: InferenceGenerateUsage,
 };
 
+pub const InferenceGenerateChunkObject = enum {
+    chat_completion_chunk,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .chat_completion_chunk => "chat.completion.chunk",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "chat.completion.chunk", .chat_completion_chunk },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Streaming generation chunk (SSE event data)
 pub const InferenceGenerateChunk = struct {
     id: []const u8,
-    object: []const u8,
+    object: InferenceGenerateChunkObject,
     created: i64,
     model: []const u8,
     choices: []const InferenceGenerateChunkChoice,
@@ -7803,6 +11008,93 @@ pub const InferenceRerankMultimodalRequest = struct {
     documents: []const InferenceRerankMultimodalDocument,
 };
 
+/// inference-native KV cache quantization format. Lower precision reduces memory usage but may affect generation quality. Default auto-selects based on backend (f16 for GPU, f32 for CPU).
+pub const InferenceGenerateRequestCacheDtype = enum {
+    f16,
+    f32,
+    int8,
+    fp8,
+    int4,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .f16 => "f16",
+            .f32 => "f32",
+            .int8 => "int8",
+            .fp8 => "fp8",
+            .int4 => "int4",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "f16", .f16 },
+            .{ "f32", .f32 },
+            .{ "int8", .int8 },
+            .{ "fp8", .fp8 },
+            .{ "int4", .int4 },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// inference-native graph execution mode. `eager` keeps the direct runtime path when possible. `compiled` runs inference graph planning, partitioning, and backend executor attachment.
+pub const InferenceGenerateRequestMode = enum {
+    eager,
+    compiled,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .eager => "eager",
+            .compiled => "compiled",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "eager", .eager },
+            .{ "compiled", .compiled },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// inference-native compiled graph target. `partitioned` attaches compiled executors to eligible graph partitions. `whole-model` requests a compiled backend only when it can own the full traced graph shape.
+pub const InferenceGenerateRequestCompiledTarget = enum {
+    partitioned,
+    whole_model,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .partitioned => "partitioned",
+            .whole_model => "whole-model",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "partitioned", .partitioned },
+            .{ "whole-model", .whole_model },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const InferenceGenerateRequest = struct {
     /// Name of the generator model from models_dir/generators/
     model: []const u8,
@@ -7837,14 +11129,14 @@ pub const InferenceGenerateRequest = struct {
     /// inference-native speculative decoding extension. Number of draft tokens proposed per verification round.
     speculative_k: ?i64 = null,
     /// inference-native KV cache quantization format. Lower precision reduces memory usage but may affect generation quality. Default auto-selects based on backend (f16 for GPU, f32 for CPU).
-    cache_dtype: ?[]const u8 = null,
+    cache_dtype: ?InferenceGenerateRequestCacheDtype = null,
     /// inference-native KV cache compaction ratio applied after prefill via Attention Matching. Selects a subset of keys and fits new values via OLS to preserve attention behavior. 0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction.
     cache_compaction_ratio: ?f32 = null,
     backend: ?InferenceModelBackend = null,
     /// inference-native graph execution mode. `eager` keeps the direct runtime path when possible. `compiled` runs inference graph planning, partitioning, and backend executor attachment.
-    mode: ?[]const u8 = null,
+    mode: ?InferenceGenerateRequestMode = null,
     /// inference-native compiled graph target. `partitioned` attaches compiled executors to eligible graph partitions. `whole-model` requests a compiled backend only when it can own the full traced graph shape.
-    compiled_target: ?[]const u8 = null,
+    compiled_target: ?InferenceGenerateRequestCompiledTarget = null,
     /// Controls how the model uses tools
     tool_choice: ?InferenceToolChoice = null,
 };
@@ -7894,9 +11186,31 @@ pub const Table = struct {
     replication_sources: ?[]const ReplicationSource = null,
 };
 
+pub const TableMigrationState = enum {
+    rebuilding,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .rebuilding => "rebuilding",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "rebuilding", .rebuilding },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Describes an in-progress schema migration. The table serves reads from read_schema while rebuilding full-text indexes for the new schema.
 pub const TableMigration = struct {
-    state: []const u8,
+    state: TableMigrationState,
     read_schema: TableSchema,
 };
 
@@ -8068,10 +11382,35 @@ pub const RowsConflictTarget = struct {
     }
 };
 
+pub const RowsOnConflictAction = enum {
+    update,
+    nothing,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .update => "update",
+            .nothing => "nothing",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "update", .update },
+            .{ "nothing", .nothing },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Typed conflict action for insert operations. `nothing` skips the insert when the target already exists. `update` applies the same typed update operators as ordinary row updates, with expression sources allowed to reference `existing` and `proposed` row images.
 pub const RowsOnConflict = struct {
     target: RowsConflictTarget,
-    action: []const u8,
+    action: RowsOnConflictAction,
     patch: ?RowsFieldPatch = null,
     increment: ?RowsNumericIncrement = null,
     patch_expr: ?RowsExpressionAssignmentMap = null,
@@ -8081,9 +11420,40 @@ pub const RowsOnConflict = struct {
     where_expression: ?RowsExpressionCondition = null,
 };
 
+pub const RowOperationOp = enum {
+    insert,
+    upsert,
+    update,
+    delete,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .insert => "insert",
+            .upsert => "upsert",
+            .update => "update",
+            .delete => "delete",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "insert", .insert },
+            .{ "upsert", .upsert },
+            .{ "update", .update },
+            .{ "delete", .delete },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Structured relational row mutation. `insert` fails if the primary identity already exists, `upsert` overwrites or creates, `update` applies a non-upsert patch by primary or unique identity, and `delete` removes by primary or unique identity. `update.patch` cannot change primary-key components. Missing unique selectors fail the write request rather than falling back to scans. The operation envelope is exact and operation-specific: unsupported fields for the selected `op` fail validation instead of being ignored.
 pub const RowOperation = struct {
-    op: []const u8,
+    op: RowOperationOp,
     /// Full row document for insert/upsert. Must include primary-key columns.
     row: ?RowsRowDocument = null,
     where: ?RowSelector = null,
@@ -8108,9 +11478,34 @@ pub const RowsBatchRequest = struct {
     sync_level: ?SyncLevel = null,
 };
 
+pub const RowsMutationSourceRequestOp = enum {
+    update,
+    delete,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .update => "update",
+            .delete => "delete",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "update", .update },
+            .{ "delete", .delete },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Typed relational mutation-source plan. The `source` is a lockable base row-query request with `row_claim.transaction_id` and no `source_cte` or `doc_key_range`; update/delete intents are staged into that transaction using committed-version predicates from the selected preimages. Claims over physical ranges, CTEs, joins, aggregates, windows, and lateral outputs are rejected until those stages expose an explicit lockable base-row contract.
 pub const RowsMutationSourceRequest = struct {
-    op: []const u8,
+    op: RowsMutationSourceRequestOp,
     source: RowsQueryRequest,
     /// Top-level static field patch for update operations.
     patch: ?RowsFieldPatch = null,
@@ -8140,9 +11535,31 @@ pub const RowsInsertSourceAssignment = struct {
     expr: RowsExpression,
 };
 
+pub const RowsInsertSourceRequestOp = enum {
+    insert,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .insert => "insert",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "insert", .insert },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Typed relational insert-source plan. The `source` is a read-only row query over `source_table` or, when omitted, the target table named in the path. Each selected source row is projected through `assignments` into a target insert row, then optional conflict handling and `RETURNING` projection run through the same row-batch semantics as ordinary inserts. Execution is fail-closed until the storage/runtime layer implements source-to-target routing, duplicate-target detection, and owner-local insert staging for this native plan.
 pub const RowsInsertSourceRequest = struct {
-    op: []const u8,
+    op: RowsInsertSourceRequestOp,
     /// Optional source table name. Omit or set to the target table for same-table insert-source plans; cross-table execution requires routed source/target ownership support.
     source_table: ?[]const u8 = null,
     source: RowsQueryRequest,
@@ -8155,12 +11572,62 @@ pub const RowsInsertSourceRequest = struct {
     returning_expressions: ?[]const RowsExpressionProjection = null,
 };
 
+pub const RowsJoinedMutationSourceRequestOp = enum {
+    update,
+    delete,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .update => "update",
+            .delete => "delete",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "update", .update },
+            .{ "delete", .delete },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const RowsJoinedMutationSourceRequestTargetSide = enum {
+    left,
+    right,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .left => "left",
+            .right => "right",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "left", .left },
+            .{ "right", .right },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Typed relational joined mutation-source plan. The target side of the `join` must carry a lockable `row_claim.transaction_id`; the non-target side is read-only input. Update plans can copy same-typed values from the source side through `source_assignments` and can apply target-local patches or expression assignments. Delete plans reject update assignments. Execution must stage intents only for claimed target rows.
 pub const RowsJoinedMutationSourceRequest = struct {
-    op: []const u8,
+    op: RowsJoinedMutationSourceRequestOp,
     /// Optional source table name for cross-table joined mutation-source plans. Omit or set to the target table for same-table joined mutation sources. Catalog-routed execution reads source rows through the source table's owner ranges and stages only target-row intents through the target table's owner ranges.
     source_table: ?[]const u8 = null,
-    target_side: []const u8,
+    target_side: RowsJoinedMutationSourceRequestTargetSide,
     join: RowsJoinRequest,
     /// Post-match computed predicates over the target row and joined source row. Unqualified fields bind to the target row; fields with `source: source` bind to the source row.
     match_expression_where: ?[]const RowsExpressionCondition = null,
@@ -8191,8 +11658,17 @@ pub const RowsQueryOrder = union(enum) {
     rows_query_order_expression: *RowsQueryOrderExpression,
     rows_query_order_field: *RowsQueryOrderField,
 
+    fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
+        const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
+        defer allocator.free(encoded);
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.UnexpectedToken,
+        };
+    }
+
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+        const parsed = parseUnionVariantFromValue(T, allocator, source, options) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return null,
         };
@@ -8240,11 +11716,61 @@ pub const RowsQueryOrder = union(enum) {
     }
 };
 
+pub const RowsQueryOrderExpressionNullTest = enum {
+    is_null,
+    is_not_null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .is_null => "is_null",
+            .is_not_null => "is_not_null",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "is_null", .is_null },
+            .{ "is_not_null", .is_not_null },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const RowsQueryOrderExpressionDirection = enum {
+    asc,
+    desc,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .asc => "asc",
+            .desc => "desc",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "asc", .asc },
+            .{ "desc", .desc },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const RowsQueryOrderExpression = struct {
     /// Typed row-expression AST for computed ordering. Mutually exclusive with `field`.
     expr: RowsExpression,
-    null_test: ?[]const u8 = null,
-    direction: ?[]const u8 = null,
+    null_test: ?RowsQueryOrderExpressionNullTest = null,
+    direction: ?RowsQueryOrderExpressionDirection = null,
 };
 
 /// Shared typed row-expression AST. A node is exactly one of `{ "field": "name" }`, `{ "value": ... }`, or an operator node such as `{ "op": "lower", "args": [{ "field": "email" }] }`. Supported operators are the shared row-local expression surface used by schema predicates, mutation expressions, query projections, filters, grouping, ordering, and SQL lowering. Mutation expressions may set `source` to `existing` or `proposed`; query expressions use the default row source.
@@ -8253,8 +11779,17 @@ pub const RowsExpression = union(enum) {
     rows_expression_field: *RowsExpressionField,
     rows_expression_value: *RowsExpressionValue,
 
+    fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
+        const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
+        defer allocator.free(encoded);
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.UnexpectedToken,
+        };
+    }
+
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+        const parsed = parseUnionVariantFromValue(T, allocator, source, options) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return null,
         };
@@ -8311,12 +11846,342 @@ pub const RowsExpression = union(enum) {
     }
 };
 
+pub const RowsExpressionOperatorOp = enum {
+    now,
+    coalesce,
+    lower,
+    upper,
+    trim,
+    btrim,
+    ltrim,
+    rtrim,
+    replace,
+    translate,
+    substring,
+    substr,
+    overlay,
+    split_part,
+    strpos,
+    left,
+    right,
+    lpad,
+    rpad,
+    repeat,
+    reverse,
+    starts_with,
+    ends_with,
+    ascii,
+    chr,
+    md5,
+    like,
+    ilike,
+    bool_and,
+    @"and",
+    bool_or,
+    @"or",
+    bool_not,
+    not,
+    concat,
+    concat_ws,
+    length,
+    char_length,
+    character_length,
+    octet_length,
+    nullif,
+    greatest,
+    least,
+    abs,
+    round,
+    trunc,
+    floor,
+    ceil,
+    sqrt,
+    sign,
+    power,
+    add,
+    sub,
+    mul,
+    div,
+    mod,
+    interval_ns,
+    interval_months,
+    date_trunc,
+    date_bin,
+    date_part,
+    extract,
+    cast,
+    json_extract,
+    json_extract_path,
+    json_extract_path_text,
+    jsonb_extract_path,
+    jsonb_extract_path_text,
+    json_typeof,
+    jsonb_typeof,
+    json_array_length,
+    jsonb_array_length,
+    array_length,
+    cardinality,
+    array_position,
+    array_positions,
+    array_append,
+    array_prepend,
+    array_cat,
+    array_remove,
+    array_replace,
+    array_to_string,
+    string_to_array,
+    uuid_v4,
+    gen_random_uuid,
+    uuid_generate_v4,
+    json_build_object,
+    jsonb_build_object,
+    to_jsonb,
+    json_path_exists,
+    regexp_replace,
+    case,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .now => "now",
+            .coalesce => "coalesce",
+            .lower => "lower",
+            .upper => "upper",
+            .trim => "trim",
+            .btrim => "btrim",
+            .ltrim => "ltrim",
+            .rtrim => "rtrim",
+            .replace => "replace",
+            .translate => "translate",
+            .substring => "substring",
+            .substr => "substr",
+            .overlay => "overlay",
+            .split_part => "split_part",
+            .strpos => "strpos",
+            .left => "left",
+            .right => "right",
+            .lpad => "lpad",
+            .rpad => "rpad",
+            .repeat => "repeat",
+            .reverse => "reverse",
+            .starts_with => "starts_with",
+            .ends_with => "ends_with",
+            .ascii => "ascii",
+            .chr => "chr",
+            .md5 => "md5",
+            .like => "like",
+            .ilike => "ilike",
+            .bool_and => "bool_and",
+            .@"and" => "and",
+            .bool_or => "bool_or",
+            .@"or" => "or",
+            .bool_not => "bool_not",
+            .not => "not",
+            .concat => "concat",
+            .concat_ws => "concat_ws",
+            .length => "length",
+            .char_length => "char_length",
+            .character_length => "character_length",
+            .octet_length => "octet_length",
+            .nullif => "nullif",
+            .greatest => "greatest",
+            .least => "least",
+            .abs => "abs",
+            .round => "round",
+            .trunc => "trunc",
+            .floor => "floor",
+            .ceil => "ceil",
+            .sqrt => "sqrt",
+            .sign => "sign",
+            .power => "power",
+            .add => "add",
+            .sub => "sub",
+            .mul => "mul",
+            .div => "div",
+            .mod => "mod",
+            .interval_ns => "interval_ns",
+            .interval_months => "interval_months",
+            .date_trunc => "date_trunc",
+            .date_bin => "date_bin",
+            .date_part => "date_part",
+            .extract => "extract",
+            .cast => "cast",
+            .json_extract => "json_extract",
+            .json_extract_path => "json_extract_path",
+            .json_extract_path_text => "json_extract_path_text",
+            .jsonb_extract_path => "jsonb_extract_path",
+            .jsonb_extract_path_text => "jsonb_extract_path_text",
+            .json_typeof => "json_typeof",
+            .jsonb_typeof => "jsonb_typeof",
+            .json_array_length => "json_array_length",
+            .jsonb_array_length => "jsonb_array_length",
+            .array_length => "array_length",
+            .cardinality => "cardinality",
+            .array_position => "array_position",
+            .array_positions => "array_positions",
+            .array_append => "array_append",
+            .array_prepend => "array_prepend",
+            .array_cat => "array_cat",
+            .array_remove => "array_remove",
+            .array_replace => "array_replace",
+            .array_to_string => "array_to_string",
+            .string_to_array => "string_to_array",
+            .uuid_v4 => "uuid_v4",
+            .gen_random_uuid => "gen_random_uuid",
+            .uuid_generate_v4 => "uuid_generate_v4",
+            .json_build_object => "json_build_object",
+            .jsonb_build_object => "jsonb_build_object",
+            .to_jsonb => "to_jsonb",
+            .json_path_exists => "json_path_exists",
+            .regexp_replace => "regexp_replace",
+            .case => "case",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "now", .now },
+            .{ "coalesce", .coalesce },
+            .{ "lower", .lower },
+            .{ "upper", .upper },
+            .{ "trim", .trim },
+            .{ "btrim", .btrim },
+            .{ "ltrim", .ltrim },
+            .{ "rtrim", .rtrim },
+            .{ "replace", .replace },
+            .{ "translate", .translate },
+            .{ "substring", .substring },
+            .{ "substr", .substr },
+            .{ "overlay", .overlay },
+            .{ "split_part", .split_part },
+            .{ "strpos", .strpos },
+            .{ "left", .left },
+            .{ "right", .right },
+            .{ "lpad", .lpad },
+            .{ "rpad", .rpad },
+            .{ "repeat", .repeat },
+            .{ "reverse", .reverse },
+            .{ "starts_with", .starts_with },
+            .{ "ends_with", .ends_with },
+            .{ "ascii", .ascii },
+            .{ "chr", .chr },
+            .{ "md5", .md5 },
+            .{ "like", .like },
+            .{ "ilike", .ilike },
+            .{ "bool_and", .bool_and },
+            .{ "and", .@"and" },
+            .{ "bool_or", .bool_or },
+            .{ "or", .@"or" },
+            .{ "bool_not", .bool_not },
+            .{ "not", .not },
+            .{ "concat", .concat },
+            .{ "concat_ws", .concat_ws },
+            .{ "length", .length },
+            .{ "char_length", .char_length },
+            .{ "character_length", .character_length },
+            .{ "octet_length", .octet_length },
+            .{ "nullif", .nullif },
+            .{ "greatest", .greatest },
+            .{ "least", .least },
+            .{ "abs", .abs },
+            .{ "round", .round },
+            .{ "trunc", .trunc },
+            .{ "floor", .floor },
+            .{ "ceil", .ceil },
+            .{ "sqrt", .sqrt },
+            .{ "sign", .sign },
+            .{ "power", .power },
+            .{ "add", .add },
+            .{ "sub", .sub },
+            .{ "mul", .mul },
+            .{ "div", .div },
+            .{ "mod", .mod },
+            .{ "interval_ns", .interval_ns },
+            .{ "interval_months", .interval_months },
+            .{ "date_trunc", .date_trunc },
+            .{ "date_bin", .date_bin },
+            .{ "date_part", .date_part },
+            .{ "extract", .extract },
+            .{ "cast", .cast },
+            .{ "json_extract", .json_extract },
+            .{ "json_extract_path", .json_extract_path },
+            .{ "json_extract_path_text", .json_extract_path_text },
+            .{ "jsonb_extract_path", .jsonb_extract_path },
+            .{ "jsonb_extract_path_text", .jsonb_extract_path_text },
+            .{ "json_typeof", .json_typeof },
+            .{ "jsonb_typeof", .jsonb_typeof },
+            .{ "json_array_length", .json_array_length },
+            .{ "jsonb_array_length", .jsonb_array_length },
+            .{ "array_length", .array_length },
+            .{ "cardinality", .cardinality },
+            .{ "array_position", .array_position },
+            .{ "array_positions", .array_positions },
+            .{ "array_append", .array_append },
+            .{ "array_prepend", .array_prepend },
+            .{ "array_cat", .array_cat },
+            .{ "array_remove", .array_remove },
+            .{ "array_replace", .array_replace },
+            .{ "array_to_string", .array_to_string },
+            .{ "string_to_array", .string_to_array },
+            .{ "uuid_v4", .uuid_v4 },
+            .{ "gen_random_uuid", .gen_random_uuid },
+            .{ "uuid_generate_v4", .uuid_generate_v4 },
+            .{ "json_build_object", .json_build_object },
+            .{ "jsonb_build_object", .jsonb_build_object },
+            .{ "to_jsonb", .to_jsonb },
+            .{ "json_path_exists", .json_path_exists },
+            .{ "regexp_replace", .regexp_replace },
+            .{ "case", .case },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Cast target for `cast`.
+pub const RowsExpressionOperatorTo = enum {
+    text,
+    numeric,
+    bool,
+    boolean,
+    datetime,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .text => "text",
+            .numeric => "numeric",
+            .bool => "bool",
+            .boolean => "boolean",
+            .datetime => "datetime",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "text", .text },
+            .{ "numeric", .numeric },
+            .{ "bool", .bool },
+            .{ "boolean", .boolean },
+            .{ "datetime", .datetime },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const RowsExpressionOperator = struct {
-    op: []const u8,
+    op: RowsExpressionOperatorOp,
     /// Operand expressions for operator nodes.
     args: ?[]const RowsExpression = null,
     /// Cast target for `cast`.
-    to: ?[]const u8 = null,
+    to: ?RowsExpressionOperatorTo = null,
     /// Structured JSON path for `json_extract` and `json_path_exists`.
     path: ?std.json.Value = null,
     /// Return JSON path extraction as text.
@@ -8332,10 +12197,59 @@ pub const RowsExpressionCaseBranch = struct {
     then: RowsExpression,
 };
 
+pub const RowsExpressionConditionOp = enum {
+    is_null,
+    is_not_null,
+    is_distinct,
+    is_not_distinct,
+    eq,
+    ne,
+    gt,
+    gte,
+    lt,
+    lte,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .is_null => "is_null",
+            .is_not_null => "is_not_null",
+            .is_distinct => "is_distinct",
+            .is_not_distinct => "is_not_distinct",
+            .eq => "eq",
+            .ne => "ne",
+            .gt => "gt",
+            .gte => "gte",
+            .lt => "lt",
+            .lte => "lte",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "is_null", .is_null },
+            .{ "is_not_null", .is_not_null },
+            .{ "is_distinct", .is_distinct },
+            .{ "is_not_distinct", .is_not_distinct },
+            .{ "eq", .eq },
+            .{ "ne", .ne },
+            .{ "gt", .gt },
+            .{ "gte", .gte },
+            .{ "lt", .lt },
+            .{ "lte", .lte },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Computed expression predicate over the shared row-expression AST.
 pub const RowsExpressionCondition = struct {
     lhs: RowsExpression,
-    op: []const u8,
+    op: RowsExpressionConditionOp,
     rhs: ?RowsExpression = null,
 };
 
@@ -8351,6 +12265,35 @@ pub const RowsExpressionArrayContainsPredicate = struct {
 pub const RowsExpressionProjection = struct {
     as: []const u8,
     expr: RowsExpression,
+};
+
+/// Controls total counting for paged reads. `exact` scans all matches and returns an exact total. `bounded` may stop after the requested page and report a lower-bound total. `none` may omit work needed only for totals.
+pub const RowsQueryRequestTotalMode = enum {
+    exact,
+    bounded,
+    none,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .exact => "exact",
+            .bounded => "bounded",
+            .none => "none",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "exact", .exact },
+            .{ "bounded", .bounded },
+            .{ "none", .none },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// Typed relational row-query plan. Predicate and expression arrays carry Antfly row-expression AST nodes; SQL syntax is adapter sugar over this native request shape.
@@ -8381,6 +12324,8 @@ pub const RowsQueryRequest = struct {
     order_by: ?[]const RowsQueryOrder = null,
     limit: ?i64 = null,
     offset: ?i64 = null,
+    /// Controls total counting for paged reads. `exact` scans all matches and returns an exact total. `bounded` may stop after the requested page and report a lower-bound total. `none` may omit work needed only for totals.
+    total_mode: ?RowsQueryRequestTotalMode = null,
     row_claim: ?RowsRowClaim = null,
     doc_key_range: ?RowsDocKeyRange = null,
 };
@@ -8393,9 +12338,90 @@ pub const RowsCte = struct {
     query: RowsQueryRequest,
 };
 
+pub const RowsAggregateSpecOp = enum {
+    count,
+    sum,
+    min,
+    max,
+    avg,
+    array_agg,
+    string_agg,
+    percentile_cont,
+    percentile_disc,
+    mode,
+    bool_or,
+    bool_and,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .count => "count",
+            .sum => "sum",
+            .min => "min",
+            .max => "max",
+            .avg => "avg",
+            .array_agg => "array_agg",
+            .string_agg => "string_agg",
+            .percentile_cont => "percentile_cont",
+            .percentile_disc => "percentile_disc",
+            .mode => "mode",
+            .bool_or => "bool_or",
+            .bool_and => "bool_and",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "count", .count },
+            .{ "sum", .sum },
+            .{ "min", .min },
+            .{ "max", .max },
+            .{ "avg", .avg },
+            .{ "array_agg", .array_agg },
+            .{ "string_agg", .string_agg },
+            .{ "percentile_cont", .percentile_cont },
+            .{ "percentile_disc", .percentile_disc },
+            .{ "mode", .mode },
+            .{ "bool_or", .bool_or },
+            .{ "bool_and", .bool_and },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Ordered-set sample direction for percentile_cont and percentile_disc; deterministic tie-break direction for mode.
+pub const RowsAggregateSpecPercentileOrder = enum {
+    asc,
+    desc,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .asc => "asc",
+            .desc => "desc",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "asc", .asc },
+            .{ "desc", .desc },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const RowsAggregateSpec = struct {
     name: []const u8,
-    op: []const u8,
+    op: RowsAggregateSpecOp,
     field: ?[]const u8 = null,
     expr: ?RowsExpression = null,
     distinct: ?bool = null,
@@ -8407,7 +12433,7 @@ pub const RowsAggregateSpec = struct {
     /// Maximum bounded per-group sample count for percentile_cont and percentile_disc.
     percentile_max_items: ?i64 = null,
     /// Ordered-set sample direction for percentile_cont and percentile_disc; deterministic tie-break direction for mode.
-    percentile_order: ?[]const u8 = null,
+    percentile_order: ?RowsAggregateSpecPercentileOrder = null,
     array_max_items: ?i64 = null,
     array_order_by: ?[]const RowsQueryOrder = null,
     /// Delimiter for string_agg aggregate specs.
@@ -8478,6 +12504,31 @@ pub const RowsWindowRequest = struct {
     offset: ?i64 = null,
 };
 
+pub const RowsJoinRequestJoinType = enum {
+    inner,
+    left,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .inner => "inner",
+            .left => "left",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "inner", .inner },
+            .{ "left", .left },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Typed equality join plan. Each side is a full row-query request and can read an ordered CTE through `source_cte`.
 pub const RowsJoinRequest = struct {
     left: RowsQueryRequest,
@@ -8491,7 +12542,7 @@ pub const RowsJoinRequest = struct {
     match_expression_not: ?[]const RowsExpressionConditionGroup = null,
     /// Post-match computed array-containment predicates over the joined rows.
     match_expression_array_contains: ?[]const RowsExpressionArrayContainsPredicate = null,
-    join_type: ?[]const u8 = null,
+    join_type: ?RowsJoinRequestJoinType = null,
     strategy: ?RowsJoinStrategy = null,
     select: ?[]const RowsJoinProjection = null,
     order_by: ?[]const RowsQueryOrder = null,
@@ -8526,8 +12577,17 @@ pub const RowsPlanRequest = union(enum) {
     rows_query_plan_request: *RowsQueryPlanRequest,
     rows_window_plan_request: *RowsWindowPlanRequest,
 
+    fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
+        const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
+        defer allocator.free(encoded);
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.UnexpectedToken,
+        };
+    }
+
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+        const parsed = parseUnionVariantFromValue(T, allocator, source, options) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return null,
         };
@@ -8685,6 +12745,32 @@ pub const QueryBuilderResult = struct {
     warnings: ?[]const []const u8 = null,
 };
 
+/// Strategy for merging graph results with search results: - union: Include nodes from both search and graph results - intersection: Only include nodes appearing in both
+pub const RetrievalQueryRequestExpandStrategy = enum {
+    @"union",
+    intersection,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .@"union" => "union",
+            .intersection => "intersection",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "union", .@"union" },
+            .{ "intersection", .intersection },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// A query in the retrieval pipeline. Extends QueryRequest with an optional tree search configuration. Each query specifies its own table. When both search fields (semantic_search, full_text_search) and tree_search are provided, the search results are used as start nodes for tree navigation.
 pub const RetrievalQueryRequest = struct {
     /// Name of the table to query. Optional for global queries.
@@ -8741,7 +12827,7 @@ pub const RetrievalQueryRequest = struct {
     /// Declarative graph queries to execute after full-text/vector searches. Results can reference search results using node selectors like $full_text_results.
     graph_searches: ?std.json.ArrayHashMap(GraphQuery) = null,
     /// Strategy for merging graph results with search results: - union: Include nodes from both search and graph results - intersection: Only include nodes appearing in both
-    expand_strategy: ?[]const u8 = null,
+    expand_strategy: ?RetrievalQueryRequestExpandStrategy = null,
     /// Optional Handlebars template string for rendering document content in RAG queries. Template has access to document fields via `{{this.fields.fieldName}}`. **Default**: Uses TOON (Token-Oriented Object Notation) format for 30-60% token reduction: ```handlebars {{encodeToon this.fields}} ``` **Available Helpers**: - `encodeToon` - Renders fields in compact TOON format with configurable options: - `lengthMarker` (bool): Add # prefix to array counts (default: true) - `indent` (int): Indentation spacing (default: 2) - `delimiter` (string): Field separator for tabular arrays - `scrubHtml` - Removes HTML tags and extracts text - `media` - Wraps data URIs for GenKit multimodal support - `eq` - Equality comparison for conditionals **Examples**: - Basic TOON: `{{encodeToon this.fields}}` - Compact TOON: `{{encodeToon this.fields lengthMarker=false indent=0}}` - Tabular data: `{{encodeToon this.fields delimiter="\t"}}` - Custom template: `Title: {{this.fields.title}}\nBody: {{this.fields.body}}` - Traditional format: `{{#each this.fields}}{{@key}}: {{this}}\n{{/each}}` TOON format produces compact, LLM-optimized output like: ``` title: Introduction to Vector Search author: Jane Doe tags[#3]: ai,search,ml ``` **References**: - TOON Specification: https://github.com/toon-format/toon - Go Implementation: https://github.com/alpkeskin/gotoon
     document_renderer: ?[]const u8 = null,
     /// Optional result pruning configuration to filter low-relevance results. Pruning helps detect "elbows" in score distributions and removes results that are significantly worse than top matches. **Common patterns:** - RAG queries: Use `max_score_gap_percent: 30` to stop at quality drop-offs - Strict matching: Use `min_score_ratio: 0.7` for high-quality results only - Combine both for best results Example: ```json { "min_score_ratio": 0.5, "max_score_gap_percent": 25.0, "min_absolute_score": 0.3 } ```
@@ -8840,6 +12926,32 @@ pub const AnswerAgentResult = struct {
     eval_result: ?EvalResult = null,
 };
 
+/// Strategy for merging graph results with search results: - union: Include nodes from both search and graph results - intersection: Only include nodes appearing in both
+pub const QueryRequestExpandStrategy = enum {
+    @"union",
+    intersection,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .@"union" => "union",
+            .intersection => "intersection",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "union", .@"union" },
+            .{ "intersection", .intersection },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const QueryRequest = struct {
     /// Name of the table to query. Optional for global queries.
     table: ?[]const u8 = null,
@@ -8895,7 +13007,7 @@ pub const QueryRequest = struct {
     /// Declarative graph queries to execute after full-text/vector searches. Results can reference search results using node selectors like $full_text_results.
     graph_searches: ?std.json.ArrayHashMap(GraphQuery) = null,
     /// Strategy for merging graph results with search results: - union: Include nodes from both search and graph results - intersection: Only include nodes appearing in both
-    expand_strategy: ?[]const u8 = null,
+    expand_strategy: ?QueryRequestExpandStrategy = null,
     /// Optional Handlebars template string for rendering document content in RAG queries. Template has access to document fields via `{{this.fields.fieldName}}`. **Default**: Uses TOON (Token-Oriented Object Notation) format for 30-60% token reduction: ```handlebars {{encodeToon this.fields}} ``` **Available Helpers**: - `encodeToon` - Renders fields in compact TOON format with configurable options: - `lengthMarker` (bool): Add # prefix to array counts (default: true) - `indent` (int): Indentation spacing (default: 2) - `delimiter` (string): Field separator for tabular arrays - `scrubHtml` - Removes HTML tags and extracts text - `media` - Wraps data URIs for GenKit multimodal support - `eq` - Equality comparison for conditionals **Examples**: - Basic TOON: `{{encodeToon this.fields}}` - Compact TOON: `{{encodeToon this.fields lengthMarker=false indent=0}}` - Tabular data: `{{encodeToon this.fields delimiter="\t"}}` - Custom template: `Title: {{this.fields.title}}\nBody: {{this.fields.body}}` - Traditional format: `{{#each this.fields}}{{@key}}: {{this}}\n{{/each}}` TOON format produces compact, LLM-optimized output like: ``` title: Introduction to Vector Search author: Jane Doe tags[#3]: ai,search,ml ``` **References**: - TOON Specification: https://github.com/toon-format/toon - Go Implementation: https://github.com/alpkeskin/gotoon
     document_renderer: ?[]const u8 = null,
     /// Optional result pruning configuration to filter low-relevance results. Pruning helps detect "elbows" in score distributions and removes results that are significantly worse than top matches. **Common patterns:** - RAG queries: Use `max_score_gap_percent: 30` to stop at quality drop-offs - Strict matching: Use `min_score_ratio: 0.7` for high-quality results only - Combine both for best results Example: ```json { "min_score_ratio": 0.5, "max_score_gap_percent": 25.0, "min_absolute_score": 0.3 } ```
@@ -8962,9 +13074,32 @@ pub const QueryResult = struct {
     table: ?[]const u8 = null,
 };
 
+/// Type of the replication source. Currently only "postgres" is supported.
+pub const ReplicationSourceType = enum {
+    postgres,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .postgres => "postgres",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "postgres", .postgres },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const ReplicationSource = struct {
     /// Type of the replication source. Currently only "postgres" is supported.
-    type: []const u8,
+    type: ReplicationSourceType,
     /// Data source name (connection string) for the PostgreSQL database. Supports `${secret:key_name}` references that resolve from the Antfly keystore or environment variables. Requires `wal_level=logical` on the source.
     dsn: []const u8,
     /// Name of the table in the PostgreSQL database to replicate from.
@@ -9002,6 +13137,32 @@ pub const ReplicationRoute = struct {
     on_delete: ?[]const ReplicationTransformOp = null,
 };
 
+/// Unique validation state. Unvalidated constraints are durable metadata but do not enforce writes until promoted.
+pub const UniqueConstraintValidationState = enum {
+    enforced,
+    unvalidated,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .enforced => "enforced",
+            .unvalidated => "unvalidated",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "enforced", .enforced },
+            .{ "unvalidated", .unvalidated },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Relational unique constraint.
 pub const UniqueConstraint = struct {
     /// Constraint name, unique within the table schema.
@@ -9017,7 +13178,112 @@ pub const UniqueConstraint = struct {
     /// Deterministic row-expression predicates that decide whether a row participates in this unique constraint.
     where_expressions: ?[]const RowsExpressionCondition = null,
     /// Unique validation state. Unvalidated constraints are durable metadata but do not enforce writes until promoted.
-    validation_state: ?[]const u8 = null,
+    validation_state: ?UniqueConstraintValidationState = null,
+};
+
+/// Catalog object that owns this physical index.
+pub const RelationalIndexOwnerKind = enum {
+    relational_column,
+    unique_constraint,
+    table,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .relational_column => "relational_column",
+            .unique_constraint => "unique_constraint",
+            .table => "table",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "relational_column", .relational_column },
+            .{ "unique_constraint", .unique_constraint },
+            .{ "table", .table },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Logical access method implemented by this index.
+pub const RelationalIndexAccessMethod = enum {
+    scalar_column,
+    ordered_tuple,
+    algebraic_filter,
+    text_search,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .scalar_column => "scalar_column",
+            .ordered_tuple => "ordered_tuple",
+            .algebraic_filter => "algebraic_filter",
+            .text_search => "text_search",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "scalar_column", .scalar_column },
+            .{ "ordered_tuple", .ordered_tuple },
+            .{ "algebraic_filter", .algebraic_filter },
+            .{ "text_search", .text_search },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Durable lifecycle state for this index generation.
+pub const RelationalIndexLifecycle = enum {
+    ready,
+    building,
+    catching_up,
+    stale,
+    rebuild_required,
+    failed,
+    invalid,
+    dropping,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .ready => "ready",
+            .building => "building",
+            .catching_up => "catching_up",
+            .stale => "stale",
+            .rebuild_required => "rebuild_required",
+            .failed => "failed",
+            .invalid => "invalid",
+            .dropping => "dropping",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "ready", .ready },
+            .{ "building", .building },
+            .{ "catching_up", .catching_up },
+            .{ "stale", .stale },
+            .{ "rebuild_required", .rebuild_required },
+            .{ "failed", .failed },
+            .{ "invalid", .invalid },
+            .{ "dropping", .dropping },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// Durable relational secondary-index metadata.
@@ -9025,11 +13291,11 @@ pub const RelationalIndex = struct {
     /// Stable index name, unique within the table schema.
     name: []const u8,
     /// Catalog object that owns this physical index.
-    owner_kind: []const u8,
-    /// Owner column or constraint name.
+    owner_kind: RelationalIndexOwnerKind,
+    /// Owner column, constraint, or table-level sentinel name.
     owner_name: ?[]const u8 = null,
     /// Logical access method implemented by this index.
-    access_method: []const u8,
+    access_method: RelationalIndexAccessMethod,
     /// Access-method-specific durable configuration, for example full-text analyzer/scoring options or schema-derived algebraic settings.
     method_config: ?std.json.Value = null,
     /// True when the entry backs a unique constraint.
@@ -9041,15 +13307,43 @@ pub const RelationalIndex = struct {
     /// Ordered tuple key definition. Required for ordered_tuple indexes.
     keys: ?[]const RelationalIndexKey = null,
     /// Durable lifecycle state for this index generation.
-    lifecycle: ?[]const u8 = null,
+    lifecycle: ?RelationalIndexLifecycle = null,
     /// Monotonic physical index generation.
     generation: ?i64 = null,
     /// Stable fingerprint of the index-defining catalog shape.
     schema_fingerprint: ?[]const u8 = null,
+    /// Shared generation/lifecycle record for ordered_tuple, text_search, and algebraic_filter access methods.
+    generation_record: ?RelationalIndexGenerationRecord = null,
     /// Field-only partial index predicate shorthand.
     where: ?RowsUniquePredicateGroup = null,
     /// Deterministic row-expression predicates for index participation.
     where_expressions: ?[]const RowsExpressionCondition = null,
+};
+
+/// Storage profile for the table. - "document" (default): schemaless JSON documents with optional, soft schema validation. All indexes are derived from the document. - "relational": required closed schema with typed columns. Documents must match a declared type; declared scalar properties are stored as typed columns for columnar predicate pushdown and aggregation. A field typed "json" stores a subtree that is still indexed like a document. Implies enforce_types and closed document types.
+pub const TableSchemaStorageMode = enum {
+    document,
+    relational,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .document => "document",
+            .relational => "relational",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "document", .document },
+            .{ "relational", .relational },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// Schema definition for a table with multiple document types
@@ -9057,7 +13351,7 @@ pub const TableSchema = struct {
     /// Version of the schema. Used for migrations.
     version: ?i64 = null,
     /// Storage profile for the table. - "document" (default): schemaless JSON documents with optional, soft schema validation. All indexes are derived from the document. - "relational": required closed schema with typed columns. Documents must match a declared type; declared scalar properties are stored as typed columns for columnar predicate pushdown and aggregation. A field typed "json" stores a subtree that is still indexed like a document. Implies enforce_types and closed document types.
-    storage_mode: ?[]const u8 = null,
+    storage_mode: ?TableSchemaStorageMode = null,
     /// Default type to use from the document_types.
     default_type: ?[]const u8 = null,
     /// Whether to enforce that documents must match one of the provided document types. If false, documents not matching any type will be accepted but not indexed.
@@ -9129,8 +13423,17 @@ pub const Query = union(enum) {
     multi_match_query: *MultiMatchQuery,
     query_string_query: *QueryStringQuery,
 
+    fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
+        const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
+        defer allocator.free(encoded);
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.UnexpectedToken,
+        };
+    }
+
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+        const parsed = parseUnionVariantFromValue(T, allocator, source, options) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return null,
         };

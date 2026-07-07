@@ -4,9 +4,10 @@ This is the design document for Antfly's SQL grammar migration. It records the
 architecture, ownership boundaries, invariants, and implementation rules needed
 to keep the generated parser aligned with the rest of the SQL stack.
 
-Track remaining work in `GRAMMAR_SLICES.md`. Do not use this file as a progress
-log; completed history that can be deduced from code, tests, fixtures, or git
-history should stay out of this document.
+Keep live migration work in the implementation, tests, fixtures, and issue/PR
+tracking rather than this design document. Completed history that can be
+deduced from code, tests, fixtures, or git history should stay out of this
+document.
 
 ## Target Architecture
 

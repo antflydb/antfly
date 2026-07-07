@@ -82,6 +82,7 @@ const RelationalIndexMode = enum {
 const RelationalConstraintProbe = enum {
     none,
     unique,
+    partial_unique,
     foreign_key,
 };
 
@@ -154,6 +155,12 @@ const QueryStats = struct {
     predicate_exact_totals: usize = 0,
     index_entries_scanned: u64 = 0,
     candidate_rows: u64 = 0,
+    candidate_stream_emitted: u64 = 0,
+    retained_candidate_rows: u64 = 0,
+    candidate_stream_early_stops: u64 = 0,
+    base_scan_rows: u64 = 0,
+    max_selected_candidate_selectivity_ppm: u64 = 0,
+    max_ordered_tuple_probe_selectivity_ppm: u64 = 0,
     candidate_gate_limit: u64 = 0,
     candidate_gate_observed: u64 = 0,
     candidate_gate_exceeded_count: u64 = 0,
@@ -162,6 +169,13 @@ const QueryStats = struct {
     residual_rechecks: u64 = 0,
     covering_payload_rows: u64 = 0,
     covering_payload_rechecked_rows: u64 = 0,
+    covering_payload_hydration_avoided_rows: u64 = 0,
+    covering_payload_fallback_metadata_missing_rows: u64 = 0,
+    covering_payload_fallback_row_generation_mismatch_rows: u64 = 0,
+    covering_payload_fallback_index_generation_mismatch_rows: u64 = 0,
+    covering_payload_fallback_schema_fingerprint_mismatch_rows: u64 = 0,
+    covering_payload_fallback_residual_predicate_rows: u64 = 0,
+    covering_payload_fallback_projection_shape_rows: u64 = 0,
     projected_rows: u64 = 0,
     ordered_tuple_plan_queries: u64 = 0,
     ordered_tuple_max_key_count: u32 = 0,
@@ -177,6 +191,7 @@ const QueryStats = struct {
     scalar_doc_set_queries: u64 = 0,
     array_doc_set_queries: u64 = 0,
     json_doc_set_queries: u64 = 0,
+    text_search_doc_set_queries: u64 = 0,
     mixed_doc_set_queries: u64 = 0,
     ordered_tuple_doc_set_queries: u64 = 0,
     ordered_tuple_stream_queries: u64 = 0,
@@ -246,9 +261,14 @@ const MatrixComparison = struct {
     ordered_tuple_scalar_doc_set_queries: u64,
     ordered_tuple_array_doc_set_queries: u64,
     ordered_tuple_json_doc_set_queries: u64,
+    ordered_tuple_text_search_doc_set_queries: u64,
     ordered_tuple_mixed_doc_set_queries: u64,
     ordered_tuple_doc_set_queries: u64,
     ordered_tuple_stream_queries: u64,
+    ordered_tuple_covering_payload_rows: u64,
+    ordered_tuple_covering_payload_rechecked_rows: u64,
+    ordered_tuple_covering_payload_hydration_avoided_rows: u64,
+    ordered_tuple_covering_payload_fallback_rows: u64,
     ordered_tuple_candidate_gate_exceeded_count: u64,
     ordered_tuple_access_missing_flag: bool,
     ordered_tuple_fallback_flag: bool,
@@ -567,6 +587,8 @@ fn parseRelationalIndexMode(raw: []const u8) ?RelationalIndexMode {
 fn parseRelationalConstraintProbe(raw: []const u8) ?RelationalConstraintProbe {
     if (std.mem.eql(u8, raw, "none")) return .none;
     if (std.mem.eql(u8, raw, "unique")) return .unique;
+    if (std.mem.eql(u8, raw, "partial-unique")) return .partial_unique;
+    if (std.mem.eql(u8, raw, "partial_unique")) return .partial_unique;
     if (std.mem.eql(u8, raw, "foreign-key")) return .foreign_key;
     if (std.mem.eql(u8, raw, "foreign_key")) return .foreign_key;
     return null;
@@ -648,7 +670,7 @@ fn runMatrix(alloc: std.mem.Allocator, counting: *CountingAllocator, base_cfg: C
     const all_write_scenarios = [_]MatrixWriteScenario{ .insert, .overwrite_changed, .overwrite_unchanged, .delete, .membership_change, .identity_rewrite };
     const selected_write_scenarios = [_]MatrixWriteScenario{base_cfg.matrix_write_scenario};
     const write_scenarios = if (base_cfg.matrix_all_write_scenarios) all_write_scenarios[0..] else selected_write_scenarios[0..];
-    const all_constraint_probes = [_]RelationalConstraintProbe{ .none, .unique, .foreign_key };
+    const all_constraint_probes = [_]RelationalConstraintProbe{ .none, .unique, .partial_unique, .foreign_key };
     const selected_constraint_probes = [_]RelationalConstraintProbe{base_cfg.relational_constraint_probe};
     const constraint_probes = if (base_cfg.matrix_all_constraint_probes) all_constraint_probes[0..] else selected_constraint_probes[0..];
     const relational_modes = [_]RelationalIndexMode{ .none, .single_column, .ordered_tuple, .partial_single_column, .partial_ordered_tuple };
@@ -661,7 +683,7 @@ fn runMatrix(alloc: std.mem.Allocator, counting: *CountingAllocator, base_cfg: C
             @tagName(base_cfg.matrix_preset),
             if (base_cfg.matrix_docs_len == 0) @tagName(base_cfg.matrix_preset) else "custom",
             if (base_cfg.matrix_all_write_scenarios) "insert,overwrite_changed,overwrite_unchanged,delete,membership_change,identity_rewrite" else @tagName(base_cfg.matrix_write_scenario),
-            if (base_cfg.matrix_all_constraint_probes) "none,unique,foreign_key" else @tagName(base_cfg.relational_constraint_probe),
+            if (base_cfg.matrix_all_constraint_probes) "none,unique,partial_unique,foreign_key" else @tagName(base_cfg.relational_constraint_probe),
             base_cfg.overwrite_passes,
             @tagName(base_cfg.overwrite_shape),
             if (base_cfg.matrix_all_query_shapes) "range,equality,ordered_pagination,mixed_candidate_sets" else @tagName(base_cfg.query_shape),
@@ -744,7 +766,7 @@ fn runMatrix(alloc: std.mem.Allocator, counting: *CountingAllocator, base_cfg: C
                             }
                         }
 
-                        if (constraint_probe == .none and write_scenario != .identity_rewrite) {
+                        if (constraint_probe == .none and write_scenario != .identity_rewrite and query_shape != .mixed_candidate_sets) {
                             var document_cfg = scenario_base_cfg;
                             document_cfg.matrix = false;
                             document_cfg.workload = .documents;
@@ -762,6 +784,15 @@ fn runMatrix(alloc: std.mem.Allocator, counting: *CountingAllocator, base_cfg: C
                             defer cleanupTempDir(document_path);
                             const document_summary = try runBench(alloc, counting, document_path, document_cfg);
                             printMatrixResult(document_cfg, selectivityLabel(predicate_min_amount), document_summary);
+                        } else if (constraint_probe == .none and query_shape == .mixed_candidate_sets) {
+                            std.debug.print(
+                                "batch_bench_matrix_skip workload=documents reason=document_mixed_candidate_sets_not_equivalent docs={d} write_scenario={s} selectivity={s}\n",
+                                .{
+                                    docs,
+                                    @tagName(write_scenario),
+                                    selectivityLabel(predicate_min_amount),
+                                },
+                            );
                         } else if (constraint_probe == .none and write_scenario == .identity_rewrite) {
                             std.debug.print(
                                 "batch_bench_matrix_skip write_scenario={s} workload=documents reason=document_identity_rewrite_not_supported docs={d} query_shape={s} selectivity={s}\n",
@@ -1396,6 +1427,12 @@ fn runQueryProbes(alloc: std.mem.Allocator, db: *db_mod.DB, cfg: Config) !QueryS
                 if (result.total_exact) stats.predicate_exact_totals += 1;
                 stats.index_entries_scanned += result.profile.index_entries_scanned;
                 stats.candidate_rows += result.profile.candidate_rows;
+                stats.candidate_stream_emitted += result.profile.candidate_stream_emitted;
+                stats.retained_candidate_rows += result.profile.retained_candidate_rows;
+                if (result.profile.candidate_stream_stop_reason != .none) stats.candidate_stream_early_stops += 1;
+                stats.base_scan_rows += result.profile.base_scan_rows;
+                stats.max_selected_candidate_selectivity_ppm = @max(stats.max_selected_candidate_selectivity_ppm, result.profile.selected_candidate_selectivity_ppm);
+                stats.max_ordered_tuple_probe_selectivity_ppm = @max(stats.max_ordered_tuple_probe_selectivity_ppm, result.profile.ordered_tuple_probe_selectivity_ppm);
                 stats.candidate_gate_limit = @max(stats.candidate_gate_limit, result.profile.candidate_gate_limit);
                 stats.candidate_gate_observed = @max(stats.candidate_gate_observed, result.profile.candidate_gate_observed);
                 if (result.profile.candidate_gate_exceeded) stats.candidate_gate_exceeded_count += 1;
@@ -1404,6 +1441,13 @@ fn runQueryProbes(alloc: std.mem.Allocator, db: *db_mod.DB, cfg: Config) !QueryS
                 stats.residual_rechecks += result.profile.residual_rechecks;
                 stats.covering_payload_rows += result.profile.covering_payload_rows;
                 stats.covering_payload_rechecked_rows += result.profile.covering_payload_rechecked_rows;
+                stats.covering_payload_hydration_avoided_rows += result.profile.covering_payload_hydration_avoided_rows;
+                stats.covering_payload_fallback_metadata_missing_rows += result.profile.covering_payload_fallback_metadata_missing_rows;
+                stats.covering_payload_fallback_row_generation_mismatch_rows += result.profile.covering_payload_fallback_row_generation_mismatch_rows;
+                stats.covering_payload_fallback_index_generation_mismatch_rows += result.profile.covering_payload_fallback_index_generation_mismatch_rows;
+                stats.covering_payload_fallback_schema_fingerprint_mismatch_rows += result.profile.covering_payload_fallback_schema_fingerprint_mismatch_rows;
+                stats.covering_payload_fallback_residual_predicate_rows += result.profile.covering_payload_fallback_residual_predicate_rows;
+                stats.covering_payload_fallback_projection_shape_rows += result.profile.covering_payload_fallback_projection_shape_rows;
                 stats.projected_rows += result.profile.projected_rows;
                 if (result.profile.ordered_tuple_plan_selected) {
                     stats.ordered_tuple_plan_queries += 1;
@@ -1422,6 +1466,7 @@ fn runQueryProbes(alloc: std.mem.Allocator, db: *db_mod.DB, cfg: Config) !QueryS
                     .scalar_doc_set => stats.scalar_doc_set_queries += 1,
                     .array_doc_set => stats.array_doc_set_queries += 1,
                     .json_doc_set => stats.json_doc_set_queries += 1,
+                    .text_search_doc_set => stats.text_search_doc_set_queries += 1,
                     .mixed_doc_set => stats.mixed_doc_set_queries += 1,
                     .ordered_tuple_doc_set => stats.ordered_tuple_doc_set_queries += 1,
                     .ordered_tuple_stream => stats.ordered_tuple_stream_queries += 1,
@@ -1530,11 +1575,11 @@ fn createdAtForDoc(doc_idx: usize) usize {
 fn relationalSchemaJsonAlloc(alloc: std.mem.Allocator, mode: RelationalIndexMode, constraint_probe: RelationalConstraintProbe, query_shape: QueryShape) ![]u8 {
     const base = relationalBaseSchemaJson(mode, query_shape);
     if (constraint_probe == .none) return try alloc.dupe(u8, base);
-    if (constraint_probe == .unique and relationalBaseSchemaHasRelationalIndexes(mode)) {
+    if ((constraint_probe == .unique or constraint_probe == .partial_unique) and relationalBaseSchemaHasRelationalIndexes(mode)) {
         return try std.fmt.allocPrint(alloc, "{s},{s}]{s}", .{
             base[0 .. base.len - 2],
-            relationalUniqueProbeIndexJson(),
-            relationalUniqueProbeConstraintOnlySuffix(),
+            relationalUniqueProbeIndexJson(constraint_probe),
+            relationalUniqueProbeConstraintOnlySuffix(constraint_probe),
         });
     }
     return try std.fmt.allocPrint(alloc, "{s}{s}", .{ base[0 .. base.len - 1], relationalConstraintProbeSchemaSuffix(constraint_probe) });
@@ -1547,18 +1592,27 @@ fn relationalBaseSchemaHasRelationalIndexes(mode: RelationalIndexMode) bool {
     };
 }
 
-fn relationalUniqueProbeIndexJson() []const u8 {
-    return "{\"name\":\"row_title_key\",\"owner_kind\":\"unique_constraint\",\"owner_name\":\"row_title_key\",\"access_method\":\"ordered_tuple\",\"columns\":[\"title\"],\"unique\":true,\"keys\":[{\"column\":\"title\"}],\"lifecycle\":\"ready\",\"generation\":7,\"schema_fingerprint\":\"unique-index-v1:row_title_key\"}";
+fn relationalUniqueProbeIndexJson(probe: RelationalConstraintProbe) []const u8 {
+    return switch (probe) {
+        .unique => "{\"name\":\"row_title_key\",\"owner_kind\":\"unique_constraint\",\"owner_name\":\"row_title_key\",\"access_method\":\"ordered_tuple\",\"columns\":[\"title\"],\"unique\":true,\"keys\":[{\"column\":\"title\"}],\"lifecycle\":\"ready\",\"generation\":7,\"schema_fingerprint\":\"unique-index-v1:row_title_key\"}",
+        .partial_unique => "{\"name\":\"row_open_title_key\",\"owner_kind\":\"unique_constraint\",\"owner_name\":\"row_open_title_key\",\"access_method\":\"ordered_tuple\",\"columns\":[\"title\"],\"unique\":true,\"keys\":[{\"column\":\"title\"}],\"where\":{\"all\":[{\"field\":\"status\",\"op\":\"eq\",\"value\":\"open\"}]},\"lifecycle\":\"ready\",\"generation\":7,\"schema_fingerprint\":\"unique-index-v1:row_open_title_key\"}",
+        .none, .foreign_key => unreachable,
+    };
 }
 
-fn relationalUniqueProbeConstraintOnlySuffix() []const u8 {
-    return ",\"unique_constraints\":[{\"name\":\"row_title_key\",\"columns\":[\"title\"]}]}";
+fn relationalUniqueProbeConstraintOnlySuffix(probe: RelationalConstraintProbe) []const u8 {
+    return switch (probe) {
+        .unique => ",\"unique_constraints\":[{\"name\":\"row_title_key\",\"columns\":[\"title\"]}]}",
+        .partial_unique => ",\"unique_constraints\":[{\"name\":\"row_open_title_key\",\"columns\":[\"title\"]}]}",
+        .none, .foreign_key => unreachable,
+    };
 }
 
 fn relationalConstraintProbeSchemaSuffix(probe: RelationalConstraintProbe) []const u8 {
     return switch (probe) {
         .none => "}",
         .unique => ",\"unique_constraints\":[{\"name\":\"row_title_key\",\"columns\":[\"title\"]}],\"relational_indexes\":[{\"name\":\"row_title_key\",\"owner_kind\":\"unique_constraint\",\"owner_name\":\"row_title_key\",\"access_method\":\"ordered_tuple\",\"columns\":[\"title\"],\"unique\":true,\"keys\":[{\"column\":\"title\"}],\"lifecycle\":\"ready\",\"generation\":7,\"schema_fingerprint\":\"unique-index-v1:row_title_key\"}]}",
+        .partial_unique => ",\"unique_constraints\":[{\"name\":\"row_open_title_key\",\"columns\":[\"title\"]}],\"relational_indexes\":[{\"name\":\"row_open_title_key\",\"owner_kind\":\"unique_constraint\",\"owner_name\":\"row_open_title_key\",\"access_method\":\"ordered_tuple\",\"columns\":[\"title\"],\"unique\":true,\"keys\":[{\"column\":\"title\"}],\"where\":{\"all\":[{\"field\":\"status\",\"op\":\"eq\",\"value\":\"open\"}]},\"lifecycle\":\"ready\",\"generation\":7,\"schema_fingerprint\":\"unique-index-v1:row_open_title_key\"}]}",
         .foreign_key => ",\"foreign_keys\":[{\"name\":\"row_self_fkey\",\"columns\":[\"id\"],\"references\":{\"table\":\"row\",\"columns\":[\"_id\"]},\"on_delete\":\"restrict\",\"on_update\":\"restrict\"}]}",
     };
 }
@@ -1573,13 +1627,13 @@ fn relationalBaseSchemaJson(mode: RelationalIndexMode, query_shape: QueryShape) 
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"title":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"},"body":{"type":"text"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status","owner_kind":"relational_column","owner_name":"status","access_method":"scalar_column","columns":["status"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:status"},{"name":"amount","owner_kind":"relational_column","owner_name":"amount","access_method":"scalar_column","columns":["amount"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:amount"}]}
         ,
         .ordered_tuple =>
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"title":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"},"body":{"type":"text"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_amount_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"amount"}],"include_columns":["id","amount"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:status_amount_idx"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"title":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"},"body":{"type":"text"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_amount_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"amount"}],"include_columns":["id","amount"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:status_amount_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
         ,
         .partial_single_column =>
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"title":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"},"body":{"type":"text"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"amount_partial_idx","owner_kind":"relational_column","owner_name":"amount","access_method":"scalar_column","columns":["amount"],"where":{"all":[{"field":"status","op":"eq","value":"open"}]},"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:amount_partial_idx"}]}
         ,
         .partial_ordered_tuple =>
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"title":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"},"body":{"type":"text"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_amount_partial_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"amount"}],"include_columns":["id","amount"],"where":{"all":[{"field":"status","op":"eq","value":"open"}]},"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:status_amount_partial_idx"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"title":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"},"body":{"type":"text"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_amount_partial_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"amount"}],"include_columns":["id","amount"],"where":{"all":[{"field":"status","op":"eq","value":"open"}]},"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:status_amount_partial_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
         ,
     };
 }
@@ -1593,13 +1647,13 @@ fn relationalMixedCandidateSetSchemaJson(mode: RelationalIndexMode) []const u8 {
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"title":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"},"body":{"type":"text"},"tags":{"type":"array","items":{"type":"keyword"}},"attrs":{"type":"json"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status","owner_kind":"relational_column","owner_name":"status","access_method":"scalar_column","columns":["status"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:status"},{"name":"amount","owner_kind":"relational_column","owner_name":"amount","access_method":"scalar_column","columns":["amount"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:amount"},{"name":"tags","owner_kind":"relational_column","owner_name":"tags","access_method":"scalar_column","columns":["tags"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tags"},{"name":"attrs","owner_kind":"relational_column","owner_name":"attrs","access_method":"scalar_column","columns":["attrs"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:attrs"}]}
         ,
         .ordered_tuple =>
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"title":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"},"body":{"type":"text"},"tags":{"type":"array","items":{"type":"keyword"}},"attrs":{"type":"json"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_amount_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"amount"}],"include_columns":["id","amount"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:status_amount_idx"},{"name":"tags","owner_kind":"relational_column","owner_name":"tags","access_method":"scalar_column","columns":["tags"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tags"},{"name":"attrs","owner_kind":"relational_column","owner_name":"attrs","access_method":"scalar_column","columns":["attrs"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:attrs"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"title":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"},"body":{"type":"text"},"tags":{"type":"array","items":{"type":"keyword"}},"attrs":{"type":"json"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_amount_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"amount"}],"include_columns":["id","amount"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:status_amount_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}},{"name":"tags","owner_kind":"relational_column","owner_name":"tags","access_method":"scalar_column","columns":["tags"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tags"},{"name":"attrs","owner_kind":"relational_column","owner_name":"attrs","access_method":"scalar_column","columns":["attrs"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:attrs"}]}
         ,
         .partial_single_column =>
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"title":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"},"body":{"type":"text"},"tags":{"type":"array","items":{"type":"keyword"}},"attrs":{"type":"json"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"amount_partial_idx","owner_kind":"relational_column","owner_name":"amount","access_method":"scalar_column","columns":["amount"],"where":{"all":[{"field":"status","op":"eq","value":"open"}]},"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:amount_partial_idx"},{"name":"tags","owner_kind":"relational_column","owner_name":"tags","access_method":"scalar_column","columns":["tags"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tags"},{"name":"attrs","owner_kind":"relational_column","owner_name":"attrs","access_method":"scalar_column","columns":["attrs"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:attrs"}]}
         ,
         .partial_ordered_tuple =>
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"title":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"},"body":{"type":"text"},"tags":{"type":"array","items":{"type":"keyword"}},"attrs":{"type":"json"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_amount_partial_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"amount"}],"include_columns":["id","amount"],"where":{"all":[{"field":"status","op":"eq","value":"open"}]},"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:status_amount_partial_idx"},{"name":"tags","owner_kind":"relational_column","owner_name":"tags","access_method":"scalar_column","columns":["tags"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tags"},{"name":"attrs","owner_kind":"relational_column","owner_name":"attrs","access_method":"scalar_column","columns":["attrs"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:attrs"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"title":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"},"body":{"type":"text"},"tags":{"type":"array","items":{"type":"keyword"}},"attrs":{"type":"json"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_amount_partial_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"amount"}],"include_columns":["id","amount"],"where":{"all":[{"field":"status","op":"eq","value":"open"}]},"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:status_amount_partial_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}},{"name":"tags","owner_kind":"relational_column","owner_name":"tags","access_method":"scalar_column","columns":["tags"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tags"},{"name":"attrs","owner_kind":"relational_column","owner_name":"attrs","access_method":"scalar_column","columns":["attrs"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:attrs"}]}
         ,
     };
 }
@@ -1767,7 +1821,7 @@ fn printSummary(cfg: Config, summary: Summary) void {
     );
     if (cfg.query_repeats > 0) {
         std.debug.print(
-            "batch_bench_query lookup_repeats={d} lookup_hits={d} lookup_ms={d:.3} predicate_repeats={d} predicate_hits={d} predicate_exact_totals={d} predicate_ms={d:.3} query_alloc_events={d} query_alloc_bytes={d} query_peak_live_bytes={d} index_entries_scanned={d} candidate_rows={d} candidate_gate_limit={d} candidate_gate_observed={d} iterator_seeks={d} hydrated_rows={d} residual_rechecks={d} covering_payload_rows={d} covering_payload_rechecked_rows={d} projected_rows={d} unknown_access_queries={d} base_scan_queries={d} resolved_doc_set_queries={d} scalar_doc_set_queries={d} array_doc_set_queries={d} json_doc_set_queries={d} mixed_doc_set_queries={d} ordered_tuple_doc_set_queries={d} ordered_tuple_stream_queries={d}\n",
+            "batch_bench_query lookup_repeats={d} lookup_hits={d} lookup_ms={d:.3} predicate_repeats={d} predicate_hits={d} predicate_exact_totals={d} predicate_ms={d:.3} query_alloc_events={d} query_alloc_bytes={d} query_peak_live_bytes={d} index_entries_scanned={d} candidate_rows={d} retained_candidate_rows={d} base_scan_rows={d} max_selected_candidate_selectivity_ppm={d} max_ordered_tuple_probe_selectivity_ppm={d} candidate_gate_limit={d} candidate_gate_observed={d} iterator_seeks={d} hydrated_rows={d} residual_rechecks={d} covering_payload_rows={d} covering_payload_rechecked_rows={d} covering_payload_hydration_avoided_rows={d} projected_rows={d}\n",
             .{
                 summary.query.lookup_repeats,
                 summary.query.lookup_hits,
@@ -1781,6 +1835,10 @@ fn printSummary(cfg: Config, summary: Summary) void {
                 summary.query.allocations.peak_live_bytes,
                 summary.query.index_entries_scanned,
                 summary.query.candidate_rows,
+                summary.query.retained_candidate_rows,
+                summary.query.base_scan_rows,
+                summary.query.max_selected_candidate_selectivity_ppm,
+                summary.query.max_ordered_tuple_probe_selectivity_ppm,
                 summary.query.candidate_gate_limit,
                 summary.query.candidate_gate_observed,
                 summary.query.iterator_seeks,
@@ -1788,16 +1846,42 @@ fn printSummary(cfg: Config, summary: Summary) void {
                 summary.query.residual_rechecks,
                 summary.query.covering_payload_rows,
                 summary.query.covering_payload_rechecked_rows,
+                summary.query.covering_payload_hydration_avoided_rows,
                 summary.query.projected_rows,
+            },
+        );
+        std.debug.print(
+            "batch_bench_query_covering_fallbacks metadata_missing={d} row_generation_mismatch={d} index_generation_mismatch={d} schema_fingerprint_mismatch={d} residual_predicates={d} projection_shape={d}\n",
+            .{
+                summary.query.covering_payload_fallback_metadata_missing_rows,
+                summary.query.covering_payload_fallback_row_generation_mismatch_rows,
+                summary.query.covering_payload_fallback_index_generation_mismatch_rows,
+                summary.query.covering_payload_fallback_schema_fingerprint_mismatch_rows,
+                summary.query.covering_payload_fallback_residual_predicate_rows,
+                summary.query.covering_payload_fallback_projection_shape_rows,
+            },
+        );
+        std.debug.print(
+            "batch_bench_query_access unknown_access_queries={d} base_scan_queries={d} resolved_doc_set_queries={d} scalar_doc_set_queries={d} array_doc_set_queries={d} json_doc_set_queries={d} text_search_doc_set_queries={d} mixed_doc_set_queries={d} ordered_tuple_doc_set_queries={d} ordered_tuple_stream_queries={d}\n",
+            .{
                 summary.query.unknown_access_queries,
                 summary.query.base_scan_queries,
                 summary.query.resolved_doc_set_queries,
                 summary.query.scalar_doc_set_queries,
                 summary.query.array_doc_set_queries,
                 summary.query.json_doc_set_queries,
+                summary.query.text_search_doc_set_queries,
                 summary.query.mixed_doc_set_queries,
                 summary.query.ordered_tuple_doc_set_queries,
                 summary.query.ordered_tuple_stream_queries,
+            },
+        );
+        std.debug.print(
+            "batch_bench_query_stream candidate_stream_emitted={d} retained_candidate_rows={d} candidate_stream_early_stops={d}\n",
+            .{
+                summary.query.candidate_stream_emitted,
+                summary.query.retained_candidate_rows,
+                summary.query.candidate_stream_early_stops,
             },
         );
         std.debug.print(
@@ -1882,7 +1966,7 @@ fn printMatrixResult(cfg: Config, selectivity: []const u8, summary: Summary) voi
         },
     );
     std.debug.print(
-        " predicate_ms={d:.3} predicate_hits={d} exact_totals={d} query_alloc_events={d} query_alloc_bytes={d} query_peak_live_bytes={d} index_entries_scanned={d} candidate_rows={d} candidate_gate_limit={d} candidate_gate_observed={d} iterator_seeks={d} hydrated_rows={d} residual_rechecks={d} covering_payload_rows={d} covering_payload_rechecked_rows={d} projected_rows={d}",
+        " predicate_ms={d:.3} predicate_hits={d} exact_totals={d} query_alloc_events={d} query_alloc_bytes={d} query_peak_live_bytes={d} index_entries_scanned={d} candidate_rows={d} candidate_stream_emitted={d} retained_candidate_rows={d} candidate_stream_early_stops={d} base_scan_rows={d} max_selected_candidate_selectivity_ppm={d} max_ordered_tuple_probe_selectivity_ppm={d} candidate_gate_limit={d} candidate_gate_observed={d} iterator_seeks={d} hydrated_rows={d} residual_rechecks={d} covering_payload_rows={d} covering_payload_rechecked_rows={d} covering_payload_hydration_avoided_rows={d} covering_payload_fallback_metadata_missing_rows={d} covering_payload_fallback_row_generation_mismatch_rows={d} covering_payload_fallback_index_generation_mismatch_rows={d} covering_payload_fallback_schema_fingerprint_mismatch_rows={d} covering_payload_fallback_residual_predicate_rows={d} covering_payload_fallback_projection_shape_rows={d} projected_rows={d}",
         .{
             nsToMsFloat(summary.query.predicate_ns),
             summary.query.predicate_hits,
@@ -1892,6 +1976,12 @@ fn printMatrixResult(cfg: Config, selectivity: []const u8, summary: Summary) voi
             summary.query.allocations.peak_live_bytes,
             summary.query.index_entries_scanned,
             summary.query.candidate_rows,
+            summary.query.candidate_stream_emitted,
+            summary.query.retained_candidate_rows,
+            summary.query.candidate_stream_early_stops,
+            summary.query.base_scan_rows,
+            summary.query.max_selected_candidate_selectivity_ppm,
+            summary.query.max_ordered_tuple_probe_selectivity_ppm,
             summary.query.candidate_gate_limit,
             summary.query.candidate_gate_observed,
             summary.query.iterator_seeks,
@@ -1899,11 +1989,18 @@ fn printMatrixResult(cfg: Config, selectivity: []const u8, summary: Summary) voi
             summary.query.residual_rechecks,
             summary.query.covering_payload_rows,
             summary.query.covering_payload_rechecked_rows,
+            summary.query.covering_payload_hydration_avoided_rows,
+            summary.query.covering_payload_fallback_metadata_missing_rows,
+            summary.query.covering_payload_fallback_row_generation_mismatch_rows,
+            summary.query.covering_payload_fallback_index_generation_mismatch_rows,
+            summary.query.covering_payload_fallback_schema_fingerprint_mismatch_rows,
+            summary.query.covering_payload_fallback_residual_predicate_rows,
+            summary.query.covering_payload_fallback_projection_shape_rows,
             summary.query.projected_rows,
         },
     );
     std.debug.print(
-        " unknown_access_queries={d} base_scan_queries={d} resolved_doc_set_queries={d} scalar_doc_set_queries={d} array_doc_set_queries={d} json_doc_set_queries={d} mixed_doc_set_queries={d} ordered_tuple_doc_set_queries={d} ordered_tuple_stream_queries={d} candidate_gate_fallbacks={d} materialization_cap_fallbacks={d} exact_paged_total_fallbacks={d} ordering_not_covered_fallbacks={d} index_not_ready_fallbacks={d} stale_generation_fallbacks={d} predicate_not_proven_fallbacks={d} no_usable_bounds_fallbacks={d}",
+        " unknown_access_queries={d} base_scan_queries={d} resolved_doc_set_queries={d} scalar_doc_set_queries={d} array_doc_set_queries={d} json_doc_set_queries={d} text_search_doc_set_queries={d} mixed_doc_set_queries={d} ordered_tuple_doc_set_queries={d} ordered_tuple_stream_queries={d} candidate_gate_fallbacks={d} materialization_cap_fallbacks={d} exact_paged_total_fallbacks={d} ordering_not_covered_fallbacks={d} index_not_ready_fallbacks={d} stale_generation_fallbacks={d} predicate_not_proven_fallbacks={d} no_usable_bounds_fallbacks={d}",
         .{
             summary.query.unknown_access_queries,
             summary.query.base_scan_queries,
@@ -1911,6 +2008,7 @@ fn printMatrixResult(cfg: Config, selectivity: []const u8, summary: Summary) voi
             summary.query.scalar_doc_set_queries,
             summary.query.array_doc_set_queries,
             summary.query.json_doc_set_queries,
+            summary.query.text_search_doc_set_queries,
             summary.query.mixed_doc_set_queries,
             summary.query.ordered_tuple_doc_set_queries,
             summary.query.ordered_tuple_stream_queries,
@@ -2039,9 +2137,19 @@ fn matrixRelationalComparison(
         .ordered_tuple_scalar_doc_set_queries = ordered_tuple.query.scalar_doc_set_queries,
         .ordered_tuple_array_doc_set_queries = ordered_tuple.query.array_doc_set_queries,
         .ordered_tuple_json_doc_set_queries = ordered_tuple.query.json_doc_set_queries,
+        .ordered_tuple_text_search_doc_set_queries = ordered_tuple.query.text_search_doc_set_queries,
         .ordered_tuple_mixed_doc_set_queries = ordered_tuple.query.mixed_doc_set_queries,
         .ordered_tuple_doc_set_queries = ordered_tuple.query.ordered_tuple_doc_set_queries,
         .ordered_tuple_stream_queries = ordered_tuple.query.ordered_tuple_stream_queries,
+        .ordered_tuple_covering_payload_rows = ordered_tuple.query.covering_payload_rows,
+        .ordered_tuple_covering_payload_rechecked_rows = ordered_tuple.query.covering_payload_rechecked_rows,
+        .ordered_tuple_covering_payload_hydration_avoided_rows = ordered_tuple.query.covering_payload_hydration_avoided_rows,
+        .ordered_tuple_covering_payload_fallback_rows = ordered_tuple.query.covering_payload_fallback_metadata_missing_rows +
+            ordered_tuple.query.covering_payload_fallback_row_generation_mismatch_rows +
+            ordered_tuple.query.covering_payload_fallback_index_generation_mismatch_rows +
+            ordered_tuple.query.covering_payload_fallback_schema_fingerprint_mismatch_rows +
+            ordered_tuple.query.covering_payload_fallback_residual_predicate_rows +
+            ordered_tuple.query.covering_payload_fallback_projection_shape_rows,
         .ordered_tuple_candidate_gate_exceeded_count = ordered_tuple.query.candidate_gate_exceeded_count,
         .ordered_tuple_access_missing_flag = ordered_tuple_access_missing,
         .ordered_tuple_fallback_flag = ordered_tuple_flagged,
@@ -2093,16 +2201,21 @@ fn printMatrixRelationalComparison(comparison: MatrixComparison) void {
         },
     );
     std.debug.print(
-        " ordered_tuple_base_scan_queries={d} ordered_tuple_resolved_doc_set_queries={d} ordered_tuple_scalar_doc_set_queries={d} ordered_tuple_array_doc_set_queries={d} ordered_tuple_json_doc_set_queries={d} ordered_tuple_mixed_doc_set_queries={d} ordered_tuple_doc_set_queries={d} ordered_tuple_stream_queries={d} ordered_tuple_candidate_gate_exceeded_count={d} ordered_tuple_access_missing_flag={any} ordered_tuple_fallback_flag={any}\n",
+        " ordered_tuple_base_scan_queries={d} ordered_tuple_resolved_doc_set_queries={d} ordered_tuple_scalar_doc_set_queries={d} ordered_tuple_array_doc_set_queries={d} ordered_tuple_json_doc_set_queries={d} ordered_tuple_text_search_doc_set_queries={d} ordered_tuple_mixed_doc_set_queries={d} ordered_tuple_doc_set_queries={d} ordered_tuple_stream_queries={d} ordered_tuple_covering_payload_rows={d} ordered_tuple_covering_payload_rechecked_rows={d} ordered_tuple_covering_payload_hydration_avoided_rows={d} ordered_tuple_covering_payload_fallback_rows={d} ordered_tuple_candidate_gate_exceeded_count={d} ordered_tuple_access_missing_flag={any} ordered_tuple_fallback_flag={any}\n",
         .{
             comparison.ordered_tuple_base_scan_queries,
             comparison.ordered_tuple_resolved_doc_set_queries,
             comparison.ordered_tuple_scalar_doc_set_queries,
             comparison.ordered_tuple_array_doc_set_queries,
             comparison.ordered_tuple_json_doc_set_queries,
+            comparison.ordered_tuple_text_search_doc_set_queries,
             comparison.ordered_tuple_mixed_doc_set_queries,
             comparison.ordered_tuple_doc_set_queries,
             comparison.ordered_tuple_stream_queries,
+            comparison.ordered_tuple_covering_payload_rows,
+            comparison.ordered_tuple_covering_payload_rechecked_rows,
+            comparison.ordered_tuple_covering_payload_hydration_avoided_rows,
+            comparison.ordered_tuple_covering_payload_fallback_rows,
             comparison.ordered_tuple_candidate_gate_exceeded_count,
             comparison.ordered_tuple_access_missing_flag,
             comparison.ordered_tuple_fallback_flag,

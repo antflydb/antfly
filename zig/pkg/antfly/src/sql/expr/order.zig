@@ -42,6 +42,7 @@ const freeExpression = plan_mod.freeExpression;
 const freeExpressionSlice = plan_mod.freeExpressionSlice;
 
 pub const OrderExpressionParserOptions = struct {
+    params: []const value_mod.SqlValue = &.{},
     field_source: db_mod.types.RelationalRowsExpressionFieldSource = .row,
     row_expression_hooks: expr_row_parse.RowExpressionParserHooks,
     arithmetic_hooks: expr_row_parse.ArithmeticExpressionParserHooks,
@@ -135,6 +136,24 @@ pub fn peekGeneralRowExpression(tokens: []const Token, pos: usize) bool {
         expr_token.peekFixedBinaryFunctionCall(tokens, pos, .mod) or
         expr_token.peekFixedBinaryFunctionCall(tokens, pos, .power) or
         expr_token.peekGreatestLeastFunctionCall(tokens, pos);
+}
+
+fn validateGeneratedOrderExpressionIdentityStrict(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    start: usize,
+    end: usize,
+    expression: db_mod.types.RelationalRowsExpression,
+    options: OrderExpressionParserOptions,
+) !void {
+    try expr_generated_validate.validateGeneratedRowExpressionIdentityStrictWithContext(
+        .{ .alloc = alloc, .params = options.params },
+        tokens,
+        start,
+        end,
+        expression,
+        options.generated_expression_ast,
+    );
 }
 
 pub fn expressionStartAt(tokens: []const Token, pos: usize) ExpressionStart {
@@ -329,12 +348,13 @@ pub fn parseExpressionAlloc(
         const expression = try expr_row_parse.parseRowExpressionAlloc(alloc, tokens, pos, type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
         var expression_transferred = false;
         errdefer if (!expression_transferred) freeExpression(alloc, expression);
-        try expr_generated_validate.validateGeneratedRowExpressionIdentity(
+        try validateGeneratedOrderExpressionIdentityStrict(
+            alloc,
             tokens,
             expression_start,
             pos.*,
             expression,
-            options.generated_expression_ast,
+            options,
         );
         try type_context.validateOrderableRowExpression(expression);
         expression_transferred = true;
@@ -371,12 +391,13 @@ pub fn parseExpressionAlloc(
             const expression = try expr_row_parse.parseParenthesizedRowExpressionAlloc(alloc, tokens, pos, options.parenthesized);
             var expression_transferred = false;
             errdefer if (!expression_transferred) freeExpression(alloc, expression);
-            try expr_generated_validate.validateGeneratedRowExpressionIdentity(
+            try validateGeneratedOrderExpressionIdentityStrict(
+                alloc,
                 tokens,
                 expression_start,
                 pos.*,
                 expression,
-                options.generated_expression_ast,
+                options,
             );
             try type_context.validateOrderableRowExpression(expression);
             expression_transferred = true;
@@ -387,12 +408,13 @@ pub fn parseExpressionAlloc(
             const expression = try expr_row_parse.parseRowExpressionAlloc(alloc, tokens, pos, type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
             var expression_transferred = false;
             errdefer if (!expression_transferred) freeExpression(alloc, expression);
-            try expr_generated_validate.validateGeneratedRowExpressionIdentity(
+            try validateGeneratedOrderExpressionIdentityStrict(
+                alloc,
                 tokens,
                 expression_start,
                 pos.*,
                 expression,
-                options.generated_expression_ast,
+                options,
             );
             try type_context.validateTextRowExpression(expression);
             expression_transferred = true;
@@ -412,12 +434,13 @@ pub fn parseExpressionAlloc(
             const expression = try expr_row_parse.parseRowExpressionAlloc(alloc, tokens, pos, type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
             var expression_transferred = false;
             errdefer if (!expression_transferred) freeExpression(alloc, expression);
-            try expr_generated_validate.validateGeneratedRowExpressionIdentity(
+            try validateGeneratedOrderExpressionIdentityStrict(
+                alloc,
                 tokens,
                 expression_start,
                 pos.*,
                 expression,
-                options.generated_expression_ast,
+                options,
             );
             try type_context.validateOrderableRowExpression(expression);
             expression_transferred = true;
@@ -448,12 +471,13 @@ pub fn parseExpressionAlloc(
             );
             var expression_transferred = false;
             errdefer if (!expression_transferred) freeExpression(alloc, expression);
-            try expr_generated_validate.validateGeneratedRowExpressionIdentity(
+            try validateGeneratedOrderExpressionIdentityStrict(
+                alloc,
                 tokens,
                 expression_start,
                 pos.*,
                 expression,
-                options.generated_expression_ast,
+                options,
             );
             if (expression.kind == .field and expression.field.len != 0) {
                 expression_transferred = true;
@@ -476,12 +500,13 @@ pub fn parseExpressionAlloc(
             const expression = try expr_row_parse.parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .md5, type_context, .text, options.fixed_unary);
             var expression_transferred = false;
             errdefer if (!expression_transferred) freeExpression(alloc, expression);
-            try expr_generated_validate.validateGeneratedRowExpressionIdentity(
+            try validateGeneratedOrderExpressionIdentityStrict(
+                alloc,
                 tokens,
                 expression_start,
                 pos.*,
                 expression,
-                options.generated_expression_ast,
+                options,
             );
             expression_transferred = true;
             return .{ .expression = expression };
@@ -491,12 +516,13 @@ pub fn parseExpressionAlloc(
             const expression = try expr_row_parse.parseRowExpressionAlloc(alloc, tokens, pos, type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
             var expression_transferred = false;
             errdefer if (!expression_transferred) freeExpression(alloc, expression);
-            try expr_generated_validate.validateGeneratedRowExpressionIdentity(
+            try validateGeneratedOrderExpressionIdentityStrict(
+                alloc,
                 tokens,
                 expression_start,
                 pos.*,
                 expression,
-                options.generated_expression_ast,
+                options,
             );
             try type_context.validateNumericRowExpression(expression);
             expression_transferred = true;
@@ -518,12 +544,13 @@ pub fn parseExpressionAlloc(
         const expression = try expr_row_parse.parseArithmeticExpressionRestAlloc(alloc, tokens, pos, .{ .kind = .field, .field = field }, 0, type_context, options.arithmetic_hooks);
         var expression_transferred = false;
         errdefer if (!expression_transferred) freeExpression(alloc, expression);
-        try expr_generated_validate.validateGeneratedRowExpressionIdentity(
+        try validateGeneratedOrderExpressionIdentityStrict(
+            alloc,
             tokens,
             expression_start,
             pos.*,
             expression,
-            options.generated_expression_ast,
+            options,
         );
         try type_context.validateNumericRowExpression(expression);
         expression_transferred = true;

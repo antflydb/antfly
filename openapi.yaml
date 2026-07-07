@@ -12594,6 +12594,20 @@ components:
           type: integer
           format: int64
           minimum: 0
+        total_mode:
+          type: string
+          enum:
+            - exact
+            - bounded
+            - none
+          description: >
+            Controls total counting for paged reads. `exact` scans all matches
+
+            and returns an exact total. `bounded` may stop after the requested
+
+            page and report a lower-bound total. `none` may omit work needed
+
+            only for totals.
         row_claim:
           $ref: '#/components/schemas/RowsRowClaim'
         doc_key_range:
@@ -13321,6 +13335,9 @@ components:
         total:
           type: integer
           format: int64
+        total_exact:
+          type: boolean
+          description: False when `total` is a bounded or no-total value rather than an exact match count.
         result_schema:
           type: array
           items:
@@ -19066,6 +19083,10 @@ components:
           type: string
           minLength: 1
           description: Declared relational column used by this key component.
+        collation:
+          type: string
+          minLength: 1
+          description: Optional collation used by this ordered key component.
         direction:
           type: string
           enum:
@@ -19081,6 +19102,70 @@ components:
           description: Null placement for ordered scans. Omitted uses method default.
       required:
         - column
+    RelationalIndexOwnerRange:
+      type: object
+      additionalProperties: false
+      description: Owner-range coverage for a relational access-method generation.
+      properties:
+        start:
+          type: string
+          description: Inclusive owner range start key.
+        end:
+          type: string
+          description: Exclusive owner range end key; empty string means unbounded.
+        range_id:
+          type: string
+          description: Optional stable range identifier.
+        placement_generation:
+          type: integer
+          format: uint64
+          description: Placement generation that produced this range assignment.
+      required:
+        - start
+        - end
+    RelationalIndexGenerationRecord:
+      type: object
+      additionalProperties: false
+      description: Shared lifecycle record for derived relational access-method generations.
+      properties:
+        generation:
+          type: integer
+          format: uint64
+          description: Monotonic physical access-method generation.
+        owner_ranges:
+          type: array
+          items:
+            $ref: '#/components/schemas/RelationalIndexOwnerRange'
+          description: Owner ranges covered by this generation.
+        lifecycle:
+          type: string
+          enum:
+            - ready
+            - building
+            - catching_up
+            - stale
+            - rebuild_required
+            - failed
+            - invalid
+            - dropping
+          description: Lifecycle state for this generation.
+        lag:
+          type: integer
+          format: uint64
+          description: Remaining catch-up lag for this generation.
+        failure_reason:
+          type: string
+          description: Typed or operator-facing failure reason when the lifecycle is not healthy.
+        ready_watermark:
+          type: integer
+          format: uint64
+          description: Durable watermark that is ready for serving.
+      required:
+        - generation
+        - owner_ranges
+        - lifecycle
+        - lag
+        - ready_watermark
     RelationalIndex:
       type: object
       additionalProperties: false
@@ -19111,7 +19196,8 @@ components:
         method_config:
           type: object
           additionalProperties: true
-          description: Access-method-specific durable configuration, for example full-text analyzer/scoring options or schema-derived algebraic settings.
+          description: Access-method-specific durable configuration, for example full-text analyzer/scoring
+            options or schema-derived algebraic settings.
         unique:
           type: boolean
           description: True when the entry backs a unique constraint.
@@ -19149,6 +19235,10 @@ components:
         schema_fingerprint:
           type: string
           description: Stable fingerprint of the index-defining catalog shape.
+        generation_record:
+          $ref: '#/components/schemas/RelationalIndexGenerationRecord'
+          description: Shared generation/lifecycle record for ordered_tuple, text_search, and algebraic_filter
+            access methods.
         where:
           $ref: '#/components/schemas/RowsUniquePredicateGroup'
           description: Field-only partial index predicate shorthand.
@@ -20140,6 +20230,17 @@ components:
         planner_last_fallback_reason:
           x-go-type-skip-optional-pointer: true
           type: string
+        planner_last_unsupported_reason:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Stable planner unsupported bucket for the latest fallback decision.
+          enum:
+            - unsupported-access-method
+            - index-not-ready
+            - stale-generation
+            - predicate-not-proven
+            - ordering-not-covered
+            - access-method-capability-mismatch
         planner_last_estimated_scan_rows:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -20317,6 +20418,14 @@ components:
         generation:
           type: integer
           format: uint64
+        lag:
+          type: integer
+          format: uint64
+          description: Shared generation-record catch-up lag for the schema-backed access method.
+        ready_watermark:
+          type: integer
+          format: uint64
+          description: Shared generation-record watermark through which the access method is ready.
         schema_fingerprint:
           type: string
           nullable: true

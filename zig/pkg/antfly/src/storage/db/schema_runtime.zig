@@ -859,6 +859,7 @@ pub fn Impl(comptime DB: type) type {
                     next_schema.relational_columns,
                     next_schema.periods,
                     unique_to_build.items,
+                    next_schema.relational_indexes,
                     self.getRange().start,
                     self.getRange().end,
                 );
@@ -2179,7 +2180,7 @@ test "db direct schema apply appends literal default and generated columns throu
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["title"],"additionalProperties":false}}}}
     ;
     const schema_v2 =
-        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"amount":{"type":"numeric"},"status":{"type":"keyword","default":"ACTIVE"},"note":{"type":"keyword"},"title_lc":{"type":"keyword","generated":{"op":"expression","expression":{"op":"lower","args":[{"field":"title"}]}}},"status_lc":{"type":"keyword","generated":{"op":"expression","expression":{"op":"lower","args":[{"field":"status"}]}}},"status_expr_lc":{"type":"keyword","generated":{"op":"expression","expression":{"op":"lower","args":[{"field":"status"}]}}}},"required":["title"],"additionalProperties":false}}},"relational_indexes":[{"name":"status","owner_kind":"relational_column","owner_name":"status","access_method":"scalar_column","columns":["status"]},{"name":"title_lc","owner_kind":"relational_column","owner_name":"title_lc","access_method":"scalar_column","columns":["title_lc"]},{"name":"status_expr_lc","owner_kind":"relational_column","owner_name":"status_expr_lc","access_method":"scalar_column","columns":["status_expr_lc"]}]}
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"amount":{"type":"numeric"},"status":{"type":"keyword","default":"ACTIVE"},"note":{"type":"keyword"},"title_lc":{"type":"keyword","generated":{"op":"expression","expression":{"op":"lower","args":[{"field":"title"}]}}},"status_lc":{"type":"keyword","generated":{"op":"expression","expression":{"op":"lower","args":[{"field":"status"}]}}},"status_expr_lc":{"type":"keyword","generated":{"op":"expression","expression":{"op":"lower","args":[{"field":"status"}]}}}},"required":["title"],"additionalProperties":false}}},"relational_indexes":[{"name":"status","owner_kind":"relational_column","owner_name":"status","access_method":"scalar_column","columns":["status"]},{"name":"title_lc","owner_kind":"relational_column","owner_name":"title_lc","access_method":"ordered_tuple","columns":["title_lc"],"keys":[{"column":"title_lc"}],"lifecycle":"ready","generation":1,"schema_fingerprint":"secondary-index-v1:title_lc","generation_record":{"generation":1,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}},{"name":"status_expr_lc","owner_kind":"relational_column","owner_name":"status_expr_lc","access_method":"ordered_tuple","columns":["status_expr_lc"],"keys":[{"column":"status_expr_lc"}],"lifecycle":"ready","generation":1,"schema_fingerprint":"secondary-index-v1:status_expr_lc","generation_record":{"generation":1,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
     ;
 
     try db.applyTableSchemaJson(alloc, schema_v1, .{});
@@ -2202,19 +2203,25 @@ test "db direct schema apply appends literal default and generated columns throu
     defer alloc.free(note_column);
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, note_column));
 
-    const title_lc_index = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "title_lc", "doc:a");
-    defer alloc.free(title_lc_index);
-    const title_lc_index_value = try db.core.store.get(alloc, title_lc_index);
-    defer alloc.free(title_lc_index_value);
-
-    const status_expr_lc_index = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "status_expr_lc", "doc:a");
-    defer alloc.free(status_expr_lc_index);
-    const status_expr_lc_index_value = try db.core.store.get(alloc, status_expr_lc_index);
-    defer alloc.free(status_expr_lc_index_value);
-
     const durable_schema = (try schema_mod.loadSchema(db.core.store, alloc)) orelse return error.TestUnexpectedResult;
     defer schema_mod.freeSchema(alloc, durable_schema);
     try std.testing.expectEqual(@as(usize, 7), durable_schema.relational_columns.len);
+    const raw_row = try relational_store_mod.getRawAlloc(alloc, db.core.store, "doc:a") orelse return error.TestUnexpectedResult;
+    defer alloc.free(raw_row);
+    const title_lc_tuple = try relational_store_mod.orderedTupleValueForIndexKeysAlloc(alloc, raw_row, durable_schema.relational_indexes[1].keys, durable_schema.relational_columns);
+    defer alloc.free(title_lc_tuple);
+    const title_lc_docs = try relational_store_mod.scanOrderedTupleDocKeysAlloc(alloc, db.core.store, "title_lc", title_lc_tuple, "", "");
+    defer relational_store_mod.freeDocKeys(alloc, title_lc_docs);
+    try std.testing.expectEqual(@as(usize, 1), title_lc_docs.len);
+    try std.testing.expectEqualStrings("doc:a", title_lc_docs[0]);
+
+    const status_expr_lc_tuple = try relational_store_mod.orderedTupleValueForIndexKeysAlloc(alloc, raw_row, durable_schema.relational_indexes[2].keys, durable_schema.relational_columns);
+    defer alloc.free(status_expr_lc_tuple);
+    const status_expr_lc_docs = try relational_store_mod.scanOrderedTupleDocKeysAlloc(alloc, db.core.store, "status_expr_lc", status_expr_lc_tuple, "", "");
+    defer relational_store_mod.freeDocKeys(alloc, status_expr_lc_docs);
+    try std.testing.expectEqual(@as(usize, 1), status_expr_lc_docs.len);
+    try std.testing.expectEqualStrings("doc:a", status_expr_lc_docs[0]);
+
     const durable_generated = durable_schema.relational_columns[6].generated orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(schema_mod.RelationalGeneratedOp.expression, durable_generated.op);
     const durable_expression = durable_generated.expression orelse return error.TestUnexpectedResult;
@@ -2261,7 +2268,7 @@ test "db repairs relational column backed indexes from authoritative packed rows
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id","status","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"orders_status_amount_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"amount"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:status_amount"},{"name":"amount","owner_kind":"relational_column","owner_name":"amount","access_method":"scalar_column","columns":["amount"]}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id","status","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"orders_status_amount_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"amount"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:status_amount","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}},{"name":"amount","owner_kind":"relational_column","owner_name":"amount","access_method":"scalar_column","columns":["amount"]}]}
     ;
     try db.applyTableSchemaJson(alloc, schema_json, .{});
     try db.batch(.{ .writes = &.{

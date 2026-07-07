@@ -498,13 +498,25 @@ pub fn parseClusterRestoreRequest(alloc: std.mem.Allocator, body: []const u8) !C
         .backup_id = try alloc.dupe(u8, parsed.value.backup_id),
         .location = try alloc.dupe(u8, parsed.value.location),
         .table_names = try cloneOptionalStringSlice(alloc, parsed.value.table_names),
-        .restore_mode = if (parsed.value.restore_mode) |value| try alloc.dupe(u8, value) else null,
+        .restore_mode = if (parsed.value.restore_mode) |value| try alloc.dupe(u8, clusterRestoreModeToken(value)) else null,
     };
 }
 
-fn validateNativeBackupFormat(format: ?[]const u8) !void {
+fn clusterRestoreModeToken(value: metadata_openapi.ClusterRestoreRequestRestoreMode) []const u8 {
+    return switch (value) {
+        .fail_if_exists => "fail_if_exists",
+        .skip_if_exists => "skip_if_exists",
+        .overwrite => "overwrite",
+    };
+}
+
+fn validateNativeBackupFormat(format: anytype) !void {
     const value = format orelse return;
-    if (std.mem.eql(u8, value, "native")) return;
+    switch (@typeInfo(@TypeOf(value))) {
+        .@"enum" => if (value == .native) return,
+        .pointer => if (std.mem.eql(u8, value, "native")) return,
+        else => {},
+    }
     return error.UnsupportedBackupFormat;
 }
 

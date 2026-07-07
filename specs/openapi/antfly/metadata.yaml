@@ -5344,6 +5344,17 @@ components:
           type: integer
           format: int64
           minimum: 0
+        total_mode:
+          type: string
+          enum:
+            - exact
+            - bounded
+            - none
+          description: |
+            Controls total counting for paged reads. `exact` scans all matches
+            and returns an exact total. `bounded` may stop after the requested
+            page and report a lower-bound total. `none` may omit work needed
+            only for totals.
         row_claim:
           $ref: "#/components/schemas/RowsRowClaim"
         doc_key_range:
@@ -6033,6 +6044,9 @@ components:
         total:
           type: integer
           format: int64
+        total_exact:
+          type: boolean
+          description: False when `total` is a bounded or no-total value rather than an exact match count.
         result_schema:
           type: array
           items:

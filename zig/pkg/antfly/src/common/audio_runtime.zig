@@ -112,8 +112,8 @@ test "audio runtime activates configured transcribing and synthesizing providers
     var tts_cfg = synthesizing.Config{
         .provider = .openai,
         .api_key = try alloc.dupe(u8, "sk-test"),
-        .model = try alloc.dupe(u8, "gpt-4o-mini-tts"),
-        .voice = try alloc.dupe(u8, "alloy"),
+        .model = .tts_1,
+        .voice = .alloy,
     };
     defer synthesizing.deinitConfig(alloc, &tts_cfg);
     try cfg.text_to_speech.registerConfig("local-tts", tts_cfg);

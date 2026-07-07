@@ -454,7 +454,7 @@ fn executeWriteAlloc(allocator: Allocator, db: *antfly.db.DB, session: *Session,
     }
 
     var write_source = table_writes.BoundTableWriteSource.init(target_table, db);
-    var lowered = try sql_adapter.lower_dml.lowerWritePlanWithLogicalPlanAndFunctionBindingsAlloc(
+    var lowered = try sql_adapter.lowerWritePlanWithLogicalPlanAndFunctionBindingsAlloc(
         allocator,
         parsed_sql,
         &logical_plan,
@@ -534,7 +534,7 @@ fn executeReadAlloc(allocator: Allocator, db: *antfly.db.DB, session: *Session, 
     const schema = try sql_adapter.runtimeSchemaForCatalogTableWithSessionAlloc(allocator, catalog_source, table_names.left, session.catalog.session());
     defer storage_schema.freeSchema(allocator, schema);
 
-    var lowered = try sql_adapter.lower_select.lowerReadPlanWithLogicalPlanAndFunctionBindingsAlloc(
+    var lowered = try sql_adapter.lowerReadPlanWithLogicalPlanAndFunctionBindingsAlloc(
         allocator,
         parsed_sql,
         &logical_plan,

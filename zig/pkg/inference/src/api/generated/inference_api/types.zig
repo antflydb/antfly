@@ -58,6 +58,111 @@ pub const MediaContentPart = antfly_generating_openapi.MediaContentPart;
 
 pub const ContentPart = antfly_generating_openapi.ContentPart;
 
+/// Encoding format for the embeddings (only "float" supported)
+pub const EmbedRequestEncodingFormat = enum {
+    float,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .float => "float",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "float", .float },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Optional embedding task type using Google embedding task-type names. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix.
+pub const EmbedRequestTaskType = enum {
+    retrieval_query,
+    retrieval_document,
+    question_answering,
+    fact_verification,
+    code_retrieval_query,
+    classification,
+    clustering,
+    semantic_similarity,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .retrieval_query => "RETRIEVAL_QUERY",
+            .retrieval_document => "RETRIEVAL_DOCUMENT",
+            .question_answering => "QUESTION_ANSWERING",
+            .fact_verification => "FACT_VERIFICATION",
+            .code_retrieval_query => "CODE_RETRIEVAL_QUERY",
+            .classification => "CLASSIFICATION",
+            .clustering => "CLUSTERING",
+            .semantic_similarity => "SEMANTIC_SIMILARITY",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "RETRIEVAL_QUERY", .retrieval_query },
+            .{ "RETRIEVAL_DOCUMENT", .retrieval_document },
+            .{ "QUESTION_ANSWERING", .question_answering },
+            .{ "FACT_VERIFICATION", .fact_verification },
+            .{ "CODE_RETRIEVAL_QUERY", .code_retrieval_query },
+            .{ "CLASSIFICATION", .classification },
+            .{ "CLUSTERING", .clustering },
+            .{ "SEMANTIC_SIMILARITY", .semantic_similarity },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Deprecated compatibility alias for task_type. search_query/query map to RETRIEVAL_QUERY; search_document/document map to RETRIEVAL_DOCUMENT; classification and clustering map to their Google task_type equivalents.
+pub const EmbedRequestInputType = enum {
+    search_query,
+    search_document,
+    query,
+    document,
+    classification,
+    clustering,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .search_query => "search_query",
+            .search_document => "search_document",
+            .query => "query",
+            .document => "document",
+            .classification => "classification",
+            .clustering => "clustering",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "search_query", .search_query },
+            .{ "search_document", .search_document },
+            .{ "query", .query },
+            .{ "document", .document },
+            .{ "classification", .classification },
+            .{ "clustering", .clustering },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// OpenAI-compatible embedding request with inference multimodal content-part extension
 pub const EmbedRequest = struct {
     /// Model name to use for embedding generation
@@ -65,13 +170,13 @@ pub const EmbedRequest = struct {
     /// Input content to embed. Supports: - a single string - an array of strings - an array of OpenAI-style content parts for multimodal embedding
     input: std.json.Value,
     /// Encoding format for the embeddings (only "float" supported)
-    encoding_format: ?[]const u8 = null,
+    encoding_format: ?EmbedRequestEncodingFormat = null,
     /// Optional truncation size for dense embeddings. Must be a positive integer no larger than the model embedding size. Not supported for sparse models.
     dimensions: ?i64 = null,
     /// Optional embedding task type using Google embedding task-type names. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix.
-    task_type: ?[]const u8 = null,
+    task_type: ?EmbedRequestTaskType = null,
     /// Deprecated compatibility alias for task_type. search_query/query map to RETRIEVAL_QUERY; search_document/document map to RETRIEVAL_DOCUMENT; classification and clustering map to their Google task_type equivalents.
-    input_type: ?[]const u8 = null,
+    input_type: ?EmbedRequestInputType = null,
 };
 
 /// A sparse vector with parallel index/value arrays, sorted by index ascending
@@ -109,8 +214,30 @@ pub const RerankMultimodalDocument = struct {
     content: antfly_generating_openapi.ChatMessageContent,
 };
 
+pub const RerankObjectObject = enum {
+    rerank_score,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .rerank_score => "rerank.score",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "rerank.score", .rerank_score },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const RerankObject = struct {
-    object: []const u8,
+    object: RerankObjectObject,
     /// Original prompt index.
     index: i64,
     /// Relevance score for this prompt.
@@ -153,8 +280,30 @@ pub const RewriteRequest = struct {
     inputs: []const []const u8,
 };
 
+pub const RewriteObjectObject = enum {
+    rewrite,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .rewrite => "rewrite",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "rewrite", .rewrite },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const RewriteObject = struct {
-    object: []const u8,
+    object: RewriteObjectObject,
     /// Original input text index.
     index: i64,
     /// Rewritten texts for this input, one per beam.
@@ -244,8 +393,30 @@ pub const ExtractFieldValue = struct {
     end: ?i64 = null,
 };
 
+pub const ExtractObjectObject = enum {
+    extraction,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .extraction => "extraction",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "extraction", .extraction },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const ExtractObject = struct {
-    object: []const u8,
+    object: ExtractObjectObject,
     /// Original input index.
     index: i64,
     /// Extraction result for this input. Maps structure names to arrays of extracted instances. Each instance maps field names to ExtractFieldValue (for ::str fields) or arrays of ExtractFieldValue (for ::list fields).
@@ -272,8 +443,30 @@ pub const TranscribeRequest = struct {
     language: ?[]const u8 = null,
 };
 
+pub const TranscribeObjectObject = enum {
+    transcription,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .transcription => "transcription",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "transcription", .transcription },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const TranscribeObject = struct {
-    object: []const u8,
+    object: TranscribeObjectObject,
     /// Input audio index.
     index: i64,
     /// Transcribed text from the audio
@@ -736,10 +929,33 @@ pub const ReadRequest = struct {
     max_tokens: ?i64 = null,
 };
 
+/// Object type, always "embedding"
+pub const EmbeddingObjectObject = enum {
+    embedding,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .embedding => "embedding",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "embedding", .embedding },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// A single embedding result
 pub const EmbeddingObject = struct {
     /// Object type, always "embedding"
-    object: []const u8,
+    object: EmbeddingObjectObject,
     /// Dense float vector for dense models, or a sparse vector object for sparse-capable models
     embedding: ?std.json.Value = null,
     /// Index of the input this embedding corresponds to
@@ -787,16 +1003,60 @@ pub const RecognizeRequest = struct {
     resolver: ?ResolverConfig = null,
 };
 
+pub const ClassifyObjectObject = enum {
+    classification,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .classification => "classification",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "classification", .classification },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const ClassifyObject = struct {
-    object: []const u8,
+    object: ClassifyObjectObject,
     /// Original input text index.
     index: i64,
     /// Classification results for this input text.
     classifications: []const ClassifyResult,
 };
 
+pub const DocumentClassificationObjectObject = enum {
+    document_classification,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .document_classification => "document.classification",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "document.classification", .document_classification },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const DocumentClassificationObject = struct {
-    object: []const u8,
+    object: DocumentClassificationObjectObject,
     index: i64,
     checkpoint_path: []const u8,
     prefix: []const u8,
@@ -834,10 +1094,33 @@ pub const ReadResult = struct {
     regions: ?[]const TextRegion = null,
 };
 
+/// The type of tool (currently only "function" is supported)
+pub const ToolType = enum {
+    function,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .function => "function",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "function", .function },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// A tool (function) that the model can call
 pub const Tool = struct {
     /// The type of tool (currently only "function" is supported)
-    type: []const u8,
+    type: ToolType,
     function: FunctionDefinition,
 };
 
@@ -858,16 +1141,68 @@ pub const GenerateMessage = struct {
     tool_calls: ?[]const antfly_generating_openapi.ToolCall = null,
 };
 
+/// Structured output mode
+pub const GenerateResponseFormatType = enum {
+    text,
+    json_object,
+    json_schema,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .text => "text",
+            .json_object => "json_object",
+            .json_schema => "json_schema",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "text", .text },
+            .{ "json_object", .json_object },
+            .{ "json_schema", .json_schema },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const GenerateResponseFormat = struct {
     /// Structured output mode
-    type: []const u8,
+    type: GenerateResponseFormatType,
     /// Optional schema payload for `type=json_schema`. Enforced during native constrained decoding and validated after generation.
     json_schema: ?GenerateJsonSchemaConfig = null,
 };
 
+/// Object type, always "list"
+pub const RerankResponseObject = enum {
+    list,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .list => "list",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "list", .list },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const RerankResponse = struct {
     /// Object type, always "list"
-    object: []const u8,
+    object: RerankResponseObject,
     /// Rerank score objects, one per input prompt.
     data: []const RerankObject,
     /// Name of model used for reranking
@@ -875,9 +1210,32 @@ pub const RerankResponse = struct {
     usage: GenerateUsage,
 };
 
+/// Object type, always "list"
+pub const RewriteResponseObject = enum {
+    list,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .list => "list",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "list", .list },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const RewriteResponse = struct {
     /// Object type, always "list"
-    object: []const u8,
+    object: RewriteResponseObject,
     /// Rewritten text objects, one per input.
     data: []const RewriteObject,
     /// Name of model used for rewriting
@@ -885,9 +1243,32 @@ pub const RewriteResponse = struct {
     usage: GenerateUsage,
 };
 
+/// Object type, always "list"
+pub const ExtractResponseObject = enum {
+    list,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .list => "list",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "list", .list },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const ExtractResponse = struct {
     /// Object type, always "list"
-    object: []const u8,
+    object: ExtractResponseObject,
     /// Extraction result objects, one per input.
     data: []const ExtractObject,
     /// Name of model used for extraction
@@ -895,14 +1276,60 @@ pub const ExtractResponse = struct {
     usage: GenerateUsage,
 };
 
+/// Object type, always "list"
+pub const TranscribeResponseObject = enum {
+    list,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .list => "list",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "list", .list },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const TranscribeResponse = struct {
     /// Object type, always "list"
-    object: []const u8,
+    object: TranscribeResponseObject,
     /// Transcription result objects.
     data: []const TranscribeObject,
     /// Name of model used for transcription
     model: []const u8,
     usage: GenerateUsage,
+};
+
+/// The type of tool call (only in first delta)
+pub const ToolCallDeltaType = enum {
+    function,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .function => "function",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "function", .function },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// Incremental tool call data for streaming
@@ -912,7 +1339,7 @@ pub const ToolCallDelta = struct {
     /// Unique identifier (only in first delta for this index)
     id: ?[]const u8 = null,
     /// The type of tool call (only in first delta)
-    type: ?[]const u8 = null,
+    type: ?ToolCallDeltaType = null,
     function: ?ToolCallFunctionDelta = null,
 };
 
@@ -926,9 +1353,32 @@ pub const ModelRef = struct {
     quantization: ?ModelQuantization = null,
 };
 
+/// OpenAI-compatible response object type.
+pub const ModelsResponseObject = enum {
+    list,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .list => "list",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "list", .list },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const ModelsResponse = struct {
     /// OpenAI-compatible response object type.
-    object: []const u8,
+    object: ModelsResponseObject,
     /// OpenAI-compatible flat model list for generation/embedding models.
     data: []const std.json.Value,
     /// Whether clients should show model download commands.
@@ -986,17 +1436,63 @@ pub const SchemasConfig = struct {
     style: ?Style = null,
 };
 
+/// Response object type.
+pub const PredictorsResponseObject = enum {
+    list,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .list => "list",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "list", .list },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const PredictorsResponse = struct {
     /// Response object type.
-    object: []const u8,
+    object: PredictorsResponseObject,
     /// Traditional ML predictors keyed by predictor name.
     predictors: std.json.ArrayHashMap(PredictorInfo),
+};
+
+/// Object type, always "list"
+pub const EmbedResponseObject = enum {
+    list,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .list => "list",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "list", .list },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// OpenAI-compatible embedding response with a polymorphic `embedding` field for dense or sparse vectors
 pub const EmbedResponse = struct {
     /// Object type, always "list"
-    object: []const u8,
+    object: EmbedResponseObject,
     /// List of embedding objects
     data: []const EmbeddingObject,
     /// Model used for embedding generation
@@ -1016,8 +1512,30 @@ pub const ChunkConfig = struct {
     audio: ?AudioChunkConfig = null,
 };
 
+pub const RecognizeObjectObject = enum {
+    recognition,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .recognition => "recognition",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "recognition", .recognition },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const RecognizeObject = struct {
-    object: []const u8,
+    object: RecognizeObjectObject,
     /// Original input text index.
     index: i64,
     /// Entities recognized for this input text.
@@ -1026,9 +1544,32 @@ pub const RecognizeObject = struct {
     relations: ?[]const Relation = null,
 };
 
+/// Object type, always "list"
+pub const ClassifyResponseObject = enum {
+    list,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .list => "list",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "list", .list },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const ClassifyResponse = struct {
     /// Object type, always "list"
-    object: []const u8,
+    object: ClassifyResponseObject,
     /// Classification result objects, one per input text.
     data: []const ClassifyObject,
     /// Name of model used for classification
@@ -1036,22 +1577,89 @@ pub const ClassifyResponse = struct {
     usage: GenerateUsage,
 };
 
+/// Object type, always "list"
+pub const DocumentClassificationResponseObject = enum {
+    list,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .list => "list",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "list", .list },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const DocumentClassificationResponse = struct {
     /// Object type, always "list"
-    object: []const u8,
+    object: DocumentClassificationResponseObject,
     data: []const DocumentClassificationObject,
     model: []const u8,
     usage: GenerateUsage,
 };
 
+pub const DocumentTokenClassificationObjectObject = enum {
+    document_token_classification,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .document_token_classification => "document.token_classification",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "document.token_classification", .document_token_classification },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const DocumentTokenClassificationObject = struct {
-    object: []const u8,
+    object: DocumentTokenClassificationObjectObject,
     index: i64,
     checkpoint_path: []const u8,
     prefix: []const u8,
     num_tokens: i64,
     /// Token classification predictions sorted by score descending.
     predictions: []const DocumentTokenClassificationPrediction,
+};
+
+pub const ReadObjectObject = enum {
+    read,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .read => "read",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "read", .read },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 pub const ReadObject = struct {
@@ -1061,7 +1669,7 @@ pub const ReadObject = struct {
     fields: ?std.json.ArrayHashMap([]const u8) = null,
     /// Individual text regions with bounding boxes and recognized text. Populated by multi-stage OCR models (Surya, PaddleOCR).
     regions: ?[]const TextRegion = null,
-    object: []const u8,
+    object: ReadObjectObject,
     /// Original input image index.
     index: i64,
 };
@@ -1073,6 +1681,93 @@ pub const GenerateChoice = struct {
     finish_reason: FinishReason,
     /// Log probability information (not supported, always null)
     logprobs: ?std.json.Value = null,
+};
+
+/// inference-native KV cache quantization format. Lower precision reduces memory usage but may affect generation quality. Default auto-selects based on backend (f16 for GPU, f32 for CPU).
+pub const GenerateRequestCacheDtype = enum {
+    f16,
+    f32,
+    int8,
+    fp8,
+    int4,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .f16 => "f16",
+            .f32 => "f32",
+            .int8 => "int8",
+            .fp8 => "fp8",
+            .int4 => "int4",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "f16", .f16 },
+            .{ "f32", .f32 },
+            .{ "int8", .int8 },
+            .{ "fp8", .fp8 },
+            .{ "int4", .int4 },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// inference-native graph execution mode. `eager` keeps the direct runtime path when possible. `compiled` runs inference graph planning, partitioning, and backend executor attachment.
+pub const GenerateRequestMode = enum {
+    eager,
+    compiled,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .eager => "eager",
+            .compiled => "compiled",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "eager", .eager },
+            .{ "compiled", .compiled },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// inference-native compiled graph target. `partitioned` attaches compiled executors to eligible graph partitions. `whole-model` requests a compiled backend only when it can own the full traced graph shape.
+pub const GenerateRequestCompiledTarget = enum {
+    partitioned,
+    whole_model,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .partitioned => "partitioned",
+            .whole_model => "whole-model",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "partitioned", .partitioned },
+            .{ "whole-model", .whole_model },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 pub const GenerateRequest = struct {
@@ -1109,14 +1804,14 @@ pub const GenerateRequest = struct {
     /// inference-native speculative decoding extension. Number of draft tokens proposed per verification round.
     speculative_k: ?i64 = null,
     /// inference-native KV cache quantization format. Lower precision reduces memory usage but may affect generation quality. Default auto-selects based on backend (f16 for GPU, f32 for CPU).
-    cache_dtype: ?[]const u8 = null,
+    cache_dtype: ?GenerateRequestCacheDtype = null,
     /// inference-native KV cache compaction ratio applied after prefill via Attention Matching. Selects a subset of keys and fits new values via OLS to preserve attention behavior. 0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction.
     cache_compaction_ratio: ?f32 = null,
     backend: ?ModelBackend = null,
     /// inference-native graph execution mode. `eager` keeps the direct runtime path when possible. `compiled` runs inference graph planning, partitioning, and backend executor attachment.
-    mode: ?[]const u8 = null,
+    mode: ?GenerateRequestMode = null,
     /// inference-native compiled graph target. `partitioned` attaches compiled executors to eligible graph partitions. `whole-model` requests a compiled backend only when it can own the full traced graph shape.
-    compiled_target: ?[]const u8 = null,
+    compiled_target: ?GenerateRequestCompiledTarget = null,
     /// Controls how the model uses tools
     tool_choice: ?ToolChoice = null,
 };
@@ -1128,6 +1823,28 @@ pub const GenerateDelta = struct {
     content: ?[]const u8 = null,
     /// Tool call deltas for streaming tool calls
     tool_calls: ?[]const ToolCallDelta = null,
+};
+
+pub const ChunkObjectObject = enum {
+    chunk,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .chunk => "chunk",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "chunk", .chunk },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// A chunk result object. Text chunks have mime_type text/plain.
@@ -1152,7 +1869,7 @@ pub const ChunkObject = struct {
     id: ?i64 = null,
     /// MIME type: text/plain, audio/wav, image/png, etc.
     mime_type: ?[]const u8 = null,
-    object: []const u8,
+    object: ChunkObjectObject,
     /// Position of this chunk object in the response data array.
     index: i64,
 };
@@ -1203,9 +1920,32 @@ pub const ChunkRequest = struct {
     config: ?ChunkConfig = null,
 };
 
+/// Object type, always "list"
+pub const RecognizeResponseObject = enum {
+    list,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .list => "list",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "list", .list },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const RecognizeResponse = struct {
     /// Object type, always "list"
-    object: []const u8,
+    object: RecognizeResponseObject,
     /// Recognition result objects, one per input text.
     data: []const RecognizeObject,
     /// Name of model used for NER
@@ -1213,17 +1953,63 @@ pub const RecognizeResponse = struct {
     usage: GenerateUsage,
 };
 
+/// Object type, always "list"
+pub const DocumentTokenClassificationResponseObject = enum {
+    list,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .list => "list",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "list", .list },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const DocumentTokenClassificationResponse = struct {
     /// Object type, always "list"
-    object: []const u8,
+    object: DocumentTokenClassificationResponseObject,
     data: []const DocumentTokenClassificationObject,
     model: []const u8,
     usage: GenerateUsage,
 };
 
+/// Object type, always "list"
+pub const ReadResponseObject = enum {
+    list,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .list => "list",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "list", .list },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const ReadResponse = struct {
     /// Object type, always "list"
-    object: []const u8,
+    object: ReadResponseObject,
     /// Read result objects, one per input image.
     data: []const ReadObject,
     /// Name of model used for reading
@@ -1231,12 +2017,35 @@ pub const ReadResponse = struct {
     usage: GenerateUsage,
 };
 
+/// The object type, always "chat.completion"
+pub const GenerateResponseObject = enum {
+    chat_completion,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .chat_completion => "chat.completion",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "chat.completion", .chat_completion },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// OpenAI-compatible chat completion response
 pub const GenerateResponse = struct {
     /// A unique identifier for the chat completion
     id: []const u8,
     /// The object type, always "chat.completion"
-    object: []const u8,
+    object: GenerateResponseObject,
     /// Unix timestamp (seconds) when the completion was created
     created: i64,
     /// Model used for generation
@@ -1252,9 +2061,32 @@ pub const GenerateChunkChoice = struct {
     finish_reason: ?FinishReason = null,
 };
 
+/// Object type, always "list"
+pub const ChunkResponseObject = enum {
+    list,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .list => "list",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "list", .list },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const ChunkResponse = struct {
     /// Object type, always "list"
-    object: []const u8,
+    object: ChunkResponseObject,
     /// Array of chunk objects
     data: []const ChunkObject,
     /// Chunking model actually used (may differ from requested if fallback occurred)
@@ -1264,10 +2096,32 @@ pub const ChunkResponse = struct {
     cache_hit: bool,
 };
 
+pub const GenerateChunkObject = enum {
+    chat_completion_chunk,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .chat_completion_chunk => "chat.completion.chunk",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "chat.completion.chunk", .chat_completion_chunk },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Streaming generation chunk (SSE event data)
 pub const GenerateChunk = struct {
     id: []const u8,
-    object: []const u8,
+    object: GenerateChunkObject,
     created: i64,
     model: []const u8,
     choices: []const GenerateChunkChoice,

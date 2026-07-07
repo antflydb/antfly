@@ -6733,7 +6733,7 @@ test "bound table read source executes SQL system-time as-of by commit sequence"
 
     const sql = try std.fmt.allocPrint(alloc, "SELECT id, name FROM docs FOR SYSTEM_TIME AS OF {d} WHERE id = 'row:1'", .{commit_sequence});
     defer alloc.free(sql);
-    var lowered = try sql_adapter.lower_select.lowerReadPlanAlloc(alloc, sql, versioned_schema, &.{});
+    var lowered = try sql_adapter.lowerReadPlanAlloc(alloc, sql, versioned_schema, &.{});
     defer lowered.deinit(alloc);
 
     const FakeCatalog = struct {
@@ -6776,7 +6776,7 @@ test "bound table read source executes SQL system-time as-of by commit sequence"
         else => return error.TestUnexpectedResult,
     }
 
-    var lowered_timestamp = try sql_adapter.lower_select.lowerReadPlanAlloc(
+    var lowered_timestamp = try sql_adapter.lowerReadPlanAlloc(
         alloc,
         "SELECT id, name FROM docs FOR SYSTEM_TIME AS OF TIMESTAMP '1970-01-01T00:00:00.000010Z' WHERE id = 'row:1'",
         versioned_schema,
@@ -6884,7 +6884,7 @@ test "bound table read source executes SQL system-time as-of by commit sequence"
         .{ commit_sequence, commit_sequence },
     );
     defer alloc.free(set_sql);
-    var lowered_set = try sql_adapter.lower_select.lowerReadPlanAlloc(alloc, set_sql, versioned_schema, &.{});
+    var lowered_set = try sql_adapter.lowerReadPlanAlloc(alloc, set_sql, versioned_schema, &.{});
     defer lowered_set.deinit(alloc);
     var set_result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
@@ -6910,7 +6910,7 @@ test "bound table read source executes SQL system-time as-of by commit sequence"
 
     const timestamp_set_sql =
         "SELECT id FROM docs FOR SYSTEM_TIME AS OF '1970-01-01T00:00:00.000010Z' WHERE name = 'first' UNION ALL SELECT id FROM docs FOR SYSTEM_TIME AS OF TIMESTAMP '1970-01-01T00:00:00.000010Z' WHERE name = 'first'";
-    var lowered_timestamp_set = try sql_adapter.lower_select.lowerReadPlanAlloc(alloc, timestamp_set_sql, versioned_schema, &.{});
+    var lowered_timestamp_set = try sql_adapter.lowerReadPlanAlloc(alloc, timestamp_set_sql, versioned_schema, &.{});
     defer lowered_timestamp_set.deinit(alloc);
     var timestamp_set_result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
@@ -6938,7 +6938,7 @@ test "bound table read source executes SQL system-time as-of by commit sequence"
         .{ commit_sequence, commit_sequence + 1 },
     );
     defer alloc.free(mismatched_set_sql);
-    if (sql_adapter.lower_select.lowerReadPlanAlloc(alloc, mismatched_set_sql, versioned_schema, &.{})) |lowered_mismatched| {
+    if (sql_adapter.lowerReadPlanAlloc(alloc, mismatched_set_sql, versioned_schema, &.{})) |lowered_mismatched| {
         var mismatched = lowered_mismatched;
         mismatched.deinit(alloc);
         return error.TestExpectedError;
@@ -6947,7 +6947,7 @@ test "bound table read source executes SQL system-time as-of by commit sequence"
         else => return err,
     }
 
-    if (sql_adapter.lower_select.lowerReadPlanAlloc(alloc, "SELECT id FROM docs FOR SYSTEM_TIME AS OF 'not-a-timestamp'", versioned_schema, &.{})) |lowered_invalid| {
+    if (sql_adapter.lowerReadPlanAlloc(alloc, "SELECT id FROM docs FOR SYSTEM_TIME AS OF 'not-a-timestamp'", versioned_schema, &.{})) |lowered_invalid| {
         var invalid_lowered = lowered_invalid;
         invalid_lowered.deinit(alloc);
         return error.TestExpectedError;
@@ -8098,7 +8098,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
         title: []const u8,
     };
 
-    var lookup_plan = try sql_adapter.lower_select.lowerReadPlanAlloc(
+    var lookup_plan = try sql_adapter.lowerReadPlanAlloc(
         alloc,
         "SELECT _id, title, key, metadata->>'status' AS status, metadata#>>'{billing,plan}' AS plan FROM docs WHERE _id = 'doc:a'",
         schema,
@@ -8124,7 +8124,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
         else => return error.TestUnexpectedResult,
     }
 
-    var doc_projection_plan = try sql_adapter.lower_select.lowerReadPlanAlloc(
+    var doc_projection_plan = try sql_adapter.lowerReadPlanAlloc(
         alloc,
         "SELECT _id, _doc FROM docs WHERE _id = 'doc:a'",
         schema,
@@ -8158,7 +8158,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
         else => return error.TestUnexpectedResult,
     }
 
-    var scalar_filter_plan = try sql_adapter.lower_select.lowerReadPlanAlloc(
+    var scalar_filter_plan = try sql_adapter.lowerReadPlanAlloc(
         alloc,
         "SELECT _id FROM docs WHERE key = 'document-key-field' LIMIT 10",
         schema,
@@ -8191,7 +8191,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
     defer native_scalar_filter.deinit(alloc);
     try expectSingleNativeQueryHitId(alloc, native_scalar_filter.json, "doc:a");
 
-    var json_path_filter_plan = try sql_adapter.lower_select.lowerReadPlanAlloc(
+    var json_path_filter_plan = try sql_adapter.lowerReadPlanAlloc(
         alloc,
         "SELECT _id FROM docs WHERE metadata#>>'{billing,plan}' = 'pro' LIMIT 10",
         schema,
@@ -8224,7 +8224,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
     defer native_json_path_filter.deinit(alloc);
     try expectSingleNativeQueryHitId(alloc, native_json_path_filter.json, "doc:a");
 
-    var scan_plan = try sql_adapter.lower_select.lowerReadPlanAlloc(
+    var scan_plan = try sql_adapter.lowerReadPlanAlloc(
         alloc,
         "SELECT _id, title FROM docs LIMIT 2",
         schema,
@@ -8265,7 +8265,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
     try std.testing.expectEqualStrings("doc:b", native_scan_rows[1].key);
     try std.testing.expectEqualStrings("beta", native_scan_rows[1].title);
 
-    var star_scan_plan = try sql_adapter.lower_select.lowerReadPlanAlloc(
+    var star_scan_plan = try sql_adapter.lowerReadPlanAlloc(
         alloc,
         "SELECT * FROM docs LIMIT 1",
         schema,
@@ -8440,7 +8440,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
         ),
     );
 
-    var full_text_plan = try sql_adapter.lower_select.lowerReadPlanAlloc(
+    var full_text_plan = try sql_adapter.lowerReadPlanAlloc(
         alloc,
         "SELECT _id, title FROM docs WHERE full_text_search('title:alpha') LIMIT 1",
         schema,
@@ -8466,7 +8466,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
         else => return error.TestUnexpectedResult,
     }
 
-    var full_text_parity_plan = try sql_adapter.lower_select.lowerReadPlanAlloc(
+    var full_text_parity_plan = try sql_adapter.lowerReadPlanAlloc(
         alloc,
         "SELECT _id, title FROM docs WHERE full_text_search('title:beta') LIMIT 10",
         schema,
@@ -8558,7 +8558,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
         ),
     );
 
-    var like_plan = try sql_adapter.lower_select.lowerReadPlanAlloc(
+    var like_plan = try sql_adapter.lowerReadPlanAlloc(
         alloc,
         "SELECT _id, title FROM docs WHERE title LIKE 'alp%' LIMIT 10",
         schema,
@@ -8611,7 +8611,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
     }
     try std.testing.expectEqual(@as(usize, 2), native_residual_matches);
 
-    var full_text_count_plan = try sql_adapter.lower_select.lowerReadPlanAlloc(
+    var full_text_count_plan = try sql_adapter.lowerReadPlanAlloc(
         alloc,
         "SELECT count(*) AS row_count FROM docs WHERE full_text_search('title:alpha')",
         schema,
@@ -8643,7 +8643,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
     defer native_full_text_alpha.deinit(alloc);
     try expectNativeQueryTotal(alloc, native_full_text_alpha.json, 2);
 
-    var full_text_grouped_count_plan = try sql_adapter.lower_select.lowerReadPlanAlloc(
+    var full_text_grouped_count_plan = try sql_adapter.lowerReadPlanAlloc(
         alloc,
         "SELECT count(*) AS row_count FROM docs WHERE full_text_search('title:alpha') GROUP BY key LIMIT 10",
         schema,
@@ -8670,7 +8670,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
         else => return error.TestUnexpectedResult,
     }
 
-    var full_text_grouped_having_order_plan = try sql_adapter.lower_select.lowerReadPlanAlloc(
+    var full_text_grouped_having_order_plan = try sql_adapter.lowerReadPlanAlloc(
         alloc,
         "SELECT count(*) AS row_count FROM docs WHERE full_text_search('title:alpha') GROUP BY key HAVING row_count = 1 ORDER BY key ASC LIMIT 10",
         schema,
@@ -8715,7 +8715,7 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
         try std.testing.expectEqualStrings("second-key", parsed_alpha_c.value.object.get("key").?.string);
     }
 
-    var scalar_count_plan = try sql_adapter.lower_select.lowerReadPlanAlloc(
+    var scalar_count_plan = try sql_adapter.lowerReadPlanAlloc(
         alloc,
         "SELECT count(*) AS row_count FROM docs WHERE key = 'document-key-field'",
         schema,

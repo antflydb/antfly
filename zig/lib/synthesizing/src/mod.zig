@@ -175,9 +175,9 @@ pub const Registry = struct {
 
 pub fn cloneConfig(alloc: Allocator, cfg: Config) !Config {
     return .{
-        .model = try dupOpt(alloc, cfg.model),
+        .model = cfg.model,
         .api_key = try dupOpt(alloc, cfg.api_key),
-        .voice = try dupOpt(alloc, cfg.voice),
+        .voice = cfg.voice,
         .base_url = try dupOpt(alloc, cfg.base_url),
         .project_id = try dupOpt(alloc, cfg.project_id),
         .location = try dupOpt(alloc, cfg.location),
@@ -185,7 +185,7 @@ pub fn cloneConfig(alloc: Allocator, cfg: Config) !Config {
         .language_code = try dupOpt(alloc, cfg.language_code),
         .voice_name = try dupOpt(alloc, cfg.voice_name),
         .voice_id = try dupOpt(alloc, cfg.voice_id),
-        .model_id = try dupOpt(alloc, cfg.model_id),
+        .model_id = cfg.model_id,
         .stability = cfg.stability,
         .similarity_boost = cfg.similarity_boost,
         .style = cfg.style,
@@ -194,9 +194,7 @@ pub fn cloneConfig(alloc: Allocator, cfg: Config) !Config {
 }
 
 pub fn deinitConfig(alloc: Allocator, cfg: *Config) void {
-    freeOpt(alloc, cfg.model);
     freeOpt(alloc, cfg.api_key);
-    freeOpt(alloc, cfg.voice);
     freeOpt(alloc, cfg.base_url);
     freeOpt(alloc, cfg.project_id);
     freeOpt(alloc, cfg.location);
@@ -204,7 +202,6 @@ pub fn deinitConfig(alloc: Allocator, cfg: *Config) void {
     freeOpt(alloc, cfg.language_code);
     freeOpt(alloc, cfg.voice_name);
     freeOpt(alloc, cfg.voice_id);
-    freeOpt(alloc, cfg.model_id);
     cfg.* = undefined;
 }
 
@@ -242,8 +239,8 @@ const OpenAiSynthesizerState = struct {
             .alloc = alloc,
             .http = http,
             .base_url = try alloc.dupe(u8, cfg.base_url orelse "https://api.openai.com/v1"),
-            .model = try alloc.dupe(u8, cfg.model orelse "tts-1"),
-            .voice = try alloc.dupe(u8, cfg.voice orelse "alloy"),
+            .model = try alloc.dupe(u8, ttsConfigModelName(cfg.model orelse .tts_1)),
+            .voice = try alloc.dupe(u8, ttsConfigVoiceName(cfg.voice orelse .alloy)),
         };
         if (cfg.api_key) |api_key| try state.setApiKey(api_key);
 
@@ -315,6 +312,24 @@ fn dupOpt(alloc: Allocator, value: ?[]const u8) !?[]const u8 {
 
 fn freeOpt(alloc: Allocator, value: ?[]const u8) void {
     if (value) |v| alloc.free(v);
+}
+
+fn ttsConfigModelName(model: audio.TTSConfigModel) []const u8 {
+    return switch (model) {
+        .tts_1 => "tts-1",
+        .tts_1_hd => "tts-1-hd",
+    };
+}
+
+fn ttsConfigVoiceName(voice: audio.TTSConfigVoice) []const u8 {
+    return switch (voice) {
+        .alloy => "alloy",
+        .echo => "echo",
+        .fable => "fable",
+        .onyx => "onyx",
+        .nova => "nova",
+        .shimmer => "shimmer",
+    };
 }
 
 test "synthesizing registry preserves named providers and default" {

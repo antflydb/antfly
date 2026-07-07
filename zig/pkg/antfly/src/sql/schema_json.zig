@@ -172,9 +172,8 @@ pub fn schemaJsonDefaultValueAlloc(alloc: std.mem.Allocator, value: runtime_sche
             }
         },
         .scalar_subquery => {
-            const normalized_value_json = relational_rows.normalizeScalarSubqueryDefaultValueJsonAlloc(alloc, value.value_json) catch return error.InvalidSqlCatalog;
-            defer alloc.free(normalized_value_json);
-            var parsed = std.json.parseFromSlice(std.json.Value, alloc, normalized_value_json, .{}) catch return error.InvalidSqlCatalog;
+            relational_rows.validateScalarSubqueryDefaultPayloadAlloc(alloc, value.value_json) catch return error.InvalidSqlCatalog;
+            var parsed = std.json.parseFromSlice(std.json.Value, alloc, value.value_json, .{}) catch return error.InvalidSqlCatalog;
             defer parsed.deinit();
             if (parsed.value != .object) return error.InvalidSqlCatalog;
             const query = parsed.value.object.get("query") orelse return error.InvalidSqlCatalog;
@@ -395,11 +394,81 @@ pub fn schemaJsonRelationalIndexAlloc(alloc: std.mem.Allocator, index: runtime_s
     if (index.expressions.len > 0) try object.put(alloc, try alloc.dupe(u8, "expressions"), try schemaJsonUniqueExpressionsAlloc(alloc, index.expressions));
     if (index.include_columns.len > 0) try object.put(alloc, try alloc.dupe(u8, "include_columns"), try schemaJsonStringArrayAlloc(alloc, index.include_columns));
     if (index.keys.len > 0) try object.put(alloc, try alloc.dupe(u8, "keys"), try schemaJsonRelationalIndexKeysAlloc(alloc, index.keys));
-    if (index.lifecycle != .ready) try putJsonString(alloc, &object, "lifecycle", ddl_plan.relationalIndexLifecycleName(index.lifecycle));
+    const lifecycle = runtime_schema.relationalIndexLifecycle(index) orelse .rebuild_required;
+    if (lifecycle != .ready) try putJsonString(alloc, &object, "lifecycle", ddl_plan.relationalIndexLifecycleName(lifecycle));
     if (index.generation != 0) try object.put(alloc, try alloc.dupe(u8, "generation"), .{ .integer = @intCast(index.generation) });
     if (index.schema_fingerprint) |fingerprint| try putJsonString(alloc, &object, "schema_fingerprint", fingerprint);
+    if (index.generation_record) |record| try object.put(alloc, try alloc.dupe(u8, "generation_record"), try schemaJsonRelationalIndexGenerationRecordAlloc(alloc, record));
+    if (!relationalIndexPlannerCapabilitiesEmpty(index.planner_capabilities)) {
+        try object.put(alloc, try alloc.dupe(u8, "planner_capabilities"), try schemaJsonRelationalIndexPlannerCapabilitiesAlloc(alloc, index.planner_capabilities));
+    }
     if (index.where.len > 0) try object.put(alloc, try alloc.dupe(u8, "where"), try schemaJsonUniquePredicateDefinitionAlloc(alloc, index.where));
     if (index.where_expressions.len > 0) try object.put(alloc, try alloc.dupe(u8, "where_expressions"), try schemaJsonExpressionConditionsAlloc(alloc, index.where_expressions));
+    return .{ .object = object };
+}
+
+fn schemaJsonRelationalIndexGenerationRecordAlloc(
+    alloc: std.mem.Allocator,
+    record: runtime_schema.RelationalIndexGenerationRecord,
+) !std.json.Value {
+    var object = std.json.ObjectMap.empty;
+    try object.put(alloc, try alloc.dupe(u8, "generation"), .{ .integer = @intCast(record.generation) });
+    try object.put(alloc, try alloc.dupe(u8, "owner_ranges"), try schemaJsonRelationalIndexOwnerRangesAlloc(alloc, record.owner_ranges));
+    try putJsonString(alloc, &object, "lifecycle", ddl_plan.relationalIndexLifecycleName(record.lifecycle));
+    try object.put(alloc, try alloc.dupe(u8, "lag"), .{ .integer = @intCast(record.lag) });
+    if (record.failure_reason) |reason| try putJsonString(alloc, &object, "failure_reason", reason);
+    try object.put(alloc, try alloc.dupe(u8, "ready_watermark"), .{ .integer = @intCast(record.ready_watermark) });
+    return .{ .object = object };
+}
+
+fn schemaJsonRelationalIndexOwnerRangesAlloc(
+    alloc: std.mem.Allocator,
+    ranges: []const runtime_schema.RelationalIndexOwnerRange,
+) !std.json.Value {
+    var array = std.json.Array.init(alloc);
+    for (ranges) |range| {
+        var object = std.json.ObjectMap.empty;
+        try putJsonString(alloc, &object, "start", range.start);
+        try putJsonString(alloc, &object, "end", range.end);
+        if (range.range_id) |range_id| try putJsonString(alloc, &object, "range_id", range_id);
+        try object.put(alloc, try alloc.dupe(u8, "placement_generation"), .{ .integer = @intCast(range.placement_generation) });
+        try array.append(.{ .object = object });
+    }
+    return .{ .array = array };
+}
+
+fn relationalIndexPlannerCapabilitiesEmpty(capabilities: runtime_schema.RelationalIndexPlannerCapabilities) bool {
+    return !capabilities.equality and
+        !capabilities.range and
+        !capabilities.ordering and
+        !capabilities.prefix and
+        !capabilities.full_text and
+        !capabilities.array and
+        !capabilities.json and
+        !capabilities.covering and
+        !capabilities.rank and
+        !capabilities.algebraic_dictionary and
+        !capabilities.algebraic_fact and
+        !capabilities.algebraic_path;
+}
+
+fn schemaJsonRelationalIndexPlannerCapabilitiesAlloc(
+    alloc: std.mem.Allocator,
+    capabilities: runtime_schema.RelationalIndexPlannerCapabilities,
+) !std.json.Value {
+    var object = std.json.ObjectMap.empty;
+    try object.put(alloc, try alloc.dupe(u8, "equality"), .{ .bool = capabilities.equality });
+    try object.put(alloc, try alloc.dupe(u8, "range"), .{ .bool = capabilities.range });
+    try object.put(alloc, try alloc.dupe(u8, "ordering"), .{ .bool = capabilities.ordering });
+    try object.put(alloc, try alloc.dupe(u8, "prefix"), .{ .bool = capabilities.prefix });
+    try object.put(alloc, try alloc.dupe(u8, "full_text"), .{ .bool = capabilities.full_text });
+    try object.put(alloc, try alloc.dupe(u8, "array"), .{ .bool = capabilities.array });
+    try object.put(alloc, try alloc.dupe(u8, "json"), .{ .bool = capabilities.json });
+    try object.put(alloc, try alloc.dupe(u8, "covering"), .{ .bool = capabilities.covering });
+    try object.put(alloc, try alloc.dupe(u8, "rank"), .{ .bool = capabilities.rank });
+    try object.put(alloc, try alloc.dupe(u8, "algebraic_dictionary"), .{ .bool = capabilities.algebraic_dictionary });
+    try object.put(alloc, try alloc.dupe(u8, "algebraic_fact"), .{ .bool = capabilities.algebraic_fact });
+    try object.put(alloc, try alloc.dupe(u8, "algebraic_path"), .{ .bool = capabilities.algebraic_path });
     return .{ .object = object };
 }
 
@@ -472,6 +541,7 @@ pub fn schemaJsonRelationalIndexKeysAlloc(alloc: std.mem.Allocator, keys: []cons
     for (keys) |key| {
         var object = std.json.ObjectMap.empty;
         try putJsonString(alloc, &object, "column", key.column);
+        if (key.collation) |collation| try putJsonString(alloc, &object, "collation", collation);
         try putJsonString(alloc, &object, "direction", switch (key.direction) {
             .asc => "asc",
             .desc => "desc",
@@ -600,8 +670,13 @@ fn appendCreateIndexRelationalIndexJsonAlloc(
         .lifecycle = .building,
         .generation = generation,
         .schema_fingerprint = schema_fingerprint,
+        .generation_record = if (access_method == .scalar_column) null else .{
+            .generation = generation,
+            .lifecycle = .building,
+        },
         .where = plan.where,
         .where_expressions = plan.where_expressions,
+        .planner_capabilities = ddl_plan.relationalPlannerCapabilitiesForCreateIndex(plan, access_method),
     };
     var indexes = try rootArrayFieldAlloc(alloc, root, "relational_indexes");
     try indexes.append(try schemaJsonRelationalIndexAlloc(alloc, index));
@@ -1250,7 +1325,6 @@ fn renameConstraintArrayFields(
                 try renameStringInJsonArray(alloc, item.object.getPtr("columns"), old_name, new_name);
                 if (item.object.getPtr("expressions")) |expressions| try renameUniqueExpressionJsonFields(alloc, expressions, old_name, new_name);
                 try renameStringInJsonArray(alloc, item.object.getPtr("include_columns"), old_name, new_name);
-                if (item.object.getPtr("index_keys")) |index_keys| try renameRelationalIndexKeyJsonFields(alloc, index_keys, old_name, new_name);
                 if (item.object.getPtr("where")) |where| try renameUniquePredicateDefinitionJsonFields(alloc, where, old_name, new_name);
                 if (item.object.getPtr("where_expressions")) |where_expressions| try renameExpressionJsonFields(alloc, where_expressions, old_name, new_name);
             },
@@ -1493,9 +1567,6 @@ fn jsonUniqueConstraintReferencesAny(value: std.json.Value, fields: []const []co
     }
     if (value.object.get("include_columns")) |include_columns| {
         if (jsonStringArrayReferencesAny(include_columns, fields)) return true;
-    }
-    if (value.object.get("index_keys")) |index_keys| {
-        if (jsonRelationalIndexKeysReferenceAny(index_keys, fields)) return true;
     }
     if (value.object.get("where")) |where| {
         if (jsonUniquePredicateDefinitionReferencesAny(where, fields)) return true;
@@ -2011,6 +2082,22 @@ test "schema json emits sequence-backed relational defaults" {
     const encoded = try std.json.Stringify.valueAlloc(alloc, value, .{});
     defer alloc.free(encoded);
     try std.testing.expectEqualStrings("{\"op\":\"sequence_next\",\"sequence\":\"usage_id_seq\",\"database\":\"tenant\",\"schema\":\"billing\"}", encoded);
+}
+
+test "schema json preserves structured scalar subquery default payloads" {
+    const alloc = std.testing.allocator;
+    var value = try schemaJsonDefaultValueAlloc(alloc, .{
+        .kind = .scalar_subquery,
+        .value_json = "{\"query\":{\"table\":\"usage_records\",\"alias\":\"u\",\"select\":[\"u.status\"],\"where\":{\"field\":\"u.id\",\"op\":\"eq\",\"value\":\"u2\"},\"order_by\":[{\"field\":\"u.id\"}],\"limit\":1}}",
+    }, true);
+    defer json_helpers.deinitJsonValue(alloc, &value);
+
+    const encoded = try std.json.Stringify.valueAlloc(alloc, value, .{});
+    defer alloc.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"op\":\"scalar_subquery\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"alias\":\"u\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"u.status\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"u.id\"") != null);
 }
 
 test "schema json emits relational check collation" {

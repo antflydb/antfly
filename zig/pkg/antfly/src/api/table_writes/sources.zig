@@ -9684,7 +9684,10 @@ pub const HostedProvisionedTableWriteSource = struct {
         // recovery may call back into another participant over HTTP while the
         // coordinator is waiting on this handler.
         try validateTransactionAgainstCatalogSchema(alloc, self.catalog, cached.db, table_name, req.writes, req.deletes, req.transforms);
-        cached.db.writeTransaction(txn_id, req) catch |err| return normalizeRelationalConstraintError(err);
+        cached.db.writeTransaction(txn_id, req) catch |err| switch (err) {
+            error.UniqueConstraintViolation => return error.IntentConflict,
+            else => return normalizeRelationalConstraintError(err),
+        };
     }
 
     fn txnResolveGroupLocal(
@@ -13687,6 +13690,11 @@ test "hosted table write source sends same-owner identity rewrites to remote bat
 
         fn execute(ptr: *anyopaque, alloc_inner: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (request.method == .GET) {
+                if (std.mem.indexOf(u8, request.uri, "/groups/7001/") == null or
+                    std.mem.indexOf(u8, request.uri, "/lookup/") == null) return error.TestUnexpectedResult;
+                return .{ .status = 404, .body = try alloc_inner.dupe(u8, "") };
+            }
             try std.testing.expectEqual(http_common.Method.POST, request.method);
             try std.testing.expectEqualStrings("application/json", request.content_type.?);
             if (self.last_uri) |uri| alloc_inner.free(uri);
@@ -24786,6 +24794,11 @@ test "hosted mutation-source remote autocommit dispatches supported stage reques
 
         fn execute(ptr: *anyopaque, alloc_inner: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (request.method == .GET) {
+                if (std.mem.indexOf(u8, request.uri, "/groups/7001/") == null or
+                    std.mem.indexOf(u8, request.uri, "/lookup/") == null) return error.TestUnexpectedResult;
+                return .{ .status = 404, .body = try alloc_inner.dupe(u8, "") };
+            }
             try std.testing.expectEqual(http_common.Method.POST, request.method);
             try std.testing.expectEqualStrings("application/json", request.content_type.?);
             self.calls += 1;
@@ -25207,6 +25220,1205 @@ test "hosted mutation source expired claim reopens and later claimer recovers" {
         try std.testing.expect(std.mem.indexOf(u8, final.json, "\"status\":\"claimed\"") == null);
         try std.testing.expect(std.mem.indexOf(u8, final.json, "\"status\":\"stale\"") == null);
     }
+}
+
+test "hosted commit routes ordered tuple unique conflicts through local catalog index owner" {
+    const alloc = std.testing.allocator;
+    const replica_root_dir = try uniqueTestTmpPathAlloc(alloc, "antfly-api-hosted-ordered-unique-local-owner");
+    defer alloc.free(replica_root_dir);
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"email":{"type":"keyword","collation":"antfly.case_insensitive"}},"required":["tenant_id","email"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_tenant_email_key","columns":["tenant_id","email"]}],"relational_indexes":[{"name":"users_tenant_email_idx","owner_kind":"unique_constraint","owner_name":"users_tenant_email_key","access_method":"ordered_tuple","unique":true,"columns":["tenant_id","email"],"keys":[{"column":"tenant_id"},{"column":"email"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"unique-index-v1:users_tenant_email","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
+    ;
+    var parsed_schema = try tables_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer storage_schema.freeSchema(alloc, runtime_schema);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "users",
+                    .placement_role = "data",
+                    .schema_json = schema_json,
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = "user:m" },
+                    .{ .group_id = 7002, .table_id = 7, .start_key = "user:m", .end_key = null },
+                })[0..]),
+                .unique_constraint_ranges = @constCast((&[_]metadata_table_manager.UniqueConstraintRangeRecord{.{
+                    .table_id = 7,
+                    .constraint_name = "users_tenant_email_key",
+                    .start_encoded_value = "",
+                    .end_encoded_value = null,
+                    .group_id = 9001,
+                    .topology_epoch = 1,
+                    .state = metadata_table_manager.unique_constraint_range_active,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const LocalRouter = struct {
+        fn iface() table_router.HostedGroupRouter {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 1;
+        }
+
+        fn localStatus(_: *anyopaque, group_id: u64) raft_mod.HostedReplicaStatus {
+            return if (group_id == 7001 or group_id == 7002 or group_id == 9001) .active else .absent;
+        }
+
+        fn groupLeaderNodeId(_: *anyopaque, group_id: u64) ?u64 {
+            return if (group_id == 7001 or group_id == 7002 or group_id == 9001) 1 else null;
+        }
+
+        fn nodeStatus(_: *anyopaque, node_id: u64, group_id: u64) raft_mod.HostedReplicaStatus {
+            _ = node_id;
+            return if (group_id == 7001 or group_id == 7002 or group_id == 9001) .active else .absent;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, _: std.mem.Allocator, _: u64) !?[]u8 {
+            return null;
+        }
+    };
+
+    const Executor = struct {
+        fn iface() http_common.RequestExecutor {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            return error.UnexpectedHttpRequest;
+        }
+    };
+
+    var source = HostedProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface(), LocalRouter.iface(), Executor.iface());
+    defer source.invalidateManagedCache("users");
+
+    const first_txn = try distributed_txn.parseTxnIdHex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    const first_table = [_]distributed_txn.TableCommitRequest{.{
+        .table_name = "users",
+        .writes = &.{.{ .key = "user:ada", .value = "{\"tenant_id\":\"tenant:1\",\"email\":\"Ada@Example.Test\"}" }},
+    }};
+    const first_outcome = (try source.source().commitTransactionWithId(alloc, first_txn, 52_000, first_table[0..], .write)).?;
+    switch (first_outcome) {
+        .committed => |result| try std.testing.expectEqual(@as(usize, 2), result.participant_count),
+        .conflict => return error.TestUnexpectedResult,
+    }
+
+    const duplicate_txn = try distributed_txn.parseTxnIdHex("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    const duplicate_table = [_]distributed_txn.TableCommitRequest{.{
+        .table_name = "users",
+        .writes = &.{.{ .key = "user:ada-duplicate", .value = "{\"tenant_id\":\"tenant:1\",\"email\":\"ada@example.test\"}" }},
+    }};
+    const duplicate_outcome = (try source.source().commitTransactionWithId(alloc, duplicate_txn, 52_100, duplicate_table[0..], .write)).?;
+    switch (duplicate_outcome) {
+        .committed => return error.TestUnexpectedResult,
+        .conflict => |conflict| {
+            try std.testing.expect(conflict.group_id == 7001 or conflict.group_id == 9001);
+        },
+    }
+    source.invalidateManagedCache("users");
+
+    const row_group_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
+    defer alloc.free(row_group_path);
+    var reopened = try db_mod.DB.open(alloc, row_group_path, .{});
+    defer reopened.close();
+    try reopened.setSchema(runtime_schema);
+    var committed_row = (try reopened.lookup(alloc, "user:ada", .{})) orelse return error.TestUnexpectedResult;
+    defer committed_row.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, committed_row.json, "\"Ada@Example.Test\"") != null);
+    try std.testing.expect((try reopened.lookup(alloc, "user:ada-duplicate", .{})) == null);
+}
+
+test "hosted local participant concurrent prepares conflict on ordered unique and foreign key owner tuples" {
+    const alloc = std.testing.allocator;
+    const replica_root_dir = try uniqueTestTmpPathAlloc(alloc, "antfly-api-hosted-concurrent-ordered-owner-conflicts");
+    defer alloc.free(replica_root_dir);
+
+    const users_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"email":{"type":"keyword","collation":"antfly.case_insensitive"}},"required":["tenant_id","email"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_tenant_email_key","columns":["tenant_id","email"]}],"relational_indexes":[{"name":"users_tenant_email_idx","owner_kind":"unique_constraint","owner_name":"users_tenant_email_key","access_method":"ordered_tuple","unique":true,"columns":["tenant_id","email"],"keys":[{"column":"tenant_id"},{"column":"email"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"unique-index-v1:users_tenant_email","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
+    ;
+    const rows_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"rows","enforce_types":true,"document_schemas":{"rows":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"email":{"type":"keyword"},"order_tenant_id":{"type":"keyword"},"order_email":{"type":"keyword"}},"additionalProperties":false}}},"unique_constraints":[{"name":"rows_tenant_email_key","columns":["tenant_id","email"]}],"foreign_keys":[{"name":"orders_user_email_fkey","columns":["order_tenant_id","order_email"],"references":{"table":"rows","columns":["tenant_id","email"]},"on_delete":"restrict"}]}
+    ;
+
+    var parsed_users_schema = try tables_api.parseValidatedTableSchema(alloc, users_schema_json);
+    defer parsed_users_schema.deinit(alloc);
+    const users_runtime_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed_users_schema);
+    defer storage_schema.freeSchema(alloc, users_runtime_schema);
+    const unique_index = db_mod.relational_store.relationalIndexForUniqueConstraint(
+        users_runtime_schema.relational_indexes,
+        users_runtime_schema.unique_constraints[0],
+        .ordered_tuple,
+    ) orelse return error.TestUnexpectedResult;
+    const user_row = try db_mod.document_mapper.buildRelationalRowValueAlloc(alloc, "{\"tenant_id\":\"tenant:1\",\"email\":\"Ada@Example.Test\"}", users_runtime_schema.relational_columns);
+    defer alloc.free(user_row);
+    const unique_tuple = try db_mod.relational_store.orderedTupleValueForIndexKeysAlloc(alloc, user_row, unique_index.keys, users_runtime_schema.relational_columns);
+    defer alloc.free(unique_tuple);
+    const unique_conflict_key = try db_mod.internal_keys.relationalOrderedTupleUniqueConflictKeyAlloc(alloc, unique_index.name, unique_tuple);
+    defer alloc.free(unique_conflict_key);
+
+    const fk_parent_tuple = try db_mod.relational_store.bytesTupleValueAlloc(alloc, &.{ "tenant:1", "ada@example.test" });
+    defer alloc.free(fk_parent_tuple);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{
+                    .{ .table_id = 7, .name = "users", .placement_role = "data", .schema_json = users_schema_json },
+                    .{ .table_id = 8, .name = "rows", .placement_role = "data", .schema_json = rows_schema_json },
+                })[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .foreign_key_ref_ranges = @constCast((&[_]metadata_table_manager.ForeignKeyReferenceRangeRecord{.{
+                    .child_table_id = 8,
+                    .constraint_name = "orders_user_email_fkey",
+                    .parent_table_id = 8,
+                    .start_parent_key = "",
+                    .end_parent_key = null,
+                    .group_id = 9002,
+                    .topology_epoch = 1,
+                }})[0..]),
+                .unique_constraint_ranges = @constCast((&[_]metadata_table_manager.UniqueConstraintRangeRecord{.{
+                    .table_id = 7,
+                    .constraint_name = "users_tenant_email_key",
+                    .start_encoded_value = "",
+                    .end_encoded_value = null,
+                    .group_id = 9001,
+                    .topology_epoch = 1,
+                    .state = metadata_table_manager.unique_constraint_range_active,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const LocalRouter = struct {
+        fn iface() table_router.HostedGroupRouter {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 1;
+        }
+
+        fn localStatus(_: *anyopaque, group_id: u64) raft_mod.HostedReplicaStatus {
+            return if (group_id == 7001 or group_id == 9001 or group_id == 9002) .active else .absent;
+        }
+
+        fn groupLeaderNodeId(_: *anyopaque, group_id: u64) ?u64 {
+            return if (group_id == 7001 or group_id == 9001 or group_id == 9002) 1 else null;
+        }
+
+        fn nodeStatus(_: *anyopaque, node_id: u64, group_id: u64) raft_mod.HostedReplicaStatus {
+            _ = node_id;
+            return if (group_id == 7001 or group_id == 9001 or group_id == 9002) .active else .absent;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, _: std.mem.Allocator, _: u64) !?[]u8 {
+            return null;
+        }
+    };
+
+    const Executor = struct {
+        fn iface() http_common.RequestExecutor {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            return error.UnexpectedHttpRequest;
+        }
+    };
+
+    var source = HostedProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface(), LocalRouter.iface(), Executor.iface());
+    defer {
+        source.invalidateManagedCache("users");
+        source.invalidateManagedCache("rows");
+    }
+    const table_source = source.source();
+
+    const unique_txn = try distributed_txn.parseTxnIdHex("11111111111111111111111111111111");
+    const users_owner_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 9001);
+    defer alloc.free(users_owner_path);
+    {
+        var owner_db = try db_mod.DB.open(alloc, users_owner_path, .{});
+        defer owner_db.close();
+        try owner_db.setSchema(users_runtime_schema);
+        _ = try owner_db.beginTransactionWithIdAndParticipants(unique_txn, 53_000, &.{"group:9001"});
+        try owner_db.writeTransaction(unique_txn, .{
+            .writes = &.{.{ .key = unique_conflict_key, .value = "\"user:ada\"" }},
+            .predicates = &.{.{ .key = unique_conflict_key, .expected_version = 0 }},
+        });
+    }
+
+    const unique_conflicting_txn = try distributed_txn.parseTxnIdHex("22222222222222222222222222222222");
+    const unique_conflicting_table = [_]distributed_txn.TableCommitRequest{.{
+        .table_name = "users",
+        .writes = &.{.{ .key = "user:duplicate", .value = "{\"tenant_id\":\"tenant:1\",\"email\":\"ada@example.test\"}" }},
+    }};
+    const unique_conflicting_outcome = (try table_source.commitTransactionWithId(alloc, unique_conflicting_txn, 53_001, unique_conflicting_table[0..], .write)).?;
+    switch (unique_conflicting_outcome) {
+        .committed => return error.TestUnexpectedResult,
+        .conflict => |conflict| {
+            try std.testing.expectEqual(@as(?u64, 9001), conflict.group_id);
+        },
+    }
+    _ = try table_source.txnResolveGroupLocal(alloc, 9001, "users", unique_txn, .aborted, 53_003);
+
+    const fk_ref_txn = try distributed_txn.parseTxnIdHex("33333333333333333333333333333333");
+    _ = try table_source.txnBeginGroupLocal(alloc, 9002, "rows", fk_ref_txn, 53_010, 0, &.{"group:9002"});
+    _ = try table_source.txnPrepareGroupLocal(alloc, 9002, "rows", fk_ref_txn, 0, .{
+        .foreign_key_ref_writes = &.{.{
+            .constraint_name = "orders_user_email_fkey",
+            .parent_table = "rows",
+            .parent_key = fk_parent_tuple,
+            .child_table = "rows",
+            .child_key = "order:ada",
+        }},
+    });
+
+    const fk_parent_delete_txn = try distributed_txn.parseTxnIdHex("44444444444444444444444444444444");
+    _ = try table_source.txnBeginGroupLocal(alloc, 9002, "rows", fk_parent_delete_txn, 53_011, 0, &.{"group:9002"});
+    try std.testing.expectError(error.IntentConflict, table_source.txnPrepareGroupLocal(alloc, 9002, "rows", fk_parent_delete_txn, 0, .{
+        .foreign_key_parent_delete_checks = &.{.{
+            .constraint_name = "orders_user_email_fkey",
+            .parent_table = "rows",
+            .parent_key = fk_parent_tuple,
+        }},
+    }));
+    _ = try table_source.txnResolveGroupLocal(alloc, 9002, "rows", fk_parent_delete_txn, .aborted, 53_012);
+    _ = try table_source.txnResolveGroupLocal(alloc, 9002, "rows", fk_ref_txn, .aborted, 53_013);
+}
+
+test "hosted commit routes ordered tuple unique owner writes over remote transaction boundary" {
+    const alloc = std.testing.allocator;
+    const replica_root_dir = try uniqueTestTmpPathAlloc(alloc, "antfly-api-hosted-ordered-unique-remote-owner");
+    defer alloc.free(replica_root_dir);
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"email":{"type":"keyword","collation":"antfly.case_insensitive"}},"required":["tenant_id","email"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_tenant_email_key","columns":["tenant_id","email"]}],"relational_indexes":[{"name":"users_tenant_email_idx","owner_kind":"unique_constraint","owner_name":"users_tenant_email_key","access_method":"ordered_tuple","unique":true,"columns":["tenant_id","email"],"keys":[{"column":"tenant_id"},{"column":"email"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"unique-index-v1:users_tenant_email","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
+    ;
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "users",
+                    .placement_role = "data",
+                    .schema_json = schema_json,
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = "user:m" },
+                    .{ .group_id = 7002, .table_id = 7, .start_key = "user:m", .end_key = null },
+                })[0..]),
+                .unique_constraint_ranges = @constCast((&[_]metadata_table_manager.UniqueConstraintRangeRecord{.{
+                    .table_id = 7,
+                    .constraint_name = "users_tenant_email_key",
+                    .start_encoded_value = "",
+                    .end_encoded_value = null,
+                    .group_id = 9001,
+                    .topology_epoch = 1,
+                    .state = metadata_table_manager.unique_constraint_range_active,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const RemoteRouter = struct {
+        fn iface() table_router.HostedGroupRouter {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 1;
+        }
+
+        fn localStatus(_: *anyopaque, _: u64) raft_mod.HostedReplicaStatus {
+            return .absent;
+        }
+
+        fn groupLeaderNodeId(_: *anyopaque, group_id: u64) ?u64 {
+            return if (group_id == 7001 or group_id == 7002 or group_id == 9001) 2 else null;
+        }
+
+        fn nodeStatus(_: *anyopaque, node_id: u64, group_id: u64) raft_mod.HostedReplicaStatus {
+            return if (node_id == 2 and (group_id == 7001 or group_id == 7002 or group_id == 9001)) .active else .absent;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, alloc_inner: std.mem.Allocator, node_id: u64) !?[]u8 {
+            if (node_id != 2) return null;
+            return try alloc_inner.dupe(u8, "http://127.0.0.1:1");
+        }
+    };
+
+    const ExecutorState = struct {
+        lookup_calls: usize = 0,
+        txn_begin_calls: usize = 0,
+        txn_prepare_calls: usize = 0,
+        txn_resolve_calls: usize = 0,
+        prepared_row_owner: bool = false,
+        prepared_unique_owner: bool = false,
+
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, alloc_inner: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (request.method == .GET) {
+                if (std.mem.indexOf(u8, request.uri, "/groups/7001/") == null or
+                    std.mem.indexOf(u8, request.uri, "/lookup/") == null) return error.TestUnexpectedResult;
+                self.lookup_calls += 1;
+                return .{ .status = 404, .body = try alloc_inner.dupe(u8, "") };
+            }
+            try std.testing.expectEqual(http_common.Method.POST, request.method);
+            try std.testing.expectEqualStrings("application/json", request.content_type.?);
+            const group_id: u64 = if (std.mem.indexOf(u8, request.uri, "/groups/7001/") != null) 7001 else if (std.mem.indexOf(u8, request.uri, "/groups/9001/") != null) 9001 else return error.TestUnexpectedResult;
+            if (std.mem.endsWith(u8, request.uri, "/txn-begin")) {
+                self.txn_begin_calls += 1;
+                var parsed = try distributed_txn.parseTxnBeginRequest(alloc_inner, request.body);
+                defer distributed_txn.freeTxnBeginRequest(alloc_inner, &parsed);
+                try std.testing.expectEqual(@as(usize, 2), parsed.participants.len);
+                return .{ .status = 200, .body = try alloc_inner.dupe(u8, "") };
+            }
+            if (std.mem.endsWith(u8, request.uri, "/txn-prepare")) {
+                self.txn_prepare_calls += 1;
+                var parsed = try distributed_txn.parseTxnPrepareRequest(alloc_inner, request.body);
+                defer distributed_txn.freeTxnPrepareRequest(alloc_inner, &parsed);
+                if (group_id == 7001) {
+                    try std.testing.expectEqual(@as(usize, 1), parsed.req.writes.len);
+                    try std.testing.expectEqual(@as(usize, 0), parsed.req.deletes.len);
+                    try std.testing.expectEqual(@as(usize, 1), parsed.req.predicates.len);
+                    try std.testing.expectEqualStrings("user:ada", parsed.req.writes[0].key);
+                    try std.testing.expectEqualStrings("{\"tenant_id\":\"tenant:1\",\"email\":\"Ada@Example.Test\"}", parsed.req.writes[0].value);
+                    try std.testing.expectEqualStrings("user:ada", parsed.req.predicates[0].key);
+                    try std.testing.expectEqual(@as(u64, 0), parsed.req.predicates[0].expected_version);
+                    self.prepared_row_owner = true;
+                } else {
+                    try std.testing.expectEqual(@as(usize, 0), parsed.req.unique_constraint_writes.len);
+                    try std.testing.expectEqual(@as(usize, 0), parsed.req.unique_constraint_deletes.len);
+                    try std.testing.expectEqual(@as(usize, 1), parsed.req.writes.len);
+                    try std.testing.expectEqual(@as(usize, 0), parsed.req.deletes.len);
+                    try std.testing.expectEqual(@as(usize, 1), parsed.req.predicates.len);
+                    try std.testing.expectEqualStrings("\"user:ada\"", parsed.req.writes[0].value);
+                    try std.testing.expectEqual(@as(u64, 0), parsed.req.predicates[0].expected_version);
+                    self.prepared_unique_owner = true;
+                }
+                return .{ .status = 200, .body = try alloc_inner.dupe(u8, "") };
+            }
+            if (std.mem.endsWith(u8, request.uri, "/txn-resolve")) {
+                self.txn_resolve_calls += 1;
+                const parsed = try distributed_txn.parseTxnResolveRequest(alloc_inner, request.body);
+                try std.testing.expectEqual(db_mod.types.TxnStatus.committed, parsed.status);
+                return .{ .status = 200, .body = try alloc_inner.dupe(u8, "") };
+            }
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    var executor = ExecutorState{};
+    var source = HostedProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface(), RemoteRouter.iface(), executor.iface());
+    defer source.invalidateManagedCache("users");
+
+    const txn_id = try distributed_txn.parseTxnIdHex("cccccccccccccccccccccccccccccccc");
+    const table = [_]distributed_txn.TableCommitRequest{.{
+        .table_name = "users",
+        .writes = &.{.{ .key = "user:ada", .value = "{\"tenant_id\":\"tenant:1\",\"email\":\"Ada@Example.Test\"}" }},
+    }};
+    const outcome = (try source.source().commitTransactionWithId(alloc, txn_id, 52_200, table[0..], .write)).?;
+    switch (outcome) {
+        .committed => |result| try std.testing.expectEqual(@as(usize, 2), result.participant_count),
+        .conflict => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(executor.prepared_row_owner);
+    try std.testing.expect(executor.prepared_unique_owner);
+    try std.testing.expectEqual(@as(usize, 1), executor.lookup_calls);
+    try std.testing.expectEqual(@as(usize, 2), executor.txn_begin_calls);
+    try std.testing.expectEqual(@as(usize, 2), executor.txn_prepare_calls);
+    try std.testing.expectEqual(@as(usize, 2), executor.txn_resolve_calls);
+}
+
+test "hosted commit routes partial ordered tuple unique owners only for matching rows" {
+    const alloc = std.testing.allocator;
+    const replica_root_dir = try uniqueTestTmpPathAlloc(alloc, "antfly-api-hosted-partial-ordered-unique-remote-owner");
+    defer alloc.free(replica_root_dir);
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"email":{"type":"keyword","collation":"antfly.case_insensitive"},"status":{"type":"keyword"}},"required":["tenant_id","email","status"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_active_email_key","columns":["tenant_id","email"]}],"relational_indexes":[{"name":"users_active_email_idx","owner_kind":"unique_constraint","owner_name":"users_active_email_key","access_method":"ordered_tuple","unique":true,"columns":["tenant_id","email"],"keys":[{"column":"tenant_id"},{"column":"email"}],"where":{"all":[{"field":"status","op":"eq","value":"active"}]},"lifecycle":"ready","generation":7,"schema_fingerprint":"unique-index-v1:users_active_email","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
+    ;
+    var parsed_schema = try tables_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer storage_schema.freeSchema(alloc, runtime_schema);
+
+    const unique_index = db_mod.relational_store.relationalIndexForUniqueConstraint(
+        runtime_schema.relational_indexes,
+        runtime_schema.unique_constraints[0],
+        .ordered_tuple,
+    ) orelse return error.TestUnexpectedResult;
+    const active_json = "{\"tenant_id\":\"tenant:1\",\"email\":\"Ada@Example.Test\",\"status\":\"active\"}";
+    const active_row = try db_mod.document_mapper.buildRelationalRowValueAlloc(alloc, active_json, runtime_schema.relational_columns);
+    defer alloc.free(active_row);
+    const active_tuple = try db_mod.relational_store.orderedTupleValueForIndexKeysAlloc(alloc, active_row, unique_index.keys, runtime_schema.relational_columns);
+    defer alloc.free(active_tuple);
+    const active_conflict_key = try db_mod.internal_keys.relationalOrderedTupleUniqueConflictKeyAlloc(alloc, unique_index.name, active_tuple);
+    defer alloc.free(active_conflict_key);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "users",
+                    .placement_role = "data",
+                    .schema_json = schema_json,
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = "user:m" },
+                    .{ .group_id = 7002, .table_id = 7, .start_key = "user:m", .end_key = null },
+                })[0..]),
+                .unique_constraint_ranges = @constCast((&[_]metadata_table_manager.UniqueConstraintRangeRecord{.{
+                    .table_id = 7,
+                    .constraint_name = "users_active_email_key",
+                    .start_encoded_value = "",
+                    .end_encoded_value = null,
+                    .group_id = 9001,
+                    .topology_epoch = 1,
+                    .state = metadata_table_manager.unique_constraint_range_active,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const RemoteRouter = struct {
+        fn iface() table_router.HostedGroupRouter {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 1;
+        }
+
+        fn localStatus(_: *anyopaque, _: u64) raft_mod.HostedReplicaStatus {
+            return .absent;
+        }
+
+        fn groupLeaderNodeId(_: *anyopaque, group_id: u64) ?u64 {
+            return if (group_id == 7001 or group_id == 7002 or group_id == 9001) 2 else null;
+        }
+
+        fn nodeStatus(_: *anyopaque, node_id: u64, group_id: u64) raft_mod.HostedReplicaStatus {
+            return if (node_id == 2 and (group_id == 7001 or group_id == 7002 or group_id == 9001)) .active else .absent;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, alloc_inner: std.mem.Allocator, node_id: u64) !?[]u8 {
+            if (node_id != 2) return null;
+            return try alloc_inner.dupe(u8, "http://127.0.0.1:1");
+        }
+    };
+
+    const ExecutorState = struct {
+        expected_conflict_key: []const u8,
+        expected_row_key: []const u8,
+        expected_row_json: []const u8,
+        expected_participants: usize,
+        expect_unique_owner: bool,
+        txn_begin_calls: usize = 0,
+        txn_prepare_calls: usize = 0,
+        txn_resolve_calls: usize = 0,
+        prepared_row_owner: bool = false,
+        prepared_unique_owner: bool = false,
+
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn resetForRow(self: *@This(), row_key: []const u8, row_json: []const u8, participants: usize, expect_unique_owner: bool) void {
+            self.expected_row_key = row_key;
+            self.expected_row_json = row_json;
+            self.expected_participants = participants;
+            self.expect_unique_owner = expect_unique_owner;
+            self.prepared_row_owner = false;
+            self.prepared_unique_owner = false;
+        }
+
+        fn execute(ptr: *anyopaque, alloc_inner: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (request.method == .GET) {
+                if (std.mem.indexOf(u8, request.uri, "/groups/7001/") == null or
+                    std.mem.indexOf(u8, request.uri, "/lookup/") == null) return error.TestUnexpectedResult;
+                return .{ .status = 404, .body = try alloc_inner.dupe(u8, "") };
+            }
+            try std.testing.expectEqual(http_common.Method.POST, request.method);
+            try std.testing.expectEqualStrings("application/json", request.content_type.?);
+            const group_id: u64 = if (std.mem.indexOf(u8, request.uri, "/groups/7001/") != null) 7001 else if (std.mem.indexOf(u8, request.uri, "/groups/9001/") != null) 9001 else return error.TestUnexpectedResult;
+            if (group_id == 9001 and !self.expect_unique_owner) return error.TestUnexpectedResult;
+            if (std.mem.endsWith(u8, request.uri, "/txn-begin")) {
+                self.txn_begin_calls += 1;
+                var parsed = try distributed_txn.parseTxnBeginRequest(alloc_inner, request.body);
+                defer distributed_txn.freeTxnBeginRequest(alloc_inner, &parsed);
+                try std.testing.expectEqual(self.expected_participants, parsed.participants.len);
+                return .{ .status = 200, .body = try alloc_inner.dupe(u8, "") };
+            }
+            if (std.mem.endsWith(u8, request.uri, "/txn-prepare")) {
+                self.txn_prepare_calls += 1;
+                var parsed = try distributed_txn.parseTxnPrepareRequest(alloc_inner, request.body);
+                defer distributed_txn.freeTxnPrepareRequest(alloc_inner, &parsed);
+                if (group_id == 7001) {
+                    try std.testing.expectEqual(@as(usize, 1), parsed.req.writes.len);
+                    try std.testing.expectEqual(@as(usize, 0), parsed.req.deletes.len);
+                    try std.testing.expectEqual(@as(usize, 1), parsed.req.predicates.len);
+                    try std.testing.expectEqualStrings(self.expected_row_key, parsed.req.writes[0].key);
+                    try std.testing.expectEqualStrings(self.expected_row_json, parsed.req.writes[0].value);
+                    try std.testing.expectEqualStrings(self.expected_row_key, parsed.req.predicates[0].key);
+                    try std.testing.expectEqual(@as(u64, 0), parsed.req.predicates[0].expected_version);
+                    self.prepared_row_owner = true;
+                } else {
+                    try std.testing.expectEqual(@as(usize, 0), parsed.req.unique_constraint_writes.len);
+                    try std.testing.expectEqual(@as(usize, 0), parsed.req.unique_constraint_deletes.len);
+                    try std.testing.expectEqual(@as(usize, 1), parsed.req.writes.len);
+                    try std.testing.expectEqual(@as(usize, 0), parsed.req.deletes.len);
+                    try std.testing.expectEqual(@as(usize, 1), parsed.req.predicates.len);
+                    try std.testing.expectEqualStrings(self.expected_conflict_key, parsed.req.writes[0].key);
+                    try std.testing.expectEqualStrings("\"user:active\"", parsed.req.writes[0].value);
+                    try std.testing.expectEqualStrings(self.expected_conflict_key, parsed.req.predicates[0].key);
+                    try std.testing.expectEqual(@as(u64, 0), parsed.req.predicates[0].expected_version);
+                    self.prepared_unique_owner = true;
+                }
+                return .{ .status = 200, .body = try alloc_inner.dupe(u8, "") };
+            }
+            if (std.mem.endsWith(u8, request.uri, "/txn-resolve")) {
+                self.txn_resolve_calls += 1;
+                const parsed = try distributed_txn.parseTxnResolveRequest(alloc_inner, request.body);
+                try std.testing.expectEqual(db_mod.types.TxnStatus.committed, parsed.status);
+                return .{ .status = 200, .body = try alloc_inner.dupe(u8, "") };
+            }
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    var executor = ExecutorState{
+        .expected_conflict_key = active_conflict_key,
+        .expected_row_key = "user:active",
+        .expected_row_json = active_json,
+        .expected_participants = 2,
+        .expect_unique_owner = true,
+    };
+    var source = HostedProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface(), RemoteRouter.iface(), executor.iface());
+    defer source.invalidateManagedCache("users");
+
+    const active_table = [_]distributed_txn.TableCommitRequest{.{
+        .table_name = "users",
+        .writes = &.{.{ .key = "user:active", .value = active_json }},
+    }};
+    const active_outcome = (try source.source().commitTransactionWithId(alloc, try distributed_txn.parseTxnIdHex("dddddddddddddddddddddddddddddddd"), 52_300, active_table[0..], .write)).?;
+    switch (active_outcome) {
+        .committed => |result| try std.testing.expectEqual(@as(usize, 2), result.participant_count),
+        .conflict => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(executor.prepared_row_owner);
+    try std.testing.expect(executor.prepared_unique_owner);
+    try std.testing.expectEqual(@as(usize, 2), executor.txn_begin_calls);
+    try std.testing.expectEqual(@as(usize, 2), executor.txn_prepare_calls);
+    try std.testing.expectEqual(@as(usize, 2), executor.txn_resolve_calls);
+
+    const inactive_json = "{\"tenant_id\":\"tenant:1\",\"email\":\"Grace@Example.Test\",\"status\":\"inactive\"}";
+    executor.resetForRow("user:inactive", inactive_json, 1, false);
+    const inactive_table = [_]distributed_txn.TableCommitRequest{.{
+        .table_name = "users",
+        .writes = &.{.{ .key = "user:inactive", .value = inactive_json }},
+    }};
+    const inactive_outcome = (try source.source().commitTransactionWithId(alloc, try distributed_txn.parseTxnIdHex("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"), 52_400, inactive_table[0..], .write)).?;
+    switch (inactive_outcome) {
+        .committed => |result| try std.testing.expectEqual(@as(usize, 1), result.participant_count),
+        .conflict => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(executor.prepared_row_owner);
+    try std.testing.expect(!executor.prepared_unique_owner);
+    try std.testing.expectEqual(@as(usize, 3), executor.txn_begin_calls);
+    try std.testing.expectEqual(@as(usize, 3), executor.txn_prepare_calls);
+    try std.testing.expectEqual(@as(usize, 3), executor.txn_resolve_calls);
+}
+
+test "hosted commit routes compound foreign key parent checks through ordered tuple unique owner" {
+    const alloc = std.testing.allocator;
+    const replica_root_dir = try uniqueTestTmpPathAlloc(alloc, "antfly-api-hosted-compound-fk-ordered-parent-owner");
+    defer alloc.free(replica_root_dir);
+
+    const orders_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"customer_region":{"type":"keyword"},"customer_email":{"type":"keyword"}},"required":["customer_region","customer_email"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_identity_fkey","columns":["customer_region","customer_email"],"references":{"table":"customers","columns":["region","email"]},"on_delete":"restrict"}]}
+    ;
+    const customers_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"customers","enforce_types":true,"document_schemas":{"customers":{"schema":{"type":"object","properties":{"region":{"type":"keyword"},"email":{"type":"keyword","collation":"antfly.case_insensitive"},"name":{"type":"keyword"}},"required":["region","email"],"additionalProperties":false}}},"unique_constraints":[{"name":"customers_region_email_key","columns":["region","email"]}],"relational_indexes":[{"name":"customers_region_email_idx","owner_kind":"unique_constraint","owner_name":"customers_region_email_key","access_method":"ordered_tuple","unique":true,"columns":["region","email"],"keys":[{"column":"region"},{"column":"email"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"unique-index-v1:customers_region_email","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
+    ;
+    var parsed_orders_schema = try tables_api.parseValidatedTableSchema(alloc, orders_schema_json);
+    defer parsed_orders_schema.deinit(alloc);
+    const orders_runtime_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed_orders_schema);
+    defer storage_schema.freeSchema(alloc, orders_runtime_schema);
+    var parsed_customers_schema = try tables_api.parseValidatedTableSchema(alloc, customers_schema_json);
+    defer parsed_customers_schema.deinit(alloc);
+    const customers_runtime_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed_customers_schema);
+    defer storage_schema.freeSchema(alloc, customers_runtime_schema);
+
+    const child_json = "{\"customer_region\":\"us-east\",\"customer_email\":\"Ada@Example.Test\"}";
+    const child_row = try db_mod.document_mapper.buildRelationalRowValueAlloc(alloc, child_json, orders_runtime_schema.relational_columns);
+    defer alloc.free(child_row);
+    const expected_parent_key = (try db_mod.relational_store.foreignKeyReferenceValueWithColumnsAlloc(
+        alloc,
+        child_row,
+        orders_runtime_schema.foreign_keys[0],
+        customers_runtime_schema.primary_key,
+        customers_runtime_schema.relational_columns,
+    )) orelse return error.TestUnexpectedResult;
+    defer alloc.free(expected_parent_key);
+    const expected_ordered_parent = (try db_mod.relational_store.orderedTupleParentValueForForeignKeyRowAlloc(
+        alloc,
+        child_row,
+        orders_runtime_schema.foreign_keys[0],
+        customers_runtime_schema.primary_key,
+        customers_runtime_schema.unique_constraints,
+        customers_runtime_schema.relational_indexes,
+        customers_runtime_schema.relational_columns,
+    )) orelse return error.TestUnexpectedResult;
+    defer alloc.free(expected_ordered_parent);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{
+                    .{ .table_id = 7, .name = "orders", .placement_role = "data", .schema_json = orders_schema_json },
+                    .{ .table_id = 8, .name = "customers", .placement_role = "data", .schema_json = customers_schema_json },
+                })[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .unique_constraint_ranges = @constCast((&[_]metadata_table_manager.UniqueConstraintRangeRecord{.{
+                    .table_id = 8,
+                    .constraint_name = "customers_region_email_key",
+                    .start_encoded_value = "",
+                    .end_encoded_value = null,
+                    .group_id = 9001,
+                    .topology_epoch = 1,
+                    .state = metadata_table_manager.unique_constraint_range_active,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const RemoteRouter = struct {
+        fn iface() table_router.HostedGroupRouter {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 1;
+        }
+
+        fn localStatus(_: *anyopaque, _: u64) raft_mod.HostedReplicaStatus {
+            return .absent;
+        }
+
+        fn groupLeaderNodeId(_: *anyopaque, group_id: u64) ?u64 {
+            return if (group_id == 7001 or group_id == 9001) 2 else null;
+        }
+
+        fn nodeStatus(_: *anyopaque, node_id: u64, group_id: u64) raft_mod.HostedReplicaStatus {
+            return if (node_id == 2 and (group_id == 7001 or group_id == 9001)) .active else .absent;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, alloc_inner: std.mem.Allocator, node_id: u64) !?[]u8 {
+            if (node_id != 2) return null;
+            return try alloc_inner.dupe(u8, "http://127.0.0.1:1");
+        }
+    };
+
+    const ExecutorState = struct {
+        expected_child_json: []const u8,
+        expected_parent_key: []const u8,
+        expected_ordered_parent: []const u8,
+        txn_begin_calls: usize = 0,
+        txn_prepare_calls: usize = 0,
+        txn_resolve_calls: usize = 0,
+        prepared_child_owner: bool = false,
+        prepared_parent_unique_owner: bool = false,
+
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, alloc_inner: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(http_common.Method.POST, request.method);
+            try std.testing.expectEqualStrings("application/json", request.content_type.?);
+            const group_id: u64 = if (std.mem.indexOf(u8, request.uri, "/groups/7001/") != null) 7001 else if (std.mem.indexOf(u8, request.uri, "/groups/9001/") != null) 9001 else return error.TestUnexpectedResult;
+            if (std.mem.endsWith(u8, request.uri, "/txn-begin")) {
+                self.txn_begin_calls += 1;
+                var parsed = try distributed_txn.parseTxnBeginRequest(alloc_inner, request.body);
+                defer distributed_txn.freeTxnBeginRequest(alloc_inner, &parsed);
+                try std.testing.expectEqual(@as(usize, 2), parsed.participants.len);
+                return .{ .status = 200, .body = try alloc_inner.dupe(u8, "") };
+            }
+            if (std.mem.endsWith(u8, request.uri, "/txn-prepare")) {
+                self.txn_prepare_calls += 1;
+                var parsed = try distributed_txn.parseTxnPrepareRequest(alloc_inner, request.body);
+                defer distributed_txn.freeTxnPrepareRequest(alloc_inner, &parsed);
+                if (group_id == 7001) {
+                    try std.testing.expectEqual(@as(usize, 1), parsed.req.writes.len);
+                    try std.testing.expectEqualStrings("order:ada", parsed.req.writes[0].key);
+                    try std.testing.expectEqualStrings(self.expected_child_json, parsed.req.writes[0].value);
+                    try std.testing.expectEqual(@as(usize, 0), parsed.req.predicates.len);
+                    try std.testing.expectEqual(@as(usize, 0), parsed.req.foreign_key_parent_checks.len);
+                    try std.testing.expectEqual(@as(usize, 1), parsed.req.foreign_key_externalized_parent_checks.len);
+                    const externalized = parsed.req.foreign_key_externalized_parent_checks[0];
+                    try std.testing.expectEqualStrings("orders_customer_identity_fkey", externalized.constraint_name);
+                    try std.testing.expectEqualStrings("row", externalized.child_table);
+                    try std.testing.expectEqualStrings("order:ada", externalized.child_key);
+                    try std.testing.expectEqualStrings("customers", externalized.parent_table);
+                    try std.testing.expectEqualStrings(self.expected_parent_key, externalized.parent_key);
+                    try std.testing.expect(externalized.parent_constraint_name != null);
+                    try std.testing.expectEqualStrings("customers_region_email_key", externalized.parent_constraint_name.?);
+                    try std.testing.expect(externalized.ordered_parent_tuple != null);
+                    try std.testing.expectEqualStrings(self.expected_ordered_parent, externalized.ordered_parent_tuple.?);
+                    self.prepared_child_owner = true;
+                } else {
+                    try std.testing.expectEqual(@as(usize, 0), parsed.req.writes.len);
+                    try std.testing.expectEqual(@as(usize, 0), parsed.req.deletes.len);
+                    try std.testing.expectEqual(@as(usize, 0), parsed.req.foreign_key_externalized_parent_checks.len);
+                    try std.testing.expectEqual(@as(usize, 1), parsed.req.foreign_key_parent_checks.len);
+                    const check = parsed.req.foreign_key_parent_checks[0];
+                    try std.testing.expectEqualStrings("orders_customer_identity_fkey", check.constraint_name);
+                    try std.testing.expectEqualStrings("orders", check.child_table);
+                    try std.testing.expectEqualStrings("order:ada", check.child_key);
+                    try std.testing.expectEqualStrings("customers", check.parent_table);
+                    try std.testing.expectEqualStrings(self.expected_parent_key, check.parent_key);
+                    try std.testing.expect(check.parent_constraint_name != null);
+                    try std.testing.expectEqualStrings("customers_region_email_key", check.parent_constraint_name.?);
+                    try std.testing.expect(check.ordered_parent_tuple != null);
+                    try std.testing.expectEqualStrings(self.expected_ordered_parent, check.ordered_parent_tuple.?);
+                    self.prepared_parent_unique_owner = true;
+                }
+                return .{ .status = 200, .body = try alloc_inner.dupe(u8, "") };
+            }
+            if (std.mem.endsWith(u8, request.uri, "/txn-resolve")) {
+                self.txn_resolve_calls += 1;
+                const parsed = try distributed_txn.parseTxnResolveRequest(alloc_inner, request.body);
+                try std.testing.expectEqual(db_mod.types.TxnStatus.committed, parsed.status);
+                return .{ .status = 200, .body = try alloc_inner.dupe(u8, "") };
+            }
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    var executor = ExecutorState{
+        .expected_child_json = child_json,
+        .expected_parent_key = expected_parent_key,
+        .expected_ordered_parent = expected_ordered_parent,
+    };
+    var source = HostedProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface(), RemoteRouter.iface(), executor.iface());
+    defer source.invalidateManagedCache("orders");
+
+    const table = [_]distributed_txn.TableCommitRequest{.{
+        .table_name = "orders",
+        .writes = &.{.{ .key = "order:ada", .value = child_json }},
+    }};
+    const outcome = (try source.source().commitTransactionWithId(alloc, try distributed_txn.parseTxnIdHex("ffffffffffffffffffffffffffffffff"), 52_500, table[0..], .write)).?;
+    switch (outcome) {
+        .committed => |result| try std.testing.expectEqual(@as(usize, 2), result.participant_count),
+        .conflict => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(executor.prepared_child_owner);
+    try std.testing.expect(executor.prepared_parent_unique_owner);
+    try std.testing.expectEqual(@as(usize, 2), executor.txn_begin_calls);
+    try std.testing.expectEqual(@as(usize, 2), executor.txn_prepare_calls);
+    try std.testing.expectEqual(@as(usize, 2), executor.txn_resolve_calls);
+}
+
+test "hosted commit routes compound foreign key parent deletes through child ordered tuple index" {
+    const alloc = std.testing.allocator;
+    const replica_root_dir = try uniqueTestTmpPathAlloc(alloc, "antfly-api-hosted-compound-fk-delete-child-ordered-index");
+    defer alloc.free(replica_root_dir);
+
+    const orders_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"customer_region":{"type":"keyword"},"customer_email":{"type":"keyword","collation":"antfly.case_insensitive"}},"required":["customer_region","customer_email"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_identity_fkey","columns":["customer_region","customer_email"],"references":{"table":"customers","columns":["region","email"]},"on_delete":"restrict"}],"relational_indexes":[{"name":"orders_customer_identity_idx","owner_kind":"relational_column","owner_name":"customer_region","access_method":"ordered_tuple","columns":["customer_region","customer_email"],"keys":[{"column":"customer_region"},{"column":"customer_email"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"child-index-v1:orders_customer_identity","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
+    ;
+    const customers_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"customers","enforce_types":true,"document_schemas":{"customers":{"schema":{"type":"object","properties":{"region":{"type":"keyword"},"email":{"type":"keyword","collation":"antfly.case_insensitive"},"name":{"type":"keyword"}},"required":["region","email"],"additionalProperties":false}}},"unique_constraints":[{"name":"customers_region_email_key","columns":["region","email"]}],"relational_indexes":[{"name":"customers_region_email_idx","owner_kind":"unique_constraint","owner_name":"customers_region_email_key","access_method":"ordered_tuple","unique":true,"columns":["region","email"],"keys":[{"column":"region"},{"column":"email"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"unique-index-v1:customers_region_email","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
+    ;
+    var parsed_orders_schema = try tables_api.parseValidatedTableSchema(alloc, orders_schema_json);
+    defer parsed_orders_schema.deinit(alloc);
+    const orders_runtime_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed_orders_schema);
+    defer storage_schema.freeSchema(alloc, orders_runtime_schema);
+    var parsed_customers_schema = try tables_api.parseValidatedTableSchema(alloc, customers_schema_json);
+    defer parsed_customers_schema.deinit(alloc);
+    const customers_runtime_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed_customers_schema);
+    defer storage_schema.freeSchema(alloc, customers_runtime_schema);
+
+    const parent_json = "{\"region\":\"us-east\",\"email\":\"ada@example.test\",\"name\":\"Ada\"}";
+    const parent_row = try db_mod.document_mapper.buildRelationalRowValueAlloc(alloc, parent_json, customers_runtime_schema.relational_columns);
+    defer alloc.free(parent_row);
+    const expected_parent_key = (try db_mod.relational_store.uniqueConstraintTupleValueAlloc(
+        alloc,
+        parent_row,
+        customers_runtime_schema.unique_constraints[0],
+    )) orelse return error.TestUnexpectedResult;
+    defer alloc.free(expected_parent_key);
+    const expected_ordered_child = (try db_mod.relational_store.orderedTupleChildValueForForeignKeyParentRowAlloc(
+        alloc,
+        parent_row,
+        orders_runtime_schema.foreign_keys[0],
+        orders_runtime_schema.relational_indexes,
+        orders_runtime_schema.relational_columns,
+        customers_runtime_schema.relational_columns,
+    )) orelse return error.TestUnexpectedResult;
+    defer alloc.free(expected_ordered_child);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{
+                    .{ .table_id = 7, .name = "orders", .placement_role = "data", .schema_json = orders_schema_json },
+                    .{ .table_id = 8, .name = "customers", .placement_role = "data", .schema_json = customers_schema_json },
+                })[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null },
+                    .{ .group_id = 8001, .table_id = 8, .start_key = "", .end_key = null },
+                })[0..]),
+                .foreign_key_ref_ranges = @constCast((&[_]metadata_table_manager.ForeignKeyReferenceRangeRecord{.{
+                    .child_table_id = 7,
+                    .constraint_name = "orders_customer_identity_fkey",
+                    .parent_table_id = 8,
+                    .start_parent_key = "",
+                    .end_parent_key = null,
+                    .group_id = 9001,
+                    .topology_epoch = 1,
+                }})[0..]),
+                .unique_constraint_ranges = @constCast((&[_]metadata_table_manager.UniqueConstraintRangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const RemoteRouter = struct {
+        fn iface() table_router.HostedGroupRouter {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 1;
+        }
+
+        fn localStatus(_: *anyopaque, _: u64) raft_mod.HostedReplicaStatus {
+            return .absent;
+        }
+
+        fn groupLeaderNodeId(_: *anyopaque, group_id: u64) ?u64 {
+            return if (group_id == 8001 or group_id == 9001) 2 else null;
+        }
+
+        fn nodeStatus(_: *anyopaque, node_id: u64, group_id: u64) raft_mod.HostedReplicaStatus {
+            return if (node_id == 2 and (group_id == 8001 or group_id == 9001)) .active else .absent;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, alloc_inner: std.mem.Allocator, node_id: u64) !?[]u8 {
+            if (node_id != 2) return null;
+            return try alloc_inner.dupe(u8, "http://127.0.0.1:1");
+        }
+    };
+
+    const ExecutorState = struct {
+        parent_json: []const u8,
+        expected_parent_key: []const u8,
+        expected_ordered_child: []const u8,
+        txn_begin_calls: usize = 0,
+        txn_prepare_calls: usize = 0,
+        txn_resolve_calls: usize = 0,
+        lookup_calls: usize = 0,
+        prepared_parent_owner: bool = false,
+        prepared_ref_owner: bool = false,
+
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn lookupResponse(self: *@This(), alloc_inner: std.mem.Allocator) !http_common.HttpResponse {
+            const headers = try alloc_inner.alloc(http_common.Header, 1);
+            headers[0] = .{
+                .name = try alloc_inner.dupe(u8, "X-Antfly-Version"),
+                .value = try alloc_inner.dupe(u8, "8"),
+            };
+            return .{
+                .status = 200,
+                .headers = headers,
+                .body = try alloc_inner.dupe(u8, self.parent_json),
+            };
+        }
+
+        fn execute(ptr: *anyopaque, alloc_inner: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const group_id: u64 = if (std.mem.indexOf(u8, request.uri, "/groups/8001/") != null) 8001 else if (std.mem.indexOf(u8, request.uri, "/groups/9001/") != null) 9001 else if (std.mem.indexOf(u8, request.uri, "/groups/9002/") != null) 9002 else return error.TestUnexpectedResult;
+            if (request.method == .GET) {
+                try std.testing.expectEqual(@as(u64, 8001), group_id);
+                try std.testing.expect(std.mem.indexOf(u8, request.uri, "/tables/customers/lookup/") != null);
+                self.lookup_calls += 1;
+                return try self.lookupResponse(alloc_inner);
+            }
+            try std.testing.expectEqual(http_common.Method.POST, request.method);
+            try std.testing.expectEqualStrings("application/json", request.content_type.?);
+            if (std.mem.endsWith(u8, request.uri, "/txn-begin")) {
+                self.txn_begin_calls += 1;
+                var parsed = try distributed_txn.parseTxnBeginRequest(alloc_inner, request.body);
+                defer distributed_txn.freeTxnBeginRequest(alloc_inner, &parsed);
+                try std.testing.expectEqual(@as(usize, 2), parsed.participants.len);
+                return .{ .status = 200, .body = try alloc_inner.dupe(u8, "") };
+            }
+            if (std.mem.endsWith(u8, request.uri, "/txn-prepare")) {
+                self.txn_prepare_calls += 1;
+                var parsed = try distributed_txn.parseTxnPrepareRequest(alloc_inner, request.body);
+                defer distributed_txn.freeTxnPrepareRequest(alloc_inner, &parsed);
+                if (group_id == 8001) {
+                    try std.testing.expectEqual(@as(usize, 1), parsed.req.deletes.len);
+                    try std.testing.expectEqualStrings("customer:ada", parsed.req.deletes[0]);
+                    try std.testing.expectEqual(@as(usize, 1), parsed.req.predicates.len);
+                    try std.testing.expectEqualStrings("customer:ada", parsed.req.predicates[0].key);
+                    try std.testing.expectEqual(@as(u64, 8), parsed.req.predicates[0].expected_version);
+                    self.prepared_parent_owner = true;
+                } else if (group_id == 9001) {
+                    try std.testing.expectEqual(@as(usize, 0), parsed.req.writes.len);
+                    try std.testing.expectEqual(@as(usize, 0), parsed.req.deletes.len);
+                    try std.testing.expectEqual(@as(usize, 1), parsed.req.foreign_key_parent_delete_checks.len);
+                    const check = parsed.req.foreign_key_parent_delete_checks[0];
+                    try std.testing.expectEqualStrings("orders_customer_identity_fkey", check.constraint_name);
+                    try std.testing.expectEqualStrings("customers", check.parent_table);
+                    try std.testing.expectEqualStrings(self.expected_parent_key, check.parent_key);
+                    try std.testing.expect(check.ordered_child_tuple != null);
+                    try std.testing.expectEqualStrings(self.expected_ordered_child, check.ordered_child_tuple.?);
+                    self.prepared_ref_owner = true;
+                } else {
+                    try std.testing.expectEqual(@as(usize, 0), parsed.req.unique_constraint_writes.len);
+                    try std.testing.expectEqual(@as(usize, 0), parsed.req.unique_constraint_deletes.len);
+                }
+                return .{ .status = 200, .body = try alloc_inner.dupe(u8, "") };
+            }
+            if (std.mem.endsWith(u8, request.uri, "/txn-resolve")) {
+                self.txn_resolve_calls += 1;
+                const parsed = try distributed_txn.parseTxnResolveRequest(alloc_inner, request.body);
+                try std.testing.expectEqual(db_mod.types.TxnStatus.committed, parsed.status);
+                return .{ .status = 200, .body = try alloc_inner.dupe(u8, "") };
+            }
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    var executor = ExecutorState{
+        .parent_json = parent_json,
+        .expected_parent_key = expected_parent_key,
+        .expected_ordered_child = expected_ordered_child,
+    };
+    var source = HostedProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface(), RemoteRouter.iface(), executor.iface());
+    defer source.invalidateManagedCache("customers");
+
+    const table = [_]distributed_txn.TableCommitRequest{.{
+        .table_name = "customers",
+        .deletes = &.{"customer:ada"},
+    }};
+    const outcome = (try source.source().commitTransactionWithId(alloc, try distributed_txn.parseTxnIdHex("aaaaaaaaaaaaaaaabbbbbbbbbbbbbbbb"), 52_600, table[0..], .write)).?;
+    switch (outcome) {
+        .committed => |result| try std.testing.expectEqual(@as(usize, 2), result.participant_count),
+        .conflict => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(executor.prepared_parent_owner);
+    try std.testing.expect(executor.prepared_ref_owner);
+    try std.testing.expectEqual(@as(usize, 1), executor.lookup_calls);
+    try std.testing.expectEqual(@as(usize, 2), executor.txn_begin_calls);
+    try std.testing.expectEqual(@as(usize, 2), executor.txn_prepare_calls);
+    try std.testing.expectEqual(@as(usize, 2), executor.txn_resolve_calls);
 }
 
 test "hosted mutation-source rejects non-lockable derived sources before routing" {

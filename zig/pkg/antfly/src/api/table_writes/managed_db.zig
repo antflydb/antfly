@@ -700,14 +700,16 @@ fn transactionWritesToBatchWrites(
     alloc: std.mem.Allocator,
     writes: []const db_mod.types.TransactionWrite,
 ) ![]db_mod.types.BatchWrite {
-    var out = try alloc.alloc(db_mod.types.BatchWrite, writes.len);
-    for (writes, 0..) |write, i| {
-        out[i] = .{
+    var out = std.ArrayListUnmanaged(db_mod.types.BatchWrite).empty;
+    errdefer out.deinit(alloc);
+    for (writes) |write| {
+        if (db_mod.internal_keys.isInternalPhysicalTableDataKey(write.key)) continue;
+        try out.append(alloc, .{
             .key = write.key,
             .value = write.value,
-        };
+        });
     }
-    return out;
+    return try out.toOwnedSlice(alloc);
 }
 
 pub fn validateTableBatchAgainstLocalSchema(

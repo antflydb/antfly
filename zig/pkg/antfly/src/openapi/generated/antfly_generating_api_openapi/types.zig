@@ -192,12 +192,62 @@ pub const ClarificationRequest = struct {
     required: ?bool = null,
 };
 
+/// Filter operator: - eq: Equals - ne: Not equals - gt/gte: Greater than (or equal) - lt/lte: Less than (or equal) - contains: Contains substring - prefix: Starts with - range: Between two values (value should be array [min, max]) - in: Value in list (value should be array)
+pub const FilterSpecOperator = enum {
+    eq,
+    ne,
+    gt,
+    gte,
+    lt,
+    lte,
+    contains,
+    prefix,
+    range,
+    in,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .eq => "eq",
+            .ne => "ne",
+            .gt => "gt",
+            .gte => "gte",
+            .lt => "lt",
+            .lte => "lte",
+            .contains => "contains",
+            .prefix => "prefix",
+            .range => "range",
+            .in => "in",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "eq", .eq },
+            .{ "ne", .ne },
+            .{ "gt", .gt },
+            .{ "gte", .gte },
+            .{ "lt", .lt },
+            .{ "lte", .lte },
+            .{ "contains", .contains },
+            .{ "prefix", .prefix },
+            .{ "range", .range },
+            .{ "in", .in },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// A filter specification to apply to search queries
 pub const FilterSpec = struct {
     /// Field name to filter on
     field: []const u8,
     /// Filter operator: - eq: Equals - ne: Not equals - gt/gte: Greater than (or equal) - lt/lte: Less than (or equal) - contains: Contains substring - prefix: Starts with - range: Between two values (value should be array [min, max]) - in: Value in list (value should be array)
-    operator: []const u8,
+    operator: FilterSpecOperator,
     /// Filter value (string, number, boolean, or array for range/in operators)
     value: std.json.Value,
 };

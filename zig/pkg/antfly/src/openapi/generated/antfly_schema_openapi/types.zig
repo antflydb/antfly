@@ -90,6 +90,38 @@ pub const PrimaryKey = struct {
     without_overlaps_period: ?[]const u8 = null,
 };
 
+/// Optional PostgreSQL range type that produced this period when lowering range-column temporal DDL.
+pub const RelationalPeriodRangeType = enum {
+    numrange,
+    daterange,
+    tsrange,
+    tstzrange,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .numrange => "numrange",
+            .daterange => "daterange",
+            .tsrange => "tsrange",
+            .tstzrange => "tstzrange",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "numrange", .numrange },
+            .{ "daterange", .daterange },
+            .{ "tsrange", .tsrange },
+            .{ "tstzrange", .tstzrange },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Application-time period over a start and end column.
 pub const RelationalPeriod = struct {
     /// Period name used by temporal constraints and `FOR PORTION OF` mutation-source plans.
@@ -99,20 +131,82 @@ pub const RelationalPeriod = struct {
     /// Exclusive period end column.
     end_column: []const u8,
     /// Optional PostgreSQL range type that produced this period when lowering range-column temporal DDL.
-    range_type: ?[]const u8 = null,
+    range_type: ?RelationalPeriodRangeType = null,
+};
+
+pub const RowsUniquePredicateOp = enum {
+    is_null,
+    is_not_null,
+    eq,
+    ne,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .is_null => "is_null",
+            .is_not_null => "is_not_null",
+            .eq => "eq",
+            .ne => "ne",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "is_null", .is_null },
+            .{ "is_not_null", .is_not_null },
+            .{ "eq", .eq },
+            .{ "ne", .ne },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// Predicate atom that must match a partial unique constraint definition.
 pub const RowsUniquePredicate = struct {
     field: []const u8,
-    op: []const u8,
+    op: RowsUniquePredicateOp,
     /// Predicate comparison value. Omit for null-test operators.
     value: ?std.json.Value = null,
 };
 
+pub const RowsExpressionFieldSource = enum {
+    row,
+    existing,
+    proposed,
+    source,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .row => "row",
+            .existing => "existing",
+            .proposed => "proposed",
+            .source => "source",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "row", .row },
+            .{ "existing", .existing },
+            .{ "proposed", .proposed },
+            .{ "source", .source },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const RowsExpressionField = struct {
     field: []const u8,
-    source: ?[]const u8 = null,
+    source: ?RowsExpressionFieldSource = null,
 };
 
 pub const RowsExpressionValue = struct {
@@ -120,14 +214,83 @@ pub const RowsExpressionValue = struct {
     value: std.json.Value,
 };
 
+/// Sort direction for ordered scans. Omitted defaults to asc.
+pub const RelationalIndexKeyDirection = enum {
+    asc,
+    desc,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .asc => "asc",
+            .desc => "desc",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "asc", .asc },
+            .{ "desc", .desc },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Null placement for ordered scans. Omitted uses method default.
+pub const RelationalIndexKeyNulls = enum {
+    default,
+    first,
+    last,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .default => "default",
+            .first => "first",
+            .last => "last",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "default", .default },
+            .{ "first", .first },
+            .{ "last", .last },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Ordered component of a relational ordered-tuple index key.
 pub const RelationalIndexKey = struct {
     /// Declared relational column used by this key component.
     column: []const u8,
+    /// Optional collation used by this ordered key component.
+    collation: ?[]const u8 = null,
     /// Sort direction for ordered scans. Omitted defaults to asc.
-    direction: ?[]const u8 = null,
+    direction: ?RelationalIndexKeyDirection = null,
     /// Null placement for ordered scans. Omitted uses method default.
-    nulls: ?[]const u8 = null,
+    nulls: ?RelationalIndexKeyNulls = null,
+};
+
+/// Owner-range coverage for a relational access-method generation.
+pub const RelationalIndexOwnerRange = struct {
+    /// Inclusive owner range start key.
+    start: []const u8,
+    /// Exclusive owner range end key; empty string means unbounded.
+    end: []const u8,
+    /// Optional stable range identifier.
+    range_id: ?[]const u8 = null,
+    /// Placement generation that produced this range assignment.
+    placement_generation: ?i64 = null,
 };
 
 /// Field mapping to apply when a dynamic template matches
@@ -145,6 +308,122 @@ pub const TemplateFieldMapping = struct {
     doc_values: ?bool = null,
 };
 
+/// Delete action. "no_action" is normalized to immediate restrictive behavior; "set_null" requires nullable child columns; "set_null" and "cascade" are bounded in local execution.
+pub const ForeignKeyOnDelete = enum {
+    restrict,
+    no_action,
+    set_null,
+    cascade,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .restrict => "restrict",
+            .no_action => "no_action",
+            .set_null => "set_null",
+            .cascade => "cascade",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "restrict", .restrict },
+            .{ "no_action", .no_action },
+            .{ "set_null", .set_null },
+            .{ "cascade", .cascade },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Update action. "restrict" and "no_action" are enforced as parent-key update checks; "set_null" and "cascade" are supported for bounded local/scheduled mutating FK action execution where owner topology is configured.
+pub const ForeignKeyOnUpdate = enum {
+    restrict,
+    no_action,
+    set_null,
+    cascade,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .restrict => "restrict",
+            .no_action => "no_action",
+            .set_null => "set_null",
+            .cascade => "cascade",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "restrict", .restrict },
+            .{ "no_action", .no_action },
+            .{ "set_null", .set_null },
+            .{ "cascade", .cascade },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Match mode. "simple" is the default and means any null or absent child component creates no reference. "full" requires all child components to be present or all absent. MATCH PARTIAL is reserved until row-subset parent matching is implemented.
+pub const ForeignKeyMatch = enum {
+    simple,
+    full,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .simple => "simple",
+            .full => "full",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "simple", .simple },
+            .{ "full", .full },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Constraint validation state. Public schema validation accepts enforced constraints and local unvalidated adoption entries; online job-owned states are reserved for hosted migration jobs.
+pub const ForeignKeyValidationState = enum {
+    enforced,
+    unvalidated,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .enforced => "enforced",
+            .unvalidated => "unvalidated",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "enforced", .enforced },
+            .{ "unvalidated", .unvalidated },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Relational foreign-key constraint.
 pub const ForeignKey = struct {
     /// Constraint name, unique within the table schema.
@@ -155,22 +434,117 @@ pub const ForeignKey = struct {
     period: ?[]const u8 = null,
     references: ?ForeignKeyReference = null,
     /// Delete action. "no_action" is normalized to immediate restrictive behavior; "set_null" requires nullable child columns; "set_null" and "cascade" are bounded in local execution.
-    on_delete: ?[]const u8 = null,
+    on_delete: ?ForeignKeyOnDelete = null,
     /// Update action. "restrict" and "no_action" are enforced as parent-key update checks; "set_null" and "cascade" are supported for bounded local/scheduled mutating FK action execution where owner topology is configured.
-    on_update: ?[]const u8 = null,
+    on_update: ?ForeignKeyOnUpdate = null,
     /// Constraint timing. Canonical values are "immediate" and "deferred"; SQL-shaped aliases such as "INITIALLY DEFERRED" and combined deferrability clauses are accepted and normalized by schema parsing.
     timing: ?[]const u8 = null,
     /// Whether transaction-level timing overrides may change this constraint's effective timing. Accepts JSON booleans and SQL-shaped strings such as "DEFERRABLE", "NOT DEFERRABLE", and "DEFERRABLE INITIALLY DEFERRED". Omitted defaults to false unless timing is "deferred" for compatibility.
     deferrable: ?std.json.Value = null,
     /// Match mode. "simple" is the default and means any null or absent child component creates no reference. "full" requires all child components to be present or all absent. MATCH PARTIAL is reserved until row-subset parent matching is implemented.
-    match: ?[]const u8 = null,
+    match: ?ForeignKeyMatch = null,
     /// Constraint validation state. Public schema validation accepts enforced constraints and local unvalidated adoption entries; online job-owned states are reserved for hosted migration jobs.
-    validation_state: ?[]const u8 = null,
+    validation_state: ?ForeignKeyValidationState = null,
 };
 
 /// Conjunction of partial-unique predicate atoms.
 pub const RowsUniquePredicateGroup = struct {
     all: []const RowsUniquePredicate,
+};
+
+/// Lifecycle state for this generation.
+pub const RelationalIndexGenerationRecordLifecycle = enum {
+    ready,
+    building,
+    catching_up,
+    stale,
+    rebuild_required,
+    failed,
+    invalid,
+    dropping,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .ready => "ready",
+            .building => "building",
+            .catching_up => "catching_up",
+            .stale => "stale",
+            .rebuild_required => "rebuild_required",
+            .failed => "failed",
+            .invalid => "invalid",
+            .dropping => "dropping",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "ready", .ready },
+            .{ "building", .building },
+            .{ "catching_up", .catching_up },
+            .{ "stale", .stale },
+            .{ "rebuild_required", .rebuild_required },
+            .{ "failed", .failed },
+            .{ "invalid", .invalid },
+            .{ "dropping", .dropping },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Shared lifecycle record for derived relational access-method generations.
+pub const RelationalIndexGenerationRecord = struct {
+    /// Monotonic physical access-method generation.
+    generation: i64,
+    /// Owner ranges covered by this generation.
+    owner_ranges: []const RelationalIndexOwnerRange,
+    /// Lifecycle state for this generation.
+    lifecycle: RelationalIndexGenerationRecordLifecycle,
+    /// Remaining catch-up lag for this generation.
+    lag: i64,
+    /// Typed or operator-facing failure reason when the lifecycle is not healthy.
+    failure_reason: ?[]const u8 = null,
+    /// Durable watermark that is ready for serving.
+    ready_watermark: i64,
+};
+
+/// Filter by detected JSON type
+pub const DynamicTemplateMatchMappingType = enum {
+    string,
+    number,
+    boolean,
+    date,
+    object,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .string => "string",
+            .number => "number",
+            .boolean => "boolean",
+            .date => "date",
+            .object => "object",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "string", .string },
+            .{ "number", .number },
+            .{ "boolean", .boolean },
+            .{ "date", .date },
+            .{ "object", .object },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// A rule for mapping dynamically detected fields. Templates are checked in order and the first matching template's mapping is used.
@@ -186,8 +560,34 @@ pub const DynamicTemplate = struct {
     /// Path exclusion pattern. If it matches the full path, the template is skipped.
     path_unmatch: ?[]const u8 = null,
     /// Filter by detected JSON type
-    match_mapping_type: ?[]const u8 = null,
+    match_mapping_type: ?DynamicTemplateMatchMappingType = null,
     mapping: ?TemplateFieldMapping = null,
+};
+
+/// Storage profile for the table. - "document" (default): schemaless JSON documents with optional, soft schema validation. All indexes are derived from the document. - "relational": required closed schema with typed columns. Documents must match a declared type; declared scalar properties are stored as typed columns for columnar predicate pushdown and aggregation. A field typed "json" stores a subtree that is still indexed like a document. Implies enforce_types and closed document types.
+pub const TableSchemaStorageMode = enum {
+    document,
+    relational,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .document => "document",
+            .relational => "relational",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "document", .document },
+            .{ "relational", .relational },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// Schema definition for a table with multiple document types
@@ -195,7 +595,7 @@ pub const TableSchema = struct {
     /// Version of the schema. Used for migrations.
     version: ?i64 = null,
     /// Storage profile for the table. - "document" (default): schemaless JSON documents with optional, soft schema validation. All indexes are derived from the document. - "relational": required closed schema with typed columns. Documents must match a declared type; declared scalar properties are stored as typed columns for columnar predicate pushdown and aggregation. A field typed "json" stores a subtree that is still indexed like a document. Implies enforce_types and closed document types.
-    storage_mode: ?[]const u8 = null,
+    storage_mode: ?TableSchemaStorageMode = null,
     /// Default type to use from the document_types.
     default_type: ?[]const u8 = null,
     /// Whether to enforce that documents must match one of the provided document types. If false, documents not matching any type will be accepted but not indexed.
@@ -226,8 +626,17 @@ pub const RowsExpression = union(enum) {
     rows_expression_field: *RowsExpressionField,
     rows_expression_value: *RowsExpressionValue,
 
+    fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
+        const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
+        defer allocator.free(encoded);
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.UnexpectedToken,
+        };
+    }
+
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+        const parsed = parseUnionVariantFromValue(T, allocator, source, options) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return null,
         };
@@ -284,12 +693,345 @@ pub const RowsExpression = union(enum) {
     }
 };
 
+pub const RowsExpressionOperatorOp = enum {
+    now,
+    coalesce,
+    lower,
+    upper,
+    initcap,
+    trim,
+    btrim,
+    ltrim,
+    rtrim,
+    replace,
+    translate,
+    substring,
+    substr,
+    overlay,
+    split_part,
+    strpos,
+    left,
+    right,
+    lpad,
+    rpad,
+    repeat,
+    reverse,
+    starts_with,
+    ends_with,
+    ascii,
+    chr,
+    md5,
+    like,
+    ilike,
+    bool_and,
+    @"and",
+    bool_or,
+    @"or",
+    bool_not,
+    not,
+    concat,
+    concat_ws,
+    length,
+    char_length,
+    character_length,
+    octet_length,
+    nullif,
+    greatest,
+    least,
+    abs,
+    round,
+    trunc,
+    floor,
+    ceil,
+    sqrt,
+    sign,
+    power,
+    add,
+    sub,
+    mul,
+    div,
+    mod,
+    interval_ns,
+    interval_months,
+    date_trunc,
+    date_bin,
+    date_part,
+    extract,
+    cast,
+    json_extract,
+    json_extract_path,
+    json_extract_path_text,
+    jsonb_extract_path,
+    jsonb_extract_path_text,
+    json_typeof,
+    jsonb_typeof,
+    json_array_length,
+    jsonb_array_length,
+    array_length,
+    cardinality,
+    array_position,
+    array_positions,
+    array_append,
+    array_prepend,
+    array_cat,
+    array_remove,
+    array_replace,
+    array_to_string,
+    string_to_array,
+    uuid_v4,
+    gen_random_uuid,
+    uuid_generate_v4,
+    json_build_object,
+    jsonb_build_object,
+    to_jsonb,
+    json_path_exists,
+    regexp_replace,
+    case,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .now => "now",
+            .coalesce => "coalesce",
+            .lower => "lower",
+            .upper => "upper",
+            .initcap => "initcap",
+            .trim => "trim",
+            .btrim => "btrim",
+            .ltrim => "ltrim",
+            .rtrim => "rtrim",
+            .replace => "replace",
+            .translate => "translate",
+            .substring => "substring",
+            .substr => "substr",
+            .overlay => "overlay",
+            .split_part => "split_part",
+            .strpos => "strpos",
+            .left => "left",
+            .right => "right",
+            .lpad => "lpad",
+            .rpad => "rpad",
+            .repeat => "repeat",
+            .reverse => "reverse",
+            .starts_with => "starts_with",
+            .ends_with => "ends_with",
+            .ascii => "ascii",
+            .chr => "chr",
+            .md5 => "md5",
+            .like => "like",
+            .ilike => "ilike",
+            .bool_and => "bool_and",
+            .@"and" => "and",
+            .bool_or => "bool_or",
+            .@"or" => "or",
+            .bool_not => "bool_not",
+            .not => "not",
+            .concat => "concat",
+            .concat_ws => "concat_ws",
+            .length => "length",
+            .char_length => "char_length",
+            .character_length => "character_length",
+            .octet_length => "octet_length",
+            .nullif => "nullif",
+            .greatest => "greatest",
+            .least => "least",
+            .abs => "abs",
+            .round => "round",
+            .trunc => "trunc",
+            .floor => "floor",
+            .ceil => "ceil",
+            .sqrt => "sqrt",
+            .sign => "sign",
+            .power => "power",
+            .add => "add",
+            .sub => "sub",
+            .mul => "mul",
+            .div => "div",
+            .mod => "mod",
+            .interval_ns => "interval_ns",
+            .interval_months => "interval_months",
+            .date_trunc => "date_trunc",
+            .date_bin => "date_bin",
+            .date_part => "date_part",
+            .extract => "extract",
+            .cast => "cast",
+            .json_extract => "json_extract",
+            .json_extract_path => "json_extract_path",
+            .json_extract_path_text => "json_extract_path_text",
+            .jsonb_extract_path => "jsonb_extract_path",
+            .jsonb_extract_path_text => "jsonb_extract_path_text",
+            .json_typeof => "json_typeof",
+            .jsonb_typeof => "jsonb_typeof",
+            .json_array_length => "json_array_length",
+            .jsonb_array_length => "jsonb_array_length",
+            .array_length => "array_length",
+            .cardinality => "cardinality",
+            .array_position => "array_position",
+            .array_positions => "array_positions",
+            .array_append => "array_append",
+            .array_prepend => "array_prepend",
+            .array_cat => "array_cat",
+            .array_remove => "array_remove",
+            .array_replace => "array_replace",
+            .array_to_string => "array_to_string",
+            .string_to_array => "string_to_array",
+            .uuid_v4 => "uuid_v4",
+            .gen_random_uuid => "gen_random_uuid",
+            .uuid_generate_v4 => "uuid_generate_v4",
+            .json_build_object => "json_build_object",
+            .jsonb_build_object => "jsonb_build_object",
+            .to_jsonb => "to_jsonb",
+            .json_path_exists => "json_path_exists",
+            .regexp_replace => "regexp_replace",
+            .case => "case",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "now", .now },
+            .{ "coalesce", .coalesce },
+            .{ "lower", .lower },
+            .{ "upper", .upper },
+            .{ "initcap", .initcap },
+            .{ "trim", .trim },
+            .{ "btrim", .btrim },
+            .{ "ltrim", .ltrim },
+            .{ "rtrim", .rtrim },
+            .{ "replace", .replace },
+            .{ "translate", .translate },
+            .{ "substring", .substring },
+            .{ "substr", .substr },
+            .{ "overlay", .overlay },
+            .{ "split_part", .split_part },
+            .{ "strpos", .strpos },
+            .{ "left", .left },
+            .{ "right", .right },
+            .{ "lpad", .lpad },
+            .{ "rpad", .rpad },
+            .{ "repeat", .repeat },
+            .{ "reverse", .reverse },
+            .{ "starts_with", .starts_with },
+            .{ "ends_with", .ends_with },
+            .{ "ascii", .ascii },
+            .{ "chr", .chr },
+            .{ "md5", .md5 },
+            .{ "like", .like },
+            .{ "ilike", .ilike },
+            .{ "bool_and", .bool_and },
+            .{ "and", .@"and" },
+            .{ "bool_or", .bool_or },
+            .{ "or", .@"or" },
+            .{ "bool_not", .bool_not },
+            .{ "not", .not },
+            .{ "concat", .concat },
+            .{ "concat_ws", .concat_ws },
+            .{ "length", .length },
+            .{ "char_length", .char_length },
+            .{ "character_length", .character_length },
+            .{ "octet_length", .octet_length },
+            .{ "nullif", .nullif },
+            .{ "greatest", .greatest },
+            .{ "least", .least },
+            .{ "abs", .abs },
+            .{ "round", .round },
+            .{ "trunc", .trunc },
+            .{ "floor", .floor },
+            .{ "ceil", .ceil },
+            .{ "sqrt", .sqrt },
+            .{ "sign", .sign },
+            .{ "power", .power },
+            .{ "add", .add },
+            .{ "sub", .sub },
+            .{ "mul", .mul },
+            .{ "div", .div },
+            .{ "mod", .mod },
+            .{ "interval_ns", .interval_ns },
+            .{ "interval_months", .interval_months },
+            .{ "date_trunc", .date_trunc },
+            .{ "date_bin", .date_bin },
+            .{ "date_part", .date_part },
+            .{ "extract", .extract },
+            .{ "cast", .cast },
+            .{ "json_extract", .json_extract },
+            .{ "json_extract_path", .json_extract_path },
+            .{ "json_extract_path_text", .json_extract_path_text },
+            .{ "jsonb_extract_path", .jsonb_extract_path },
+            .{ "jsonb_extract_path_text", .jsonb_extract_path_text },
+            .{ "json_typeof", .json_typeof },
+            .{ "jsonb_typeof", .jsonb_typeof },
+            .{ "json_array_length", .json_array_length },
+            .{ "jsonb_array_length", .jsonb_array_length },
+            .{ "array_length", .array_length },
+            .{ "cardinality", .cardinality },
+            .{ "array_position", .array_position },
+            .{ "array_positions", .array_positions },
+            .{ "array_append", .array_append },
+            .{ "array_prepend", .array_prepend },
+            .{ "array_cat", .array_cat },
+            .{ "array_remove", .array_remove },
+            .{ "array_replace", .array_replace },
+            .{ "array_to_string", .array_to_string },
+            .{ "string_to_array", .string_to_array },
+            .{ "uuid_v4", .uuid_v4 },
+            .{ "gen_random_uuid", .gen_random_uuid },
+            .{ "uuid_generate_v4", .uuid_generate_v4 },
+            .{ "json_build_object", .json_build_object },
+            .{ "jsonb_build_object", .jsonb_build_object },
+            .{ "to_jsonb", .to_jsonb },
+            .{ "json_path_exists", .json_path_exists },
+            .{ "regexp_replace", .regexp_replace },
+            .{ "case", .case },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Cast target for `cast`.
+pub const RowsExpressionOperatorTo = enum {
+    text,
+    numeric,
+    bool,
+    boolean,
+    datetime,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .text => "text",
+            .numeric => "numeric",
+            .bool => "bool",
+            .boolean => "boolean",
+            .datetime => "datetime",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "text", .text },
+            .{ "numeric", .numeric },
+            .{ "bool", .bool },
+            .{ "boolean", .boolean },
+            .{ "datetime", .datetime },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const RowsExpressionOperator = struct {
-    op: []const u8,
+    op: RowsExpressionOperatorOp,
     /// Operand expressions for operator nodes.
     args: ?[]const RowsExpression = null,
     /// Cast target for `cast`.
-    to: ?[]const u8 = null,
+    to: ?RowsExpressionOperatorTo = null,
     /// Structured JSON path for `json_extract` and `json_path_exists`.
     path: ?std.json.Value = null,
     /// Return JSON path extraction as text.
@@ -305,11 +1047,86 @@ pub const RowsExpressionCaseBranch = struct {
     then: RowsExpression,
 };
 
+pub const RowsExpressionConditionOp = enum {
+    is_null,
+    is_not_null,
+    is_distinct,
+    is_not_distinct,
+    eq,
+    ne,
+    gt,
+    gte,
+    lt,
+    lte,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .is_null => "is_null",
+            .is_not_null => "is_not_null",
+            .is_distinct => "is_distinct",
+            .is_not_distinct => "is_not_distinct",
+            .eq => "eq",
+            .ne => "ne",
+            .gt => "gt",
+            .gte => "gte",
+            .lt => "lt",
+            .lte => "lte",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "is_null", .is_null },
+            .{ "is_not_null", .is_not_null },
+            .{ "is_distinct", .is_distinct },
+            .{ "is_not_distinct", .is_not_distinct },
+            .{ "eq", .eq },
+            .{ "ne", .ne },
+            .{ "gt", .gt },
+            .{ "gte", .gte },
+            .{ "lt", .lt },
+            .{ "lte", .lte },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Computed expression predicate over the shared row-expression AST.
 pub const RowsExpressionCondition = struct {
     lhs: RowsExpression,
-    op: []const u8,
+    op: RowsExpressionConditionOp,
     rhs: ?RowsExpression = null,
+};
+
+/// Unique validation state. Unvalidated constraints are durable metadata but do not enforce writes until promoted.
+pub const UniqueConstraintValidationState = enum {
+    enforced,
+    unvalidated,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .enforced => "enforced",
+            .unvalidated => "unvalidated",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "enforced", .enforced },
+            .{ "unvalidated", .unvalidated },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// Relational unique constraint.
@@ -327,7 +1144,112 @@ pub const UniqueConstraint = struct {
     /// Deterministic row-expression predicates that decide whether a row participates in this unique constraint.
     where_expressions: ?[]const RowsExpressionCondition = null,
     /// Unique validation state. Unvalidated constraints are durable metadata but do not enforce writes until promoted.
-    validation_state: ?[]const u8 = null,
+    validation_state: ?UniqueConstraintValidationState = null,
+};
+
+/// Catalog object that owns this physical index.
+pub const RelationalIndexOwnerKind = enum {
+    relational_column,
+    unique_constraint,
+    table,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .relational_column => "relational_column",
+            .unique_constraint => "unique_constraint",
+            .table => "table",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "relational_column", .relational_column },
+            .{ "unique_constraint", .unique_constraint },
+            .{ "table", .table },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Logical access method implemented by this index.
+pub const RelationalIndexAccessMethod = enum {
+    scalar_column,
+    ordered_tuple,
+    algebraic_filter,
+    text_search,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .scalar_column => "scalar_column",
+            .ordered_tuple => "ordered_tuple",
+            .algebraic_filter => "algebraic_filter",
+            .text_search => "text_search",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "scalar_column", .scalar_column },
+            .{ "ordered_tuple", .ordered_tuple },
+            .{ "algebraic_filter", .algebraic_filter },
+            .{ "text_search", .text_search },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Durable lifecycle state for this index generation.
+pub const RelationalIndexLifecycle = enum {
+    ready,
+    building,
+    catching_up,
+    stale,
+    rebuild_required,
+    failed,
+    invalid,
+    dropping,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .ready => "ready",
+            .building => "building",
+            .catching_up => "catching_up",
+            .stale => "stale",
+            .rebuild_required => "rebuild_required",
+            .failed => "failed",
+            .invalid => "invalid",
+            .dropping => "dropping",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "ready", .ready },
+            .{ "building", .building },
+            .{ "catching_up", .catching_up },
+            .{ "stale", .stale },
+            .{ "rebuild_required", .rebuild_required },
+            .{ "failed", .failed },
+            .{ "invalid", .invalid },
+            .{ "dropping", .dropping },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// Durable relational secondary-index metadata.
@@ -335,11 +1257,11 @@ pub const RelationalIndex = struct {
     /// Stable index name, unique within the table schema.
     name: []const u8,
     /// Catalog object that owns this physical index.
-    owner_kind: []const u8,
-    /// Owner column or constraint name.
+    owner_kind: RelationalIndexOwnerKind,
+    /// Owner column, constraint, or table-level sentinel name.
     owner_name: ?[]const u8 = null,
     /// Logical access method implemented by this index.
-    access_method: []const u8,
+    access_method: RelationalIndexAccessMethod,
     /// Access-method-specific durable configuration, for example full-text analyzer/scoring options or schema-derived algebraic settings.
     method_config: ?std.json.Value = null,
     /// True when the entry backs a unique constraint.
@@ -351,11 +1273,13 @@ pub const RelationalIndex = struct {
     /// Ordered tuple key definition. Required for ordered_tuple indexes.
     keys: ?[]const RelationalIndexKey = null,
     /// Durable lifecycle state for this index generation.
-    lifecycle: ?[]const u8 = null,
+    lifecycle: ?RelationalIndexLifecycle = null,
     /// Monotonic physical index generation.
     generation: ?i64 = null,
     /// Stable fingerprint of the index-defining catalog shape.
     schema_fingerprint: ?[]const u8 = null,
+    /// Shared generation/lifecycle record for ordered_tuple, text_search, and algebraic_filter access methods.
+    generation_record: ?RelationalIndexGenerationRecord = null,
     /// Field-only partial index predicate shorthand.
     where: ?RowsUniquePredicateGroup = null,
     /// Deterministic row-expression predicates for index participation.

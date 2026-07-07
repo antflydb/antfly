@@ -13,9 +13,31 @@ pub const Error = struct {
     @"error": []const u8,
 };
 
+pub const TextContentPartType = enum {
+    text,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .text => "text",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "text", .text },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Text content for embedding
 pub const TextContentPart = struct {
-    type: []const u8,
+    type: TextContentPartType,
     /// Text content to embed
     text: []const u8,
 };
@@ -26,9 +48,31 @@ pub const ImageURL = struct {
     url: []const u8,
 };
 
+pub const MediaContentPartType = enum {
+    media,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .media => "media",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "media", .media },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Binary or URL media content for providers that support non-image media parts.
 pub const MediaContentPart = struct {
-    type: []const u8,
+    type: MediaContentPartType,
     /// Base64-encoded binary data. Use either data or url.
     data: ?[]const u8 = null,
     /// URL or data URI media reference. Use either url or data.
@@ -480,9 +524,31 @@ pub const ModelQuantization = enum {
     }
 };
 
+pub const ImageURLContentPartType = enum {
+    image_url,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .image_url => "image_url",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "image_url", .image_url },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Image content for embedding (OpenAI-compatible format)
 pub const ImageURLContentPart = struct {
-    type: []const u8,
+    type: ImageURLContentPartType,
     image_url: ImageURL,
 };
 
@@ -563,9 +629,32 @@ pub const ReadResult = struct {
     regions: ?[]const TextRegion = null,
 };
 
+/// OpenAI-compatible response object type.
+pub const ModelsResponseObject = enum {
+    list,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .list => "list",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "list", .list },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const ModelsResponse = struct {
     /// OpenAI-compatible response object type.
-    object: []const u8,
+    object: ModelsResponseObject,
     /// OpenAI-compatible flat model list for generation/embedding models.
     data: []const std.json.Value,
     /// Whether clients should show model download commands.
@@ -593,10 +682,33 @@ pub const ModelsResponse = struct {
     transcribers: std.json.ArrayHashMap(ModelInfo),
 };
 
+/// The type of tool (currently only "function" is supported)
+pub const ToolType = enum {
+    function,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .function => "function",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "function", .function },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// A tool (function) that the model can call
 pub const Tool = struct {
     /// The type of tool (currently only "function" is supported)
-    type: []const u8,
+    type: ToolType,
     function: FunctionDefinition,
 };
 
@@ -608,6 +720,29 @@ pub const GenerateMessage = struct {
     tool_calls: ?[]const antfly_generating_openapi.ToolCall = null,
 };
 
+/// The type of tool call (only in first delta)
+pub const ToolCallDeltaType = enum {
+    function,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .function => "function",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "function", .function },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Incremental tool call data for streaming
 pub const ToolCallDelta = struct {
     /// Index of the tool call in the array
@@ -615,7 +750,7 @@ pub const ToolCallDelta = struct {
     /// Unique identifier (only in first delta for this index)
     id: ?[]const u8 = null,
     /// The type of tool call (only in first delta)
-    type: ?[]const u8 = null,
+    type: ?ToolCallDeltaType = null,
     function: ?ToolCallFunctionDelta = null,
 };
 
@@ -635,8 +770,17 @@ pub const ContentPart = union(enum) {
     image_url_content_part: *ImageURLContentPart,
     text_content_part: *TextContentPart,
 
+    fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
+        const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
+        defer allocator.free(encoded);
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.UnexpectedToken,
+        };
+    }
+
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+        const parsed = parseUnionVariantFromValue(T, allocator, source, options) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return null,
         };
@@ -799,12 +943,35 @@ pub const ChunkRequest = struct {
     config: ?ChunkConfig = null,
 };
 
+/// The object type, always "chat.completion"
+pub const GenerateResponseObject = enum {
+    chat_completion,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .chat_completion => "chat.completion",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "chat.completion", .chat_completion },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// OpenAI-compatible chat completion response
 pub const GenerateResponse = struct {
     /// A unique identifier for the chat completion
     id: []const u8,
     /// The object type, always "chat.completion"
-    object: []const u8,
+    object: GenerateResponseObject,
     /// Unix timestamp (seconds) when the completion was created
     created: i64,
     /// Model used for generation
@@ -829,10 +996,32 @@ pub const ChatMessage = struct {
     tool_call_id: ?[]const u8 = null,
 };
 
+pub const GenerateChunkObject = enum {
+    chat_completion_chunk,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .chat_completion_chunk => "chat.completion.chunk",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "chat.completion.chunk", .chat_completion_chunk },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Streaming generation chunk (SSE event data)
 pub const GenerateChunk = struct {
     id: []const u8,
-    object: []const u8,
+    object: GenerateChunkObject,
     created: i64,
     model: []const u8,
     choices: []const GenerateChunkChoice,

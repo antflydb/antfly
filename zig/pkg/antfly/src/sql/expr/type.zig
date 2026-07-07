@@ -1782,6 +1782,9 @@ pub fn validateGeneratedColumnForColumns(columns: []const runtime_schema.Relatio
         .expression => {
             const expression = generated.expression orelse return error.InvalidSqlCatalog;
             try validateGeneratedColumnExpressionForColumns(columns, column.name, expression);
+            if (!rowExpressionDeterministic(expression)) return error.InvalidSqlCatalog;
+            const expression_type = try checkExpressionTypeForColumns(columns, expression);
+            if (!checkExpressionTypesComparable(.{ .type = column.field_type }, expression_type)) return error.InvalidSqlCatalog;
         },
     }
 }

@@ -45,6 +45,14 @@ pub fn uniqueConstraintUsesDedicatedOwnerRows(constraint: schema_mod.UniqueConst
     return std.mem.eql(u8, constraint.name, primary_key_constraint_name) or constraint.without_overlaps_period != null;
 }
 
+pub fn uniqueConstraintUsesDedicatedOwnerRowsWithIndexes(
+    constraint: schema_mod.UniqueConstraint,
+    relational_indexes: []const schema_mod.RelationalIndex,
+) bool {
+    if (uniqueConstraintUsesDedicatedOwnerRows(constraint)) return true;
+    return relationalIndexForUniqueConstraint(relational_indexes, constraint, null) == null;
+}
+
 /// Project a relational document into its serialized typed-row KV value and
 /// track the buffer for cleanup. The row is always freshly allocated (the codec
 /// owns no input bytes), so it is appended to `owned_values` unconditionally.
@@ -470,6 +478,11 @@ pub fn encodeForeignKeyExternalizedParentCheckIntentValueAlloc(alloc: Allocator,
         defer alloc.free(encoded);
         try out.appendSlice(alloc, encoded);
     }
+    if (check.ordered_parent_tuple) |tuple| {
+        const encoded = try std.fmt.allocPrint(alloc, ",\"ordered_parent_tuple\":{f}", .{std.json.fmt(tuple, .{})});
+        defer alloc.free(encoded);
+        try out.appendSlice(alloc, encoded);
+    }
     if (check.child_period_start_json) |json| {
         const encoded = try std.fmt.allocPrint(alloc, ",\"child_period_start\":{s}", .{json});
         defer alloc.free(encoded);
@@ -571,6 +584,7 @@ pub fn freeExternalizedForeignKeyParentCheck(alloc: Allocator, check: *Externali
     alloc.free(@constCast(check.parent_table));
     alloc.free(@constCast(check.parent_key));
     if (check.parent_constraint_name) |name| alloc.free(@constCast(name));
+    if (check.ordered_parent_tuple) |tuple| alloc.free(@constCast(tuple));
     if (check.child_period_start_json) |json| alloc.free(@constCast(json));
     if (check.child_period_end_json) |json| alloc.free(@constCast(json));
     check.* = undefined;
@@ -610,6 +624,11 @@ fn parseForeignKeyExternalizedParentCheckIntentValueAlloc(alloc: Allocator, raw:
     else
         null;
     errdefer if (parent_constraint_name) |name| alloc.free(name);
+    const ordered_parent_tuple = if (jsonObjectString(obj, "ordered_parent_tuple")) |tuple|
+        try alloc.dupe(u8, tuple)
+    else
+        null;
+    errdefer if (ordered_parent_tuple) |tuple| alloc.free(tuple);
     const child_period_start_json = if (obj.get("child_period_start")) |value|
         try std.json.Stringify.valueAlloc(alloc, value, .{ .emit_null_optional_fields = false })
     else
@@ -628,6 +647,7 @@ fn parseForeignKeyExternalizedParentCheckIntentValueAlloc(alloc: Allocator, raw:
         .parent_table = parent_table,
         .parent_key = parent_key,
         .parent_constraint_name = parent_constraint_name,
+        .ordered_parent_tuple = ordered_parent_tuple,
         .child_period_start_json = child_period_start_json,
         .child_period_end_json = child_period_end_json,
         .timing = if (std.mem.eql(u8, timing, "deferred")) .deferred else .immediate,
@@ -980,6 +1000,7 @@ pub const ExternalizedForeignKeyParentCheck = struct {
     parent_table: []const u8,
     parent_key: []const u8,
     parent_constraint_name: ?[]const u8 = null,
+    ordered_parent_tuple: ?[]const u8 = null,
     child_period_start_json: ?[]const u8 = null,
     child_period_end_json: ?[]const u8 = null,
     timing: schema_mod.ForeignKeyTiming = .immediate,
@@ -1212,7 +1233,10 @@ pub const ColumnIndexPolicy = struct {
     pub fn canSkipUnchangedRowDerivedMaintenance(self: ColumnIndexPolicy) bool {
         for (self.columns) |column| {
             if (self.catalogIndexForMaintainedColumn(column)) |index| {
-                if (index.lifecycle != .ready) return false;
+                switch (index.access_method) {
+                    .scalar_column, .ordered_tuple => if (!relationalIndexReady(index)) return false,
+                    .algebraic_filter, .text_search => return false,
+                }
             }
         }
         return true;
@@ -1265,7 +1289,7 @@ pub const ColumnIndexPolicy = struct {
         for (self.columns) |column| {
             if (!std.mem.eql(u8, column.path, path) and !std.mem.eql(u8, column.name, path)) continue;
             if (self.catalogIndexForColumn(column, .scalar_column)) |index| {
-                return index.lifecycle == .ready;
+                return relationalIndexReady(index);
             }
             return false;
         }
@@ -1275,7 +1299,7 @@ pub const ColumnIndexPolicy = struct {
     pub fn indexForRebuild(self: ColumnIndexPolicy, index_name: []const u8, index_generation: u64) !schema_mod.RelationalIndex {
         if (self.catalogIndexByName(index_name)) |index| {
             if (index.owner_kind != .relational_column) return error.RelationalIndexNotFound;
-            if (!relationalIndexLifecycleRebuildable(index.lifecycle)) return error.RelationalIndexNotBuilding;
+            if (!relationalIndexRebuildable(index)) return error.RelationalIndexNotBuilding;
             if (index.generation != index_generation) return error.RelationalIndexGenerationMismatch;
             _ = self.columnByName(index.owner_name) orelse return error.RelationalIndexNotFound;
             return index;
@@ -1295,7 +1319,7 @@ pub const ColumnIndexPolicy = struct {
     fn catalogIndexForMaintainedColumn(self: ColumnIndexPolicy, column: schema_mod.RelationalColumn) ?schema_mod.RelationalIndex {
         const index = self.catalogIndexForColumn(column, null) orelse return null;
         return switch (index.access_method) {
-            .scalar_column, .ordered_tuple => if (relationalIndexLifecycleMaintained(index.lifecycle)) index else null,
+            .scalar_column, .ordered_tuple => if (relationalIndexMaintained(index)) index else null,
             .algebraic_filter, .text_search => null,
         };
     }
@@ -1418,13 +1442,28 @@ fn orderedTupleIndexEntryKeysForCellsAlloc(
     include_columns: []const []const u8,
     columns: []const schema_mod.RelationalColumn,
 ) !OrderedTupleIndexEntryKeys {
+    return try orderedTupleIndexEntryKeysForCellsWithMetadataAlloc(alloc, index_id, doc_key, cells, index_keys, include_columns, columns, 0, 0, null);
+}
+
+fn orderedTupleIndexEntryKeysForCellsWithMetadataAlloc(
+    alloc: Allocator,
+    index_id: []const u8,
+    doc_key: []const u8,
+    cells: []const relational_row_codec.Cell,
+    index_keys: []const schema_mod.RelationalIndexKey,
+    include_columns: []const []const u8,
+    columns: []const schema_mod.RelationalColumn,
+    row_generation: u64,
+    index_generation: u64,
+    schema_fingerprint: ?[]const u8,
+) !OrderedTupleIndexEntryKeys {
     const encoded_tuple = try orderedTupleValueForIndexKeyCellsAlloc(alloc, cells, index_keys, columns);
     errdefer alloc.free(encoded_tuple);
     const forward_key = try internal_keys.relationalOrderedTupleIndexKeyAlloc(alloc, index_id, encoded_tuple, doc_key);
     errdefer alloc.free(forward_key);
     const reverse_key = try internal_keys.relationalOrderedTupleIndexByDocKeyAlloc(alloc, doc_key, index_id, encoded_tuple);
     errdefer alloc.free(reverse_key);
-    const forward_value = try orderedTupleIncludePayloadForCellsAlloc(alloc, cells, include_columns, columns);
+    const forward_value = try orderedTupleIncludePayloadForCellsAlloc(alloc, cells, include_columns, columns, row_generation, index_generation, schema_fingerprint);
     return .{
         .encoded_tuple = encoded_tuple,
         .forward_key = forward_key,
@@ -1447,7 +1486,7 @@ fn orderedTupleIndexEntryKeysForEncodedTupleAlloc(
     errdefer alloc.free(forward_key);
     const reverse_key = try internal_keys.relationalOrderedTupleIndexByDocKeyAlloc(alloc, doc_key, index_id, encoded_tuple);
     errdefer alloc.free(reverse_key);
-    const forward_value = try orderedTupleIncludePayloadForCellsAlloc(alloc, cells, include_columns, columns);
+    const forward_value = try orderedTupleIncludePayloadForCellsAlloc(alloc, cells, include_columns, columns, 0, 0, null);
     return .{
         .encoded_tuple = encoded_tuple,
         .forward_key = forward_key,
@@ -1486,6 +1525,18 @@ fn orderedTupleUniqueIndexTupleValueForCellsAlloc(
     if (!(try rowMatchesExpressionConditionsWithColumns(alloc, row_value, index.where_expressions, columns))) return null;
     if (constraint.expressions.len == 0) return try orderedTupleValueForIndexKeyCellsAlloc(alloc, cells, index.keys, columns);
     return try uniqueConstraintExpressionTupleValueFromCellsAlloc(alloc, row_value, cells, constraint, columns);
+}
+
+pub fn orderedTupleUniqueIndexTupleValueAlloc(
+    alloc: Allocator,
+    row_value: []const u8,
+    constraint: schema_mod.UniqueConstraint,
+    index: schema_mod.RelationalIndex,
+    columns: []const schema_mod.RelationalColumn,
+) !?[]u8 {
+    var row = try relational_row_codec.deserialize(alloc, row_value);
+    defer row.deinit(alloc);
+    return try orderedTupleUniqueIndexTupleValueForCellsAlloc(alloc, row_value, row.cells, constraint, index, columns);
 }
 
 fn uniqueConstraintExpressionTupleValueFromCellsAlloc(
@@ -1533,6 +1584,9 @@ fn orderedTupleIncludePayloadForCellsAlloc(
     cells: []const relational_row_codec.Cell,
     include_columns: []const []const u8,
     columns: []const schema_mod.RelationalColumn,
+    row_generation: u64,
+    index_generation: u64,
+    schema_fingerprint: ?[]const u8,
 ) ![]u8 {
     if (include_columns.len == 0) return try alloc.dupe(u8, "");
     const payload_cells = try alloc.alloc(relational_row_codec.Cell, include_columns.len);
@@ -1547,7 +1601,85 @@ fn orderedTupleIncludePayloadForCellsAlloc(
             count += 1;
         }
     }
-    return try relational_row_codec.serialize(alloc, payload_cells[0..count]);
+    const cell_payload = try relational_row_codec.serialize(alloc, payload_cells[0..count]);
+    errdefer alloc.free(cell_payload);
+    if (row_generation == 0 or index_generation == 0 or schema_fingerprint == null or schema_fingerprint.?.len == 0) return cell_payload;
+    const encoded = try orderedTuplePayloadEnvelopeAlloc(alloc, row_generation, index_generation, schema_fingerprint.?, cell_payload);
+    alloc.free(cell_payload);
+    return encoded;
+}
+
+const ordered_tuple_payload_magic = "\x00antfly:ordered-tuple-payload:v1";
+
+pub const OrderedTuplePayloadView = struct {
+    has_metadata: bool = false,
+    row_generation: u64 = 0,
+    index_generation: u64 = 0,
+    schema_fingerprint: []const u8 = "",
+    cells: []const u8 = "",
+};
+
+fn orderedTuplePayloadEnvelopeAlloc(
+    alloc: Allocator,
+    row_generation: u64,
+    index_generation: u64,
+    schema_fingerprint: []const u8,
+    cell_payload: []const u8,
+) ![]u8 {
+    if (schema_fingerprint.len > std.math.maxInt(u16)) return error.InvalidColumnValue;
+    var out = try alloc.alloc(u8, ordered_tuple_payload_magic.len + 8 + 8 + 2 + schema_fingerprint.len + cell_payload.len);
+    var pos: usize = 0;
+    @memcpy(out[pos..][0..ordered_tuple_payload_magic.len], ordered_tuple_payload_magic);
+    pos += ordered_tuple_payload_magic.len;
+    std.mem.writeInt(u64, out[pos..][0..8], row_generation, .big);
+    pos += 8;
+    std.mem.writeInt(u64, out[pos..][0..8], index_generation, .big);
+    pos += 8;
+    std.mem.writeInt(u16, out[pos..][0..2], @intCast(schema_fingerprint.len), .big);
+    pos += 2;
+    @memcpy(out[pos..][0..schema_fingerprint.len], schema_fingerprint);
+    pos += schema_fingerprint.len;
+    @memcpy(out[pos..][0..cell_payload.len], cell_payload);
+    return out;
+}
+
+pub fn orderedTuplePayloadView(entry_payload: []const u8) !OrderedTuplePayloadView {
+    if (entry_payload.len == 0) return .{};
+    if (!std.mem.startsWith(u8, entry_payload, ordered_tuple_payload_magic)) {
+        return .{ .cells = entry_payload };
+    }
+    var pos: usize = ordered_tuple_payload_magic.len;
+    if (entry_payload.len < pos + 8 + 8 + 2) return error.InvalidColumnValue;
+    const row_generation = std.mem.readInt(u64, entry_payload[pos..][0..8], .big);
+    pos += 8;
+    const index_generation = std.mem.readInt(u64, entry_payload[pos..][0..8], .big);
+    pos += 8;
+    const fingerprint_len = std.mem.readInt(u16, entry_payload[pos..][0..2], .big);
+    pos += 2;
+    if (entry_payload.len < pos + fingerprint_len) return error.InvalidColumnValue;
+    const schema_fingerprint = entry_payload[pos..][0..fingerprint_len];
+    pos += fingerprint_len;
+    return .{
+        .has_metadata = true,
+        .row_generation = row_generation,
+        .index_generation = index_generation,
+        .schema_fingerprint = schema_fingerprint,
+        .cells = entry_payload[pos..],
+    };
+}
+
+pub fn orderedTuplePayloadMatchesMetadata(
+    entry_payload: []const u8,
+    index: schema_mod.RelationalIndex,
+    row_generation: u64,
+) !?[]const u8 {
+    const view = try orderedTuplePayloadView(entry_payload);
+    if (!view.has_metadata) return null;
+    if (view.row_generation != row_generation) return null;
+    if (view.index_generation != index.generation) return null;
+    const schema_fingerprint = index.schema_fingerprint orelse return null;
+    if (!std.mem.eql(u8, view.schema_fingerprint, schema_fingerprint)) return null;
+    return view.cells;
 }
 
 fn orderedTupleEntryRowMatchForRowValueAlloc(
@@ -1612,7 +1744,8 @@ fn orderedTupleEntryRowMatchForRowValueAlloc(
         try alloc.alloc(?relational_row_codec.Cell, include_count);
     defer if (include_count > stack_entry_payload_cells.len) alloc.free(entry_payload_cells);
 
-    try relational_row_codec.collectCellsByLookup(entry_payload, lookups[key_count..], entry_payload_cells);
+    const payload_view = try orderedTuplePayloadView(entry_payload);
+    try relational_row_codec.collectCellsByLookup(payload_view.cells, lookups[key_count..], entry_payload_cells);
     return if (orderedTupleIncludePayloadCellsMatch(cells[key_count..], entry_payload_cells)) .tuple_and_payload else .tuple;
 }
 
@@ -1814,6 +1947,7 @@ pub const WriteParticipant = struct {
     set_null_update_limit: usize = default_max_set_null_updates,
     cascade_depth: usize = 0,
     cascade_delete_count: usize = 0,
+    next_row_generation: u64 = 0,
     prepared: bool = false,
     closed: bool = false,
 
@@ -1895,6 +2029,10 @@ pub const WriteParticipant = struct {
         self.relational_columns = relational_columns;
     }
 
+    pub fn configureNextRowGeneration(self: *WriteParticipant, row_generation: u64) void {
+        self.next_row_generation = row_generation;
+    }
+
     fn uniqueConstraintTupleValueForRowAlloc(
         self: *const WriteParticipant,
         row_value: []const u8,
@@ -1922,6 +2060,8 @@ pub const WriteParticipant = struct {
         _ = table;
         _ = txn_id;
         if (self.closed) return error.ParticipantClosed;
+        const row_generation = self.next_row_generation;
+        self.next_row_generation = 0;
         const old_row = try getRawAlloc(self.alloc, self.store, doc_key);
         defer if (old_row) |row| self.alloc.free(row);
         const final_state_deleted = containsKey(self.planned_delete_keys, doc_key);
@@ -1959,7 +2099,7 @@ pub const WriteParticipant = struct {
         try self.preparePrimaryKeyUpsertWithCells(doc_key, old_row, old_cells, typed_row, new_cells, final_state_deleted);
         try self.prepareUniqueConstraintUpsertWithCells(doc_key, old_row, old_cells, typed_row, new_cells, final_state_deleted);
         try self.prepareForeignKeyUpsertWithCells(doc_key, old_row, old_cells, typed_row, new_cells, final_state_deleted);
-        try appendUpsertWithColumnIndexPolicyAndOldRowAndCells(self.alloc, self.writes, self.deletes, self.owned_keys, self.owned_values, doc_key, old_row, old_cells, typed_row, new_cells, self.column_index_policy);
+        try appendUpsertWithColumnIndexPolicyAndOldRowAndCells(self.alloc, self.writes, self.deletes, self.owned_keys, self.owned_values, doc_key, old_row, old_cells, typed_row, new_cells, self.column_index_policy, row_generation);
         try self.appendOrderedTupleUniqueConstraintUpsertWithCells(doc_key, old_row, old_cells, typed_row, new_cells, final_state_deleted);
         self.prepared = true;
     }
@@ -2008,6 +2148,8 @@ pub const WriteParticipant = struct {
         _ = txn_id;
         if (self.closed) return error.ParticipantClosed;
         if (std.mem.eql(u8, old_doc_key, new_doc_key)) return error.UnsupportedOperation;
+        const row_generation = self.next_row_generation;
+        self.next_row_generation = 0;
         const old_row = try getRawAlloc(self.alloc, self.store, old_doc_key) orelse return error.RowSelectorNotFound;
         defer self.alloc.free(old_row);
         var old_decoded = try relational_row_codec.deserialize(self.alloc, old_row);
@@ -2043,6 +2185,7 @@ pub const WriteParticipant = struct {
             new_row,
             new_decoded.cells,
             self.column_index_policy,
+            row_generation,
         );
         self.prepared = true;
     }
@@ -2990,7 +3133,7 @@ pub const WriteParticipant = struct {
                 else
                     null;
                 defer if (ordered_parent_tuple) |tuple| self.alloc.free(tuple);
-                if (!self.parentCheckExternalized(foreign_key, doc_key, parent_key, new_span)) try self.deferForeignKeyParentCheck(foreign_key, parent_key, ordered_parent_tuple, new_span);
+                if (!self.parentCheckExternalized(foreign_key, doc_key, parent_key, ordered_parent_tuple, new_span)) try self.deferForeignKeyParentCheck(foreign_key, parent_key, ordered_parent_tuple, new_span);
                 if (parent_changed) try self.appendForeignKeyRefWrite(foreign_key, parent_key, doc_key);
             }
         }
@@ -3025,7 +3168,7 @@ pub const WriteParticipant = struct {
                 else
                     null;
                 defer if (ordered_parent_tuple) |tuple| self.alloc.free(tuple);
-                if (!self.parentCheckExternalized(foreign_key, doc_key, parent_key, new_span)) try self.deferForeignKeyParentCheck(foreign_key, parent_key, ordered_parent_tuple, new_span);
+                if (!self.parentCheckExternalized(foreign_key, doc_key, parent_key, ordered_parent_tuple, new_span)) try self.deferForeignKeyParentCheck(foreign_key, parent_key, ordered_parent_tuple, new_span);
                 if (parent_changed) try self.appendForeignKeyRefWrite(foreign_key, parent_key, doc_key);
             }
         }
@@ -3071,13 +3214,13 @@ pub const WriteParticipant = struct {
             if (new_parent) |parent_key| {
                 const ordered_parent_tuple = try self.orderedTupleParentValueForForeignKeyCellsAlloc(foreign_key, new_cells);
                 defer if (ordered_parent_tuple) |tuple| self.alloc.free(tuple);
-                if (parent_changed and !self.parentCheckExternalized(foreign_key, new_doc_key, parent_key, null)) try self.deferForeignKeyParentCheck(foreign_key, parent_key, ordered_parent_tuple, null);
+                if (parent_changed and !self.parentCheckExternalized(foreign_key, new_doc_key, parent_key, ordered_parent_tuple, null)) try self.deferForeignKeyParentCheck(foreign_key, parent_key, ordered_parent_tuple, null);
                 try self.appendForeignKeyRefWrite(foreign_key, parent_key, new_doc_key);
             }
         }
     }
 
-    fn parentCheckExternalized(self: *const WriteParticipant, foreign_key: schema_mod.ForeignKey, child_key: []const u8, parent_key: []const u8, child_span: ?PeriodSpan) bool {
+    fn parentCheckExternalized(self: *const WriteParticipant, foreign_key: schema_mod.ForeignKey, child_key: []const u8, parent_key: []const u8, ordered_parent_tuple: ?[]const u8, child_span: ?PeriodSpan) bool {
         for (self.externalized_parent_checks) |check| {
             if (!std.mem.eql(u8, check.constraint_name, foreign_key.name)) continue;
             if (!std.mem.eql(u8, check.child_table, self.effectiveTableName())) continue;
@@ -3091,9 +3234,14 @@ pub const WriteParticipant = struct {
             } else if (check.child_period_start_json != null or check.child_period_end_json != null) continue;
             if (foreignKeyReferencesPrimaryKey(foreign_key)) {
                 if (check.parent_constraint_name != null) continue;
+                if (check.ordered_parent_tuple != null) continue;
             } else {
                 const check_constraint_name = check.parent_constraint_name orelse continue;
                 if (check_constraint_name.len == 0) continue;
+                if (ordered_parent_tuple) |tuple| {
+                    const check_tuple = check.ordered_parent_tuple orelse continue;
+                    if (!std.mem.eql(u8, tuple, check_tuple)) continue;
+                } else if (check.ordered_parent_tuple != null) continue;
                 if (std.mem.eql(u8, foreign_key.parent_table, self.effectiveTableName())) {
                     const parent_constraint = self.findParentTupleConstraint(foreign_key.parent_columns) orelse continue;
                     if (!std.mem.eql(u8, check_constraint_name, parent_constraint.name)) continue;
@@ -4186,7 +4334,7 @@ fn foreignKeyParentExistsForChildRow(
     return try temporalForeignKeyParentCovers(alloc, store, parent_constraint, parent_key, child_span);
 }
 
-fn orderedTupleParentValueForForeignKeyRowAlloc(
+pub fn orderedTupleParentValueForForeignKeyRowAlloc(
     alloc: Allocator,
     row_value: []const u8,
     foreign_key: schema_mod.ForeignKey,
@@ -4216,6 +4364,51 @@ fn orderedTupleParentValueForForeignKeyRowAlloc(
         const child_column = foreign_key.child_columns[parent_column_index];
         ordered_cells[key_index] = findCellInCells(row.cells, child_column) orelse return null;
         ordered_columns[key_index] = findRelationalColumn(columns, index_key.column) orelse return null;
+    }
+
+    return try orderedTupleValueForMatchedIndexCellsAlloc(alloc, ordered_cells, ordered_columns, index.keys);
+}
+
+pub fn readyChildOrderedTupleIndexForForeignKey(
+    relational_indexes: []const schema_mod.RelationalIndex,
+    foreign_key: schema_mod.ForeignKey,
+) !?schema_mod.RelationalIndex {
+    if (foreign_key.child_period != null or foreign_key.parent_period != null) return null;
+    var saw_covering_ordered_index = false;
+    for (relational_indexes) |index| {
+        if (index.owner_kind != .relational_column or index.access_method != .ordered_tuple) continue;
+        if (!orderedTupleIndexCoversForeignKeyChildColumns(index, foreign_key)) continue;
+        saw_covering_ordered_index = true;
+        if (!orderedTupleIndexReadyForConstraintLookup(index)) return error.ForeignKeyViolation;
+        if (index.where.len != 0 or index.where_expressions.len != 0) return error.ForeignKeyViolation;
+        return index;
+    }
+    return if (saw_covering_ordered_index) error.ForeignKeyViolation else null;
+}
+
+pub fn orderedTupleChildValueForForeignKeyParentRowAlloc(
+    alloc: Allocator,
+    parent_row_value: []const u8,
+    foreign_key: schema_mod.ForeignKey,
+    child_relational_indexes: []const schema_mod.RelationalIndex,
+    child_columns: []const schema_mod.RelationalColumn,
+    parent_columns: []const schema_mod.RelationalColumn,
+) !?[]u8 {
+    const index = try readyChildOrderedTupleIndexForForeignKey(child_relational_indexes, foreign_key) orelse return null;
+    var parent_row = try relational_row_codec.deserialize(alloc, parent_row_value);
+    defer parent_row.deinit(alloc);
+
+    const ordered_cells = try alloc.alloc(?relational_row_codec.Cell, index.keys.len);
+    defer alloc.free(ordered_cells);
+    const ordered_columns = try alloc.alloc(schema_mod.RelationalColumn, index.keys.len);
+    defer alloc.free(ordered_columns);
+
+    for (index.keys, 0..) |index_key, key_index| {
+        const child_column_index = foreignKeyChildColumnIndex(foreign_key, index_key.column) orelse return error.ForeignKeyViolation;
+        const parent_column = foreign_key.parent_columns[child_column_index];
+        ordered_cells[key_index] = findCellInCells(parent_row.cells, parent_column) orelse return error.ForeignKeyViolation;
+        if (findRelationalColumn(parent_columns, parent_column) == null) return error.ForeignKeyViolation;
+        ordered_columns[key_index] = findRelationalColumn(child_columns, index_key.column) orelse return error.ForeignKeyViolation;
     }
 
     return try orderedTupleValueForMatchedIndexCellsAlloc(alloc, ordered_cells, ordered_columns, index.keys);
@@ -7705,7 +7898,7 @@ fn appendUpsertWithColumnIndexPolicyAndOldRow(
     row_value: []const u8,
     column_index_policy: ColumnIndexPolicy,
 ) !void {
-    try appendUpsertInternalWithOldRow(alloc, writes, deletes, owned_keys, owned_values, doc_key, old_row_value, row_value, column_index_policy);
+    try appendUpsertInternalWithOldRow(alloc, writes, deletes, owned_keys, owned_values, doc_key, old_row_value, row_value, column_index_policy, 0);
 }
 
 fn appendUpsertWithColumnIndexPolicyAndOldRowAndCells(
@@ -7720,8 +7913,9 @@ fn appendUpsertWithColumnIndexPolicyAndOldRowAndCells(
     row_value: []const u8,
     new_cells: ?[]const relational_row_codec.Cell,
     column_index_policy: ColumnIndexPolicy,
+    row_generation: u64,
 ) !void {
-    try appendUpsertInternalWithOldRowAndCells(alloc, writes, deletes, owned_keys, owned_values, doc_key, old_row_value, old_cells, row_value, new_cells, column_index_policy);
+    try appendUpsertInternalWithOldRowAndCells(alloc, writes, deletes, owned_keys, owned_values, doc_key, old_row_value, old_cells, row_value, new_cells, column_index_policy, row_generation);
 }
 
 pub fn appendDeleteOwnedBatch(
@@ -7787,6 +7981,7 @@ pub fn appendColumnBackedIndexWritesForRowWithColumnIndexPolicy(
         row_value,
         row.cells,
         column_index_policy,
+        0,
     );
 }
 
@@ -9340,6 +9535,7 @@ pub fn rebuildColumnIndexFromRowsInSpanPageWithColumnIndexPolicy(
                 row.row_value,
                 decoded.cells,
                 target_policy,
+                0,
             );
         }
         if (writes.items.len > before) {
@@ -9985,6 +10181,7 @@ pub fn rebuildUniqueConstraintRowsInRange(
     columns: []const schema_mod.RelationalColumn,
     periods: []const schema_mod.RelationalPeriod,
     unique_constraints: []const schema_mod.UniqueConstraint,
+    relational_indexes: []const schema_mod.RelationalIndex,
     lower_doc_key: []const u8,
     upper_doc_key: []const u8,
 ) !void {
@@ -10008,7 +10205,7 @@ pub fn rebuildUniqueConstraintRowsInRange(
 
     for (rows) |row| {
         for (unique_constraints) |constraint| {
-            if (!uniqueConstraintUsesDedicatedOwnerRows(constraint)) continue;
+            if (!uniqueConstraintUsesDedicatedOwnerRowsWithIndexes(constraint, relational_indexes)) continue;
             const encoded_value = (try uniqueConstraintTupleValueWithColumnsAlloc(alloc, row.row_value, constraint, columns)) orelse continue;
             defer alloc.free(encoded_value);
 
@@ -10053,6 +10250,7 @@ pub fn reconcileUniqueConstraintRowsInRange(
     columns: []const schema_mod.RelationalColumn,
     periods: []const schema_mod.RelationalPeriod,
     unique_constraints: []const schema_mod.UniqueConstraint,
+    relational_indexes: []const schema_mod.RelationalIndex,
     lower_doc_key: []const u8,
     upper_doc_key: []const u8,
     mode: ForeignKeyIntegrityMode,
@@ -10081,7 +10279,7 @@ pub fn reconcileUniqueConstraintRowsInRange(
     for (rows) |row| {
         report.scanned_rows += 1;
         for (unique_constraints) |constraint| {
-            if (!uniqueConstraintUsesDedicatedOwnerRows(constraint)) continue;
+            if (!uniqueConstraintUsesDedicatedOwnerRowsWithIndexes(constraint, relational_indexes)) continue;
             const encoded_value = (try uniqueConstraintTupleValueWithColumnsAlloc(alloc, row.row_value, constraint, columns)) orelse continue;
             defer alloc.free(encoded_value);
             const key = if (constraint.without_overlaps_period) |period_name| blk: {
@@ -10144,7 +10342,7 @@ pub fn reconcileUniqueConstraintRowsInRange(
         const constraint_name = (try decodeRelationalUniqueConstraintNameAlloc(alloc, entry.key)) orelse continue;
         defer alloc.free(constraint_name);
         if (findUniqueConstraintNameInCatalog(unique_constraints, constraint_name)) |constraint| {
-            if (!uniqueConstraintUsesDedicatedOwnerRows(constraint)) {
+            if (!uniqueConstraintUsesDedicatedOwnerRowsWithIndexes(constraint, relational_indexes)) {
                 report.stale_unique_rows += 1;
                 if (mode == .repair or mode == .dry_run) {
                     report.deleted_stale_unique_rows += 1;
@@ -10174,7 +10372,7 @@ pub fn reconcileUniqueConstraintRowsInRange(
         const constraint_name = (try decodeRelationalTemporalUniqueConstraintNameAlloc(alloc, entry.key)) orelse continue;
         defer alloc.free(constraint_name);
         if (findUniqueConstraintNameInCatalog(unique_constraints, constraint_name)) |constraint| {
-            if (!uniqueConstraintUsesDedicatedOwnerRows(constraint)) continue;
+            if (!uniqueConstraintUsesDedicatedOwnerRowsWithIndexes(constraint, relational_indexes)) continue;
         } else continue;
         report.scanned_unique_rows += 1;
         if (batchWriteValue(expected.items, entry.key)) |expected_owner| {
@@ -10945,7 +11143,7 @@ fn appendUpsertInternal(
 ) !void {
     const old_row_value = try getRawAlloc(alloc, store, doc_key);
     defer if (old_row_value) |value| alloc.free(value);
-    try appendUpsertInternalWithOldRow(alloc, writes, deletes, owned_keys, owned_values, doc_key, old_row_value, row_value, column_index_policy);
+    try appendUpsertInternalWithOldRow(alloc, writes, deletes, owned_keys, owned_values, doc_key, old_row_value, row_value, column_index_policy, 0);
 }
 
 fn appendUpsertInternalWithOldRow(
@@ -10958,11 +11156,12 @@ fn appendUpsertInternalWithOldRow(
     old_row_value: ?[]const u8,
     row_value: []const u8,
     column_index_policy: ColumnIndexPolicy,
+    row_generation: u64,
 ) !void {
     if (!column_index_policy.mayIndexAnyRow() or
         (old_row_value != null and std.mem.eql(u8, old_row_value.?, row_value) and column_index_policy.canSkipUnchangedRowDerivedMaintenance()))
     {
-        return try appendUpsertInternalWithOldRowAndCells(alloc, writes, deletes, owned_keys, owned_values, doc_key, old_row_value, null, row_value, null, column_index_policy);
+        return try appendUpsertInternalWithOldRowAndCells(alloc, writes, deletes, owned_keys, owned_values, doc_key, old_row_value, null, row_value, null, column_index_policy, row_generation);
     }
 
     var new_row = try relational_row_codec.deserialize(alloc, row_value);
@@ -10986,6 +11185,7 @@ fn appendUpsertInternalWithOldRow(
         row_value,
         new_row.cells,
         column_index_policy,
+        row_generation,
     );
 }
 
@@ -11001,6 +11201,7 @@ fn appendUpsertInternalWithOldRowAndCells(
     row_value: []const u8,
     new_cells: ?[]const relational_row_codec.Cell,
     column_index_policy: ColumnIndexPolicy,
+    row_generation: u64,
 ) !void {
     const may_index_any_row = column_index_policy.mayIndexAnyRow();
     if (may_index_any_row) try validateColumnIndexPolicyForWriteMaintenance(column_index_policy);
@@ -11053,6 +11254,7 @@ fn appendUpsertInternalWithOldRowAndCells(
             row_value,
             resolved_new_cells,
             column_index_policy,
+            row_generation,
         );
     } else {
         const reserve = insertIndexReserveCounts(column_index_policy, resolved_new_cells);
@@ -11064,7 +11266,7 @@ fn appendUpsertInternalWithOldRowAndCells(
                 try appendColumnIndexWriteForCell(alloc, writes, owned_keys, owned_values, doc_key, cell);
             }
         }
-        try appendOrderedTupleIndexWritesForRowWithColumnIndexPolicy(alloc, writes, owned_keys, owned_values, doc_key, row_value, resolved_new_cells, column_index_policy);
+        try appendOrderedTupleIndexWritesForRowWithColumnIndexPolicy(alloc, writes, owned_keys, owned_values, doc_key, row_value, resolved_new_cells, column_index_policy, row_generation);
     }
 }
 
@@ -11155,6 +11357,7 @@ fn appendChangedOrderedTupleIndexMutationsForRows(
     new_row_value: []const u8,
     new_cells: []const relational_row_codec.Cell,
     column_index_policy: ColumnIndexPolicy,
+    row_generation: u64,
 ) !void {
     for (column_index_policy.indexes) |index| {
         if (index.owner_kind != .relational_column) continue;
@@ -11170,7 +11373,7 @@ fn appendChangedOrderedTupleIndexMutationsForRows(
                 try appendOrderedTupleIndexDeleteKeys(alloc, deletes, owned_keys, &old_keys);
                 continue;
             }
-            var new_keys = try orderedTupleIndexEntryKeysForCellsAlloc(alloc, index.name, doc_key, new_cells, index.keys, index.include_columns, column_index_policy.columns);
+            var new_keys = try orderedTupleIndexEntryKeysForCellsWithMetadataAlloc(alloc, index.name, doc_key, new_cells, index.keys, index.include_columns, column_index_policy.columns, row_generation, index.generation, index.schema_fingerprint);
             defer new_keys.deinit(alloc);
             if (std.mem.eql(u8, old_keys.encoded_tuple, new_keys.encoded_tuple)) {
                 if (!std.mem.eql(u8, old_keys.forward_value, new_keys.forward_value)) {
@@ -11181,7 +11384,7 @@ fn appendChangedOrderedTupleIndexMutationsForRows(
             try appendOrderedTupleIndexDeleteKeys(alloc, deletes, owned_keys, &old_keys);
             try appendOrderedTupleIndexWriteKeys(alloc, writes, owned_keys, owned_values, &new_keys);
         } else if (new_indexed) {
-            var new_keys = try orderedTupleIndexEntryKeysForCellsAlloc(alloc, index.name, doc_key, new_cells, index.keys, index.include_columns, column_index_policy.columns);
+            var new_keys = try orderedTupleIndexEntryKeysForCellsWithMetadataAlloc(alloc, index.name, doc_key, new_cells, index.keys, index.include_columns, column_index_policy.columns, row_generation, index.generation, index.schema_fingerprint);
             defer new_keys.deinit(alloc);
             try appendOrderedTupleIndexWriteKeys(alloc, writes, owned_keys, owned_values, &new_keys);
         }
@@ -11243,6 +11446,7 @@ fn appendOrderedTupleIndexWritesForRowWithColumnIndexPolicy(
     row_value: []const u8,
     cells: []const relational_row_codec.Cell,
     column_index_policy: ColumnIndexPolicy,
+    row_generation: u64,
 ) !void {
     for (column_index_policy.indexes) |index| {
         if (index.owner_kind != .relational_column) continue;
@@ -11250,7 +11454,7 @@ fn appendOrderedTupleIndexWritesForRowWithColumnIndexPolicy(
         if (column_index_policy.orderedTupleIndexOwnerColumn(index) == null) continue;
         if (!(try orderedTupleIndexMaintainedChecked(index))) continue;
         if (!(try column_index_policy.shouldIndexCatalogRow(alloc, index, row_value))) continue;
-        var keys = try orderedTupleIndexEntryKeysForCellsAlloc(alloc, index.name, doc_key, cells, index.keys, index.include_columns, column_index_policy.columns);
+        var keys = try orderedTupleIndexEntryKeysForCellsWithMetadataAlloc(alloc, index.name, doc_key, cells, index.keys, index.include_columns, column_index_policy.columns, row_generation, index.generation, index.schema_fingerprint);
         defer keys.deinit(alloc);
         try appendOrderedTupleIndexWriteKeys(alloc, writes, owned_keys, owned_values, &keys);
     }
@@ -11280,7 +11484,7 @@ fn appendOrderedTupleIndexDeletesForRowWithColumnIndexPolicy(
 fn orderedTupleIndexMaintained(index: schema_mod.RelationalIndex) bool {
     return index.access_method == .ordered_tuple and
         index.keys.len != 0 and
-        relationalIndexLifecycleMaintained(index.lifecycle);
+        relationalIndexMaintained(index);
 }
 
 fn orderedTupleIndexMaintainedChecked(index: schema_mod.RelationalIndex) !bool {
@@ -11302,31 +11506,40 @@ fn validateColumnIndexPolicyForWriteMaintenance(column_index_policy: ColumnIndex
 fn orderedTupleIndexRebuildable(index: schema_mod.RelationalIndex) bool {
     return index.access_method == .ordered_tuple and
         index.keys.len != 0 and
-        relationalIndexLifecycleRebuildable(index.lifecycle);
+        relationalIndexRebuildable(index);
 }
 
 fn orderedTupleUniqueIndexMaintained(constraint: schema_mod.UniqueConstraint, index: schema_mod.RelationalIndex) bool {
     return index.access_method == .ordered_tuple and
         (index.keys.len != 0 or constraint.expressions.len != 0) and
         constraint.without_overlaps_period == null and
-        relationalIndexLifecycleMaintained(index.lifecycle);
+        relationalIndexMaintained(index);
 }
 
 pub fn orderedTupleUniqueIndexLookupReady(constraint: schema_mod.UniqueConstraint, index: schema_mod.RelationalIndex) bool {
+    const expression_keys_match = blk: {
+        if (index.expressions.len != constraint.expressions.len) break :blk false;
+        for (index.expressions, constraint.expressions) |index_expression, constraint_expression| {
+            if (index_expression.op != constraint_expression.op) break :blk false;
+            if (!std.mem.eql(u8, index_expression.field, constraint_expression.field)) break :blk false;
+            if (index_expression.expression != null or constraint_expression.expression != null) break :blk false;
+        }
+        break :blk true;
+    };
     return constraint.validation_state == .enforced and
         index.access_method == .ordered_tuple and
-        index.keys.len != 0 and
         index.keys.len == constraint.columns.len and
+        (index.keys.len != 0 or constraint.expressions.len != 0) and
+        expression_keys_match and
         index.generation != 0 and
         index.schema_fingerprint != null and
         index.schema_fingerprint.?.len != 0 and
-        constraint.expressions.len == 0 and
         constraint.without_overlaps_period == null and
-        index.lifecycle == .ready;
+        relationalIndexReady(index);
 }
 
 fn orderedTupleIndexReadyForConstraintLookup(index: schema_mod.RelationalIndex) bool {
-    return index.lifecycle == .ready and
+    return relationalIndexReady(index) and
         index.generation != 0 and
         index.schema_fingerprint != null and
         index.schema_fingerprint.?.len != 0;
@@ -11372,6 +11585,21 @@ fn relationalIndexLifecycleRebuildable(lifecycle: schema_mod.RelationalIndexLife
         .building, .rebuild_required => true,
         .ready, .catching_up, .invalid, .dropping, .stale, .failed => false,
     };
+}
+
+fn relationalIndexMaintained(index: schema_mod.RelationalIndex) bool {
+    const lifecycle = schema_mod.relationalIndexLifecycle(index) orelse return false;
+    return relationalIndexLifecycleMaintained(lifecycle);
+}
+
+fn relationalIndexRebuildable(index: schema_mod.RelationalIndex) bool {
+    const lifecycle = schema_mod.relationalIndexLifecycle(index) orelse return false;
+    return relationalIndexLifecycleRebuildable(lifecycle);
+}
+
+fn relationalIndexReady(index: schema_mod.RelationalIndex) bool {
+    const lifecycle = schema_mod.relationalIndexLifecycle(index) orelse return false;
+    return lifecycle == .ready;
 }
 
 fn orderedTupleIndexId(column: schema_mod.RelationalColumn) []const u8 {
@@ -12275,6 +12503,7 @@ test "relational ordered tuple index maintenance skips unchanged overwrites" {
         .lifecycle = .ready,
         .generation = 7,
         .schema_fingerprint = "secondary-index-v1:orders_status_amount_idx",
+        .generation_record = .{ .generation = 7, .lifecycle = .ready },
     }};
 
     const initial_row = try relational_row_codec.serialize(alloc, &.{
@@ -12412,7 +12641,7 @@ test "relational ordered tuple index maintenance skips unchanged overwrites" {
     try std.testing.expectEqual(@as(usize, 0), active_after_delete.len);
 }
 
-test "relational ordered tuple column maintenance rejects missing durable identity" {
+test "relational ordered tuple column maintenance fails closed on missing durable identity" {
     const alloc = std.testing.allocator;
     var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
     defer backend.close();
@@ -12468,23 +12697,26 @@ test "relational ordered tuple column maintenance rejects missing durable identi
         owned_values.deinit(alloc);
     }
 
-    try std.testing.expectError(
-        error.RelationalIndexGenerationMismatch,
-        appendUpsertWithColumnIndexPolicy(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:missing-generation", row, ColumnIndexPolicy.fromSchemaParts(columns[0..], missing_generation_indexes[0..])),
-    );
-    try std.testing.expectEqual(@as(usize, 0), writes.items.len);
-    try std.testing.expectEqual(@as(usize, 0), deletes.items.len);
-    try std.testing.expectEqual(@as(usize, 0), owned_keys.items.len);
-    try std.testing.expectEqual(@as(usize, 0), owned_values.items.len);
+    const countOrderedWrites = struct {
+        fn count(items: []const docstore_mod.KVPair) usize {
+            var n: usize = 0;
+            for (items) |item| {
+                if (internal_keys.isRelationalOrderedTupleIndexKey(item.key) or
+                    internal_keys.isRelationalOrderedTupleIndexByDocKey(item.key)) n += 1;
+            }
+            return n;
+        }
+    }.count;
 
-    try std.testing.expectError(
-        error.InvalidSchemaUpdateRequest,
-        appendUpsertWithColumnIndexPolicy(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:missing-fingerprint", row, ColumnIndexPolicy.fromSchemaParts(columns[0..], missing_fingerprint_indexes[0..])),
-    );
-    try std.testing.expectEqual(@as(usize, 0), writes.items.len);
+    try appendUpsertWithColumnIndexPolicy(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:missing-generation", row, ColumnIndexPolicy.fromSchemaParts(columns[0..], missing_generation_indexes[0..]));
+    try std.testing.expectEqual(@as(usize, 0), countOrderedWrites(writes.items));
     try std.testing.expectEqual(@as(usize, 0), deletes.items.len);
-    try std.testing.expectEqual(@as(usize, 0), owned_keys.items.len);
-    try std.testing.expectEqual(@as(usize, 0), owned_values.items.len);
+    writes.clearRetainingCapacity();
+    deletes.clearRetainingCapacity();
+
+    try appendUpsertWithColumnIndexPolicy(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:missing-fingerprint", row, ColumnIndexPolicy.fromSchemaParts(columns[0..], missing_fingerprint_indexes[0..]));
+    try std.testing.expectEqual(@as(usize, 0), countOrderedWrites(writes.items));
+    try std.testing.expectEqual(@as(usize, 0), deletes.items.len);
 }
 
 test "relational ordered tuple index maintenance tracks partial predicate membership" {
@@ -12520,6 +12752,7 @@ test "relational ordered tuple index maintenance tracks partial predicate member
         .lifecycle = .ready,
         .generation = 7,
         .schema_fingerprint = "secondary-index-v1:orders_status_amount_partial_idx",
+        .generation_record = .{ .generation = 7, .lifecycle = .ready },
     }};
 
     const inactive_row = try relational_row_codec.serialize(alloc, &.{
@@ -12688,6 +12921,7 @@ test "relational ordered tuple index scan orders duplicate tuples by document ke
         .lifecycle = .ready,
         .generation = 7,
         .schema_fingerprint = "secondary-index-v1:orders_status_amount_dup_idx",
+        .generation_record = .{ .generation = 7, .lifecycle = .ready },
     }};
 
     const duplicate_row = try relational_row_codec.serialize(alloc, &.{
@@ -12779,6 +13013,14 @@ test "relational ordered tuple index maintenance respects lifecycle states" {
         .{ .column = "status" },
         .{ .column = "amount" },
     };
+    const missing_record_keys = [_]schema_mod.RelationalIndexKey{
+        .{ .column = "status" },
+        .{ .column = "amount" },
+    };
+    const stale_record_keys = [_]schema_mod.RelationalIndexKey{
+        .{ .column = "status" },
+        .{ .column = "amount" },
+    };
     const columns = [_]schema_mod.RelationalColumn{
         .{
             .name = "ready_status",
@@ -12828,6 +13070,18 @@ test "relational ordered tuple index maintenance respects lifecycle states" {
             .field_type = .keyword,
             .indexed = false,
         },
+        .{
+            .name = "missing_record_status",
+            .path = "status",
+            .field_type = .keyword,
+            .indexed = false,
+        },
+        .{
+            .name = "stale_record_status",
+            .path = "status",
+            .field_type = .keyword,
+            .indexed = false,
+        },
         .{ .name = "amount", .path = "amount", .field_type = .numeric, .indexed = false },
     };
     const indexes = [_]schema_mod.RelationalIndex{
@@ -12841,6 +13095,7 @@ test "relational ordered tuple index maintenance respects lifecycle states" {
             .lifecycle = .ready,
             .generation = 10,
             .schema_fingerprint = "secondary-index-v1:orders_ready_tuple_idx",
+            .generation_record = .{ .generation = 10, .lifecycle = .ready },
         },
         .{
             .name = "orders_building_tuple_idx",
@@ -12852,6 +13107,7 @@ test "relational ordered tuple index maintenance respects lifecycle states" {
             .lifecycle = .building,
             .generation = 11,
             .schema_fingerprint = "secondary-index-v1:orders_building_tuple_idx",
+            .generation_record = .{ .generation = 11, .lifecycle = .building },
         },
         .{
             .name = "orders_invalid_tuple_idx",
@@ -12863,6 +13119,7 @@ test "relational ordered tuple index maintenance respects lifecycle states" {
             .lifecycle = .invalid,
             .generation = 12,
             .schema_fingerprint = "secondary-index-v1:orders_invalid_tuple_idx",
+            .generation_record = .{ .generation = 12, .lifecycle = .invalid },
         },
         .{
             .name = "orders_dropping_tuple_idx",
@@ -12874,6 +13131,7 @@ test "relational ordered tuple index maintenance respects lifecycle states" {
             .lifecycle = .dropping,
             .generation = 13,
             .schema_fingerprint = "secondary-index-v1:orders_dropping_tuple_idx",
+            .generation_record = .{ .generation = 13, .lifecycle = .dropping },
         },
         .{
             .name = "orders_catching_up_tuple_idx",
@@ -12885,6 +13143,7 @@ test "relational ordered tuple index maintenance respects lifecycle states" {
             .lifecycle = .catching_up,
             .generation = 14,
             .schema_fingerprint = "secondary-index-v1:orders_catching_up_tuple_idx",
+            .generation_record = .{ .generation = 14, .lifecycle = .catching_up },
         },
         .{
             .name = "orders_stale_tuple_idx",
@@ -12896,6 +13155,7 @@ test "relational ordered tuple index maintenance respects lifecycle states" {
             .lifecycle = .stale,
             .generation = 15,
             .schema_fingerprint = "secondary-index-v1:orders_stale_tuple_idx",
+            .generation_record = .{ .generation = 15, .lifecycle = .stale },
         },
         .{
             .name = "orders_rebuild_required_tuple_idx",
@@ -12907,6 +13167,7 @@ test "relational ordered tuple index maintenance respects lifecycle states" {
             .lifecycle = .rebuild_required,
             .generation = 16,
             .schema_fingerprint = "secondary-index-v1:orders_rebuild_required_tuple_idx",
+            .generation_record = .{ .generation = 16, .lifecycle = .rebuild_required },
         },
         .{
             .name = "orders_failed_tuple_idx",
@@ -12918,6 +13179,31 @@ test "relational ordered tuple index maintenance respects lifecycle states" {
             .lifecycle = .failed,
             .generation = 17,
             .schema_fingerprint = "secondary-index-v1:orders_failed_tuple_idx",
+            .generation_record = .{ .generation = 17, .lifecycle = .failed },
+        },
+        .{
+            .name = "orders_missing_record_tuple_idx",
+            .owner_kind = .relational_column,
+            .owner_name = "missing_record_status",
+            .access_method = .ordered_tuple,
+            .columns = &.{ "status", "amount" },
+            .keys = missing_record_keys[0..],
+            .lifecycle = .ready,
+            .generation = 18,
+            .schema_fingerprint = "secondary-index-v1:orders_missing_record_tuple_idx",
+            .generation_record = null,
+        },
+        .{
+            .name = "orders_stale_record_tuple_idx",
+            .owner_kind = .relational_column,
+            .owner_name = "stale_record_status",
+            .access_method = .ordered_tuple,
+            .columns = &.{ "status", "amount" },
+            .keys = stale_record_keys[0..],
+            .lifecycle = .ready,
+            .generation = 19,
+            .schema_fingerprint = "secondary-index-v1:orders_stale_record_tuple_idx",
+            .generation_record = .{ .generation = 18, .lifecycle = .ready },
         },
     };
 
@@ -13006,6 +13292,12 @@ test "relational ordered tuple index maintenance respects lifecycle states" {
     const failed_docs = try scanOrderedTupleDocKeysAlloc(alloc, &store, "orders_failed_tuple_idx", tuple, "", "");
     defer freeDocKeys(alloc, failed_docs);
     try std.testing.expectEqual(@as(usize, 0), failed_docs.len);
+    const missing_record_docs = try scanOrderedTupleDocKeysAlloc(alloc, &store, "orders_missing_record_tuple_idx", tuple, "", "");
+    defer freeDocKeys(alloc, missing_record_docs);
+    try std.testing.expectEqual(@as(usize, 0), missing_record_docs.len);
+    const stale_record_docs = try scanOrderedTupleDocKeysAlloc(alloc, &store, "orders_stale_record_tuple_idx", tuple, "", "");
+    defer freeDocKeys(alloc, stale_record_docs);
+    try std.testing.expectEqual(@as(usize, 0), stale_record_docs.len);
 
     writes.clearRetainingCapacity();
     deletes.clearRetainingCapacity();
@@ -13059,6 +13351,7 @@ test "relational ordered tuple index mutation batches are retry idempotent" {
         .lifecycle = .ready,
         .generation = 7,
         .schema_fingerprint = "secondary-index-v1:orders_retry_tuple_idx",
+        .generation_record = .{ .generation = 7, .lifecycle = .ready },
     }};
 
     const initial_row = try relational_row_codec.serialize(alloc, &.{
@@ -13155,6 +13448,7 @@ test "relational index reserve counts catalog indexes instead of all cells" {
             .lifecycle = .ready,
             .generation = 7,
             .schema_fingerprint = "secondary-index-v1:orders_status_amount_idx",
+            .generation_record = .{ .generation = 7, .lifecycle = .ready },
         },
         .{
             .name = "customer",
@@ -13535,6 +13829,7 @@ test "relational unique constraints honor case-insensitive column collation" {
         .lifecycle = .ready,
         .generation = 1,
         .schema_fingerprint = "unique-index-v1:events_email_key",
+        .generation_record = .{ .generation = 1, .lifecycle = .ready },
     }};
 
     const tuple_a = (try uniqueConstraintTupleValueWithColumnsAlloc(alloc, row_a, unique[0], &columns)) orelse return error.TestUnexpectedResult;
@@ -13604,6 +13899,7 @@ test "relational ordered tuple entries track unique constraint metadata" {
         .lifecycle = .ready,
         .generation = 7,
         .schema_fingerprint = "unique-index-v1:users_tenant_email_key",
+        .generation_record = .{ .generation = 7, .lifecycle = .ready },
     }};
 
     const inactive_row = try relational_row_codec.serialize(alloc, &.{
@@ -13801,6 +14097,7 @@ test "relational ordered tuple unique maintenance uses catalog-only index metada
         .lifecycle = .ready,
         .generation = 7,
         .schema_fingerprint = "secondary-index-v1:users_tenant_email_key",
+        .generation_record = .{ .generation = 7, .lifecycle = .ready },
     }};
     const policy = ColumnIndexPolicy.fromSchemaParts(columns[0..], indexes[0..]);
 
@@ -13955,6 +14252,7 @@ test "relational ordered tuple unique maintenance uses expression catalog metada
         .lifecycle = .ready,
         .generation = 7,
         .schema_fingerprint = "secondary-index-v1:users_tenant_lower_email_key",
+        .generation_record = .{ .generation = 7, .lifecycle = .ready },
     }};
     const policy = ColumnIndexPolicy.fromSchemaParts(columns[0..], indexes[0..]);
 
@@ -14072,6 +14370,7 @@ test "relational ordered tuple unique enforcement uses ready partial metadata" {
         .lifecycle = .ready,
         .generation = 7,
         .schema_fingerprint = "secondary-index-v1:users_active_email_key",
+        .generation_record = .{ .generation = 7, .lifecycle = .ready },
     }};
     const policy = ColumnIndexPolicy.fromSchemaParts(columns[0..], indexes[0..]);
 
@@ -14192,6 +14491,7 @@ test "relational ordered tuple unique maintenance respects lifecycle states" {
             .lifecycle = .ready,
             .generation = 7,
             .schema_fingerprint = "unique-index-v1:users_ready_key",
+            .generation_record = .{ .generation = 7, .lifecycle = .ready },
         },
         .{
             .name = "users_building_key",
@@ -14204,6 +14504,7 @@ test "relational ordered tuple unique maintenance respects lifecycle states" {
             .lifecycle = .building,
             .generation = 7,
             .schema_fingerprint = "unique-index-v1:users_building_key",
+            .generation_record = .{ .generation = 7, .lifecycle = .building },
         },
         .{
             .name = "users_catching_up_key",
@@ -14216,6 +14517,7 @@ test "relational ordered tuple unique maintenance respects lifecycle states" {
             .lifecycle = .catching_up,
             .generation = 7,
             .schema_fingerprint = "unique-index-v1:users_catching_up_key",
+            .generation_record = .{ .generation = 7, .lifecycle = .catching_up },
         },
         .{
             .name = "users_stale_key",
@@ -14228,6 +14530,7 @@ test "relational ordered tuple unique maintenance respects lifecycle states" {
             .lifecycle = .stale,
             .generation = 7,
             .schema_fingerprint = "unique-index-v1:users_stale_key",
+            .generation_record = .{ .generation = 7, .lifecycle = .stale },
         },
         .{
             .name = "users_failed_key",
@@ -14240,6 +14543,7 @@ test "relational ordered tuple unique maintenance respects lifecycle states" {
             .lifecycle = .failed,
             .generation = 7,
             .schema_fingerprint = "unique-index-v1:users_failed_key",
+            .generation_record = .{ .generation = 7, .lifecycle = .failed },
         },
     };
     const row = try relational_row_codec.serialize(alloc, &.{
@@ -14366,6 +14670,7 @@ test "relational foreign key parent checks use ready ordered tuple unique metada
         .lifecycle = .ready,
         .generation = 7,
         .schema_fingerprint = "unique-index-v1:users_tenant_email_key",
+        .generation_record = .{ .generation = 7, .lifecycle = .ready },
     }};
     const foreign_keys = [_]schema_mod.ForeignKey{.{
         .name = "orders_user_email_fkey",
@@ -14521,6 +14826,7 @@ test "relational foreign key parent checks use catalog-only ordered tuple unique
         .lifecycle = .ready,
         .generation = 7,
         .schema_fingerprint = "unique-index-v1:users_tenant_email_key",
+        .generation_record = .{ .generation = 7, .lifecycle = .ready },
     }};
     const foreign_keys = [_]schema_mod.ForeignKey{.{
         .name = "orders_user_email_fkey",
@@ -14618,6 +14924,7 @@ test "relational foreign key parent checks see staged ordered tuple unique paren
         .lifecycle = .ready,
         .generation = 7,
         .schema_fingerprint = "unique-index-v1:users_tenant_email_key",
+        .generation_record = .{ .generation = 7, .lifecycle = .ready },
     }};
     const foreign_keys = [_]schema_mod.ForeignKey{.{
         .name = "orders_user_email_fkey",
@@ -14709,6 +15016,7 @@ test "relational restrict parent delete uses child ordered tuple index" {
         .lifecycle = .ready,
         .generation = 7,
         .schema_fingerprint = "secondary-index-v1:orders_user_lookup_idx",
+        .generation_record = .{ .generation = 7, .lifecycle = .ready },
     }};
     const unique = [_]schema_mod.UniqueConstraint{.{
         .name = "users_tenant_email_key",
@@ -14814,6 +15122,7 @@ test "relational restrict parent delete proves child ordered tuple partial predi
         .lifecycle = .ready,
         .generation = 7,
         .schema_fingerprint = "secondary-index-v1:orders_user_lookup_idx",
+        .generation_record = .{ .generation = 7, .lifecycle = .ready },
         .where = child_index_where[0..],
     }};
     const unique = [_]schema_mod.UniqueConstraint{.{
@@ -14921,6 +15230,7 @@ test "relational restrict parent delete fails closed on unproved child ordered t
         .lifecycle = .ready,
         .generation = 7,
         .schema_fingerprint = "secondary-index-v1:orders_user_lookup_idx",
+        .generation_record = .{ .generation = 7, .lifecycle = .ready },
         .where = child_index_where[0..],
     }};
     const unique = [_]schema_mod.UniqueConstraint{.{
@@ -15002,6 +15312,7 @@ test "relational restrict parent delete fails closed on stale child ordered tupl
         .lifecycle = .stale,
         .generation = 7,
         .schema_fingerprint = "secondary-index-v1:orders_user_lookup_idx",
+        .generation_record = .{ .generation = 7, .lifecycle = .stale },
     }};
     const unique = [_]schema_mod.UniqueConstraint{.{
         .name = "users_tenant_email_key",
@@ -16325,14 +16636,31 @@ test "relational upsert skips unchanged secondary index churn" {
     }};
     const initial_row = try relational_row_codec.serialize(alloc, initial_cells[0..]);
     defer alloc.free(initial_row);
-    try appendUpsert(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:a", initial_row);
+    const columns = [_]schema_mod.RelationalColumn{.{
+        .name = "amount",
+        .path = "amount",
+        .field_type = .numeric,
+    }};
+    const indexes = [_]schema_mod.RelationalIndex{.{
+        .name = "amount",
+        .owner_kind = .relational_column,
+        .owner_name = "amount",
+        .access_method = .scalar_column,
+        .columns = &.{"amount"},
+        .lifecycle = .ready,
+        .generation = 7,
+        .schema_fingerprint = "secondary-index-v1:amount",
+    }};
+    const policy = ColumnIndexPolicy.fromSchemaParts(columns[0..], indexes[0..]);
+
+    try appendUpsertWithColumnIndexPolicy(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:a", initial_row, policy);
     try std.testing.expectEqual(@as(usize, 3), writes.items.len);
     try std.testing.expectEqual(@as(usize, 0), deletes.items.len);
     try store.putBatch(writes.items, deletes.items);
 
     writes.clearRetainingCapacity();
     deletes.clearRetainingCapacity();
-    try appendUpsert(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:a", initial_row);
+    try appendUpsertWithColumnIndexPolicy(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:a", initial_row, policy);
     try std.testing.expectEqual(@as(usize, 1), writes.items.len);
     try std.testing.expectEqual(@as(usize, 0), deletes.items.len);
     try store.putBatch(writes.items, deletes.items);
@@ -16346,7 +16674,7 @@ test "relational upsert skips unchanged secondary index churn" {
     defer alloc.free(changed_row);
     writes.clearRetainingCapacity();
     deletes.clearRetainingCapacity();
-    try appendUpsert(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:a", changed_row);
+    try appendUpsertWithColumnIndexPolicy(alloc, &store, &writes, &deletes, &owned_keys, &owned_values, "doc:a", changed_row, policy);
     try std.testing.expectEqual(@as(usize, 3), writes.items.len);
     try std.testing.expectEqual(@as(usize, 2), deletes.items.len);
 }
@@ -17330,6 +17658,7 @@ test "relational secondary index range rebuild repairs ordered tuple pages from 
         .lifecycle = .ready,
         .generation = 6,
         .schema_fingerprint = "secondary-index-v1:orders_status_amount_idx",
+        .generation_record = .{ .generation = 6, .lifecycle = .ready },
     }};
     const initial_policy = ColumnIndexPolicy.fromSchemaParts(initial_columns[0..], initial_indexes[0..]);
 
@@ -17372,6 +17701,7 @@ test "relational secondary index range rebuild repairs ordered tuple pages from 
         .lifecycle = .building,
         .generation = 7,
         .schema_fingerprint = "secondary-index-v1:orders_status_amount_idx",
+        .generation_record = .{ .generation = 7, .lifecycle = .building },
         .where = &.{.{ .field = "status", .op = .eq, .value_json = "\"active\"" }},
     }};
     const rebuild_policy = ColumnIndexPolicy.fromSchemaParts(rebuild_columns[0..], rebuild_indexes[0..]);
@@ -17410,9 +17740,9 @@ test "relational secondary index range rebuild repairs ordered tuple pages from 
     try std.testing.expectEqual(@as(u64, 2), second.report.deleted_entries);
     try std.testing.expectEqual(@as(u64, 0), second.report.written_entries);
 
-    const active_tuple = try orderedTupleValueForIndexKeysAlloc(alloc, active_row, rebuild_columns[0].index_keys, rebuild_columns[0..]);
+    const active_tuple = try orderedTupleValueForIndexKeysAlloc(alloc, active_row, rebuild_indexes[0].keys, rebuild_columns[0..]);
     defer alloc.free(active_tuple);
-    const inactive_tuple = try orderedTupleValueForIndexKeysAlloc(alloc, inactive_row, rebuild_columns[0].index_keys, rebuild_columns[0..]);
+    const inactive_tuple = try orderedTupleValueForIndexKeysAlloc(alloc, inactive_row, rebuild_indexes[0].keys, rebuild_columns[0..]);
     defer alloc.free(inactive_tuple);
     const active_docs = try scanOrderedTupleDocKeysAlloc(alloc, &store, "orders_status_amount_idx", active_tuple, "", "");
     defer freeDocKeys(alloc, active_docs);
@@ -17474,6 +17804,7 @@ test "relational ordered tuple maintenance and rebuild use catalog-only index me
         .lifecycle = .ready,
         .generation = 6,
         .schema_fingerprint = "secondary-index-v1:orders_status_amount_idx",
+        .generation_record = .{ .generation = 6, .lifecycle = .ready },
         .where = &.{.{ .field = "status", .op = .eq, .value_json = "\"active\"" }},
     }};
     const ready_policy = ColumnIndexPolicy.fromSchemaParts(columns[0..], ready_indexes[0..]);
@@ -17519,6 +17850,7 @@ test "relational ordered tuple maintenance and rebuild use catalog-only index me
         .lifecycle = .building,
         .generation = 7,
         .schema_fingerprint = "secondary-index-v1:orders_status_amount_idx",
+        .generation_record = .{ .generation = 7, .lifecycle = .building },
         .where = &.{.{ .field = "status", .op = .eq, .value_json = "\"active\"" }},
     }};
     const building_policy = ColumnIndexPolicy.fromSchemaParts(columns[0..], building_indexes[0..]);
@@ -17708,6 +18040,7 @@ test "relational column scan delete by document range removes ordered tuple entr
         .lifecycle = .ready,
         .generation = 7,
         .schema_fingerprint = "secondary-index-v1:orders_status_amount_idx",
+        .generation_record = .{ .generation = 7, .lifecycle = .ready },
     }};
     const policy = ColumnIndexPolicy.fromSchemaParts(columns[0..], indexes[0..]);
 
@@ -17805,6 +18138,7 @@ test "relational column backed repair rebuilds ordered tuple entries from packed
             .lifecycle = .ready,
             .generation = 7,
             .schema_fingerprint = "secondary-index-v1:orders_status_amount_idx",
+            .generation_record = .{ .generation = 7, .lifecycle = .ready },
         },
         .{
             .name = "amount",

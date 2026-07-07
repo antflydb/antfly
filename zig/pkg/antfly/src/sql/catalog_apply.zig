@@ -1775,6 +1775,11 @@ fn appendCreateIndexRelationalIndexAlloc(
         .lifecycle = .building,
         .generation = generation,
         .schema_fingerprint = schema_fingerprint,
+        .generation_record = if (access_method == .scalar_column) null else .{
+            .generation = generation,
+            .lifecycle = .building,
+        },
+        .planner_capabilities = ddl_plan.relationalPlannerCapabilitiesForCreateIndex(plan, access_method),
         .where = plan.where,
         .where_expressions = plan.where_expressions,
     };
@@ -2558,7 +2563,7 @@ test "catalog apply applies incremental ddl plans to public schema json" {
 
     var ordered_composite_index = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
-        "CREATE INDEX users_tenant_status_updated_idx ON users (tenant_id ASC, status DESC NULLS LAST, updated_at_ns ASC NULLS FIRST) INCLUDE (email);",
+        "CREATE INDEX users_tenant_status_updated_idx ON users (tenant_id ASC, status COLLATE \"C\" DESC NULLS LAST, updated_at_ns ASC NULLS FIRST) INCLUDE (email);",
     );
     defer ordered_composite_index.deinit(alloc);
     var ordered_composite_indexed = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, created.schema_json, ordered_composite_index);
@@ -2581,6 +2586,7 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     try std.testing.expectEqual(runtime_schema.RelationalIndexKeyDirection.asc, ordered_idx.keys[0].direction);
     try std.testing.expectEqual(runtime_schema.RelationalIndexKeyNulls.default, ordered_idx.keys[0].nulls);
     try std.testing.expectEqualStrings("status", ordered_idx.keys[1].column);
+    try std.testing.expectEqualStrings("C", ordered_idx.keys[1].collation orelse return error.TestUnexpectedResult);
     try std.testing.expectEqual(runtime_schema.RelationalIndexKeyDirection.desc, ordered_idx.keys[1].direction);
     try std.testing.expectEqual(runtime_schema.RelationalIndexKeyNulls.last, ordered_idx.keys[1].nulls);
     try std.testing.expectEqualStrings("updated_at_ns", ordered_idx.keys[2].column);
@@ -2610,6 +2616,7 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     try std.testing.expectEqual(ordered_idx.generation, ready_ordered_idx.generation);
     try std.testing.expectEqual(@as(usize, 3), ready_ordered_idx.keys.len);
     try std.testing.expectEqualStrings("status", ready_ordered_idx.keys[1].column);
+    try std.testing.expectEqualStrings("C", ready_ordered_idx.keys[1].collation orelse return error.TestUnexpectedResult);
     try std.testing.expectEqual(runtime_schema.RelationalIndexKeyDirection.desc, ready_ordered_idx.keys[1].direction);
     try std.testing.expectEqual(runtime_schema.RelationalIndexKeyNulls.last, ready_ordered_idx.keys[1].nulls);
     try std.testing.expectEqualStrings("email", ready_ordered_idx.include_columns[0]);
@@ -3974,6 +3981,10 @@ test "catalog apply applies create index ddl plan to runtime schema" {
     try std.testing.expectEqual(runtime_schema.RelationalIndexKeyNulls.last, status_idx.keys[0].nulls);
     try std.testing.expectEqual(@as(usize, 1), status_idx.where.len);
     try std.testing.expectEqualStrings("deleted_at", status_idx.where[0].field);
+    try std.testing.expect(status_idx.planner_capabilities.equality);
+    try std.testing.expect(status_idx.planner_capabilities.range);
+    try std.testing.expect(status_idx.planner_capabilities.ordering);
+    try std.testing.expect(!status_idx.planner_capabilities.covering);
 
     try std.testing.expectError(error.InvalidSqlCatalog, applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, indexed, partial_index));
 
@@ -4010,6 +4021,7 @@ test "catalog apply applies create index ddl plan to runtime schema" {
     try std.testing.expectEqualStrings("amount", email_cover_idx.include_columns[1]);
     try std.testing.expectEqual(@as(usize, 1), email_cover_idx.keys.len);
     try std.testing.expectEqualStrings("email", email_cover_idx.keys[0].column);
+    try std.testing.expect(email_cover_idx.planner_capabilities.covering);
     const covered_tenant = binder.relationalColumnForField(covering_schema, "tenant_id", null) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 0), covered_tenant.index_include_columns.len);
 
@@ -4048,6 +4060,9 @@ test "catalog apply applies create index ddl plan to runtime schema" {
     try std.testing.expect(std.mem.indexOf(u8, full_text_idx.method_config_json.?, "\"type\":\"full_text\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, full_text_idx.method_config_json.?, "\"field\":\"status\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, full_text_idx.method_config_json.?, "\"analyzer\":\"standard\"") != null);
+    try std.testing.expect(full_text_idx.planner_capabilities.full_text);
+    try std.testing.expect(full_text_idx.planner_capabilities.rank);
+    try std.testing.expect(!full_text_idx.planner_capabilities.ordering);
 
     var algebraic_index = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
@@ -4065,6 +4080,13 @@ test "catalog apply applies create index ddl plan to runtime schema" {
     try std.testing.expectEqual(@as(usize, 0), algebraic_idx.columns.len);
     try std.testing.expectEqual(@as(usize, 0), algebraic_idx.keys.len);
     try std.testing.expectEqualStrings("{\"type\":\"algebraic\",\"derive_from_schema\":true}", algebraic_idx.method_config_json.?);
+    try std.testing.expect(algebraic_idx.planner_capabilities.equality);
+    try std.testing.expect(algebraic_idx.planner_capabilities.prefix);
+    try std.testing.expect(algebraic_idx.planner_capabilities.array);
+    try std.testing.expect(algebraic_idx.planner_capabilities.json);
+    try std.testing.expect(algebraic_idx.planner_capabilities.algebraic_dictionary);
+    try std.testing.expect(algebraic_idx.planner_capabilities.algebraic_fact);
+    try std.testing.expect(algebraic_idx.planner_capabilities.algebraic_path);
 
     var algebraic_false = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,

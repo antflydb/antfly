@@ -27,3 +27,7 @@ pub const BedrockGeneratorConfig = types.BedrockGeneratorConfig;
 pub const AnthropicGeneratorConfig = types.AnthropicGeneratorConfig;
 pub const CohereGeneratorConfig = types.CohereGeneratorConfig;
 pub const OpenRouterGeneratorConfig = types.OpenRouterGeneratorConfig;
+pub const TextContentPartType = types.TextContentPartType;
+pub const MediaContentPartType = types.MediaContentPartType;
+pub const ImageURLContentPartType = types.ImageURLContentPartType;
+pub const ToolCallType = types.ToolCallType;

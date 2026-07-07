@@ -3104,7 +3104,7 @@ fn parseRemoteGraphMetricStatusValueWithOwnedName(
     const out = db_mod.types.GraphMetricStatus{
         .name = owned_name,
         .state = graphMetricStateFromName(status.state) orelse return error.InvalidQueryRequest,
-        .phase = graphMetricPhaseFromName(status.phase) orelse return error.InvalidQueryRequest,
+        .phase = graphMetricPhaseFromStatusPhase(status.phase),
         .edge_filter = owned_edge_filter,
         .metadata_version = @intCast(@max(status.metadata_version orelse 0, 0)),
         .maintenance_paused = status.maintenance_paused orelse false,
@@ -3139,8 +3139,10 @@ fn parseRemoteGraphMetricEdgeFilterStatus(
     maybe_filter: ?indexes_openapi.GraphMetricEdgeFilterStatus,
 ) !graph_mod.GraphMetricEdgeFilter {
     const filter = maybe_filter orelse return .{};
-    if (std.mem.eql(u8, filter.mode, "all")) return .{};
-    if (!std.mem.eql(u8, filter.mode, "types")) return error.InvalidQueryRequest;
+    switch (filter.mode) {
+        .all => return .{},
+        .types => {},
+    }
     const raw_types = filter.types orelse return error.InvalidQueryRequest;
     if (raw_types.len == 0) return error.InvalidQueryRequest;
     const types = try alloc.alloc([]const u8, raw_types.len);
@@ -3169,7 +3171,7 @@ fn parseRemoteGraphMetricEventValue(
 ) !graph_mod.GraphIndex.GraphMetricEvent {
     return .{
         .sequence = @intCast(@max(event.sequence, 0)),
-        .kind = graphMetricEventKindFromName(event.kind) orelse return error.InvalidQueryRequest,
+        .kind = graphMetricEventKindFromEventKind(event.kind),
         .at_ms = @intCast(@max(event.at_ms, 0)),
         .target_edge_generation = @intCast(@max(event.target_edge_generation, 0)),
         .published_generation = @intCast(@max(event.published_generation, 0)),
@@ -3198,6 +3200,16 @@ fn graphMetricEventKindFromName(name: []const u8) ?graph_mod.GraphIndex.GraphMet
     return null;
 }
 
+fn graphMetricEventKindFromEventKind(kind: indexes_openapi.GraphMetricEventKind) graph_mod.GraphIndex.GraphMetricEventKind {
+    return switch (kind) {
+        .publish => .publish,
+        .delete => .delete,
+        .pause => .pause,
+        .@"resume" => .@"resume",
+        .failed => .failed,
+    };
+}
+
 fn graphMetricStateFromName(name: []const u8) ?graph_mod.GraphIndex.GraphMetricState {
     if (std.mem.eql(u8, name, "disabled")) return .disabled;
     if (std.mem.eql(u8, name, "not_ready")) return .not_ready;
@@ -3222,6 +3234,25 @@ fn graphMetricPhaseFromName(name: []const u8) ?graph_mod.GraphIndex.GraphMetricB
     if (std.mem.eql(u8, name, "publish_generation")) return .publish_generation;
     if (std.mem.eql(u8, name, "cleanup_old_generations")) return .cleanup_old_generations;
     return null;
+}
+
+fn graphMetricPhaseFromStatusPhase(phase: indexes_openapi.GraphMetricStatusPhase) graph_mod.GraphIndex.GraphMetricBuildPhase {
+    return switch (phase) {
+        .idle => .idle,
+        .computing => .computing,
+        .publishing => .publishing,
+        .complete => .complete,
+        .prepare_generation => .prepare_generation,
+        .scan_edges_and_out_degree => .scan_edges_and_out_degree,
+        .initialize_ranks => .initialize_ranks,
+        .iterate_contributions => .iterate_contributions,
+        .reduce_ranks => .reduce_ranks,
+        .hits_hub_contributions => .hits_hub_contributions,
+        .hits_hub_reduce_ranks => .hits_hub_reduce_ranks,
+        .check_convergence => .check_convergence,
+        .publish_generation => .publish_generation,
+        .cleanup_old_generations => .cleanup_old_generations,
+    };
 }
 
 fn parseRemoteGraphMatches(

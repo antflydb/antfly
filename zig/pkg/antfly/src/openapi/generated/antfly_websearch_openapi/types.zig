@@ -140,6 +140,35 @@ pub const WebSearchResponse = struct {
     search_time_ms: ?i64 = null,
 };
 
+/// Search mode to request from Exa
+pub const ExaSearchConfigSearchType = enum {
+    auto,
+    neural,
+    keyword,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .auto => "auto",
+            .neural => "neural",
+            .keyword => "keyword",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "auto", .auto },
+            .{ "neural", .neural },
+            .{ "keyword", .keyword },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Configuration for Exa neural/semantic web search. Exa is optimized for semantic web search, highlights, and retrieved page contents for RAG and agent workflows. **Setup:** 1. Sign up at https://exa.ai 2. Get API key from dashboard **Docs:** https://docs.exa.ai
 pub const ExaSearchConfig = struct {
     provider: WebSearchProvider,
@@ -172,7 +201,7 @@ pub const ExaSearchConfig = struct {
     /// Ask the provider to return highlighted passages when supported
     include_highlights: ?bool = null,
     /// Search mode to request from Exa
-    search_type: ?[]const u8 = null,
+    search_type: ?ExaSearchConfigSearchType = null,
     /// Provider-specific result count override
     num_results: ?i64 = null,
     /// ISO date/time lower bound for published date filtering
@@ -183,6 +212,73 @@ pub const ExaSearchConfig = struct {
     include_domains: ?[]const []const u8 = null,
     /// Exclude results from these domains
     exclude_domains: ?[]const []const u8 = null,
+};
+
+/// Type of search to perform
+pub const SerperSearchConfigSearchType = enum {
+    search,
+    news,
+    images,
+    places,
+    shopping,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .search => "search",
+            .news => "news",
+            .images => "images",
+            .places => "places",
+            .shopping => "shopping",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "search", .search },
+            .{ "news", .news },
+            .{ "images", .images },
+            .{ "places", .places },
+            .{ "shopping", .shopping },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Time period filter: d=day, w=week, m=month, y=year
+pub const SerperSearchConfigTimePeriod = enum {
+    d,
+    w,
+    m,
+    y,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .d => "d",
+            .w => "w",
+            .m => "m",
+            .y => "y",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "d", .d },
+            .{ "w", .w },
+            .{ "m", .m },
+            .{ "y", .y },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// Configuration for Serper.dev Google Search API. Serper provides a simpler alternative to Google Custom Search with competitive pricing and easy setup. **Setup:** 1. Sign up at https://serper.dev 2. Get API key from dashboard **Docs:** https://serper.dev/docs
@@ -217,9 +313,35 @@ pub const SerperSearchConfig = struct {
     /// Ask the provider to return highlighted passages when supported
     include_highlights: ?bool = null,
     /// Type of search to perform
-    search_type: ?[]const u8 = null,
+    search_type: ?SerperSearchConfigSearchType = null,
     /// Time period filter: d=day, w=week, m=month, y=year
-    time_period: ?[]const u8 = null,
+    time_period: ?SerperSearchConfigTimePeriod = null,
+};
+
+/// Search depth: - basic: Fast search with standard results - advanced: Deeper search with more comprehensive results
+pub const TavilySearchConfigSearchDepth = enum {
+    basic,
+    advanced,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .basic => "basic",
+            .advanced => "advanced",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "basic", .basic },
+            .{ "advanced", .advanced },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// Configuration for Tavily AI Search API. Tavily is optimized for RAG and AI applications, providing pre-processed results with summaries and relevance scoring. **Setup:** 1. Sign up at https://tavily.com 2. Get API key from dashboard **Docs:** https://docs.tavily.com
@@ -254,7 +376,7 @@ pub const TavilySearchConfig = struct {
     /// Ask the provider to return highlighted passages when supported
     include_highlights: ?bool = null,
     /// Search depth: - basic: Fast search with standard results - advanced: Deeper search with more comprehensive results
-    search_depth: ?[]const u8 = null,
+    search_depth: ?TavilySearchConfigSearchDepth = null,
     /// Include AI-generated answer summary
     include_answer: ?bool = null,
     /// Include raw HTML content of pages
@@ -263,6 +385,38 @@ pub const TavilySearchConfig = struct {
     include_domains: ?[]const []const u8 = null,
     /// Exclude results from these domains
     exclude_domains: ?[]const []const u8 = null,
+};
+
+/// Freshness filter: pd=day, pw=week, pm=month, py=year
+pub const BraveSearchConfigFreshness = enum {
+    pd,
+    pw,
+    pm,
+    py,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .pd => "pd",
+            .pw => "pw",
+            .pm => "pm",
+            .py => "py",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "pd", .pd },
+            .{ "pw", .pw },
+            .{ "pm", .pm },
+            .{ "py", .py },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// Configuration for Brave Search API. Brave Search provides privacy-focused search with its own independent index. **Setup:** 1. Sign up at https://brave.com/search/api/ 2. Get API key from dashboard **Docs:** https://api.search.brave.com/app/documentation
@@ -297,7 +451,7 @@ pub const BraveSearchConfig = struct {
     /// Ask the provider to return highlighted passages when supported
     include_highlights: ?bool = null,
     /// Freshness filter: pd=day, pw=week, pm=month, py=year
-    freshness: ?[]const u8 = null,
+    freshness: ?BraveSearchConfigFreshness = null,
     /// Include text decorations (bold, italic markers)
     text_decorations: ?bool = null,
     /// Enable spellcheck suggestions
@@ -337,6 +491,58 @@ pub const YouSearchConfig = struct {
     include_highlights: ?bool = null,
 };
 
+/// Search depth to request from Linkup
+pub const LinkupSearchConfigDepth = enum {
+    standard,
+    deep,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .standard => "standard",
+            .deep => "deep",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "standard", .standard },
+            .{ "deep", .deep },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Linkup response shape to request
+pub const LinkupSearchConfigOutputType = enum {
+    search_results,
+    sourced_answer,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .search_results => "searchResults",
+            .sourced_answer => "sourcedAnswer",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "searchResults", .search_results },
+            .{ "sourcedAnswer", .sourced_answer },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Configuration for Linkup Search API. Linkup is useful for web search, source retrieval, and structured research workflows. **Setup:** 1. Sign up at https://linkup.so 2. Get API key from dashboard **Docs:** https://docs.linkup.so
 pub const LinkupSearchConfig = struct {
     provider: WebSearchProvider,
@@ -369,9 +575,32 @@ pub const LinkupSearchConfig = struct {
     /// Ask the provider to return highlighted passages when supported
     include_highlights: ?bool = null,
     /// Search depth to request from Linkup
-    depth: ?[]const u8 = null,
+    depth: ?LinkupSearchConfigDepth = null,
     /// Linkup response shape to request
-    output_type: ?[]const u8 = null,
+    output_type: ?LinkupSearchConfigOutputType = null,
+};
+
+/// Google Cloud search service flavor
+pub const VertexSearchConfigService = enum {
+    agent_search,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .agent_search => "agent_search",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "agent_search", .agent_search },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// Configuration for Google Cloud Agent Search / Vertex AI Search. Use this for bounded Google Cloud search over configured data stores or verified websites. The provider token is `vertex` to match Antfly's existing Google Cloud provider convention. **Setup:** 1. Enable Discovery Engine API in Google Cloud 2. Create an Agent Search app/data store 3. Grant service account access to query the serving config **Docs:** https://cloud.google.com/generative-ai-app-builder/docs
@@ -406,5 +635,5 @@ pub const VertexSearchConfig = struct {
     /// Ask the provider to return highlighted passages when supported
     include_highlights: ?bool = null,
     /// Google Cloud search service flavor
-    service: ?[]const u8 = null,
+    service: ?VertexSearchConfigService = null,
 };

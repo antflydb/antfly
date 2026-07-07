@@ -18,6 +18,7 @@ const placement_planner = @import("placement_planner.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const table_manager = @import("table_manager.zig");
 const relational_store = @import("../storage/db/relational_store.zig");
+const storage_schema = @import("../storage/schema.zig");
 const platform_clock = @import("../platform/clock.zig");
 const platform_time = @import("../platform/time.zig");
 const schema_mod = @import("../schema/mod.zig");
@@ -2292,8 +2293,8 @@ fn uniqueConstraintGroupIdExists(
 }
 
 fn secondaryIndexNeedsRebuild(index: anytype) bool {
-    return index.generation != 0 and
-        index.lifecycle == .building;
+    const lifecycle = storage_schema.relationalIndexLifecycle(index) orelse return false;
+    return index.generation != 0 and lifecycle == .building;
 }
 
 fn secondaryIndexRebuildRangeStillDeclared(

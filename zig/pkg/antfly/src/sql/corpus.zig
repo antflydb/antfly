@@ -1204,7 +1204,7 @@ pub fn appParityStructuredFixtureSummary(
             .access_method = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .access, .method }),
             .conversion_catalog = appParityTokensHaveIdentifier(sql_tokens, "conversion"),
             .foreign_data_wrapper = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .foreign, .data }) and
-                appParityTokensHaveIdentifier(sql_tokens, "wrapper"),
+                appParityTokensHaveIdentifier(sql_tokens, "contract"),
             .operator_class_family = appParityTokensHaveKeyword(sql_tokens, .operator) and
                 (appParityTokensHaveIdentifier(sql_tokens, "class") or
                     appParityTokensHaveIdentifier(sql_tokens, "family")),
@@ -1894,7 +1894,7 @@ pub const relational_routed_visibility_matrix_format: u64 = 1;
 pub const relational_semantic_implication_matrix_format: u64 = 1;
 pub const relational_sql_api_coverage_inventory_format: u64 = 1;
 pub const relational_sql_adapter_removal_inventory_format: u64 = 1;
-pub const sql_compatibility_wrapper_inventory_format: u64 = 1;
+pub const sql_cutover_contract_inventory_format: u64 = 1;
 pub const sql_generated_ast_migration_fixture_format: u64 = 1;
 pub const sql_parser_migration_table_format: u64 = 1;
 pub const sql_production_ingress_cutover_format: u64 = 1;
@@ -2002,10 +2002,10 @@ pub const AppParitySummaryAssertionRequirements = struct {
     }
 };
 
-pub const SqlCompatibilityWrapperEntry = struct {
+pub const SqlCutoverContractEntry = struct {
     id: []const u8,
     family: []const u8,
-    wrapper_class: []const u8,
+    contract_class: []const u8,
     classification: []const u8,
     file: []const u8,
     symbol: []const u8,
@@ -2013,11 +2013,11 @@ pub const SqlCompatibilityWrapperEntry = struct {
     compatibility_reason: []const u8,
     typed_replacement: []const u8,
     deletion_gate: []const u8,
-    deletion_evidence: SqlCompatibilityWrapperDeletionEvidence,
-    state_safety: SqlCompatibilityWrapperStateSafety,
+    deletion_evidence: SqlCutoverContractDeletionEvidence,
+    state_safety: SqlCutoverContractStateSafety,
 };
 
-pub const SqlCompatibilityWrapperDeletionEvidence = struct {
+pub const SqlCutoverContractDeletionEvidence = struct {
     typed_parser: []const u8,
     typed_binder: []const u8,
     typed_plan: []const u8,
@@ -2025,24 +2025,24 @@ pub const SqlCompatibilityWrapperDeletionEvidence = struct {
     parity: []const u8,
 };
 
-pub const SqlCompatibilityWrapperStateSafety = struct {
+pub const SqlCutoverContractStateSafety = struct {
     durable_catalog: []const u8,
     durable_document: []const u8,
     durable_row: []const u8,
     proof: []const u8,
 };
 
-pub const SqlCompatibilityWrapperInventoryRoot = struct {
+pub const SqlCutoverContractInventoryRoot = struct {
     inventory_format: u64,
-    wrappers: []const SqlCompatibilityWrapperEntry,
+    contracts: []const SqlCutoverContractEntry,
 };
 
-pub const SqlCompatibilityWrapperInventory = struct {
+pub const SqlCutoverContractInventory = struct {
     parsed: std.json.Parsed(std.json.Value),
-    root: SqlCompatibilityWrapperInventoryRoot,
+    root: SqlCutoverContractInventoryRoot,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        freeSqlCompatibilityWrapperInventoryRoot(alloc, self.root);
+        freeSqlCutoverContractInventoryRoot(alloc, self.root);
         self.parsed.deinit();
     }
 };
@@ -2118,11 +2118,11 @@ pub const SqlProductionIngressCutoverGate = struct {
     completion_condition: []const u8,
 };
 
-pub const SqlProductionIngressCutoverWrapper = struct {
-    wrapper_id: []const u8,
+pub const SqlProductionIngressCutoverContract = struct {
+    contract_id: []const u8,
     family: []const u8,
     requirement_id: []const u8,
-    legacy_admission: []const u8,
+    cutover_admission: []const u8,
     public_boundary_corruption_required: bool,
 };
 
@@ -2135,7 +2135,7 @@ pub const SqlProductionIngressCutoverFamily = struct {
 pub const SqlProductionIngressCutoverRoot = struct {
     cutover_format: u64,
     gates: []const SqlProductionIngressCutoverGate,
-    wrappers: []const SqlProductionIngressCutoverWrapper,
+    contracts: []const SqlProductionIngressCutoverContract,
     families: []const SqlProductionIngressCutoverFamily,
 };
 
@@ -3035,8 +3035,8 @@ const sql_parser_migration_table_entrypoints = [_][]const u8{
 const sql_parser_migration_table_parser_statuses = [_][]const u8{
     "generated_gated_unsupported",
     "generated_owned",
-    "legacy_only",
-    "mixed_generated_plus_legacy_probes",
+    "tokenized_only",
+    "mixed_generated_plus_token_probes",
 };
 
 const sql_production_terminal_bridge_categories = [_][]const u8{
@@ -3073,61 +3073,59 @@ fn sqlProductionTerminalBridgeCategoryKnown(name: []const u8) bool {
     return false;
 }
 
-const sql_compatibility_wrapper_classes = [_][]const u8{
+const sql_cutover_contract_classes = [_][]const u8{
     "binder",
     "parser",
     "planner",
     "runtime",
 };
 
-fn sqlCompatibilityWrapperClassKnown(name: []const u8) bool {
-    for (sql_compatibility_wrapper_classes) |known| {
+fn sqlCutoverContractClassKnown(name: []const u8) bool {
+    for (sql_cutover_contract_classes) |known| {
         if (std.mem.eql(u8, name, known)) return true;
     }
     return false;
 }
 
-fn sqlCompatibilityWrapperClassificationKnown(name: []const u8) bool {
+fn sqlCutoverContractClassificationKnown(name: []const u8) bool {
     return std.mem.eql(u8, name, "compatibility_contract") or
         std.mem.eql(u8, name, "migration_blocker") or
         std.mem.eql(u8, name, "removable_dead_path");
 }
 
-const sql_compatibility_wrapper_contract_reasons = [_][]const u8{
+const sql_cutover_contract_reasons = [_][]const u8{
     "bounded_document_query_scan",
 };
 
-fn sqlCompatibilityWrapperContractReasonKnown(name: []const u8) bool {
-    for (sql_compatibility_wrapper_contract_reasons) |known| {
+fn sqlCutoverContractReasonKnown(name: []const u8) bool {
+    for (sql_cutover_contract_reasons) |known| {
         if (std.mem.eql(u8, name, known)) return true;
     }
     return false;
 }
 
-pub fn parseSqlCompatibilityWrapperInventoryRootAlloc(
+pub fn parseSqlCutoverContractInventoryRootAlloc(
     alloc: std.mem.Allocator,
     value: std.json.Value,
-) !SqlCompatibilityWrapperInventoryRoot {
+) !SqlCutoverContractInventoryRoot {
     const root = try fixtureJsonObject(value);
-    try fixtureRequireOnlyKeys(root, &.{ "inventory_format", "wrappers" });
+    try fixtureRequireOnlyKeys(root, &.{ "inventory_format", "contracts" });
     const inventory_format = try fixtureJsonOptionalU64(root, "inventory_format", 0);
-    if (inventory_format != sql_compatibility_wrapper_inventory_format) return error.TestUnexpectedResult;
-    const wrapper_values = switch (root.get("wrappers") orelse return error.TestUnexpectedResult) {
+    if (inventory_format != sql_cutover_contract_inventory_format) return error.TestUnexpectedResult;
+    const contract_values = switch (root.get("contracts") orelse return error.TestUnexpectedResult) {
         .array => |items| items,
         else => return error.TestUnexpectedResult,
     };
-    if (wrapper_values.items.len == 0) return error.TestUnexpectedResult;
-
-    var wrappers = std.ArrayListUnmanaged(SqlCompatibilityWrapperEntry).empty;
-    errdefer wrappers.deinit(alloc);
+    var contracts = std.ArrayListUnmanaged(SqlCutoverContractEntry).empty;
+    errdefer contracts.deinit(alloc);
     var seen_ids = std.StringHashMapUnmanaged(void){};
     defer seen_ids.deinit(alloc);
-    for (wrapper_values.items, 0..) |wrapper_value, i| {
-        const item = try fixtureJsonObject(wrapper_value);
+    for (contract_values.items, 0..) |contract_value, i| {
+        const item = try fixtureJsonObject(contract_value);
         try fixtureRequireOnlyKeys(item, &.{
             "id",
             "family",
-            "wrapper_class",
+            "contract_class",
             "classification",
             "file",
             "symbol",
@@ -3140,7 +3138,7 @@ pub fn parseSqlCompatibilityWrapperInventoryRootAlloc(
         });
         const id = try fixtureJsonOptionalString(item, "id", "");
         const family = try fixtureJsonOptionalString(item, "family", "");
-        const wrapper_class = try fixtureJsonOptionalString(item, "wrapper_class", "");
+        const contract_class = try fixtureJsonOptionalString(item, "contract_class", "");
         const classification = try fixtureJsonOptionalString(item, "classification", "");
         const file = try fixtureJsonOptionalString(item, "file", "");
         const symbol = try fixtureJsonOptionalString(item, "symbol", "");
@@ -3148,11 +3146,11 @@ pub fn parseSqlCompatibilityWrapperInventoryRootAlloc(
         const compatibility_reason = try fixtureJsonOptionalString(item, "compatibility_reason", "");
         const typed_replacement = try fixtureJsonOptionalString(item, "typed_replacement", "");
         const deletion_gate = try fixtureJsonOptionalString(item, "deletion_gate", "");
-        const deletion_evidence = try parseSqlCompatibilityWrapperDeletionEvidence(item.get("deletion_evidence") orelse return error.TestUnexpectedResult);
-        const state_safety = try parseSqlCompatibilityWrapperStateSafety(item.get("state_safety") orelse return error.TestUnexpectedResult);
+        const deletion_evidence = try parseSqlCutoverContractDeletionEvidence(item.get("deletion_evidence") orelse return error.TestUnexpectedResult);
+        const state_safety = try parseSqlCutoverContractStateSafety(item.get("state_safety") orelse return error.TestUnexpectedResult);
         if (id.len == 0 or
             family.len == 0 or
-            wrapper_class.len == 0 or
+            contract_class.len == 0 or
             classification.len == 0 or
             file.len == 0 or
             symbol.len == 0 or
@@ -3161,30 +3159,30 @@ pub fn parseSqlCompatibilityWrapperInventoryRootAlloc(
             deletion_gate.len == 0 or
             seen_ids.contains(id) or
             !sqlParserMigrationFamilyKnown(family) or
-            !sqlCompatibilityWrapperClassKnown(wrapper_class) or
-            !sqlCompatibilityWrapperClassificationKnown(classification) or
+            !sqlCutoverContractClassKnown(contract_class) or
+            !sqlCutoverContractClassificationKnown(classification) or
             !std.mem.startsWith(u8, file, "zig/pkg/antfly/src/sql/"))
         {
             return error.TestUnexpectedResult;
         }
         if (std.mem.eql(u8, classification, "compatibility_contract")) {
-            if (!sqlCompatibilityWrapperContractReasonKnown(contract_reason)) return error.TestUnexpectedResult;
+            if (!sqlCutoverContractReasonKnown(contract_reason)) return error.TestUnexpectedResult;
         } else if (contract_reason.len != 0) {
             return error.TestUnexpectedResult;
         }
         if (std.mem.eql(u8, classification, "compatibility_contract") and
-            (!sqlCompatibilityWrapperStateEffectIsSafe(state_safety.durable_catalog) or
-                !sqlCompatibilityWrapperStateEffectIsSafe(state_safety.durable_document) or
-                !sqlCompatibilityWrapperStateEffectIsSafe(state_safety.durable_row)))
+            (!sqlCutoverContractStateEffectIsSafe(state_safety.durable_catalog) or
+                !sqlCutoverContractStateEffectIsSafe(state_safety.durable_document) or
+                !sqlCutoverContractStateEffectIsSafe(state_safety.durable_row)))
         {
             return error.TestUnexpectedResult;
         }
-        if (i > 0 and !std.mem.lessThan(u8, wrappers.items[i - 1].id, id)) return error.TestUnexpectedResult;
+        if (i > 0 and !std.mem.lessThan(u8, contracts.items[i - 1].id, id)) return error.TestUnexpectedResult;
         try seen_ids.put(alloc, id, {});
-        try wrappers.append(alloc, .{
+        try contracts.append(alloc, .{
             .id = id,
             .family = family,
-            .wrapper_class = wrapper_class,
+            .contract_class = contract_class,
             .classification = classification,
             .file = file,
             .symbol = symbol,
@@ -3198,20 +3196,20 @@ pub fn parseSqlCompatibilityWrapperInventoryRootAlloc(
     }
     return .{
         .inventory_format = inventory_format,
-        .wrappers = try wrappers.toOwnedSlice(alloc),
+        .contracts = try contracts.toOwnedSlice(alloc),
     };
 }
 
-fn parseSqlCompatibilityWrapperStateSafety(value: std.json.Value) !SqlCompatibilityWrapperStateSafety {
+fn parseSqlCutoverContractStateSafety(value: std.json.Value) !SqlCutoverContractStateSafety {
     const state_safety = try fixtureJsonObject(value);
     try fixtureRequireOnlyKeys(state_safety, &.{ "durable_catalog", "durable_document", "durable_row", "proof" });
     const durable_catalog = try fixtureJsonOptionalString(state_safety, "durable_catalog", "");
     const durable_document = try fixtureJsonOptionalString(state_safety, "durable_document", "");
     const durable_row = try fixtureJsonOptionalString(state_safety, "durable_row", "");
     const proof = try fixtureJsonOptionalString(state_safety, "proof", "");
-    if (!sqlCompatibilityWrapperStateEffectKnown(durable_catalog) or
-        !sqlCompatibilityWrapperStateEffectKnown(durable_document) or
-        !sqlCompatibilityWrapperStateEffectKnown(durable_row) or
+    if (!sqlCutoverContractStateEffectKnown(durable_catalog) or
+        !sqlCutoverContractStateEffectKnown(durable_document) or
+        !sqlCutoverContractStateEffectKnown(durable_row) or
         proof.len == 0)
     {
         return error.TestUnexpectedResult;
@@ -3224,17 +3222,17 @@ fn parseSqlCompatibilityWrapperStateSafety(value: std.json.Value) !SqlCompatibil
     };
 }
 
-fn sqlCompatibilityWrapperStateEffectKnown(name: []const u8) bool {
+fn sqlCutoverContractStateEffectKnown(name: []const u8) bool {
     return std.mem.eql(u8, name, "none") or
         std.mem.eql(u8, name, "read_only") or
         std.mem.eql(u8, name, "unproven_migration_blocker");
 }
 
-fn sqlCompatibilityWrapperStateEffectIsSafe(name: []const u8) bool {
+fn sqlCutoverContractStateEffectIsSafe(name: []const u8) bool {
     return std.mem.eql(u8, name, "none") or std.mem.eql(u8, name, "read_only");
 }
 
-fn parseSqlCompatibilityWrapperDeletionEvidence(value: std.json.Value) !SqlCompatibilityWrapperDeletionEvidence {
+fn parseSqlCutoverContractDeletionEvidence(value: std.json.Value) !SqlCutoverContractDeletionEvidence {
     const evidence = try fixtureJsonObject(value);
     try fixtureRequireOnlyKeys(evidence, &.{ "typed_parser", "typed_binder", "typed_plan", "typed_runtime", "parity" });
     const typed_parser = try fixtureJsonOptionalString(evidence, "typed_parser", "");
@@ -3259,20 +3257,20 @@ fn parseSqlCompatibilityWrapperDeletionEvidence(value: std.json.Value) !SqlCompa
     };
 }
 
-pub fn freeSqlCompatibilityWrapperInventoryRoot(
+pub fn freeSqlCutoverContractInventoryRoot(
     alloc: std.mem.Allocator,
-    root: SqlCompatibilityWrapperInventoryRoot,
+    root: SqlCutoverContractInventoryRoot,
 ) void {
-    if (root.wrappers.len > 0) alloc.free(root.wrappers);
+    if (root.contracts.len > 0) alloc.free(root.contracts);
 }
 
-pub fn parseSqlCompatibilityWrapperInventoryAlloc(alloc: std.mem.Allocator) !SqlCompatibilityWrapperInventory {
-    const inventory_json = @embedFile("fixtures/sql_compatibility_wrappers.json");
+pub fn parseSqlCutoverContractInventoryAlloc(alloc: std.mem.Allocator) !SqlCutoverContractInventory {
+    const inventory_json = @embedFile("fixtures/sql_cutover_contracts.json");
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, inventory_json, .{});
     errdefer parsed.deinit();
 
-    const root = try parseSqlCompatibilityWrapperInventoryRootAlloc(alloc, parsed.value);
-    errdefer freeSqlCompatibilityWrapperInventoryRoot(alloc, root);
+    const root = try parseSqlCutoverContractInventoryRootAlloc(alloc, parsed.value);
+    errdefer freeSqlCutoverContractInventoryRoot(alloc, root);
 
     return .{
         .parsed = parsed,
@@ -3729,7 +3727,7 @@ fn sqlProductionIngressCutoverStatusKnown(name: []const u8) bool {
         std.mem.eql(u8, name, "gap_tracked");
 }
 
-fn sqlProductionIngressCutoverLegacyAdmissionKnown(name: []const u8) bool {
+fn sqlProductionIngressCutoverAdmissionKnown(name: []const u8) bool {
     return std.mem.eql(u8, name, "compatibility_contract") or
         std.mem.eql(u8, name, "migration_blocker") or
         std.mem.eql(u8, name, "removable_dead_path");
@@ -3740,21 +3738,21 @@ pub fn parseSqlProductionIngressCutoverRootAlloc(
     value: std.json.Value,
 ) !SqlProductionIngressCutoverRoot {
     const root = try fixtureJsonObject(value);
-    try fixtureRequireOnlyKeys(root, &.{ "cutover_format", "gates", "wrappers", "families" });
+    try fixtureRequireOnlyKeys(root, &.{ "cutover_format", "gates", "contracts", "families" });
     const cutover_format = try fixtureJsonOptionalU64(root, "cutover_format", 0);
     if (cutover_format != sql_production_ingress_cutover_format) return error.TestUnexpectedResult;
 
     const gates = try parseSqlProductionIngressCutoverGatesAlloc(alloc, root.get("gates") orelse return error.TestUnexpectedResult);
     errdefer if (gates.len > 0) alloc.free(gates);
-    const wrappers = try parseSqlProductionIngressCutoverWrappersAlloc(alloc, root.get("wrappers") orelse return error.TestUnexpectedResult);
-    errdefer if (wrappers.len > 0) alloc.free(wrappers);
+    const contracts = try parseSqlProductionIngressCutoverContractsAlloc(alloc, root.get("contracts") orelse return error.TestUnexpectedResult);
+    errdefer if (contracts.len > 0) alloc.free(contracts);
     const families = try parseSqlProductionIngressCutoverFamiliesAlloc(alloc, root.get("families") orelse return error.TestUnexpectedResult);
     errdefer if (families.len > 0) alloc.free(families);
 
     return .{
         .cutover_format = cutover_format,
         .gates = gates,
-        .wrappers = wrappers,
+        .contracts = contracts,
         .families = families,
     };
 }
@@ -3818,62 +3816,61 @@ fn parseSqlProductionIngressCutoverGatesAlloc(
     return try gates.toOwnedSlice(alloc);
 }
 
-fn parseSqlProductionIngressCutoverWrappersAlloc(
+fn parseSqlProductionIngressCutoverContractsAlloc(
     alloc: std.mem.Allocator,
     value: std.json.Value,
-) ![]const SqlProductionIngressCutoverWrapper {
-    const wrapper_values = switch (value) {
+) ![]const SqlProductionIngressCutoverContract {
+    const contract_values = switch (value) {
         .array => |items| items,
         else => return error.TestUnexpectedResult,
     };
-    if (wrapper_values.items.len == 0) return error.TestUnexpectedResult;
-    var wrappers = std.ArrayListUnmanaged(SqlProductionIngressCutoverWrapper).empty;
-    errdefer wrappers.deinit(alloc);
+    var contracts = std.ArrayListUnmanaged(SqlProductionIngressCutoverContract).empty;
+    errdefer contracts.deinit(alloc);
     var seen = std.StringHashMapUnmanaged(void){};
     defer seen.deinit(alloc);
 
-    for (wrapper_values.items, 0..) |wrapper_value, i| {
-        const item = try fixtureJsonObject(wrapper_value);
+    for (contract_values.items, 0..) |contract_value, i| {
+        const item = try fixtureJsonObject(contract_value);
         try fixtureRequireOnlyKeys(item, &.{
-            "wrapper_id",
+            "contract_id",
             "family",
             "requirement_id",
-            "legacy_admission",
+            "cutover_admission",
             "public_boundary_corruption_required",
         });
-        const wrapper_id = try fixtureJsonOptionalString(item, "wrapper_id", "");
+        const contract_id = try fixtureJsonOptionalString(item, "contract_id", "");
         const family = try fixtureJsonOptionalString(item, "family", "");
         const requirement_id = try fixtureJsonOptionalString(item, "requirement_id", "");
-        const legacy_admission = try fixtureJsonOptionalString(item, "legacy_admission", "");
+        const cutover_admission = try fixtureJsonOptionalString(item, "cutover_admission", "");
         const public_boundary_corruption_required = try fixtureJsonOptionalBool(item, "public_boundary_corruption_required") orelse return error.TestUnexpectedResult;
-        if (wrapper_id.len == 0 or
+        if (contract_id.len == 0 or
             family.len == 0 or
             requirement_id.len == 0 or
-            legacy_admission.len == 0 or
-            seen.contains(wrapper_id) or
+            cutover_admission.len == 0 or
+            seen.contains(contract_id) or
             !sqlParserMigrationFamilyKnown(family) or
             !sqlProductionIngressCutoverGateKnown(requirement_id) or
-            !sqlProductionIngressCutoverLegacyAdmissionKnown(legacy_admission))
+            !sqlProductionIngressCutoverAdmissionKnown(cutover_admission))
         {
             return error.TestUnexpectedResult;
         }
-        if (std.mem.eql(u8, legacy_admission, "migration_blocker") and !public_boundary_corruption_required) {
+        if (std.mem.eql(u8, cutover_admission, "migration_blocker") and !public_boundary_corruption_required) {
             return error.TestUnexpectedResult;
         }
-        if (std.mem.eql(u8, legacy_admission, "compatibility_contract") and public_boundary_corruption_required) {
+        if (std.mem.eql(u8, cutover_admission, "compatibility_contract") and public_boundary_corruption_required) {
             return error.TestUnexpectedResult;
         }
-        if (i > 0 and !std.mem.lessThan(u8, wrappers.items[i - 1].wrapper_id, wrapper_id)) return error.TestUnexpectedResult;
-        try seen.put(alloc, wrapper_id, {});
-        try wrappers.append(alloc, .{
-            .wrapper_id = wrapper_id,
+        if (i > 0 and !std.mem.lessThan(u8, contracts.items[i - 1].contract_id, contract_id)) return error.TestUnexpectedResult;
+        try seen.put(alloc, contract_id, {});
+        try contracts.append(alloc, .{
+            .contract_id = contract_id,
             .family = family,
             .requirement_id = requirement_id,
-            .legacy_admission = legacy_admission,
+            .cutover_admission = cutover_admission,
             .public_boundary_corruption_required = public_boundary_corruption_required,
         });
     }
-    return try wrappers.toOwnedSlice(alloc);
+    return try contracts.toOwnedSlice(alloc);
 }
 
 fn parseSqlProductionIngressCutoverFamiliesAlloc(
@@ -3925,7 +3922,7 @@ pub fn freeSqlProductionIngressCutoverRoot(
     root: SqlProductionIngressCutoverRoot,
 ) void {
     if (root.gates.len > 0) alloc.free(root.gates);
-    if (root.wrappers.len > 0) alloc.free(root.wrappers);
+    if (root.contracts.len > 0) alloc.free(root.contracts);
     if (root.families.len > 0) alloc.free(root.families);
 }
 
@@ -4086,12 +4083,12 @@ pub fn parseSqlProductionTerminalBridgeAlloc(alloc: std.mem.Allocator) !SqlProdu
     };
 }
 
-fn sqlProductionIngressCutoverWrapperForId(
+fn sqlProductionIngressCutoverContractForId(
     root: SqlProductionIngressCutoverRoot,
     id: []const u8,
-) ?SqlProductionIngressCutoverWrapper {
-    for (root.wrappers) |wrapper| {
-        if (std.mem.eql(u8, wrapper.wrapper_id, id)) return wrapper;
+) ?SqlProductionIngressCutoverContract {
+    for (root.contracts) |contract| {
+        if (std.mem.eql(u8, contract.contract_id, id)) return contract;
     }
     return null;
 }
@@ -4259,9 +4256,9 @@ pub fn parseDocumentSqlDependencyGuardRootAlloc(
             !documentSqlDependencyGuardKnown(entry.response_guard) or
             !documentSqlDependencyGuardKnown(entry.expression_guard) or
             !documentSqlDependencyGuardKnown(entry.durable_storage_guard) or
-            !sqlCompatibilityWrapperStateEffectKnown(entry.durable_catalog) or
-            !sqlCompatibilityWrapperStateEffectKnown(entry.durable_document) or
-            !sqlCompatibilityWrapperStateEffectKnown(entry.durable_row) or
+            !sqlCutoverContractStateEffectKnown(entry.durable_catalog) or
+            !sqlCutoverContractStateEffectKnown(entry.durable_document) or
+            !sqlCutoverContractStateEffectKnown(entry.durable_row) or
             !std.mem.startsWith(u8, entry.evidence_file, "zig/") or
             entry.evidence_symbol.len == 0 or
             !std.mem.eql(u8, entry.release_gate, "relational-release-gate"))
@@ -4270,16 +4267,16 @@ pub fn parseDocumentSqlDependencyGuardRootAlloc(
         }
         if (i > 0 and !std.mem.lessThan(u8, entries.items[i - 1].id, entry.id)) return error.TestUnexpectedResult;
         if (std.mem.eql(u8, entry.admission, "admitted_read_only") and
-            (!sqlCompatibilityWrapperStateEffectIsSafe(entry.durable_catalog) or
-                !sqlCompatibilityWrapperStateEffectIsSafe(entry.durable_document) or
-                !sqlCompatibilityWrapperStateEffectIsSafe(entry.durable_row)))
+            (!sqlCutoverContractStateEffectIsSafe(entry.durable_catalog) or
+                !sqlCutoverContractStateEffectIsSafe(entry.durable_document) or
+                !sqlCutoverContractStateEffectIsSafe(entry.durable_row)))
         {
             return error.TestUnexpectedResult;
         }
         if (std.mem.eql(u8, entry.admission, "blocked_until_native_parity") and
-            sqlCompatibilityWrapperStateEffectIsSafe(entry.durable_catalog) and
-            sqlCompatibilityWrapperStateEffectIsSafe(entry.durable_document) and
-            sqlCompatibilityWrapperStateEffectIsSafe(entry.durable_row))
+            sqlCutoverContractStateEffectIsSafe(entry.durable_catalog) and
+            sqlCutoverContractStateEffectIsSafe(entry.durable_document) and
+            sqlCutoverContractStateEffectIsSafe(entry.durable_row))
         {
             return error.TestUnexpectedResult;
         }
@@ -6203,7 +6200,7 @@ pub fn parseRelationalSqlApiCoverageInventoryAlloc(alloc: std.mem.Allocator) !Re
 const relational_sql_adapter_removal_inventory_ids = [_][]const u8{
     "application-migration-equivalence-corpus",
     "catalog-snapshot-binding",
-    "legacy-wrapper-deletion",
+    "tokenized-contract-deletion",
     "structural-sql-normalization",
 };
 
@@ -6217,7 +6214,7 @@ fn relationalSqlAdapterRemovalInventoryIdKnown(name: []const u8) bool {
 fn relationalSqlAdapterRemovalSurfaceKnown(name: []const u8) bool {
     return std.mem.eql(u8, name, "application_migration_equivalence_corpus") or
         std.mem.eql(u8, name, "catalog_snapshot_binding") or
-        std.mem.eql(u8, name, "legacy_wrapper_deletion") or
+        std.mem.eql(u8, name, "tokenized_contract_deletion") or
         std.mem.eql(u8, name, "structural_sql_normalization");
 }
 
@@ -6274,7 +6271,7 @@ pub fn parseRelationalSqlAdapterRemovalInventoryRootAlloc(
         if (entry.id.len == 0 or
             seen.contains(entry.id) or
             !relationalSqlAdapterRemovalInventoryIdKnown(entry.id) or
-            !std.mem.eql(u8, entry.relational_slices_section, "SQL adapter and compatibility wrapper removal") or
+            !std.mem.eql(u8, entry.relational_slices_section, "SQL adapter and cutover contract removal") or
             !relationalSqlAdapterRemovalSurfaceKnown(entry.surface) or
             !relationalSqlAdapterRemovalStatusKnown(entry.status) or
             entry.current_evidence.len == 0 or
@@ -12639,30 +12636,21 @@ test "sql adapter corpus validates unsupported reason manifest" {
     );
 }
 
-test "sql adapter corpus validates compatibility wrapper inventory" {
+test "sql adapter corpus validates cutover contract inventory" {
     const alloc = std.testing.allocator;
-    var inventory = try parseSqlCompatibilityWrapperInventoryAlloc(alloc);
+    var inventory = try parseSqlCutoverContractInventoryAlloc(alloc);
     defer inventory.deinit(alloc);
-    try std.testing.expectEqual(sql_compatibility_wrapper_inventory_format, inventory.root.inventory_format);
-    try std.testing.expect(inventory.root.wrappers.len > 0);
-    try std.testing.expectEqual(@as(usize, 1), inventory.root.wrappers.len);
-    try std.testing.expectEqualStrings("document-query-bounded-scan-runtime", inventory.root.wrappers[0].id);
-    try std.testing.expectEqualStrings("runtime", inventory.root.wrappers[0].wrapper_class);
-    try std.testing.expectEqualStrings(
-        "Generated read ASTs identify document source, projection, predicate, ordering, aggregate, and UNNEST shapes.",
-        inventory.root.wrappers[0].deletion_evidence.typed_parser,
-    );
-    try std.testing.expectEqualStrings("none", inventory.root.wrappers[0].state_safety.durable_catalog);
-    try std.testing.expectEqualStrings("bounded_document_query_scan", inventory.root.wrappers[0].contract_reason);
+    try std.testing.expectEqual(sql_cutover_contract_inventory_format, inventory.root.inventory_format);
+    try std.testing.expectEqual(@as(usize, 0), inventory.root.contracts.len);
 
     const unknown_class_json =
         \\{
         \\  "inventory_format": 1,
-        \\  "wrappers": [
+        \\  "contracts": [
         \\    {
-        \\      "id": "bad-wrapper",
+        \\      "id": "bad-contract",
         \\      "family": "query",
-        \\      "wrapper_class": "unknown",
+        \\      "contract_class": "unknown",
         \\      "classification": "migration_blocker",
         \\      "file": "zig/pkg/antfly/src/sql/tokenized.zig",
         \\      "symbol": "readStatementKindIncludingGeneratedAst",
@@ -12688,16 +12676,16 @@ test "sql adapter corpus validates compatibility wrapper inventory" {
     ;
     var parsed_unknown_class = try std.json.parseFromSlice(std.json.Value, alloc, unknown_class_json, .{});
     defer parsed_unknown_class.deinit();
-    try std.testing.expectError(error.TestUnexpectedResult, parseSqlCompatibilityWrapperInventoryRootAlloc(alloc, parsed_unknown_class.value));
+    try std.testing.expectError(error.TestUnexpectedResult, parseSqlCutoverContractInventoryRootAlloc(alloc, parsed_unknown_class.value));
 
     const unsorted_json =
         \\{
         \\  "inventory_format": 1,
-        \\  "wrappers": [
+        \\  "contracts": [
         \\    {
         \\      "id": "write-statement-kind-classifier",
         \\      "family": "dml",
-        \\      "wrapper_class": "parser",
+        \\      "contract_class": "parser",
         \\      "classification": "migration_blocker",
         \\      "file": "zig/pkg/antfly/src/sql/tokenized.zig",
         \\      "symbol": "writeStatementKindIncludingGeneratedAst",
@@ -12721,7 +12709,7 @@ test "sql adapter corpus validates compatibility wrapper inventory" {
         \\    {
         \\      "id": "binder-dml-source-token-scanners",
         \\      "family": "dml",
-        \\      "wrapper_class": "binder",
+        \\      "contract_class": "binder",
         \\      "classification": "migration_blocker",
         \\      "file": "zig/pkg/antfly/src/sql/binder.zig",
         \\      "symbol": "insertSourceTableNamesFromParsedSqlAlloc",
@@ -12747,16 +12735,16 @@ test "sql adapter corpus validates compatibility wrapper inventory" {
     ;
     var parsed_unsorted = try std.json.parseFromSlice(std.json.Value, alloc, unsorted_json, .{});
     defer parsed_unsorted.deinit();
-    try std.testing.expectError(error.TestUnexpectedResult, parseSqlCompatibilityWrapperInventoryRootAlloc(alloc, parsed_unsorted.value));
+    try std.testing.expectError(error.TestUnexpectedResult, parseSqlCutoverContractInventoryRootAlloc(alloc, parsed_unsorted.value));
 
     const outside_sql_json =
         \\{
         \\  "inventory_format": 1,
-        \\  "wrappers": [
+        \\  "contracts": [
         \\    {
         \\      "id": "bad-file",
         \\      "family": "query",
-        \\      "wrapper_class": "parser",
+        \\      "contract_class": "parser",
         \\      "classification": "migration_blocker",
         \\      "file": "zig/pkg/antfly/src/storage/db.zig",
         \\      "symbol": "readStatementKindIncludingGeneratedAst",
@@ -12782,16 +12770,16 @@ test "sql adapter corpus validates compatibility wrapper inventory" {
     ;
     var parsed_outside_sql = try std.json.parseFromSlice(std.json.Value, alloc, outside_sql_json, .{});
     defer parsed_outside_sql.deinit();
-    try std.testing.expectError(error.TestUnexpectedResult, parseSqlCompatibilityWrapperInventoryRootAlloc(alloc, parsed_outside_sql.value));
+    try std.testing.expectError(error.TestUnexpectedResult, parseSqlCutoverContractInventoryRootAlloc(alloc, parsed_outside_sql.value));
 
     const missing_evidence_json =
         \\{
         \\  "inventory_format": 1,
-        \\  "wrappers": [
+        \\  "contracts": [
         \\    {
         \\      "id": "missing-evidence",
         \\      "family": "query",
-        \\      "wrapper_class": "parser",
+        \\      "contract_class": "parser",
         \\      "classification": "migration_blocker",
         \\      "file": "zig/pkg/antfly/src/sql/tokenized.zig",
         \\      "symbol": "readStatementKindIncludingGeneratedAst",
@@ -12817,16 +12805,16 @@ test "sql adapter corpus validates compatibility wrapper inventory" {
     ;
     var parsed_missing_evidence = try std.json.parseFromSlice(std.json.Value, alloc, missing_evidence_json, .{});
     defer parsed_missing_evidence.deinit();
-    try std.testing.expectError(error.TestUnexpectedResult, parseSqlCompatibilityWrapperInventoryRootAlloc(alloc, parsed_missing_evidence.value));
+    try std.testing.expectError(error.TestUnexpectedResult, parseSqlCutoverContractInventoryRootAlloc(alloc, parsed_missing_evidence.value));
 
     const misplaced_contract_reason_json =
         \\{
         \\  "inventory_format": 1,
-        \\  "wrappers": [
+        \\  "contracts": [
         \\    {
         \\      "id": "misplaced-contract-reason",
         \\      "family": "query",
-        \\      "wrapper_class": "parser",
+        \\      "contract_class": "parser",
         \\      "classification": "migration_blocker",
         \\      "file": "zig/pkg/antfly/src/sql/tokenized.zig",
         \\      "symbol": "readStatementKindIncludingGeneratedAst",
@@ -12853,16 +12841,16 @@ test "sql adapter corpus validates compatibility wrapper inventory" {
     ;
     var parsed_misplaced_contract_reason = try std.json.parseFromSlice(std.json.Value, alloc, misplaced_contract_reason_json, .{});
     defer parsed_misplaced_contract_reason.deinit();
-    try std.testing.expectError(error.TestUnexpectedResult, parseSqlCompatibilityWrapperInventoryRootAlloc(alloc, parsed_misplaced_contract_reason.value));
+    try std.testing.expectError(error.TestUnexpectedResult, parseSqlCutoverContractInventoryRootAlloc(alloc, parsed_misplaced_contract_reason.value));
 
     const unknown_contract_reason_json =
         \\{
         \\  "inventory_format": 1,
-        \\  "wrappers": [
+        \\  "contracts": [
         \\    {
         \\      "id": "unknown-contract-reason",
         \\      "family": "query",
-        \\      "wrapper_class": "runtime",
+        \\      "contract_class": "runtime",
         \\      "classification": "compatibility_contract",
         \\      "file": "zig/pkg/antfly/src/sql/document_plan.zig",
         \\      "symbol": "bounded document query scan fallbacks",
@@ -12889,16 +12877,16 @@ test "sql adapter corpus validates compatibility wrapper inventory" {
     ;
     var parsed_unknown_contract_reason = try std.json.parseFromSlice(std.json.Value, alloc, unknown_contract_reason_json, .{});
     defer parsed_unknown_contract_reason.deinit();
-    try std.testing.expectError(error.TestUnexpectedResult, parseSqlCompatibilityWrapperInventoryRootAlloc(alloc, parsed_unknown_contract_reason.value));
+    try std.testing.expectError(error.TestUnexpectedResult, parseSqlCutoverContractInventoryRootAlloc(alloc, parsed_unknown_contract_reason.value));
 
     const unsafe_contract_json =
         \\{
         \\  "inventory_format": 1,
-        \\  "wrappers": [
+        \\  "contracts": [
         \\    {
         \\      "id": "unsafe-contract",
         \\      "family": "query",
-        \\      "wrapper_class": "runtime",
+        \\      "contract_class": "runtime",
         \\      "classification": "compatibility_contract",
         \\      "file": "zig/pkg/antfly/src/sql/document_plan.zig",
         \\      "symbol": "bounded document query scan fallbacks",
@@ -12925,7 +12913,7 @@ test "sql adapter corpus validates compatibility wrapper inventory" {
     ;
     var parsed_unsafe_contract = try std.json.parseFromSlice(std.json.Value, alloc, unsafe_contract_json, .{});
     defer parsed_unsafe_contract.deinit();
-    try std.testing.expectError(error.TestUnexpectedResult, parseSqlCompatibilityWrapperInventoryRootAlloc(alloc, parsed_unsafe_contract.value));
+    try std.testing.expectError(error.TestUnexpectedResult, parseSqlCutoverContractInventoryRootAlloc(alloc, parsed_unsafe_contract.value));
 }
 
 test "sql adapter corpus validates parser migration table manifest" {
@@ -12962,7 +12950,7 @@ test "sql adapter corpus validates parser migration table manifest" {
         \\      "compatibility_entry_point": "compat",
         \\      "generated_ast_entry_point": "generated",
         \\      "entrypoints": ["tokenized"],
-        \\      "parser_status": "mixed_generated_plus_legacy_probes",
+        \\      "parser_status": "mixed_generated_plus_token_probes",
         \\      "retained_ast_corruption_test": "test",
         \\      "coverage_file": "coverage.json",
         \\      "removal_gate": "gate"
@@ -12983,7 +12971,7 @@ test "sql adapter corpus validates parser migration table manifest" {
         \\      "compatibility_entry_point": "compat",
         \\      "generated_ast_entry_point": "generated",
         \\      "entrypoints": ["tokenized"],
-        \\      "parser_status": "mixed_generated_plus_legacy_probes",
+        \\      "parser_status": "mixed_generated_plus_token_probes",
         \\      "retained_ast_corruption_test": "test",
         \\      "coverage_file": "coverage.json",
         \\      "removal_gate": "gate"
@@ -12993,7 +12981,7 @@ test "sql adapter corpus validates parser migration table manifest" {
         \\      "compatibility_entry_point": "compat",
         \\      "generated_ast_entry_point": "generated",
         \\      "entrypoints": ["tokenized"],
-        \\      "parser_status": "mixed_generated_plus_legacy_probes",
+        \\      "parser_status": "mixed_generated_plus_token_probes",
         \\      "retained_ast_corruption_test": "test",
         \\      "coverage_file": "coverage.json",
         \\      "removal_gate": "gate"
@@ -13014,7 +13002,7 @@ test "sql adapter corpus validates parser migration table manifest" {
         \\      "compatibility_entry_point": "compat",
         \\      "generated_ast_entry_point": "generated",
         \\      "entrypoints": ["tokenized"],
-        \\      "parser_status": "mixed_generated_plus_legacy_probes",
+        \\      "parser_status": "mixed_generated_plus_token_probes",
         \\      "retained_ast_corruption_test": "test",
         \\      "coverage_file": "coverage.json",
         \\      "removal_gate": "gate"
@@ -13072,26 +13060,26 @@ test "sql adapter corpus validates production ingress cutover manifest" {
     try std.testing.expectEqual(sql_production_ingress_cutover_format, cutover.root.cutover_format);
     try std.testing.expectEqual(sql_production_ingress_cutover_gate_ids.len, cutover.root.gates.len);
     try std.testing.expectEqualStrings("generated-ast-dispatch", cutover.root.gates[0].id);
-    try std.testing.expectEqualStrings("fixture_enforced", cutover.root.gates[0].status);
+    try std.testing.expectEqualStrings("complete", cutover.root.gates[0].status);
     try std.testing.expectEqualStrings("complete", cutover.root.gates[1].status);
     try std.testing.expectEqualStrings("complete", cutover.root.gates[2].status);
-    try std.testing.expectEqualStrings("document-query-bounded-scan-runtime", cutover.root.wrappers[cutover.root.wrappers.len - 1].wrapper_id);
+    try std.testing.expectEqual(@as(usize, 0), cutover.root.contracts.len);
     try std.testing.expectEqualStrings("roles", cutover.root.families[cutover.root.families.len - 1].family);
 
-    var wrappers = try parseSqlCompatibilityWrapperInventoryAlloc(alloc);
-    defer wrappers.deinit(alloc);
-    try std.testing.expectEqual(wrappers.root.wrappers.len, cutover.root.wrappers.len);
-    for (wrappers.root.wrappers) |wrapper| {
-        const cutover_wrapper = sqlProductionIngressCutoverWrapperForId(cutover.root, wrapper.id) orelse return error.TestUnexpectedResult;
-        try std.testing.expectEqualStrings(wrapper.family, cutover_wrapper.family);
-        try std.testing.expectEqualStrings(wrapper.classification, cutover_wrapper.legacy_admission);
-        if (std.mem.eql(u8, wrapper.classification, "migration_blocker")) {
-            try std.testing.expect(cutover_wrapper.public_boundary_corruption_required);
-        } else if (std.mem.eql(u8, wrapper.classification, "compatibility_contract")) {
-            try std.testing.expect(!cutover_wrapper.public_boundary_corruption_required);
-            try std.testing.expect(sqlCompatibilityWrapperStateEffectIsSafe(wrapper.state_safety.durable_catalog));
-            try std.testing.expect(sqlCompatibilityWrapperStateEffectIsSafe(wrapper.state_safety.durable_document));
-            try std.testing.expect(sqlCompatibilityWrapperStateEffectIsSafe(wrapper.state_safety.durable_row));
+    var contracts = try parseSqlCutoverContractInventoryAlloc(alloc);
+    defer contracts.deinit(alloc);
+    try std.testing.expectEqual(contracts.root.contracts.len, cutover.root.contracts.len);
+    for (contracts.root.contracts) |contract| {
+        const cutover_contract = sqlProductionIngressCutoverContractForId(cutover.root, contract.id) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings(contract.family, cutover_contract.family);
+        try std.testing.expectEqualStrings(contract.classification, cutover_contract.cutover_admission);
+        if (std.mem.eql(u8, contract.classification, "migration_blocker")) {
+            try std.testing.expect(cutover_contract.public_boundary_corruption_required);
+        } else if (std.mem.eql(u8, contract.classification, "compatibility_contract")) {
+            try std.testing.expect(!cutover_contract.public_boundary_corruption_required);
+            try std.testing.expect(sqlCutoverContractStateEffectIsSafe(contract.state_safety.durable_catalog));
+            try std.testing.expect(sqlCutoverContractStateEffectIsSafe(contract.state_safety.durable_document));
+            try std.testing.expect(sqlCutoverContractStateEffectIsSafe(contract.state_safety.durable_row));
         }
     }
 
@@ -13103,7 +13091,7 @@ test "sql adapter corpus validates production ingress cutover manifest" {
         try std.testing.expect(sqlParserMigrationEntrypointsContain(family.entrypoints, cutover_family.required_entrypoint));
         try std.testing.expectEqualStrings("retained-ast-corruption-boundary", cutover_family.corruption_gate);
         try std.testing.expect(family.retained_ast_corruption_test.len != 0);
-        try std.testing.expect(!std.mem.eql(u8, family.parser_status, "mixed_generated_plus_legacy_probes"));
+        try std.testing.expect(!std.mem.eql(u8, family.parser_status, "mixed_generated_plus_token_probes"));
     }
 
     var terminal_bridge = try parseSqlProductionTerminalBridgeAlloc(alloc);
@@ -13143,12 +13131,12 @@ test "sql adapter corpus validates production ingress cutover manifest" {
         \\      "completion_condition": "condition"
         \\    }
         \\  ],
-        \\  "wrappers": [
+        \\  "contracts": [
         \\    {
-        \\      "wrapper_id": "read-statement-kind-classifier",
+        \\      "contract_id": "read-statement-kind-classifier",
         \\      "family": "query",
         \\      "requirement_id": "generated-ast-dispatch",
-        \\      "legacy_admission": "migration_blocker",
+        \\      "cutover_admission": "migration_blocker",
         \\      "public_boundary_corruption_required": true
         \\    }
         \\  ],
@@ -13194,12 +13182,12 @@ test "sql adapter corpus validates production ingress cutover manifest" {
         \\      "completion_condition": "condition"
         \\    }
         \\  ],
-        \\  "wrappers": [
+        \\  "contracts": [
         \\    {
-        \\      "wrapper_id": "read-statement-kind-classifier",
+        \\      "contract_id": "read-statement-kind-classifier",
         \\      "family": "query",
         \\      "requirement_id": "generated-ast-dispatch",
-        \\      "legacy_admission": "migration_blocker",
+        \\      "cutover_admission": "migration_blocker",
         \\      "public_boundary_corruption_required": false
         \\    }
         \\  ],
@@ -14706,7 +14694,7 @@ test "sql adapter corpus validates relational SQL adapter removal inventory mani
     try std.testing.expectEqualStrings("application-migration-equivalence-corpus", inventory.root.entries[0].id);
     try std.testing.expectEqualStrings("application_migration_equivalence_corpus", inventory.root.entries[0].surface);
     try std.testing.expectEqualStrings("catalog-snapshot-binding", inventory.root.entries[1].id);
-    try std.testing.expectEqualStrings("legacy-wrapper-deletion", inventory.root.entries[2].id);
+    try std.testing.expectEqualStrings("tokenized-contract-deletion", inventory.root.entries[2].id);
     try std.testing.expectEqualStrings("release_evidence", inventory.root.entries[2].status);
     try std.testing.expectEqualStrings("structural-sql-normalization", inventory.root.entries[3].id);
 
@@ -14716,7 +14704,7 @@ test "sql adapter corpus validates relational SQL adapter removal inventory mani
         \\  "entries": [
         \\    {
         \\      "id": "application-migration-equivalence-corpus",
-        \\      "relational_slices_section": "SQL adapter and compatibility wrapper removal",
+        \\      "relational_slices_section": "SQL adapter and cutover contract removal",
         \\      "surface": "parser_spelling",
         \\      "status": "partial_release_gated",
         \\      "current_evidence": "current",
@@ -14738,7 +14726,7 @@ test "sql adapter corpus validates relational SQL adapter removal inventory mani
         \\  "entries": [
         \\    {
         \\      "id": "application-migration-equivalence-corpus",
-        \\      "relational_slices_section": "SQL adapter and compatibility wrapper removal",
+        \\      "relational_slices_section": "SQL adapter and cutover contract removal",
         \\      "surface": "application_migration_equivalence_corpus",
         \\      "status": "partial_release_gated",
         \\      "current_evidence": "current",
@@ -14760,7 +14748,7 @@ test "sql adapter corpus validates relational SQL adapter removal inventory mani
         \\  "entries": [
         \\    {
         \\      "id": "application-migration-equivalence-corpus",
-        \\      "relational_slices_section": "SQL adapter and compatibility wrapper removal",
+        \\      "relational_slices_section": "SQL adapter and cutover contract removal",
         \\      "surface": "application_migration_equivalence_corpus",
         \\      "status": "partial_release_gated",
         \\      "current_evidence": "current",

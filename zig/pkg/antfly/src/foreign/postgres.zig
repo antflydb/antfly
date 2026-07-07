@@ -116,16 +116,24 @@ pub fn fromMetadataOpenApi(alloc: Allocator, foreign_source: anytype) !Config {
 
 fn fromAnyOpenApiForeignSource(
     alloc: Allocator,
-    source_type: []const u8,
+    source_type: anytype,
     dsn: []const u8,
     postgres_table: []const u8,
     columns: anytype,
 ) !Config {
-    if (!std.mem.eql(u8, source_type, "postgres")) return error.UnsupportedSourceKind;
+    if (!openApiForeignSourceIsPostgres(source_type)) return error.UnsupportedSourceKind;
     return .{
         .dsn = try alloc.dupe(u8, dsn),
         .postgres_table = try alloc.dupe(u8, postgres_table),
         .columns = try cloneOpenApiColumnsAlloc(alloc, columns),
+    };
+}
+
+fn openApiForeignSourceIsPostgres(source_type: anytype) bool {
+    return switch (@typeInfo(@TypeOf(source_type))) {
+        .@"enum" => source_type == .postgres,
+        .pointer => std.mem.eql(u8, source_type, "postgres"),
+        else => false,
     };
 }
 

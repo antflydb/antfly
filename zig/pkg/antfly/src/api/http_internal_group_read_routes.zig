@@ -1014,45 +1014,125 @@ test "internal group read routes expose relational rows source group local" {
             }
             try std.testing.expectEqual(@as(u64, 42), topology_epoch);
             try std.testing.expect(req_inner.select_all);
-            try std.testing.expectEqualStrings("a", doc_key_range.start);
+            try std.testing.expect(doc_key_range.start.len > 0);
             try std.testing.expectEqualStrings("z", doc_key_range.end);
             try std.testing.expectEqual(@import("../raft/mod.zig").ReadConsistency.read_index, consistency);
 
+            const fallback_reason: db_mod.types.RelationalRowsQueryResult.FallbackReason = switch (doc_key_range.start[0]) {
+                'a' => .ordered_tuple_predicate_not_proven,
+                'b' => .ordered_tuple_index_not_ready,
+                'c' => .ordered_tuple_stale_generation,
+                'd' => .ordered_tuple_access_method_mismatch,
+                'e' => .ordered_tuple_order_field_not_covered,
+                'f' => .ordered_tuple_no_usable_bounds,
+                else => return error.InvalidRequest,
+            };
             const rows = try alloc_inner.alloc([]const u8, 1);
             errdefer alloc_inner.free(rows);
             rows[0] = try alloc_inner.dupe(u8, "{\"id\":\"a\"}");
+            var profile = db_mod.types.RelationalRowsQueryResult.Profile{
+                .access_method = .base_scan,
+                .fallback_reason = fallback_reason,
+            };
+            profile.refreshUnsupportedReason();
             return .{
                 .rows = rows,
                 .total = 1,
+                .include_profile = req_inner.profile,
+                .profile = profile,
             };
         }
     };
 
-    var resp = (try handle(.{
-        .alloc = alloc,
-        .reads = FakeReads.source(),
-        .catalog = .{
-            .ptr = undefined,
+    const ProfileCase = struct {
+        start: []const u8,
+        fallback_reason: db_mod.types.RelationalRowsQueryResult.FallbackReason,
+        unsupported_reason: db_mod.types.RelationalRowsQueryResult.UnsupportedReason,
+        unsupported_json: []const u8,
+    };
+    const profile_cases = [_]ProfileCase{
+        .{
+            .start = "a",
+            .fallback_reason = .ordered_tuple_predicate_not_proven,
+            .unsupported_reason = .predicate_not_proven,
+            .unsupported_json = "\"unsupported_reason\":\"predicate-not-proven\"",
         },
-        .query_router = .{
-            .ptr = undefined,
-            .route_query_to_read_schema = struct {
-                fn route(_: *anyopaque, _: []const u8, _: *db_mod.types.SearchRequest) !void {}
-            }.route,
+        .{
+            .start = "b",
+            .fallback_reason = .ordered_tuple_index_not_ready,
+            .unsupported_reason = .index_not_ready,
+            .unsupported_json = "\"unsupported_reason\":\"index-not-ready\"",
         },
-    }, .{
-        .method = .POST,
-        .uri = "/internal/v1/groups/7/tables/docs/rows/source",
-        .body = "{\"schema_json\":\"{\\\"type\\\":\\\"object\\\"}\",\"topology_epoch\":42,\"req\":{\"select_all\":true},\"doc_key_range\":{\"start\":\"a\",\"end\":\"z\"}}",
-    }, "/internal/v1/groups/7/tables/docs/rows/source", "")).?;
-    defer resp.deinit(alloc);
+        .{
+            .start = "c",
+            .fallback_reason = .ordered_tuple_stale_generation,
+            .unsupported_reason = .stale_generation,
+            .unsupported_json = "\"unsupported_reason\":\"stale-generation\"",
+        },
+        .{
+            .start = "d",
+            .fallback_reason = .ordered_tuple_access_method_mismatch,
+            .unsupported_reason = .unsupported_access_method,
+            .unsupported_json = "\"unsupported_reason\":\"unsupported-access-method\"",
+        },
+        .{
+            .start = "e",
+            .fallback_reason = .ordered_tuple_order_field_not_covered,
+            .unsupported_reason = .ordering_not_covered,
+            .unsupported_json = "\"unsupported_reason\":\"ordering-not-covered\"",
+        },
+        .{
+            .start = "f",
+            .fallback_reason = .ordered_tuple_no_usable_bounds,
+            .unsupported_reason = .access_method_capability_mismatch,
+            .unsupported_json = "\"unsupported_reason\":\"access-method-capability-mismatch\"",
+        },
+    };
+    for (profile_cases) |case| {
+        const body = try std.fmt.allocPrint(
+            alloc,
+            "{{\"schema_json\":\"{{\\\"type\\\":\\\"object\\\"}}\",\"topology_epoch\":42,\"req\":{{\"select_all\":true,\"profile\":true}},\"doc_key_range\":{{\"start\":\"{s}\",\"end\":\"z\"}}}}",
+            .{case.start},
+        );
+        defer alloc.free(body);
+        var resp = (try handle(.{
+            .alloc = alloc,
+            .reads = FakeReads.source(),
+            .catalog = .{
+                .ptr = undefined,
+            },
+            .query_router = .{
+                .ptr = undefined,
+                .route_query_to_read_schema = struct {
+                    fn route(_: *anyopaque, _: []const u8, _: *db_mod.types.SearchRequest) !void {}
+                }.route,
+            },
+        }, .{
+            .method = .POST,
+            .uri = "/internal/v1/groups/7/tables/docs/rows/source",
+            .body = body,
+        }, "/internal/v1/groups/7/tables/docs/rows/source", "")).?;
+        defer resp.deinit(alloc);
 
-    try std.testing.expectEqual(@as(u16, 200), resp.status);
-    var parsed = try std.json.parseFromSlice(db_mod.types.RelationalRowsQueryResult, alloc, resp.body, .{});
-    defer parsed.deinit();
-    try std.testing.expectEqual(@as(u32, 1), parsed.value.total);
-    try std.testing.expectEqual(@as(usize, 1), parsed.value.rows.len);
-    try std.testing.expectEqualStrings("{\"id\":\"a\"}", parsed.value.rows[0]);
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, case.unsupported_json) != null);
+        var parsed = try std.json.parseFromSlice(db_mod.types.RelationalRowsQueryResult, alloc, resp.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(u32, 1), parsed.value.total);
+        try std.testing.expectEqual(@as(usize, 1), parsed.value.rows.len);
+        try std.testing.expectEqualStrings("{\"id\":\"a\"}", parsed.value.rows[0]);
+        try std.testing.expect(parsed.value.include_profile);
+        try std.testing.expectEqual(case.fallback_reason, parsed.value.profile.fallback_reason);
+        try std.testing.expectEqual(case.unsupported_reason, parsed.value.profile.unsupported_reason);
+        try std.testing.expectEqual(case.unsupported_reason, parsed.value.profile.unsupportedReason());
+    }
+
+    try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSlice(
+        db_mod.types.RelationalRowsQueryResult,
+        alloc,
+        "{\"rows\":[],\"include_profile\":true,\"profile\":{\"unsupported_reason\":\"mystery-bucket\"}}",
+        .{},
+    ));
 
     var stale_resp = (try handle(.{
         .alloc = alloc,

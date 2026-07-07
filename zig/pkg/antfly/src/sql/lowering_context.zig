@@ -771,7 +771,7 @@ fn lowerGeneratedSetOperationQueryPlanAlloc(
         .function_bindings = context.function_bindings,
         .generated_read_ast = null,
     };
-    return lower_expr.parseQueryPlanAlloc(
+    return lower_expr.lowerTokenizedQueryPlanAlloc(
         context.alloc,
         tokens,
         &parser_state.pos,
@@ -1266,6 +1266,7 @@ fn validateGeneratedCteBodyMetadata(tokens: []const tokenized.Token, cte: genera
             cte.body_source_alias_tokens,
             cte.body_source_alias_name_tokens,
             cte.body_source_system_time_tokens,
+            null,
         );
         try validateGeneratedJoinTreeMetadataForSource(
             tokens,
@@ -1474,6 +1475,7 @@ fn validateGeneratedJoinTreeMetadataForSource(
             join.left_alias_tokens,
             join.left_alias_name_tokens,
             null,
+            null,
         );
         try validateGeneratedReadSourceTableMetadata(
             tokens,
@@ -1481,6 +1483,7 @@ fn validateGeneratedJoinTreeMetadataForSource(
             join.right_table_tokens,
             join.right_alias_tokens,
             join.right_alias_name_tokens,
+            null,
             null,
         );
         try validateGeneratedJoinKindForOperator(tokens, join.operator_tokens, join.kind);
@@ -1795,6 +1798,7 @@ fn validateGeneratedReadClauseMetadata(tokens: []const tokenized.Token, read_ast
             read_ast.source_alias_tokens,
             read_ast.source_alias_name_tokens,
             read_ast.source_system_time_tokens,
+            read_ast.source_unnest_tokens,
         );
     } else if (read_ast.source_antfly_function_items.len != 0 or
         read_ast.source_antfly_function_count != 0 or
@@ -1804,6 +1808,12 @@ fn validateGeneratedReadClauseMetadata(tokens: []const tokenized.Token, read_ast
         read_ast.source_graph_function_name_tokens != null or
         read_ast.source_graph_function_argument_tokens != null or
         read_ast.source_graph_function_kind != null or
+        read_ast.source_unnest_tokens != null or
+        read_ast.source_unnest_name_tokens != null or
+        read_ast.source_unnest_argument_tokens != null or
+        read_ast.source_unnest_argument_expression.tokens != null or
+        read_ast.source_unnest_alias_tokens != null or
+        read_ast.source_unnest_alias_name_tokens != null or
         read_ast.source_table_tokens != null or
         read_ast.source_alias_tokens != null or
         read_ast.source_alias_name_tokens != null or
@@ -1929,9 +1939,10 @@ fn validateGeneratedReadSourceTableMetadata(
     maybe_source_alias: ?generated_parser.GeneratedSqlTokenRange,
     maybe_source_alias_name: ?generated_parser.GeneratedSqlTokenRange,
     maybe_source_system_time: ?generated_parser.GeneratedSqlTokenRange,
+    maybe_trailing_source: ?generated_parser.GeneratedSqlTokenRange,
 ) !void {
     const source = maybe_source orelse {
-        if (maybe_source_table != null or maybe_source_alias != null or maybe_source_alias_name != null or maybe_source_system_time != null) {
+        if (maybe_source_table != null or maybe_source_alias != null or maybe_source_alias_name != null or maybe_source_system_time != null or maybe_trailing_source != null) {
             return error.UnsupportedSqlShape;
         }
         return;
@@ -1966,7 +1977,12 @@ fn validateGeneratedReadSourceTableMetadata(
         maybe_source_alias,
         maybe_source_alias_name,
     );
-    if (alias_end != source_body_end) return error.UnsupportedSqlShape;
+    if (maybe_trailing_source) |trailing| {
+        if (trailing.start <= alias_end or trailing.end != source_body_end or trailing.end > tokens.len) return error.UnsupportedSqlShape;
+        if (tokens[alias_end].kind != .comma or alias_end + 1 != trailing.start) return error.UnsupportedSqlShape;
+    } else if (alias_end != source_body_end) {
+        return error.UnsupportedSqlShape;
+    }
 }
 
 fn generatedReadSingleSourceAliasEnd(
@@ -3191,6 +3207,7 @@ fn validateGeneratedGroupedExpressionAstStructure(expression: generated_parser.G
     payload.inner_tokens = null;
     payload.inner_expression_kind = null;
     payload.inner_expression = null;
+    payload.argument_items = .{};
     try validateGeneratedExpressionAstHasNoUnexpectedPayload(payload);
 }
 
@@ -4714,7 +4731,7 @@ fn validateGeneratedExpressionAstRanges(
         try validateGeneratedReadListAstContainedByRange(expression.argument_items, argument_value_tokens);
         try validateGeneratedReadCommaDelimitedList(tokens, argument_value_tokens, expression.argument_items);
         try validateGeneratedExpressionOwnedListPayloads(tokens, read_ast, expression.argument_items, true);
-    } else if (expression.argument_items.count != 0) {
+    } else if (expression.argument_items.count != 0 and expression.kind != .grouped) {
         return error.UnsupportedSqlShape;
     }
     if (expression.argument_order_tokens) |argument_order_tokens| {
@@ -5103,6 +5120,7 @@ fn validateGeneratedSetOperationAstRanges(
             set_operation.right_source_alias_tokens,
             set_operation.right_source_alias_name_tokens,
             set_operation.right_source_system_time_tokens,
+            null,
         );
         try validateGeneratedSetOperationRightJoinMetadata(tokens, source, set_operation);
     } else if (set_operation.right_source_table_tokens != null or
@@ -5664,7 +5682,7 @@ fn lowerQueryParsedSqlForLoweringContextTestAlloc(
         .function_bindings = function_bindings,
         .generated_read_ast = try generatedReadAstForParsedSql(parsed_sql),
     };
-    var lowered = lower_expr.parseQueryPlanAlloc(
+    var lowered = lower_expr.lowerTokenizedQueryPlanAlloc(
         alloc,
         tokens,
         &parser_state.pos,
@@ -5721,7 +5739,7 @@ fn lowerWindowParsedSqlForLoweringContextTestAlloc(
         .params = params,
         .generated_read_ast = try generatedReadAstForParsedSql(parsed_sql),
     };
-    var lowered = plan.parseWindowPlanAlloc(
+    var lowered = plan.lowerTokenizedWindowPlanAlloc(
         alloc,
         tokens,
         &parser_state.pos,
@@ -5758,7 +5776,7 @@ fn lowerAggregateParsedSqlForLoweringContextTestAlloc(
         .params = params,
         .generated_read_ast = try generatedReadAstForParsedSql(parsed_sql),
     };
-    var lowered = plan.parseAggregatePlanAlloc(
+    var lowered = plan.lowerTokenizedAggregatePlanAlloc(
         alloc,
         tokens,
         &parser_state.pos,
@@ -5798,7 +5816,7 @@ fn lowerJoinWithSchemasParsedSqlForLoweringContextTestAlloc(
         .params = params,
         .generated_read_ast = try generatedReadAstForParsedSql(parsed_sql),
     };
-    var lowered = plan.parseJoinPlanAlloc(
+    var lowered = plan.lowerTokenizedJoinPlanAlloc(
         alloc,
         tokens,
         &parser_state.pos,
@@ -5838,7 +5856,7 @@ fn lowerLateralWithSchemasParsedSqlForLoweringContextTestAlloc(
         .params = params,
         .generated_read_ast = try generatedReadAstForParsedSql(parsed_sql),
     };
-    var lowered = plan.parseLateralPlanAlloc(
+    var lowered = plan.lowerTokenizedLateralPlanAlloc(
         alloc,
         tokens,
         &parser_state.pos,
@@ -5875,7 +5893,7 @@ fn lowerRecursiveCteParsedSqlForLoweringContextTestAlloc(
         .function_bindings = function_bindings,
         .generated_read_ast = try generatedReadAstForParsedSql(parsed_sql),
     };
-    return try plan.parseRecursiveCtePlanAlloc(
+    return try plan.lowerTokenizedRecursiveCtePlanAlloc(
         alloc,
         tokens,
         &parser_state.pos,
@@ -5905,7 +5923,7 @@ fn lowerSetOperationParsedSqlForLoweringContextTestAlloc(
         .generated_read_ast = try generatedReadAstForParsedSql(parsed_sql),
         .function_bindings = function_bindings,
     };
-    return try plan.parseSetOperationPlanAlloc(
+    return try plan.lowerTokenizedSetOperationPlanAlloc(
         alloc,
         tokens,
         &parser_state.pos,
@@ -5936,11 +5954,11 @@ test "sql adapter lowering context lowers generated read AST through typed read 
     };
 
     for (cases) |sql| {
-        var legacy = try lowerReadPlanForLoweringContextTestAlloc(alloc, sql, schema, &.{});
-        defer legacy.deinit(alloc);
+        var tokenized_lowered = try lowerReadPlanForLoweringContextTestAlloc(alloc, sql, schema, &.{});
+        defer tokenized_lowered.deinit(alloc);
         var generated = try lowerGeneratedReadPlanForLoweringContextTestAlloc(alloc, sql, schema, &.{});
         defer generated.deinit(alloc);
-        try std.testing.expectEqual(std.meta.activeTag(legacy), std.meta.activeTag(generated));
+        try std.testing.expectEqual(std.meta.activeTag(tokenized_lowered), std.meta.activeTag(generated));
     }
 }
 

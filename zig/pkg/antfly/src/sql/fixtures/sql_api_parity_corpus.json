@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "b35f962cc1bf508ce62ca641b5931334a8fd2fd244a1f826c54da1981e8d5e5f",
-  "source_entry_count": 1581,
-  "entry_count": 1581,
+  "source_sha256": "186e77b0aabce9284ca5b60f890f6765b3186c3333226851de761e31fbe53afc",
+  "source_entry_count": 1586,
+  "entry_count": 1586,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -1994,7 +1994,7 @@
         "request_fingerprint": "native_equivalence:class=native_equivalent:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=index_management:target=usage_records_status_idx:permission=admin:diagnostic=:plan=ddl:maintenance:kind=reindex:target=index:name=usage_records_status_idx:concurrently=true:execution="
       },
       "plan": "ddl:maintenance:kind=reindex:target=index:name=usage_records_status_idx:concurrently=true",
-      "catalog_tables": [{"name": "usage_records", "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"x-antfly-index\":true,\"x-antfly-index-name\":\"usage_records_status_idx\",\"x-antfly-index-access-method\":\"scalar_column\",\"x-antfly-index-generation\":1,\"x-antfly-index-schema-fingerprint\":\"secondary-index-v1:usage_records_status_idx\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}", "indexes_json": "{\"usage_records_status_idx\":{}}"}],
+      "catalog_tables": [{"name": "usage_records", "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]},\"relational_indexes\":[{\"name\":\"usage_records_status_idx\",\"owner_kind\":\"relational_column\",\"owner_name\":\"status\",\"access_method\":\"scalar_column\",\"columns\":[\"status\"],\"lifecycle\":\"ready\",\"generation\":1,\"schema_fingerprint\":\"secondary-index-v1:usage_records_status_idx\"}]}", "indexes_json": "{\"usage_records_status_idx\":{}}"}],
       "sql": "REINDEX INDEX CONCURRENTLY usage_records_status_idx"
     },
     {
@@ -2022,7 +2022,7 @@
         "request_fingerprint": "native_equivalence:class=native_equivalent:surface=maintenance:model=maintenance_operation:route=maintenance:target=usage_records:permission=admin:diagnostic=:plan=ddl:maintenance:kind=cluster:table=usage_records:index=usage_records_status_idx:verbose=false:execution="
       },
       "plan": "ddl:maintenance:kind=cluster:table=usage_records:index=usage_records_status_idx:verbose=false",
-      "catalog_tables": [{"name": "usage_records", "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"x-antfly-index\":true,\"x-antfly-index-name\":\"usage_records_status_idx\",\"x-antfly-index-access-method\":\"scalar_column\",\"x-antfly-index-generation\":1,\"x-antfly-index-schema-fingerprint\":\"secondary-index-v1:usage_records_status_idx\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}", "indexes_json": "{\"usage_records_status_idx\":{}}"}],
+      "catalog_tables": [{"name": "usage_records", "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]},\"relational_indexes\":[{\"name\":\"usage_records_status_idx\",\"owner_kind\":\"relational_column\",\"owner_name\":\"status\",\"access_method\":\"scalar_column\",\"columns\":[\"status\"],\"lifecycle\":\"ready\",\"generation\":1,\"schema_fingerprint\":\"secondary-index-v1:usage_records_status_idx\"}]}", "indexes_json": "{\"usage_records_status_idx\":{}}"}],
       "sql": "CLUSTER usage_records USING usage_records_status_idx"
     },
     {
@@ -2050,7 +2050,7 @@
         "request_fingerprint": "native_equivalence:class=native_equivalent:surface=maintenance:model=maintenance_operation:route=maintenance:target=usage_records:permission=admin:diagnostic=:plan=ddl:maintenance:kind=cluster:table=usage_records:index=usage_records_status_idx:verbose=true:execution="
       },
       "plan": "ddl:maintenance:kind=cluster:table=usage_records:index=usage_records_status_idx:verbose=true",
-      "catalog_tables": [{"name": "usage_records", "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"x-antfly-index\":true,\"x-antfly-index-name\":\"usage_records_status_idx\",\"x-antfly-index-access-method\":\"scalar_column\",\"x-antfly-index-generation\":1,\"x-antfly-index-schema-fingerprint\":\"secondary-index-v1:usage_records_status_idx\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}", "indexes_json": "{\"usage_records_status_idx\":{}}"}],
+      "catalog_tables": [{"name": "usage_records", "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]},\"relational_indexes\":[{\"name\":\"usage_records_status_idx\",\"owner_kind\":\"relational_column\",\"owner_name\":\"status\",\"access_method\":\"scalar_column\",\"columns\":[\"status\"],\"lifecycle\":\"ready\",\"generation\":1,\"schema_fingerprint\":\"secondary-index-v1:usage_records_status_idx\"}]}", "indexes_json": "{\"usage_records_status_idx\":{}}"}],
       "sql": "CLUSTER VERBOSE usage_records USING usage_records_status_idx"
     },
     {
@@ -18473,6 +18473,54 @@
       "sql": "CREATE TABLE generated_expr_records (\n  id uuid PRIMARY KEY,\n  status text,\n  amount numeric,\n  fee numeric,\n  metadata jsonb,\n  status_slug text GENERATED ALWAYS AS (replace(lower(status), ' ', '-')) STORED,\n  amount_cents numeric GENERATED ALWAYS AS (round((amount + fee) * 100)) STORED,\n  source_key text GENERATED ALWAYS AS (jsonb_extract_path_text(metadata, 'source')) STORED\n);"
     },
     {
+      "name": "unsupported schema generated column scalar subquery",
+      "family": "unsupported_ddl",
+      "native_request_kind": "catalog_mutation",
+      "native_request_json": "{\"classification\":\"unsupported\",\"surface\":\"catalog_mutation\",\"native_model\":\"catalog_mutation\",\"native_route\":\"unsupported\",\"target_resource\":\"\",\"permission\":\"none\",\"diagnostic\":\"row_rewrite_expression_plan\",\"sql_plan\":\"unsupported:ddl:requires=row_rewrite_expression_plan\",\"execution_plan\":\"\"}",
+      "sql_fingerprint": "native_equivalence:class=unsupported:surface=catalog_mutation:model=catalog_mutation:route=unsupported:target=:permission=none:diagnostic=row_rewrite_expression_plan:plan=unsupported:ddl:requires=row_rewrite_expression_plan:execution=",
+      "native_fingerprint": "native_equivalence:class=unsupported:surface=catalog_mutation:model=catalog_mutation:route=unsupported:target=:permission=none:diagnostic=row_rewrite_expression_plan:plan=unsupported:ddl:requires=row_rewrite_expression_plan:execution=",
+      "native_equivalence": {
+        "classification": "unsupported",
+        "surface": "catalog_mutation",
+        "native_model": "catalog_mutation",
+        "native_route": "unsupported",
+        "target_resource": "",
+        "auth_resource": "none",
+        "permission": "none",
+        "audit_action": "reject",
+        "row_filter": "not_applicable",
+        "request_fingerprint": "native_equivalence:class=unsupported:surface=catalog_mutation:model=catalog_mutation:route=unsupported:target=:permission=none:diagnostic=row_rewrite_expression_plan:plan=unsupported:ddl:requires=row_rewrite_expression_plan:execution=",
+        "diagnostic": "row_rewrite_expression_plan"
+      },
+      "plan": "unsupported:ddl:requires=row_rewrite_expression_plan",
+      "classification_reason": "row_rewrite_expression_plan",
+      "sql": "CREATE TABLE generated_usage_records (id text, status_key text GENERATED ALWAYS AS ((SELECT lower(id) FROM generated_usage_records LIMIT 1)) STORED);"
+    },
+    {
+      "name": "unsupported schema alter add generated column scalar subquery",
+      "family": "unsupported_ddl",
+      "native_request_kind": "catalog_mutation",
+      "native_request_json": "{\"classification\":\"unsupported\",\"surface\":\"catalog_mutation\",\"native_model\":\"catalog_mutation\",\"native_route\":\"unsupported\",\"target_resource\":\"\",\"permission\":\"none\",\"diagnostic\":\"row_rewrite_expression_plan\",\"sql_plan\":\"unsupported:ddl:requires=row_rewrite_expression_plan\",\"execution_plan\":\"\"}",
+      "sql_fingerprint": "native_equivalence:class=unsupported:surface=catalog_mutation:model=catalog_mutation:route=unsupported:target=:permission=none:diagnostic=row_rewrite_expression_plan:plan=unsupported:ddl:requires=row_rewrite_expression_plan:execution=",
+      "native_fingerprint": "native_equivalence:class=unsupported:surface=catalog_mutation:model=catalog_mutation:route=unsupported:target=:permission=none:diagnostic=row_rewrite_expression_plan:plan=unsupported:ddl:requires=row_rewrite_expression_plan:execution=",
+      "native_equivalence": {
+        "classification": "unsupported",
+        "surface": "catalog_mutation",
+        "native_model": "catalog_mutation",
+        "native_route": "unsupported",
+        "target_resource": "",
+        "auth_resource": "none",
+        "permission": "none",
+        "audit_action": "reject",
+        "row_filter": "not_applicable",
+        "request_fingerprint": "native_equivalence:class=unsupported:surface=catalog_mutation:model=catalog_mutation:route=unsupported:target=:permission=none:diagnostic=row_rewrite_expression_plan:plan=unsupported:ddl:requires=row_rewrite_expression_plan:execution=",
+        "diagnostic": "row_rewrite_expression_plan"
+      },
+      "plan": "unsupported:ddl:requires=row_rewrite_expression_plan",
+      "classification_reason": "row_rewrite_expression_plan",
+      "sql": "ALTER TABLE generated_usage_records ADD COLUMN status_key text GENERATED ALWAYS AS ((SELECT lower(id) FROM generated_usage_records LIMIT 1)) STORED;"
+    },
+    {
       "name": "schema create table inline named constraints",
       "family": "ddl",
       "summary": {
@@ -19150,7 +19198,7 @@
       },
       "plan": "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=0:unique=false:if_not_exists=false:method=text_search",
       "applied_plan": "applied:rebuild=true:validation=false:rewrite=false:building_indexes=1:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=1:work=rebuild/table/derived_artifacts",
-      "sql": "CREATE TEXT SEARCH usage_records_status_fts ON usage_records (status) WITH (analyzer = 'standard', scoring = 'bm25', highlight = true, snippet = true, segment_lifecycle = 'merge_on_commit');"
+      "sql": "CREATE TEXT SEARCH usage_records_status_fts ON usage_records (status) WITH (analyzer = 'standard', scoring = 'bm25', highlight = true, snippet = true);"
     },
     {
       "name": "schema create full text access method index",
@@ -19253,6 +19301,78 @@
       "plan": "unsupported:ddl:requires=index_access_method_plan",
       "classification_reason": "index_access_method_plan",
       "sql": "CREATE INDEX usage_records_algebraic_filter_bad_type_idx ON usage_records USING antfly_algebraic () WITH (derive_from_schema = 'true');"
+    },
+    {
+      "name": "unsupported create ordered tuple fillfactor option",
+      "family": "unsupported_ddl",
+      "native_request_kind": "derived_index_lifecycle",
+      "native_request_json": "{\"classification\":\"unsupported\",\"surface\":\"derived_index_lifecycle\",\"native_model\":\"derived_index_lifecycle\",\"native_route\":\"unsupported\",\"target_resource\":\"\",\"permission\":\"none\",\"diagnostic\":\"index_access_method_plan\",\"sql_plan\":\"unsupported:ddl:requires=index_access_method_plan\",\"execution_plan\":\"\"}",
+      "sql_fingerprint": "native_equivalence:class=unsupported:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=unsupported:target=:permission=none:diagnostic=index_access_method_plan:plan=unsupported:ddl:requires=index_access_method_plan:execution=",
+      "native_fingerprint": "native_equivalence:class=unsupported:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=unsupported:target=:permission=none:diagnostic=index_access_method_plan:plan=unsupported:ddl:requires=index_access_method_plan:execution=",
+      "native_equivalence": {
+        "classification": "unsupported",
+        "surface": "derived_index_lifecycle",
+        "native_model": "derived_index_lifecycle",
+        "native_route": "unsupported",
+        "target_resource": "",
+        "auth_resource": "none",
+        "permission": "none",
+        "audit_action": "reject",
+        "row_filter": "not_applicable",
+        "request_fingerprint": "native_equivalence:class=unsupported:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=unsupported:target=:permission=none:diagnostic=index_access_method_plan:plan=unsupported:ddl:requires=index_access_method_plan:execution=",
+        "diagnostic": "index_access_method_plan"
+      },
+      "plan": "unsupported:ddl:requires=index_access_method_plan",
+      "classification_reason": "index_access_method_plan",
+      "sql": "CREATE INDEX usage_records_status_fillfactor_idx ON usage_records USING btree (status) WITH (fillfactor = 70);"
+    },
+    {
+      "name": "unsupported create ordered tuple deduplicate option",
+      "family": "unsupported_ddl",
+      "native_request_kind": "derived_index_lifecycle",
+      "native_request_json": "{\"classification\":\"unsupported\",\"surface\":\"derived_index_lifecycle\",\"native_model\":\"derived_index_lifecycle\",\"native_route\":\"unsupported\",\"target_resource\":\"\",\"permission\":\"none\",\"diagnostic\":\"index_access_method_plan\",\"sql_plan\":\"unsupported:ddl:requires=index_access_method_plan\",\"execution_plan\":\"\"}",
+      "sql_fingerprint": "native_equivalence:class=unsupported:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=unsupported:target=:permission=none:diagnostic=index_access_method_plan:plan=unsupported:ddl:requires=index_access_method_plan:execution=",
+      "native_fingerprint": "native_equivalence:class=unsupported:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=unsupported:target=:permission=none:diagnostic=index_access_method_plan:plan=unsupported:ddl:requires=index_access_method_plan:execution=",
+      "native_equivalence": {
+        "classification": "unsupported",
+        "surface": "derived_index_lifecycle",
+        "native_model": "derived_index_lifecycle",
+        "native_route": "unsupported",
+        "target_resource": "",
+        "auth_resource": "none",
+        "permission": "none",
+        "audit_action": "reject",
+        "row_filter": "not_applicable",
+        "request_fingerprint": "native_equivalence:class=unsupported:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=unsupported:target=:permission=none:diagnostic=index_access_method_plan:plan=unsupported:ddl:requires=index_access_method_plan:execution=",
+        "diagnostic": "index_access_method_plan"
+      },
+      "plan": "unsupported:ddl:requires=index_access_method_plan",
+      "classification_reason": "index_access_method_plan",
+      "sql": "CREATE INDEX usage_records_status_deduplicate_idx ON usage_records USING btree (status) WITH (deduplicate_items = off);"
+    },
+    {
+      "name": "unsupported create ordered tuple durable lifecycle option",
+      "family": "unsupported_ddl",
+      "native_request_kind": "derived_index_lifecycle",
+      "native_request_json": "{\"classification\":\"unsupported\",\"surface\":\"derived_index_lifecycle\",\"native_model\":\"derived_index_lifecycle\",\"native_route\":\"unsupported\",\"target_resource\":\"\",\"permission\":\"none\",\"diagnostic\":\"index_access_method_plan\",\"sql_plan\":\"unsupported:ddl:requires=index_access_method_plan\",\"execution_plan\":\"\"}",
+      "sql_fingerprint": "native_equivalence:class=unsupported:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=unsupported:target=:permission=none:diagnostic=index_access_method_plan:plan=unsupported:ddl:requires=index_access_method_plan:execution=",
+      "native_fingerprint": "native_equivalence:class=unsupported:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=unsupported:target=:permission=none:diagnostic=index_access_method_plan:plan=unsupported:ddl:requires=index_access_method_plan:execution=",
+      "native_equivalence": {
+        "classification": "unsupported",
+        "surface": "derived_index_lifecycle",
+        "native_model": "derived_index_lifecycle",
+        "native_route": "unsupported",
+        "target_resource": "",
+        "auth_resource": "none",
+        "permission": "none",
+        "audit_action": "reject",
+        "row_filter": "not_applicable",
+        "request_fingerprint": "native_equivalence:class=unsupported:surface=derived_index_lifecycle:model=derived_index_lifecycle:route=unsupported:target=:permission=none:diagnostic=index_access_method_plan:plan=unsupported:ddl:requires=index_access_method_plan:execution=",
+        "diagnostic": "index_access_method_plan"
+      },
+      "plan": "unsupported:ddl:requires=index_access_method_plan",
+      "classification_reason": "index_access_method_plan",
+      "sql": "CREATE INDEX usage_records_status_lifecycle_idx ON usage_records USING btree (status) WITH (lifecycle = 'ready');"
     },
     {
       "name": "schema covering partial index",
@@ -24542,29 +24662,27 @@
     },
     {
       "name": "unsupported document sql non identity delete",
-      "family": "unsupported_write",
+      "family": "document_write",
       "summary": {
         "table_name": "docs"
       },
       "native_request_kind": "document_write_request",
-      "native_request_json": "{\"classification\":\"unsupported\",\"surface\":\"document_write\",\"native_model\":\"document_write_request\",\"native_route\":\"unsupported\",\"target_resource\":\"docs\",\"permission\":\"none\",\"diagnostic\":\"document_sql_write_unsupported\",\"sql_plan\":\"unsupported:write:requires=document_sql_write_unsupported\",\"execution_plan\":\"\"}",
-      "sql_fingerprint": "native_equivalence:class=unsupported:surface=document_write:model=document_write_request:route=unsupported:target=docs:permission=none:diagnostic=document_sql_write_unsupported:plan=unsupported:write:requires=document_sql_write_unsupported:execution=",
-      "native_fingerprint": "native_equivalence:class=unsupported:surface=document_write:model=document_write_request:route=unsupported:target=docs:permission=none:diagnostic=document_sql_write_unsupported:plan=unsupported:write:requires=document_sql_write_unsupported:execution=",
+      "native_request_json": "{\"classification\":\"native_equivalent\",\"surface\":\"document_write\",\"native_model\":\"document_write_request\",\"native_route\":\"document_write\",\"target_resource\":\"docs\",\"permission\":\"write\",\"diagnostic\":\"\",\"sql_plan\":\"document_write:table=docs:operation=non_identity_delete:producer=bounded_scan:producer_scan_rows=10000:producer_scan_bytes=8388608:producer_residual=1:template=delete\",\"execution_plan\":\"\"}",
+      "sql_fingerprint": "native_equivalence:class=native_equivalent:surface=document_write:model=document_write_request:route=document_write:target=docs:permission=write:diagnostic=:plan=document_write:table=docs:operation=non_identity_delete:producer=bounded_scan:producer_scan_rows=10000:producer_scan_bytes=8388608:producer_residual=1:template=delete:execution=",
+      "native_fingerprint": "native_equivalence:class=native_equivalent:surface=document_write:model=document_write_request:route=document_write:target=docs:permission=write:diagnostic=:plan=document_write:table=docs:operation=non_identity_delete:producer=bounded_scan:producer_scan_rows=10000:producer_scan_bytes=8388608:producer_residual=1:template=delete:execution=",
       "native_equivalence": {
-        "classification": "unsupported",
+        "classification": "native_equivalent",
         "surface": "document_write",
         "native_model": "document_write_request",
-        "native_route": "unsupported",
+        "native_route": "document_write",
         "target_resource": "docs",
-        "auth_resource": "none",
-        "permission": "none",
-        "audit_action": "reject",
+        "auth_resource": "table",
+        "permission": "write",
+        "audit_action": "mutate_documents",
         "row_filter": "preserved",
-        "request_fingerprint": "native_equivalence:class=unsupported:surface=document_write:model=document_write_request:route=unsupported:target=docs:permission=none:diagnostic=document_sql_write_unsupported:plan=unsupported:write:requires=document_sql_write_unsupported:execution=",
-        "diagnostic": "document_sql_write_unsupported"
+        "request_fingerprint": "native_equivalence:class=native_equivalent:surface=document_write:model=document_write_request:route=document_write:target=docs:permission=write:diagnostic=:plan=document_write:table=docs:operation=non_identity_delete:producer=bounded_scan:producer_scan_rows=10000:producer_scan_bytes=8388608:producer_residual=1:template=delete:execution="
       },
-      "plan": "unsupported:write:requires=document_sql_write_unsupported",
-      "classification_reason": "document_sql_write_unsupported",
+      "plan": "document_write:table=docs:operation=non_identity_delete:producer=bounded_scan:producer_scan_rows=10000:producer_scan_bytes=8388608:producer_residual=1:template=delete",
       "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\"}},\"additionalProperties\":true}}}}",
       "sql": "DELETE FROM docs WHERE status = 'draft' AND lower(title) = 'launch'"
     },

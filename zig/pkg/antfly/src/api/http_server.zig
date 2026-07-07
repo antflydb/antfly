@@ -6403,7 +6403,7 @@ pub const ApiHttpServer = struct {
         return null;
     }
 
-    fn takePublicSqlRowsBatchFromDocumentBatch(document_batch: *sql_adapter.plan.OwnedDocumentBatchRequest) relational_rows_api.OwnedRowsBatchRequest {
+    fn takePublicSqlRowsBatchFromDocumentBatch(document_batch: *sql_adapter.OwnedDocumentBatchRequest) relational_rows_api.OwnedRowsBatchRequest {
         const rows_batch = relational_rows_api.OwnedRowsBatchRequest{
             .writes = document_batch.writes,
             .deletes = document_batch.deletes,
@@ -8414,7 +8414,7 @@ pub const ApiHttpServer = struct {
             .routine_expressions = routine_bindings,
         };
 
-        var lowered = sql_adapter.lower_dml.lowerWritePlanWithLogicalPlanAndFunctionBindingsAlloc(
+        var lowered = sql_adapter.lowerWritePlanWithLogicalPlanAndFunctionBindingsAlloc(
             self.alloc,
             parsed_sql,
             logical_plan,
@@ -8867,7 +8867,7 @@ pub const ApiHttpServer = struct {
             .routine_expressions = routine_bindings,
         };
 
-        var lowered = sql_adapter.lower_select.lowerReadPlanWithLogicalPlanAndFunctionBindingsAlloc(
+        var lowered = sql_adapter.lowerReadPlanWithLogicalPlanAndFunctionBindingsAlloc(
             self.alloc,
             parsed_sql,
             logical_plan,
@@ -9340,7 +9340,7 @@ pub const ApiHttpServer = struct {
             .routine_expressions = routine_bindings,
         };
 
-        var lowered = sql_adapter.lower_select.lowerReadPlanWithLogicalPlanAndFunctionBindingsAlloc(
+        var lowered = sql_adapter.lowerReadPlanWithLogicalPlanAndFunctionBindingsAlloc(
             self.alloc,
             parsed_sql,
             &logical_plan,
@@ -12160,9 +12160,9 @@ pub const ApiHttpServer = struct {
                 .function_bindings = function_bindings,
             });
             defer logical_plan.deinit(alloc);
-            return try sql_adapter.lower_select.lowerReadPlanWithLogicalPlanAndFunctionBindingsAlloc(alloc, &parsed_sql, &logical_plan, schema, params, function_bindings);
+            return try sql_adapter.lowerReadPlanWithLogicalPlanAndFunctionBindingsAlloc(alloc, &parsed_sql, &logical_plan, schema, params, function_bindings);
         }
-        return try sql_adapter.lower_select.lowerReadPlanWithFunctionBindingsParsedSqlAlloc(alloc, &parsed_sql, schema, params, function_bindings);
+        return try sql_adapter.lowerReadPlanWithFunctionBindingsParsedSqlAlloc(alloc, &parsed_sql, schema, params, function_bindings);
     }
 
     fn planBulkSqlExecutionWithSessionAlloc(
@@ -23673,7 +23673,7 @@ pub const ApiHttpServer = struct {
         defer parsed_req.deinit();
 
         if (parsed_req.value.format) |format| {
-            if (!std.mem.eql(u8, format, "native")) {
+            if (format != .native) {
                 return try textResponse(self.alloc, 400, "portable table backups are not supported; omit format or use native");
             }
         }
@@ -34474,6 +34474,135 @@ test "api http server maps relational CTE spill admission to rows backpressure" 
     defer response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 429), response.status);
     try std.testing.expectEqualStrings("rows query backpressured", response.body);
+}
+
+test "api http server passes rows total mode through public query route" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+
+    const TotalMode = db_mod.types.RelationalRowsQueryRequest.TotalMode;
+    const FakeSource = struct {
+        tables: [1]metadata_table_manager.TableRecord,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = try status(ptr),
+                .tables = self.tables[0..],
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeReads = struct {
+        expected: [2]TotalMode = .{ .bounded, .none },
+        calls: usize = 0,
+
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                    .rows_query_plan = rowsQueryPlan,
+                },
+            };
+        }
+
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn rowsQueryPlan(
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            _: []const u8,
+            _: runtime_schema_mod.TableSchema,
+            plan: db_mod.types.RelationalRowsQueryPlan,
+            _: raft_mod.ReadConsistency,
+        ) !?db_mod.types.RelationalRowsQueryResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(self.calls < self.expected.len);
+            try std.testing.expectEqual(self.expected[self.calls], plan.query.total_mode);
+            self.calls += 1;
+
+            const rows = try allocator.alloc([]const u8, 1);
+            errdefer allocator.free(rows);
+            rows[0] = try allocator.dupe(u8, "{\"id\":\"evt-1\"}");
+            return .{
+                .rows = rows,
+                .total = 1,
+                .total_exact = false,
+            };
+        }
+    };
+
+    var source = FakeSource{ .tables = .{.{
+        .table_id = 1,
+        .name = "events",
+        .schema_json = schema_json,
+        .desired_replica_count = 1,
+    }} };
+    var reads = FakeReads{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), reads.source(), null);
+    defer server.deinit();
+
+    var bounded_response = try server.handlePublicTableRowsQuery(
+        "events",
+        "{\"query\":{\"select\":[\"id\"],\"limit\":1,\"total_mode\":\"bounded\"}}",
+        null,
+    );
+    defer bounded_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), bounded_response.status);
+    var bounded = try std.json.parseFromSlice(metadata_openapi.RowsQueryResultSet, alloc, bounded_response.body, .{ .allocate = .alloc_always });
+    defer bounded.deinit();
+    try std.testing.expectEqual(@as(i64, 1), bounded.value.total.?);
+    try std.testing.expect(bounded.value.total_exact.? == false);
+
+    var none_response = try server.handlePublicTableRowsQuery(
+        "events",
+        "{\"query\":{\"select\":[\"id\"],\"limit\":1,\"total_mode\":\"none\"}}",
+        null,
+    );
+    defer none_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), none_response.status);
+    var no_total = try std.json.parseFromSlice(metadata_openapi.RowsQueryResultSet, alloc, none_response.body, .{ .allocate = .alloc_always });
+    defer no_total.deinit();
+    try std.testing.expectEqual(@as(i64, 1), no_total.value.total.?);
+    try std.testing.expect(no_total.value.total_exact.? == false);
+    try std.testing.expectEqual(@as(usize, 2), reads.calls);
 }
 
 test "api http server maps public row owner unavailability to service unavailable" {
@@ -46489,7 +46618,7 @@ test "api http server serves table metadata routes against real metadata service
     defer parsed_updated_detail.deinit();
     try std.testing.expect(parsed_updated_detail.value.schema != null);
     try std.testing.expect(parsed_updated_detail.value.migration != null);
-    try std.testing.expect(parsed_updated_detail.value.migration.?.state.len > 0);
+    try std.testing.expectEqual(metadata_openapi.TableMigrationState.rebuilding, parsed_updated_detail.value.migration.?.state);
 
     const valid_batch_body = try test_contract_helpers.normalizeBatchRequest(std.testing.allocator, "{\"inserts\":{\"doc:ok\":{\"title\":\"alpha\",\"status\":\"published\"}}}");
     defer std.testing.allocator.free(valid_batch_body);

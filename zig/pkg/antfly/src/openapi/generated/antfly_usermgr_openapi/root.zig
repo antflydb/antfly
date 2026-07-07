@@ -19,3 +19,4 @@ pub const ApiKey = types.ApiKey;
 pub const ApiKeyWithSecret = types.ApiKeyWithSecret;
 pub const RowFilterEntry = types.RowFilterEntry;
 pub const CreateApiKeyRequest = types.CreateApiKeyRequest;
+pub const AuthSubjectKind = types.AuthSubjectKind;

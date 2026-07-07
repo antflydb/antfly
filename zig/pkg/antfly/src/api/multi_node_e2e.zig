@@ -1462,7 +1462,7 @@ test "public api multi-node e2e routes CRUD from a non-host node" {
     try std.testing.expect(parsed_updated_schema.value.schema != null);
     try std.testing.expect(parsed_updated_schema.value.schema.?.document_schemas != null);
     try std.testing.expect(parsed_updated_schema.value.migration != null);
-    try std.testing.expectEqualStrings("rebuilding", parsed_updated_schema.value.migration.?.state);
+    try std.testing.expectEqual(metadata_openapi.TableMigrationState.rebuilding, parsed_updated_schema.value.migration.?.state);
     try std.testing.expectEqual(@as(?i64, 0), parsed_updated_schema.value.migration.?.read_schema.version);
 
     var table_detail_after_schema = try client.fetchTable(client_base, "docs");
@@ -1470,7 +1470,7 @@ test "public api multi-node e2e routes CRUD from a non-host node" {
     var parsed_table_detail_after_schema = try std.json.parseFromSlice(metadata_openapi.TableStatus, std.heap.page_allocator, table_detail_after_schema.body, .{});
     defer parsed_table_detail_after_schema.deinit();
     try std.testing.expect(parsed_table_detail_after_schema.value.migration != null);
-    try std.testing.expectEqualStrings("rebuilding", parsed_table_detail_after_schema.value.migration.?.state);
+    try std.testing.expectEqual(metadata_openapi.TableMigrationState.rebuilding, parsed_table_detail_after_schema.value.migration.?.state);
     try std.testing.expect(parsed_table_detail_after_schema.value.indexes.map.get("full_text_index_v0") != null);
     try std.testing.expect(parsed_table_detail_after_schema.value.indexes.map.get("full_text_index_v1") != null);
 

@@ -337,9 +337,9 @@ pub const TypeGenerator = struct {
     }
 
     fn inlineEnumSchema(prop_name: []const u8, prop_sor: types.SchemaOrRef) ?types.Schema {
-        if (!std.mem.eql(u8, prop_name, "index_type")) return null;
+        _ = prop_name;
         return switch (prop_sor) {
-            .schema => |schema| if (schema.enum_values.len == 1) schema else null,
+            .schema => |schema| if (schema.enum_values.len > 0) schema else null,
             .ref => null,
         };
     }
@@ -587,6 +587,9 @@ pub const TypeGenerator = struct {
         if (variants.items.len == 0) {
             try self.generateEmptyUnionJsonStubs();
         } else {
+            try self.emitUnionVariantParseFromValueHelper();
+            try self.w.blank();
+
             try self.w.line("pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {{", .{});
             self.w.indent();
             try self.w.line("if (source != .object) return error.UnexpectedToken;", .{});
@@ -602,7 +605,7 @@ pub const TypeGenerator = struct {
             for (variants.items) |v| {
                 try self.w.line("if (std.mem.eql(u8, disc_str, \"{s}\")) {{", .{v.disc_value});
                 self.w.indent();
-                try self.w.line("return .{{ .{s} = try std.json.parseFromValueLeaky({s}, allocator, source, options) }};", .{ v.field, v.zig_type });
+                try self.w.line("return .{{ .{s} = try parseUnionVariantFromValue({s}, allocator, source, options) }};", .{ v.field, v.zig_type });
                 self.w.dedent();
                 try self.w.line("}}", .{});
             }
@@ -710,9 +713,12 @@ pub const TypeGenerator = struct {
 
         try self.w.blank();
 
+        try self.emitUnionVariantParseFromValueHelper();
+        try self.w.blank();
+
         try self.w.line("fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {{", .{});
         self.w.indent();
-        try self.w.line("const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {{", .{});
+        try self.w.line("const parsed = parseUnionVariantFromValue(T, allocator, source, options) catch |err| switch (err) {{", .{});
         self.w.indent();
         try self.w.line("error.OutOfMemory => return err,", .{});
         try self.w.line("else => return null,", .{});
@@ -806,6 +812,21 @@ pub const TypeGenerator = struct {
         try self.w.blank();
 
         try self.w.line("pub fn jsonStringify(_: @This(), _: anytype) !void {{", .{});
+        try self.w.line("}}", .{});
+    }
+
+    fn emitUnionVariantParseFromValueHelper(self: *TypeGenerator) !void {
+        try self.w.line("fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {{", .{});
+        self.w.indent();
+        try self.w.line("const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{{}});", .{});
+        try self.w.line("defer allocator.free(encoded);", .{});
+        try self.w.line("return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {{", .{});
+        self.w.indent();
+        try self.w.line("error.OutOfMemory => return error.OutOfMemory,", .{});
+        try self.w.line("else => return error.UnexpectedToken,", .{});
+        self.w.dedent();
+        try self.w.line("}};", .{});
+        self.w.dedent();
         try self.w.line("}}", .{});
     }
 
@@ -1027,6 +1048,46 @@ test "inline index_type discriminator struct fields generate named enum types" {
     try std.testing.expect(std.mem.indexOf(u8, output, ".full_text => \"full_text\",") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "index_type: FullTextIndexStatsIndexType,") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "index_type: []const u8,") == null);
+}
+
+test "optional inline string enum struct fields generate named enum types" {
+    const alloc = std.testing.allocator;
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    var props = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
+    try props.put(arena, "unsupported_reason", .{
+        .schema = .{
+            .schema_type = .{ .single = "string" },
+            .enum_values = &.{ "index-not-ready", "stale-generation" },
+            .description = "Stable unsupported bucket.",
+        },
+    });
+
+    var schemas = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
+    try schemas.put(arena, "PlannerStatus", .{
+        .schema = .{
+            .schema_type = .{ .single = "object" },
+            .properties = props,
+        },
+    });
+
+    const doc = types.OpenApiDoc{
+        .openapi = "3.1.0",
+        .info = .{ .title = "Test", .version = "1.0" },
+        .components = types.Components{ .schemas = schemas },
+    };
+    var resolver = Resolver.init(arena, &doc);
+    var w = SourceWriter.init(arena);
+    var gen = TypeGenerator.init(arena, &w, &resolver);
+    try gen.generateAll(&doc);
+    const output = w.toSlice();
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "pub const PlannerStatusUnsupportedReason = enum {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, ".index_not_ready => \"index-not-ready\",") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "unsupported_reason: ?PlannerStatusUnsupportedReason = null,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "unsupported_reason: ?[]const u8 = null,") == null);
 }
 
 test "discriminated oneOf generates parse from token source" {

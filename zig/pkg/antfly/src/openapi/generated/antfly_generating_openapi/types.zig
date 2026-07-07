@@ -129,9 +129,31 @@ pub const ChatMessageRole = enum {
     }
 };
 
+pub const TextContentPartType = enum {
+    text,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .text => "text",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "text", .text },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Text content for multimodal input.
 pub const TextContentPart = struct {
-    type: []const u8,
+    type: TextContentPartType,
     /// Text content.
     text: []const u8,
 };
@@ -142,9 +164,31 @@ pub const ImageURL = struct {
     url: []const u8,
 };
 
+pub const MediaContentPartType = enum {
+    media,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .media => "media",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "media", .media },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Inline binary media content (audio, image, etc.).
 pub const MediaContentPart = struct {
-    type: []const u8,
+    type: MediaContentPartType,
     /// Base64-encoded binary data.
     data: []const u8,
     /// MIME type (audio/wav, image/gif, image/png, etc.).
@@ -331,17 +375,61 @@ pub const OpenRouterGeneratorConfig = struct {
     presence_penalty: ?f32 = null,
 };
 
+pub const ImageURLContentPartType = enum {
+    image_url,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .image_url => "image_url",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "image_url", .image_url },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Image content in OpenAI-compatible format.
 pub const ImageURLContentPart = struct {
-    type: []const u8,
+    type: ImageURLContentPartType,
     image_url: ImageURL,
+};
+
+pub const ToolCallType = enum {
+    function,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .function => "function",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "function", .function },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// OpenAI-compatible assistant tool call.
 pub const ToolCall = struct {
     /// Tool call identifier.
     id: []const u8,
-    type: []const u8,
+    type: ToolCallType,
     function: ToolCallFunction,
 };
 
@@ -388,8 +476,17 @@ pub const ContentPart = union(enum) {
     image_url_content_part: *ImageURLContentPart,
     text_content_part: *TextContentPart,
 
+    fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
+        const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
+        defer allocator.free(encoded);
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.UnexpectedToken,
+        };
+    }
+
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+        const parsed = parseUnionVariantFromValue(T, allocator, source, options) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return null,
         };

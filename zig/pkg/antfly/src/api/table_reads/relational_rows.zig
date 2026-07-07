@@ -18,6 +18,7 @@ const metadata_api = @import("../../metadata/api.zig");
 const metadata_table_manager = @import("../../metadata/table_manager.zig");
 const metadata_transition_state = @import("../../metadata/transition_state.zig");
 const db_mod = @import("../../storage/db/mod.zig");
+const db_relational_rows = @import("../../storage/db/relational_rows.zig");
 const storage_schema = @import("../../storage/schema.zig");
 const document_sql_runtime = @import("../../sql/document_runtime.zig");
 const sql_adapter = @import("../../sql/mod.zig");
@@ -384,6 +385,14 @@ pub fn executeLoweredSqlReadPlanWithSessionAlloc(
         },
         .document_query => |lowered| blk: {
             const target = try catalogTargetForLoweredSqlTable(session, default_table_name, lowered.table_name);
+            const owned_schema = try catalogRuntimeSchemaUnlessDefaultAlloc(alloc, catalog, default_table_name, lowered.table_name);
+            defer if (owned_schema) |schema| storage_schema.freeSchema(alloc, schema);
+            const runtime_schema = owned_schema orelse default_schema;
+            if (try executeRelationalFullTextDocumentReadAsRowsAlloc(alloc, source, lowered, runtime_schema, consistency)) |result| {
+                var owned_result = result;
+                errdefer owned_result.deinit(alloc);
+                break :blk .{ .query = owned_result };
+            }
             const native_table_name = try nativeCatalogTableNameAlloc(alloc, catalog, target);
             defer alloc.free(native_table_name);
             var adapter = document_sql.RuntimeSourceAdapter{
@@ -536,6 +545,298 @@ pub fn executeLoweredSqlReadPlanWithSessionAlloc(
             break :blk .{ .lateral = result };
         },
     };
+}
+
+fn executeRelationalFullTextDocumentReadAsRowsAlloc(
+    alloc: std.mem.Allocator,
+    source: core.TableReadSource,
+    lowered: sql_adapter.DocumentReadPlan,
+    runtime_schema: storage_schema.TableSchema,
+    consistency: raft_mod.ReadConsistency,
+) !?db_mod.types.RelationalRowsQueryResult {
+    if (runtime_schema.storage_mode != .relational or runtime_schema.primary_key == null) return null;
+    var plan = (relationalRowsPlanFromDocumentFullTextReadAlloc(alloc, lowered, runtime_schema) catch |err| switch (err) {
+        error.UnsupportedRowsQuery => return null,
+        else => return err,
+    }) orelse return null;
+    defer plan.deinit(alloc);
+    return try source.rowsQueryPlan(alloc, lowered.table_name, runtime_schema, plan, consistency);
+}
+
+fn relationalRowsPlanFromDocumentFullTextReadAlloc(
+    alloc: std.mem.Allocator,
+    lowered: sql_adapter.DocumentReadPlan,
+    runtime_schema: storage_schema.TableSchema,
+) !?db_mod.types.RelationalRowsQueryPlan {
+    if (lowered.view_mapping != null or lowered.unnest != null or lowered.lateral_subquery != null or lowered.order_by != null) return null;
+    if (lowered.producer != .indexed_query) return null;
+    const indexed = lowered.producer.indexed_query;
+    if (indexed.native_query_json != null or indexed.full_text_query == null) return null;
+
+    var request = db_mod.types.RelationalRowsQueryRequest{
+        .select_all = false,
+        .limit = lowered.limit,
+    };
+    errdefer request.deinit(alloc);
+
+    if (indexed.index_name) |index_name| {
+        request.primary_text_index_name = try alloc.dupe(u8, index_name);
+    }
+    request.full_text = try relationalRowsTextQueryFromDocumentFullTextStringAlloc(alloc, runtime_schema, indexed.full_text_query.?);
+
+    try appendRelationalRowsProjectionFromDocumentReadAlloc(alloc, runtime_schema, lowered, &request);
+    try appendRelationalRowsPredicatesFromDocumentFilterJsonAlloc(alloc, runtime_schema, indexed.filter_query_json, &request);
+    try appendRelationalRowsPredicatesFromDocumentFilterJsonAlloc(alloc, runtime_schema, indexed.residual_filter_json, &request);
+
+    return .{ .query = request };
+}
+
+fn appendRelationalRowsProjectionFromDocumentReadAlloc(
+    alloc: std.mem.Allocator,
+    runtime_schema: storage_schema.TableSchema,
+    lowered: sql_adapter.DocumentReadPlan,
+    request: *db_mod.types.RelationalRowsQueryRequest,
+) !void {
+    var select = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (select.items) |field| alloc.free(@constCast(field));
+        select.deinit(alloc);
+    }
+    var aliases = std.ArrayListUnmanaged(db_mod.types.RelationalRowsFieldAliasProjection).empty;
+    errdefer {
+        for (aliases.items) |alias| {
+            alloc.free(@constCast(alias.output));
+            alloc.free(@constCast(alias.field));
+        }
+        aliases.deinit(alloc);
+    }
+
+    for (lowered.projection) |projection| {
+        if (projection.kind != .field or projection.lateral) return error.UnsupportedRowsQuery;
+        const field = relationalRowsFieldFromDocumentPath(runtime_schema, projection.field) orelse return error.UnsupportedRowsQuery;
+        if (std.mem.eql(u8, projection.output, field)) {
+            const owned_field = try alloc.dupe(u8, field);
+            errdefer alloc.free(owned_field);
+            try select.append(alloc, owned_field);
+        } else {
+            const output = try alloc.dupe(u8, projection.output);
+            errdefer alloc.free(output);
+            const owned_field = try alloc.dupe(u8, field);
+            errdefer alloc.free(owned_field);
+            try aliases.append(alloc, .{ .output = output, .field = owned_field });
+        }
+    }
+
+    const owned_select = try select.toOwnedSlice(alloc);
+    errdefer {
+        for (owned_select) |field| alloc.free(@constCast(field));
+        if (owned_select.len > 0) alloc.free(owned_select);
+    }
+    const owned_aliases = try aliases.toOwnedSlice(alloc);
+    errdefer {
+        for (owned_aliases) |alias| {
+            alloc.free(@constCast(alias.output));
+            alloc.free(@constCast(alias.field));
+        }
+        if (owned_aliases.len > 0) alloc.free(owned_aliases);
+    }
+    request.select = owned_select;
+    request.field_aliases = owned_aliases;
+}
+
+fn appendRelationalRowsPredicatesFromDocumentFilterJsonAlloc(
+    alloc: std.mem.Allocator,
+    runtime_schema: storage_schema.TableSchema,
+    maybe_filter_json: ?[]const u8,
+    request: *db_mod.types.RelationalRowsQueryRequest,
+) !void {
+    const filter_json = maybe_filter_json orelse return;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, filter_json, .{}) catch return error.UnsupportedRowsQuery;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.UnsupportedRowsQuery;
+
+    var predicates = std.ArrayListUnmanaged(storage_schema.RelationalCheck).empty;
+    defer predicates.deinit(alloc);
+    errdefer for (predicates.items) |predicate| freeRelationalRowsPredicateLocal(alloc, predicate);
+
+    try appendRelationalRowsPredicatesFromDocumentFilterValueAlloc(alloc, runtime_schema, parsed.value, &predicates);
+    if (predicates.items.len == 0) return;
+
+    const old_len = request.predicates.len;
+    const next = try alloc.alloc(storage_schema.RelationalCheck, old_len + predicates.items.len);
+    errdefer alloc.free(next);
+    if (old_len > 0) @memcpy(next[0..old_len], request.predicates);
+    @memcpy(next[old_len..], predicates.items);
+    if (old_len > 0) alloc.free(@constCast(request.predicates));
+    request.predicates = next;
+    predicates.items.len = 0;
+}
+
+fn appendRelationalRowsPredicatesFromDocumentFilterValueAlloc(
+    alloc: std.mem.Allocator,
+    runtime_schema: storage_schema.TableSchema,
+    value: std.json.Value,
+    predicates: *std.ArrayListUnmanaged(storage_schema.RelationalCheck),
+) !void {
+    if (value != .object) return error.UnsupportedRowsQuery;
+    if (value.object.get("match_none") != null) return error.UnsupportedRowsQuery;
+    if (value.object.get("conjuncts")) |conjuncts| {
+        if (conjuncts != .array) return error.UnsupportedRowsQuery;
+        for (conjuncts.array.items) |item| try appendRelationalRowsPredicatesFromDocumentFilterValueAlloc(alloc, runtime_schema, item, predicates);
+        return;
+    }
+    if (value.object.get("bool")) |bool_value| {
+        if (bool_value != .object) return error.UnsupportedRowsQuery;
+        if (bool_value.object.get("filter")) |items| {
+            if (items != .array) return error.UnsupportedRowsQuery;
+            for (items.array.items) |item| try appendRelationalRowsPredicatesFromDocumentFilterValueAlloc(alloc, runtime_schema, item, predicates);
+            return;
+        }
+        if (bool_value.object.get("must")) |items| {
+            if (items != .array) return error.UnsupportedRowsQuery;
+            for (items.array.items) |item| try appendRelationalRowsPredicatesFromDocumentFilterValueAlloc(alloc, runtime_schema, item, predicates);
+            return;
+        }
+        return error.UnsupportedRowsQuery;
+    }
+    if (value.object.get("term")) |term| {
+        try appendRelationalRowsTermPredicateFromDocumentFilterAlloc(alloc, runtime_schema, term, predicates);
+        return;
+    }
+    return error.UnsupportedRowsQuery;
+}
+
+fn appendRelationalRowsTermPredicateFromDocumentFilterAlloc(
+    alloc: std.mem.Allocator,
+    runtime_schema: storage_schema.TableSchema,
+    term: std.json.Value,
+    predicates: *std.ArrayListUnmanaged(storage_schema.RelationalCheck),
+) !void {
+    if (term != .object) return error.UnsupportedRowsQuery;
+    const path_value = term.object.get("path") orelse return error.UnsupportedRowsQuery;
+    const value = term.object.get("value") orelse return error.UnsupportedRowsQuery;
+    if (path_value != .string) return error.UnsupportedRowsQuery;
+    const column = relationalRowsColumnFromDocumentPath(runtime_schema, path_value.string) orelse return error.UnsupportedRowsQuery;
+    const field = try alloc.dupe(u8, column.name);
+    errdefer alloc.free(field);
+    const value_json = try jsonValueStringifyAllocLocal(alloc, value);
+    errdefer alloc.free(value_json);
+    const collation = if (column.collation) |name| try alloc.dupe(u8, name) else null;
+    errdefer if (collation) |name| alloc.free(name);
+    try predicates.append(alloc, .{
+        .name = "",
+        .field = field,
+        .op = .eq,
+        .value_json = value_json,
+        .collation = collation,
+    });
+}
+
+fn relationalRowsTextQueryFromDocumentFullTextStringAlloc(
+    alloc: std.mem.Allocator,
+    runtime_schema: storage_schema.TableSchema,
+    query: []const u8,
+) !db_mod.types.TextQuery {
+    const colon = std.mem.indexOfScalar(u8, query, ':') orelse return error.UnsupportedRowsQuery;
+    if (colon == 0) return error.UnsupportedRowsQuery;
+    const raw_field = std.mem.trim(u8, query[0..colon], " \t\r\n");
+    const text = std.mem.trim(u8, query[colon + 1 ..], " \t\r\n");
+    if (raw_field.len == 0 or raw_field.len != colon or text.len == 0) return error.UnsupportedRowsQuery;
+    for (raw_field) |ch| {
+        if (!(std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '-' or ch == '.' or ch == '/')) return error.UnsupportedRowsQuery;
+    }
+    const field = relationalRowsFieldFromDocumentPath(runtime_schema, raw_field) orelse return error.UnsupportedRowsQuery;
+    const owned_field = try alloc.dupe(u8, field);
+    errdefer alloc.free(owned_field);
+    const owned_text = try alloc.dupe(u8, text);
+    errdefer alloc.free(owned_text);
+    return .{ .match = .{
+        .field = owned_field,
+        .text = owned_text,
+    } };
+}
+
+fn relationalRowsFieldFromDocumentPath(
+    runtime_schema: storage_schema.TableSchema,
+    path: []const u8,
+) ?[]const u8 {
+    return if (relationalRowsColumnFromDocumentPath(runtime_schema, path)) |column| column.name else null;
+}
+
+fn relationalRowsColumnFromDocumentPath(
+    runtime_schema: storage_schema.TableSchema,
+    path: []const u8,
+) ?storage_schema.RelationalColumn {
+    const trimmed = if (std.mem.startsWith(u8, path, "/")) path[1..] else path;
+    if (trimmed.len == 0 or std.mem.indexOfScalar(u8, trimmed, '/') != null) return null;
+    for (runtime_schema.relational_columns) |column| {
+        if (std.mem.eql(u8, column.name, trimmed) or std.mem.eql(u8, column.path, path) or std.mem.eql(u8, column.path, trimmed)) return column;
+    }
+    return null;
+}
+
+fn freeRelationalRowsPredicateLocal(alloc: std.mem.Allocator, predicate: storage_schema.RelationalCheck) void {
+    if (predicate.field.len > 0) alloc.free(@constCast(predicate.field));
+    if (predicate.value_json) |value_json| if (value_json.len > 0) alloc.free(@constCast(value_json));
+    if (predicate.collation) |collation| if (collation.len > 0) alloc.free(@constCast(collation));
+}
+
+fn jsonValueStringifyAllocLocal(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try std.json.Stringify.value(value, .{}, &out.writer);
+    return try out.toOwnedSlice();
+}
+
+test "relational full text document read lowers to rows query request" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"title":{"type":"text"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const runtime_schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer storage_schema.freeSchema(alloc, runtime_schema);
+
+    var projections = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .field, .field = "id", .output = "id" },
+        .{ .kind = .field, .field = "title", .output = "headline" },
+    };
+    const lowered = sql_adapter.DocumentReadPlan{
+        .table_name = "articles",
+        .projection = projections[0..],
+        .producer = .{ .indexed_query = .{
+            .index_name = "title_ft",
+            .full_text_query = "title:alpha",
+            .filter_query_json = "{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}",
+        } },
+        .limit = 10,
+    };
+
+    var plan = (try relationalRowsPlanFromDocumentFullTextReadAlloc(alloc, lowered, runtime_schema)) orelse return error.TestUnexpectedResult;
+    defer plan.deinit(alloc);
+
+    try std.testing.expectEqual(@as(?u32, 10), plan.query.limit);
+    try std.testing.expectEqualStrings("title_ft", plan.query.primary_text_index_name.?);
+    try std.testing.expectEqual(@as(usize, 1), plan.query.select.len);
+    try std.testing.expectEqualStrings("id", plan.query.select[0]);
+    try std.testing.expectEqual(@as(usize, 1), plan.query.field_aliases.len);
+    try std.testing.expectEqualStrings("headline", plan.query.field_aliases[0].output);
+    try std.testing.expectEqualStrings("title", plan.query.field_aliases[0].field);
+    try std.testing.expectEqual(@as(usize, 1), plan.query.predicates.len);
+    try std.testing.expectEqualStrings("status", plan.query.predicates[0].field);
+    try std.testing.expectEqualStrings("\"active\"", plan.query.predicates[0].value_json.?);
+    try std.testing.expect(plan.query.full_text != null);
+    switch (plan.query.full_text.?) {
+        .match => |match| {
+            try std.testing.expectEqualStrings("title", match.field);
+            try std.testing.expectEqualStrings("alpha", match.text);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 pub fn executeLoweredRelationPopulationPlanAlloc(
@@ -2399,7 +2700,7 @@ test "lowered sql recursive cte plans execute bounded materialization" {
         }
     };
 
-    var lowered = try sql_adapter.lower_select.lowerReadPlanAlloc(
+    var lowered = try sql_adapter.lowerReadPlanAlloc(
         alloc,
         "WITH RECURSIVE walk(id, depth) AS (SELECT id, depth FROM nodes WHERE parent_id = 'root' UNION ALL SELECT nodes.id, walk.depth + 1 FROM nodes JOIN walk ON nodes.parent_id = walk.id) SELECT id FROM walk WHERE depth > 1 ORDER BY id",
         schema,
@@ -2769,7 +3070,7 @@ test "lowered relation population plans execute routed typed read sources" {
 
     var catalog = FakeCatalog{};
     var fake = FakeRoutedSource{};
-    var lowered = try sql_adapter.lower_select.lowerRelationPopulationPlanWithCatalogAlloc(
+    var lowered = try sql_adapter.lowerRelationPopulationPlanWithCatalogAlloc(
         alloc,
         "CREATE TABLE order_archive AS SELECT o.id AS order_id, c.name AS customer_name FROM orders AS o LEFT JOIN customers AS c ON o.status = c.status ORDER BY order_id ASC",
         orders_schema,
@@ -2797,7 +3098,7 @@ test "lowered relation population plans execute routed typed read sources" {
     try std.testing.expectEqualStrings("{\"order_id\":\"o1\",\"customer_name\":\"Ada\"}", result.rows[0]);
     try std.testing.expectEqualStrings("{\"order_id\":\"o2\",\"customer_name\":\"Grace\"}", result.rows[1]);
 
-    var lowered_no_data = try sql_adapter.lower_select.lowerRelationPopulationPlanWithCatalogAlloc(
+    var lowered_no_data = try sql_adapter.lowerRelationPopulationPlanWithCatalogAlloc(
         alloc,
         "CREATE TABLE order_archive_empty AS SELECT o.id AS order_id, c.name AS customer_name FROM orders AS o LEFT JOIN customers AS c ON o.status = c.status WITH NO DATA",
         orders_schema,
@@ -3945,9 +4246,25 @@ pub const RoutedRows = struct {
 
 const RoutedMergeScanRows = struct {
     rows: []db_mod.types.RelationalRowsCollectedRow,
+    materialized_rows: u64 = 0,
+    materialized_bytes: u64 = 0,
+    spilled: bool = false,
+    spilled_rows: u64 = 0,
+    spilled_bytes: u64 = 0,
 
     fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         db_mod.types.freeRelationalRowsCollectedRows(alloc, self.rows);
+        self.* = undefined;
+    }
+};
+
+const RoutedScanRowFingerprint = struct {
+    key: []u8,
+    version: u64,
+    json_hash: u64,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.key);
         self.* = undefined;
     }
 };
@@ -4118,10 +4435,18 @@ fn collectMergeScanRowsFromRoutedScansAlloc(
 
     var owned_rows = try rows.toOwnedSlice(alloc);
     errdefer db_mod.types.freeRelationalRowsCollectedRows(alloc, owned_rows);
+    const spill_required = materialization.spill_required;
     if (materialization.spill_required) {
         owned_rows = try spillAndReloadCollectedRowsAlloc(alloc, owned_rows, "routed-scan");
     }
-    return .{ .rows = owned_rows };
+    return .{
+        .rows = owned_rows,
+        .materialized_rows = materialization.rows,
+        .materialized_bytes = materialization.bytes,
+        .spilled = spill_required,
+        .spilled_rows = if (spill_required) materialization.rows else 0,
+        .spilled_bytes = if (spill_required) materialization.bytes else 0,
+    };
 }
 
 fn appendMergeScanRowsFromRoutedScanAlloc(
@@ -4303,10 +4628,969 @@ fn collectStableMergeScanRowsFromRoutedScansAlloc(
 
     var owned_rows = try rows.toOwnedSlice(alloc);
     errdefer db_mod.types.freeRelationalRowsCollectedRows(alloc, owned_rows);
+    const spill_required = materialization.spill_required;
     if (materialization.spill_required) {
         owned_rows = try spillAndReloadCollectedRowsAlloc(alloc, owned_rows, "routed-scan");
     }
-    return .{ .rows = owned_rows };
+    return .{
+        .rows = owned_rows,
+        .materialized_rows = materialization.rows,
+        .materialized_bytes = materialization.bytes,
+        .spilled = spill_required,
+        .spilled_rows = if (spill_required) materialization.rows else 0,
+        .spilled_bytes = if (spill_required) materialization.bytes else 0,
+    };
+}
+
+fn routedRowsQueryPlanCanUseStreamingCountOnly(plan: db_mod.types.RelationalRowsQueryPlan) bool {
+    return plan.ctes.len == 0 and
+        plan.query.source_cte.len == 0 and
+        relational_rows_api.rowsQueryCanUseCountOnlyResultForRouting(plan.query);
+}
+
+fn routedRowsQueryPlanCanUseStreamingBoundedSorted(plan: db_mod.types.RelationalRowsQueryPlan) bool {
+    return plan.ctes.len == 0 and
+        plan.query.source_cte.len == 0 and
+        relational_rows_api.rowsQueryCanUseBoundedSortedResultForRouting(plan.query);
+}
+
+fn routedRowsQueryPlanCanUseStreamingCteBoundedSorted(
+    schema: storage_schema.TableSchema,
+    plan: db_mod.types.RelationalRowsQueryPlan,
+) bool {
+    if (plan.ctes.len != 1) return false;
+    const cte = plan.ctes[0];
+    if (cte.name.len == 0 or !std.mem.eql(u8, plan.query.source_cte, cte.name)) return false;
+    if (!relational_rows_api.rowsQueryCanUseBoundedSortedResultForRouting(plan.query)) return false;
+    if (!routedRowsQueryRequestHasNoFilters(plan.query)) return false;
+    if (!routedRowsQueryRequestHasSimpleProjection(plan.query)) return false;
+    if (!routedRowsQueryOrdersUseSimpleFields(plan.query.order_by)) return false;
+    if (!routedRowsQueryFieldsExistInCteOutput(schema, plan.query, cte.query)) return false;
+    if (cte.join != null or cte.lateral != null or cte.table_function != null) return false;
+    if (cte.max_rows != null or cte.max_bytes != null or cte.spill_after_bytes != null) return false;
+    if (!routedRowsQueryRequestCanStreamAsRowPreservingFilter(cte.query)) return false;
+    return routedRowsSelectFieldsExist(schema, cte.query.select);
+}
+
+fn routedRowsQueryPlanCanUseStreamingCteCountOnly(
+    schema: storage_schema.TableSchema,
+    plan: db_mod.types.RelationalRowsQueryPlan,
+) bool {
+    if (plan.ctes.len != 1) return false;
+    const cte = plan.ctes[0];
+    if (cte.name.len == 0 or !std.mem.eql(u8, plan.query.source_cte, cte.name)) return false;
+    if (!relational_rows_api.rowsQueryCanUseCountOnlyResultForRouting(plan.query)) return false;
+    if (!routedRowsQueryRequestHasNoFilters(plan.query)) return false;
+    if (cte.join != null or cte.lateral != null or cte.table_function != null) return false;
+    if (cte.max_rows != null or cte.max_bytes != null or cte.spill_after_bytes != null) return false;
+    if (!routedRowsQueryRequestCanStreamAsRowPreservingFilter(cte.query)) return false;
+    return routedRowsSelectFieldsExist(schema, cte.query.select);
+}
+
+fn routedRowsCteCanStreamAsCountFilter(
+    schema: storage_schema.TableSchema,
+    cte: db_mod.types.RelationalRowsCte,
+) bool {
+    if (cte.name.len == 0) return false;
+    if (cte.join != null or cte.lateral != null or cte.table_function != null) return false;
+    if (cte.max_rows != null or cte.max_bytes != null or cte.spill_after_bytes != null) return false;
+    var local_query = cte.query;
+    local_query.source_cte = "";
+    if (!routedRowsQueryRequestCanStreamAsRowPreservingFilter(local_query)) return false;
+    if (!routedRowsSelectFieldsExist(schema, cte.query.select)) return false;
+    return routedRowsQueryFiltersUseSchemaFields(schema, cte.query);
+}
+
+fn routedRowsQueryRequestCanStreamAsRowPreservingFilter(req: db_mod.types.RelationalRowsQueryRequest) bool {
+    return req.source_cte.len == 0 and
+        req.row_claim == null and
+        req.doc_key_range == null and
+        req.distinct_on.len == 0 and
+        req.distinct_on_expressions.len == 0 and
+        req.order_by.len == 0 and
+        req.limit == null and
+        req.offset == 0 and
+        req.json_extract.len == 0 and
+        req.array_length.len == 0 and
+        req.coalesce.len == 0 and
+        req.field_aliases.len == 0 and
+        req.expressions.len == 0 and
+        req.scalar_subqueries.len == 0 and
+        req.subquery_predicates.len == 0;
+}
+
+fn routedRowsQueryFiltersUseSchemaFields(schema: storage_schema.TableSchema, req: db_mod.types.RelationalRowsQueryRequest) bool {
+    if (req.expression_predicates.len != 0 or
+        req.expression_or_predicates.len != 0 or
+        req.expression_not_predicates.len != 0 or
+        req.expression_array_contains.len != 0) return false;
+    for (req.predicates) |predicate| if (!routedRowsFieldExists(schema, predicate.field)) return false;
+    for (req.array_any) |predicate| if (!routedRowsFieldExists(schema, predicate.field)) return false;
+    for (req.array_contains) |predicate| if (!routedRowsFieldExists(schema, predicate.field)) return false;
+    for (req.array_eq) |predicate| if (!routedRowsFieldExists(schema, predicate.field)) return false;
+    for (req.in_predicates) |predicate| if (!routedRowsFieldExists(schema, predicate.field)) return false;
+    for (req.json_contains) |predicate| if (!routedRowsFieldExists(schema, predicate.field)) return false;
+    for (req.json_path_eq) |predicate| if (!routedRowsFieldExists(schema, predicate.field)) return false;
+    for (req.json_path_exists) |predicate| if (!routedRowsFieldExists(schema, predicate.field)) return false;
+    for (req.text_patterns) |predicate| if (!routedRowsFieldExists(schema, predicate.field)) return false;
+    for (req.or_predicates) |group| if (!routedRowsPredicateGroupUsesSchemaFields(schema, group)) return false;
+    for (req.not_predicates) |group| if (!routedRowsPredicateGroupUsesSchemaFields(schema, group)) return false;
+    for (req.access_or_predicates) |group| if (!routedRowsAccessPredicateGroupUsesSchemaFields(schema, group)) return false;
+    for (req.access_not_predicates) |group| if (!routedRowsAccessPredicateGroupUsesSchemaFields(schema, group)) return false;
+    return true;
+}
+
+fn routedRowsPredicateGroupUsesSchemaFields(schema: storage_schema.TableSchema, group: db_mod.types.RelationalRowsPredicateGroup) bool {
+    for (group.predicates) |predicate| if (!routedRowsFieldExists(schema, predicate.field)) return false;
+    return true;
+}
+
+fn routedRowsAccessPredicateGroupUsesSchemaFields(schema: storage_schema.TableSchema, group: db_mod.types.RelationalRowsAccessPredicateGroup) bool {
+    for (group.predicates) |predicate| if (!routedRowsFieldExists(schema, predicate.field)) return false;
+    for (group.array_any) |predicate| if (!routedRowsFieldExists(schema, predicate.field)) return false;
+    for (group.array_contains) |predicate| if (!routedRowsFieldExists(schema, predicate.field)) return false;
+    for (group.array_eq) |predicate| if (!routedRowsFieldExists(schema, predicate.field)) return false;
+    for (group.in_predicates) |predicate| if (!routedRowsFieldExists(schema, predicate.field)) return false;
+    for (group.json_contains) |predicate| if (!routedRowsFieldExists(schema, predicate.field)) return false;
+    for (group.json_path_eq) |predicate| if (!routedRowsFieldExists(schema, predicate.field)) return false;
+    for (group.json_path_exists) |predicate| if (!routedRowsFieldExists(schema, predicate.field)) return false;
+    for (group.text_patterns) |predicate| if (!routedRowsFieldExists(schema, predicate.field)) return false;
+    return true;
+}
+
+fn routedRowsQueryRequestHasNoFilters(req: db_mod.types.RelationalRowsQueryRequest) bool {
+    return req.predicates.len == 0 and
+        req.array_any.len == 0 and
+        req.array_contains.len == 0 and
+        req.array_eq.len == 0 and
+        req.in_predicates.len == 0 and
+        req.json_contains.len == 0 and
+        req.json_path_eq.len == 0 and
+        req.json_path_exists.len == 0 and
+        req.text_patterns.len == 0 and
+        req.or_predicates.len == 0 and
+        req.not_predicates.len == 0 and
+        req.access_or_predicates.len == 0 and
+        req.access_not_predicates.len == 0 and
+        req.expression_predicates.len == 0 and
+        req.expression_or_predicates.len == 0 and
+        req.expression_not_predicates.len == 0 and
+        req.expression_array_contains.len == 0 and
+        req.subquery_predicates.len == 0;
+}
+
+fn routedRowsQueryRequestHasSimpleProjection(req: db_mod.types.RelationalRowsQueryRequest) bool {
+    return req.json_extract.len == 0 and
+        req.array_length.len == 0 and
+        req.coalesce.len == 0 and
+        req.field_aliases.len == 0 and
+        req.expressions.len == 0;
+}
+
+fn routedRowsQueryOrdersUseSimpleFields(order_by: []const db_mod.types.RelationalRowsQueryOrder) bool {
+    for (order_by) |order| {
+        if (order.field.len == 0 or order.expression != null) return false;
+    }
+    return true;
+}
+
+fn routedRowsQueryFieldsExistInCteOutput(
+    schema: storage_schema.TableSchema,
+    req: db_mod.types.RelationalRowsQueryRequest,
+    cte_query: db_mod.types.RelationalRowsQueryRequest,
+) bool {
+    if (cte_query.select_all) {
+        if (!routedRowsSelectFieldsExist(schema, req.select)) return false;
+        for (req.order_by) |order| {
+            if (!routedRowsFieldExists(schema, order.field)) return false;
+        }
+        return true;
+    }
+    for (req.select) |field| {
+        if (!routedRowsFieldInSelection(field, cte_query.select)) return false;
+    }
+    for (req.order_by) |order| {
+        if (!routedRowsFieldInSelection(order.field, cte_query.select)) return false;
+    }
+    return true;
+}
+
+fn routedRowsFieldInSelection(field: []const u8, selected: []const []const u8) bool {
+    for (selected) |candidate| {
+        if (std.mem.eql(u8, field, candidate)) return true;
+    }
+    return false;
+}
+
+fn routedRowsSelectFieldsExist(schema: storage_schema.TableSchema, fields: []const []const u8) bool {
+    if (fields.len == 0) return true;
+    for (fields) |field| {
+        if (!routedRowsFieldExists(schema, field)) return false;
+    }
+    return true;
+}
+
+fn routedRowsFieldExists(schema: storage_schema.TableSchema, field: []const u8) bool {
+    for (schema.relational_columns) |column| {
+        if (std.mem.eql(u8, field, column.name) or std.mem.eql(u8, field, column.path)) return true;
+    }
+    return false;
+}
+
+fn countRowsQueryFromRoutedScansAlloc(
+    alloc: std.mem.Allocator,
+    source: core.TableReadSource,
+    table_name: []const u8,
+    schema: storage_schema.TableSchema,
+    req: db_mod.types.RelationalRowsQueryRequest,
+    ranges: []const db_mod.types.RelationalRowsDocKeyRange,
+    consistency: raft_mod.ReadConsistency,
+) !?db_mod.types.RelationalRowsQueryResult {
+    var total: u32 = 0;
+    var scanned_rows: u64 = 0;
+    var saw_source = false;
+    if (ranges.len == 0) {
+        const counted = (try countRowsQueryFromRoutedScanAlloc(alloc, source, table_name, schema, req, "", "", consistency, &scanned_rows)) orelse return null;
+        saw_source = true;
+        total = try addRoutedRowsCount(total, counted);
+    } else {
+        for (ranges) |range| {
+            const counted = (try countRowsQueryFromRoutedScanAlloc(alloc, source, table_name, schema, req, range.start, range.end, consistency, &scanned_rows)) orelse continue;
+            saw_source = true;
+            total = try addRoutedRowsCount(total, counted);
+        }
+    }
+    if (!saw_source) return null;
+    return .{
+        .rows = &.{},
+        .total = total,
+        .total_exact = true,
+        .include_profile = req.profile,
+        .profile = .{
+            .access_method = .base_scan,
+            .total_mode = req.total_mode,
+            .count_only = true,
+            .base_scan_rows = scanned_rows,
+            .candidate_rows = scanned_rows,
+            .iterator_seeks = if (ranges.len == 0) 1 else @intCast(ranges.len),
+        },
+    };
+}
+
+fn countRowsQueryFromRoutedScansThroughCteChainAlloc(
+    alloc: std.mem.Allocator,
+    source: core.TableReadSource,
+    table_name: []const u8,
+    schema: storage_schema.TableSchema,
+    plan: db_mod.types.RelationalRowsQueryPlan,
+    consistency: raft_mod.ReadConsistency,
+) !?db_mod.types.RelationalRowsQueryResult {
+    if (!relational_rows_api.rowsQueryCanUseCountOnlyResultForRouting(plan.query)) return null;
+    if (!routedRowsQueryFiltersUseSchemaFields(schema, plan.query)) return null;
+    if (plan.query.source_cte.len == 0 or plan.ctes.len == 0) return null;
+
+    var chain = std.ArrayListUnmanaged(db_mod.types.RelationalRowsCte).empty;
+    defer chain.deinit(alloc);
+
+    var source_cte = plan.query.source_cte;
+    while (source_cte.len != 0) {
+        if (chain.items.len >= plan.ctes.len) return null;
+        const cte = routedRowsFindCte(plan.ctes, source_cte) orelse return null;
+        if (!routedRowsCteCanStreamAsCountFilter(schema, cte)) return null;
+        try chain.append(alloc, cte);
+        source_cte = cte.query.source_cte;
+    }
+    if (chain.items.len == 0) return null;
+
+    var predicates = std.ArrayListUnmanaged(storage_schema.RelationalCheck).empty;
+    defer predicates.deinit(alloc);
+    var array_any = std.ArrayListUnmanaged(db_mod.types.RelationalRowsArrayAnyPredicate).empty;
+    defer array_any.deinit(alloc);
+    var array_contains = std.ArrayListUnmanaged(db_mod.types.RelationalRowsArrayContainsPredicate).empty;
+    defer array_contains.deinit(alloc);
+    var array_eq = std.ArrayListUnmanaged(db_mod.types.RelationalRowsArrayEqPredicate).empty;
+    defer array_eq.deinit(alloc);
+    var in_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsInPredicate).empty;
+    defer in_predicates.deinit(alloc);
+    var json_contains = std.ArrayListUnmanaged(db_mod.types.RelationalRowsJsonContainsPredicate).empty;
+    defer json_contains.deinit(alloc);
+    var json_path_eq = std.ArrayListUnmanaged(db_mod.types.RelationalRowsJsonPathEqPredicate).empty;
+    defer json_path_eq.deinit(alloc);
+    var json_path_exists = std.ArrayListUnmanaged(db_mod.types.RelationalRowsJsonPathExistsPredicate).empty;
+    defer json_path_exists.deinit(alloc);
+    var text_patterns = std.ArrayListUnmanaged(db_mod.types.RelationalRowsTextPatternPredicate).empty;
+    defer text_patterns.deinit(alloc);
+    var or_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsPredicateGroup).empty;
+    defer or_predicates.deinit(alloc);
+    var not_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsPredicateGroup).empty;
+    defer not_predicates.deinit(alloc);
+    var access_or_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsAccessPredicateGroup).empty;
+    defer access_or_predicates.deinit(alloc);
+    var access_not_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsAccessPredicateGroup).empty;
+    defer access_not_predicates.deinit(alloc);
+    var expression_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition).empty;
+    defer expression_predicates.deinit(alloc);
+    var expression_or_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup).empty;
+    defer expression_or_predicates.deinit(alloc);
+    var expression_not_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup).empty;
+    defer expression_not_predicates.deinit(alloc);
+    var expression_array_contains = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionArrayContainsPredicate).empty;
+    defer expression_array_contains.deinit(alloc);
+
+    var reverse_index = chain.items.len;
+    while (reverse_index > 0) {
+        reverse_index -= 1;
+        const req = chain.items[reverse_index].query;
+        try predicates.appendSlice(alloc, req.predicates);
+        try array_any.appendSlice(alloc, req.array_any);
+        try array_contains.appendSlice(alloc, req.array_contains);
+        try array_eq.appendSlice(alloc, req.array_eq);
+        try in_predicates.appendSlice(alloc, req.in_predicates);
+        try json_contains.appendSlice(alloc, req.json_contains);
+        try json_path_eq.appendSlice(alloc, req.json_path_eq);
+        try json_path_exists.appendSlice(alloc, req.json_path_exists);
+        try text_patterns.appendSlice(alloc, req.text_patterns);
+        try or_predicates.appendSlice(alloc, req.or_predicates);
+        try not_predicates.appendSlice(alloc, req.not_predicates);
+        try access_or_predicates.appendSlice(alloc, req.access_or_predicates);
+        try access_not_predicates.appendSlice(alloc, req.access_not_predicates);
+        try expression_predicates.appendSlice(alloc, req.expression_predicates);
+        try expression_or_predicates.appendSlice(alloc, req.expression_or_predicates);
+        try expression_not_predicates.appendSlice(alloc, req.expression_not_predicates);
+        try expression_array_contains.appendSlice(alloc, req.expression_array_contains);
+    }
+    try predicates.appendSlice(alloc, plan.query.predicates);
+    try array_any.appendSlice(alloc, plan.query.array_any);
+    try array_contains.appendSlice(alloc, plan.query.array_contains);
+    try array_eq.appendSlice(alloc, plan.query.array_eq);
+    try in_predicates.appendSlice(alloc, plan.query.in_predicates);
+    try json_contains.appendSlice(alloc, plan.query.json_contains);
+    try json_path_eq.appendSlice(alloc, plan.query.json_path_eq);
+    try json_path_exists.appendSlice(alloc, plan.query.json_path_exists);
+    try text_patterns.appendSlice(alloc, plan.query.text_patterns);
+    try or_predicates.appendSlice(alloc, plan.query.or_predicates);
+    try not_predicates.appendSlice(alloc, plan.query.not_predicates);
+    try access_or_predicates.appendSlice(alloc, plan.query.access_or_predicates);
+    try access_not_predicates.appendSlice(alloc, plan.query.access_not_predicates);
+    try expression_predicates.appendSlice(alloc, plan.query.expression_predicates);
+    try expression_or_predicates.appendSlice(alloc, plan.query.expression_or_predicates);
+    try expression_not_predicates.appendSlice(alloc, plan.query.expression_not_predicates);
+    try expression_array_contains.appendSlice(alloc, plan.query.expression_array_contains);
+
+    const merged_req = db_mod.types.RelationalRowsQueryRequest{
+        .predicates = predicates.items,
+        .array_any = array_any.items,
+        .array_contains = array_contains.items,
+        .array_eq = array_eq.items,
+        .in_predicates = in_predicates.items,
+        .json_contains = json_contains.items,
+        .json_path_eq = json_path_eq.items,
+        .json_path_exists = json_path_exists.items,
+        .text_patterns = text_patterns.items,
+        .or_predicates = or_predicates.items,
+        .not_predicates = not_predicates.items,
+        .access_or_predicates = access_or_predicates.items,
+        .access_not_predicates = access_not_predicates.items,
+        .expression_predicates = expression_predicates.items,
+        .expression_or_predicates = expression_or_predicates.items,
+        .expression_not_predicates = expression_not_predicates.items,
+        .expression_array_contains = expression_array_contains.items,
+        .limit = 0,
+        .total_mode = .exact,
+        .profile = plan.query.profile,
+    };
+    return try countRowsQueryFromRoutedScansAlloc(alloc, source, table_name, schema, merged_req, plan.ranges, consistency);
+}
+
+fn routedRowsFindCte(ctes: []const db_mod.types.RelationalRowsCte, name: []const u8) ?db_mod.types.RelationalRowsCte {
+    for (ctes) |cte| {
+        if (std.mem.eql(u8, cte.name, name)) return cte;
+    }
+    return null;
+}
+
+fn addRoutedRowsCount(current: u32, delta: u32) !u32 {
+    return std.math.add(u32, current, delta) catch error.UnsupportedRowsQuery;
+}
+
+fn routedRowsSetOperationPlanCanUseCountOnly(plan: db_mod.types.RelationalRowsSetOperationPlan) bool {
+    if (plan.operation != .union_all and
+        plan.operation != .union_distinct and
+        plan.operation != .intersect and
+        plan.operation != .except) return false;
+    if (plan.order_by.len != 0 or plan.limit != null or plan.offset != 0) return false;
+    if (!relational_rows_api.rowsQueryCanUseCountOnlyResultForRouting(plan.left.query)) return false;
+    if (!relational_rows_api.rowsQueryCanUseCountOnlyResultForRouting(plan.right.query)) return false;
+    if (plan.ctes.len != 0 and (plan.left.ctes.len != 0 or plan.right.ctes.len != 0)) return false;
+    return true;
+}
+
+fn rowsUnionAllCountOnlyPlanFromRoutedScansAlloc(
+    alloc: std.mem.Allocator,
+    source: core.TableReadSource,
+    table_name: []const u8,
+    runtime_schema: storage_schema.TableSchema,
+    plan: db_mod.types.RelationalRowsSetOperationPlan,
+    consistency: raft_mod.ReadConsistency,
+) !?db_mod.types.RelationalRowsQueryResult {
+    if (plan.operation != .union_all or !routedRowsSetOperationPlanCanUseCountOnly(plan)) return null;
+
+    var left_plan = plan.left;
+    var right_plan = plan.right;
+    if (plan.ctes.len != 0) {
+        left_plan.ctes = plan.ctes;
+        right_plan.ctes = plan.ctes;
+    }
+
+    var left = (try rowsQueryPlanFromRoutedScansAlloc(alloc, source, table_name, runtime_schema, left_plan, consistency)) orelse return null;
+    defer left.deinit(alloc);
+    if (left.rows.len != 0 or !left.total_exact) return null;
+
+    var right = (try rowsQueryPlanFromRoutedScansAlloc(alloc, source, table_name, runtime_schema, right_plan, consistency)) orelse return null;
+    defer right.deinit(alloc);
+    if (right.rows.len != 0 or !right.total_exact) return null;
+
+    var profile = db_mod.types.RelationalRowsQueryResult.Profile{
+        .access_method = .base_scan,
+        .total_mode = .exact,
+        .count_only = true,
+    };
+    profile.base_scan_rows = try std.math.add(u64, left.profile.base_scan_rows, right.profile.base_scan_rows);
+    profile.candidate_rows = try std.math.add(u64, left.profile.candidate_rows, right.profile.candidate_rows);
+    profile.iterator_seeks = try std.math.add(u64, left.profile.iterator_seeks, right.profile.iterator_seeks);
+    profile.covering_payload_rows = try std.math.add(u64, left.profile.covering_payload_rows, right.profile.covering_payload_rows);
+    profile.covering_payload_rechecked_rows = try std.math.add(u64, left.profile.covering_payload_rechecked_rows, right.profile.covering_payload_rechecked_rows);
+    profile.covering_payload_hydration_avoided_rows = try std.math.add(u64, left.profile.covering_payload_hydration_avoided_rows, right.profile.covering_payload_hydration_avoided_rows);
+    profile.covering_payload_fallback_metadata_missing_rows = try std.math.add(u64, left.profile.covering_payload_fallback_metadata_missing_rows, right.profile.covering_payload_fallback_metadata_missing_rows);
+    profile.covering_payload_fallback_row_generation_mismatch_rows = try std.math.add(u64, left.profile.covering_payload_fallback_row_generation_mismatch_rows, right.profile.covering_payload_fallback_row_generation_mismatch_rows);
+    profile.covering_payload_fallback_index_generation_mismatch_rows = try std.math.add(u64, left.profile.covering_payload_fallback_index_generation_mismatch_rows, right.profile.covering_payload_fallback_index_generation_mismatch_rows);
+    profile.covering_payload_fallback_schema_fingerprint_mismatch_rows = try std.math.add(u64, left.profile.covering_payload_fallback_schema_fingerprint_mismatch_rows, right.profile.covering_payload_fallback_schema_fingerprint_mismatch_rows);
+    profile.covering_payload_fallback_residual_predicate_rows = try std.math.add(u64, left.profile.covering_payload_fallback_residual_predicate_rows, right.profile.covering_payload_fallback_residual_predicate_rows);
+    profile.covering_payload_fallback_projection_shape_rows = try std.math.add(u64, left.profile.covering_payload_fallback_projection_shape_rows, right.profile.covering_payload_fallback_projection_shape_rows);
+    profile.routed_materialization_fallbacks = try std.math.add(u64, left.profile.routed_materialization_fallbacks, right.profile.routed_materialization_fallbacks);
+    profile.routed_materialized_rows = try std.math.add(u64, left.profile.routed_materialized_rows, right.profile.routed_materialized_rows);
+    profile.routed_materialized_bytes = try std.math.add(u64, left.profile.routed_materialized_bytes, right.profile.routed_materialized_bytes);
+    profile.routed_spill_count = try std.math.add(u64, left.profile.routed_spill_count, right.profile.routed_spill_count);
+    profile.routed_spilled_rows = try std.math.add(u64, left.profile.routed_spilled_rows, right.profile.routed_spilled_rows);
+    profile.routed_spilled_bytes = try std.math.add(u64, left.profile.routed_spilled_bytes, right.profile.routed_spilled_bytes);
+
+    return .{
+        .rows = &.{},
+        .total = try addRoutedRowsCount(left.total, right.total),
+        .total_exact = true,
+        .include_profile = left.include_profile or right.include_profile,
+        .profile = profile,
+    };
+}
+
+fn routedRowsFreeStringSet(alloc: std.mem.Allocator, set: *std.StringHashMapUnmanaged(void)) void {
+    var keys = set.keyIterator();
+    while (keys.next()) |key| alloc.free(@constCast(key.*));
+    set.deinit(alloc);
+}
+
+fn routedRowsPutStringSetKeyAlloc(
+    alloc: std.mem.Allocator,
+    set: *std.StringHashMapUnmanaged(void),
+    key_value: []const u8,
+) !bool {
+    if (set.contains(key_value)) return false;
+    const key = try alloc.dupe(u8, key_value);
+    errdefer alloc.free(key);
+    const gop = try set.getOrPut(alloc, key);
+    if (gop.found_existing) {
+        alloc.free(key);
+        return false;
+    }
+    return true;
+}
+
+fn routedRowsStringSetCountAsU32(set: std.StringHashMapUnmanaged(void)) !u32 {
+    return std.math.cast(u32, set.count()) orelse error.UnsupportedRowsQuery;
+}
+
+fn routedRowsSetMembershipCountAsU32(
+    included: std.StringHashMapUnmanaged(void),
+    probe: std.StringHashMapUnmanaged(void),
+    want_present: bool,
+) !u32 {
+    var total: u32 = 0;
+    var keys = included.keyIterator();
+    while (keys.next()) |key| {
+        if (probe.contains(key.*) == want_present) {
+            total = try addRoutedRowsCount(total, 1);
+        }
+    }
+    return total;
+}
+
+const RoutedRowsBorrowedFilterLists = struct {
+    predicates: std.ArrayListUnmanaged(storage_schema.RelationalCheck) = .empty,
+    array_any: std.ArrayListUnmanaged(db_mod.types.RelationalRowsArrayAnyPredicate) = .empty,
+    array_contains: std.ArrayListUnmanaged(db_mod.types.RelationalRowsArrayContainsPredicate) = .empty,
+    array_eq: std.ArrayListUnmanaged(db_mod.types.RelationalRowsArrayEqPredicate) = .empty,
+    in_predicates: std.ArrayListUnmanaged(db_mod.types.RelationalRowsInPredicate) = .empty,
+    json_contains: std.ArrayListUnmanaged(db_mod.types.RelationalRowsJsonContainsPredicate) = .empty,
+    json_path_eq: std.ArrayListUnmanaged(db_mod.types.RelationalRowsJsonPathEqPredicate) = .empty,
+    json_path_exists: std.ArrayListUnmanaged(db_mod.types.RelationalRowsJsonPathExistsPredicate) = .empty,
+    text_patterns: std.ArrayListUnmanaged(db_mod.types.RelationalRowsTextPatternPredicate) = .empty,
+    or_predicates: std.ArrayListUnmanaged(db_mod.types.RelationalRowsPredicateGroup) = .empty,
+    not_predicates: std.ArrayListUnmanaged(db_mod.types.RelationalRowsPredicateGroup) = .empty,
+    access_or_predicates: std.ArrayListUnmanaged(db_mod.types.RelationalRowsAccessPredicateGroup) = .empty,
+    access_not_predicates: std.ArrayListUnmanaged(db_mod.types.RelationalRowsAccessPredicateGroup) = .empty,
+    expression_predicates: std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition) = .empty,
+    expression_or_predicates: std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup) = .empty,
+    expression_not_predicates: std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup) = .empty,
+    expression_array_contains: std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionArrayContainsPredicate) = .empty,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        self.predicates.deinit(alloc);
+        self.array_any.deinit(alloc);
+        self.array_contains.deinit(alloc);
+        self.array_eq.deinit(alloc);
+        self.in_predicates.deinit(alloc);
+        self.json_contains.deinit(alloc);
+        self.json_path_eq.deinit(alloc);
+        self.json_path_exists.deinit(alloc);
+        self.text_patterns.deinit(alloc);
+        self.or_predicates.deinit(alloc);
+        self.not_predicates.deinit(alloc);
+        self.access_or_predicates.deinit(alloc);
+        self.access_not_predicates.deinit(alloc);
+        self.expression_predicates.deinit(alloc);
+        self.expression_or_predicates.deinit(alloc);
+        self.expression_not_predicates.deinit(alloc);
+        self.expression_array_contains.deinit(alloc);
+    }
+
+    fn append(self: *@This(), alloc: std.mem.Allocator, req: db_mod.types.RelationalRowsQueryRequest) !void {
+        try self.predicates.appendSlice(alloc, req.predicates);
+        try self.array_any.appendSlice(alloc, req.array_any);
+        try self.array_contains.appendSlice(alloc, req.array_contains);
+        try self.array_eq.appendSlice(alloc, req.array_eq);
+        try self.in_predicates.appendSlice(alloc, req.in_predicates);
+        try self.json_contains.appendSlice(alloc, req.json_contains);
+        try self.json_path_eq.appendSlice(alloc, req.json_path_eq);
+        try self.json_path_exists.appendSlice(alloc, req.json_path_exists);
+        try self.text_patterns.appendSlice(alloc, req.text_patterns);
+        try self.or_predicates.appendSlice(alloc, req.or_predicates);
+        try self.not_predicates.appendSlice(alloc, req.not_predicates);
+        try self.access_or_predicates.appendSlice(alloc, req.access_or_predicates);
+        try self.access_not_predicates.appendSlice(alloc, req.access_not_predicates);
+        try self.expression_predicates.appendSlice(alloc, req.expression_predicates);
+        try self.expression_or_predicates.appendSlice(alloc, req.expression_or_predicates);
+        try self.expression_not_predicates.appendSlice(alloc, req.expression_not_predicates);
+        try self.expression_array_contains.appendSlice(alloc, req.expression_array_contains);
+    }
+
+    fn query(self: *@This(), base: db_mod.types.RelationalRowsQueryRequest) db_mod.types.RelationalRowsQueryRequest {
+        var out = base;
+        out.source_cte = "";
+        out.predicates = self.predicates.items;
+        out.array_any = self.array_any.items;
+        out.array_contains = self.array_contains.items;
+        out.array_eq = self.array_eq.items;
+        out.in_predicates = self.in_predicates.items;
+        out.json_contains = self.json_contains.items;
+        out.json_path_eq = self.json_path_eq.items;
+        out.json_path_exists = self.json_path_exists.items;
+        out.text_patterns = self.text_patterns.items;
+        out.or_predicates = self.or_predicates.items;
+        out.not_predicates = self.not_predicates.items;
+        out.access_or_predicates = self.access_or_predicates.items;
+        out.access_not_predicates = self.access_not_predicates.items;
+        out.expression_predicates = self.expression_predicates.items;
+        out.expression_or_predicates = self.expression_or_predicates.items;
+        out.expression_not_predicates = self.expression_not_predicates.items;
+        out.expression_array_contains = self.expression_array_contains.items;
+        out.limit = null;
+        out.total_mode = .exact;
+        out.profile = false;
+        return out;
+    }
+};
+
+fn routedRowsUnionDistinctMergedCteBranchQueryAlloc(
+    alloc: std.mem.Allocator,
+    schema: storage_schema.TableSchema,
+    plan: db_mod.types.RelationalRowsQueryPlan,
+    filters: *RoutedRowsBorrowedFilterLists,
+) !?db_mod.types.RelationalRowsQueryRequest {
+    if (plan.query.source_cte.len == 0) return null;
+    if (!routedRowsQueryFiltersUseSchemaFields(schema, plan.query)) return null;
+
+    var chain = std.ArrayListUnmanaged(db_mod.types.RelationalRowsCte).empty;
+    defer chain.deinit(alloc);
+
+    var source_cte = plan.query.source_cte;
+    while (source_cte.len != 0) {
+        if (chain.items.len >= plan.ctes.len) return null;
+        const cte = routedRowsFindCte(plan.ctes, source_cte) orelse return null;
+        if (!routedRowsCteCanStreamAsCountFilter(schema, cte)) return null;
+        try chain.append(alloc, cte);
+        source_cte = cte.query.source_cte;
+    }
+    if (chain.items.len == 0) return null;
+    if (!routedRowsQueryFieldsExistInCteOutput(schema, plan.query, chain.items[0].query)) return null;
+
+    var reverse_index = chain.items.len;
+    while (reverse_index > 0) {
+        reverse_index -= 1;
+        try filters.append(alloc, chain.items[reverse_index].query);
+    }
+    try filters.append(alloc, plan.query);
+    return filters.query(plan.query);
+}
+
+fn appendUnionDistinctProjectedRowsFromRoutedScanAlloc(
+    alloc: std.mem.Allocator,
+    source: core.TableReadSource,
+    table_name: []const u8,
+    schema: storage_schema.TableSchema,
+    req: db_mod.types.RelationalRowsQueryRequest,
+    from_key: []const u8,
+    to_key: []const u8,
+    consistency: raft_mod.ReadConsistency,
+    seen: *std.StringHashMapUnmanaged(void),
+    profile: *db_mod.types.RelationalRowsQueryResult.Profile,
+) !bool {
+    var scan_result = (try source.scan(alloc, table_name, from_key, to_key, .{
+        .include_documents = true,
+        .include_all_fields = true,
+    }, consistency)) orelse return false;
+    defer scan_result.deinit(alloc);
+
+    var lines = std.mem.splitScalar(u8, scan_result.ndjson, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var row = try mergeScanRowFromScanLineAlloc(alloc, line);
+        defer row.deinit(alloc);
+        profile.base_scan_rows += 1;
+        profile.candidate_rows += 1;
+
+        var lookup = (try source.lookup(alloc, table_name, row.key, .{ .include_all_fields = true }, consistency)) orelse return error.TopologyChanged;
+        defer lookup.deinit(alloc);
+        if (row.version != lookup.version) return error.TopologyChanged;
+        if (!std.mem.eql(u8, row.json, lookup.json)) return error.TopologyChanged;
+
+        var branch_req = req;
+        branch_req.source_cte = "";
+        branch_req.limit = null;
+        branch_req.total_mode = .exact;
+        branch_req.profile = false;
+        const branch_rows = [_][]const u8{lookup.json};
+        var projected = try relational_rows_api.executeRowsQueryOnJsonRowsAlloc(alloc, schema, branch_req, branch_rows[0..]);
+        defer projected.deinit(alloc);
+        profile.hydrated_rows += 1;
+        profile.projected_rows += @intCast(projected.rows.len);
+        for (projected.rows) |projected_row| {
+            _ = try routedRowsPutStringSetKeyAlloc(alloc, seen, projected_row);
+        }
+    }
+    return true;
+}
+
+fn appendUnionDistinctProjectedRowsFromRoutedScansAlloc(
+    alloc: std.mem.Allocator,
+    source: core.TableReadSource,
+    table_name: []const u8,
+    schema: storage_schema.TableSchema,
+    plan: db_mod.types.RelationalRowsQueryPlan,
+    consistency: raft_mod.ReadConsistency,
+    seen: *std.StringHashMapUnmanaged(void),
+    profile: *db_mod.types.RelationalRowsQueryResult.Profile,
+) !bool {
+    var filters = RoutedRowsBorrowedFilterLists{};
+    defer filters.deinit(alloc);
+    var query = plan.query;
+    if (plan.query.source_cte.len != 0) {
+        query = (try routedRowsUnionDistinctMergedCteBranchQueryAlloc(alloc, schema, plan, &filters)) orelse return false;
+    } else if (plan.ctes.len != 0) {
+        return false;
+    }
+    var saw_source = false;
+    if (plan.ranges.len == 0) {
+        saw_source = try appendUnionDistinctProjectedRowsFromRoutedScanAlloc(alloc, source, table_name, schema, query, "", "", consistency, seen, profile);
+    } else {
+        for (plan.ranges) |range| {
+            saw_source = (try appendUnionDistinctProjectedRowsFromRoutedScanAlloc(alloc, source, table_name, schema, query, range.start, range.end, consistency, seen, profile)) or saw_source;
+        }
+    }
+    profile.iterator_seeks += if (plan.ranges.len == 0) 1 else @intCast(plan.ranges.len);
+    return saw_source;
+}
+
+fn rowsUnionDistinctCountOnlyPlanFromRoutedScansAlloc(
+    alloc: std.mem.Allocator,
+    source: core.TableReadSource,
+    table_name: []const u8,
+    runtime_schema: storage_schema.TableSchema,
+    plan: db_mod.types.RelationalRowsSetOperationPlan,
+    consistency: raft_mod.ReadConsistency,
+) !?db_mod.types.RelationalRowsQueryResult {
+    if (plan.operation != .union_distinct or !routedRowsSetOperationPlanCanUseCountOnly(plan)) return null;
+
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer routedRowsFreeStringSet(alloc, &seen);
+
+    var profile = db_mod.types.RelationalRowsQueryResult.Profile{
+        .access_method = .base_scan,
+        .total_mode = .exact,
+        .count_only = true,
+    };
+    var left_plan = plan.left;
+    var right_plan = plan.right;
+    if (plan.ctes.len != 0) {
+        left_plan.ctes = plan.ctes;
+        right_plan.ctes = plan.ctes;
+    }
+    var saw_source = try appendUnionDistinctProjectedRowsFromRoutedScansAlloc(alloc, source, table_name, runtime_schema, left_plan, consistency, &seen, &profile);
+    saw_source = (try appendUnionDistinctProjectedRowsFromRoutedScansAlloc(alloc, source, table_name, runtime_schema, right_plan, consistency, &seen, &profile)) or saw_source;
+    if (!saw_source) return null;
+
+    return .{
+        .rows = &.{},
+        .total = try routedRowsStringSetCountAsU32(seen),
+        .total_exact = true,
+        .include_profile = plan.left.query.profile or plan.right.query.profile,
+        .profile = profile,
+    };
+}
+
+fn rowsIntersectExceptCountOnlyPlanFromRoutedScansAlloc(
+    alloc: std.mem.Allocator,
+    source: core.TableReadSource,
+    table_name: []const u8,
+    runtime_schema: storage_schema.TableSchema,
+    plan: db_mod.types.RelationalRowsSetOperationPlan,
+    consistency: raft_mod.ReadConsistency,
+) !?db_mod.types.RelationalRowsQueryResult {
+    if ((plan.operation != .intersect and plan.operation != .except) or !routedRowsSetOperationPlanCanUseCountOnly(plan)) return null;
+
+    var left_seen = std.StringHashMapUnmanaged(void).empty;
+    defer routedRowsFreeStringSet(alloc, &left_seen);
+    var right_seen = std.StringHashMapUnmanaged(void).empty;
+    defer routedRowsFreeStringSet(alloc, &right_seen);
+
+    var profile = db_mod.types.RelationalRowsQueryResult.Profile{
+        .access_method = .base_scan,
+        .total_mode = .exact,
+        .count_only = true,
+    };
+    var left_plan = plan.left;
+    var right_plan = plan.right;
+    if (plan.ctes.len != 0) {
+        left_plan.ctes = plan.ctes;
+        right_plan.ctes = plan.ctes;
+    }
+    const saw_left = try appendUnionDistinctProjectedRowsFromRoutedScansAlloc(alloc, source, table_name, runtime_schema, left_plan, consistency, &left_seen, &profile);
+    const saw_right = try appendUnionDistinctProjectedRowsFromRoutedScansAlloc(alloc, source, table_name, runtime_schema, right_plan, consistency, &right_seen, &profile);
+    if (!saw_left and !saw_right) return null;
+
+    const total = switch (plan.operation) {
+        .intersect => try routedRowsSetMembershipCountAsU32(left_seen, right_seen, true),
+        .except => try routedRowsSetMembershipCountAsU32(left_seen, right_seen, false),
+        else => unreachable,
+    };
+    return .{
+        .rows = &.{},
+        .total = total,
+        .total_exact = true,
+        .include_profile = plan.left.query.profile or plan.right.query.profile,
+        .profile = profile,
+    };
+}
+
+fn boundedSortedRowsQueryFromRoutedScansAlloc(
+    alloc: std.mem.Allocator,
+    source: core.TableReadSource,
+    table_name: []const u8,
+    schema: storage_schema.TableSchema,
+    req: db_mod.types.RelationalRowsQueryRequest,
+    ranges: []const db_mod.types.RelationalRowsDocKeyRange,
+    consistency: raft_mod.ReadConsistency,
+) !?db_mod.types.RelationalRowsQueryResult {
+    var stream = try relational_rows_api.RowsQueryBoundedSortedStream.init(schema, req);
+    defer stream.deinit(alloc);
+
+    var fingerprints = std.ArrayListUnmanaged(RoutedScanRowFingerprint).empty;
+    defer {
+        for (fingerprints.items) |*fingerprint| fingerprint.deinit(alloc);
+        fingerprints.deinit(alloc);
+    }
+
+    var saw_source = false;
+    if (ranges.len == 0) {
+        saw_source = try appendBoundedSortedRowsFromRoutedScanAlloc(alloc, source, table_name, "", "", &stream, &fingerprints, consistency);
+    } else {
+        for (ranges) |range| {
+            saw_source = (try appendBoundedSortedRowsFromRoutedScanAlloc(alloc, source, table_name, range.start, range.end, &stream, &fingerprints, consistency)) or saw_source;
+        }
+    }
+    if (!saw_source) return null;
+    try verifyRoutedScanRangesUnchangedByFingerprintAlloc(alloc, source, table_name, ranges, fingerprints.items, consistency);
+    return try stream.toResult(alloc);
+}
+
+fn boundedSortedRowsQueryFromRoutedScansThroughCteAlloc(
+    alloc: std.mem.Allocator,
+    source: core.TableReadSource,
+    table_name: []const u8,
+    schema: storage_schema.TableSchema,
+    cte: db_mod.types.RelationalRowsCte,
+    final_req: db_mod.types.RelationalRowsQueryRequest,
+    ranges: []const db_mod.types.RelationalRowsDocKeyRange,
+    consistency: raft_mod.ReadConsistency,
+) !?db_mod.types.RelationalRowsQueryResult {
+    var local_req = final_req;
+    local_req.source_cte = "";
+    var stream = try relational_rows_api.RowsQueryBoundedSortedStream.init(schema, local_req);
+    defer stream.deinit(alloc);
+
+    var fingerprints = std.ArrayListUnmanaged(RoutedScanRowFingerprint).empty;
+    defer {
+        for (fingerprints.items) |*fingerprint| fingerprint.deinit(alloc);
+        fingerprints.deinit(alloc);
+    }
+
+    var saw_source = false;
+    if (ranges.len == 0) {
+        saw_source = try appendBoundedSortedRowsFromRoutedScanThroughCteAlloc(alloc, source, table_name, schema, cte.query, "", "", &stream, &fingerprints, consistency);
+    } else {
+        for (ranges) |range| {
+            saw_source = (try appendBoundedSortedRowsFromRoutedScanThroughCteAlloc(alloc, source, table_name, schema, cte.query, range.start, range.end, &stream, &fingerprints, consistency)) or saw_source;
+        }
+    }
+    if (!saw_source) return null;
+    try verifyRoutedScanRangesUnchangedByFingerprintAlloc(alloc, source, table_name, ranges, fingerprints.items, consistency);
+    return try stream.toResult(alloc);
+}
+
+fn appendBoundedSortedRowsFromRoutedScanAlloc(
+    alloc: std.mem.Allocator,
+    source: core.TableReadSource,
+    table_name: []const u8,
+    from_key: []const u8,
+    to_key: []const u8,
+    stream: *relational_rows_api.RowsQueryBoundedSortedStream,
+    fingerprints: *std.ArrayListUnmanaged(RoutedScanRowFingerprint),
+    consistency: raft_mod.ReadConsistency,
+) !bool {
+    var scan_result = (try source.scan(alloc, table_name, from_key, to_key, .{
+        .include_documents = true,
+        .include_all_fields = true,
+    }, consistency)) orelse return false;
+    defer scan_result.deinit(alloc);
+    stream.recordIteratorSeek();
+
+    var lines = std.mem.splitScalar(u8, scan_result.ndjson, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var row = try mergeScanRowFromScanLineAlloc(alloc, line);
+        defer row.deinit(alloc);
+
+        var lookup = (try source.lookup(alloc, table_name, row.key, .{ .include_all_fields = true }, consistency)) orelse return error.TopologyChanged;
+        defer lookup.deinit(alloc);
+        if (row.version != lookup.version) return error.TopologyChanged;
+        if (!std.mem.eql(u8, row.json, lookup.json)) return error.TopologyChanged;
+
+        const key = try alloc.dupe(u8, row.key);
+        errdefer alloc.free(key);
+        try fingerprints.append(alloc, .{
+            .key = key,
+            .version = row.version,
+            .json_hash = routedScanJsonHash(row.json),
+        });
+        try stream.appendScannedRowJsonAlloc(alloc, lookup.json);
+    }
+    return true;
+}
+
+fn appendBoundedSortedRowsFromRoutedScanThroughCteAlloc(
+    alloc: std.mem.Allocator,
+    source: core.TableReadSource,
+    table_name: []const u8,
+    schema: storage_schema.TableSchema,
+    cte_query: db_mod.types.RelationalRowsQueryRequest,
+    from_key: []const u8,
+    to_key: []const u8,
+    stream: *relational_rows_api.RowsQueryBoundedSortedStream,
+    fingerprints: *std.ArrayListUnmanaged(RoutedScanRowFingerprint),
+    consistency: raft_mod.ReadConsistency,
+) !bool {
+    var scan_result = (try source.scan(alloc, table_name, from_key, to_key, .{
+        .include_documents = true,
+        .include_all_fields = true,
+    }, consistency)) orelse return false;
+    defer scan_result.deinit(alloc);
+    stream.recordIteratorSeek();
+
+    var lines = std.mem.splitScalar(u8, scan_result.ndjson, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var row = try mergeScanRowFromScanLineAlloc(alloc, line);
+        defer row.deinit(alloc);
+
+        var lookup = (try source.lookup(alloc, table_name, row.key, .{ .include_all_fields = true }, consistency)) orelse return error.TopologyChanged;
+        defer lookup.deinit(alloc);
+        if (row.version != lookup.version) return error.TopologyChanged;
+        if (!std.mem.eql(u8, row.json, lookup.json)) return error.TopologyChanged;
+
+        const key = try alloc.dupe(u8, row.key);
+        errdefer alloc.free(key);
+        try fingerprints.append(alloc, .{
+            .key = key,
+            .version = row.version,
+            .json_hash = routedScanJsonHash(row.json),
+        });
+
+        const cte_rows = [_][]const u8{lookup.json};
+        var cte_result = try relational_rows_api.executeRowsQueryOnJsonRowsAlloc(alloc, schema, cte_query, cte_rows[0..]);
+        defer cte_result.deinit(alloc);
+        if (cte_result.rows.len > 1) return error.UnsupportedRowsQuery;
+        if (cte_result.rows.len == 1) try stream.appendScannedRowJsonAlloc(alloc, cte_result.rows[0]);
+    }
+    return true;
+}
+
+fn routedScanJsonHash(json: []const u8) u64 {
+    return std.hash.Wyhash.hash(0, json);
+}
+
+fn countRowsQueryFromRoutedScanAlloc(
+    alloc: std.mem.Allocator,
+    source: core.TableReadSource,
+    table_name: []const u8,
+    schema: storage_schema.TableSchema,
+    req: db_mod.types.RelationalRowsQueryRequest,
+    from_key: []const u8,
+    to_key: []const u8,
+    consistency: raft_mod.ReadConsistency,
+    scanned_rows: *u64,
+) !?u32 {
+    var scan_result = (try source.scan(alloc, table_name, from_key, to_key, .{
+        .include_documents = true,
+        .include_all_fields = true,
+    }, consistency)) orelse return null;
+    defer scan_result.deinit(alloc);
+
+    var total: u32 = 0;
+    var lines = std.mem.splitScalar(u8, scan_result.ndjson, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var row = try mergeScanRowFromScanLineAlloc(alloc, line);
+        defer row.deinit(alloc);
+        scanned_rows.* += 1;
+
+        var lookup = (try source.lookup(alloc, table_name, row.key, .{ .include_all_fields = true }, consistency)) orelse return error.TopologyChanged;
+        defer lookup.deinit(alloc);
+        if (row.version != lookup.version) return error.TopologyChanged;
+        if (!std.mem.eql(u8, row.json, lookup.json)) return error.TopologyChanged;
+        if (try relational_rows_api.rowsQueryJsonMatchesCountOnlyAlloc(alloc, schema, req, lookup.json)) {
+            total = try addRoutedRowsCount(total, 1);
+        }
+    }
+    return total;
 }
 
 fn verifyRoutedScanRowsStillCurrentAlloc(
@@ -4402,6 +5686,80 @@ fn verifyRoutedScanRangesUnchangedAlloc(
     }
 }
 
+fn addRoutedMaterializationProfile(
+    result: *db_mod.types.RelationalRowsQueryResult,
+    scanned_rows: RoutedMergeScanRows,
+) void {
+    result.profile.routed_materialization_fallbacks += 1;
+    result.profile.routed_materialized_rows += scanned_rows.materialized_rows;
+    result.profile.routed_materialized_bytes += scanned_rows.materialized_bytes;
+    if (scanned_rows.spilled) {
+        result.profile.routed_spill_count += 1;
+        result.profile.routed_spilled_rows += scanned_rows.spilled_rows;
+        result.profile.routed_spilled_bytes += scanned_rows.spilled_bytes;
+    }
+}
+
+fn verifyRoutedScanRangeUnchangedByFingerprintAlloc(
+    alloc: std.mem.Allocator,
+    source: core.TableReadSource,
+    table_name: []const u8,
+    from_key: []const u8,
+    to_key: []const u8,
+    expected_rows: []const RoutedScanRowFingerprint,
+    consistency: raft_mod.ReadConsistency,
+) !void {
+    var scan_result = (try source.scan(alloc, table_name, from_key, to_key, .{
+        .include_documents = true,
+        .include_all_fields = true,
+    }, consistency)) orelse return error.TopologyChanged;
+    defer scan_result.deinit(alloc);
+
+    var expected_count: usize = 0;
+    for (expected_rows) |row| {
+        if (routedScanRowKeyInRange(row.key, from_key, to_key)) expected_count += 1;
+    }
+
+    var expected_index: usize = 0;
+    var observed_count: usize = 0;
+    var lines = std.mem.splitScalar(u8, scan_result.ndjson, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        if (observed_count >= expected_count) return error.TopologyChanged;
+        var current = try mergeScanRowFromScanLineAlloc(alloc, line);
+        defer current.deinit(alloc);
+
+        while (expected_index < expected_rows.len and !routedScanRowKeyInRange(expected_rows[expected_index].key, from_key, to_key)) {
+            expected_index += 1;
+        }
+        if (expected_index >= expected_rows.len) return error.TopologyChanged;
+        const expected = expected_rows[expected_index];
+        if (!std.mem.eql(u8, current.key, expected.key)) return error.TopologyChanged;
+        if (current.version != expected.version) return error.TopologyChanged;
+        if (routedScanJsonHash(current.json) != expected.json_hash) return error.TopologyChanged;
+        expected_index += 1;
+        observed_count += 1;
+    }
+    if (observed_count != expected_count) return error.TopologyChanged;
+}
+
+fn verifyRoutedScanRangesUnchangedByFingerprintAlloc(
+    alloc: std.mem.Allocator,
+    source: core.TableReadSource,
+    table_name: []const u8,
+    ranges: []const db_mod.types.RelationalRowsDocKeyRange,
+    expected_rows: []const RoutedScanRowFingerprint,
+    consistency: raft_mod.ReadConsistency,
+) !void {
+    if (ranges.len == 0) {
+        try verifyRoutedScanRangeUnchangedByFingerprintAlloc(alloc, source, table_name, "", "", expected_rows, consistency);
+        return;
+    }
+    for (ranges) |range| {
+        try verifyRoutedScanRangeUnchangedByFingerprintAlloc(alloc, source, table_name, range.start, range.end, expected_rows, consistency);
+    }
+}
+
 pub fn rowsQueryPlanFromRoutedScansAlloc(
     alloc: std.mem.Allocator,
     source: core.TableReadSource,
@@ -4413,6 +5771,25 @@ pub fn rowsQueryPlanFromRoutedScansAlloc(
     try rejectRoutedRowsQueryPlanRowClaims(plan);
     try rejectRoutedRowsQueryPlanDocKeyRanges(plan);
     if (!scanPayloadCanStripSyntheticKey(runtime_schema)) return error.UnsupportedRowsQuery;
+    if (routedRowsQueryPlanCanUseStreamingCountOnly(plan)) {
+        return try countRowsQueryFromRoutedScansAlloc(alloc, source, table_name, runtime_schema, plan.query, plan.ranges, consistency);
+    }
+    if (routedRowsQueryPlanCanUseStreamingBoundedSorted(plan)) {
+        return try boundedSortedRowsQueryFromRoutedScansAlloc(alloc, source, table_name, runtime_schema, plan.query, plan.ranges, consistency);
+    }
+    if (routedRowsQueryPlanCanUseStreamingCteBoundedSorted(runtime_schema, plan)) {
+        return try boundedSortedRowsQueryFromRoutedScansThroughCteAlloc(alloc, source, table_name, runtime_schema, plan.ctes[0], plan.query, plan.ranges, consistency);
+    }
+    if (try countRowsQueryFromRoutedScansThroughCteChainAlloc(alloc, source, table_name, runtime_schema, plan, consistency)) |result| {
+        return result;
+    }
+    if (routedRowsQueryPlanCanUseStreamingCteCountOnly(runtime_schema, plan)) {
+        var cte_count_query = plan.ctes[0].query;
+        cte_count_query.limit = 0;
+        cte_count_query.total_mode = .exact;
+        cte_count_query.profile = plan.query.profile;
+        return try countRowsQueryFromRoutedScansAlloc(alloc, source, table_name, runtime_schema, cte_count_query, plan.ranges, consistency);
+    }
 
     var scanned_rows = (try collectStableMergeScanRowsFromRoutedScansAlloc(alloc, source, table_name, runtime_schema, plan.ranges, consistency)) orelse return null;
     defer scanned_rows.deinit(alloc);
@@ -4424,7 +5801,9 @@ pub fn rowsQueryPlanFromRoutedScansAlloc(
 
     var local_plan = plan;
     local_plan.ranges = &.{};
-    return try relational_rows_api.executeRowsQueryPlanOnJsonRowsAlloc(alloc, runtime_schema, local_plan, row_jsons);
+    var result = try relational_rows_api.executeRowsQueryPlanOnJsonRowsAlloc(alloc, runtime_schema, local_plan, row_jsons);
+    addRoutedMaterializationProfile(&result, scanned_rows);
+    return result;
 }
 
 pub fn rowsAggregatePlanFromRoutedScansAlloc(
@@ -4458,6 +5837,15 @@ pub fn rowsSetOperationPlanFromRoutedScansAlloc(
     try rejectRoutedRowsSetOperationPlanRowClaims(plan);
     try rejectRoutedRowsSetOperationPlanDocKeyRanges(plan);
     if (!scanPayloadCanStripSyntheticKey(runtime_schema)) return error.UnsupportedRowsQuery;
+    if (try rowsUnionAllCountOnlyPlanFromRoutedScansAlloc(alloc, source, table_name, runtime_schema, plan, consistency)) |result| {
+        return result;
+    }
+    if (try rowsUnionDistinctCountOnlyPlanFromRoutedScansAlloc(alloc, source, table_name, runtime_schema, plan, consistency)) |result| {
+        return result;
+    }
+    if (try rowsIntersectExceptCountOnlyPlanFromRoutedScansAlloc(alloc, source, table_name, runtime_schema, plan, consistency)) |result| {
+        return result;
+    }
     if (plan.ctes.len != 0) {
         if (plan.left.ctes.len != 0 or plan.right.ctes.len != 0) return error.InvalidRowsRequest;
         const cte_ranges = try routedRowsPlanRangesForSetOperationAlloc(alloc, plan.left.ranges, plan.right.ranges);
@@ -4646,6 +6034,636 @@ pub fn effectiveSideTable(default_table_name: []const u8, maybe_table_name: []co
     return if (maybe_table_name.len == 0) default_table_name else maybe_table_name;
 }
 
+fn routedRowsJoinPlanCanUseCountOnly(plan: db_mod.types.RelationalRowsJoinPlan) bool {
+    const join = plan.join;
+    if (join.join_type != .inner and join.join_type != .left and join.join_type != .full) return false;
+    if (join.on.len == 0) return false;
+    if (join.order_by.len != 0 or join.limit != null or join.offset != 0) return false;
+    if (join.select.len != 0) return false;
+    if (!relational_rows_api.rowsQueryCanUseCountOnlyResultForRouting(join.left)) return false;
+    if (!relational_rows_api.rowsQueryCanUseCountOnlyResultForRouting(join.right)) return false;
+    if (plan.ctes.len != 0 and (plan.join.left.source_cte.len == 0 and plan.join.right.source_cte.len == 0)) return false;
+    return true;
+}
+
+fn routedRowsJoinHasOnExpressionPredicates(join: db_mod.types.RelationalRowsJoinRequest) bool {
+    return join.on_expression_predicates.len != 0 or
+        join.on_expression_or_predicates.len != 0 or
+        join.on_expression_not_predicates.len != 0 or
+        join.on_expression_array_contains.len != 0;
+}
+
+fn routedRowsJoinHasMatchPredicates(join: db_mod.types.RelationalRowsJoinRequest) bool {
+    return join.match_expression_predicates.len != 0 or
+        join.match_expression_or_predicates.len != 0 or
+        join.match_expression_not_predicates.len != 0 or
+        join.match_expression_array_contains.len != 0;
+}
+
+fn routedRowsJoinKeyJsonAlloc(
+    alloc: std.mem.Allocator,
+    row: std.json.Value,
+    predicates: []const db_mod.types.RelationalRowsJoinOn,
+    side: db_mod.types.RelationalRowsJoinProjectionSide,
+) !?[]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeByte('[');
+    for (predicates, 0..) |predicate, i| {
+        const field = switch (side) {
+            .left => predicate.left_field,
+            .right => predicate.right_field,
+        };
+        const value = db_relational_rows.jsonValueAtPath(row, field) orelse {
+            out.deinit();
+            return null;
+        };
+        if (value.* == .null) {
+            out.deinit();
+            return null;
+        }
+        if (i != 0) try writer.writeByte(',');
+        try std.json.Stringify.value(value.*, .{}, writer);
+    }
+    try writer.writeByte(']');
+    return try out.toOwnedSlice();
+}
+
+fn routedRowsFreeJoinKeyCounts(alloc: std.mem.Allocator, counts: *std.StringHashMapUnmanaged(u32)) void {
+    var keys = counts.keyIterator();
+    while (keys.next()) |key| alloc.free(@constCast(key.*));
+    counts.deinit(alloc);
+}
+
+const RoutedJoinRightRows = struct {
+    rows: std.ArrayListUnmanaged([]u8) = .empty,
+    matched: std.ArrayListUnmanaged(bool) = .empty,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        for (self.rows.items) |row| alloc.free(row);
+        self.rows.deinit(alloc);
+        self.matched.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+fn routedRowsFreeJoinRightRows(alloc: std.mem.Allocator, rows_by_key: *std.StringArrayHashMapUnmanaged(RoutedJoinRightRows)) void {
+    for (rows_by_key.keys()) |key| alloc.free(key);
+    for (rows_by_key.values()) |*rows| rows.deinit(alloc);
+    rows_by_key.deinit(alloc);
+}
+
+fn routedRowsIncrementJoinKeyCountAlloc(
+    alloc: std.mem.Allocator,
+    counts: *std.StringHashMapUnmanaged(u32),
+    key_value: []const u8,
+) !void {
+    const key = try alloc.dupe(u8, key_value);
+    errdefer alloc.free(key);
+    const gop = try counts.getOrPut(alloc, key);
+    if (gop.found_existing) {
+        alloc.free(key);
+        gop.value_ptr.* = try addRoutedRowsCount(gop.value_ptr.*, 1);
+    } else {
+        gop.key_ptr.* = key;
+        gop.value_ptr.* = 1;
+    }
+}
+
+fn routedRowsAppendJoinRightRowAlloc(
+    alloc: std.mem.Allocator,
+    rows_by_key: *std.StringArrayHashMapUnmanaged(RoutedJoinRightRows),
+    key_value: []const u8,
+    row_json: []const u8,
+) !void {
+    const key = try alloc.dupe(u8, key_value);
+    errdefer alloc.free(key);
+    const gop = try rows_by_key.getOrPut(alloc, key);
+    if (!gop.found_existing) {
+        gop.key_ptr.* = key;
+        gop.value_ptr.* = .{};
+    } else {
+        alloc.free(key);
+    }
+    const row_copy = try alloc.dupe(u8, row_json);
+    errdefer alloc.free(row_copy);
+    try gop.value_ptr.matched.append(alloc, false);
+    errdefer gop.value_ptr.matched.items.len -= 1;
+    try gop.value_ptr.rows.append(alloc, row_copy);
+}
+
+fn routedRowsJoinSideMergedQueryAlloc(
+    alloc: std.mem.Allocator,
+    schema: storage_schema.TableSchema,
+    ctes: []const db_mod.types.RelationalRowsCte,
+    side_query: db_mod.types.RelationalRowsQueryRequest,
+    filters: *RoutedRowsBorrowedFilterLists,
+) !?db_mod.types.RelationalRowsQueryRequest {
+    const plan = db_mod.types.RelationalRowsQueryPlan{
+        .ctes = ctes,
+        .query = side_query,
+    };
+    var query = if (side_query.source_cte.len == 0) side_query else (try routedRowsUnionDistinctMergedCteBranchQueryAlloc(alloc, schema, plan, filters)) orelse return null;
+    query.select = &.{};
+    query.json_extract = &.{};
+    query.array_length = &.{};
+    query.coalesce = &.{};
+    query.field_aliases = &.{};
+    query.expressions = &.{};
+    query.scalar_subqueries = &.{};
+    query.select_all = true;
+    query.limit = 0;
+    query.total_mode = .exact;
+    query.profile = false;
+    return query;
+}
+
+fn routedRowsLateralSideMergedQueryAlloc(
+    alloc: std.mem.Allocator,
+    schema: storage_schema.TableSchema,
+    ctes: []const db_mod.types.RelationalRowsCte,
+    side_query: db_mod.types.RelationalRowsQueryRequest,
+    filters: *RoutedRowsBorrowedFilterLists,
+) !?db_mod.types.RelationalRowsQueryRequest {
+    if (side_query.source_cte.len == 0) return side_query;
+    var query = (try routedRowsUnionDistinctMergedCteBranchQueryAlloc(alloc, schema, .{
+        .ctes = ctes,
+        .query = side_query,
+    }, filters)) orelse return null;
+    query.limit = side_query.limit;
+    query.total_mode = side_query.total_mode;
+    query.profile = false;
+    return query;
+}
+
+fn accumulateRoutedJoinSideCountsFromScanAlloc(
+    alloc: std.mem.Allocator,
+    source: core.TableReadSource,
+    table_name: []const u8,
+    schema: storage_schema.TableSchema,
+    req: db_mod.types.RelationalRowsQueryRequest,
+    join_on: []const db_mod.types.RelationalRowsJoinOn,
+    side: db_mod.types.RelationalRowsJoinProjectionSide,
+    from_key: []const u8,
+    to_key: []const u8,
+    consistency: raft_mod.ReadConsistency,
+    counts: *std.StringHashMapUnmanaged(u32),
+    scanned_rows: *u64,
+    filtered_rows: ?*u64,
+    matched_rows: *u64,
+) !bool {
+    var scan_result = (try source.scan(alloc, table_name, from_key, to_key, .{
+        .include_documents = true,
+        .include_all_fields = true,
+    }, consistency)) orelse return false;
+    defer scan_result.deinit(alloc);
+
+    var lines = std.mem.splitScalar(u8, scan_result.ndjson, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var row = try mergeScanRowFromScanLineAlloc(alloc, line);
+        defer row.deinit(alloc);
+        scanned_rows.* += 1;
+
+        var lookup = (try source.lookup(alloc, table_name, row.key, .{ .include_all_fields = true }, consistency)) orelse return error.TopologyChanged;
+        defer lookup.deinit(alloc);
+        if (row.version != lookup.version) return error.TopologyChanged;
+        if (!std.mem.eql(u8, row.json, lookup.json)) return error.TopologyChanged;
+        if (!try relational_rows_api.rowsQueryJsonMatchesCountOnlyAlloc(alloc, schema, req, lookup.json)) continue;
+        if (filtered_rows) |count| count.* += 1;
+
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, lookup.json, .{}) catch return error.InvalidRowsRequest;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidRowsRequest;
+        const key_json = (try routedRowsJoinKeyJsonAlloc(alloc, parsed.value, join_on, side)) orelse continue;
+        defer alloc.free(key_json);
+        try routedRowsIncrementJoinKeyCountAlloc(alloc, counts, key_json);
+        matched_rows.* += 1;
+    }
+    return true;
+}
+
+fn accumulateRoutedJoinSideCountsAlloc(
+    alloc: std.mem.Allocator,
+    source: core.TableReadSource,
+    table_name: []const u8,
+    schema: storage_schema.TableSchema,
+    req: db_mod.types.RelationalRowsQueryRequest,
+    ranges: []const db_mod.types.RelationalRowsDocKeyRange,
+    join_on: []const db_mod.types.RelationalRowsJoinOn,
+    side: db_mod.types.RelationalRowsJoinProjectionSide,
+    consistency: raft_mod.ReadConsistency,
+    counts: *std.StringHashMapUnmanaged(u32),
+    scanned_rows: *u64,
+    matched_rows: *u64,
+    iterator_seeks: *u64,
+) !bool {
+    var saw_source = false;
+    if (ranges.len == 0) {
+        saw_source = try accumulateRoutedJoinSideCountsFromScanAlloc(alloc, source, table_name, schema, req, join_on, side, "", "", consistency, counts, scanned_rows, null, matched_rows);
+        iterator_seeks.* += 1;
+    } else {
+        for (ranges) |range| {
+            saw_source = (try accumulateRoutedJoinSideCountsFromScanAlloc(alloc, source, table_name, schema, req, join_on, side, range.start, range.end, consistency, counts, scanned_rows, null, matched_rows)) or saw_source;
+        }
+        iterator_seeks.* += @intCast(ranges.len);
+    }
+    return saw_source;
+}
+
+fn accumulateRoutedJoinFilteredSideCountsAlloc(
+    alloc: std.mem.Allocator,
+    source: core.TableReadSource,
+    table_name: []const u8,
+    schema: storage_schema.TableSchema,
+    req: db_mod.types.RelationalRowsQueryRequest,
+    ranges: []const db_mod.types.RelationalRowsDocKeyRange,
+    join_on: []const db_mod.types.RelationalRowsJoinOn,
+    side: db_mod.types.RelationalRowsJoinProjectionSide,
+    consistency: raft_mod.ReadConsistency,
+    counts: *std.StringHashMapUnmanaged(u32),
+    scanned_rows: *u64,
+    filtered_rows: *u64,
+    matched_rows: *u64,
+    iterator_seeks: *u64,
+) !bool {
+    var saw_source = false;
+    if (ranges.len == 0) {
+        saw_source = try accumulateRoutedJoinSideCountsFromScanAlloc(alloc, source, table_name, schema, req, join_on, side, "", "", consistency, counts, scanned_rows, filtered_rows, matched_rows);
+        iterator_seeks.* += 1;
+    } else {
+        for (ranges) |range| {
+            saw_source = (try accumulateRoutedJoinSideCountsFromScanAlloc(alloc, source, table_name, schema, req, join_on, side, range.start, range.end, consistency, counts, scanned_rows, filtered_rows, matched_rows)) or saw_source;
+        }
+        iterator_seeks.* += @intCast(ranges.len);
+    }
+    return saw_source;
+}
+
+fn accumulateRoutedJoinRightRowsFromScanAlloc(
+    alloc: std.mem.Allocator,
+    source: core.TableReadSource,
+    table_name: []const u8,
+    schema: storage_schema.TableSchema,
+    req: db_mod.types.RelationalRowsQueryRequest,
+    join_on: []const db_mod.types.RelationalRowsJoinOn,
+    from_key: []const u8,
+    to_key: []const u8,
+    consistency: raft_mod.ReadConsistency,
+    rows_by_key: *std.StringArrayHashMapUnmanaged(RoutedJoinRightRows),
+    scanned_rows: *u64,
+    filtered_rows: ?*u64,
+    matched_rows: *u64,
+) !bool {
+    var scan_result = (try source.scan(alloc, table_name, from_key, to_key, .{
+        .include_documents = true,
+        .include_all_fields = true,
+    }, consistency)) orelse return false;
+    defer scan_result.deinit(alloc);
+
+    var lines = std.mem.splitScalar(u8, scan_result.ndjson, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var row = try mergeScanRowFromScanLineAlloc(alloc, line);
+        defer row.deinit(alloc);
+        scanned_rows.* += 1;
+
+        var lookup = (try source.lookup(alloc, table_name, row.key, .{ .include_all_fields = true }, consistency)) orelse return error.TopologyChanged;
+        defer lookup.deinit(alloc);
+        if (row.version != lookup.version) return error.TopologyChanged;
+        if (!std.mem.eql(u8, row.json, lookup.json)) return error.TopologyChanged;
+        if (!try relational_rows_api.rowsQueryJsonMatchesCountOnlyAlloc(alloc, schema, req, lookup.json)) continue;
+        if (filtered_rows) |count| count.* += 1;
+
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, lookup.json, .{}) catch return error.InvalidRowsRequest;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidRowsRequest;
+        const key_json = (try routedRowsJoinKeyJsonAlloc(alloc, parsed.value, join_on, .right)) orelse continue;
+        defer alloc.free(key_json);
+        try routedRowsAppendJoinRightRowAlloc(alloc, rows_by_key, key_json, lookup.json);
+        matched_rows.* += 1;
+    }
+    return true;
+}
+
+fn accumulateRoutedJoinRightRowsAlloc(
+    alloc: std.mem.Allocator,
+    source: core.TableReadSource,
+    table_name: []const u8,
+    schema: storage_schema.TableSchema,
+    req: db_mod.types.RelationalRowsQueryRequest,
+    ranges: []const db_mod.types.RelationalRowsDocKeyRange,
+    join_on: []const db_mod.types.RelationalRowsJoinOn,
+    consistency: raft_mod.ReadConsistency,
+    rows_by_key: *std.StringArrayHashMapUnmanaged(RoutedJoinRightRows),
+    scanned_rows: *u64,
+    filtered_rows: ?*u64,
+    matched_rows: *u64,
+    iterator_seeks: *u64,
+) !bool {
+    var saw_source = false;
+    if (ranges.len == 0) {
+        saw_source = try accumulateRoutedJoinRightRowsFromScanAlloc(alloc, source, table_name, schema, req, join_on, "", "", consistency, rows_by_key, scanned_rows, filtered_rows, matched_rows);
+        iterator_seeks.* += 1;
+    } else {
+        for (ranges) |range| {
+            saw_source = (try accumulateRoutedJoinRightRowsFromScanAlloc(alloc, source, table_name, schema, req, join_on, range.start, range.end, consistency, rows_by_key, scanned_rows, filtered_rows, matched_rows)) or saw_source;
+        }
+        iterator_seeks.* += @intCast(ranges.len);
+    }
+    return saw_source;
+}
+
+fn countRoutedJoinResidualMatchesFromLeftScanAlloc(
+    alloc: std.mem.Allocator,
+    source: core.TableReadSource,
+    table_name: []const u8,
+    schema: storage_schema.TableSchema,
+    req: db_mod.types.RelationalRowsQueryRequest,
+    join: db_mod.types.RelationalRowsJoinRequest,
+    left_columns: []const storage_schema.RelationalColumn,
+    right_columns: []const storage_schema.RelationalColumn,
+    from_key: []const u8,
+    to_key: []const u8,
+    consistency: raft_mod.ReadConsistency,
+    right_rows_by_key: *std.StringArrayHashMapUnmanaged(RoutedJoinRightRows),
+    total: *u32,
+    scanned_rows: *u64,
+    matched_rows: *u64,
+    null_extend_unmatched_left: bool,
+    mark_right_on_match: bool,
+) !bool {
+    var scan_result = (try source.scan(alloc, table_name, from_key, to_key, .{
+        .include_documents = true,
+        .include_all_fields = true,
+    }, consistency)) orelse return false;
+    defer scan_result.deinit(alloc);
+
+    var lines = std.mem.splitScalar(u8, scan_result.ndjson, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var row = try mergeScanRowFromScanLineAlloc(alloc, line);
+        defer row.deinit(alloc);
+        scanned_rows.* += 1;
+
+        var lookup = (try source.lookup(alloc, table_name, row.key, .{ .include_all_fields = true }, consistency)) orelse return error.TopologyChanged;
+        defer lookup.deinit(alloc);
+        if (row.version != lookup.version) return error.TopologyChanged;
+        if (!std.mem.eql(u8, row.json, lookup.json)) return error.TopologyChanged;
+        if (!try relational_rows_api.rowsQueryJsonMatchesCountOnlyAlloc(alloc, schema, req, lookup.json)) continue;
+        matched_rows.* += 1;
+
+        var parsed_left = std.json.parseFromSlice(std.json.Value, alloc, lookup.json, .{}) catch return error.InvalidRowsRequest;
+        defer parsed_left.deinit();
+        if (parsed_left.value != .object) return error.InvalidRowsRequest;
+        const key_json = (try routedRowsJoinKeyJsonAlloc(alloc, parsed_left.value, join.on, .left)) orelse {
+            if (null_extend_unmatched_left) total.* = try addRoutedRowsCount(total.*, 1);
+            continue;
+        };
+        defer alloc.free(key_json);
+        const right_rows = right_rows_by_key.getPtr(key_json) orelse {
+            if (null_extend_unmatched_left) total.* = try addRoutedRowsCount(total.*, 1);
+            continue;
+        };
+        var matched_any = false;
+        for (right_rows.rows.items, 0..) |right_row, right_index| {
+            const now_ns = platform_time.realtimeNs();
+            if (!try db_relational_rows.joinOnExpressionPredicatesPass(alloc, parsed_left.value, left_columns, right_row, right_columns, join, now_ns)) continue;
+            if (mark_right_on_match) right_rows.matched.items[right_index] = true;
+            if (!try db_relational_rows.joinMatchPredicatesPass(alloc, parsed_left.value, left_columns, right_row, right_columns, join, now_ns)) continue;
+            matched_any = true;
+            total.* = try addRoutedRowsCount(total.*, 1);
+        }
+        if (!matched_any and null_extend_unmatched_left) total.* = try addRoutedRowsCount(total.*, 1);
+    }
+    return true;
+}
+
+fn countRoutedJoinResidualMatchesFromLeftAlloc(
+    alloc: std.mem.Allocator,
+    source: core.TableReadSource,
+    table_name: []const u8,
+    schema: storage_schema.TableSchema,
+    req: db_mod.types.RelationalRowsQueryRequest,
+    ranges: []const db_mod.types.RelationalRowsDocKeyRange,
+    join: db_mod.types.RelationalRowsJoinRequest,
+    left_columns: []const storage_schema.RelationalColumn,
+    right_columns: []const storage_schema.RelationalColumn,
+    consistency: raft_mod.ReadConsistency,
+    right_rows_by_key: *std.StringArrayHashMapUnmanaged(RoutedJoinRightRows),
+    total: *u32,
+    scanned_rows: *u64,
+    matched_rows: *u64,
+    iterator_seeks: *u64,
+    null_extend_unmatched_left: bool,
+    mark_right_on_match: bool,
+) !bool {
+    var saw_source = false;
+    if (ranges.len == 0) {
+        saw_source = try countRoutedJoinResidualMatchesFromLeftScanAlloc(alloc, source, table_name, schema, req, join, left_columns, right_columns, "", "", consistency, right_rows_by_key, total, scanned_rows, matched_rows, null_extend_unmatched_left, mark_right_on_match);
+        iterator_seeks.* += 1;
+    } else {
+        for (ranges) |range| {
+            saw_source = (try countRoutedJoinResidualMatchesFromLeftScanAlloc(alloc, source, table_name, schema, req, join, left_columns, right_columns, range.start, range.end, consistency, right_rows_by_key, total, scanned_rows, matched_rows, null_extend_unmatched_left, mark_right_on_match)) or saw_source;
+        }
+        iterator_seeks.* += @intCast(ranges.len);
+    }
+    return saw_source;
+}
+
+fn countUnmatchedRoutedJoinRightRows(rows_by_key: std.StringArrayHashMapUnmanaged(RoutedJoinRightRows), right_filtered_rows: u64, right_keyed_rows: u64) !u32 {
+    if (right_filtered_rows < right_keyed_rows) return error.UnsupportedRowsQuery;
+    var total = std.math.cast(u32, right_filtered_rows - right_keyed_rows) orelse return error.UnsupportedRowsQuery;
+    for (rows_by_key.values()) |right_rows| {
+        for (right_rows.matched.items) |matched| {
+            if (!matched) total = try addRoutedRowsCount(total, 1);
+        }
+    }
+    return total;
+}
+
+fn routedJoinInnerCountFromKeyCounts(left_counts: std.StringHashMapUnmanaged(u32), right_counts: std.StringHashMapUnmanaged(u32)) !u32 {
+    var total: u32 = 0;
+    var left_it = left_counts.iterator();
+    while (left_it.next()) |entry| {
+        const right_count = right_counts.get(entry.key_ptr.*) orelse continue;
+        const matches = std.math.mul(u32, entry.value_ptr.*, right_count) catch return error.UnsupportedRowsQuery;
+        total = try addRoutedRowsCount(total, matches);
+    }
+    return total;
+}
+
+fn routedJoinLeftCountFromKeyCounts(left_counts: std.StringHashMapUnmanaged(u32), right_counts: std.StringHashMapUnmanaged(u32), left_filtered_rows: u64) !u32 {
+    var total: u32 = 0;
+    var keyed_left_rows: u64 = 0;
+    var left_it = left_counts.iterator();
+    while (left_it.next()) |entry| {
+        keyed_left_rows += entry.value_ptr.*;
+        const right_count = right_counts.get(entry.key_ptr.*) orelse {
+            total = try addRoutedRowsCount(total, entry.value_ptr.*);
+            continue;
+        };
+        const matches = std.math.mul(u32, entry.value_ptr.*, right_count) catch return error.UnsupportedRowsQuery;
+        total = try addRoutedRowsCount(total, matches);
+    }
+    if (left_filtered_rows < keyed_left_rows) return error.UnsupportedRowsQuery;
+    const null_extended_rows = std.math.cast(u32, left_filtered_rows - keyed_left_rows) orelse return error.UnsupportedRowsQuery;
+    return try addRoutedRowsCount(total, null_extended_rows);
+}
+
+fn routedJoinFullCountFromKeyCounts(left_counts: std.StringHashMapUnmanaged(u32), right_counts: std.StringHashMapUnmanaged(u32), left_filtered_rows: u64, right_filtered_rows: u64) !u32 {
+    var total: u32 = 0;
+    var keyed_left_rows: u64 = 0;
+    var left_it = left_counts.iterator();
+    while (left_it.next()) |entry| {
+        keyed_left_rows += entry.value_ptr.*;
+        const right_count = right_counts.get(entry.key_ptr.*) orelse {
+            total = try addRoutedRowsCount(total, entry.value_ptr.*);
+            continue;
+        };
+        const matches = std.math.mul(u32, entry.value_ptr.*, right_count) catch return error.UnsupportedRowsQuery;
+        total = try addRoutedRowsCount(total, matches);
+    }
+
+    var keyed_right_rows: u64 = 0;
+    var right_it = right_counts.iterator();
+    while (right_it.next()) |entry| {
+        keyed_right_rows += entry.value_ptr.*;
+        if (left_counts.contains(entry.key_ptr.*)) continue;
+        total = try addRoutedRowsCount(total, entry.value_ptr.*);
+    }
+
+    if (left_filtered_rows < keyed_left_rows or right_filtered_rows < keyed_right_rows) return error.UnsupportedRowsQuery;
+    const null_extended_left_rows = std.math.cast(u32, left_filtered_rows - keyed_left_rows) orelse return error.UnsupportedRowsQuery;
+    const null_extended_right_rows = std.math.cast(u32, right_filtered_rows - keyed_right_rows) orelse return error.UnsupportedRowsQuery;
+    total = try addRoutedRowsCount(total, null_extended_left_rows);
+    return try addRoutedRowsCount(total, null_extended_right_rows);
+}
+
+fn rowsJoinCountOnlyPlanFromRoutedScansWithSchemasAlloc(
+    alloc: std.mem.Allocator,
+    source: core.TableReadSource,
+    cte_table_name: []const u8,
+    left_table_name: []const u8,
+    right_table_name: []const u8,
+    cte_base_schema: storage_schema.TableSchema,
+    left_schema: storage_schema.TableSchema,
+    right_schema: storage_schema.TableSchema,
+    plan: db_mod.types.RelationalRowsJoinPlan,
+    consistency: raft_mod.ReadConsistency,
+) !?db_mod.types.RelationalRowsJoinResult {
+    if (!routedRowsJoinPlanCanUseCountOnly(plan)) return null;
+
+    const cte_ranges = if (plan.ctes.len == 0) &.{} else try routedRowsPlanRangesForJoinCtesAlloc(
+        alloc,
+        cte_table_name,
+        left_table_name,
+        right_table_name,
+        plan.join.left,
+        plan.join.right,
+        plan.left_ranges,
+        plan.right_ranges,
+    );
+    defer if (cte_ranges.len > 0) alloc.free(cte_ranges);
+
+    var left_filters = RoutedRowsBorrowedFilterLists{};
+    defer left_filters.deinit(alloc);
+    const left_uses_cte = plan.join.left.source_cte.len != 0;
+    const left_scan_table = if (left_uses_cte) cte_table_name else left_table_name;
+    const left_scan_schema = if (left_uses_cte) cte_base_schema else left_schema;
+    const left_scan_ranges = if (left_uses_cte) cte_ranges else plan.left_ranges;
+    const left_query = (try routedRowsJoinSideMergedQueryAlloc(alloc, left_scan_schema, plan.ctes, plan.join.left, &left_filters)) orelse return null;
+    var right_filters = RoutedRowsBorrowedFilterLists{};
+    defer right_filters.deinit(alloc);
+    const right_uses_cte = plan.join.right.source_cte.len != 0;
+    const right_scan_table = if (right_uses_cte) cte_table_name else right_table_name;
+    const right_scan_schema = if (right_uses_cte) cte_base_schema else right_schema;
+    const right_scan_ranges = if (right_uses_cte) cte_ranges else plan.right_ranges;
+    const right_query = (try routedRowsJoinSideMergedQueryAlloc(alloc, right_scan_schema, plan.ctes, plan.join.right, &right_filters)) orelse return null;
+    const has_residual_predicates = routedRowsJoinHasOnExpressionPredicates(plan.join) or routedRowsJoinHasMatchPredicates(plan.join);
+
+    if (has_residual_predicates) {
+        var right_rows_by_key = std.StringArrayHashMapUnmanaged(RoutedJoinRightRows).empty;
+        defer routedRowsFreeJoinRightRows(alloc, &right_rows_by_key);
+
+        var left_scanned_rows: u64 = 0;
+        var left_matched_rows: u64 = 0;
+        var right_scanned_rows: u64 = 0;
+        var right_filtered_rows: u64 = 0;
+        var right_matched_rows: u64 = 0;
+        var iterator_seeks: u64 = 0;
+        const saw_right = try accumulateRoutedJoinRightRowsAlloc(alloc, source, right_scan_table, right_scan_schema, right_query, right_scan_ranges, plan.join.on, consistency, &right_rows_by_key, &right_scanned_rows, if (plan.join.join_type == .full and !routedRowsJoinHasMatchPredicates(plan.join)) &right_filtered_rows else null, &right_matched_rows, &iterator_seeks);
+        var total: u32 = 0;
+        const null_extend_unmatched = (plan.join.join_type == .left or plan.join.join_type == .full) and !routedRowsJoinHasMatchPredicates(plan.join);
+        const saw_left = try countRoutedJoinResidualMatchesFromLeftAlloc(
+            alloc,
+            source,
+            left_scan_table,
+            left_scan_schema,
+            left_query,
+            left_scan_ranges,
+            plan.join,
+            left_scan_schema.relational_columns,
+            right_scan_schema.relational_columns,
+            consistency,
+            &right_rows_by_key,
+            &total,
+            &left_scanned_rows,
+            &left_matched_rows,
+            &iterator_seeks,
+            null_extend_unmatched,
+            plan.join.join_type == .full and !routedRowsJoinHasMatchPredicates(plan.join),
+        );
+        if (!saw_left or !saw_right) return null;
+        if (plan.join.join_type == .full and !routedRowsJoinHasMatchPredicates(plan.join)) {
+            total = try addRoutedRowsCount(total, try countUnmatchedRoutedJoinRightRows(right_rows_by_key, right_filtered_rows, right_matched_rows));
+        }
+        const left_count_for_strategy = std.math.cast(usize, left_matched_rows) orelse return error.UnsupportedRowsQuery;
+        const right_count_for_strategy = std.math.cast(usize, right_matched_rows) orelse return error.UnsupportedRowsQuery;
+        return .{
+            .rows = &.{},
+            .total_rows = total,
+            .strategy_selection = db_mod.types.relationalRowsSelectJoinStrategy(plan.join, left_count_for_strategy, right_count_for_strategy, false),
+        };
+    }
+
+    var left_counts = std.StringHashMapUnmanaged(u32).empty;
+    defer routedRowsFreeJoinKeyCounts(alloc, &left_counts);
+    var right_counts = std.StringHashMapUnmanaged(u32).empty;
+    defer routedRowsFreeJoinKeyCounts(alloc, &right_counts);
+
+    var left_scanned_rows: u64 = 0;
+    var left_filtered_rows: u64 = 0;
+    var left_matched_rows: u64 = 0;
+    var right_scanned_rows: u64 = 0;
+    var right_filtered_rows: u64 = 0;
+    var right_matched_rows: u64 = 0;
+    var iterator_seeks: u64 = 0;
+    const saw_left = if (plan.join.join_type == .left or plan.join.join_type == .full)
+        try accumulateRoutedJoinFilteredSideCountsAlloc(alloc, source, left_scan_table, left_scan_schema, left_query, left_scan_ranges, plan.join.on, .left, consistency, &left_counts, &left_scanned_rows, &left_filtered_rows, &left_matched_rows, &iterator_seeks)
+    else
+        try accumulateRoutedJoinSideCountsAlloc(alloc, source, left_scan_table, left_scan_schema, left_query, left_scan_ranges, plan.join.on, .left, consistency, &left_counts, &left_scanned_rows, &left_matched_rows, &iterator_seeks);
+    const saw_right = if (plan.join.join_type == .full)
+        try accumulateRoutedJoinFilteredSideCountsAlloc(alloc, source, right_scan_table, right_scan_schema, right_query, right_scan_ranges, plan.join.on, .right, consistency, &right_counts, &right_scanned_rows, &right_filtered_rows, &right_matched_rows, &iterator_seeks)
+    else
+        try accumulateRoutedJoinSideCountsAlloc(alloc, source, right_scan_table, right_scan_schema, right_query, right_scan_ranges, plan.join.on, .right, consistency, &right_counts, &right_scanned_rows, &right_matched_rows, &iterator_seeks);
+    if (!saw_left or !saw_right) return null;
+
+    const total = switch (plan.join.join_type) {
+        .inner => try routedJoinInnerCountFromKeyCounts(left_counts, right_counts),
+        .left => try routedJoinLeftCountFromKeyCounts(left_counts, right_counts, left_filtered_rows),
+        .full => try routedJoinFullCountFromKeyCounts(left_counts, right_counts, left_filtered_rows, right_filtered_rows),
+    };
+    const left_count_for_strategy = std.math.cast(usize, left_matched_rows) orelse return error.UnsupportedRowsQuery;
+    const right_count_for_strategy = std.math.cast(usize, right_matched_rows) orelse return error.UnsupportedRowsQuery;
+    return .{
+        .rows = &.{},
+        .total_rows = total,
+        .strategy_selection = db_mod.types.relationalRowsSelectJoinStrategy(plan.join, left_count_for_strategy, right_count_for_strategy, false),
+    };
+}
+
 pub fn rowsJoinPlanFromRoutedScansWithSchemasAlloc(
     alloc: std.mem.Allocator,
     source: core.TableReadSource,
@@ -4667,6 +6685,9 @@ pub fn rowsJoinPlanFromRoutedScansWithSchemasAlloc(
         return error.UnsupportedRowsQuery;
     }
     try preflightRoutedRowsJoinStrategy(plan);
+    if (try rowsJoinCountOnlyPlanFromRoutedScansWithSchemasAlloc(alloc, source, cte_table_name, left_table_name, right_table_name, cte_base_schema, left_schema, right_schema, plan, consistency)) |result| {
+        return result;
+    }
 
     const empty_rows: []const []const u8 = &.{};
     var cte_rows_storage: ?RoutedRows = null;
@@ -4732,6 +6753,307 @@ fn routedRowsJoinInputHasFilterOrPagination(req: db_mod.types.RelationalRowsQuer
         req.offset != 0;
 }
 
+fn routedRowsLateralPlanCanUseCountOnly(plan: db_mod.types.RelationalRowsLateralPlan) bool {
+    const lateral = plan.lateral;
+    if (lateral.limit == null or lateral.limit.? != 0) return false;
+    if (lateral.offset != 0 or lateral.order_by.len != 0 or lateral.select.len != 0) return false;
+    if (lateral.left.order_by.len != 0 and lateral.left.limit == null and lateral.left.offset != 0) return false;
+    if (plan.ctes.len != 0 and lateral.left.source_cte.len == 0 and lateral.right.source_cte.len == 0) return false;
+    return true;
+}
+
+fn routedRowsLateralRightCountForLeftAlloc(
+    alloc: std.mem.Allocator,
+    source: core.TableReadSource,
+    right_table_name: []const u8,
+    right_schema: storage_schema.TableSchema,
+    right_ranges: []const db_mod.types.RelationalRowsDocKeyRange,
+    ctes: []const db_mod.types.RelationalRowsCte,
+    lateral: db_mod.types.RelationalRowsLateralRequest,
+    left_row: std.json.Value,
+    left_columns: []const storage_schema.RelationalColumn,
+    right_columns: []const storage_schema.RelationalColumn,
+    consistency: raft_mod.ReadConsistency,
+) !?u32 {
+    const correlated_predicates = try lateralCorrelationPredicatesAlloc(alloc, left_row, lateral.correlations);
+    defer freeOwnedRelationalChecks(alloc, correlated_predicates);
+    if (correlated_predicates.len != lateral.correlations.len) {
+        return if (db_relational_rows.lateralHasMatchPredicates(lateral)) 0 else 1;
+    }
+
+    var right_source = db_relational_rows.joinSideSource(lateral.right);
+    const combined_predicates = try combinedBorrowedAndOwnedRelationalChecksAlloc(alloc, lateral.right.predicates, correlated_predicates);
+    defer if (combined_predicates.len > 0) alloc.free(combined_predicates);
+    right_source.predicates = combined_predicates;
+    var right_filters = RoutedRowsBorrowedFilterLists{};
+    defer right_filters.deinit(alloc);
+    right_source = (try routedRowsLateralSideMergedQueryAlloc(alloc, right_schema, ctes, right_source, &right_filters)) orelse return null;
+
+    var right_result = (try source.rowsQueryPlan(alloc, right_table_name, right_schema, .{
+        .ranges = right_ranges,
+        .query = right_source,
+    }, consistency)) orelse return null;
+    defer right_result.deinit(alloc);
+
+    var matched_rows: u32 = 0;
+    for (right_result.rows) |right_row| {
+        if (!try db_relational_rows.lateralMatchPredicatesPassWithColumns(alloc, left_row, left_columns, right_row, right_columns, lateral, platform_time.realtimeNs())) continue;
+        matched_rows = try addRoutedRowsCount(matched_rows, 1);
+    }
+    if (matched_rows == 0 and !db_relational_rows.lateralHasMatchPredicates(lateral)) return 1;
+    return matched_rows;
+}
+
+fn countRoutedLateralFromLeftScanAlloc(
+    alloc: std.mem.Allocator,
+    source: core.TableReadSource,
+    left_table_name: []const u8,
+    right_table_name: []const u8,
+    left_schema: storage_schema.TableSchema,
+    right_schema: storage_schema.TableSchema,
+    left_query: db_mod.types.RelationalRowsQueryRequest,
+    right_ranges: []const db_mod.types.RelationalRowsDocKeyRange,
+    ctes: []const db_mod.types.RelationalRowsCte,
+    lateral: db_mod.types.RelationalRowsLateralRequest,
+    from_key: []const u8,
+    to_key: []const u8,
+    consistency: raft_mod.ReadConsistency,
+    left_offset_remaining: *u32,
+    left_limit_remaining: ?*u32,
+    total: *u32,
+) !bool {
+    var scan_result = (try source.scan(alloc, left_table_name, from_key, to_key, .{
+        .include_documents = true,
+        .include_all_fields = true,
+    }, consistency)) orelse return false;
+    defer scan_result.deinit(alloc);
+
+    var lines = std.mem.splitScalar(u8, scan_result.ndjson, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var row = try mergeScanRowFromScanLineAlloc(alloc, line);
+        defer row.deinit(alloc);
+
+        var lookup = (try source.lookup(alloc, left_table_name, row.key, .{ .include_all_fields = true }, consistency)) orelse return error.TopologyChanged;
+        defer lookup.deinit(alloc);
+        if (row.version != lookup.version) return error.TopologyChanged;
+        if (!std.mem.eql(u8, row.json, lookup.json)) return error.TopologyChanged;
+        if (!try relational_rows_api.rowsQueryJsonMatchesCountOnlyAlloc(alloc, left_schema, left_query, lookup.json)) continue;
+        if (left_offset_remaining.* > 0) {
+            left_offset_remaining.* -= 1;
+            continue;
+        }
+        if (left_limit_remaining) |remaining| {
+            if (remaining.* == 0) return true;
+            remaining.* -= 1;
+        }
+
+        var parsed_left = std.json.parseFromSlice(std.json.Value, alloc, lookup.json, .{}) catch return error.InvalidRowsRequest;
+        defer parsed_left.deinit();
+        if (parsed_left.value != .object) return error.InvalidRowsRequest;
+        const right_count = (try routedRowsLateralRightCountForLeftAlloc(
+            alloc,
+            source,
+            right_table_name,
+            right_schema,
+            right_ranges,
+            ctes,
+            lateral,
+            parsed_left.value,
+            left_schema.relational_columns,
+            right_schema.relational_columns,
+            consistency,
+        )) orelse return false;
+        total.* = try addRoutedRowsCount(total.*, right_count);
+        if (left_limit_remaining) |remaining| {
+            if (remaining.* == 0) return true;
+        }
+    }
+    return true;
+}
+
+fn appendRoutedLateralOrderedLeftRowsFromScanAlloc(
+    alloc: std.mem.Allocator,
+    source: core.TableReadSource,
+    table_name: []const u8,
+    from_key: []const u8,
+    to_key: []const u8,
+    consistency: raft_mod.ReadConsistency,
+    stream: *relational_rows_api.RowsQueryBoundedSortedStream,
+) !bool {
+    var scan_result = (try source.scan(alloc, table_name, from_key, to_key, .{
+        .include_documents = true,
+        .include_all_fields = true,
+    }, consistency)) orelse return false;
+    defer scan_result.deinit(alloc);
+
+    var lines = std.mem.splitScalar(u8, scan_result.ndjson, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var row = try mergeScanRowFromScanLineAlloc(alloc, line);
+        defer row.deinit(alloc);
+
+        var lookup = (try source.lookup(alloc, table_name, row.key, .{ .include_all_fields = true }, consistency)) orelse return error.TopologyChanged;
+        defer lookup.deinit(alloc);
+        if (row.version != lookup.version) return error.TopologyChanged;
+        if (!std.mem.eql(u8, row.json, lookup.json)) return error.TopologyChanged;
+        try stream.appendScannedRowJsonAlloc(alloc, lookup.json);
+    }
+    return true;
+}
+
+fn collectRoutedLateralOrderedLeftRowsAlloc(
+    alloc: std.mem.Allocator,
+    source: core.TableReadSource,
+    table_name: []const u8,
+    schema: storage_schema.TableSchema,
+    req: db_mod.types.RelationalRowsQueryRequest,
+    ranges: []const db_mod.types.RelationalRowsDocKeyRange,
+    consistency: raft_mod.ReadConsistency,
+) !?db_mod.types.RelationalRowsQueryResult {
+    var stream = try relational_rows_api.RowsQueryBoundedSortedStream.init(schema, req);
+    defer stream.deinit(alloc);
+
+    var saw_source = false;
+    if (ranges.len == 0) {
+        stream.recordIteratorSeek();
+        saw_source = try appendRoutedLateralOrderedLeftRowsFromScanAlloc(alloc, source, table_name, "", "", consistency, &stream);
+    } else {
+        for (ranges) |range| {
+            stream.recordIteratorSeek();
+            saw_source = (try appendRoutedLateralOrderedLeftRowsFromScanAlloc(alloc, source, table_name, range.start, range.end, consistency, &stream)) or saw_source;
+        }
+    }
+    if (!saw_source) return null;
+    return try stream.toResult(alloc);
+}
+
+fn countRoutedLateralFromLeftRowsAlloc(
+    alloc: std.mem.Allocator,
+    source: core.TableReadSource,
+    right_table_name: []const u8,
+    right_schema: storage_schema.TableSchema,
+    right_ranges: []const db_mod.types.RelationalRowsDocKeyRange,
+    ctes: []const db_mod.types.RelationalRowsCte,
+    lateral: db_mod.types.RelationalRowsLateralRequest,
+    left_rows: []const []const u8,
+    left_columns: []const storage_schema.RelationalColumn,
+    right_columns: []const storage_schema.RelationalColumn,
+    consistency: raft_mod.ReadConsistency,
+) !?u32 {
+    var total: u32 = 0;
+    for (left_rows) |left_row| {
+        var parsed_left = std.json.parseFromSlice(std.json.Value, alloc, left_row, .{}) catch return error.InvalidRowsRequest;
+        defer parsed_left.deinit();
+        if (parsed_left.value != .object) return error.InvalidRowsRequest;
+        const right_count = (try routedRowsLateralRightCountForLeftAlloc(
+            alloc,
+            source,
+            right_table_name,
+            right_schema,
+            right_ranges,
+            ctes,
+            lateral,
+            parsed_left.value,
+            left_columns,
+            right_columns,
+            consistency,
+        )) orelse return null;
+        total = try addRoutedRowsCount(total, right_count);
+    }
+    return total;
+}
+
+fn rowsLateralCountOnlyPlanFromRoutedScansWithSchemasAlloc(
+    alloc: std.mem.Allocator,
+    source: core.TableReadSource,
+    cte_table_name: []const u8,
+    left_table_name: []const u8,
+    right_table_name: []const u8,
+    cte_base_schema: storage_schema.TableSchema,
+    left_schema: storage_schema.TableSchema,
+    right_schema: storage_schema.TableSchema,
+    plan: db_mod.types.RelationalRowsLateralPlan,
+    consistency: raft_mod.ReadConsistency,
+) !?db_mod.types.RelationalRowsJoinResult {
+    if (!routedRowsLateralPlanCanUseCountOnly(plan)) return null;
+
+    const cte_ranges = if (plan.ctes.len == 0) &.{} else try routedRowsPlanRangesForJoinCtesAlloc(
+        alloc,
+        cte_table_name,
+        left_table_name,
+        right_table_name,
+        plan.lateral.left,
+        plan.lateral.right,
+        plan.left_ranges,
+        plan.right_ranges,
+    );
+    defer if (cte_ranges.len > 0) alloc.free(cte_ranges);
+
+    var left_filters = RoutedRowsBorrowedFilterLists{};
+    defer left_filters.deinit(alloc);
+    const left_uses_cte = plan.lateral.left.source_cte.len != 0;
+    const left_scan_table = if (left_uses_cte) cte_table_name else left_table_name;
+    const left_scan_schema = if (left_uses_cte) cte_base_schema else left_schema;
+    const left_scan_ranges = if (left_uses_cte) cte_ranges else plan.left_ranges;
+    const left_source = db_relational_rows.lateralLeftSource(plan.lateral.left);
+    var left_query = (try routedRowsJoinSideMergedQueryAlloc(alloc, left_scan_schema, plan.ctes, left_source, &left_filters)) orelse return null;
+    const right_uses_cte = plan.lateral.right.source_cte.len != 0;
+    const right_scan_table = if (right_uses_cte) cte_table_name else right_table_name;
+    const right_scan_schema = if (right_uses_cte) cte_base_schema else right_schema;
+    const right_scan_ranges = if (right_uses_cte) cte_ranges else plan.right_ranges;
+    const left_needs_ordered_page = plan.lateral.left.order_by.len != 0 and plan.lateral.left.limit != null;
+    if (left_needs_ordered_page) {
+        if (plan.lateral.left.limit.? == 0) {
+            return .{
+                .rows = &.{},
+                .total_rows = 0,
+            };
+        }
+        left_query.limit = plan.lateral.left.limit;
+        var ordered_left = (try collectRoutedLateralOrderedLeftRowsAlloc(alloc, source, left_scan_table, left_scan_schema, left_query, left_scan_ranges, consistency)) orelse return null;
+        defer ordered_left.deinit(alloc);
+        const total = (try countRoutedLateralFromLeftRowsAlloc(
+            alloc,
+            source,
+            right_scan_table,
+            right_scan_schema,
+            right_scan_ranges,
+            plan.ctes,
+            plan.lateral,
+            ordered_left.rows,
+            left_scan_schema.relational_columns,
+            right_scan_schema.relational_columns,
+            consistency,
+        )) orelse return null;
+        return .{
+            .rows = &.{},
+            .total_rows = total,
+        };
+    }
+
+    var total: u32 = 0;
+    var saw_left = false;
+    var left_offset_remaining = plan.lateral.left.offset;
+    var left_limit_storage = plan.lateral.left.limit orelse std.math.maxInt(u32);
+    const left_limit_remaining: ?*u32 = if (plan.lateral.left.limit != null) &left_limit_storage else null;
+    if (left_scan_ranges.len == 0) {
+        saw_left = try countRoutedLateralFromLeftScanAlloc(alloc, source, left_scan_table, right_scan_table, left_scan_schema, right_scan_schema, left_query, right_scan_ranges, plan.ctes, plan.lateral, "", "", consistency, &left_offset_remaining, left_limit_remaining, &total);
+    } else {
+        for (left_scan_ranges) |range| {
+            saw_left = (try countRoutedLateralFromLeftScanAlloc(alloc, source, left_scan_table, right_scan_table, left_scan_schema, right_scan_schema, left_query, right_scan_ranges, plan.ctes, plan.lateral, range.start, range.end, consistency, &left_offset_remaining, left_limit_remaining, &total)) or saw_left;
+            if (left_limit_remaining) |remaining| {
+                if (remaining.* == 0) break;
+            }
+        }
+    }
+    if (!saw_left) return null;
+    return .{
+        .rows = &.{},
+        .total_rows = total,
+    };
+}
+
 pub fn rowsLateralPlanFromRoutedScansWithSchemasAlloc(
     alloc: std.mem.Allocator,
     source: core.TableReadSource,
@@ -4751,6 +7073,9 @@ pub fn rowsLateralPlanFromRoutedScansWithSchemasAlloc(
         !scanPayloadCanStripSyntheticKey(right_schema))
     {
         return error.UnsupportedRowsQuery;
+    }
+    if (try rowsLateralCountOnlyPlanFromRoutedScansWithSchemasAlloc(alloc, source, cte_table_name, left_table_name, right_table_name, cte_base_schema, left_schema, right_schema, plan, consistency)) |result| {
+        return result;
     }
 
     const empty_rows: []const []const u8 = &.{};
@@ -4952,6 +7277,23 @@ test "routed rows materialization tracker uses shared spill and hard cap policy"
     try std.testing.expectEqualStrings("b", reloaded_collected[1].key);
     try std.testing.expectEqualStrings(rows[1], reloaded_collected[1].json);
     try std.testing.expectEqual(@as(u64, 4), reloaded_collected[1].version);
+
+    var profile_result = db_mod.types.RelationalRowsQueryResult{ .include_profile = true };
+    addRoutedMaterializationProfile(&profile_result, .{
+        .rows = &.{},
+        .materialized_rows = spill_budget.rows,
+        .materialized_bytes = spill_budget.bytes,
+        .spilled = true,
+        .spilled_rows = spill_budget.rows,
+        .spilled_bytes = spill_budget.bytes,
+    });
+    defer profile_result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 1), profile_result.profile.routed_materialization_fallbacks);
+    try std.testing.expectEqual(spill_budget.rows, profile_result.profile.routed_materialized_rows);
+    try std.testing.expectEqual(spill_budget.bytes, profile_result.profile.routed_materialized_bytes);
+    try std.testing.expectEqual(@as(u64, 1), profile_result.profile.routed_spill_count);
+    try std.testing.expectEqual(spill_budget.rows, profile_result.profile.routed_spilled_rows);
+    try std.testing.expectEqual(spill_budget.bytes, profile_result.profile.routed_spilled_bytes);
 }
 
 test "routed paginated rows fail closed when live writes change scanned range membership" {
@@ -5069,14 +7411,26 @@ test "routed paginated rows fail closed when live writes change scanned range me
             .order_by = order_by[0..],
             .limit = 2,
             .offset = 1,
+            .total_mode = .bounded,
+            .profile = true,
         },
     }, .read_index)).?;
     defer result.deinit(alloc);
 
-    try std.testing.expectEqual(@as(u32, 4), result.total);
+    try std.testing.expect(result.include_profile);
+    try std.testing.expect(!result.total_exact);
+    try std.testing.expectEqual(@as(u32, 3), result.total);
     try std.testing.expectEqual(@as(usize, 2), result.rows.len);
     try std.testing.expectEqualStrings("{\"id\":\"b\"}", result.rows[0]);
     try std.testing.expectEqualStrings("{\"id\":\"q\"}", result.rows[1]);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryResult.AccessMethod.base_scan, result.profile.access_method);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryRequest.TotalMode.bounded, result.profile.total_mode);
+    try std.testing.expectEqual(@as(u64, 4), result.profile.base_scan_rows);
+    try std.testing.expectEqual(@as(u64, 4), result.profile.candidate_rows);
+    try std.testing.expectEqual(@as(u64, 4), result.profile.candidate_stream_emitted);
+    try std.testing.expectEqual(@as(u64, 3), result.profile.retained_candidate_rows);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.projected_rows);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.iterator_seeks);
     try std.testing.expectEqual(@as(usize, 4), stable_fake.scan_calls);
     try std.testing.expectEqual(@as(usize, 4), stable_fake.lookup_calls);
 
@@ -5339,14 +7693,157 @@ test "routed rows query plan executes over scanned owner rows with ctes" {
             .select_all = false,
             .order_by = order_by[0..],
             .limit = 1,
+            .total_mode = .bounded,
+            .profile = true,
         },
     }, .read_index)).?;
     defer result.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 4), fake.scan_calls);
-    try std.testing.expectEqual(@as(u32, 2), result.total);
+    try std.testing.expect(result.include_profile);
+    try std.testing.expect(!result.total_exact);
+    try std.testing.expectEqual(@as(u32, 1), result.total);
     try std.testing.expectEqual(@as(usize, 1), result.rows.len);
     try std.testing.expectEqualStrings("{\"id\":\"z\"}", result.rows[0]);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryResult.AccessMethod.base_scan, result.profile.access_method);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryRequest.TotalMode.bounded, result.profile.total_mode);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.base_scan_rows);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.candidate_rows);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.candidate_stream_emitted);
+    try std.testing.expectEqual(@as(u64, 1), result.profile.retained_candidate_rows);
+    try std.testing.expectEqual(@as(u64, 1), result.profile.projected_rows);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.iterator_seeks);
+    try std.testing.expectEqual(@as(usize, 3), fake.lookup_calls);
+
+    const count_only_scan_calls_before = fake.scan_calls;
+    const count_only_lookup_calls_before = fake.lookup_calls;
+    var count_only = (try source.rowsQueryPlan(alloc, "orders", schema, .{
+        .ctes = ctes[0..],
+        .ranges = ranges[0..],
+        .query = .{
+            .source_cte = "open_rows",
+            .limit = 0,
+            .total_mode = .exact,
+            .profile = true,
+        },
+    }, .read_index)).?;
+    defer count_only.deinit(alloc);
+    try std.testing.expect(count_only.include_profile);
+    try std.testing.expect(count_only.total_exact);
+    try std.testing.expectEqual(@as(u32, 2), count_only.total);
+    try std.testing.expectEqual(@as(usize, 0), count_only.rows.len);
+    try std.testing.expect(count_only.profile.count_only);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryRequest.TotalMode.exact, count_only.profile.total_mode);
+    try std.testing.expectEqual(@as(u64, 0), count_only.profile.retained_candidate_rows);
+    try std.testing.expectEqual(@as(u64, 0), count_only.profile.projected_rows);
+    try std.testing.expectEqual(count_only_scan_calls_before + 2, fake.scan_calls);
+    try std.testing.expectEqual(count_only_lookup_calls_before + 3, fake.lookup_calls);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryResult.AccessMethod.base_scan, count_only.profile.access_method);
+    try std.testing.expectEqual(@as(u64, 3), count_only.profile.base_scan_rows);
+    try std.testing.expectEqual(@as(u64, 3), count_only.profile.candidate_rows);
+
+    const expensive_predicates = [_]storage_schema.RelationalCheck{.{
+        .name = "amount_gt_five",
+        .field = "amount",
+        .op = .gt,
+        .value_json = "5",
+    }};
+    const chained_ctes = [_]db_mod.types.RelationalRowsCte{
+        .{
+            .name = "open_rows",
+            .query = .{
+                .predicates = cte_predicates[0..],
+                .select = cte_select[0..],
+                .select_all = false,
+            },
+        },
+        .{
+            .name = "expensive_open_rows",
+            .query = .{
+                .source_cte = "open_rows",
+                .predicates = expensive_predicates[0..],
+                .select = cte_select[0..],
+                .select_all = false,
+            },
+        },
+    };
+    const chained_count_scan_calls_before = fake.scan_calls;
+    const chained_count_lookup_calls_before = fake.lookup_calls;
+    var chained_count_only = (try source.rowsQueryPlan(alloc, "orders", schema, .{
+        .ctes = chained_ctes[0..],
+        .ranges = ranges[0..],
+        .query = .{
+            .source_cte = "expensive_open_rows",
+            .limit = 0,
+            .total_mode = .exact,
+            .profile = true,
+        },
+    }, .read_index)).?;
+    defer chained_count_only.deinit(alloc);
+    try std.testing.expect(chained_count_only.include_profile);
+    try std.testing.expect(chained_count_only.total_exact);
+    try std.testing.expectEqual(@as(u32, 1), chained_count_only.total);
+    try std.testing.expectEqual(@as(usize, 0), chained_count_only.rows.len);
+    try std.testing.expect(chained_count_only.profile.count_only);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryRequest.TotalMode.exact, chained_count_only.profile.total_mode);
+    try std.testing.expectEqual(@as(u64, 0), chained_count_only.profile.retained_candidate_rows);
+    try std.testing.expectEqual(@as(u64, 0), chained_count_only.profile.projected_rows);
+    try std.testing.expectEqual(@as(u64, 0), chained_count_only.profile.routed_materialization_fallbacks);
+    try std.testing.expectEqual(chained_count_scan_calls_before + 2, fake.scan_calls);
+    try std.testing.expectEqual(chained_count_lookup_calls_before + 3, fake.lookup_calls);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryResult.AccessMethod.base_scan, chained_count_only.profile.access_method);
+    try std.testing.expectEqual(@as(u64, 3), chained_count_only.profile.base_scan_rows);
+    try std.testing.expectEqual(@as(u64, 3), chained_count_only.profile.candidate_rows);
+
+    const non_cte_count_scan_calls_before = fake.scan_calls;
+    const non_cte_count_lookup_calls_before = fake.lookup_calls;
+    var non_cte_count_only = (try source.rowsQueryPlan(alloc, "orders", schema, .{
+        .ranges = ranges[0..],
+        .query = .{
+            .predicates = cte_predicates[0..],
+            .limit = 0,
+            .total_mode = .exact,
+            .profile = true,
+        },
+    }, .read_index)).?;
+    defer non_cte_count_only.deinit(alloc);
+    try std.testing.expect(non_cte_count_only.include_profile);
+    try std.testing.expect(non_cte_count_only.total_exact);
+    try std.testing.expectEqual(@as(u32, 2), non_cte_count_only.total);
+    try std.testing.expectEqual(@as(usize, 0), non_cte_count_only.rows.len);
+    try std.testing.expect(non_cte_count_only.profile.count_only);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryRequest.TotalMode.exact, non_cte_count_only.profile.total_mode);
+    try std.testing.expectEqual(@as(u64, 0), non_cte_count_only.profile.retained_candidate_rows);
+    try std.testing.expectEqual(@as(u64, 0), non_cte_count_only.profile.projected_rows);
+    try std.testing.expectEqual(non_cte_count_scan_calls_before + 2, fake.scan_calls);
+    try std.testing.expectEqual(non_cte_count_lookup_calls_before + 3, fake.lookup_calls);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryResult.AccessMethod.base_scan, non_cte_count_only.profile.access_method);
+    try std.testing.expectEqual(@as(u64, 3), non_cte_count_only.profile.base_scan_rows);
+    try std.testing.expectEqual(@as(u64, 3), non_cte_count_only.profile.candidate_rows);
+
+    const generic_fallback_scan_calls_before = fake.scan_calls;
+    const generic_fallback_lookup_calls_before = fake.lookup_calls;
+    const distinct_on = [_][]const u8{"status"};
+    var generic_fallback = (try source.rowsQueryPlan(alloc, "orders", schema, .{
+        .ranges = ranges[0..],
+        .query = .{
+            .distinct_on = distinct_on[0..],
+            .select = &.{"status"},
+            .select_all = false,
+            .profile = true,
+        },
+    }, .read_index)).?;
+    defer generic_fallback.deinit(alloc);
+    try std.testing.expect(generic_fallback.include_profile);
+    try std.testing.expect(generic_fallback.total_exact);
+    try std.testing.expectEqual(@as(u32, 2), generic_fallback.total);
+    try std.testing.expectEqual(@as(usize, 2), generic_fallback.rows.len);
+    try std.testing.expectEqual(@as(u64, 1), generic_fallback.profile.routed_materialization_fallbacks);
+    try std.testing.expectEqual(@as(u64, 3), generic_fallback.profile.routed_materialized_rows);
+    try std.testing.expect(generic_fallback.profile.routed_materialized_bytes > 0);
+    try std.testing.expectEqual(@as(u64, 0), generic_fallback.profile.routed_spill_count);
+    try std.testing.expectEqual(generic_fallback_scan_calls_before + 4, fake.scan_calls);
+    try std.testing.expectEqual(generic_fallback_lookup_calls_before + 3, fake.lookup_calls);
 
     var inserted_during_pagination_fake = FakeRoutedSource{ .lookup_mode = .rescan_inserted_first_range };
     var inserted_during_pagination_source = inserted_during_pagination_fake.source();
@@ -5953,6 +8450,171 @@ test "routed rows query plan executes over scanned owner rows with ctes" {
     try std.testing.expectEqual(@as(u32, 4), join_result.total_rows);
     try std.testing.expectEqualStrings("{\"left_id\":\"a\",\"right_id\":\"a\"}", join_result.rows[0]);
 
+    const count_only_join_scan_calls_before = fake.scan_calls;
+    const count_only_join_lookup_calls_before = fake.lookup_calls;
+    var count_only_join = (try source.rowsJoinPlan(alloc, "orders", schema, .{
+        .ctes = ctes[0..],
+        .join = .{
+            .left = .{ .source_cte = "open_rows", .limit = 0, .total_mode = .exact },
+            .right = .{ .limit = 0, .total_mode = .exact },
+            .on = join_on[0..],
+        },
+    }, .read_index)).?;
+    defer count_only_join.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 4), count_only_join.total_rows);
+    try std.testing.expectEqual(@as(usize, 0), count_only_join.rows.len);
+    try std.testing.expectEqual(count_only_join_scan_calls_before + 2, fake.scan_calls);
+    try std.testing.expectEqual(count_only_join_lookup_calls_before + 6, fake.lookup_calls);
+
+    const join_same_id_rhs = [_]db_mod.types.RelationalRowsExpression{.{
+        .kind = .field,
+        .field = "id",
+        .field_source = .source,
+    }};
+    const join_amount_gt_three_rhs = [_]db_mod.types.RelationalRowsExpression{.{
+        .kind = .value,
+        .value_json = "3",
+    }};
+    const join_residual_predicates = [_]db_mod.types.RelationalRowsExpressionCondition{
+        .{
+            .lhs = .{ .kind = .field, .field = "id", .field_source = .row },
+            .op = .eq,
+            .rhs = join_same_id_rhs[0..],
+        },
+        .{
+            .lhs = .{ .kind = .field, .field = "amount", .field_source = .row },
+            .op = .gt,
+            .rhs = join_amount_gt_three_rhs[0..],
+        },
+    };
+
+    const count_only_join_on_residual_scan_calls_before = fake.scan_calls;
+    const count_only_join_on_residual_lookup_calls_before = fake.lookup_calls;
+    var count_only_join_on_residual = (try source.rowsJoinPlan(alloc, "orders", schema, .{
+        .ctes = ctes[0..],
+        .join = .{
+            .left = .{ .source_cte = "open_rows", .limit = 0, .total_mode = .exact },
+            .right = .{ .limit = 0, .total_mode = .exact },
+            .on = join_on[0..],
+            .on_expression_predicates = join_residual_predicates[0..],
+        },
+    }, .read_index)).?;
+    defer count_only_join_on_residual.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), count_only_join_on_residual.total_rows);
+    try std.testing.expectEqual(@as(usize, 0), count_only_join_on_residual.rows.len);
+    try std.testing.expectEqual(count_only_join_on_residual_scan_calls_before + 2, fake.scan_calls);
+    try std.testing.expectEqual(count_only_join_on_residual_lookup_calls_before + 6, fake.lookup_calls);
+
+    const count_only_join_match_residual_scan_calls_before = fake.scan_calls;
+    const count_only_join_match_residual_lookup_calls_before = fake.lookup_calls;
+    var count_only_join_match_residual = (try source.rowsJoinPlan(alloc, "orders", schema, .{
+        .ctes = ctes[0..],
+        .join = .{
+            .left = .{ .source_cte = "open_rows", .limit = 0, .total_mode = .exact },
+            .right = .{ .limit = 0, .total_mode = .exact },
+            .on = join_on[0..],
+            .match_expression_predicates = join_residual_predicates[0..],
+        },
+    }, .read_index)).?;
+    defer count_only_join_match_residual.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), count_only_join_match_residual.total_rows);
+    try std.testing.expectEqual(@as(usize, 0), count_only_join_match_residual.rows.len);
+    try std.testing.expectEqual(count_only_join_match_residual_scan_calls_before + 2, fake.scan_calls);
+    try std.testing.expectEqual(count_only_join_match_residual_lookup_calls_before + 6, fake.lookup_calls);
+
+    const closed_right_predicates = [_]storage_schema.RelationalCheck{.{
+        .name = "status_closed",
+        .field = "status",
+        .value_json = "\"closed\"",
+    }};
+    const count_only_left_join_scan_calls_before = fake.scan_calls;
+    const count_only_left_join_lookup_calls_before = fake.lookup_calls;
+    var count_only_left_join = (try source.rowsJoinPlan(alloc, "orders", schema, .{
+        .ctes = ctes[0..],
+        .join = .{
+            .left = .{ .source_cte = "open_rows", .limit = 0, .total_mode = .exact },
+            .right = .{ .predicates = closed_right_predicates[0..], .limit = 0, .total_mode = .exact },
+            .on = join_on[0..],
+            .join_type = .left,
+        },
+    }, .read_index)).?;
+    defer count_only_left_join.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), count_only_left_join.total_rows);
+    try std.testing.expectEqual(@as(usize, 0), count_only_left_join.rows.len);
+    try std.testing.expectEqual(count_only_left_join_scan_calls_before + 2, fake.scan_calls);
+    try std.testing.expectEqual(count_only_left_join_lookup_calls_before + 6, fake.lookup_calls);
+
+    const count_only_full_join_scan_calls_before = fake.scan_calls;
+    const count_only_full_join_lookup_calls_before = fake.lookup_calls;
+    var count_only_full_join = (try source.rowsJoinPlan(alloc, "orders", schema, .{
+        .ctes = ctes[0..],
+        .join = .{
+            .left = .{ .source_cte = "open_rows", .limit = 0, .total_mode = .exact },
+            .right = .{ .predicates = closed_right_predicates[0..], .limit = 0, .total_mode = .exact },
+            .on = join_on[0..],
+            .join_type = .full,
+        },
+    }, .read_index)).?;
+    defer count_only_full_join.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 3), count_only_full_join.total_rows);
+    try std.testing.expectEqual(@as(usize, 0), count_only_full_join.rows.len);
+    try std.testing.expectEqual(count_only_full_join_scan_calls_before + 2, fake.scan_calls);
+    try std.testing.expectEqual(count_only_full_join_lookup_calls_before + 6, fake.lookup_calls);
+
+    const count_only_full_join_on_residual_scan_calls_before = fake.scan_calls;
+    const count_only_full_join_on_residual_lookup_calls_before = fake.lookup_calls;
+    var count_only_full_join_on_residual = (try source.rowsJoinPlan(alloc, "orders", schema, .{
+        .ctes = ctes[0..],
+        .join = .{
+            .left = .{ .source_cte = "open_rows", .limit = 0, .total_mode = .exact },
+            .right = .{ .limit = 0, .total_mode = .exact },
+            .on = join_on[0..],
+            .join_type = .full,
+            .on_expression_predicates = join_residual_predicates[0..],
+        },
+    }, .read_index)).?;
+    defer count_only_full_join_on_residual.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 4), count_only_full_join_on_residual.total_rows);
+    try std.testing.expectEqual(@as(usize, 0), count_only_full_join_on_residual.rows.len);
+    try std.testing.expectEqual(count_only_full_join_on_residual_scan_calls_before + 2, fake.scan_calls);
+    try std.testing.expectEqual(count_only_full_join_on_residual_lookup_calls_before + 6, fake.lookup_calls);
+
+    const count_only_left_join_residual_scan_calls_before = fake.scan_calls;
+    const count_only_left_join_residual_lookup_calls_before = fake.lookup_calls;
+    var count_only_left_join_residual = (try source.rowsJoinPlan(alloc, "orders", schema, .{
+        .ctes = ctes[0..],
+        .join = .{
+            .left = .{ .source_cte = "open_rows", .limit = 0, .total_mode = .exact },
+            .right = .{ .limit = 0, .total_mode = .exact },
+            .on = join_on[0..],
+            .join_type = .left,
+            .match_expression_predicates = join_residual_predicates[0..],
+        },
+    }, .read_index)).?;
+    defer count_only_left_join_residual.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), count_only_left_join_residual.total_rows);
+    try std.testing.expectEqual(@as(usize, 0), count_only_left_join_residual.rows.len);
+    try std.testing.expectEqual(count_only_left_join_residual_scan_calls_before + 2, fake.scan_calls);
+    try std.testing.expectEqual(count_only_left_join_residual_lookup_calls_before + 6, fake.lookup_calls);
+
+    const count_only_full_join_match_residual_scan_calls_before = fake.scan_calls;
+    const count_only_full_join_match_residual_lookup_calls_before = fake.lookup_calls;
+    var count_only_full_join_match_residual = (try source.rowsJoinPlan(alloc, "orders", schema, .{
+        .ctes = ctes[0..],
+        .join = .{
+            .left = .{ .source_cte = "open_rows", .limit = 0, .total_mode = .exact },
+            .right = .{ .limit = 0, .total_mode = .exact },
+            .on = join_on[0..],
+            .join_type = .full,
+            .match_expression_predicates = join_residual_predicates[0..],
+        },
+    }, .read_index)).?;
+    defer count_only_full_join_match_residual.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), count_only_full_join_match_residual.total_rows);
+    try std.testing.expectEqual(@as(usize, 0), count_only_full_join_match_residual.rows.len);
+    try std.testing.expectEqual(count_only_full_join_match_residual_scan_calls_before + 2, fake.scan_calls);
+    try std.testing.expectEqual(count_only_full_join_match_residual_lookup_calls_before + 6, fake.lookup_calls);
+
     const lateral_select = [_]db_mod.types.RelationalRowsJoinProjection{
         .{ .output = "left_id", .side = .left, .field = "id" },
         .{ .output = "latest_id", .side = .right, .field = "id" },
@@ -5972,6 +8634,129 @@ test "routed rows query plan executes over scanned owner rows with ctes" {
     try std.testing.expectEqual(@as(u32, 2), lateral_result.total_rows);
     try std.testing.expectEqualStrings("{\"left_id\":\"a\",\"latest_id\":\"z\",\"latest_amount\":7}", lateral_result.rows[0]);
     try std.testing.expectEqualStrings("{\"left_id\":\"z\",\"latest_id\":\"z\",\"latest_amount\":7}", lateral_result.rows[1]);
+
+    var count_only_lateral = (try source.rowsLateralPlan(alloc, "orders", schema, .{
+        .ctes = ctes[0..],
+        .lateral = .{
+            .left = .{ .source_cte = "open_rows" },
+            .right = .{ .order_by = &.{.{ .field = "amount", .direction = .desc }}, .limit = 1 },
+            .correlations = lateral_correlations[0..],
+            .limit = 0,
+        },
+    }, .read_index)).?;
+    defer count_only_lateral.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), count_only_lateral.total_rows);
+    try std.testing.expectEqual(@as(usize, 0), count_only_lateral.rows.len);
+
+    var count_only_lateral_match_residual = (try source.rowsLateralPlan(alloc, "orders", schema, .{
+        .ctes = ctes[0..],
+        .lateral = .{
+            .left = .{ .source_cte = "open_rows" },
+            .right = .{ .order_by = &.{.{ .field = "amount", .direction = .desc }}, .limit = 1 },
+            .correlations = lateral_correlations[0..],
+            .match_expression_predicates = join_residual_predicates[0..],
+            .limit = 0,
+        },
+    }, .read_index)).?;
+    defer count_only_lateral_match_residual.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), count_only_lateral_match_residual.total_rows);
+    try std.testing.expectEqual(@as(usize, 0), count_only_lateral_match_residual.rows.len);
+
+    var count_only_lateral_ordered_left = (try source.rowsLateralPlan(alloc, "orders", schema, .{
+        .ctes = ctes[0..],
+        .lateral = .{
+            .left = .{ .source_cte = "open_rows", .order_by = &.{.{ .field = "amount", .direction = .desc }} },
+            .right = .{ .order_by = &.{.{ .field = "amount", .direction = .desc }}, .limit = 1 },
+            .correlations = lateral_correlations[0..],
+            .limit = 0,
+        },
+    }, .read_index)).?;
+    defer count_only_lateral_ordered_left.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), count_only_lateral_ordered_left.total_rows);
+    try std.testing.expectEqual(@as(usize, 0), count_only_lateral_ordered_left.rows.len);
+
+    var count_only_lateral_ordered_left_limit_desc = (try source.rowsLateralPlan(alloc, "orders", schema, .{
+        .ctes = ctes[0..],
+        .lateral = .{
+            .left = .{ .source_cte = "open_rows", .order_by = &.{.{ .field = "amount", .direction = .desc }}, .limit = 1 },
+            .right = .{ .order_by = &.{.{ .field = "amount", .direction = .desc }}, .limit = 1 },
+            .correlations = lateral_correlations[0..],
+            .match_expression_predicates = join_residual_predicates[0..],
+            .limit = 0,
+        },
+    }, .read_index)).?;
+    defer count_only_lateral_ordered_left_limit_desc.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), count_only_lateral_ordered_left_limit_desc.total_rows);
+    try std.testing.expectEqual(@as(usize, 0), count_only_lateral_ordered_left_limit_desc.rows.len);
+
+    var count_only_lateral_ordered_left_limit_asc = (try source.rowsLateralPlan(alloc, "orders", schema, .{
+        .ctes = ctes[0..],
+        .lateral = .{
+            .left = .{ .source_cte = "open_rows", .order_by = &.{.{ .field = "amount", .direction = .asc }}, .limit = 1 },
+            .right = .{ .order_by = &.{.{ .field = "amount", .direction = .desc }}, .limit = 1 },
+            .correlations = lateral_correlations[0..],
+            .match_expression_predicates = join_residual_predicates[0..],
+            .limit = 0,
+        },
+    }, .read_index)).?;
+    defer count_only_lateral_ordered_left_limit_asc.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 0), count_only_lateral_ordered_left_limit_asc.total_rows);
+    try std.testing.expectEqual(@as(usize, 0), count_only_lateral_ordered_left_limit_asc.rows.len);
+
+    var count_only_lateral_left_limit_match_residual = (try source.rowsLateralPlan(alloc, "orders", schema, .{
+        .ctes = ctes[0..],
+        .lateral = .{
+            .left = .{ .source_cte = "open_rows", .limit = 1 },
+            .right = .{ .order_by = &.{.{ .field = "amount", .direction = .desc }}, .limit = 1 },
+            .correlations = lateral_correlations[0..],
+            .match_expression_predicates = join_residual_predicates[0..],
+            .limit = 0,
+        },
+    }, .read_index)).?;
+    defer count_only_lateral_left_limit_match_residual.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 0), count_only_lateral_left_limit_match_residual.total_rows);
+    try std.testing.expectEqual(@as(usize, 0), count_only_lateral_left_limit_match_residual.rows.len);
+
+    var count_only_lateral_left_offset_match_residual = (try source.rowsLateralPlan(alloc, "orders", schema, .{
+        .ctes = ctes[0..],
+        .lateral = .{
+            .left = .{ .source_cte = "open_rows", .offset = 1, .limit = 1 },
+            .right = .{ .order_by = &.{.{ .field = "amount", .direction = .desc }}, .limit = 1 },
+            .correlations = lateral_correlations[0..],
+            .match_expression_predicates = join_residual_predicates[0..],
+            .limit = 0,
+        },
+    }, .read_index)).?;
+    defer count_only_lateral_left_offset_match_residual.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), count_only_lateral_left_offset_match_residual.total_rows);
+    try std.testing.expectEqual(@as(usize, 0), count_only_lateral_left_offset_match_residual.rows.len);
+
+    var count_only_lateral_right_cte = (try source.rowsLateralPlan(alloc, "orders", schema, .{
+        .ctes = ctes[0..],
+        .lateral = .{
+            .left = .{},
+            .right = .{ .source_cte = "open_rows", .order_by = &.{.{ .field = "amount", .direction = .desc }}, .limit = 1 },
+            .correlations = lateral_correlations[0..],
+            .limit = 0,
+        },
+    }, .read_index)).?;
+    defer count_only_lateral_right_cte.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 3), count_only_lateral_right_cte.total_rows);
+    try std.testing.expectEqual(@as(usize, 0), count_only_lateral_right_cte.rows.len);
+
+    var count_only_lateral_right_cte_match_residual = (try source.rowsLateralPlan(alloc, "orders", schema, .{
+        .ctes = ctes[0..],
+        .lateral = .{
+            .left = .{},
+            .right = .{ .source_cte = "open_rows", .order_by = &.{.{ .field = "amount", .direction = .desc }}, .limit = 1 },
+            .correlations = lateral_correlations[0..],
+            .match_expression_predicates = join_residual_predicates[0..],
+            .limit = 0,
+        },
+    }, .read_index)).?;
+    defer count_only_lateral_right_cte_match_residual.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), count_only_lateral_right_cte_match_residual.total_rows);
+    try std.testing.expectEqual(@as(usize, 0), count_only_lateral_right_cte_match_residual.rows.len);
 
     var customer_columns = [_]storage_schema.RelationalColumn{
         .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
@@ -6209,7 +8994,7 @@ test "lowered sql cross-table read plans execute through routed scans" {
 
     var catalog = FakeCatalog{};
     var fake = FakeRoutedSource{};
-    var lowered = try sql_adapter.lower_select.lowerReadPlanWithCatalogAlloc(
+    var lowered = try sql_adapter.lowerReadPlanWithCatalogAlloc(
         alloc,
         "SELECT o.id AS order_id, c.name AS customer_name FROM orders AS o LEFT JOIN customers AS c ON o.status = c.status ORDER BY order_id ASC",
         orders_schema,
@@ -6282,6 +9067,7 @@ test "lowered sql set operation plans preserve overlapping union all rows" {
         const LookupMode = enum { stable, changed, version_changed };
 
         scan_calls: usize = 0,
+        lookup_calls: usize = 0,
         lookup_mode: LookupMode = .stable,
 
         fn source(self: *@This()) TableReadSource {
@@ -6307,6 +9093,7 @@ test "lowered sql set operation plans preserve overlapping union all rows" {
         ) !?LookupResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (!std.mem.eql(u8, table_name, "usage_records")) return error.TableNotFound;
+            self.lookup_calls += 1;
             const json = if (std.mem.eql(u8, key, "u1"))
                 "{\"id\":\"u1\",\"status\":\"open\",\"enabled\":true}"
             else if (std.mem.eql(u8, key, "u2"))
@@ -6397,7 +9184,7 @@ test "lowered sql set operation plans preserve overlapping union all rows" {
         }
     };
 
-    var lowered = try sql_adapter.lower_select.lowerReadPlanAlloc(
+    var lowered = try sql_adapter.lowerReadPlanAlloc(
         alloc,
         "SELECT id FROM usage_records WHERE status = 'open' UNION ALL SELECT id FROM usage_records WHERE enabled IS TRUE",
         schema,
@@ -6461,7 +9248,7 @@ test "lowered sql set operation plans preserve overlapping union all rows" {
         .read_index,
     ));
 
-    var lowered_distinct = try sql_adapter.lower_select.lowerReadPlanAlloc(
+    var lowered_distinct = try sql_adapter.lowerReadPlanAlloc(
         alloc,
         "SELECT id FROM usage_records WHERE status = 'open' UNION SELECT id FROM usage_records WHERE enabled IS TRUE",
         schema,
@@ -6501,7 +9288,56 @@ test "lowered sql set operation plans preserve overlapping union all rows" {
         else => return error.TestUnexpectedResult,
     }
 
-    var lowered_intersect = try sql_adapter.lower_select.lowerReadPlanAlloc(
+    const open_predicates = [_]storage_schema.RelationalCheck{.{
+        .name = "status_open",
+        .field = "status",
+        .value_json = "\"open\"",
+    }};
+    const enabled_predicates = [_]storage_schema.RelationalCheck{.{
+        .name = "enabled_true",
+        .field = "enabled",
+        .value_json = "true",
+    }};
+    const projected_id = [_][]const u8{"id"};
+    var fake_distinct_count = FakeSource{};
+    var distinct_count = (try rowsSetOperationPlanFromRoutedScansAlloc(alloc, fake_distinct_count.source(), "usage_records", schema, .{
+        .operation = .union_distinct,
+        .left = .{ .query = .{
+            .predicates = open_predicates[0..],
+            .select = projected_id[0..],
+            .select_all = false,
+            .limit = 0,
+            .total_mode = .exact,
+            .profile = true,
+        } },
+        .right = .{ .query = .{
+            .predicates = enabled_predicates[0..],
+            .select = projected_id[0..],
+            .select_all = false,
+            .limit = 0,
+            .total_mode = .exact,
+            .profile = true,
+        } },
+    }, .read_index)).?;
+    defer distinct_count.deinit(alloc);
+    try std.testing.expect(distinct_count.include_profile);
+    try std.testing.expect(distinct_count.total_exact);
+    try std.testing.expectEqual(@as(u32, 3), distinct_count.total);
+    try std.testing.expectEqual(@as(usize, 0), distinct_count.rows.len);
+    try std.testing.expect(distinct_count.profile.count_only);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryRequest.TotalMode.exact, distinct_count.profile.total_mode);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryResult.AccessMethod.base_scan, distinct_count.profile.access_method);
+    try std.testing.expectEqual(@as(u64, 6), distinct_count.profile.base_scan_rows);
+    try std.testing.expectEqual(@as(u64, 6), distinct_count.profile.candidate_rows);
+    try std.testing.expectEqual(@as(u64, 6), distinct_count.profile.hydrated_rows);
+    try std.testing.expectEqual(@as(u64, 4), distinct_count.profile.projected_rows);
+    try std.testing.expectEqual(@as(u64, 2), distinct_count.profile.iterator_seeks);
+    try std.testing.expectEqual(@as(u64, 0), distinct_count.profile.retained_candidate_rows);
+    try std.testing.expectEqual(@as(u64, 0), distinct_count.profile.routed_materialization_fallbacks);
+    try std.testing.expectEqual(@as(usize, 2), fake_distinct_count.scan_calls);
+    try std.testing.expectEqual(@as(usize, 6), fake_distinct_count.lookup_calls);
+
+    var lowered_intersect = try sql_adapter.lowerReadPlanAlloc(
         alloc,
         "SELECT id FROM usage_records WHERE status = 'open' INTERSECT SELECT id FROM usage_records WHERE enabled IS TRUE",
         schema,
@@ -6539,7 +9375,83 @@ test "lowered sql set operation plans preserve overlapping union all rows" {
         else => return error.TestUnexpectedResult,
     }
 
-    var lowered_tail = try sql_adapter.lower_select.lowerReadPlanAlloc(
+    var fake_intersect_count = FakeSource{};
+    var intersect_count = (try rowsSetOperationPlanFromRoutedScansAlloc(alloc, fake_intersect_count.source(), "usage_records", schema, .{
+        .operation = .intersect,
+        .left = .{ .query = .{
+            .predicates = open_predicates[0..],
+            .select = projected_id[0..],
+            .select_all = false,
+            .limit = 0,
+            .total_mode = .exact,
+            .profile = true,
+        } },
+        .right = .{ .query = .{
+            .predicates = enabled_predicates[0..],
+            .select = projected_id[0..],
+            .select_all = false,
+            .limit = 0,
+            .total_mode = .exact,
+            .profile = true,
+        } },
+    }, .read_index)).?;
+    defer intersect_count.deinit(alloc);
+    try std.testing.expect(intersect_count.include_profile);
+    try std.testing.expect(intersect_count.total_exact);
+    try std.testing.expectEqual(@as(u32, 1), intersect_count.total);
+    try std.testing.expectEqual(@as(usize, 0), intersect_count.rows.len);
+    try std.testing.expect(intersect_count.profile.count_only);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryRequest.TotalMode.exact, intersect_count.profile.total_mode);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryResult.AccessMethod.base_scan, intersect_count.profile.access_method);
+    try std.testing.expectEqual(@as(u64, 6), intersect_count.profile.base_scan_rows);
+    try std.testing.expectEqual(@as(u64, 6), intersect_count.profile.candidate_rows);
+    try std.testing.expectEqual(@as(u64, 6), intersect_count.profile.hydrated_rows);
+    try std.testing.expectEqual(@as(u64, 4), intersect_count.profile.projected_rows);
+    try std.testing.expectEqual(@as(u64, 2), intersect_count.profile.iterator_seeks);
+    try std.testing.expectEqual(@as(u64, 0), intersect_count.profile.retained_candidate_rows);
+    try std.testing.expectEqual(@as(u64, 0), intersect_count.profile.routed_materialization_fallbacks);
+    try std.testing.expectEqual(@as(usize, 2), fake_intersect_count.scan_calls);
+    try std.testing.expectEqual(@as(usize, 6), fake_intersect_count.lookup_calls);
+
+    var fake_except_count = FakeSource{};
+    var except_count = (try rowsSetOperationPlanFromRoutedScansAlloc(alloc, fake_except_count.source(), "usage_records", schema, .{
+        .operation = .except,
+        .left = .{ .query = .{
+            .predicates = open_predicates[0..],
+            .select = projected_id[0..],
+            .select_all = false,
+            .limit = 0,
+            .total_mode = .exact,
+            .profile = true,
+        } },
+        .right = .{ .query = .{
+            .predicates = enabled_predicates[0..],
+            .select = projected_id[0..],
+            .select_all = false,
+            .limit = 0,
+            .total_mode = .exact,
+            .profile = true,
+        } },
+    }, .read_index)).?;
+    defer except_count.deinit(alloc);
+    try std.testing.expect(except_count.include_profile);
+    try std.testing.expect(except_count.total_exact);
+    try std.testing.expectEqual(@as(u32, 1), except_count.total);
+    try std.testing.expectEqual(@as(usize, 0), except_count.rows.len);
+    try std.testing.expect(except_count.profile.count_only);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryRequest.TotalMode.exact, except_count.profile.total_mode);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryResult.AccessMethod.base_scan, except_count.profile.access_method);
+    try std.testing.expectEqual(@as(u64, 6), except_count.profile.base_scan_rows);
+    try std.testing.expectEqual(@as(u64, 6), except_count.profile.candidate_rows);
+    try std.testing.expectEqual(@as(u64, 6), except_count.profile.hydrated_rows);
+    try std.testing.expectEqual(@as(u64, 4), except_count.profile.projected_rows);
+    try std.testing.expectEqual(@as(u64, 2), except_count.profile.iterator_seeks);
+    try std.testing.expectEqual(@as(u64, 0), except_count.profile.retained_candidate_rows);
+    try std.testing.expectEqual(@as(u64, 0), except_count.profile.routed_materialization_fallbacks);
+    try std.testing.expectEqual(@as(usize, 2), fake_except_count.scan_calls);
+    try std.testing.expectEqual(@as(usize, 6), fake_except_count.lookup_calls);
+
+    var lowered_tail = try sql_adapter.lowerReadPlanAlloc(
         alloc,
         "SELECT id FROM usage_records WHERE status = 'open' UNION ALL SELECT id FROM usage_records WHERE enabled IS TRUE ORDER BY id DESC LIMIT 2 OFFSET 1",
         schema,
@@ -6574,7 +9486,7 @@ test "lowered sql set operation plans preserve overlapping union all rows" {
         else => return error.TestUnexpectedResult,
     }
 
-    var lowered_cte = try sql_adapter.lower_select.lowerReadPlanAlloc(
+    var lowered_cte = try sql_adapter.lowerReadPlanAlloc(
         alloc,
         "WITH open_rows AS (SELECT id, status, enabled FROM usage_records WHERE status = 'open') SELECT id FROM open_rows UNION ALL SELECT id FROM open_rows ORDER BY id DESC LIMIT 3",
         schema,
@@ -6616,15 +9528,10 @@ test "lowered sql set operation plans preserve overlapping union all rows" {
     }
 
     const cte_select = [_][]const u8{ "id", "status", "enabled" };
-    const cte_predicates = [_]storage_schema.RelationalCheck{.{
-        .name = "enabled_true",
-        .field = "enabled",
-        .value_json = "true",
-    }};
     const ranged_ctes = [_]db_mod.types.RelationalRowsCte{.{
         .name = "enabled_rows",
         .query = .{
-            .predicates = cte_predicates[0..],
+            .predicates = enabled_predicates[0..],
             .select = cte_select[0..],
             .select_all = false,
         },
@@ -6672,6 +9579,173 @@ test "lowered sql set operation plans preserve overlapping union all rows" {
     try std.testing.expectEqualStrings("{\"id\":\"u3\"}", ranged_cte_result.rows[0]);
     try std.testing.expectEqualStrings("{\"id\":\"u3\"}", ranged_cte_result.rows[1]);
     try std.testing.expectEqualStrings("{\"id\":\"u1\"}", ranged_cte_result.rows[2]);
+
+    const count_only_scan_calls_before = fake_ranged_cte.scan_calls;
+    const count_only_lookup_calls_before = fake_ranged_cte.lookup_calls;
+    var ranged_cte_count_only = (try rowsSetOperationPlanFromRoutedScansAlloc(alloc, fake_ranged_cte.source(), "usage_records", schema, .{
+        .operation = .union_all,
+        .ctes = ranged_ctes[0..],
+        .left = .{
+            .ranges = left_cte_ranges[0..],
+            .query = .{
+                .source_cte = "enabled_rows",
+                .limit = 0,
+                .total_mode = .exact,
+                .profile = true,
+            },
+        },
+        .right = .{
+            .ranges = right_cte_ranges[0..],
+            .query = .{
+                .source_cte = "enabled_rows",
+                .limit = 0,
+                .total_mode = .exact,
+                .profile = true,
+            },
+        },
+    }, .read_index)).?;
+    defer ranged_cte_count_only.deinit(alloc);
+    try std.testing.expect(ranged_cte_count_only.include_profile);
+    try std.testing.expect(ranged_cte_count_only.total_exact);
+    try std.testing.expectEqual(@as(u32, 2), ranged_cte_count_only.total);
+    try std.testing.expectEqual(@as(usize, 0), ranged_cte_count_only.rows.len);
+    try std.testing.expect(ranged_cte_count_only.profile.count_only);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryRequest.TotalMode.exact, ranged_cte_count_only.profile.total_mode);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryResult.AccessMethod.base_scan, ranged_cte_count_only.profile.access_method);
+    try std.testing.expectEqual(@as(u64, 2), ranged_cte_count_only.profile.base_scan_rows);
+    try std.testing.expectEqual(@as(u64, 2), ranged_cte_count_only.profile.candidate_rows);
+    try std.testing.expectEqual(@as(u64, 2), ranged_cte_count_only.profile.iterator_seeks);
+    try std.testing.expectEqual(@as(u64, 0), ranged_cte_count_only.profile.retained_candidate_rows);
+    try std.testing.expectEqual(@as(u64, 0), ranged_cte_count_only.profile.projected_rows);
+    try std.testing.expectEqual(@as(u64, 0), ranged_cte_count_only.profile.routed_materialization_fallbacks);
+    try std.testing.expectEqual(count_only_scan_calls_before + 2, fake_ranged_cte.scan_calls);
+    try std.testing.expectEqual(count_only_lookup_calls_before + 2, fake_ranged_cte.lookup_calls);
+
+    const distinct_cte_scan_calls_before = fake_ranged_cte.scan_calls;
+    const distinct_cte_lookup_calls_before = fake_ranged_cte.lookup_calls;
+    var distinct_cte_count_only = (try rowsSetOperationPlanFromRoutedScansAlloc(alloc, fake_ranged_cte.source(), "usage_records", schema, .{
+        .operation = .union_distinct,
+        .ctes = ranged_ctes[0..],
+        .left = .{ .query = .{
+            .source_cte = "enabled_rows",
+            .select = id_select[0..],
+            .select_all = false,
+            .limit = 0,
+            .total_mode = .exact,
+            .profile = true,
+        } },
+        .right = .{ .query = .{
+            .source_cte = "enabled_rows",
+            .select = id_select[0..],
+            .select_all = false,
+            .limit = 0,
+            .total_mode = .exact,
+            .profile = true,
+        } },
+    }, .read_index)).?;
+    defer distinct_cte_count_only.deinit(alloc);
+    try std.testing.expect(distinct_cte_count_only.include_profile);
+    try std.testing.expect(distinct_cte_count_only.total_exact);
+    try std.testing.expectEqual(@as(u32, 2), distinct_cte_count_only.total);
+    try std.testing.expectEqual(@as(usize, 0), distinct_cte_count_only.rows.len);
+    try std.testing.expect(distinct_cte_count_only.profile.count_only);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryRequest.TotalMode.exact, distinct_cte_count_only.profile.total_mode);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryResult.AccessMethod.base_scan, distinct_cte_count_only.profile.access_method);
+    try std.testing.expectEqual(@as(u64, 6), distinct_cte_count_only.profile.base_scan_rows);
+    try std.testing.expectEqual(@as(u64, 6), distinct_cte_count_only.profile.candidate_rows);
+    try std.testing.expectEqual(@as(u64, 6), distinct_cte_count_only.profile.hydrated_rows);
+    try std.testing.expectEqual(@as(u64, 4), distinct_cte_count_only.profile.projected_rows);
+    try std.testing.expectEqual(@as(u64, 2), distinct_cte_count_only.profile.iterator_seeks);
+    try std.testing.expectEqual(@as(u64, 0), distinct_cte_count_only.profile.retained_candidate_rows);
+    try std.testing.expectEqual(@as(u64, 0), distinct_cte_count_only.profile.routed_materialization_fallbacks);
+    try std.testing.expectEqual(distinct_cte_scan_calls_before + 2, fake_ranged_cte.scan_calls);
+    try std.testing.expectEqual(distinct_cte_lookup_calls_before + 6, fake_ranged_cte.lookup_calls);
+
+    const intersect_cte_scan_calls_before = fake_ranged_cte.scan_calls;
+    const intersect_cte_lookup_calls_before = fake_ranged_cte.lookup_calls;
+    var intersect_cte_count_only = (try rowsSetOperationPlanFromRoutedScansAlloc(alloc, fake_ranged_cte.source(), "usage_records", schema, .{
+        .operation = .intersect,
+        .ctes = ranged_ctes[0..],
+        .left = .{ .query = .{
+            .source_cte = "enabled_rows",
+            .select = id_select[0..],
+            .select_all = false,
+            .limit = 0,
+            .total_mode = .exact,
+            .profile = true,
+        } },
+        .right = .{
+            .ranges = right_cte_ranges[0..],
+            .query = .{
+                .source_cte = "enabled_rows",
+                .select = id_select[0..],
+                .select_all = false,
+                .limit = 0,
+                .total_mode = .exact,
+                .profile = true,
+            },
+        },
+    }, .read_index)).?;
+    defer intersect_cte_count_only.deinit(alloc);
+    try std.testing.expect(intersect_cte_count_only.include_profile);
+    try std.testing.expect(intersect_cte_count_only.total_exact);
+    try std.testing.expectEqual(@as(u32, 1), intersect_cte_count_only.total);
+    try std.testing.expectEqual(@as(usize, 0), intersect_cte_count_only.rows.len);
+    try std.testing.expect(intersect_cte_count_only.profile.count_only);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryRequest.TotalMode.exact, intersect_cte_count_only.profile.total_mode);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryResult.AccessMethod.base_scan, intersect_cte_count_only.profile.access_method);
+    try std.testing.expectEqual(@as(u64, 4), intersect_cte_count_only.profile.base_scan_rows);
+    try std.testing.expectEqual(@as(u64, 4), intersect_cte_count_only.profile.candidate_rows);
+    try std.testing.expectEqual(@as(u64, 4), intersect_cte_count_only.profile.hydrated_rows);
+    try std.testing.expectEqual(@as(u64, 3), intersect_cte_count_only.profile.projected_rows);
+    try std.testing.expectEqual(@as(u64, 2), intersect_cte_count_only.profile.iterator_seeks);
+    try std.testing.expectEqual(@as(u64, 0), intersect_cte_count_only.profile.retained_candidate_rows);
+    try std.testing.expectEqual(@as(u64, 0), intersect_cte_count_only.profile.routed_materialization_fallbacks);
+    try std.testing.expectEqual(intersect_cte_scan_calls_before + 2, fake_ranged_cte.scan_calls);
+    try std.testing.expectEqual(intersect_cte_lookup_calls_before + 4, fake_ranged_cte.lookup_calls);
+
+    const except_cte_scan_calls_before = fake_ranged_cte.scan_calls;
+    const except_cte_lookup_calls_before = fake_ranged_cte.lookup_calls;
+    var except_cte_count_only = (try rowsSetOperationPlanFromRoutedScansAlloc(alloc, fake_ranged_cte.source(), "usage_records", schema, .{
+        .operation = .except,
+        .ctes = ranged_ctes[0..],
+        .left = .{ .query = .{
+            .source_cte = "enabled_rows",
+            .select = id_select[0..],
+            .select_all = false,
+            .limit = 0,
+            .total_mode = .exact,
+            .profile = true,
+        } },
+        .right = .{
+            .ranges = right_cte_ranges[0..],
+            .query = .{
+                .source_cte = "enabled_rows",
+                .select = id_select[0..],
+                .select_all = false,
+                .limit = 0,
+                .total_mode = .exact,
+                .profile = true,
+            },
+        },
+    }, .read_index)).?;
+    defer except_cte_count_only.deinit(alloc);
+    try std.testing.expect(except_cte_count_only.include_profile);
+    try std.testing.expect(except_cte_count_only.total_exact);
+    try std.testing.expectEqual(@as(u32, 1), except_cte_count_only.total);
+    try std.testing.expectEqual(@as(usize, 0), except_cte_count_only.rows.len);
+    try std.testing.expect(except_cte_count_only.profile.count_only);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryRequest.TotalMode.exact, except_cte_count_only.profile.total_mode);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryResult.AccessMethod.base_scan, except_cte_count_only.profile.access_method);
+    try std.testing.expectEqual(@as(u64, 4), except_cte_count_only.profile.base_scan_rows);
+    try std.testing.expectEqual(@as(u64, 4), except_cte_count_only.profile.candidate_rows);
+    try std.testing.expectEqual(@as(u64, 4), except_cte_count_only.profile.hydrated_rows);
+    try std.testing.expectEqual(@as(u64, 3), except_cte_count_only.profile.projected_rows);
+    try std.testing.expectEqual(@as(u64, 2), except_cte_count_only.profile.iterator_seeks);
+    try std.testing.expectEqual(@as(u64, 0), except_cte_count_only.profile.retained_candidate_rows);
+    try std.testing.expectEqual(@as(u64, 0), except_cte_count_only.profile.routed_materialization_fallbacks);
+    try std.testing.expectEqual(except_cte_scan_calls_before + 2, fake_ranged_cte.scan_calls);
+    try std.testing.expectEqual(except_cte_lookup_calls_before + 4, fake_ranged_cte.lookup_calls);
 }
 
 test "lowered sql set operation plans route cross table branches through catalog schemas" {
@@ -6916,7 +9990,7 @@ test "lowered sql set operation plans route cross table branches through catalog
     };
 
     var catalog = FakeCatalog{};
-    var lowered = try sql_adapter.lower_select.lowerReadPlanWithCatalogAlloc(
+    var lowered = try sql_adapter.lowerReadPlanWithCatalogAlloc(
         alloc,
         "SELECT id FROM usage_records WHERE status = 'open' UNION ALL SELECT id FROM archived_records WHERE enabled IS TRUE",
         usage_schema,
@@ -6957,7 +10031,7 @@ test "lowered sql set operation plans route cross table branches through catalog
         else => return error.TestUnexpectedResult,
     }
 
-    var lowered_cte = try sql_adapter.lower_select.lowerReadPlanWithCatalogAlloc(
+    var lowered_cte = try sql_adapter.lowerReadPlanWithCatalogAlloc(
         alloc,
         "WITH open_usage AS (SELECT id, status, enabled FROM usage_records WHERE status = 'open') SELECT id FROM open_usage UNION ALL SELECT id FROM archived_records WHERE enabled IS TRUE",
         usage_schema,
@@ -7005,7 +10079,7 @@ test "lowered sql set operation plans route cross table branches through catalog
         else => return error.TestUnexpectedResult,
     }
 
-    var lowered_as_of = try sql_adapter.lower_select.lowerReadPlanWithCatalogAlloc(
+    var lowered_as_of = try sql_adapter.lowerReadPlanWithCatalogAlloc(
         alloc,
         "SELECT id FROM usage_records FOR SYSTEM_TIME AS OF 42 WHERE status = 'open' UNION ALL SELECT id FROM archived_records FOR SYSTEM_TIME AS OF 42 WHERE enabled IS TRUE",
         usage_schema,
@@ -7050,7 +10124,7 @@ test "lowered sql set operation plans route cross table branches through catalog
         else => return error.TestUnexpectedResult,
     }
 
-    var lowered_cte_as_of = try sql_adapter.lower_select.lowerReadPlanWithCatalogAlloc(
+    var lowered_cte_as_of = try sql_adapter.lowerReadPlanWithCatalogAlloc(
         alloc,
         "WITH open_usage AS (SELECT id, status, enabled FROM usage_records WHERE status = 'open') SELECT id FROM open_usage FOR SYSTEM_TIME AS OF 42 UNION ALL SELECT id FROM archived_records FOR SYSTEM_TIME AS OF 42 WHERE enabled IS TRUE",
         usage_schema,
@@ -7123,7 +10197,7 @@ test "lowered sql set operation plans route cross table branches through catalog
         }
     };
 
-    var lowered_same_table_as_of = try sql_adapter.lower_select.lowerReadPlanWithCatalogAlloc(
+    var lowered_same_table_as_of = try sql_adapter.lowerReadPlanWithCatalogAlloc(
         alloc,
         "SELECT id FROM usage_records FOR SYSTEM_TIME AS OF 42 WHERE status = 'open' UNION ALL SELECT id FROM usage_records FOR SYSTEM_TIME AS OF 42 WHERE enabled IS TRUE",
         usage_schema,
@@ -7167,7 +10241,7 @@ test "lowered sql set operation plans route cross table branches through catalog
         else => return error.TestUnexpectedResult,
     }
 
-    var lowered_as_of_timestamp = try sql_adapter.lower_select.lowerReadPlanWithCatalogAlloc(
+    var lowered_as_of_timestamp = try sql_adapter.lowerReadPlanWithCatalogAlloc(
         alloc,
         "SELECT id FROM usage_records FOR SYSTEM_TIME AS OF TIMESTAMP '1970-01-01T00:00:00.000055Z' WHERE status = 'open' UNION ALL SELECT id FROM archived_records FOR SYSTEM_TIME AS OF TIMESTAMP '1970-01-01T00:00:00.000055Z' WHERE enabled IS TRUE",
         usage_schema,
@@ -7212,14 +10286,14 @@ test "lowered sql set operation plans route cross table branches through catalog
         else => return error.TestUnexpectedResult,
     }
 
-    try std.testing.expectError(error.UnsupportedSqlShape, sql_adapter.lower_select.lowerReadPlanWithCatalogAlloc(
+    try std.testing.expectError(error.UnsupportedSqlShape, sql_adapter.lowerReadPlanWithCatalogAlloc(
         alloc,
         "SELECT id FROM usage_records FOR SYSTEM_TIME AS OF 42 WHERE status = 'open' UNION ALL SELECT id FROM archived_records FOR SYSTEM_TIME AS OF TIMESTAMP '1970-01-01T00:00:00.000055Z' WHERE enabled IS TRUE",
         usage_schema,
         &.{},
         catalog.iface(),
     ));
-    try std.testing.expectError(error.UnsupportedSqlShape, sql_adapter.lower_select.lowerReadPlanWithCatalogAlloc(
+    try std.testing.expectError(error.UnsupportedSqlShape, sql_adapter.lowerReadPlanWithCatalogAlloc(
         alloc,
         "SELECT id FROM usage_records FOR SYSTEM_TIME AS OF TIMESTAMP '1970-01-01T00:00:00.000055Z' WHERE status = 'open' UNION ALL SELECT id FROM archived_records FOR SYSTEM_TIME AS OF TIMESTAMP '1970-01-01T00:00:00.000056Z' WHERE enabled IS TRUE",
         usage_schema,
@@ -7256,7 +10330,7 @@ test "lowered sql set operation plans route cross table branches through catalog
         else => return error.TestUnexpectedResult,
     }
 
-    var lowered_except = try sql_adapter.lower_select.lowerReadPlanWithCatalogAlloc(
+    var lowered_except = try sql_adapter.lowerReadPlanWithCatalogAlloc(
         alloc,
         "SELECT id FROM usage_records WHERE status = 'open' EXCEPT SELECT id FROM archived_records WHERE status = 'deleted'",
         usage_schema,
@@ -7294,7 +10368,7 @@ test "lowered sql set operation plans route cross table branches through catalog
         else => return error.TestUnexpectedResult,
     }
 
-    var lowered_intersect = try sql_adapter.lower_select.lowerReadPlanWithCatalogAlloc(
+    var lowered_intersect = try sql_adapter.lowerReadPlanWithCatalogAlloc(
         alloc,
         "SELECT id FROM usage_records WHERE status = 'open' INTERSECT SELECT id FROM archived_records WHERE status = 'deleted'",
         usage_schema,
@@ -7563,7 +10637,7 @@ test "lowered sql set operation RHS multi-join CTEs route incompatible side sche
     }
 
     var catalog = FakeCatalog{};
-    var lowered_generated = try sql_adapter.lower_select.lowerReadPlanWithCatalogAlloc(
+    var lowered_generated = try sql_adapter.lowerReadPlanWithCatalogAlloc(
         alloc,
         "SELECT id FROM usage_records WHERE status = 'open' UNION ALL SELECT tenant_records.tenant_ref AS id FROM usage_records JOIN archived_records ON usage_records.id = archived_records.id JOIN tenant_records ON archived_records.tenant_ref = tenant_records.tenant_ref",
         usage_schema,

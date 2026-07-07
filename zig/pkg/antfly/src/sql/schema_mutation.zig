@@ -204,16 +204,51 @@ pub fn schemaWithSecondaryIndexReadyCheckedAlloc(
     if (fingerprint_value != .string or fingerprint_value.string.len == 0) return error.InvalidSchemaUpdateRequest;
     if (!std.mem.eql(u8, fingerprint_value.string, expected.schema_fingerprint)) return error.SecondaryIndexSchemaFingerprintMismatch;
 
-    const lifecycle_value = index.getPtr("lifecycle") orelse return error.SecondaryIndexNotBuilding;
-    if (lifecycle_value.* != .string) return error.InvalidSchemaUpdateRequest;
-    if (!std.mem.eql(u8, lifecycle_value.string, "building") and !std.mem.eql(u8, lifecycle_value.string, "catching_up")) return error.SecondaryIndexNotBuilding;
-    lifecycle_value.* = .{ .string = "ready" };
+    try promoteRelationalIndexLifecycleToReady(index, actual_method, generation);
 
     const updated = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
     errdefer alloc.free(updated);
     var validated = try schema_mod.parseValidatedTableSchema(alloc, updated);
     validated.deinit(alloc);
     return updated;
+}
+
+fn promoteRelationalIndexLifecycleToReady(
+    index: *std.json.ObjectMap,
+    access_method: runtime_schema.RelationalIndexAccessMethod,
+    generation: u64,
+) !void {
+    const lifecycle_value = index.getPtr("lifecycle") orelse return error.SecondaryIndexNotBuilding;
+    if (lifecycle_value.* != .string) return error.InvalidSchemaUpdateRequest;
+
+    const generation_record = switch (access_method) {
+        .scalar_column => null,
+        .ordered_tuple, .text_search, .algebraic_filter => try relationalIndexGenerationRecordObject(index, generation),
+    };
+    const lifecycle_text = if (generation_record) |record| blk: {
+        const record_lifecycle = record.getPtr("lifecycle") orelse return error.SecondaryIndexNotBuilding;
+        if (record_lifecycle.* != .string) return error.InvalidSchemaUpdateRequest;
+        break :blk record_lifecycle.string;
+    } else lifecycle_value.string;
+
+    if (!std.mem.eql(u8, lifecycle_text, lifecycle_value.string)) return error.InvalidSchemaUpdateRequest;
+    if (!std.mem.eql(u8, lifecycle_text, "building") and !std.mem.eql(u8, lifecycle_text, "catching_up")) return error.SecondaryIndexNotBuilding;
+
+    lifecycle_value.* = .{ .string = "ready" };
+    if (generation_record) |record| {
+        const record_lifecycle = record.getPtr("lifecycle").?;
+        record_lifecycle.* = .{ .string = "ready" };
+    }
+}
+
+fn relationalIndexGenerationRecordObject(index: *std.json.ObjectMap, generation: u64) !*std.json.ObjectMap {
+    const record_value = index.getPtr("generation_record") orelse return error.InvalidSchemaUpdateRequest;
+    if (record_value.* != .object) return error.InvalidSchemaUpdateRequest;
+    const record = &record_value.object;
+    const record_generation = record.get("generation") orelse return error.InvalidSchemaUpdateRequest;
+    if (record_generation != .integer or record_generation.integer <= 0) return error.InvalidSchemaUpdateRequest;
+    if (@as(u64, @intCast(record_generation.integer)) != generation) return error.SecondaryIndexGenerationMismatch;
+    return record;
 }
 
 fn relationalIndexObjectForSecondaryIndex(root: *std.json.ObjectMap, index_name: []const u8) ?*std.json.ObjectMap {

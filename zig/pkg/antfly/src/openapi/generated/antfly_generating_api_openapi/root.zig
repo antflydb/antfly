@@ -28,3 +28,4 @@ pub const ChatToolName = types.ChatToolName;
 pub const ChatToolsConfig = types.ChatToolsConfig;
 pub const ClarificationRequest = types.ClarificationRequest;
 pub const FilterSpec = types.FilterSpec;
+pub const FilterSpecOperator = types.FilterSpecOperator;

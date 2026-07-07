@@ -402,7 +402,8 @@ pub fn promoteReadySecondaryIndexesForCatalog(
 
     var promoted: u64 = 0;
     for (runtime.relational_indexes) |index| {
-        if (index.lifecycle != .building) continue;
+        const lifecycle = storage_schema.relationalIndexLifecycle(index) orelse continue;
+        if (lifecycle != .building) continue;
         if (index.generation == 0) continue;
         const schema_fingerprint = index.schema_fingerprint orelse continue;
         if (schema_fingerprint.len == 0) continue;
@@ -1589,7 +1590,7 @@ test "secondary index rebuild worker rebuilds ordered tuple index in bounded pag
     defer db.close();
 
     const building_schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"note":{"type":"keyword"}},"required":["id","status","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"orders_status_amount_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"amount"}],"include_columns":["note"],"lifecycle":"building","generation":9,"schema_fingerprint":"secondary-index-v1:status_amount","where":{"all":[{"field":"status","op":"eq","value":"active"}]}}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"note":{"type":"keyword"}},"required":["id","status","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"orders_status_amount_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"amount"}],"include_columns":["note"],"lifecycle":"building","generation":9,"schema_fingerprint":"secondary-index-v1:status_amount","generation_record":{"generation":9,"owner_ranges":[],"lifecycle":"building","lag":0,"ready_watermark":0},"where":{"all":[{"field":"status","op":"eq","value":"active"}]}}]}
     ;
     try db.applyTableSchemaJson(alloc, building_schema_json, .{});
     var parsed_schema = try schema_mod.parseValidatedTableSchema(alloc, building_schema_json);
@@ -1774,7 +1775,7 @@ test "secondary index rebuild worker rebuilds and promotes expression generated 
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"users_lower_email_idx":{"type":"keyword","generated":{"op":"expression","expression":{"op":"lower","args":[{"field":"email"}]}}}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"users_lower_email_idx","owner_kind":"relational_column","owner_name":"users_lower_email_idx","access_method":"scalar_column","columns":["users_lower_email_idx"],"lifecycle":"building","generation":9,"schema_fingerprint":"secondary-index-v1:users_lower_email_idx"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"users_lower_email_idx":{"type":"keyword","generated":{"op":"expression","expression":{"op":"lower","args":[{"field":"email"}]}}}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"users_lower_email_idx","owner_kind":"relational_column","owner_name":"users_lower_email_idx","access_method":"ordered_tuple","columns":["users_lower_email_idx"],"keys":[{"column":"users_lower_email_idx"}],"lifecycle":"building","generation":9,"schema_fingerprint":"secondary-index-v1:users_lower_email_idx","generation_record":{"generation":9,"owner_ranges":[],"lifecycle":"building","lag":0,"ready_watermark":0}}]}
     ;
     try db.applyTableSchemaJson(alloc, schema_json, .{});
     var parsed_schema = try schema_mod.parseValidatedTableSchema(alloc, schema_json);
@@ -1791,11 +1792,17 @@ test "secondary index rebuild worker rebuilds and promotes expression generated 
     defer alloc.free(row_a_key);
     try db.batch(rows_batch.req);
 
-    const valid_generated_key = try db_mod.internal_keys.relationalColumnIndexKeyAlloc(alloc, "users_lower_email_idx", row_a_key);
+    const raw_row_a = try db_mod.relational_store.getRawAlloc(alloc, db.core.store, row_a_key) orelse return error.TestUnexpectedResult;
+    defer alloc.free(raw_row_a);
+    const valid_generated_tuple = try db_mod.relational_store.orderedTupleValueForIndexKeysAlloc(alloc, raw_row_a, runtime_schema.relational_indexes[0].keys, runtime_schema.relational_columns);
+    defer alloc.free(valid_generated_tuple);
+    const valid_generated_key = try db_mod.internal_keys.relationalOrderedTupleIndexKeyAlloc(alloc, "users_lower_email_idx", valid_generated_tuple, row_a_key);
     defer alloc.free(valid_generated_key);
-    const stale_generated_key = try db_mod.internal_keys.relationalColumnIndexKeyAlloc(alloc, "users_lower_email_idx", "row:stale");
+    const stale_generated_key = try db_mod.internal_keys.relationalOrderedTupleIndexKeyAlloc(alloc, "users_lower_email_idx", valid_generated_tuple, "row:stale");
     defer alloc.free(stale_generated_key);
-    try db.core.store.put(stale_generated_key, "");
+    const stale_generated_reverse_key = try db_mod.internal_keys.relationalOrderedTupleIndexByDocKeyAlloc(alloc, "row:stale", "users_lower_email_idx", valid_generated_tuple);
+    defer alloc.free(stale_generated_reverse_key);
+    try db.core.store.putBatch(&.{ .{ .key = stale_generated_key, .value = "" }, .{ .key = stale_generated_reverse_key, .value = "" } }, &.{});
     const stale_before = try db.core.store.get(alloc, stale_generated_key);
     defer alloc.free(stale_before);
 
@@ -1839,8 +1846,8 @@ test "secondary index rebuild worker rebuilds and promotes expression generated 
 
     const valid_after = try db.core.store.get(alloc, valid_generated_key);
     defer alloc.free(valid_after);
-    try std.testing.expect(valid_after.len > 0);
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, stale_generated_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, stale_generated_reverse_key));
 
     const final_records = try manager.listSecondaryIndexRebuildRanges(alloc);
     defer manager.freeSecondaryIndexRebuildRanges(alloc, final_records);
@@ -1891,7 +1898,7 @@ test "secondary index rebuild worker rebuilds and promotes expression generated 
             try std.testing.expectEqualStrings("users", table_name);
             try std.testing.expectEqualStrings("users_lower_email_idx", index_name);
             try std.testing.expectEqual(@as(u64, 9), expected.generation);
-            try std.testing.expectEqual(storage_schema.RelationalIndexAccessMethod.scalar_column, expected.access_method);
+            try std.testing.expectEqual(storage_schema.RelationalIndexAccessMethod.ordered_tuple, expected.access_method);
             try std.testing.expectEqualStrings("secondary-index-v1:users_lower_email_idx", expected.schema_fingerprint);
             self.promoted = true;
             return true;

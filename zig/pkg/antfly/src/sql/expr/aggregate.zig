@@ -88,10 +88,13 @@ pub const PercentileArgument = struct {
 };
 
 pub const InputExpressionParserOptions = struct {
+    params: []const value_mod.SqlValue = &.{},
     context_hooks: expr_row_parse.SelectParserContextHooks,
     row_expression_hooks: expr_row_parse.RowExpressionParserHooks,
     arithmetic_hooks: expr_row_parse.ArithmeticExpressionParserHooks,
     variadic_hooks: expr_row_parse.VariadicRowExpressionParserHooks,
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst = null,
+    require_exact_generated_expression: bool = false,
 };
 
 pub const SpecParserOptions = struct {
@@ -121,6 +124,7 @@ pub const OutputExpressionConditionParserOptions = struct {
     context_hooks: expr_row_parse.SelectParserContextHooks,
     case_expression_hooks: expr_row_parse.CaseExpressionParserHooks,
     generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst = null,
+    require_exact_generated_expression: bool = false,
 };
 
 pub const BareBooleanHavingExpressionParserOptions = struct {
@@ -522,8 +526,9 @@ pub fn parseInputExpressionAlloc(
     defer_row_expression_field_validation: bool,
     options: InputExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpression {
+    const start = pos.*;
     if (peekExpressionInput(tokens, pos.*)) {
-        return try expr_row_parse.parseRowExpressionAlloc(
+        const expression = try expr_row_parse.parseRowExpressionAlloc(
             alloc,
             tokens,
             pos,
@@ -532,6 +537,20 @@ pub fn parseInputExpressionAlloc(
             options.arithmetic_hooks,
             options.variadic_hooks,
         );
+        errdefer freeExpression(alloc, expression);
+        if (options.require_exact_generated_expression) {
+            try expr_generated_validate.validateGeneratedRowExpressionIdentityStrictWithContext(
+                .{ .alloc = alloc, .params = options.params },
+                tokens,
+                start,
+                pos.*,
+                expression,
+                options.generated_expression_ast,
+            );
+        } else {
+            try expr_generated_validate.validateGeneratedRowExpressionIdentity(tokens, start, pos.*, expression, options.generated_expression_ast);
+        }
+        return expression;
     }
 
     const parsed_field = try expr_generated.parseRowExpressionFieldOwnedAlloc(
@@ -558,7 +577,7 @@ pub fn parseInputExpressionAlloc(
     if (column.field_type != .numeric) return error.InvalidSqlCatalog;
     if (expr_operator.peekArithmeticOperator(tokens, pos.*) == null) return error.UnsupportedSqlShape;
     field_transferred = true;
-    return try expr_row_parse.parseArithmeticExpressionRestAlloc(
+    const expression = try expr_row_parse.parseArithmeticExpressionRestAlloc(
         alloc,
         tokens,
         pos,
@@ -567,6 +586,20 @@ pub fn parseInputExpressionAlloc(
         options.context_hooks.row_expression_type_context(options.context_hooks.ptr),
         options.arithmetic_hooks,
     );
+    errdefer freeExpression(alloc, expression);
+    if (options.require_exact_generated_expression) {
+        try expr_generated_validate.validateGeneratedRowExpressionIdentityStrictWithContext(
+            .{ .alloc = alloc, .params = options.params },
+            tokens,
+            start,
+            pos.*,
+            expression,
+            options.generated_expression_ast,
+        );
+    } else {
+        try expr_generated_validate.validateGeneratedRowExpressionIdentity(tokens, start, pos.*, expression, options.generated_expression_ast);
+    }
+    return expression;
 }
 
 pub fn parseSpecAlloc(
@@ -635,6 +668,11 @@ pub fn parseSpecAlloc(
         try parser.expectKeyword(tokens, pos, "order");
         try parser.expectKeyword(tokens, pos, "by");
         within_group_order_start = pos.*;
+        var order_expression_hooks = options.order_expression_hooks;
+        if (options.generated_expression_ast) |generated_function| {
+            if (generated_function.within_group_order_items.expressions.len == 0) return error.UnsupportedSqlShape;
+            order_expression_hooks.generated_expression_ast = &generated_function.within_group_order_items.expressions[0];
+        }
         var order = try expr_order.parseExpressionAlloc(
             alloc,
             tokens,
@@ -645,7 +683,7 @@ pub fn parseSpecAlloc(
             returning_expression_qualifiers,
             defer_row_expression_field_validation,
             type_context,
-            options.order_expression_hooks,
+            order_expression_hooks,
         );
         defer {
             if (order.field.len > 0) alloc.free(order.field);
@@ -680,6 +718,11 @@ pub fn parseSpecAlloc(
         try parser.expectKeyword(tokens, pos, "order");
         try parser.expectKeyword(tokens, pos, "by");
         within_group_order_start = pos.*;
+        var order_expression_hooks = options.order_expression_hooks;
+        if (options.generated_expression_ast) |generated_function| {
+            if (generated_function.within_group_order_items.expressions.len == 0) return error.UnsupportedSqlShape;
+            order_expression_hooks.generated_expression_ast = &generated_function.within_group_order_items.expressions[0];
+        }
         var order = try expr_order.parseExpressionAlloc(
             alloc,
             tokens,
@@ -690,7 +733,7 @@ pub fn parseSpecAlloc(
             returning_expression_qualifiers,
             defer_row_expression_field_validation,
             type_context,
-            options.order_expression_hooks,
+            order_expression_hooks,
         );
         defer {
             if (order.field.len > 0) alloc.free(order.field);
@@ -723,6 +766,12 @@ pub fn parseSpecAlloc(
         field = null;
     } else {
         if (peekExpressionInput(tokens, pos.*)) {
+            var input_options = options.aggregate_input;
+            if (options.generated_expression_ast) |generated_function| {
+                if (generated_function.argument_items.expressions.len == 0) return error.UnsupportedSqlShape;
+                input_options.generated_expression_ast = &generated_function.argument_items.expressions[0];
+                input_options.require_exact_generated_expression = true;
+            }
             const parsed_expression = try parseInputExpressionAlloc(
                 alloc,
                 tokens,
@@ -731,7 +780,7 @@ pub fn parseSpecAlloc(
                 field_expression_qualifiers,
                 returning_expression_qualifiers,
                 defer_row_expression_field_validation,
-                options.aggregate_input,
+                input_options,
             );
             var parsed_expression_transferred = false;
             errdefer if (!parsed_expression_transferred) freeExpression(alloc, parsed_expression);
@@ -781,6 +830,10 @@ pub fn parseSpecAlloc(
     }
     if ((op == .array_agg or op == .string_agg) and parser.matchKeyword(tokens, pos, "order")) {
         try parser.expectKeyword(tokens, pos, "by");
+        const generated_argument_order_items = if (options.generated_expression_ast) |generated_function|
+            &generated_function.argument_order_items
+        else
+            null;
         try expr_order.parseByWithExpressionHooksAlloc(
             alloc,
             tokens,
@@ -794,7 +847,7 @@ pub fn parseSpecAlloc(
             type_context,
             options.order_expression_hooks,
             null,
-            null,
+            generated_argument_order_items,
         );
     }
     if (!isPercentileOp(op) and op != .mode) {
@@ -965,6 +1018,7 @@ pub fn parseFilterConditionAlternativesAlloc(
     const generated_condition_expression = try expr_generated_validate.generatedPredicateExpressionAtStart(tokens, pos.*, generated_expression_ast);
     var expression_hooks_with_generated = expression_hooks;
     expression_hooks_with_generated.generated_expression_ast = generated_condition_expression;
+    expression_hooks_with_generated.require_exact_generated_expression = generated_condition_expression != null;
 
     if (try parseFilterBooleanIsNotGroupsAlloc(
         alloc,
@@ -1323,6 +1377,7 @@ pub fn parseFilterAlloc(
             } else if (peekExpressionFilter(tokens, pos.*)) {
                 var expression_condition_hooks_with_generated = expression_condition_hooks;
                 expression_condition_hooks_with_generated.generated_expression_ast = try expr_generated_validate.generatedPredicateExpressionAtStart(tokens, pos.*, generated_expression_ast);
+                expression_condition_hooks_with_generated.require_exact_generated_expression = expression_condition_hooks_with_generated.generated_expression_ast != null;
                 try expr_where_condition.parseExpressionWhereConditionsAlloc(
                     alloc,
                     tokens,
@@ -1502,6 +1557,7 @@ pub fn parseOutputExpressionConditionAlloc(
         .storage_mode = .relational,
         .relational_columns = output_columns,
     };
+    const condition_start = pos.*;
     var operator_token_index: usize = 0;
     const condition = try expr_where_condition.parseCaseExpressionConditionWithSelectSchemaAndOperatorAlloc(
         alloc,
@@ -1514,7 +1570,11 @@ pub fn parseOutputExpressionConditionAlloc(
     );
     var condition_transferred = false;
     errdefer if (!condition_transferred) freeExpressionCondition(alloc, condition);
-    try expr_generated_validate.validateGeneratedRelationalPredicateExpression(options.generated_expression_ast, tokens, operator_token_index, condition.op);
+    if (options.require_exact_generated_expression) {
+        try expr_generated_validate.validateGeneratedExpressionConditionIdentityStrict(tokens, condition_start, pos.*, condition, options.generated_expression_ast);
+    } else {
+        try expr_generated_validate.validateGeneratedRelationalPredicateExpression(options.generated_expression_ast, tokens, operator_token_index, condition.op);
+    }
     condition_transferred = true;
     return condition;
 }
@@ -1615,6 +1675,7 @@ pub fn parseHavingConditionAlternativesAlloc(
     field_options_with_generated.generated_expression_ast = generated_condition_expression;
     var expression_options_with_generated = expression_options;
     expression_options_with_generated.generated_expression_ast = generated_condition_expression;
+    expression_options_with_generated.require_exact_generated_expression = generated_condition_expression != null;
 
     if (try parseHavingBooleanIsNotGroups(alloc, tokens, pos, schema, type_context, alternatives, group_fields, group_expressions, aggregations, field_options_with_generated)) {
         return;
@@ -1783,6 +1844,7 @@ pub fn parseHavingAlloc(
         } else if (peekHavingExpression(tokens, pos.*)) {
             var expression_options_with_generated = expression_condition_options;
             expression_options_with_generated.generated_expression_ast = try expr_generated_validate.generatedPredicateExpressionAtStart(tokens, pos.*, generated_expression_ast);
+            expression_options_with_generated.require_exact_generated_expression = expression_options_with_generated.generated_expression_ast != null;
             const condition = try parseOutputExpressionConditionAlloc(alloc, tokens, pos, schema, type_context, group_fields, group_expressions, aggregations, expression_options_with_generated);
             var condition_transferred = false;
             errdefer if (!condition_transferred) freeExpressionCondition(alloc, condition);

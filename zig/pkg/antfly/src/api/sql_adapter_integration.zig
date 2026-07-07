@@ -71,9 +71,18 @@ const AppParityDdlSummaryPlan = union(enum) {
     create_update_policy: ddl_plan.CreateUpdatePolicyPlan,
 };
 
-const Parser = sql_adapter.ParserState;
-
 const TestPrimaryResolver = sql_adapter.TestPrimaryResolver;
+
+test "public sql adapter does not export broad parser lowerer modules" {
+    try std.testing.expect(!@hasDecl(sql_adapter, "lower_dml"));
+    try std.testing.expect(!@hasDecl(sql_adapter, "lower_select"));
+    try std.testing.expect(!@hasDecl(sql_adapter, "lower_ddl"));
+    try std.testing.expect(!@hasDecl(sql_adapter, "ddl_plan"));
+    try std.testing.expect(!@hasDecl(sql_adapter, "grammar"));
+    try std.testing.expect(!@hasDecl(sql_adapter, "lower_expr"));
+    try std.testing.expect(!@hasDecl(sql_adapter, "plan"));
+    try std.testing.expect(!@hasDecl(sql_adapter, "query_function"));
+}
 
 const AppParityCorpusPlanFamily = sql_adapter.AppParityCorpusPlanFamily;
 const AppParityDdlTag = sql_adapter.AppParityDdlTag;
@@ -107,7 +116,7 @@ fn planLogicalDdlParsedForAppParityAlloc(
     parsed_sql: *const sql_adapter.ParsedSql,
 ) !sql_adapter.LogicalSqlPlan {
     if (parsedSqlLooksLikeAdvisoryLockDdl(parsed_sql)) {
-        return try sql_adapter.lower_ddl.logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, .{});
+        return try sql_adapter.logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, .{});
     }
     return try sql_adapter.planParsedSqlWithSessionAlloc(alloc, parsed_sql, .{
         .catalog = table_catalog.unavailableCatalogSource(),
@@ -121,7 +130,7 @@ fn planLogicalDdlEntryForAppParityAlloc(
     parsed_sql: *const sql_adapter.ParsedSql,
 ) !sql_adapter.LogicalSqlPlan {
     if (entry.summary.ddl_tag == .advisory_lock and parsedSqlLooksLikeAdvisoryLockDdl(parsed_sql)) {
-        return try sql_adapter.lower_ddl.logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, .{});
+        return try sql_adapter.logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, .{});
     }
     var catalog_opt = try sql_adapter.appParityCatalogForEntryParsedSqlAlloc(alloc, entry, parsed_sql);
     if (catalog_opt) |*catalog| {
@@ -131,7 +140,7 @@ fn planLogicalDdlEntryForAppParityAlloc(
             .function_bindings = .{},
         });
     }
-    return try sql_adapter.lower_ddl.logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, .{});
+    return try sql_adapter.logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, .{});
 }
 
 fn expectAdapterNoopLogicalPlan(
@@ -933,7 +942,7 @@ fn lowerAppParityReadPlanParsedSqlAlloc(
             .catalog = catalog.iface(),
         });
         defer logical_plan.deinit(alloc);
-        return try sql_adapter.lower_select.lowerReadPlanWithLogicalPlanAndFunctionBindingsAlloc(
+        return try sql_adapter.lowerReadPlanWithLogicalPlanAndFunctionBindingsAlloc(
             alloc,
             parsed_sql,
             &logical_plan,
@@ -1134,7 +1143,7 @@ fn lowerAppParityWritePlanParsedSqlAlloc(
                 .unique_resolver = unique_resolver,
             });
         }
-        return try sql_adapter.lower_dml.lowerWritePlanWithLogicalPlanAndFunctionBindingsAlloc(alloc, parsed_sql, &logical_plan, effective_schema, entry.params, .{});
+        return try sql_adapter.lowerWritePlanWithLogicalPlanAndFunctionBindingsAlloc(alloc, parsed_sql, &logical_plan, effective_schema, entry.params, .{});
     }
     return try lowerWritePlanParsedSqlAlloc(alloc, parsed_sql, effective_schema, entry.params, .{
         .unique_resolver = unique_resolver,
@@ -1575,7 +1584,7 @@ fn expectAppParityCorpusEntry(
         .merge_mutation,
         => return error.TestUnexpectedResult,
         .adapter_noop_ddl => {
-            if (sql_adapter.lower_ddl.logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, .{})) |logical_value| {
+            if (sql_adapter.logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, .{})) |logical_value| {
                 var logical = logical_value;
                 defer logical.deinit(alloc);
                 try expectAdapterNoopLogicalPlan(entry, logical);
@@ -3179,32 +3188,32 @@ const appendNonZeroU32FingerprintAlloc = sql_adapter.appendNonZeroU32Fingerprint
 const appendTrueBoolFingerprintAlloc = sql_adapter.appendTrueBoolFingerprintAlloc;
 const applyLogicalDdlPlanToSchemaJsonAlloc = sql_adapter.applyLogicalDdlPlanToSchemaJsonAlloc;
 const buildMergeMutationBatchAlloc = sql_adapter.buildMergeMutationBatchAlloc;
-const buildMergeMutationBatchFromDbAcrossRangesAlloc = sql_adapter.lower_dml.buildMergeMutationBatchFromDbAcrossRangesAlloc;
-const buildMergeMutationBatchFromDbsAcrossRangesAlloc = sql_adapter.lower_dml.buildMergeMutationBatchFromDbsAcrossRangesAlloc;
+const buildMergeMutationBatchFromDbAcrossRangesAlloc = sql_adapter.buildMergeMutationBatchFromDbAcrossRangesAlloc;
+const buildMergeMutationBatchFromDbsAcrossRangesAlloc = sql_adapter.buildMergeMutationBatchFromDbsAcrossRangesAlloc;
 const bulkSqlIoExecutionFingerprintAlloc = sql_adapter.bulkSqlIoExecutionFingerprintAlloc;
 const bulkSqlIoExecutionPlanFromDdlPlan = sql_adapter.bulkSqlIoExecutionPlanFromDdlPlan;
 const createIndexPlanGeneratedExpressionCount = sql_adapter.createIndexPlanGeneratedExpressionCount;
 const ddlAppliedFingerprintAlloc = sql_adapter.ddlAppliedFingerprintAlloc;
 const ddlFingerprintAlloc = sql_adapter.ddlFingerprintAlloc;
-const lowerDeleteParsedSqlAlloc = sql_adapter.lower_dml.lowerDeleteParsedSqlAlloc;
-const lowerDeleteJoinedMutationSourceWithSchemasAlloc = sql_adapter.lower_dml.lowerDeleteJoinedMutationSourceWithSchemasAlloc;
-const lowerDeleteJoinedMutationSourceWithSchemasParsedSqlAlloc = sql_adapter.lower_dml.lowerDeleteJoinedMutationSourceWithSchemasParsedSqlAlloc;
-const lowerExplainPlanWithOptionsCatalogAndFunctionBindingsParsedSqlAlloc = sql_adapter.lower_select.lowerExplainPlanWithOptionsCatalogAndFunctionBindingsParsedSqlAlloc;
-const lowerInsertWithResolverParsedSqlAlloc = sql_adapter.lower_dml.lowerInsertWithResolverParsedSqlAlloc;
-const lowerInsertWithResolverStrictParsedSqlAlloc = sql_adapter.lower_dml.lowerInsertWithResolverStrictParsedSqlAlloc;
-const lowerMergeMutationPlanParsedSqlAlloc = sql_adapter.lower_dml.lowerMergeMutationPlanParsedSqlAlloc;
-const lowerQueryPlanWithFunctionBindingsParsedSqlAlloc = sql_adapter.lower_select.lowerQueryPlanWithFunctionBindingsParsedSqlAlloc;
-const lowerReadPlanAlloc = sql_adapter.lower_select.lowerReadPlanAlloc;
-const lowerReadPlanWithCatalogAndFunctionBindingsParsedSqlAlloc = sql_adapter.lower_select.lowerReadPlanWithCatalogAndFunctionBindingsParsedSqlAlloc;
-const lowerReadPlanWithCatalogAlloc = sql_adapter.lower_select.lowerReadPlanWithCatalogAlloc;
-const lowerReadPlanWithFunctionBindingsParsedSqlAlloc = sql_adapter.lower_select.lowerReadPlanWithFunctionBindingsParsedSqlAlloc;
-const lowerRelationPopulationPlanWithCatalogAndFunctionBindingsParsedSqlAlloc = sql_adapter.lower_select.lowerRelationPopulationPlanWithCatalogAndFunctionBindingsParsedSqlAlloc;
-const lowerSelectParsedSqlAlloc = sql_adapter.lower_select.lowerSelectParsedSqlAlloc;
-const lowerUpdateJoinedMutationSourceWithSchemasAlloc = sql_adapter.lower_dml.lowerUpdateJoinedMutationSourceWithSchemasAlloc;
-const lowerUpdateJoinedMutationSourceWithSchemasParsedSqlAlloc = sql_adapter.lower_dml.lowerUpdateJoinedMutationSourceWithSchemasParsedSqlAlloc;
-const lowerUpdateMutationSourceParsedSqlAlloc = sql_adapter.lower_dml.lowerUpdateMutationSourceParsedSqlAlloc;
-const lowerUpdateParsedSqlAlloc = sql_adapter.lower_dml.lowerUpdateParsedSqlAlloc;
-const lowerUpdateStrictParsedSqlAlloc = sql_adapter.lower_dml.lowerUpdateStrictParsedSqlAlloc;
+const lowerDeleteParsedSqlAlloc = sql_adapter.lowerDeleteParsedSqlAlloc;
+const lowerDeleteJoinedMutationSourceWithSchemasAlloc = sql_adapter.lowerDeleteJoinedMutationSourceWithSchemasAlloc;
+const lowerDeleteJoinedMutationSourceWithSchemasParsedSqlAlloc = sql_adapter.lowerDeleteJoinedMutationSourceWithSchemasParsedSqlAlloc;
+const lowerExplainPlanWithOptionsCatalogAndFunctionBindingsParsedSqlAlloc = sql_adapter.lowerExplainPlanWithOptionsCatalogAndFunctionBindingsParsedSqlAlloc;
+const lowerInsertWithResolverParsedSqlAlloc = sql_adapter.lowerInsertWithResolverParsedSqlAlloc;
+const lowerInsertWithResolverStrictParsedSqlAlloc = sql_adapter.lowerInsertWithResolverStrictParsedSqlAlloc;
+const lowerMergeMutationPlanParsedSqlAlloc = sql_adapter.lowerMergeMutationPlanParsedSqlAlloc;
+const lowerQueryPlanWithFunctionBindingsParsedSqlAlloc = sql_adapter.lowerQueryPlanWithFunctionBindingsParsedSqlAlloc;
+const lowerReadPlanAlloc = sql_adapter.lowerReadPlanAlloc;
+const lowerReadPlanWithCatalogAndFunctionBindingsParsedSqlAlloc = sql_adapter.lowerReadPlanWithCatalogAndFunctionBindingsParsedSqlAlloc;
+const lowerReadPlanWithCatalogAlloc = sql_adapter.lowerReadPlanWithCatalogAlloc;
+const lowerReadPlanWithFunctionBindingsParsedSqlAlloc = sql_adapter.lowerReadPlanWithFunctionBindingsParsedSqlAlloc;
+const lowerRelationPopulationPlanWithCatalogAndFunctionBindingsParsedSqlAlloc = sql_adapter.lowerRelationPopulationPlanWithCatalogAndFunctionBindingsParsedSqlAlloc;
+const lowerSelectParsedSqlAlloc = sql_adapter.lowerSelectParsedSqlAlloc;
+const lowerUpdateJoinedMutationSourceWithSchemasAlloc = sql_adapter.lowerUpdateJoinedMutationSourceWithSchemasAlloc;
+const lowerUpdateJoinedMutationSourceWithSchemasParsedSqlAlloc = sql_adapter.lowerUpdateJoinedMutationSourceWithSchemasParsedSqlAlloc;
+const lowerUpdateMutationSourceParsedSqlAlloc = sql_adapter.lowerUpdateMutationSourceParsedSqlAlloc;
+const lowerUpdateParsedSqlAlloc = sql_adapter.lowerUpdateParsedSqlAlloc;
+const lowerUpdateStrictParsedSqlAlloc = sql_adapter.lowerUpdateStrictParsedSqlAlloc;
 const lowerWritePlanAlloc = sql_adapter.lowerWritePlanAlloc;
 const lowerWritePlanWithCatalogAlloc = sql_adapter.lowerWritePlanWithCatalogAlloc;
 const lowerWritePlanWithCatalogParsedSqlAlloc = sql_adapter.lowerWritePlanWithCatalogParsedSqlAlloc;
@@ -8117,6 +8126,514 @@ test "postgres sql adapter insert source temporal unique conflict executes throu
     try std.testing.expectEqual(@as(u32, 1), rows.total);
     try std.testing.expectEqual(@as(usize, 1), rows.rows.len);
     try std.testing.expectEqualStrings("{\"id\":\"existing\",\"sku\":\"sku:a\",\"valid_from\":0,\"valid_to\":10,\"price\":13}", rows.rows[0]);
+}
+
+test "postgres sql adapter lowered indexed read selects ordered tuple stream" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"status":{"type":"keyword"},"created_at":{"type":"numeric"},"amount":{"type":"numeric"}},"required":["id","tenant","status","created_at"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_status_created_idx","owner_kind":"relational_column","owner_name":"tenant","access_method":"ordered_tuple","columns":["tenant","status","created_at"],"keys":[{"column":"tenant"},{"column":"status"},{"column":"created_at","direction":"desc","nulls":"last"}],"include_columns":["id","amount"],"lifecycle":"ready","generation":9,"schema_fingerprint":"secondary-index-v1:tenant_status_created_idx","generation_record":{"generation":9,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sql-indexed-read-plan-execution", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    try db.applyTableSchemaJson(alloc, schema_json, .{});
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"tenant\":\"t1\",\"status\":\"open\",\"created_at\":10,\"amount\":4}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"tenant\":\"t1\",\"status\":\"open\",\"created_at\":30,\"amount\":8}" },
+            .{ .key = "row:c", .value = "{\"id\":\"c\",\"tenant\":\"t1\",\"status\":\"closed\",\"created_at\":20,\"amount\":2}" },
+            .{ .key = "row:d", .value = "{\"id\":\"d\",\"tenant\":\"t2\",\"status\":\"open\",\"created_at\":40,\"amount\":9}" },
+        },
+        .sync_level = .write,
+    });
+
+    var lowered_plan = try lowerReadPlanAlloc(
+        alloc,
+        "SELECT id, amount FROM usage_records WHERE tenant = 't1' AND status = 'open' LIMIT 2",
+        schema,
+        &.{},
+    );
+    defer lowered_plan.deinit(alloc);
+
+    switch (lowered_plan) {
+        .query => |lowered| {
+            var request = lowered.plan.query;
+            request.profile = true;
+            request.total_mode = .none;
+            var result = try db.queryRelationalRows(alloc, schema, request);
+            defer result.deinit(alloc);
+
+            try std.testing.expectEqual(db_mod.types.RelationalRowsQueryResult.AccessMethod.ordered_tuple_stream, result.profile.access_method);
+            try std.testing.expect(result.profile.ordered_tuple_plan_selected);
+            try std.testing.expectEqual(@as(u32, 2), result.total);
+            try std.testing.expect(!result.total_exact);
+            try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+            try std.testing.expectEqualStrings("{\"id\":\"b\",\"amount\":8}", result.rows[0]);
+            try std.testing.expectEqualStrings("{\"id\":\"a\",\"amount\":4}", result.rows[1]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "postgres sql adapter relational full text read matches rows API scalar predicate" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"title":{"type":"text"},"status":{"type":"keyword"}},"required":["id","title","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_idx","owner_kind":"relational_column","owner_name":"status","access_method":"scalar_column","columns":["status"]}]}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sql-relational-full-text-scalar-parity", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    try db.applyTableSchemaJson(alloc, schema_json, .{});
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"title\":\"alpha launch notes\",\"status\":\"active\"}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"title\":\"beta launch notes\",\"status\":\"active\"}" },
+            .{ .key = "row:c", .value = "{\"id\":\"c\",\"title\":\"alpha archive notes\",\"status\":\"archived\"}" },
+            .{ .key = "row:d", .value = "{\"id\":\"d\",\"title\":\"alpha support notes\",\"status\":\"active\"}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    var lowered_plan = try lowerReadPlanAlloc(
+        alloc,
+        "SELECT id, status FROM usage_records WHERE full_text_search('title:alpha') AND status = 'active' ORDER BY id LIMIT 10",
+        schema,
+        &.{},
+    );
+    defer lowered_plan.deinit(alloc);
+
+    const select = [_][]const u8{ "id", "status" };
+    const predicates = [_]runtime_schema.RelationalCheck{.{
+        .name = "",
+        .field = "status",
+        .op = .eq,
+        .value_json = "\"active\"",
+    }};
+    const order_by = [_]db_mod.types.RelationalRowsQueryOrder{.{
+        .field = "id",
+        .direction = .asc,
+    }};
+    var api_result = try db.queryRelationalRows(alloc, schema, .{
+        .predicates = predicates[0..],
+        .full_text = .{ .match = .{ .field = "title", .text = "alpha" } },
+        .select = select[0..],
+        .select_all = false,
+        .order_by = order_by[0..],
+        .limit = 10,
+        .profile = true,
+    });
+    defer api_result.deinit(alloc);
+
+    switch (lowered_plan) {
+        .query => |lowered| {
+            try std.testing.expect(lowered.plan.query.full_text != null);
+            try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.predicates.len);
+            var sql_request = lowered.plan.query;
+            sql_request.profile = true;
+            var sql_result = try db.queryRelationalRows(alloc, schema, sql_request);
+            defer sql_result.deinit(alloc);
+
+            try std.testing.expectEqual(api_result.total, sql_result.total);
+            try std.testing.expectEqual(api_result.rows.len, sql_result.rows.len);
+            for (api_result.rows, 0..) |row, i| {
+                try std.testing.expectEqualStrings(row, sql_result.rows[i]);
+            }
+            try std.testing.expectEqual(api_result.profile.access_method, sql_result.profile.access_method);
+            try std.testing.expectEqual(api_result.profile.scalar_candidate_sets, sql_result.profile.scalar_candidate_sets);
+            try std.testing.expectEqual(api_result.profile.text_search_candidate_sets, sql_result.profile.text_search_candidate_sets);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "postgres sql adapter relational full text read matches rows API array predicate" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"title":{"type":"text"},"status":{"type":"keyword"},"tags":{"type":"array","items":{"type":"keyword"}}},"required":["id","title","status","tags"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sql-relational-full-text-array-parity", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    try db.applyTableSchemaJson(alloc, schema_json, .{});
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"title\":\"alpha launch notes\",\"status\":\"active\",\"tags\":[\"urgent\",\"launch\"]}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"title\":\"beta launch notes\",\"status\":\"active\",\"tags\":[\"urgent\"]}" },
+            .{ .key = "row:c", .value = "{\"id\":\"c\",\"title\":\"alpha archive notes\",\"status\":\"archived\",\"tags\":[\"support\"]}" },
+            .{ .key = "row:d", .value = "{\"id\":\"d\",\"title\":\"alpha support notes\",\"status\":\"active\",\"tags\":[\"urgent\",\"support\"]}" },
+            .{ .key = "row:e", .value = "{\"id\":\"e\",\"title\":\"alpha billing notes\",\"status\":\"active\",\"tags\":[\"billing\"]}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    var lowered_plan = try lowerReadPlanAlloc(
+        alloc,
+        "SELECT id, status FROM usage_records WHERE full_text_search('title:alpha') AND tags @> ARRAY['urgent']::text[] ORDER BY id LIMIT 10",
+        schema,
+        &.{},
+    );
+    defer lowered_plan.deinit(alloc);
+
+    const select = [_][]const u8{ "id", "status" };
+    const array_contains = [_]db_mod.types.RelationalRowsArrayContainsPredicate{.{
+        .field = "tags",
+        .value_json = "[\"urgent\"]",
+    }};
+    const order_by = [_]db_mod.types.RelationalRowsQueryOrder{.{
+        .field = "id",
+        .direction = .asc,
+    }};
+    var api_result = try db.queryRelationalRows(alloc, schema, .{
+        .array_contains = array_contains[0..],
+        .full_text = .{ .match = .{ .field = "title", .text = "alpha" } },
+        .select = select[0..],
+        .select_all = false,
+        .order_by = order_by[0..],
+        .limit = 10,
+        .profile = true,
+    });
+    defer api_result.deinit(alloc);
+
+    switch (lowered_plan) {
+        .query => |lowered| {
+            try std.testing.expect(lowered.plan.query.full_text != null);
+            try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.array_contains.len);
+            try std.testing.expectEqual(@as(usize, 0), lowered.plan.query.predicates.len);
+            var sql_request = lowered.plan.query;
+            sql_request.profile = true;
+            var sql_result = try db.queryRelationalRows(alloc, schema, sql_request);
+            defer sql_result.deinit(alloc);
+
+            try std.testing.expectEqual(api_result.total, sql_result.total);
+            try std.testing.expectEqual(api_result.rows.len, sql_result.rows.len);
+            for (api_result.rows, 0..) |row, i| {
+                try std.testing.expectEqualStrings(row, sql_result.rows[i]);
+            }
+            try std.testing.expectEqualStrings("{\"id\":\"a\",\"status\":\"active\"}", sql_result.rows[0]);
+            try std.testing.expectEqualStrings("{\"id\":\"d\",\"status\":\"active\"}", sql_result.rows[1]);
+            try std.testing.expectEqual(api_result.profile.access_method, sql_result.profile.access_method);
+            try std.testing.expectEqual(api_result.profile.array_candidate_sets, sql_result.profile.array_candidate_sets);
+            try std.testing.expectEqual(api_result.profile.text_search_candidate_sets, sql_result.profile.text_search_candidate_sets);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "postgres sql adapter relational full text read matches rows API JSON predicate" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"title":{"type":"text"},"status":{"type":"keyword"},"metadata":{"type":"json"}},"required":["id","title","status","metadata"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sql-relational-full-text-json-parity", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    try db.applyTableSchemaJson(alloc, schema_json, .{});
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"title\":\"alpha launch notes\",\"status\":\"active\",\"metadata\":{\"billing\":{\"plan\":\"pro\"},\"source\":\"api\"}}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"title\":\"beta launch notes\",\"status\":\"active\",\"metadata\":{\"billing\":{\"plan\":\"pro\"},\"source\":\"api\"}}" },
+            .{ .key = "row:c", .value = "{\"id\":\"c\",\"title\":\"alpha archive notes\",\"status\":\"archived\",\"metadata\":{\"billing\":{\"plan\":\"free\"},\"source\":\"api\"}}" },
+            .{ .key = "row:d", .value = "{\"id\":\"d\",\"title\":\"alpha support notes\",\"status\":\"active\",\"metadata\":{\"billing\":{\"plan\":\"pro\"},\"source\":\"worker\"}}" },
+            .{ .key = "row:e", .value = "{\"id\":\"e\",\"title\":\"alpha billing notes\",\"status\":\"active\",\"metadata\":{\"billing\":{\"plan\":\"trial\"},\"source\":\"api\"}}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    var lowered_plan = try lowerReadPlanAlloc(
+        alloc,
+        "SELECT id, status FROM usage_records WHERE full_text_search('title:alpha') AND metadata @> '{\"billing\":{\"plan\":\"pro\"}}'::jsonb ORDER BY id LIMIT 10",
+        schema,
+        &.{},
+    );
+    defer lowered_plan.deinit(alloc);
+
+    const select = [_][]const u8{ "id", "status" };
+    const json_contains = [_]db_mod.types.RelationalRowsJsonContainsPredicate{.{
+        .field = "metadata",
+        .value_json = "{\"billing\":{\"plan\":\"pro\"}}",
+    }};
+    const order_by = [_]db_mod.types.RelationalRowsQueryOrder{.{
+        .field = "id",
+        .direction = .asc,
+    }};
+    var api_result = try db.queryRelationalRows(alloc, schema, .{
+        .json_contains = json_contains[0..],
+        .full_text = .{ .match = .{ .field = "title", .text = "alpha" } },
+        .select = select[0..],
+        .select_all = false,
+        .order_by = order_by[0..],
+        .limit = 10,
+        .profile = true,
+    });
+    defer api_result.deinit(alloc);
+
+    switch (lowered_plan) {
+        .query => |lowered| {
+            try std.testing.expect(lowered.plan.query.full_text != null);
+            try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.json_contains.len);
+            try std.testing.expectEqual(@as(usize, 0), lowered.plan.query.predicates.len);
+            var sql_request = lowered.plan.query;
+            sql_request.profile = true;
+            var sql_result = try db.queryRelationalRows(alloc, schema, sql_request);
+            defer sql_result.deinit(alloc);
+
+            try std.testing.expectEqual(api_result.total, sql_result.total);
+            try std.testing.expectEqual(api_result.rows.len, sql_result.rows.len);
+            for (api_result.rows, 0..) |row, i| {
+                try std.testing.expectEqualStrings(row, sql_result.rows[i]);
+            }
+            try std.testing.expectEqualStrings("{\"id\":\"a\",\"status\":\"active\"}", sql_result.rows[0]);
+            try std.testing.expectEqualStrings("{\"id\":\"d\",\"status\":\"active\"}", sql_result.rows[1]);
+            try std.testing.expectEqual(api_result.profile.access_method, sql_result.profile.access_method);
+            try std.testing.expectEqual(api_result.profile.json_candidate_sets, sql_result.profile.json_candidate_sets);
+            try std.testing.expectEqual(api_result.profile.text_search_candidate_sets, sql_result.profile.text_search_candidate_sets);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "postgres sql adapter relational full text read matches rows API ordered tuple predicate" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"title":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id","tenant","title","status","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_status_idx","owner_kind":"relational_column","owner_name":"tenant","access_method":"ordered_tuple","columns":["tenant","status"],"keys":[{"column":"tenant"},{"column":"status"}],"include_columns":["id","amount"],"lifecycle":"ready","generation":9,"schema_fingerprint":"secondary-index-v1:tenant_status_idx","generation_record":{"generation":9,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sql-relational-full-text-ordered-tuple-parity", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    try db.applyTableSchemaJson(alloc, schema_json, .{});
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"tenant\":\"t1\",\"title\":\"alpha launch notes\",\"status\":\"active\",\"amount\":7}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"tenant\":\"t1\",\"title\":\"beta launch notes\",\"status\":\"active\",\"amount\":9}" },
+            .{ .key = "row:c", .value = "{\"id\":\"c\",\"tenant\":\"t1\",\"title\":\"alpha archive notes\",\"status\":\"archived\",\"amount\":3}" },
+            .{ .key = "row:d", .value = "{\"id\":\"d\",\"tenant\":\"t2\",\"title\":\"alpha support notes\",\"status\":\"active\",\"amount\":5}" },
+            .{ .key = "row:e", .value = "{\"id\":\"e\",\"tenant\":\"t1\",\"title\":\"alpha billing notes\",\"status\":\"active\",\"amount\":11}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    var lowered_plan = try lowerReadPlanAlloc(
+        alloc,
+        "SELECT id, amount FROM usage_records WHERE full_text_search('title:alpha') AND tenant = 't1' AND status = 'active' ORDER BY id LIMIT 10",
+        schema,
+        &.{},
+    );
+    defer lowered_plan.deinit(alloc);
+
+    const select = [_][]const u8{ "id", "amount" };
+    const predicates = [_]runtime_schema.RelationalCheck{
+        .{ .name = "", .field = "tenant", .op = .eq, .value_json = "\"t1\"" },
+        .{ .name = "", .field = "status", .op = .eq, .value_json = "\"active\"" },
+    };
+    const order_by = [_]db_mod.types.RelationalRowsQueryOrder{.{
+        .field = "id",
+        .direction = .asc,
+    }};
+    var api_result = try db.queryRelationalRows(alloc, schema, .{
+        .predicates = predicates[0..],
+        .full_text = .{ .match = .{ .field = "title", .text = "alpha" } },
+        .select = select[0..],
+        .select_all = false,
+        .order_by = order_by[0..],
+        .limit = 10,
+        .profile = true,
+    });
+    defer api_result.deinit(alloc);
+
+    switch (lowered_plan) {
+        .query => |lowered| {
+            try std.testing.expect(lowered.plan.query.full_text != null);
+            try std.testing.expectEqual(@as(usize, 2), lowered.plan.query.predicates.len);
+            var sql_request = lowered.plan.query;
+            sql_request.profile = true;
+            var sql_result = try db.queryRelationalRows(alloc, schema, sql_request);
+            defer sql_result.deinit(alloc);
+
+            try std.testing.expectEqual(api_result.total, sql_result.total);
+            try std.testing.expectEqual(api_result.rows.len, sql_result.rows.len);
+            for (api_result.rows, 0..) |row, i| {
+                try std.testing.expectEqualStrings(row, sql_result.rows[i]);
+            }
+            try std.testing.expectEqualStrings("{\"id\":\"a\",\"amount\":7}", sql_result.rows[0]);
+            try std.testing.expectEqualStrings("{\"id\":\"e\",\"amount\":11}", sql_result.rows[1]);
+            try std.testing.expectEqual(@as(u32, 1), sql_result.profile.ordered_tuple_candidate_sets);
+            try std.testing.expectEqual(@as(u32, 1), sql_result.profile.text_search_candidate_sets);
+            try std.testing.expect(sql_result.profile.ordered_tuple_plan_selected);
+            try std.testing.expectEqual(api_result.profile.access_method, sql_result.profile.access_method);
+            try std.testing.expectEqual(api_result.profile.ordered_tuple_candidate_sets, sql_result.profile.ordered_tuple_candidate_sets);
+            try std.testing.expectEqual(api_result.profile.text_search_candidate_sets, sql_result.profile.text_search_candidate_sets);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "postgres sql adapter expression-key ordered tuple read reports typed unsupported reasons" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"email":{"type":"keyword"}},"required":["id","tenant","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_tenant_lower_email_key","columns":["tenant"],"expressions":[{"op":"lower","field":"email"}]}],"relational_indexes":[{"name":"users_tenant_lower_email_key","owner_kind":"unique_constraint","owner_name":"users_tenant_lower_email_key","access_method":"ordered_tuple","columns":["tenant"],"expressions":[{"op":"lower","field":"email"}],"unique":true,"keys":[{"column":"tenant"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:users_tenant_lower_email_key","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sql-expression-key-indexed-read-plan-execution", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    try db.applyTableSchemaJson(alloc, schema_json, .{});
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"tenant\":\"t1\",\"email\":\"Zulu@Example.test\"}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"tenant\":\"t1\",\"email\":\"Ada@Example.test\"}" },
+            .{ .key = "row:c", .value = "{\"id\":\"c\",\"tenant\":\"t1\",\"email\":\"Grace@Example.test\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    var lowered_plan = try lowerReadPlanAlloc(
+        alloc,
+        "SELECT id, email FROM usage_records WHERE tenant = 't1' ORDER BY lower(email) LIMIT 2",
+        schema,
+        &.{},
+    );
+    defer lowered_plan.deinit(alloc);
+
+    switch (lowered_plan) {
+        .query => |lowered| {
+            var request = lowered.plan.query;
+            request.profile = true;
+            request.total_mode = .none;
+            var result = try db.queryRelationalRows(alloc, schema, request);
+            defer result.deinit(alloc);
+
+            try std.testing.expect(result.include_profile);
+            try std.testing.expect(result.profile.access_method != .ordered_tuple_stream);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsQueryResult.FallbackReason.ordered_tuple_order_field_not_covered, result.profile.fallback_reason);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsQueryResult.UnsupportedReason.ordering_not_covered, result.profile.unsupportedReason());
+            try std.testing.expectEqual(@as(u32, 2), result.total);
+            try std.testing.expect(!result.total_exact);
+            try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+            try std.testing.expectEqualStrings("{\"id\":\"b\",\"email\":\"Ada@Example.test\"}", result.rows[0]);
+            try std.testing.expectEqualStrings("{\"id\":\"c\",\"email\":\"Grace@Example.test\"}", result.rows[1]);
+
+            const response = try relational_rows.encodeRowsQueryResponseAlloc(alloc, result);
+            defer alloc.free(response);
+            try std.testing.expect(std.mem.indexOf(u8, response, "\"fallback_reason\":\"ordered_tuple_order_field_not_covered\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, response, "\"unsupported_reason\":\"ordering-not-covered\"") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var range_plan = try lowerReadPlanAlloc(
+        alloc,
+        "SELECT id, email FROM usage_records WHERE tenant = 't1' AND lower(email) > 'b' ORDER BY id LIMIT 2",
+        schema,
+        &.{},
+    );
+    defer range_plan.deinit(alloc);
+
+    switch (range_plan) {
+        .query => |lowered| {
+            var request = lowered.plan.query;
+            request.profile = true;
+            request.total_mode = .none;
+            var result = try db.queryRelationalRows(alloc, schema, request);
+            defer result.deinit(alloc);
+
+            try std.testing.expect(result.include_profile);
+            try std.testing.expect(result.profile.access_method != .ordered_tuple_doc_set);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsQueryResult.FallbackReason.ordered_tuple_predicate_not_proven, result.profile.fallback_reason);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsQueryResult.UnsupportedReason.predicate_not_proven, result.profile.unsupportedReason());
+            try std.testing.expectEqual(@as(u32, 2), result.total);
+            try std.testing.expect(!result.total_exact);
+            try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+            try std.testing.expectEqualStrings("{\"id\":\"a\",\"email\":\"Zulu@Example.test\"}", result.rows[0]);
+            try std.testing.expectEqualStrings("{\"id\":\"c\",\"email\":\"Grace@Example.test\"}", result.rows[1]);
+
+            const response = try relational_rows.encodeRowsQueryResponseAlloc(alloc, result);
+            defer alloc.free(response);
+            try std.testing.expect(std.mem.indexOf(u8, response, "\"fallback_reason\":\"ordered_tuple_predicate_not_proven\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, response, "\"unsupported_reason\":\"predicate-not-proven\"") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "postgres sql adapter typed read plans execute through relational storage" {

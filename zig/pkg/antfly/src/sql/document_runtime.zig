@@ -3334,9 +3334,7 @@ fn documentSqlIndexQueryRequestAlloc(
     var first = true;
     if (query.full_text_query) |full_text| {
         try appendJsonFieldName(alloc, &out, &first, "full_text_search");
-        try out.appendSlice(alloc, "{\"query\":");
-        try appendJsonString(alloc, &out, full_text);
-        try out.append(alloc, '}');
+        try documentSqlAppendFullTextSearchAlloc(alloc, &out, full_text);
     } else if (query.filter_query_json != null) {
         try appendJsonFieldName(alloc, &out, &first, "full_text_search");
         try out.appendSlice(alloc, "{\"match_all\":{}}");
@@ -3362,6 +3360,38 @@ fn documentSqlIndexQueryRequestAlloc(
         .body_json = body,
         .index_name = query.index_name,
     };
+}
+
+fn documentSqlAppendFullTextSearchAlloc(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    query: []const u8,
+) !void {
+    if (documentSqlFullTextQueryLeadingField(query)) |field| {
+        const text = std.mem.trim(u8, query[field.len + 1 ..], " \t\r\n");
+        if (text.len > 0) {
+            try out.appendSlice(alloc, "{\"match\":");
+            try appendJsonString(alloc, out, text);
+            try out.appendSlice(alloc, ",\"field\":");
+            try appendJsonString(alloc, out, field);
+            try out.append(alloc, '}');
+            return;
+        }
+    }
+    try out.appendSlice(alloc, "{\"query\":");
+    try appendJsonString(alloc, out, query);
+    try out.append(alloc, '}');
+}
+
+fn documentSqlFullTextQueryLeadingField(query: []const u8) ?[]const u8 {
+    const colon = std.mem.indexOfScalar(u8, query, ':') orelse return null;
+    if (colon == 0) return null;
+    const field = std.mem.trim(u8, query[0..colon], " \t\r\n");
+    if (field.len == 0 or field.len != colon) return null;
+    for (field) |ch| {
+        if (!(std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '-' or ch == '.' or ch == '/')) return null;
+    }
+    return field;
 }
 
 fn documentSqlNativeIndexQueryRequestBodyAlloc(
@@ -4772,7 +4802,7 @@ fn documentSqlProjectedParsedRowJsonWithUnnestAndLateralAlloc(
                     try writer.writeAll("null");
                     continue;
                 }
-                const number = try documentSqlJsonNumber(value);
+                const number = try documentSqlNumericCastValue(value);
                 try writer.print("{d}", .{number});
             },
             .scalar_boolean_cast => {
@@ -5869,7 +5899,7 @@ fn documentSqlFilterValueMatches(
         const path = try documentSqlFilterPath(range);
         const actual = documentSqlProjectedValue(doc, path) orelse return false;
         if (actual == .null) return false;
-        const number = try documentSqlJsonNumber(actual);
+        const number = try documentSqlNumericCastValue(actual);
         return try documentSqlNumericRangeValueMatches(number, range);
     }
     if (filter.object.get("scalar_boolean_cast_term")) |term| {
@@ -6439,6 +6469,14 @@ fn documentSqlJsonNumber(value: std.json.Value) !f64 {
         .integer => |item| @floatFromInt(item),
         .float => |item| item,
         .number_string => |text| try std.fmt.parseFloat(f64, text),
+        else => error.InvalidRowsRequest,
+    };
+}
+
+fn documentSqlNumericCastValue(value: std.json.Value) !f64 {
+    return switch (value) {
+        .integer, .float, .number_string => try documentSqlJsonNumber(value),
+        .string => |text| std.fmt.parseFloat(f64, text) catch return error.InvalidRowsRequest,
         else => error.InvalidRowsRequest,
     };
 }

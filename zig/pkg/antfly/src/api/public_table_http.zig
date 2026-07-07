@@ -678,10 +678,19 @@ pub fn handleTableBackup(
     };
 }
 
-fn parseBackupFormat(value: ?[]const u8) !backups_api.BackupFormat {
+fn parseBackupFormat(value: anytype) !backups_api.BackupFormat {
     const format = value orelse return .native;
-    if (std.mem.eql(u8, format, "native")) return .native;
-    if (std.mem.eql(u8, format, "portable")) return .portable;
+    switch (@typeInfo(@TypeOf(format))) {
+        .@"enum" => return switch (format) {
+            .native => .native,
+            .portable => .portable,
+        },
+        .pointer => {
+            if (std.mem.eql(u8, format, "native")) return .native;
+            if (std.mem.eql(u8, format, "portable")) return .portable;
+        },
+        else => {},
+    }
     return error.UnsupportedBackupFormat;
 }
 

@@ -1675,7 +1675,7 @@ fn durableRelationalSqlDdlPlanFromParsedSqlAlloc(
     parsed_sql: *const sql_adapter.ParsedSql,
     function_bindings: sql_adapter.SqlFunctionBindings,
 ) !sql_adapter.DurableSqlPlan {
-    var logical_plan = try sql_adapter.lower_ddl.logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, function_bindings);
+    var logical_plan = try sql_adapter.logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, function_bindings);
     errdefer logical_plan.deinit(alloc);
     return try sql_adapter.takeDurableSqlPlanFromLogical(&logical_plan);
 }
@@ -1707,14 +1707,17 @@ pub fn applyTableDdlPlanToTableRecordWithSessionAlloc(
 
     switch (plan.*) {
         .create_index => |create_index| {
-            if (create_index.derived_index_config_json) |index_json| {
+            if (create_index.derived_index_config_json) |index_json| if (sql_adapter.createIndexPlanIsSchemaDerivedAlgebraic(create_index)) {
+                return try applyRelationalAlgebraicIndexCreateToTableRecordAlloc(alloc, table, create_index, index_json);
+            } else if (create_index.method != .antfly_full_text) {
                 return try applyRelationalDerivedIndexCreateToTableRecordAlloc(alloc, table, create_index, index_json);
-            }
+            };
         },
         .drop_index => |drop_index| {
             if (try tableIndexesJsonContainsIndex(alloc, table.indexes_json, drop_index.index_name)) {
                 return try applyRelationalDerivedIndexDropToTableRecordAlloc(alloc, table, drop_index.index_name);
             }
+            try validateDerivedIndexHasNoDependentsAlloc(alloc, table.indexes_json, drop_index.index_name);
         },
         else => {},
     }
@@ -1732,6 +1735,45 @@ pub fn applyTableDdlPlanToTableRecordWithSessionAlloc(
     defer applied.deinit(alloc);
 
     const updated = try applyRelationalDdlSchemaRecordAlloc(alloc, table, applied.schema_json);
+    const work_items = applied.work_items;
+    applied.work_items = &.{};
+    return .{
+        .table = updated,
+        .requires_rebuild = applied.requires_rebuild,
+        .validation_required = applied.validation_required,
+        .rewrite_required = applied.rewrite_required,
+        .work_items = work_items,
+    };
+}
+
+fn applyRelationalAlgebraicIndexCreateToTableRecordAlloc(
+    alloc: std.mem.Allocator,
+    table: *const metadata_table_manager.TableRecord,
+    plan: sql_adapter.CreateIndexPlan,
+    index_json: []const u8,
+) !AppliedRelationalSqlDdlRecord {
+    if (table.schema_json.len == 0) return error.InvalidSchemaUpdateRequest;
+
+    var applied = try sql_adapter.applyTableDdlPlanToSchemaJsonAlloc(alloc, table.schema_json, .{ .create_index = plan });
+    defer applied.deinit(alloc);
+
+    var updated = try applyRelationalDdlSchemaRecordAlloc(alloc, table, applied.schema_json);
+    errdefer metadata_table_manager.freeTable(alloc, updated);
+
+    if (!(try tableIndexesJsonContainsIndex(alloc, updated.indexes_json, plan.index_name))) {
+        try validateDerivedIndexFieldRefsForSchemaAlloc(alloc, index_json, updated.schema_json);
+        try validateDerivedIndexCatalogRefsForTableIndexesAlloc(alloc, index_json, updated.indexes_json, updated.schema_json);
+
+        const next_indexes_json = try indexes_api.addIndexToTableIndexesJson(alloc, updated.indexes_json, plan.index_name, index_json);
+        defer alloc.free(next_indexes_json);
+        const prepared_indexes_json = try prepareTableIndexesForSchemaAlloc(alloc, updated.name, next_indexes_json, updated.schema_json);
+        defer alloc.free(prepared_indexes_json);
+
+        const owned_indexes_json = try alloc.dupe(u8, prepared_indexes_json);
+        alloc.free(updated.indexes_json);
+        updated.indexes_json = owned_indexes_json;
+    }
+
     const work_items = applied.work_items;
     applied.work_items = &.{};
     return .{
@@ -1887,7 +1929,7 @@ fn applyRelationalDerivedIndexCreateToTableRecordAlloc(
         return error.InvalidSqlCatalog;
     }
     try validateDerivedIndexFieldRefsForSchemaAlloc(alloc, index_json, table.schema_json);
-    try validateDerivedIndexCatalogRefsForTableIndexesAlloc(alloc, index_json, table.indexes_json);
+    try validateDerivedIndexCatalogRefsForTableIndexesAlloc(alloc, index_json, table.indexes_json, table.schema_json);
 
     const next_indexes_json = try indexes_api.addIndexToTableIndexesJson(alloc, table.indexes_json, plan.index_name, index_json);
     defer alloc.free(next_indexes_json);
@@ -1962,6 +2004,7 @@ fn validateDerivedIndexCatalogRefsForTableIndexesAlloc(
     alloc: std.mem.Allocator,
     index_json: []const u8,
     indexes_json: []const u8,
+    schema_json: []const u8,
 ) !void {
     var parsed_index = try std.json.parseFromSlice(std.json.Value, alloc, index_json, .{});
     defer parsed_index.deinit();
@@ -1992,10 +2035,28 @@ fn validateDerivedIndexCatalogRefsForTableIndexesAlloc(
         if (sources.array.items.len == 0) return error.InvalidTableIndexMetadata;
         for (sources.array.items) |source| {
             if (source != .string) return error.InvalidTableIndexMetadata;
-            const source_config = indexes.get(source.string) orelse return error.InvalidTableIndexMetadata;
-            try validateHybridSourceIndexConfigType(source_config);
+            if (indexes.get(source.string)) |source_config| {
+                try validateHybridSourceIndexConfigType(source_config);
+                continue;
+            }
+            if (try relationalTextSearchIndexExistsAlloc(alloc, schema_json, source.string)) continue;
+            return error.InvalidTableIndexMetadata;
         }
     }
+}
+
+fn relationalTextSearchIndexExistsAlloc(
+    alloc: std.mem.Allocator,
+    schema_json: []const u8,
+    index_name: []const u8,
+) !bool {
+    if (schema_json.len == 0) return false;
+    var parsed = try parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema_mod.freeSchema(alloc, runtime);
+    const index = secondaryIndexCatalogByName(runtime.relational_indexes, index_name) orelse return false;
+    return index.access_method == .text_search;
 }
 
 fn validateGraphEdgePolicyValue(value: std.json.Value) !void {
@@ -2579,20 +2640,13 @@ pub fn schemaWithSecondaryIndexBuildingAlloc(
         const key = try json_alloc.dupe(u8, "generation");
         try index.put(json_alloc, key, .{ .integer = generation_integer });
     }
-    if (index.getPtr("access_method")) |value| {
-        if (value.* != .string or value.string.len == 0) value.* = .{ .string = "scalar_column" };
-    } else {
-        const key = try json_alloc.dupe(u8, "access_method");
-        try index.put(json_alloc, key, .{ .string = "scalar_column" });
-    }
-    if (index.getPtr("schema_fingerprint")) |value| {
-        if (value.* != .string or value.string.len == 0) {
-            value.* = .{ .string = try std.fmt.allocPrint(json_alloc, "secondary-index-v1:{s}", .{index_name}) };
-        }
-    } else {
-        const key = try json_alloc.dupe(u8, "schema_fingerprint");
-        try index.put(json_alloc, key, .{ .string = try std.fmt.allocPrint(json_alloc, "secondary-index-v1:{s}", .{index_name}) });
-    }
+    const access_method_value = index.get("access_method") orelse return error.InvalidSchemaUpdateRequest;
+    if (access_method_value != .string or access_method_value.string.len == 0) return error.InvalidSchemaUpdateRequest;
+    const access_method = runtime_schema_mod.RelationalIndexAccessMethod.fromString(access_method_value.string) orelse return error.InvalidSchemaUpdateRequest;
+    const fingerprint_value = index.get("schema_fingerprint") orelse return error.InvalidSchemaUpdateRequest;
+    if (fingerprint_value != .string or fingerprint_value.string.len == 0) return error.InvalidSchemaUpdateRequest;
+    try markRelationalIndexGenerationRecordBuilding(index, access_method, generation_integer);
+    try ensureRelationalIndexPlannerCapabilities(json_alloc, index, access_method);
 
     const updated = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
     errdefer alloc.free(updated);
@@ -2606,6 +2660,68 @@ pub fn schemaWithSecondaryIndexBuildingAlloc(
         return error.InvalidSchemaUpdateRequest;
     }
     return updated;
+}
+
+fn markRelationalIndexGenerationRecordBuilding(
+    index: *std.json.ObjectMap,
+    access_method: runtime_schema_mod.RelationalIndexAccessMethod,
+    generation_integer: i64,
+) !void {
+    switch (access_method) {
+        .scalar_column => return,
+        .ordered_tuple, .text_search, .algebraic_filter => {},
+    }
+    const record_value = index.getPtr("generation_record") orelse return error.InvalidSchemaUpdateRequest;
+    if (record_value.* != .object) return error.InvalidSchemaUpdateRequest;
+    const record = &record_value.object;
+    if (record.getPtr("generation")) |value| {
+        value.* = .{ .integer = generation_integer };
+    } else {
+        return error.InvalidSchemaUpdateRequest;
+    }
+    if (record.getPtr("lifecycle")) |value| {
+        value.* = .{ .string = "building" };
+    } else {
+        return error.InvalidSchemaUpdateRequest;
+    }
+}
+
+fn ensureRelationalIndexPlannerCapabilities(
+    json_alloc: std.mem.Allocator,
+    index: *std.json.ObjectMap,
+    access_method: runtime_schema_mod.RelationalIndexAccessMethod,
+) !void {
+    if (index.get("planner_capabilities")) |value| {
+        if (value != .object) return error.InvalidSchemaUpdateRequest;
+        return;
+    }
+
+    var capabilities = std.json.ObjectMap.empty;
+    try putPlannerCapability(json_alloc, &capabilities, "equality", access_method == .scalar_column or access_method == .ordered_tuple or access_method == .algebraic_filter);
+    try putPlannerCapability(json_alloc, &capabilities, "range", access_method == .scalar_column or access_method == .ordered_tuple);
+    try putPlannerCapability(json_alloc, &capabilities, "ordering", access_method == .ordered_tuple);
+    try putPlannerCapability(json_alloc, &capabilities, "prefix", access_method == .algebraic_filter);
+    try putPlannerCapability(json_alloc, &capabilities, "full_text", access_method == .text_search);
+    try putPlannerCapability(json_alloc, &capabilities, "array", access_method == .algebraic_filter);
+    try putPlannerCapability(json_alloc, &capabilities, "json", access_method == .algebraic_filter);
+    try putPlannerCapability(json_alloc, &capabilities, "covering", false);
+    try putPlannerCapability(json_alloc, &capabilities, "rank", access_method == .text_search);
+    try putPlannerCapability(json_alloc, &capabilities, "algebraic_dictionary", access_method == .algebraic_filter);
+    try putPlannerCapability(json_alloc, &capabilities, "algebraic_fact", access_method == .algebraic_filter);
+    try putPlannerCapability(json_alloc, &capabilities, "algebraic_path", access_method == .algebraic_filter);
+
+    const key = try json_alloc.dupe(u8, "planner_capabilities");
+    try index.put(json_alloc, key, .{ .object = capabilities });
+}
+
+fn putPlannerCapability(
+    json_alloc: std.mem.Allocator,
+    object: *std.json.ObjectMap,
+    name: []const u8,
+    value: bool,
+) !void {
+    const key = try json_alloc.dupe(u8, name);
+    try object.put(json_alloc, key, .{ .bool = value });
 }
 
 fn relationalIndexObjectForSecondaryIndex(root: *std.json.ObjectMap, index_name: []const u8) ?*std.json.ObjectMap {
@@ -2768,7 +2884,7 @@ fn buildTableStatus(
         .shards = shards,
         .schema = try parseOptionalTableSchema(alloc, table.schema_json),
         .migration = if (table.read_schema_json.len > 0) .{
-            .state = "rebuilding",
+            .state = .rebuilding,
             .read_schema = try parseTableSchema(alloc, table.read_schema_json),
         } else null,
         .replication_sources = try parseReplicationSources(alloc, snapshot, table, include_replication_runtime),
@@ -6505,29 +6621,86 @@ test "metadata.schema update sql ddl applies Antfly derived indexes to table met
     defer full_text.deinit(std.testing.allocator);
     try std.testing.expect(full_text.requires_rebuild);
     try std.testing.expectEqual(@as(usize, 1), full_text.work_items.len);
-    try std.testing.expect(std.mem.indexOf(u8, full_text.table.indexes_json, "\"docs_body_fts\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, full_text.table.indexes_json, "\"type\":\"full_text\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, full_text.table.schema_json, "\"docs_body_fts\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, full_text.table.indexes_json, "\"docs_body_fts\"") == null);
+    var full_text_schema = try parseValidatedTableSchema(std.testing.allocator, full_text.table.schema_json);
+    defer full_text_schema.deinit(std.testing.allocator);
+    const full_text_runtime = try deriveRuntimeTableSchema(std.testing.allocator, full_text_schema);
+    defer runtime_schema_mod.freeSchema(std.testing.allocator, full_text_runtime);
+    const docs_body_fts = secondaryIndexCatalogByName(full_text_runtime.relational_indexes, "docs_body_fts") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(runtime_schema_mod.RelationalIndexAccessMethod.text_search, docs_body_fts.access_method);
+    try std.testing.expectEqualStrings("body", docs_body_fts.owner_name);
+    try std.testing.expectEqual(runtime_schema_mod.RelationalIndexLifecycle.building, docs_body_fts.lifecycle);
+    try std.testing.expect(docs_body_fts.generation != 0);
+    try std.testing.expect(docs_body_fts.schema_fingerprint != null);
+    try std.testing.expect(docs_body_fts.planner_capabilities.full_text);
+    try std.testing.expect(docs_body_fts.planner_capabilities.rank);
+    try std.testing.expect(!docs_body_fts.planner_capabilities.ordering);
+    try std.testing.expect(docs_body_fts.method_config_json != null);
+    try std.testing.expect(std.mem.indexOf(u8, docs_body_fts.method_config_json.?, "\"type\":\"full_text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, docs_body_fts.method_config_json.?, "\"field\":\"body\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, docs_body_fts.method_config_json.?, "\"analyzer\":\"standard\"") != null);
 
     var text_search = try applyRelationalSqlDdlToTableRecordAlloc(
         std.testing.allocator,
         &full_text.table,
-        "CREATE TEXT SEARCH docs_body_fts_v2 ON docs (body) WITH (analyzer = 'standard', scoring = 'bm25', highlight = true, snippet = true, segment_lifecycle = 'merge_on_commit');",
+        "CREATE TEXT SEARCH docs_source_doc_fts ON docs (source_doc) WITH (analyzer = 'standard', scoring = 'bm25', highlight = true, snippet = true);",
     );
     defer text_search.deinit(std.testing.allocator);
     try std.testing.expect(text_search.requires_rebuild);
     try std.testing.expectEqual(@as(usize, 1), text_search.work_items.len);
-    try std.testing.expect(std.mem.indexOf(u8, text_search.table.indexes_json, "\"docs_body_fts_v2\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text_search.table.indexes_json, "\"type\":\"full_text\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text_search.table.indexes_json, "\"analyzer\":\"standard\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text_search.table.indexes_json, "\"scoring\":\"bm25\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text_search.table.indexes_json, "\"highlight\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text_search.table.indexes_json, "\"snippet\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text_search.table.indexes_json, "\"segment_lifecycle\":\"merge_on_commit\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_search.table.indexes_json, "\"docs_source_doc_fts\"") == null);
+    var text_search_schema = try parseValidatedTableSchema(std.testing.allocator, text_search.table.schema_json);
+    defer text_search_schema.deinit(std.testing.allocator);
+    const text_search_runtime = try deriveRuntimeTableSchema(std.testing.allocator, text_search_schema);
+    defer runtime_schema_mod.freeSchema(std.testing.allocator, text_search_runtime);
+    const docs_source_doc_fts = secondaryIndexCatalogByName(text_search_runtime.relational_indexes, "docs_source_doc_fts") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(runtime_schema_mod.RelationalIndexAccessMethod.text_search, docs_source_doc_fts.access_method);
+    try std.testing.expectEqualStrings("source_doc", docs_source_doc_fts.owner_name);
+    try std.testing.expect(docs_source_doc_fts.planner_capabilities.full_text);
+    try std.testing.expect(docs_source_doc_fts.planner_capabilities.rank);
+    try std.testing.expect(docs_source_doc_fts.method_config_json != null);
+    try std.testing.expect(std.mem.indexOf(u8, docs_source_doc_fts.method_config_json.?, "\"type\":\"full_text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, docs_source_doc_fts.method_config_json.?, "\"field\":\"source_doc\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, docs_source_doc_fts.method_config_json.?, "\"analyzer\":\"standard\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, docs_source_doc_fts.method_config_json.?, "\"scoring\":\"bm25\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, docs_source_doc_fts.method_config_json.?, "\"highlight\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, docs_source_doc_fts.method_config_json.?, "\"snippet\":true") != null);
+
+    var algebraic = try applyRelationalSqlDdlToTableRecordAlloc(
+        std.testing.allocator,
+        &text_search.table,
+        "CREATE INDEX docs_algebraic_filter ON docs USING antfly_algebraic () WITH (derive_from_schema = true);",
+    );
+    defer algebraic.deinit(std.testing.allocator);
+    try std.testing.expect(algebraic.requires_rebuild);
+    try std.testing.expectEqual(@as(usize, 1), algebraic.work_items.len);
+    try std.testing.expect(std.mem.indexOf(u8, algebraic.table.indexes_json, "\"docs_algebraic_filter\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, algebraic.table.indexes_json, "\"derive_from_schema\"") == null);
+    var algebraic_schema = try parseValidatedTableSchema(std.testing.allocator, algebraic.table.schema_json);
+    defer algebraic_schema.deinit(std.testing.allocator);
+    const algebraic_runtime = try deriveRuntimeTableSchema(std.testing.allocator, algebraic_schema);
+    defer runtime_schema_mod.freeSchema(std.testing.allocator, algebraic_runtime);
+    const docs_algebraic_filter = secondaryIndexCatalogByName(algebraic_runtime.relational_indexes, "docs_algebraic_filter") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(runtime_schema_mod.RelationalIndexOwnerKind.table, docs_algebraic_filter.owner_kind);
+    try std.testing.expectEqualStrings(runtime_schema_mod.relational_table_index_owner_name, docs_algebraic_filter.owner_name);
+    try std.testing.expectEqual(runtime_schema_mod.RelationalIndexAccessMethod.algebraic_filter, docs_algebraic_filter.access_method);
+    try std.testing.expectEqual(runtime_schema_mod.RelationalIndexLifecycle.building, docs_algebraic_filter.lifecycle);
+    try std.testing.expect(docs_algebraic_filter.generation != 0);
+    try std.testing.expect(docs_algebraic_filter.schema_fingerprint != null);
+    try std.testing.expect(docs_algebraic_filter.planner_capabilities.equality);
+    try std.testing.expect(docs_algebraic_filter.planner_capabilities.prefix);
+    try std.testing.expect(docs_algebraic_filter.planner_capabilities.array);
+    try std.testing.expect(docs_algebraic_filter.planner_capabilities.json);
+    try std.testing.expect(docs_algebraic_filter.planner_capabilities.algebraic_dictionary);
+    try std.testing.expect(docs_algebraic_filter.planner_capabilities.algebraic_fact);
+    try std.testing.expect(docs_algebraic_filter.planner_capabilities.algebraic_path);
+    try std.testing.expect(docs_algebraic_filter.method_config_json != null);
+    try std.testing.expect(std.mem.indexOf(u8, docs_algebraic_filter.method_config_json.?, "\"type\":\"algebraic\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, docs_algebraic_filter.method_config_json.?, "\"derive_from_schema\":true") != null);
 
     var semantic = try applyRelationalSqlDdlToTableRecordAlloc(
         std.testing.allocator,
-        &text_search.table,
+        &algebraic.table,
         "CREATE INDEX docs_body_semantic ON docs USING antfly_aknn (body) WITH (embedding_name = 'body_embedding_v1', model = 'local-model', dimension = 384);",
     );
     defer semantic.deinit(std.testing.allocator);
@@ -6630,17 +6803,27 @@ test "metadata.schema update sql ddl applies Antfly derived indexes to table met
         ),
     );
 
+    try std.testing.expectError(
+        error.InvalidTableIndexMetadata,
+        applyRelationalSqlDdlToTableRecordAlloc(
+            std.testing.allocator,
+            &hybrid.table,
+            "DROP INDEX docs_body_fts;",
+        ),
+    );
+
     var duplicate_noop = try applyRelationalSqlDdlToTableRecordAlloc(
         std.testing.allocator,
         &hybrid.table,
         "CREATE INDEX IF NOT EXISTS docs_body_fts ON docs USING antfly_full_text (body);",
     );
     defer duplicate_noop.deinit(std.testing.allocator);
-    try std.testing.expect(duplicate_noop.noop);
+    try std.testing.expect(!duplicate_noop.requires_rebuild);
     try std.testing.expectEqualStrings(hybrid.table.indexes_json, duplicate_noop.table.indexes_json);
+    try std.testing.expectEqualStrings(hybrid.table.schema_json, duplicate_noop.table.schema_json);
 
     try std.testing.expectError(
-        error.InvalidTableIndexMetadata,
+        error.InvalidSqlCatalog,
         applyRelationalSqlDdlToTableRecordAlloc(
             std.testing.allocator,
             &hybrid.table,
@@ -7261,6 +7444,37 @@ test "metadata.schema update promotes secondary index only for matching building
             .schema_fingerprint = "secondary-index-v1:other",
         }),
     );
+
+    const ordered_tuple_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_amount_idx","owner_kind":"relational_column","owner_name":"tenant","access_method":"ordered_tuple","columns":["tenant"],"keys":[{"column":"tenant"},{"column":"amount"}],"lifecycle":"building","generation":15,"schema_fingerprint":"secondary-index-v1:tenant_amount","generation_record":{"generation":15,"owner_ranges":[],"lifecycle":"building","lag":0,"ready_watermark":0}}]}
+    ;
+    const ordered_ready = try schemaWithSecondaryIndexReadyCheckedAlloc(alloc, ordered_tuple_json, "tenant_amount_idx", .{
+        .generation = 15,
+        .access_method = .ordered_tuple,
+        .schema_fingerprint = "secondary-index-v1:tenant_amount",
+    });
+    defer alloc.free(ordered_ready);
+    var ordered_parsed = try parseValidatedTableSchema(alloc, ordered_ready);
+    defer ordered_parsed.deinit(alloc);
+    const ordered_runtime = try deriveRuntimeTableSchema(alloc, ordered_parsed);
+    defer runtime_schema_mod.freeSchema(alloc, ordered_runtime);
+    const ordered_index = secondaryIndexCatalogByName(ordered_runtime.relational_indexes, "tenant_amount_idx") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(runtime_schema_mod.RelationalIndexLifecycle.ready, ordered_index.lifecycle);
+    const ordered_record = ordered_index.generation_record orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(runtime_schema_mod.RelationalIndexLifecycle.ready, ordered_record.lifecycle);
+    try std.testing.expectEqual(@as(u64, 15), ordered_record.generation);
+
+    const mismatched_ordered_tuple_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_amount_idx","owner_kind":"relational_column","owner_name":"tenant","access_method":"ordered_tuple","columns":["tenant"],"keys":[{"column":"tenant"},{"column":"amount"}],"lifecycle":"building","generation":15,"schema_fingerprint":"secondary-index-v1:tenant_amount","generation_record":{"generation":15,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
+    ;
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        schemaWithSecondaryIndexReadyCheckedAlloc(alloc, mismatched_ordered_tuple_json, "tenant_amount_idx", .{
+            .generation = 15,
+            .access_method = .ordered_tuple,
+            .schema_fingerprint = "secondary-index-v1:tenant_amount",
+        }),
+    );
 }
 
 test "metadata.schema update marks secondary index building and permits lifecycle transition" {
@@ -7278,6 +7492,10 @@ test "metadata.schema update marks secondary index building and permits lifecycl
     const status_index = secondaryIndexCatalogByName(runtime.relational_indexes, "usage_status_idx") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(runtime_schema_mod.RelationalIndexLifecycle.building, status_index.lifecycle);
     try std.testing.expectEqual(@as(u64, 10), status_index.generation);
+    try std.testing.expect(status_index.planner_capabilities.equality);
+    try std.testing.expect(status_index.planner_capabilities.range);
+    try std.testing.expect(!status_index.planner_capabilities.ordering);
+    try std.testing.expect(!status_index.planner_capabilities.full_text);
 
     const table: metadata_table_manager.TableRecord = .{
         .table_id = 9,
@@ -7307,6 +7525,20 @@ test "metadata.schema update marks secondary index building and permits lifecycl
         error.InvalidSchemaUpdateRequest,
         schemaWithSecondaryIndexBuildingAlloc(alloc, schema_json, "usage_status_idx", 0),
     );
+    const missing_access_method_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"usage_status_idx","owner_kind":"relational_column","owner_name":"status","columns":["status"],"lifecycle":"ready","generation":1,"schema_fingerprint":"secondary-index-v1:usage_status_idx"}]}
+    ;
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        schemaWithSecondaryIndexBuildingAlloc(alloc, missing_access_method_json, "usage_status_idx", 10),
+    );
+    const missing_fingerprint_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"usage_status_idx","owner_kind":"relational_column","owner_name":"status","access_method":"scalar_column","columns":["status"],"lifecycle":"ready","generation":1}]}
+    ;
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        schemaWithSecondaryIndexBuildingAlloc(alloc, missing_fingerprint_json, "usage_status_idx", 10),
+    );
 }
 
 test "create table preparation auto-creates an algebraic index for relational schemas" {
@@ -7330,7 +7562,7 @@ test "create table preparation auto-creates an algebraic index for relational sc
 test "public schema catalog roundtrip preserves first-class relational indexes" {
     const alloc = std.testing.allocator;
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"status":{"type":"keyword"},"created_at":{"type":"datetime"}},"required":["id","tenant_id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_status_idx","owner_kind":"relational_column","owner_name":"tenant_id","access_method":"ordered_tuple","columns":["tenant_id","status"],"include_columns":["created_at"],"keys":[{"column":"tenant_id"},{"column":"status","direction":"desc","nulls":"last"}],"lifecycle":"catching_up","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_status","where":{"all":[{"field":"tenant_id","op":"is_not_null"}]}}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"status":{"type":"keyword"},"created_at":{"type":"datetime"}},"required":["id","tenant_id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_status_idx","owner_kind":"relational_column","owner_name":"tenant_id","access_method":"ordered_tuple","columns":["tenant_id","status"],"include_columns":["created_at"],"keys":[{"column":"tenant_id"},{"column":"status","collation":"C","direction":"desc","nulls":"last"}],"lifecycle":"catching_up","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_status","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"catching_up","lag":0,"ready_watermark":0},"where":{"all":[{"field":"tenant_id","op":"is_not_null"}]}}]}
     ;
 
     var public_arena = std.heap.ArenaAllocator.init(alloc);
@@ -7339,10 +7571,11 @@ test "public schema catalog roundtrip preserves first-class relational indexes" 
     const public_indexes = public_schema.relational_indexes orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 1), public_indexes.len);
     try std.testing.expectEqualStrings("tenant_status_idx", public_indexes[0].name);
-    try std.testing.expectEqualStrings("ordered_tuple", public_indexes[0].access_method);
+    try std.testing.expectEqual(schema_openapi.RelationalIndexAccessMethod.ordered_tuple, public_indexes[0].access_method);
     try std.testing.expectEqualStrings("tenant_id", public_indexes[0].keys.?[0].column);
-    try std.testing.expectEqualStrings("desc", public_indexes[0].keys.?[1].direction.?);
-    try std.testing.expectEqualStrings("last", public_indexes[0].keys.?[1].nulls.?);
+    try std.testing.expectEqualStrings("C", public_indexes[0].keys.?[1].collation.?);
+    try std.testing.expectEqual(schema_openapi.RelationalIndexKeyDirection.desc, public_indexes[0].keys.?[1].direction.?);
+    try std.testing.expectEqual(schema_openapi.RelationalIndexKeyNulls.last, public_indexes[0].keys.?[1].nulls.?);
 
     const table: metadata_table_manager.TableRecord = .{
         .table_id = 91,
@@ -7374,7 +7607,7 @@ test "public schema catalog roundtrip preserves first-class relational indexes" 
 test "public schema catalog roundtrip preserves admitted relational access methods" {
     const alloc = std.testing.allocator;
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"attrs":{"type":"json"},"body":{"type":"text"}},"required":["id","tenant_id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_scalar_idx","owner_kind":"relational_column","owner_name":"status","access_method":"scalar_column","columns":["status"],"generation":3,"schema_fingerprint":"secondary-index-v1:status_scalar"},{"name":"tenant_amount_idx","owner_kind":"relational_column","owner_name":"tenant_id","access_method":"ordered_tuple","columns":["tenant_id","amount"],"include_columns":["status"],"keys":[{"column":"tenant_id"},{"column":"amount","direction":"desc","nulls":"last"}],"lifecycle":"ready","generation":4,"schema_fingerprint":"secondary-index-v1:tenant_amount"},{"name":"attrs_algebraic_idx","owner_kind":"relational_column","owner_name":"attrs","access_method":"algebraic_filter","columns":["attrs"],"generation":5,"schema_fingerprint":"secondary-index-v1:attrs_algebraic"},{"name":"body_text_idx","owner_kind":"relational_column","owner_name":"body","access_method":"text_search","method_config":{"type":"full_text","field":"body","analyzer":"standard"},"columns":["body"],"generation":6,"schema_fingerprint":"secondary-index-v1:body_text"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"attrs":{"type":"json"},"body":{"type":"text"}},"required":["id","tenant_id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_scalar_idx","owner_kind":"relational_column","owner_name":"status","access_method":"scalar_column","columns":["status"],"generation":3,"schema_fingerprint":"secondary-index-v1:status_scalar"},{"name":"tenant_amount_idx","owner_kind":"relational_column","owner_name":"tenant_id","access_method":"ordered_tuple","columns":["tenant_id","amount"],"include_columns":["status"],"keys":[{"column":"tenant_id"},{"column":"amount","direction":"desc","nulls":"last"}],"lifecycle":"ready","generation":4,"schema_fingerprint":"secondary-index-v1:tenant_amount","generation_record":{"generation":4,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}},{"name":"attrs_algebraic_idx","owner_kind":"relational_column","owner_name":"attrs","access_method":"algebraic_filter","columns":["attrs"],"generation":5,"schema_fingerprint":"secondary-index-v1:attrs_algebraic","generation_record":{"generation":5,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}},{"name":"body_text_idx","owner_kind":"relational_column","owner_name":"body","access_method":"text_search","method_config":{"type":"full_text","field":"body","analyzer":"standard"},"columns":["body"],"generation":6,"schema_fingerprint":"secondary-index-v1:body_text","generation_record":{"generation":6,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
     ;
 
     var public_arena = std.heap.ArenaAllocator.init(alloc);
@@ -7382,12 +7615,12 @@ test "public schema catalog roundtrip preserves admitted relational access metho
     const public_schema = try parseTableSchema(public_arena.allocator(), schema_json);
     const public_indexes = public_schema.relational_indexes orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 4), public_indexes.len);
-    try std.testing.expectEqualStrings("scalar_column", public_indexes[0].access_method);
-    try std.testing.expectEqualStrings("ordered_tuple", public_indexes[1].access_method);
-    try std.testing.expectEqualStrings("algebraic_filter", public_indexes[2].access_method);
-    try std.testing.expectEqualStrings("text_search", public_indexes[3].access_method);
+    try std.testing.expectEqual(schema_openapi.RelationalIndexAccessMethod.scalar_column, public_indexes[0].access_method);
+    try std.testing.expectEqual(schema_openapi.RelationalIndexAccessMethod.ordered_tuple, public_indexes[1].access_method);
+    try std.testing.expectEqual(schema_openapi.RelationalIndexAccessMethod.algebraic_filter, public_indexes[2].access_method);
+    try std.testing.expectEqual(schema_openapi.RelationalIndexAccessMethod.text_search, public_indexes[3].access_method);
     try std.testing.expectEqualStrings("amount", public_indexes[1].keys.?[1].column);
-    try std.testing.expectEqualStrings("desc", public_indexes[1].keys.?[1].direction.?);
+    try std.testing.expectEqual(schema_openapi.RelationalIndexKeyDirection.desc, public_indexes[1].keys.?[1].direction.?);
 
     const table: metadata_table_manager.TableRecord = .{
         .table_id = 92,

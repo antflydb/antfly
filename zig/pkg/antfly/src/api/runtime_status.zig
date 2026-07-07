@@ -973,6 +973,13 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
             .catch_up_phase = item.catch_up_phase,
             .catch_up_applied_sequence = item.catch_up_applied_sequence,
             .catch_up_target_sequence = item.catch_up_target_sequence,
+            .relational_generation_present = item.relational_generation_present,
+            .relational_generation_record_valid = item.relational_generation_record_valid,
+            .relational_generation = item.relational_generation,
+            .relational_generation_lifecycle = item.relational_generation_lifecycle,
+            .relational_generation_lag = item.relational_generation_lag,
+            .relational_generation_ready_watermark = item.relational_generation_ready_watermark,
+            .relational_generation_catch_up_required = item.relational_generation_catch_up_required,
             .text_merge = item.text_merge,
             .hbc_cache = item.hbc_cache,
             .hbc_posting = item.hbc_posting,
@@ -1104,6 +1111,13 @@ test "table runtime snapshot cache clones stored status" {
         .name = try std.testing.allocator.dupe(u8, "alg"),
         .kind = .algebraic,
         .doc_count = 11,
+        .relational_generation_present = true,
+        .relational_generation_record_valid = true,
+        .relational_generation = 9,
+        .relational_generation_lifecycle = .building,
+        .relational_generation_lag = 23,
+        .relational_generation_ready_watermark = 144,
+        .relational_generation_catch_up_required = true,
         .algebraic_parse_error_count = 1,
         .algebraic_schema_version = 42,
         .algebraic_capability_fingerprint = try std.testing.allocator.dupe(u8, "cap:v1"),
@@ -1212,6 +1226,13 @@ test "table runtime snapshot cache clones stored status" {
     try std.testing.expectEqual(@as(u64, 5), cloned.items[0].stats.doc_set_planning.stale_identity_generation_rejection_count);
     try std.testing.expectEqualStrings("vec", cloned.items[0].stats.indexes[0].name);
     try std.testing.expectEqualStrings("alg", cloned.items[0].stats.indexes[1].name);
+    try std.testing.expect(cloned.items[0].stats.indexes[1].relational_generation_present);
+    try std.testing.expect(cloned.items[0].stats.indexes[1].relational_generation_record_valid);
+    try std.testing.expectEqual(@as(u64, 9), cloned.items[0].stats.indexes[1].relational_generation);
+    try std.testing.expectEqualStrings("building", @tagName(cloned.items[0].stats.indexes[1].relational_generation_lifecycle));
+    try std.testing.expectEqual(@as(u64, 23), cloned.items[0].stats.indexes[1].relational_generation_lag);
+    try std.testing.expectEqual(@as(u64, 144), cloned.items[0].stats.indexes[1].relational_generation_ready_watermark);
+    try std.testing.expect(cloned.items[0].stats.indexes[1].relational_generation_catch_up_required);
     try std.testing.expectEqual(@as(u64, 1), cloned.items[0].stats.indexes[1].algebraic_parse_error_count);
     try std.testing.expectEqual(@as(u32, 42), cloned.items[0].stats.indexes[1].algebraic_schema_version);
     try std.testing.expectEqualStrings("cap:v1", cloned.items[0].stats.indexes[1].algebraic_capability_fingerprint.?);

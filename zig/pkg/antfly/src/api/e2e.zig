@@ -601,7 +601,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     try std.testing.expect(parsed_updated_schema.value.schema != null);
     try std.testing.expect(parsed_updated_schema.value.schema.?.document_schemas != null);
     try std.testing.expect(parsed_updated_schema.value.migration != null);
-    try std.testing.expectEqualStrings("rebuilding", parsed_updated_schema.value.migration.?.state);
+    try std.testing.expectEqual(metadata_openapi.TableMigrationState.rebuilding, parsed_updated_schema.value.migration.?.state);
     try std.testing.expectEqual(@as(?i64, 0), parsed_updated_schema.value.migration.?.read_schema.version);
 
     var table_detail_after_schema = try client.fetchTable(base_uri, "docs");
@@ -609,7 +609,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     var parsed_table_detail_after_schema = try std.json.parseFromSlice(metadata_openapi.TableStatus, std.testing.allocator, table_detail_after_schema.body, .{});
     defer parsed_table_detail_after_schema.deinit();
     try std.testing.expect(parsed_table_detail_after_schema.value.migration != null);
-    try std.testing.expectEqualStrings("rebuilding", parsed_table_detail_after_schema.value.migration.?.state);
+    try std.testing.expectEqual(metadata_openapi.TableMigrationState.rebuilding, parsed_table_detail_after_schema.value.migration.?.state);
     try std.testing.expect(parsed_table_detail_after_schema.value.indexes.map.get("full_text_index_v0") != null);
     try std.testing.expect(parsed_table_detail_after_schema.value.indexes.map.get("full_text_index_v1") != null);
 
@@ -1234,7 +1234,7 @@ test "public api e2e rebuilds schema-migration full-text index on exact backfill
     var parsed_updated_schema = try parseJsonBody(metadata_openapi.TableStatus, std.testing.allocator, updated_schema.body);
     defer parsed_updated_schema.deinit();
     try std.testing.expect(parsed_updated_schema.value.migration != null);
-    try std.testing.expectEqualStrings("rebuilding", parsed_updated_schema.value.migration.?.state);
+    try std.testing.expectEqual(metadata_openapi.TableMigrationState.rebuilding, parsed_updated_schema.value.migration.?.state);
     try std.testing.expectEqual(@as(i64, 0), parsed_updated_schema.value.migration.?.read_schema.version);
     try std.testing.expect(parsed_updated_schema.value.indexes.map.get("full_text_index_v1") != null);
 
@@ -1369,7 +1369,7 @@ test "public api e2e rejects table backup during active schema migration" {
     var parsed_updated_schema = try parseJsonBody(metadata_openapi.TableStatus, std.testing.allocator, updated_schema.body);
     defer parsed_updated_schema.deinit();
     try std.testing.expect(parsed_updated_schema.value.migration != null);
-    try std.testing.expectEqualStrings("rebuilding", parsed_updated_schema.value.migration.?.state);
+    try std.testing.expectEqual(metadata_openapi.TableMigrationState.rebuilding, parsed_updated_schema.value.migration.?.state);
 
     const backup_body = try std.fmt.allocPrint(
         std.testing.allocator,
@@ -1476,7 +1476,7 @@ test "public api e2e rejects table restore for migration-state backup manifests"
     defer backup_resp.deinit(std.testing.allocator);
     var parsed_backup = try parseJsonBody(metadata_openapi.ClusterBackupResponse, std.testing.allocator, backup_resp.body);
     defer parsed_backup.deinit();
-    try std.testing.expectEqualStrings("successful", parsed_backup.value.status);
+    try std.testing.expectEqual(metadata_openapi.ClusterBackupResponseStatus.completed, parsed_backup.value.status);
 
     var manifest = try backups_api.readManifest(std.testing.allocator, backup_root, "restore-migration-snap");
     defer manifest.deinit(std.testing.allocator);
@@ -1593,7 +1593,7 @@ test "public api e2e rejects table restore when target already exists" {
     defer backup_resp.deinit(std.testing.allocator);
     var parsed_backup = try parseJsonBody(metadata_openapi.ClusterBackupResponse, std.testing.allocator, backup_resp.body);
     defer parsed_backup.deinit();
-    try std.testing.expectEqualStrings("successful", parsed_backup.value.status);
+    try std.testing.expectEqual(metadata_openapi.ClusterBackupResponseStatus.completed, parsed_backup.value.status);
 
     const restore_body = try std.fmt.allocPrint(
         std.testing.allocator,
@@ -1700,7 +1700,7 @@ test "public api e2e rejects table restore for mismatched backup manifests" {
     defer backup_resp.deinit(std.testing.allocator);
     var parsed_backup = try parseJsonBody(metadata_openapi.ClusterBackupResponse, std.testing.allocator, backup_resp.body);
     defer parsed_backup.deinit();
-    try std.testing.expectEqualStrings("successful", parsed_backup.value.status);
+    try std.testing.expectEqual(metadata_openapi.ClusterBackupResponseStatus.completed, parsed_backup.value.status);
 
     var manifest = try backups_api.readManifest(std.testing.allocator, backup_root, "restore-mismatch-snap");
     defer manifest.deinit(std.testing.allocator);
@@ -2023,7 +2023,7 @@ test "public api e2e backs up drops and restores a table" {
     defer backup_resp.deinit(std.testing.allocator);
     var parsed_backup = try parseJsonBody(metadata_openapi.ClusterBackupResponse, std.testing.allocator, backup_resp.body);
     defer parsed_backup.deinit();
-    try std.testing.expectEqualStrings("successful", parsed_backup.value.status);
+    try std.testing.expectEqual(metadata_openapi.ClusterBackupResponseStatus.completed, parsed_backup.value.status);
 
     _ = try client.dropTable(base_uri, "docs");
 
@@ -2048,7 +2048,7 @@ test "public api e2e backs up drops and restores a table" {
     try std.testing.expectEqual(@as(u16, 202), restore_resp.status);
     var parsed_restore = try parseJsonBody(metadata_openapi.ClusterRestoreResponse, std.testing.allocator, restore_resp.body);
     defer parsed_restore.deinit();
-    try std.testing.expectEqualStrings("triggered", parsed_restore.value.status);
+    try std.testing.expectEqual(metadata_openapi.ClusterRestoreResponseStatus.triggered, parsed_restore.value.status);
 
     var lookup = try client.fetchLookup(base_uri, "docs", "doc:a", null);
     defer lookup.deinit(std.testing.allocator);
@@ -2157,7 +2157,7 @@ test "public api split e2e backs up drops and restores a table" {
     defer backup_resp.deinit(std.testing.allocator);
     var parsed_backup = try parseJsonBody(metadata_openapi.ClusterBackupResponse, std.testing.allocator, backup_resp.body);
     defer parsed_backup.deinit();
-    try std.testing.expectEqualStrings("successful", parsed_backup.value.status);
+    try std.testing.expectEqual(metadata_openapi.ClusterBackupResponseStatus.completed, parsed_backup.value.status);
 
     _ = try client.dropTable(base_uri, "docs");
 
@@ -2182,7 +2182,7 @@ test "public api split e2e backs up drops and restores a table" {
     try std.testing.expectEqual(@as(u16, 202), restore_resp.status);
     var parsed_restore = try parseJsonBody(metadata_openapi.ClusterRestoreResponse, std.testing.allocator, restore_resp.body);
     defer parsed_restore.deinit();
-    try std.testing.expectEqualStrings("triggered", parsed_restore.value.status);
+    try std.testing.expectEqual(metadata_openapi.ClusterRestoreResponseStatus.triggered, parsed_restore.value.status);
 
     var lookup = try client.fetchLookup(base_uri, "docs", "doc:a", null);
     defer lookup.deinit(std.testing.allocator);
@@ -2307,7 +2307,7 @@ test "public api swarm-like e2e backs up drops and restores a table" {
     defer backup_resp.deinit(std.testing.allocator);
     var parsed_backup = try parseJsonBody(metadata_openapi.ClusterBackupResponse, std.testing.allocator, backup_resp.body);
     defer parsed_backup.deinit();
-    try std.testing.expectEqualStrings("successful", parsed_backup.value.status);
+    try std.testing.expectEqual(metadata_openapi.ClusterBackupResponseStatus.completed, parsed_backup.value.status);
 
     _ = try client.dropTable(base_uri, "docs");
     rounds = 0;
@@ -3123,7 +3123,7 @@ test "public api e2e restores managed embeddings from table backup" {
     defer backup_resp.deinit(std.testing.allocator);
     var parsed_backup = try parseJsonBody(metadata_openapi.ClusterBackupResponse, std.testing.allocator, backup_resp.body);
     defer parsed_backup.deinit();
-    try std.testing.expectEqualStrings("successful", parsed_backup.value.status);
+    try std.testing.expectEqual(metadata_openapi.ClusterBackupResponseStatus.completed, parsed_backup.value.status);
 
     _ = try client.dropTable(base_uri, "docs");
 
@@ -3142,7 +3142,7 @@ test "public api e2e restores managed embeddings from table backup" {
     defer restore_resp.deinit(std.testing.allocator);
     var parsed_restore = try parseJsonBody(metadata_openapi.ClusterRestoreResponse, std.testing.allocator, restore_resp.body);
     defer parsed_restore.deinit();
-    try std.testing.expectEqualStrings("triggered", parsed_restore.value.status);
+    try std.testing.expectEqual(metadata_openapi.ClusterRestoreResponseStatus.triggered, parsed_restore.value.status);
 
     rounds = 0;
     while (rounds < 12) : (rounds += 1) try svc.runRound();
@@ -4875,7 +4875,7 @@ test "public api e2e restores managed sparse embeddings from table backup" {
     defer backup_resp.deinit(std.testing.allocator);
     var parsed_backup = try parseJsonBody(metadata_openapi.ClusterBackupResponse, std.testing.allocator, backup_resp.body);
     defer parsed_backup.deinit();
-    try std.testing.expectEqualStrings("successful", parsed_backup.value.status);
+    try std.testing.expectEqual(metadata_openapi.ClusterBackupResponseStatus.completed, parsed_backup.value.status);
 
     _ = try client.dropTable(base_uri, "docs");
 
@@ -4894,7 +4894,7 @@ test "public api e2e restores managed sparse embeddings from table backup" {
     defer restore_resp.deinit(std.testing.allocator);
     var parsed_restore = try parseJsonBody(metadata_openapi.ClusterRestoreResponse, std.testing.allocator, restore_resp.body);
     defer parsed_restore.deinit();
-    try std.testing.expectEqualStrings("triggered", parsed_restore.value.status);
+    try std.testing.expectEqual(metadata_openapi.ClusterRestoreResponseStatus.triggered, parsed_restore.value.status);
 
     rounds = 0;
     while (rounds < 12) : (rounds += 1) try svc.runRound();
@@ -5707,7 +5707,7 @@ test "public api e2e restores chunked managed embeddings from table backup" {
     defer backup_resp.deinit(std.testing.allocator);
     var parsed_backup = try parseJsonBody(metadata_openapi.ClusterBackupResponse, std.testing.allocator, backup_resp.body);
     defer parsed_backup.deinit();
-    try std.testing.expectEqualStrings("successful", parsed_backup.value.status);
+    try std.testing.expectEqual(metadata_openapi.ClusterBackupResponseStatus.completed, parsed_backup.value.status);
 
     _ = try client.dropTable(base_uri, "docs");
 
@@ -5726,7 +5726,7 @@ test "public api e2e restores chunked managed embeddings from table backup" {
     defer restore_resp.deinit(std.testing.allocator);
     var parsed_restore = try parseJsonBody(metadata_openapi.ClusterRestoreResponse, std.testing.allocator, restore_resp.body);
     defer parsed_restore.deinit();
-    try std.testing.expectEqualStrings("triggered", parsed_restore.value.status);
+    try std.testing.expectEqual(metadata_openapi.ClusterRestoreResponseStatus.triggered, parsed_restore.value.status);
 
     rounds = 0;
     while (rounds < 12) : (rounds += 1) try svc.runRound();
@@ -6719,7 +6719,7 @@ test "public api e2e restores graph indexes from table backup" {
     defer backup_resp.deinit(std.testing.allocator);
     var parsed_backup = try parseJsonBody(metadata_openapi.ClusterBackupResponse, std.testing.allocator, backup_resp.body);
     defer parsed_backup.deinit();
-    try std.testing.expectEqualStrings("successful", parsed_backup.value.status);
+    try std.testing.expectEqual(metadata_openapi.ClusterBackupResponseStatus.completed, parsed_backup.value.status);
 
     _ = try client.dropTable(base_uri, "docs");
 
@@ -6738,7 +6738,7 @@ test "public api e2e restores graph indexes from table backup" {
     defer restore_resp.deinit(std.testing.allocator);
     var parsed_restore = try parseJsonBody(metadata_openapi.ClusterRestoreResponse, std.testing.allocator, restore_resp.body);
     defer parsed_restore.deinit();
-    try std.testing.expectEqualStrings("triggered", parsed_restore.value.status);
+    try std.testing.expectEqual(metadata_openapi.ClusterRestoreResponseStatus.triggered, parsed_restore.value.status);
 
     rounds = 0;
     while (rounds < 12) : (rounds += 1) try svc.runRound();
@@ -7261,10 +7261,10 @@ test "public api e2e serves cluster backup list and restore routes" {
     var parsed_backup = try std.json.parseFromSlice(metadata_openapi.ClusterBackupResponse, std.testing.allocator, backup_resp.body, .{});
     defer parsed_backup.deinit();
     try std.testing.expectEqualStrings("cluster-snap", parsed_backup.value.backup_id);
-    try std.testing.expectEqualStrings("successful", parsed_backup.value.status);
+    try std.testing.expectEqual(metadata_openapi.ClusterBackupResponseStatus.completed, parsed_backup.value.status);
     try std.testing.expectEqual(@as(usize, 2), parsed_backup.value.tables.len);
     for (parsed_backup.value.tables) |table_status| {
-        try std.testing.expectEqualStrings("successful", table_status.status);
+        try std.testing.expectEqual(metadata_openapi.TableBackupStatusStatus.completed, table_status.status);
         try std.testing.expect(table_status.@"error" == null);
     }
 
@@ -7316,10 +7316,10 @@ test "public api e2e serves cluster backup list and restore routes" {
     defer skip_restore_resp.deinit(std.testing.allocator);
     var parsed_skip_restore = try std.json.parseFromSlice(metadata_openapi.ClusterRestoreResponse, std.testing.allocator, skip_restore_resp.body, .{});
     defer parsed_skip_restore.deinit();
-    try std.testing.expectEqualStrings("triggered", parsed_skip_restore.value.status);
+    try std.testing.expectEqual(metadata_openapi.ClusterRestoreResponseStatus.triggered, parsed_skip_restore.value.status);
     try std.testing.expectEqual(@as(usize, 2), parsed_skip_restore.value.tables.len);
     for (parsed_skip_restore.value.tables) |table_status| {
-        try std.testing.expectEqualStrings("skipped", table_status.status);
+        try std.testing.expectEqual(metadata_openapi.TableRestoreStatusStatus.skipped, table_status.status);
         try std.testing.expect(table_status.@"error" == null);
     }
 
@@ -7354,10 +7354,10 @@ test "public api e2e serves cluster backup list and restore routes" {
     defer restore_resp.deinit(std.testing.allocator);
     var parsed_restore = try std.json.parseFromSlice(metadata_openapi.ClusterRestoreResponse, std.testing.allocator, restore_resp.body, .{});
     defer parsed_restore.deinit();
-    try std.testing.expectEqualStrings("triggered", parsed_restore.value.status);
+    try std.testing.expectEqual(metadata_openapi.ClusterRestoreResponseStatus.triggered, parsed_restore.value.status);
     try std.testing.expectEqual(@as(usize, 2), parsed_restore.value.tables.len);
     for (parsed_restore.value.tables) |table_status| {
-        try std.testing.expectEqualStrings("triggered", table_status.status);
+        try std.testing.expectEqual(metadata_openapi.TableRestoreStatusStatus.triggered, table_status.status);
         try std.testing.expect(table_status.@"error" == null);
     }
 
@@ -7396,10 +7396,10 @@ test "public api e2e serves cluster backup list and restore routes" {
     defer overwrite_restore_resp.deinit(std.testing.allocator);
     var parsed_overwrite_restore = try std.json.parseFromSlice(metadata_openapi.ClusterRestoreResponse, std.testing.allocator, overwrite_restore_resp.body, .{});
     defer parsed_overwrite_restore.deinit();
-    try std.testing.expectEqualStrings("triggered", parsed_overwrite_restore.value.status);
+    try std.testing.expectEqual(metadata_openapi.ClusterRestoreResponseStatus.triggered, parsed_overwrite_restore.value.status);
     try std.testing.expectEqual(@as(usize, 2), parsed_overwrite_restore.value.tables.len);
     for (parsed_overwrite_restore.value.tables) |table_status| {
-        try std.testing.expectEqualStrings("triggered", table_status.status);
+        try std.testing.expectEqual(metadata_openapi.TableRestoreStatusStatus.triggered, table_status.status);
         try std.testing.expect(table_status.@"error" == null);
     }
 
@@ -7514,7 +7514,7 @@ test "public api e2e reports partial cluster backup and restore statuses" {
     defer partial_backup_resp.deinit(std.testing.allocator);
     var parsed_partial_backup = try std.json.parseFromSlice(metadata_openapi.ClusterBackupResponse, std.testing.allocator, partial_backup_resp.body, .{});
     defer parsed_partial_backup.deinit();
-    try std.testing.expectEqualStrings("partial", parsed_partial_backup.value.status);
+    try std.testing.expectEqual(metadata_openapi.ClusterBackupResponseStatus.partial, parsed_partial_backup.value.status);
     try std.testing.expectEqual(@as(usize, 2), parsed_partial_backup.value.tables.len);
 
     var saw_docs_backup = false;
@@ -7522,11 +7522,11 @@ test "public api e2e reports partial cluster backup and restore statuses" {
     for (parsed_partial_backup.value.tables) |table_status| {
         if (std.mem.eql(u8, table_status.name, "docs")) {
             saw_docs_backup = true;
-            try std.testing.expectEqualStrings("completed", table_status.status);
+            try std.testing.expectEqual(metadata_openapi.TableBackupStatusStatus.completed, table_status.status);
             try std.testing.expect(table_status.@"error" == null);
         } else if (std.mem.eql(u8, table_status.name, "missing")) {
             saw_missing_backup = true;
-            try std.testing.expectEqualStrings("failed", table_status.status);
+            try std.testing.expectEqual(metadata_openapi.TableBackupStatusStatus.failed, table_status.status);
             try std.testing.expectEqualStrings("not found", table_status.@"error".?);
         }
     }
@@ -7559,7 +7559,7 @@ test "public api e2e reports partial cluster backup and restore statuses" {
     defer partial_restore_resp.deinit(std.testing.allocator);
     var parsed_partial_restore = try std.json.parseFromSlice(metadata_openapi.ClusterRestoreResponse, std.testing.allocator, partial_restore_resp.body, .{});
     defer parsed_partial_restore.deinit();
-    try std.testing.expectEqualStrings("partial", parsed_partial_restore.value.status);
+    try std.testing.expectEqual(metadata_openapi.ClusterRestoreResponseStatus.partial, parsed_partial_restore.value.status);
     try std.testing.expectEqual(@as(usize, 2), parsed_partial_restore.value.tables.len);
 
     var saw_docs_restore = false;
@@ -7567,11 +7567,11 @@ test "public api e2e reports partial cluster backup and restore statuses" {
     for (parsed_partial_restore.value.tables) |table_status| {
         if (std.mem.eql(u8, table_status.name, "docs")) {
             saw_docs_restore = true;
-            try std.testing.expectEqualStrings("triggered", table_status.status);
+            try std.testing.expectEqual(metadata_openapi.TableRestoreStatusStatus.triggered, table_status.status);
             try std.testing.expect(table_status.@"error" == null);
         } else if (std.mem.eql(u8, table_status.name, "missing")) {
             saw_missing_restore = true;
-            try std.testing.expectEqualStrings("failed", table_status.status);
+            try std.testing.expectEqual(metadata_openapi.TableRestoreStatusStatus.failed, table_status.status);
             try std.testing.expectEqualStrings("backup does not include table", table_status.@"error".?);
         }
     }
@@ -7761,7 +7761,7 @@ test "public api e2e reports unsupported multi-range tables in cluster backup" {
     defer partial_backup_resp.deinit(std.testing.allocator);
     var parsed_partial_backup = try std.json.parseFromSlice(metadata_openapi.ClusterBackupResponse, std.testing.allocator, partial_backup_resp.body, .{});
     defer parsed_partial_backup.deinit();
-    try std.testing.expectEqualStrings("partial", parsed_partial_backup.value.status);
+    try std.testing.expectEqual(metadata_openapi.ClusterBackupResponseStatus.partial, parsed_partial_backup.value.status);
     try std.testing.expectEqual(@as(usize, 2), parsed_partial_backup.value.tables.len);
 
     var saw_docs_backup = false;
@@ -7769,11 +7769,11 @@ test "public api e2e reports unsupported multi-range tables in cluster backup" {
     for (parsed_partial_backup.value.tables) |table_status| {
         if (std.mem.eql(u8, table_status.name, "docs")) {
             saw_docs_backup = true;
-            try std.testing.expectEqualStrings("failed", table_status.status);
+            try std.testing.expectEqual(metadata_openapi.TableBackupStatusStatus.failed, table_status.status);
             try std.testing.expectEqualStrings("backup does not support multi-range tables", table_status.@"error".?);
         } else if (std.mem.eql(u8, table_status.name, "logs")) {
             saw_logs_backup = true;
-            try std.testing.expectEqualStrings("completed", table_status.status);
+            try std.testing.expectEqual(metadata_openapi.TableBackupStatusStatus.completed, table_status.status);
             try std.testing.expect(table_status.@"error" == null);
         }
     }
@@ -7806,7 +7806,7 @@ test "public api e2e reports unsupported multi-range tables in cluster backup" {
     defer partial_restore_resp.deinit(std.testing.allocator);
     var parsed_partial_restore = try std.json.parseFromSlice(metadata_openapi.ClusterRestoreResponse, std.testing.allocator, partial_restore_resp.body, .{});
     defer parsed_partial_restore.deinit();
-    try std.testing.expectEqualStrings("partial", parsed_partial_restore.value.status);
+    try std.testing.expectEqual(metadata_openapi.ClusterRestoreResponseStatus.partial, parsed_partial_restore.value.status);
     try std.testing.expectEqual(@as(usize, 2), parsed_partial_restore.value.tables.len);
 
     var saw_docs_restore = false;
@@ -7814,11 +7814,11 @@ test "public api e2e reports unsupported multi-range tables in cluster backup" {
     for (parsed_partial_restore.value.tables) |table_status| {
         if (std.mem.eql(u8, table_status.name, "docs")) {
             saw_docs_restore = true;
-            try std.testing.expectEqualStrings("failed", table_status.status);
+            try std.testing.expectEqual(metadata_openapi.TableRestoreStatusStatus.failed, table_status.status);
             try std.testing.expectEqualStrings("backup does not include table", table_status.@"error".?);
         } else if (std.mem.eql(u8, table_status.name, "logs")) {
             saw_logs_restore = true;
-            try std.testing.expectEqualStrings("triggered", table_status.status);
+            try std.testing.expectEqual(metadata_openapi.TableRestoreStatusStatus.triggered, table_status.status);
             try std.testing.expect(table_status.@"error" == null);
         }
     }

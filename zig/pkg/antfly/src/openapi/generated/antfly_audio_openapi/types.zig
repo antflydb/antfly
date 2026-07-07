@@ -106,14 +106,78 @@ pub const AudioFormat = enum {
     }
 };
 
+/// TTS model to use. tts-1 is faster, tts-1-hd has higher quality.
+pub const OpenAITTSConfigModel = enum {
+    tts_1,
+    tts_1_hd,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .tts_1 => "tts-1",
+            .tts_1_hd => "tts-1-hd",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "tts-1", .tts_1 },
+            .{ "tts-1-hd", .tts_1_hd },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Default voice to use.
+pub const OpenAITTSConfigVoice = enum {
+    alloy,
+    echo,
+    fable,
+    onyx,
+    nova,
+    shimmer,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .alloy => "alloy",
+            .echo => "echo",
+            .fable => "fable",
+            .onyx => "onyx",
+            .nova => "nova",
+            .shimmer => "shimmer",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "alloy", .alloy },
+            .{ "echo", .echo },
+            .{ "fable", .fable },
+            .{ "onyx", .onyx },
+            .{ "nova", .nova },
+            .{ "shimmer", .shimmer },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Configuration for OpenAI TTS provider. API key via `api_key` field or `OPENAI_API_KEY` environment variable. **Models:** tts-1 (faster, lower quality), tts-1-hd (higher quality) **Voices:** alloy, echo, fable, onyx, nova, shimmer **Docs:** https://platform.openai.com/docs/guides/text-to-speech
 pub const OpenAITTSConfig = struct {
     /// TTS model to use. tts-1 is faster, tts-1-hd has higher quality.
-    model: ?[]const u8 = null,
+    model: ?OpenAITTSConfigModel = null,
     /// OpenAI API key. Falls back to OPENAI_API_KEY environment variable.
     api_key: ?[]const u8 = null,
     /// Default voice to use.
-    voice: ?[]const u8 = null,
+    voice: ?OpenAITTSConfigVoice = null,
     /// API base URL. Falls back to OPENAI_BASE_URL environment variable.
     base_url: ?[]const u8 = null,
 };
@@ -132,6 +196,35 @@ pub const VertexTTSConfig = struct {
     voice_name: ?[]const u8 = null,
 };
 
+/// TTS model to use.
+pub const ElevenLabsTTSConfigModelId = enum {
+    eleven_monolingual_v1,
+    eleven_multilingual_v2,
+    eleven_turbo_v2_5,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .eleven_monolingual_v1 => "eleven_monolingual_v1",
+            .eleven_multilingual_v2 => "eleven_multilingual_v2",
+            .eleven_turbo_v2_5 => "eleven_turbo_v2_5",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "eleven_monolingual_v1", .eleven_monolingual_v1 },
+            .{ "eleven_multilingual_v2", .eleven_multilingual_v2 },
+            .{ "eleven_turbo_v2_5", .eleven_turbo_v2_5 },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Configuration for ElevenLabs TTS provider. API key via `api_key` field or `ELEVENLABS_API_KEY` environment variable. **Models:** eleven_monolingual_v1, eleven_multilingual_v2, eleven_turbo_v2_5 (fastest) **Docs:** https://elevenlabs.io/docs/api-reference
 pub const ElevenLabsTTSConfig = struct {
     /// ElevenLabs API key. Falls back to ELEVENLABS_API_KEY environment variable.
@@ -139,7 +232,7 @@ pub const ElevenLabsTTSConfig = struct {
     /// Default ElevenLabs voice ID.
     voice_id: []const u8,
     /// TTS model to use.
-    model_id: ?[]const u8 = null,
+    model_id: ?ElevenLabsTTSConfigModelId = null,
     /// Voice stability (0.0-1.0). Higher = more consistent.
     stability: ?f64 = null,
     /// Similarity boost (0.0-1.0). Higher = more similar to original voice.
@@ -195,6 +288,37 @@ pub const Speaker = struct {
     label: ?[]const u8 = null,
 };
 
+pub const VoiceGender = enum {
+    male,
+    female,
+    neutral,
+    unknown,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .male => "male",
+            .female => "female",
+            .neutral => "neutral",
+            .unknown => "unknown",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "male", .male },
+            .{ "female", .female },
+            .{ "neutral", .neutral },
+            .{ "unknown", .unknown },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// An available TTS voice.
 pub const Voice = struct {
     /// Voice ID.
@@ -203,7 +327,7 @@ pub const Voice = struct {
     name: ?[]const u8 = null,
     /// Primary language code.
     language: ?[]const u8 = null,
-    gender: ?[]const u8 = null,
+    gender: ?VoiceGender = null,
     description: ?[]const u8 = null,
     /// URL to preview audio sample.
     preview_url: ?[]const u8 = null,
@@ -250,14 +374,107 @@ pub const STTRequest = struct {
     diarization: ?bool = null,
 };
 
+/// TTS model to use. tts-1 is faster, tts-1-hd has higher quality.
+pub const TTSConfigModel = enum {
+    tts_1,
+    tts_1_hd,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .tts_1 => "tts-1",
+            .tts_1_hd => "tts-1-hd",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "tts-1", .tts_1 },
+            .{ "tts-1-hd", .tts_1_hd },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Default voice to use.
+pub const TTSConfigVoice = enum {
+    alloy,
+    echo,
+    fable,
+    onyx,
+    nova,
+    shimmer,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .alloy => "alloy",
+            .echo => "echo",
+            .fable => "fable",
+            .onyx => "onyx",
+            .nova => "nova",
+            .shimmer => "shimmer",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "alloy", .alloy },
+            .{ "echo", .echo },
+            .{ "fable", .fable },
+            .{ "onyx", .onyx },
+            .{ "nova", .nova },
+            .{ "shimmer", .shimmer },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// TTS model to use.
+pub const TTSConfigModelId = enum {
+    eleven_monolingual_v1,
+    eleven_multilingual_v2,
+    eleven_turbo_v2_5,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .eleven_monolingual_v1 => "eleven_monolingual_v1",
+            .eleven_multilingual_v2 => "eleven_multilingual_v2",
+            .eleven_turbo_v2_5 => "eleven_turbo_v2_5",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "eleven_monolingual_v1", .eleven_monolingual_v1 },
+            .{ "eleven_multilingual_v2", .eleven_multilingual_v2 },
+            .{ "eleven_turbo_v2_5", .eleven_turbo_v2_5 },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Unified configuration for a TTS provider. Select the provider type and configure provider-specific settings. **Supported Providers:** - `openai` - OpenAI TTS (tts-1, tts-1-hd) - `vertex` - Google Cloud Text-to-Speech (Vertex AI) - `elevenlabs` - ElevenLabs premium voices **Example:** ```yaml provider: openai model: tts-1-hd voice: nova ```
 pub const TTSConfig = struct {
     /// TTS model to use. tts-1 is faster, tts-1-hd has higher quality.
-    model: ?[]const u8 = null,
+    model: ?TTSConfigModel = null,
     /// OpenAI API key. Falls back to OPENAI_API_KEY environment variable.
     api_key: ?[]const u8 = null,
     /// Default voice to use.
-    voice: ?[]const u8 = null,
+    voice: ?TTSConfigVoice = null,
     /// API base URL. Falls back to OPENAI_BASE_URL environment variable.
     base_url: ?[]const u8 = null,
     /// Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
@@ -273,7 +490,7 @@ pub const TTSConfig = struct {
     /// Default ElevenLabs voice ID.
     voice_id: ?[]const u8 = null,
     /// TTS model to use.
-    model_id: ?[]const u8 = null,
+    model_id: ?TTSConfigModelId = null,
     /// Voice stability (0.0-1.0). Higher = more consistent.
     stability: ?f64 = null,
     /// Similarity boost (0.0-1.0). Higher = more similar to original voice.

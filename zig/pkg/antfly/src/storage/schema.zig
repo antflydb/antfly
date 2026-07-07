@@ -244,6 +244,7 @@ pub const RelationalIndexKeyNulls = enum(u8) {
 
 pub const RelationalIndexKey = struct {
     column: []const u8,
+    collation: ?[]const u8 = null,
     direction: RelationalIndexKeyDirection = .asc,
     nulls: RelationalIndexKeyNulls = .default,
 };
@@ -514,6 +515,37 @@ pub const RelationalIndexOwnerKind = enum(u8) {
 
 pub const relational_table_index_owner_name = "__antfly_table__";
 
+pub const RelationalIndexOwnerRange = struct {
+    start: []const u8 = "",
+    end: []const u8 = "",
+    range_id: ?[]const u8 = null,
+    placement_generation: u64 = 0,
+};
+
+pub const RelationalIndexGenerationRecord = struct {
+    generation: u64,
+    owner_ranges: []const RelationalIndexOwnerRange = &.{},
+    lifecycle: RelationalIndexLifecycle = .ready,
+    lag: u64 = 0,
+    failure_reason: ?[]const u8 = null,
+    ready_watermark: u64 = 0,
+};
+
+pub const RelationalIndexPlannerCapabilities = struct {
+    equality: bool = false,
+    range: bool = false,
+    ordering: bool = false,
+    prefix: bool = false,
+    full_text: bool = false,
+    array: bool = false,
+    json: bool = false,
+    covering: bool = false,
+    rank: bool = false,
+    algebraic_dictionary: bool = false,
+    algebraic_fact: bool = false,
+    algebraic_path: bool = false,
+};
+
 pub const RelationalIndex = struct {
     name: []const u8,
     owner_kind: RelationalIndexOwnerKind,
@@ -528,9 +560,50 @@ pub const RelationalIndex = struct {
     lifecycle: RelationalIndexLifecycle = .ready,
     generation: u64 = 0,
     schema_fingerprint: ?[]const u8 = null,
+    owner_ranges: []const RelationalIndexOwnerRange = &.{},
+    generation_record: ?RelationalIndexGenerationRecord = null,
+    planner_capabilities: RelationalIndexPlannerCapabilities = .{},
     where: []const UniquePredicate = &.{},
     where_expressions: []const RelationalRowsExpressionCondition = &.{},
 };
+
+pub fn relationalIndexGenerationRecordValid(index: RelationalIndex) bool {
+    switch (index.access_method) {
+        .scalar_column => return index.generation_record == null,
+        .ordered_tuple, .text_search, .algebraic_filter => {
+            const record = index.generation_record orelse return false;
+            if (index.generation == 0 or record.generation != index.generation) return false;
+            if (record.lifecycle != index.lifecycle) return false;
+            if (index.owner_ranges.len != 0 and !relationalIndexOwnerRangeSlicesEqual(index.owner_ranges, record.owner_ranges)) return false;
+            return true;
+        },
+    }
+}
+
+pub fn relationalIndexLifecycle(index: RelationalIndex) ?RelationalIndexLifecycle {
+    return switch (index.access_method) {
+        .scalar_column => index.lifecycle,
+        .ordered_tuple, .text_search, .algebraic_filter => if (relationalIndexGenerationRecordValid(index)) index.generation_record.?.lifecycle else null,
+    };
+}
+
+pub fn relationalIndexOwnerRangeSlicesEqual(
+    lhs: []const RelationalIndexOwnerRange,
+    rhs: []const RelationalIndexOwnerRange,
+) bool {
+    if (lhs.len != rhs.len) return false;
+    for (lhs, rhs) |left, right| {
+        if (!std.mem.eql(u8, left.start, right.start)) return false;
+        if (!std.mem.eql(u8, left.end, right.end)) return false;
+        if (left.placement_generation != right.placement_generation) return false;
+        if (left.range_id == null and right.range_id != null) return false;
+        if (left.range_id != null and right.range_id == null) return false;
+        if (left.range_id) |left_id| {
+            if (!std.mem.eql(u8, left_id, right.range_id.?)) return false;
+        }
+    }
+    return true;
+}
 
 pub const UniqueConstraintValidationState = enum(u8) {
     enforced = 0,
@@ -614,6 +687,7 @@ pub fn relationalIndexKeySlicesEqual(a: []const RelationalIndexKey, b: []const R
     if (a.len != b.len) return false;
     for (a, b) |left, right| {
         if (!std.mem.eql(u8, left.column, right.column)) return false;
+        if (!optionalBytesEqual(left.collation, right.collation)) return false;
         if (left.direction != right.direction) return false;
         if (left.nulls != right.nulls) return false;
     }
@@ -842,7 +916,7 @@ pub const TableSchema = struct {
 
 const schema_key = "\x00\x00__metadata__:schema";
 const schema_version_prefix = "\x00\x00__metadata__:schema_v";
-const schema_format_version = 52;
+const schema_format_version = 56;
 
 // ============================================================================
 // Serialization
@@ -1036,6 +1110,9 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
         try buf.append(alloc, @intFromEnum(index.lifecycle));
         try appendU64(&buf, alloc, index.generation);
         try appendOptStr(&buf, alloc, index.schema_fingerprint);
+        try appendRelationalIndexOwnerRangeSlice(&buf, alloc, index.owner_ranges);
+        try appendRelationalIndexGenerationRecord(&buf, alloc, index.generation_record);
+        try appendRelationalIndexPlannerCapabilities(&buf, alloc, index.planner_capabilities);
         try appendUniquePredicateSlice(&buf, alloc, index.where);
         try appendRelationalRowsExpressionConditionSlice(&buf, alloc, index.where_expressions);
     }
@@ -1679,6 +1756,11 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
             const generation = readU64(data, &pos);
             const schema_fingerprint = try readOptStrAlloc(alloc, data, &pos);
             errdefer if (schema_fingerprint) |fingerprint| alloc.free(fingerprint);
+            const owner_ranges = try readRelationalIndexOwnerRangeSliceAlloc(alloc, data, &pos);
+            errdefer freeRelationalIndexOwnerRangeSlice(alloc, owner_ranges);
+            const generation_record = try readRelationalIndexGenerationRecordAlloc(alloc, data, &pos);
+            errdefer if (generation_record) |record| freeRelationalIndexGenerationRecord(alloc, record);
+            const planner_capabilities = readRelationalIndexPlannerCapabilities(data, &pos);
             const where = try readUniquePredicateSliceAlloc(alloc, data, &pos);
             errdefer freeUniquePredicateSlice(alloc, where);
             const where_expressions = try readRelationalRowsExpressionConditionSliceAlloc(alloc, data, &pos);
@@ -1697,6 +1779,9 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
                 .lifecycle = lifecycle,
                 .generation = generation,
                 .schema_fingerprint = schema_fingerprint,
+                .owner_ranges = owner_ranges,
+                .generation_record = generation_record,
+                .planner_capabilities = planner_capabilities,
                 .where = where,
                 .where_expressions = where_expressions,
             };
@@ -1880,7 +1965,10 @@ fn freeRelationalGeneratedValue(alloc: Allocator, generated: RelationalGenerated
 }
 
 pub fn freeRelationalIndexKeySlice(alloc: Allocator, keys: []const RelationalIndexKey) void {
-    for (keys) |key| alloc.free(key.column);
+    for (keys) |key| {
+        alloc.free(key.column);
+        if (key.collation) |collation| alloc.free(collation);
+    }
     if (keys.len > 0) alloc.free(keys);
 }
 
@@ -1996,8 +2084,26 @@ fn freeRelationalIndex(alloc: Allocator, index: RelationalIndex) void {
     freeStringSlice(alloc, index.include_columns);
     freeRelationalIndexKeySlice(alloc, index.keys);
     if (index.schema_fingerprint) |fingerprint| alloc.free(fingerprint);
+    freeRelationalIndexOwnerRangeSlice(alloc, index.owner_ranges);
+    if (index.generation_record) |record| freeRelationalIndexGenerationRecord(alloc, record);
     freeUniquePredicateSlice(alloc, index.where);
     freeRelationalRowsExpressionConditionSlice(alloc, index.where_expressions);
+}
+
+pub fn freeRelationalIndexGenerationRecord(alloc: Allocator, record: RelationalIndexGenerationRecord) void {
+    freeRelationalIndexOwnerRangeSlice(alloc, record.owner_ranges);
+    if (record.failure_reason) |reason| alloc.free(reason);
+}
+
+fn freeRelationalIndexOwnerRangeSlice(alloc: Allocator, ranges: []const RelationalIndexOwnerRange) void {
+    for (ranges) |range| freeRelationalIndexOwnerRange(alloc, range);
+    if (ranges.len > 0) alloc.free(ranges);
+}
+
+fn freeRelationalIndexOwnerRange(alloc: Allocator, range: RelationalIndexOwnerRange) void {
+    alloc.free(range.start);
+    alloc.free(range.end);
+    if (range.range_id) |range_id| alloc.free(range_id);
 }
 
 fn freeUniqueExpressionSlice(alloc: Allocator, expressions: []const UniqueExpression) void {
@@ -2560,9 +2666,61 @@ fn appendRelationalIndexKeySlice(
     try appendU32(buf, alloc, @intCast(keys.len));
     for (keys) |key| {
         try appendStr(buf, alloc, key.column);
+        try appendOptStr(buf, alloc, key.collation);
         try buf.append(alloc, @intFromEnum(key.direction));
         try buf.append(alloc, @intFromEnum(key.nulls));
     }
+}
+
+fn appendRelationalIndexOwnerRangeSlice(
+    buf: *std.ArrayListUnmanaged(u8),
+    alloc: Allocator,
+    ranges: []const RelationalIndexOwnerRange,
+) !void {
+    try appendU32(buf, alloc, @intCast(ranges.len));
+    for (ranges) |range| {
+        try appendStr(buf, alloc, range.start);
+        try appendStr(buf, alloc, range.end);
+        try appendOptStr(buf, alloc, range.range_id);
+        try appendU64(buf, alloc, range.placement_generation);
+    }
+}
+
+fn appendRelationalIndexGenerationRecord(
+    buf: *std.ArrayListUnmanaged(u8),
+    alloc: Allocator,
+    record: ?RelationalIndexGenerationRecord,
+) !void {
+    if (record) |value| {
+        try buf.append(alloc, 1);
+        try appendU64(buf, alloc, value.generation);
+        try appendRelationalIndexOwnerRangeSlice(buf, alloc, value.owner_ranges);
+        try buf.append(alloc, @intFromEnum(value.lifecycle));
+        try appendU64(buf, alloc, value.lag);
+        try appendOptStr(buf, alloc, value.failure_reason);
+        try appendU64(buf, alloc, value.ready_watermark);
+    } else {
+        try buf.append(alloc, 0);
+    }
+}
+
+fn appendRelationalIndexPlannerCapabilities(
+    buf: *std.ArrayListUnmanaged(u8),
+    alloc: Allocator,
+    capabilities: RelationalIndexPlannerCapabilities,
+) !void {
+    try buf.append(alloc, if (capabilities.equality) 1 else 0);
+    try buf.append(alloc, if (capabilities.range) 1 else 0);
+    try buf.append(alloc, if (capabilities.ordering) 1 else 0);
+    try buf.append(alloc, if (capabilities.prefix) 1 else 0);
+    try buf.append(alloc, if (capabilities.full_text) 1 else 0);
+    try buf.append(alloc, if (capabilities.array) 1 else 0);
+    try buf.append(alloc, if (capabilities.json) 1 else 0);
+    try buf.append(alloc, if (capabilities.covering) 1 else 0);
+    try buf.append(alloc, if (capabilities.rank) 1 else 0);
+    try buf.append(alloc, if (capabilities.algebraic_dictionary) 1 else 0);
+    try buf.append(alloc, if (capabilities.algebraic_fact) 1 else 0);
+    try buf.append(alloc, if (capabilities.algebraic_path) 1 else 0);
 }
 
 fn appendUniqueExpressionSlice(
@@ -2817,23 +2975,103 @@ fn readStringSliceAlloc(alloc: Allocator, data: []const u8, pos: *usize) ![]cons
     return out;
 }
 
+fn readRelationalIndexOwnerRangeSliceAlloc(alloc: Allocator, data: []const u8, pos: *usize) ![]const RelationalIndexOwnerRange {
+    const count = readU32(data, pos);
+    if (count == 0) return &.{};
+    const out = try alloc.alloc(RelationalIndexOwnerRange, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |range| freeRelationalIndexOwnerRange(alloc, range);
+        alloc.free(out);
+    }
+    for (out) |*range| {
+        const start = try alloc.dupe(u8, readStr(data, pos));
+        errdefer alloc.free(start);
+        const end = try alloc.dupe(u8, readStr(data, pos));
+        errdefer alloc.free(end);
+        const range_id = try readOptStrAlloc(alloc, data, pos);
+        errdefer if (range_id) |value| alloc.free(value);
+        range.* = .{
+            .start = start,
+            .end = end,
+            .range_id = range_id,
+            .placement_generation = readU64(data, pos),
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn readRelationalIndexGenerationRecordAlloc(
+    alloc: Allocator,
+    data: []const u8,
+    pos: *usize,
+) !?RelationalIndexGenerationRecord {
+    if (data[pos.*] == 0) {
+        pos.* += 1;
+        return null;
+    }
+    pos.* += 1;
+    const generation = readU64(data, pos);
+    const owner_ranges = try readRelationalIndexOwnerRangeSliceAlloc(alloc, data, pos);
+    errdefer freeRelationalIndexOwnerRangeSlice(alloc, owner_ranges);
+    const lifecycle: RelationalIndexLifecycle = @enumFromInt(data[pos.*]);
+    pos.* += 1;
+    const lag = readU64(data, pos);
+    const failure_reason = try readOptStrAlloc(alloc, data, pos);
+    errdefer if (failure_reason) |reason| alloc.free(reason);
+    const ready_watermark = readU64(data, pos);
+    return .{
+        .generation = generation,
+        .owner_ranges = owner_ranges,
+        .lifecycle = lifecycle,
+        .lag = lag,
+        .failure_reason = failure_reason,
+        .ready_watermark = ready_watermark,
+    };
+}
+
+fn readRelationalIndexPlannerCapabilities(data: []const u8, pos: *usize) RelationalIndexPlannerCapabilities {
+    const capabilities = RelationalIndexPlannerCapabilities{
+        .equality = data[pos.*] == 1,
+        .range = data[pos.* + 1] == 1,
+        .ordering = data[pos.* + 2] == 1,
+        .prefix = data[pos.* + 3] == 1,
+        .full_text = data[pos.* + 4] == 1,
+        .array = data[pos.* + 5] == 1,
+        .json = data[pos.* + 6] == 1,
+        .covering = data[pos.* + 7] == 1,
+        .rank = data[pos.* + 8] == 1,
+        .algebraic_dictionary = data[pos.* + 9] == 1,
+        .algebraic_fact = data[pos.* + 10] == 1,
+        .algebraic_path = data[pos.* + 11] == 1,
+    };
+    pos.* += 12;
+    return capabilities;
+}
+
 fn readRelationalIndexKeySliceAlloc(alloc: Allocator, data: []const u8, pos: *usize) ![]const RelationalIndexKey {
     const count = readU32(data, pos);
     if (count == 0) return &.{};
     const out = try alloc.alloc(RelationalIndexKey, count);
     var initialized: usize = 0;
     errdefer {
-        for (out[0..initialized]) |key| alloc.free(key.column);
+        for (out[0..initialized]) |key| {
+            alloc.free(key.column);
+            if (key.collation) |collation| alloc.free(collation);
+        }
         alloc.free(out);
     }
     for (out) |*key| {
         const column = try alloc.dupe(u8, readStr(data, pos));
         errdefer alloc.free(column);
+        const collation = try readOptStrAlloc(alloc, data, pos);
+        errdefer if (collation) |value| alloc.free(value);
         const direction: RelationalIndexKeyDirection = @enumFromInt(data[pos.*]);
         pos.* += 1;
         const nulls: RelationalIndexKeyNulls = @enumFromInt(data[pos.*]);
         pos.* += 1;
-        key.* = .{ .column = column, .direction = direction, .nulls = nulls };
+        key.* = .{ .column = column, .collation = collation, .direction = direction, .nulls = nulls };
         initialized += 1;
     }
     return out;
@@ -3173,6 +3411,47 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
                 .lifecycle = .building,
                 .generation = 12345,
                 .schema_fingerprint = "secondary-index-v1:test",
+                .owner_ranges = &.{
+                    .{
+                        .start = "row:a",
+                        .end = "row:m",
+                        .range_id = "range-1",
+                        .placement_generation = 77,
+                    },
+                    .{
+                        .start = "row:m",
+                        .end = "",
+                        .range_id = "range-2",
+                        .placement_generation = 78,
+                    },
+                },
+                .generation_record = .{
+                    .generation = 12345,
+                    .owner_ranges = &.{
+                        .{
+                            .start = "row:a",
+                            .end = "row:m",
+                            .range_id = "range-1",
+                            .placement_generation = 77,
+                        },
+                        .{
+                            .start = "row:m",
+                            .end = "",
+                            .range_id = "range-2",
+                            .placement_generation = 78,
+                        },
+                    },
+                    .lifecycle = .building,
+                    .lag = 12,
+                    .failure_reason = "catch-up lag",
+                    .ready_watermark = 9876,
+                },
+                .planner_capabilities = .{
+                    .equality = true,
+                    .range = true,
+                    .ordering = true,
+                    .covering = true,
+                },
                 .where = &.{.{ .field = "tenant_id", .op = .is_not_null }},
                 .where_expressions = &.{.{
                     .lhs = .{ .kind = .lower, .operands = &.{.{ .kind = .field, .field = "tenant_id" }} },
@@ -3245,6 +3524,7 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
 
     const data = try serializeSchema(alloc, schema);
     defer alloc.free(data);
+    try std.testing.expectEqual(@as(u32, 56), std.mem.readInt(u32, data[4..8], .little));
 
     var downgraded = try alloc.dupe(u8, data);
     defer alloc.free(downgraded);
@@ -3376,6 +3656,29 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
     try std.testing.expectEqual(RelationalIndexLifecycle.building, loaded.relational_indexes[0].lifecycle);
     try std.testing.expectEqual(@as(u64, 12345), loaded.relational_indexes[0].generation);
     try std.testing.expectEqualStrings("secondary-index-v1:test", loaded.relational_indexes[0].schema_fingerprint.?);
+    try std.testing.expectEqual(@as(usize, 2), loaded.relational_indexes[0].owner_ranges.len);
+    try std.testing.expectEqualStrings("row:a", loaded.relational_indexes[0].owner_ranges[0].start);
+    try std.testing.expectEqualStrings("row:m", loaded.relational_indexes[0].owner_ranges[0].end);
+    try std.testing.expectEqualStrings("range-1", loaded.relational_indexes[0].owner_ranges[0].range_id.?);
+    try std.testing.expectEqual(@as(u64, 77), loaded.relational_indexes[0].owner_ranges[0].placement_generation);
+    try std.testing.expectEqualStrings("row:m", loaded.relational_indexes[0].owner_ranges[1].start);
+    try std.testing.expectEqualStrings("", loaded.relational_indexes[0].owner_ranges[1].end);
+    try std.testing.expectEqualStrings("range-2", loaded.relational_indexes[0].owner_ranges[1].range_id.?);
+    const generation_record = loaded.relational_indexes[0].generation_record orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 12345), generation_record.generation);
+    try std.testing.expectEqual(RelationalIndexLifecycle.building, generation_record.lifecycle);
+    try std.testing.expectEqual(@as(u64, 12), generation_record.lag);
+    try std.testing.expectEqualStrings("catch-up lag", generation_record.failure_reason.?);
+    try std.testing.expectEqual(@as(u64, 9876), generation_record.ready_watermark);
+    try std.testing.expectEqual(@as(usize, 2), generation_record.owner_ranges.len);
+    try std.testing.expectEqualStrings("row:a", generation_record.owner_ranges[0].start);
+    try std.testing.expectEqualStrings("row:m", generation_record.owner_ranges[0].end);
+    try std.testing.expectEqualStrings("range-1", generation_record.owner_ranges[0].range_id.?);
+    try std.testing.expect(loaded.relational_indexes[0].planner_capabilities.equality);
+    try std.testing.expect(loaded.relational_indexes[0].planner_capabilities.range);
+    try std.testing.expect(loaded.relational_indexes[0].planner_capabilities.ordering);
+    try std.testing.expect(loaded.relational_indexes[0].planner_capabilities.covering);
+    try std.testing.expect(!loaded.relational_indexes[0].planner_capabilities.full_text);
     try std.testing.expectEqual(@as(usize, 1), loaded.relational_indexes[0].where.len);
     try std.testing.expectEqualStrings("tenant_id", loaded.relational_indexes[0].where[0].field);
     try std.testing.expectEqual(@as(usize, 1), loaded.relational_indexes[0].where_expressions.len);

@@ -139,8 +139,30 @@ pub const ExtractionRequest = struct {
     options: ?ExtractionOptions = null,
 };
 
+pub const ExtractionResponseObject = enum {
+    extraction,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .extraction => "extraction",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "extraction", .extraction },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const ExtractionResponse = struct {
-    object: []const u8,
+    object: ExtractionResponseObject,
     model: []const u8,
     data: []const ExtractionObject,
     usage: ?std.json.Value = null,

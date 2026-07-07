@@ -18,9 +18,11 @@ const catalog_resources = @import("catalog_resources.zig");
 const sql_statement_kind = @import("statement_kind.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const expr_condition = @import("expr/condition.zig");
+const expr_build = @import("expr/build.zig");
 const expr_type = @import("expr/type.zig");
 const expr_operator = @import("expr/operator.zig");
 const expr_token = @import("expr/token.zig");
+const expr_generated_validate = @import("expr/generated_validate.zig");
 const generated_parser = @import("generated_parser.zig");
 const generated_read_validate = @import("generated_read_validate.zig");
 const expr_where_condition = @import("expr/where_condition.zig");
@@ -365,6 +367,33 @@ pub const DdlPlanParserOptions = struct {
     row_security_policy_options: RowSecurityPolicyOptions,
 };
 
+fn makeDdlExpressionOptions(ptr: anytype) DdlExpressionOptions {
+    const Accessors = parser_context.ParserState.ContextAccessors;
+    return .{
+        .params = ptr.params,
+        .realtime_ns = value_mod.currentRealtimeNs(),
+        .function_bindings = ptr.function_bindings,
+        .context_hooks = Accessors.selectParserContextHooks(ptr),
+        .row_expression_hooks = Accessors.rowExpressionParserHooks(ptr),
+        .arithmetic_hooks = Accessors.arithmeticExpressionParserHooks(ptr),
+        .variadic_hooks = Accessors.variadicRowExpressionParserHooks(ptr),
+        .routine_expression = Accessors.routineExpressionRowExpressionParserOptions(ptr),
+        .condition_alternatives = Accessors.expressionWhereConditionAlternativesParserHooks(ptr),
+    };
+}
+
+fn makeDdlColumnDefinitionOptions(ptr: anytype) DdlColumnDefinitionOptions {
+    return .{
+        .schema = ptr.schema,
+        .params = ptr.params,
+        .function_bindings = ptr.function_bindings,
+        .field_expression_qualifiers = ptr.field_expression_qualifiers,
+        .returning_expression_qualifiers = ptr.returning_expression_qualifiers,
+        .defer_row_expression_field_validation = ptr.defer_row_expression_field_validation,
+        .expression_options = makeDdlExpressionOptions(ptr),
+    };
+}
+
 fn defaultDdlPlanParserOptionsForTest(alloc: std.mem.Allocator, tokens: []const grammar.Token) DdlPlanParserOptions {
     var state = parser_context.ParserState{
         .alloc = alloc,
@@ -375,7 +404,7 @@ fn defaultDdlPlanParserOptionsForTest(alloc: std.mem.Allocator, tokens: []const 
         .field_expression_qualifiers = state.field_expression_qualifiers,
         .returning_expression_qualifiers = state.returning_expression_qualifiers,
         .defer_row_expression_field_validation = state.defer_row_expression_field_validation,
-        .column_definition_options = parser_context.ParserState.ContextAccessors.ddlColumnDefinitionOptions(&state),
+        .column_definition_options = makeDdlColumnDefinitionOptions(&state),
         .domain_options = parser_context.ParserState.ContextAccessors.ddlDomainOptions(&state),
         .create_index_options = parser_context.ParserState.ContextAccessors.createIndexOptions(&state),
         .row_security_policy_options = parser_context.ParserState.ContextAccessors.rowSecurityPolicyOptions(&state),
@@ -2727,6 +2756,8 @@ pub const DropTablePlan = struct {
 pub const DropIndexPlan = struct {
     index_name: []const u8,
     if_exists: bool = false,
+    concurrently: bool = false,
+    dependency_mode: DropDependencyMode = .restrict,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.index_name);
@@ -6992,7 +7023,8 @@ fn applyGeneratedCreateDomainOptionAlloc(
     if (ast.domain_operation_kind_items.len != ast.domain_operation_items.count or
         ast.domain_operation_constraint_name_items.len != ast.domain_operation_items.count or
         ast.domain_operation_default_value_items.len != ast.domain_operation_items.count or
-        ast.domain_operation_check_payload_items.len != ast.domain_operation_items.count)
+        ast.domain_operation_check_payload_items.len != ast.domain_operation_items.count or
+        ast.domain_operation_check_payload_expressions.len != ast.domain_operation_items.count)
     {
         return error.UnsupportedSqlShape;
     }
@@ -7035,11 +7067,18 @@ fn applyGeneratedCreateDomainOptionAlloc(
             return error.UnsupportedSqlShape;
         }
         if (payload.start != kind.end or payload.end != item.end) return error.UnsupportedSqlShape;
-        var pos = payload.start;
-        const check = try parseDomainCheckConstraintAlloc(alloc, tokens, &pos, if (constraint_name) |name| tokens[name.start].text else null, plan.field_type, options);
+        const check_expression = &ast.domain_operation_check_payload_expressions[index];
+        try validateGeneratedDdlCheckPayloadExpressionAst(tokens, payload, check_expression);
+        const check = try generatedDdlCheckConstraintFromAstAlloc(
+            alloc,
+            tokens,
+            payload,
+            check_expression.*,
+            if (constraint_name) |name| tokens[name.start].text else null,
+            options.expression_options,
+        );
         var transferred = false;
         errdefer if (!transferred) freeDdlRelationalCheck(alloc, check);
-        if (pos != payload.end) return error.UnsupportedSqlShape;
         try checks.append(alloc, check);
         transferred = true;
         return;
@@ -7262,7 +7301,8 @@ fn validateGeneratedCreateDomainOptionPayloadItems(
         ast.domain_operation_kind_items.len != count or
         ast.domain_operation_constraint_name_items.len != count or
         ast.domain_operation_default_value_items.len != count or
-        ast.domain_operation_check_payload_items.len != count)
+        ast.domain_operation_check_payload_items.len != count or
+        ast.domain_operation_check_payload_expressions.len != count)
     {
         return error.UnsupportedSqlShape;
     }
@@ -7275,6 +7315,9 @@ fn validateGeneratedCreateDomainOptionPayloadItems(
         if (!generatedOptionalRangeEqual(ast.domain_operation_check_payload_items[index], expected.check_payload)) return error.UnsupportedSqlShape;
         if (ast.domain_operation_check_payload_items[index]) |payload| {
             if (!generatedParenthesizedRangeIsValid(tokens, payload)) return error.UnsupportedSqlShape;
+            try validateGeneratedDdlCheckPayloadExpressionAst(tokens, payload, &ast.domain_operation_check_payload_expressions[index]);
+        } else if (ast.domain_operation_check_payload_expressions[index].tokens != null) {
+            return error.UnsupportedSqlShape;
         }
     }
 }
@@ -11319,6 +11362,8 @@ fn validateGeneratedAlterTableOperationPrimaryUniqueConstraintPayloadItems(
             const not_valid_start = if (expected_timing) |range| range.end else timing_start;
             const expected_not_valid = generatedDdlConstraintNotValidRange(tokens, not_valid_start, operation.end);
             if (!generatedDdlOptionalRangeMatches(not_valid_items[index], expected_not_valid)) return error.UnsupportedSqlShape;
+            const expected_tail_end = if (expected_not_valid) |range| range.end else not_valid_start;
+            if (expected_tail_end != operation.end) return error.UnsupportedSqlShape;
         } else if (nulls_items[index] != null or column_list_items[index] != null or include_items[index] != null or timing_items[index] != null or not_valid_items[index] != null) {
             return error.UnsupportedSqlShape;
         }
@@ -11387,12 +11432,14 @@ fn validateGeneratedAlterTableOperationCheckConstraintPayloadItems(
     ast: *const generated_parser.GeneratedSqlDdlAst,
 ) !void {
     const payload_items = ast.alter_table_operation_check_payload_items;
+    const payload_expressions = ast.alter_table_operation_check_payload_expressions;
     const not_valid_items = ast.alter_table_operation_check_not_valid_items;
-    if (payload_items.len == 0 and not_valid_items.len == 0) {
+    if (payload_items.len == 0 and payload_expressions.len == 0 and not_valid_items.len == 0) {
         if (generatedDdlHasCheckTableConstraints(tokens, ast)) return error.UnsupportedSqlShape;
         return;
     }
     if (payload_items.len != not_valid_items.len or
+        payload_items.len != payload_expressions.len or
         payload_items.len != ast.alter_table_operation_items.count or
         ast.alter_table_operation_items.items.len != ast.alter_table_operation_items.count)
     {
@@ -11407,11 +11454,12 @@ fn validateGeneratedAlterTableOperationCheckConstraintPayloadItems(
             const payload = payload_items[index] orelse return error.UnsupportedSqlShape;
             if (payload.end > tokens.len or payload.start != kind.end or payload.end > operation.end) return error.UnsupportedSqlShape;
             if (!generatedDdlParenthesizedRangeIsValid(tokens, payload)) return error.UnsupportedSqlShape;
+            try validateGeneratedDdlCheckPayloadExpressionAst(tokens, payload, &payload_expressions[index]);
             const expected_not_valid = generatedDdlTrailingConstraintNotValidRange(tokens, payload.start, operation.end);
             if (!generatedDdlOptionalRangeMatches(not_valid_items[index], expected_not_valid)) return error.UnsupportedSqlShape;
             const expected_payload_end = if (expected_not_valid) |range| range.start else operation.end;
             if (payload.end != expected_payload_end) return error.UnsupportedSqlShape;
-        } else if (payload_items[index] != null or not_valid_items[index] != null) {
+        } else if (payload_items[index] != null or payload_expressions[index].tokens != null or not_valid_items[index] != null) {
             return error.UnsupportedSqlShape;
         }
     }
@@ -11636,12 +11684,13 @@ fn validateGeneratedAlterTableOperationInlineConstraintPrefixItems(
     const foreign_key_payload_items = ast.alter_table_operation_inline_foreign_key_payload_items;
     const foreign_key_not_valid_items = ast.alter_table_operation_inline_foreign_key_not_valid_items;
     const check_payload_items = ast.alter_table_operation_inline_check_payload_items;
+    const check_payload_expressions = ast.alter_table_operation_inline_check_payload_expressions;
     const check_not_valid_items = ast.alter_table_operation_inline_check_not_valid_items;
     if (inline_items.items.len != inline_items.count) return error.UnsupportedSqlShape;
     if (name_items.len != inline_items.count or kind_items.len != inline_items.count) return error.UnsupportedSqlShape;
     if (nulls_items.len != inline_items.count or include_items.len != inline_items.count or timing_items.len != inline_items.count or not_valid_items.len != inline_items.count) return error.UnsupportedSqlShape;
     if (foreign_key_payload_items.len != inline_items.count or foreign_key_not_valid_items.len != inline_items.count) return error.UnsupportedSqlShape;
-    if (check_payload_items.len != inline_items.count or check_not_valid_items.len != inline_items.count) return error.UnsupportedSqlShape;
+    if (check_payload_items.len != inline_items.count or check_payload_expressions.len != inline_items.count or check_not_valid_items.len != inline_items.count) return error.UnsupportedSqlShape;
     if (inline_items.count == 0) {
         if (generatedDdlColumnDefinitionsHaveInlineConstraints(tokens, ast)) return error.UnsupportedSqlShape;
         return;
@@ -11695,8 +11744,9 @@ fn generatedDdlInlineCheckConstraintPayloadMatches(
 ) bool {
     const kind = ast.alter_table_operation_inline_constraint_kind_items[index];
     const payload = ast.alter_table_operation_inline_check_payload_items[index];
+    const expression = &ast.alter_table_operation_inline_check_payload_expressions[index];
     const not_valid = ast.alter_table_operation_inline_check_not_valid_items[index];
-    if (!generatedDdlConstraintKindIsCheck(tokens, kind)) return payload == null and not_valid == null;
+    if (!generatedDdlConstraintKindIsCheck(tokens, kind)) return payload == null and expression.tokens == null and not_valid == null;
 
     const operation = generatedDdlInlineConstraintContainingOperation(ast, kind) orelse return false;
     const segment_end = generatedDdlNextInlineConstraintPrefixStart(tokens, operation, kind.end) orelse operation.end;
@@ -11705,7 +11755,9 @@ fn generatedDdlInlineCheckConstraintPayloadMatches(
     const expected_payload_end = if (expected_not_valid) |range| range.start else segment_end;
     const payload_range = payload orelse return false;
     if (payload_range.end > tokens.len or payload_range.start != kind.end or payload_range.end != expected_payload_end) return false;
-    return generatedDdlParenthesizedRangeIsValid(tokens, payload_range);
+    if (!generatedDdlParenthesizedRangeIsValid(tokens, payload_range)) return false;
+    validateGeneratedDdlCheckPayloadExpressionAst(tokens, payload_range, expression) catch return false;
+    return true;
 }
 
 fn generatedDdlInlineForeignKeyConstraintPayloadMatches(
@@ -11740,21 +11792,24 @@ fn generatedDdlInlinePrimaryUniqueConstraintPayloadMatches(
     const not_valid = ast.alter_table_operation_inline_constraint_not_valid_items[index];
     if (!is_primary_unique) return nulls == null and include == null and timing == null and not_valid == null;
 
-    const operation_end = generatedDdlInlineConstraintContainingOperationEnd(ast, kind) orelse return false;
+    const operation = generatedDdlInlineConstraintContainingOperation(ast, kind) orelse return false;
+    const segment_end = generatedDdlNextInlineConstraintPrefixStart(tokens, operation, kind.end) orelse operation.end;
     const expected_nulls = if (tokens[kind.start].matchesKeyword("unique"))
-        generatedDdlUniqueNullsDistinctRange(tokens, kind.end, operation_end)
+        generatedDdlUniqueNullsDistinctRange(tokens, kind.end, segment_end)
     else
         null;
     if (!generatedDdlOptionalRangeMatches(nulls, expected_nulls)) return false;
     const include_start = if (expected_nulls) |range| range.end else kind.end;
-    const expected_include = generatedDdlConstraintIncludeRange(tokens, include_start, operation_end);
+    const expected_include = generatedDdlConstraintIncludeRange(tokens, include_start, segment_end);
     if (!generatedDdlOptionalRangeMatches(include, expected_include)) return false;
     const timing_start = if (expected_include) |range| range.end else include_start;
-    const expected_timing = generatedDdlConstraintTimingRange(tokens, timing_start, operation_end);
+    const expected_timing = generatedDdlConstraintTimingRange(tokens, timing_start, segment_end);
     if (!generatedDdlOptionalRangeMatches(timing, expected_timing)) return false;
     const not_valid_start = if (expected_timing) |range| range.end else timing_start;
-    const expected_not_valid = generatedDdlConstraintNotValidRange(tokens, not_valid_start, operation_end);
-    return generatedDdlOptionalRangeMatches(not_valid, expected_not_valid);
+    const expected_not_valid = generatedDdlConstraintNotValidRange(tokens, not_valid_start, segment_end);
+    if (!generatedDdlOptionalRangeMatches(not_valid, expected_not_valid)) return false;
+    const expected_tail_end = if (expected_not_valid) |range| range.end else not_valid_start;
+    return expected_tail_end == segment_end;
 }
 
 fn generatedDdlInlineConstraintContainingOperationEnd(
@@ -11922,12 +11977,14 @@ fn validateGeneratedAlterTableOperationColumnDefinitionItems(
     const collation_items = ast.alter_table_operation_column_collation_items;
     const default_clause_items = ast.alter_table_operation_column_default_clause_items;
     const generated_clause_items = ast.alter_table_operation_column_generated_clause_items;
-    if (name_items.len == 0 and type_items.len == 0 and nullability_items.len == 0 and collation_items.len == 0 and default_clause_items.len == 0 and generated_clause_items.len == 0) return;
+    const identity_clause_items = ast.alter_table_operation_column_identity_clause_items;
+    if (name_items.len == 0 and type_items.len == 0 and nullability_items.len == 0 and collation_items.len == 0 and default_clause_items.len == 0 and generated_clause_items.len == 0 and identity_clause_items.len == 0) return;
     if (name_items.len != type_items.len or
         name_items.len != nullability_items.len or
         name_items.len != collation_items.len or
         name_items.len != default_clause_items.len or
         name_items.len != generated_clause_items.len or
+        name_items.len != identity_clause_items.len or
         name_items.len != ast.alter_table_operation_items.items.len or
         ast.alter_table_operation_items.items.len != ast.alter_table_operation_items.count)
     {
@@ -11940,6 +11997,7 @@ fn validateGeneratedAlterTableOperationColumnDefinitionItems(
         const collation_range = collation_items[index];
         const default_clause_range = default_clause_items[index];
         const generated_clause_range = generated_clause_items[index];
+        const identity_clause_range = identity_clause_items[index];
         if (generatedDdlItemLooksLikeColumnDefinition(tokens, item)) {
             const name = name_range orelse return error.UnsupportedSqlShape;
             const type_tokens = type_range orelse return error.UnsupportedSqlShape;
@@ -11969,10 +12027,89 @@ fn validateGeneratedAlterTableOperationColumnDefinitionItems(
             } else if (generatedDdlColumnDefinitionStoredGeneratedClauseRange(tokens, item) != null) {
                 return error.UnsupportedSqlShape;
             }
-        } else if (name_range != null or type_range != null or nullability_range != null or collation_range != null or default_clause_range != null or generated_clause_range != null) {
+            if (identity_clause_range) |range| {
+                if (range.start < type_tokens.end or range.end > item.end or range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
+                if (!generatedDdlColumnIdentityClauseRangeIsValid(tokens, item, range)) return error.UnsupportedSqlShape;
+            } else if (generatedDdlColumnIdentityClauseRange(tokens, item) != null) {
+                return error.UnsupportedSqlShape;
+            }
+            try validateGeneratedDdlColumnDefinitionTailCovered(tokens, item, type_tokens.end, .{
+                nullability_range,
+                collation_range,
+                default_clause_range,
+                generated_clause_range,
+                identity_clause_range,
+            });
+        } else if (name_range != null or type_range != null or nullability_range != null or collation_range != null or default_clause_range != null or generated_clause_range != null or identity_clause_range != null) {
             return error.UnsupportedSqlShape;
         }
     }
+}
+
+fn validateGeneratedDdlColumnDefinitionTailCovered(
+    tokens: []const grammar.Token,
+    item: generated_parser.GeneratedSqlTokenRange,
+    start: usize,
+    ranges: [5]?generated_parser.GeneratedSqlTokenRange,
+) !void {
+    var cursor = start;
+    while (cursor < item.end) {
+        if (generatedDdlColumnDefinitionTailRangeEndAt(ranges, cursor)) |range_end| {
+            if (range_end <= cursor or range_end > item.end) return error.UnsupportedSqlShape;
+            cursor = range_end;
+            continue;
+        }
+        if (generatedDdlColumnInlineConstraintPrefixAt(tokens, item, cursor)) |prefix| {
+            cursor = generatedDdlNextInlineConstraintPrefixStart(tokens, item, prefix.kind.end) orelse item.end;
+            continue;
+        }
+        return error.UnsupportedSqlShape;
+    }
+}
+
+fn generatedDdlColumnDefinitionTailRangeEndAt(
+    ranges: [5]?generated_parser.GeneratedSqlTokenRange,
+    cursor: usize,
+) ?usize {
+    for (ranges) |maybe_range| {
+        const range = maybe_range orelse continue;
+        if (range.start == cursor) return range.end;
+    }
+    return null;
+}
+
+fn generatedDdlColumnIdentityClauseRangeIsValid(
+    tokens: []const grammar.Token,
+    item: generated_parser.GeneratedSqlTokenRange,
+    range: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    const expected = generatedDdlColumnIdentityClauseRange(tokens, item) orelse return false;
+    return std.meta.eql(expected, range);
+}
+
+fn generatedDdlColumnIdentityClauseRange(
+    tokens: []const grammar.Token,
+    item: generated_parser.GeneratedSqlTokenRange,
+) ?generated_parser.GeneratedSqlTokenRange {
+    const start = findTopLevelKeyword(tokens, item.start, item.end, .generated) orelse return null;
+    var cursor = start + 1;
+    if (cursor >= item.end) return null;
+    if (tokens[cursor].matchesKeywordTag(.always)) {
+        cursor += 1;
+    } else if (cursor + 1 < item.end and tokens[cursor].matchesKeywordTag(.by) and tokens[cursor + 1].matchesKeywordTag(.default)) {
+        cursor += 2;
+    } else {
+        return null;
+    }
+    if (cursor >= item.end or !tokens[cursor].matchesKeywordTag(.as)) return null;
+    cursor += 1;
+    if (cursor >= item.end or !tokens[cursor].matchesKeyword("identity")) return null;
+    cursor += 1;
+    if (cursor < item.end and tokens[cursor].kind == .lparen) {
+        const close_index = findGeneratedMatchingParen(tokens, cursor, item.end) orelse return null;
+        cursor = close_index + 1;
+    }
+    return .{ .start = start, .end = cursor };
 }
 
 fn generatedDdlItemLooksLikeColumnDefinition(
@@ -12143,9 +12280,11 @@ fn validateGeneratedAlterTableOperationDefaultValueItems(
     ast: *const generated_parser.GeneratedSqlDdlAst,
 ) !void {
     const default_items = ast.alter_table_operation_default_value_items;
+    const default_expressions = ast.alter_table_operation_default_value_expressions;
     const clause_items = ast.alter_table_operation_column_default_clause_items;
-    if (default_items.len == 0 and clause_items.len == 0) return;
+    if (default_items.len == 0 and default_expressions.len == 0 and clause_items.len == 0) return;
     if (default_items.len != ast.alter_table_operation_items.items.len or
+        default_expressions.len != ast.alter_table_operation_items.items.len or
         clause_items.len != ast.alter_table_operation_items.items.len or
         ast.alter_table_operation_items.items.len != ast.alter_table_operation_items.count)
     {
@@ -12167,6 +12306,8 @@ fn validateGeneratedAlterTableOperationDefaultValueItems(
             } else if (!generatedAlterTableAlterColumnSetDefaultValueRangeIsValid(tokens, item, default_range)) {
                 return error.UnsupportedSqlShape;
             }
+            const expression_range = default_expressions[index].tokens orelse return error.UnsupportedSqlShape;
+            if (!generatedDdlTokenRangeEqual(expression_range, default_range)) return error.UnsupportedSqlShape;
         } else if (generatedDdlItemRequiresDefaultValueRange(tokens, item)) {
             return error.UnsupportedSqlShape;
         } else if (maybe_clause_range != null) {
@@ -13604,11 +13745,13 @@ fn dropIndexPlanFromGeneratedDdlAstAlloc(
 ) !DropIndexPlan {
     const end = try requireGeneratedDdlHeader(tokens, ast.statement_span, .drop, .index);
     var index: usize = 2;
-    if (index < end and tokens[index].matchesKeyword("concurrently")) index += 1;
+    const concurrently = index < end and tokens[index].matchesKeyword("concurrently");
+    if (concurrently) index += 1;
     if (ast.if_exists) try expectGeneratedIfExists(tokens, &index, end);
     const name_range = try requireGeneratedTokenRangeAt(ast.object_name_tokens, index, end);
     index = name_range.end;
-    if (ast.cascade) {
+    const dependency_mode: DropDependencyMode = if (ast.cascade) .cascade else .restrict;
+    if (dependency_mode == .cascade) {
         if (index >= end or !tokens[index].matchesKeywordTag(.cascade)) return error.UnsupportedSqlShape;
         index += 1;
     } else if (index < end and tokens[index].matchesKeywordTag(.restrict)) {
@@ -13618,6 +13761,8 @@ fn dropIndexPlanFromGeneratedDdlAstAlloc(
     return .{
         .index_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, name_range),
         .if_exists = ast.if_exists,
+        .concurrently = concurrently,
+        .dependency_mode = dependency_mode,
     };
 }
 
@@ -13656,17 +13801,28 @@ fn identityAllocatorPlanFromGeneratedDdlAstAlloc(
 
     const first_item = ast.alter_table_operation_items.items[0];
     if (!generatedRangeWithinStatement(first_item, end) or first_item.start != items_range.start or first_item.start >= first_item.end or first_item.end > items_range.end) return error.UnsupportedSqlShape;
-    var first_pos: usize = 0;
-    const first_tokens = tokens[first_item.start..first_item.end];
-    const column_name = try grammar.parseIdentifierOwnedAlloc(alloc, first_tokens, &first_pos);
+    if (ast.alter_table_operation_column_name_items.len == 0 or ast.alter_table_operation_column_type_items.len == 0 or ast.alter_table_operation_column_identity_clause_items.len == 0) return error.UnsupportedSqlShape;
+    const first_name_range = ast.alter_table_operation_column_name_items[0] orelse return error.UnsupportedSqlShape;
+    const first_type_range = ast.alter_table_operation_column_type_items[0] orelse return error.UnsupportedSqlShape;
+    if (first_name_range.start != first_item.start or first_name_range.end != first_type_range.start) return error.UnsupportedSqlShape;
+    const first_identity_range = ast.alter_table_operation_column_identity_clause_items[0];
+    const column_name = try generatedIdentifierAlloc(alloc, tokens, first_name_range);
     var column_name_transferred = false;
     errdefer if (!column_name_transferred) alloc.free(column_name);
     const path = try alloc.dupe(u8, column_name);
     var path_transferred = false;
     errdefer if (!path_transferred) alloc.free(path);
-    var identity = try parseIdentityAllocatorSpecAlloc(first_tokens, &first_pos);
+    const identity_range = if (first_identity_range) |range| blk: {
+        if (range.start < first_type_range.end or range.end > first_item.end) return error.UnsupportedSqlShape;
+        break :blk generated_parser.GeneratedSqlTokenRange{ .start = first_type_range.start, .end = range.end };
+    } else first_type_range;
+    var identity_pos: usize = 0;
+    var identity = try parseIdentityAllocatorSpecAlloc(tokens[identity_range.start..identity_range.end], &identity_pos);
+    if (identity_pos != identity_range.end - identity_range.start) return error.UnsupportedSqlShape;
     var identity_transferred = false;
     errdefer if (!identity_transferred) identity.deinit(alloc);
+    var first_pos = identity_range.end - first_item.start;
+    const first_tokens = tokens[first_item.start..first_item.end];
     const first_cursor = parser.Cursor.init(first_tokens, &first_pos);
     var primary_key = false;
     if (first_cursor.matchKeyword("primary")) {
@@ -13714,6 +13870,10 @@ fn identityAllocatorPlanFromGeneratedDdlAstAlloc(
         item_hooks.expression_options.generated_default_value_token_offset = item.start;
         if (ast.alter_table_operation_default_value_items.len != 0) {
             item_hooks.expression_options.generated_default_value_tokens = ast.alter_table_operation_default_value_items[item_index];
+            item_hooks.expression_options.generated_default_value_ast = if (ast.alter_table_operation_default_value_items[item_index] != null)
+                &ast.alter_table_operation_default_value_expressions[item_index]
+            else
+                null;
         }
         item_hooks.generated_column_name_full_tokens = tokens;
         item_hooks.generated_column_header_token_offset = item.start;
@@ -14469,6 +14629,10 @@ fn alterTablePlanFromGeneratedAstAlloc(
         local_options.expression_options.generated_default_value_token_offset = item.start;
         if (ast.alter_table_operation_default_value_items.len != 0) {
             local_options.expression_options.generated_default_value_tokens = ast.alter_table_operation_default_value_items[item_index];
+            local_options.expression_options.generated_default_value_ast = if (ast.alter_table_operation_default_value_items[item_index] != null)
+                &ast.alter_table_operation_default_value_expressions[item_index]
+            else
+                null;
         }
         local_options.generated_constraint_name_full_tokens = tokens;
         local_options.generated_constraint_token_offset = item.start;
@@ -14483,6 +14647,10 @@ fn alterTablePlanFromGeneratedAstAlloc(
             local_options.generated_foreign_key_payload_tokens = ast.alter_table_operation_foreign_key_payload_items[item_index];
             local_options.generated_foreign_key_not_valid_tokens = ast.alter_table_operation_foreign_key_not_valid_items[item_index];
             local_options.generated_check_payload_tokens = ast.alter_table_operation_check_payload_items[item_index];
+            local_options.generated_check_payload_expression = if (ast.alter_table_operation_check_payload_items[item_index] != null)
+                &ast.alter_table_operation_check_payload_expressions[item_index]
+            else
+                null;
             local_options.generated_check_not_valid_tokens = ast.alter_table_operation_check_not_valid_items[item_index];
             local_options.generated_period_payload_tokens = ast.alter_table_operation_period_payload_items[item_index];
         }
@@ -14498,6 +14666,7 @@ fn alterTablePlanFromGeneratedAstAlloc(
         local_options.generated_inline_foreign_key_payload_items = ast.alter_table_operation_inline_foreign_key_payload_items;
         local_options.generated_inline_foreign_key_not_valid_items = ast.alter_table_operation_inline_foreign_key_not_valid_items;
         local_options.generated_inline_check_payload_items = ast.alter_table_operation_inline_check_payload_items;
+        local_options.generated_inline_check_payload_expressions = ast.alter_table_operation_inline_check_payload_expressions;
         local_options.generated_inline_check_not_valid_items = ast.alter_table_operation_inline_check_not_valid_items;
         local_options.generated_column_name_full_tokens = tokens;
         local_options.generated_column_header_token_offset = item.start;
@@ -15543,57 +15712,30 @@ fn generatedAlterTableAddOperationPrefixAlloc(
     pos: *usize,
     hooks: DdlColumnDefinitionOptions,
 ) !GeneratedAlterTableAddOperationPrefix {
-    if (hooks.generated_constraint_name_full_tokens) |full_tokens| {
-        const kind_range = hooks.generated_constraint_kind_tokens orelse return error.UnsupportedSqlShape;
-        if (kind_range.start < hooks.generated_constraint_token_offset or kind_range.end > full_tokens.len) return error.UnsupportedSqlShape;
-        const local_kind_start = kind_range.start - hooks.generated_constraint_token_offset;
-        const local_kind_end = kind_range.end - hooks.generated_constraint_token_offset;
-        if (local_kind_end > tokens.len or local_kind_start <= pos.*) return error.UnsupportedSqlShape;
-        if (!tokens[pos.*].matchesKeyword("add")) return error.UnsupportedSqlShape;
-        if (local_kind_start == pos.* + 1) {
-            if (hooks.generated_constraint_name_tokens != null) return error.UnsupportedSqlShape;
-        } else {
-            const name_range = hooks.generated_constraint_name_tokens orelse return error.UnsupportedSqlShape;
-            if (name_range.start < hooks.generated_constraint_token_offset or name_range.end > full_tokens.len) return error.UnsupportedSqlShape;
-            const local_name_start = name_range.start - hooks.generated_constraint_token_offset;
-            const local_name_end = name_range.end - hooks.generated_constraint_token_offset;
-            if (local_name_end > tokens.len or local_name_end != local_name_start + 1) return error.UnsupportedSqlShape;
-            if (local_name_start != pos.* + 2 or !tokens[pos.* + 1].matchesKeywordTag(.constraint)) return error.UnsupportedSqlShape;
-            if (local_kind_start != local_name_end) return error.UnsupportedSqlShape;
-        }
-        const kind = try generatedAlterTableAddOperationKindFromRange(tokens[local_kind_start..local_kind_end]);
-        const constraint_name = if (hooks.generated_constraint_name_tokens) |name_range|
-            try generatedIdentifierAlloc(alloc, full_tokens, name_range)
-        else
-            null;
-        pos.* = local_kind_start;
-        return .{ .kind = kind, .constraint_name = constraint_name };
+    const full_tokens = hooks.generated_constraint_name_full_tokens orelse return error.UnsupportedSqlShape;
+    const kind_range = hooks.generated_constraint_kind_tokens orelse return error.UnsupportedSqlShape;
+    if (kind_range.start < hooks.generated_constraint_token_offset or kind_range.end > full_tokens.len) return error.UnsupportedSqlShape;
+    const local_kind_start = kind_range.start - hooks.generated_constraint_token_offset;
+    const local_kind_end = kind_range.end - hooks.generated_constraint_token_offset;
+    if (local_kind_end > tokens.len or local_kind_start <= pos.*) return error.UnsupportedSqlShape;
+    if (!tokens[pos.*].matchesKeyword("add")) return error.UnsupportedSqlShape;
+    if (local_kind_start == pos.* + 1) {
+        if (hooks.generated_constraint_name_tokens != null) return error.UnsupportedSqlShape;
+    } else {
+        const name_range = hooks.generated_constraint_name_tokens orelse return error.UnsupportedSqlShape;
+        if (name_range.start < hooks.generated_constraint_token_offset or name_range.end > full_tokens.len) return error.UnsupportedSqlShape;
+        const local_name_start = name_range.start - hooks.generated_constraint_token_offset;
+        const local_name_end = name_range.end - hooks.generated_constraint_token_offset;
+        if (local_name_end > tokens.len or local_name_end != local_name_start + 1) return error.UnsupportedSqlShape;
+        if (local_name_start != pos.* + 2 or !tokens[pos.* + 1].matchesKeywordTag(.constraint)) return error.UnsupportedSqlShape;
+        if (local_kind_start != local_name_end) return error.UnsupportedSqlShape;
     }
-
-    const cursor = parser.Cursor.init(tokens, pos);
-    try cursor.expectKeyword("add");
-    if (cursor.matchKeyword("period")) return .{ .kind = .period };
-
-    const constraint_name: ?[]const u8 = if (cursor.matchKeyword("constraint"))
-        try parseGeneratedAlterTableOwnedNameAlloc(alloc, tokens, pos)
+    const kind = try generatedAlterTableAddOperationKindFromRange(tokens[local_kind_start..local_kind_end]);
+    const constraint_name = if (hooks.generated_constraint_name_tokens) |name_range|
+        try generatedIdentifierAlloc(alloc, full_tokens, name_range)
     else
         null;
-    var constraint_name_transferred = false;
-    errdefer if (!constraint_name_transferred) if (constraint_name) |name| alloc.free(name);
-
-    const kind: GeneratedAlterTableAddOperationKind = if (cursor.peekKeyword("primary")) blk: {
-        break :blk .primary_key;
-    } else if (cursor.peekKeyword("unique")) blk: {
-        break :blk .unique;
-    } else if (cursor.peekKeyword("foreign")) blk: {
-        break :blk .foreign_key;
-    } else if (cursor.peekKeyword("check")) blk: {
-        break :blk .check;
-    } else {
-        return error.UnsupportedSqlShape;
-    };
-
-    constraint_name_transferred = true;
+    pos.* = local_kind_start;
     return .{ .kind = kind, .constraint_name = constraint_name };
 }
 
@@ -15782,6 +15924,12 @@ fn generatedCreateIndexOpClass(tokens: []const grammar.Token, method: DdlIndexMe
     if (range.end == range.start + 1) return .default;
     if (method == .btree) {
         var pos = range.start + 1;
+        if (pos < range.end and tokens[pos].matchesKeyword("collate")) {
+            pos += 1;
+            if (pos >= range.end or tokens[pos].kind != .identifier) return error.UnsupportedSqlShape;
+            pos += 1;
+            if (pos < range.end and std.mem.endsWith(u8, tokens[pos - 1].text, ".") and tokens[pos].kind == .identifier) pos += 1;
+        }
         if (pos < range.end and (tokens[pos].matchesKeywordTag(.asc) or tokens[pos].matchesKeywordTag(.desc))) pos += 1;
         if (pos < range.end and tokens[pos].matchesKeywordTag(.nulls)) {
             pos += 1;
@@ -15806,6 +15954,34 @@ fn generatedCreateIndexOpClass(tokens: []const grammar.Token, method: DdlIndexMe
         else => {},
     }
     return error.UnsupportedSqlShape;
+}
+
+const DerivedIndexExpressionRange = struct {
+    expression_range: generated_parser.GeneratedSqlTokenRange,
+    opclass: DdlIndexOpClass = .default,
+};
+
+fn derivedIndexExpressionRangeWithoutOpClass(
+    tokens: []const grammar.Token,
+    method: DdlIndexMethod,
+    expression_range: generated_parser.GeneratedSqlTokenRange,
+) !DerivedIndexExpressionRange {
+    if (expression_range.start >= expression_range.end or expression_range.end > tokens.len) return error.UnsupportedSqlShape;
+    if (method != .hnsw) return .{ .expression_range = expression_range };
+    if (expression_range.end > expression_range.start + 1 and tokens[expression_range.end - 1].kind == .identifier) {
+        const opclass = generatedCreateIndexOpClass(tokens, method, .{
+            .start = expression_range.end - 2,
+            .end = expression_range.end,
+        }) catch return .{ .expression_range = expression_range };
+        return .{
+            .expression_range = .{
+                .start = expression_range.start,
+                .end = expression_range.end - 1,
+            },
+            .opclass = opclass,
+        };
+    }
+    return .{ .expression_range = expression_range };
 }
 
 fn generatedRelationalIndexKeyDirection(direction: ?generated_parser.GeneratedSqlOrderDirection) runtime_schema.RelationalIndexKeyDirection {
@@ -16006,9 +16182,8 @@ fn generatedCreateIndexWhereExpressionConditionSupported(tokens: []const grammar
             generatedCreateIndexWhereExpressionConditionSupported(tokens, left.*) and generatedCreateIndexWhereExpressionConditionSupported(tokens, right.*)
         else
             false else false,
-        .comparison => {
-            const operator = expression.operator_tokens orelse return false;
-            _ = generatedCreateIndexWhereComparisonOp(tokens, operator) catch return false;
+        .comparison, .is_distinct_from, .is_not_distinct_from => {
+            _ = generatedCreateIndexWhereExpressionConditionOp(tokens, expression) catch return false;
             const left = expression.left_expression orelse return false;
             const right = expression.right_expression orelse return false;
             return generatedDdlTokenRangeEqual(left.tokens orelse return false, expression.left_tokens orelse return false) and
@@ -16043,6 +16218,15 @@ fn generatedCreateIndexWhereComparisonOp(tokens: []const grammar.Token, range: g
     };
 }
 
+fn generatedCreateIndexWhereExpressionConditionOp(tokens: []const grammar.Token, expression: generated_parser.GeneratedSqlExpressionAst) !runtime_schema.RelationalCheckOp {
+    return switch (expression.kind) {
+        .comparison => try generatedCreateIndexWhereComparisonOp(tokens, expression.operator_tokens orelse return error.UnsupportedSqlShape),
+        .is_distinct_from => .is_distinct,
+        .is_not_distinct_from => .is_not_distinct,
+        else => error.UnsupportedSqlShape,
+    };
+}
+
 fn generatedCreateIndexAppendWhereExpressionConditionAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
@@ -16055,7 +16239,7 @@ fn generatedCreateIndexAppendWhereExpressionConditionAlloc(
             try generatedCreateIndexAppendWhereExpressionConditionAlloc(alloc, tokens, (expression.left_expression orelse return error.UnsupportedSqlShape).*, out);
             try generatedCreateIndexAppendWhereExpressionConditionAlloc(alloc, tokens, (expression.right_expression orelse return error.UnsupportedSqlShape).*, out);
         },
-        .comparison => {
+        .comparison, .is_distinct_from, .is_not_distinct_from => {
             const left = expression.left_expression orelse return error.UnsupportedSqlShape;
             const right = expression.right_expression orelse return error.UnsupportedSqlShape;
             if (!generatedCreateIndexWhereExpressionConditionSupported(tokens, expression)) return error.UnsupportedSqlShape;
@@ -16074,7 +16258,7 @@ fn generatedCreateIndexAppendWhereExpressionConditionAlloc(
             errdefer if (!rhs_transferred) alloc.free(rhs);
             try out.append(alloc, .{
                 .lhs = lhs,
-                .op = try generatedCreateIndexWhereComparisonOp(tokens, expression.operator_tokens orelse return error.UnsupportedSqlShape),
+                .op = try generatedCreateIndexWhereExpressionConditionOp(tokens, expression),
                 .rhs = rhs,
             });
             lhs_transferred = true;
@@ -16120,6 +16304,10 @@ fn generatedCreateIndexExpressionItemSuffixSupported(
 ) bool {
     if (expression_range.start < item.start or expression_range.end > item.end or item.end > tokens.len) return false;
     var pos = expression_range.end;
+    if (generatedCreateIndexElementCollationRange(tokens, item, expression_range) catch return false) |collation_range| {
+        if (collation_range.start != pos) return false;
+        pos = collation_range.end;
+    }
     if (pos < item.end and (tokens[pos].matchesKeywordTag(.asc) or tokens[pos].matchesKeywordTag(.desc))) pos += 1;
     if (pos < item.end and tokens[pos].matchesKeywordTag(.nulls)) {
         pos += 1;
@@ -16127,6 +16315,42 @@ fn generatedCreateIndexExpressionItemSuffixSupported(
         pos += 1;
     }
     return pos == item.end;
+}
+
+fn generatedCreateIndexElementCollationRange(
+    tokens: []const grammar.Token,
+    item: generated_parser.GeneratedSqlTokenRange,
+    expression_range: generated_parser.GeneratedSqlTokenRange,
+) !?generated_parser.GeneratedSqlTokenRange {
+    if (expression_range.start < item.start or expression_range.end > item.end or item.end > tokens.len) return error.UnsupportedSqlShape;
+    var pos = expression_range.end;
+    if (pos >= item.end or !tokens[pos].matchesKeyword("collate")) return null;
+    const start = pos;
+    pos += 1;
+    if (pos >= item.end or tokens[pos].kind != .identifier) return error.UnsupportedSqlShape;
+    pos += 1;
+    if (pos < item.end and std.mem.endsWith(u8, tokens[pos - 1].text, ".") and tokens[pos].kind == .identifier) pos += 1;
+    return .{ .start = start, .end = pos };
+}
+
+fn generatedCreateIndexElementCollationAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    item: generated_parser.GeneratedSqlTokenRange,
+    expression_range: generated_parser.GeneratedSqlTokenRange,
+) !?[]const u8 {
+    const range = (try generatedCreateIndexElementCollationRange(tokens, item, expression_range)) orelse return null;
+    if (range.start + 2 == range.end) {
+        return try grammar.normalizeSqlObjectIdentifierAlloc(alloc, tokens[range.start + 1].text);
+    }
+    if (range.start + 3 == range.end) {
+        var combined = std.ArrayListUnmanaged(u8).empty;
+        defer combined.deinit(alloc);
+        try combined.appendSlice(alloc, tokens[range.start + 1].text);
+        try combined.appendSlice(alloc, tokens[range.start + 2].text);
+        return try grammar.normalizeSqlObjectIdentifierAlloc(alloc, combined.items);
+    }
+    return error.UnsupportedSqlShape;
 }
 
 fn generatedCreateIndexElementHasWithoutOverlaps(
@@ -16545,11 +16769,54 @@ fn generatedCreateIndexRowExpressionAlloc(
             if (!generatedCreateIndexLiteralRangeSupported(tokens, range)) return null;
             return try generatedCreateIndexValueExpressionAlloc(alloc, try generatedCreateIndexLiteralJsonAlloc(alloc, tokens, range));
         },
+        .interval_literal => {
+            const range = expression.tokens orelse return error.UnsupportedSqlShape;
+            var pos = range.start;
+            const lowered = try expr_build.parseSqlIntervalRowExpressionAlloc(alloc, tokens[0..range.end], &pos);
+            if (pos != range.end) {
+                runtime_schema.freeRelationalRowsExpression(alloc, lowered);
+                return error.UnsupportedSqlShape;
+            }
+            return lowered;
+        },
+        .timestamp_literal => {
+            const range = expression.tokens orelse return error.UnsupportedSqlShape;
+            var pos = range.start;
+            const lowered = try expr_build.parseSqlTypedDatetimeLiteralRowExpressionAlloc(alloc, tokens[0..range.end], &pos);
+            if (pos != range.end) {
+                runtime_schema.freeRelationalRowsExpression(alloc, lowered);
+                return error.UnsupportedSqlShape;
+            }
+            return lowered;
+        },
+        .current_timestamp => {
+            const range = expression.tokens orelse return error.UnsupportedSqlShape;
+            var pos = range.start;
+            const lowered = try expr_build.parseSqlNowRowExpressionAlloc(alloc, tokens[0..range.end], &pos);
+            if (pos != range.end) {
+                runtime_schema.freeRelationalRowsExpression(alloc, lowered);
+                return error.UnsupportedSqlShape;
+            }
+            return lowered;
+        },
+        .current_date => {
+            const range = expression.tokens orelse return error.UnsupportedSqlShape;
+            var pos = range.start;
+            const lowered = try expr_build.parseSqlCurrentDateRowExpressionAlloc(alloc, tokens[0..range.end], &pos);
+            if (pos != range.end) {
+                runtime_schema.freeRelationalRowsExpression(alloc, lowered);
+                return error.UnsupportedSqlShape;
+            }
+            return lowered;
+        },
         .unary_positive => return try generatedCreateIndexRowExpressionAlloc(alloc, tokens, (expression.right_expression orelse return error.UnsupportedSqlShape).*),
         .unary_negative => {
             const range = expression.tokens orelse return error.UnsupportedSqlShape;
             if (!generatedCreateIndexLiteralRangeSupported(tokens, range)) return null;
             return try generatedCreateIndexValueExpressionAlloc(alloc, try generatedCreateIndexLiteralJsonAlloc(alloc, tokens, range));
+        },
+        .array_constructor => {
+            return try generatedCreateIndexValueExpressionAlloc(alloc, try generatedDdlArrayConstructorValueJsonAlloc(alloc, tokens, expression));
         },
         .additive, .subtractive, .multiplicative, .divisive, .modulo, .string_concat => {
             const kind = generatedCreateIndexRowExpressionBinaryKind(expression.kind) orelse unreachable;
@@ -16726,11 +16993,11 @@ fn generatedDerivedIndexColumnsAlloc(
     }
     for (elements.items, 0..) |item, index| {
         if (item.start >= item.end or item.end > tokens.len) return error.UnsupportedSqlShape;
-        const expression_range = elements.expression_items[index];
+        const raw_expression_range = elements.expression_items[index];
+        const derived_range = try derivedIndexExpressionRangeWithoutOpClass(tokens, method, raw_expression_range);
+        const expression_range = derived_range.expression_range;
         if (expression_range.start < item.start or expression_range.end > item.end or expression_range.end > tokens.len) return error.UnsupportedSqlShape;
-        const suffix_range = generated_parser.GeneratedSqlTokenRange{ .start = expression_range.start, .end = item.end };
-        const item_opclass = try generatedCreateIndexOpClass(tokens, method, suffix_range);
-        if (item_opclass != .default) opclass.* = item_opclass;
+        if (derived_range.opclass != .default) opclass.* = derived_range.opclass;
         columns[index] = try generatedDerivedIndexFieldPathAlloc(alloc, tokens, expression_range);
         initialized += 1;
     }
@@ -16874,19 +17141,26 @@ fn generatedCreateIndexPlanAlloc(
             const key_column = try alloc.dupe(u8, column);
             var key_column_transferred = false;
             errdefer if (!key_column_transferred) alloc.free(key_column);
+            const key_collation = try generatedCreateIndexElementCollationAlloc(alloc, tokens, item, expression_range);
+            var key_collation_transferred = false;
+            errdefer if (!key_collation_transferred) if (key_collation) |collation| alloc.free(collation);
+            if (method != .btree and key_collation != null) return error.UnsupportedSqlShape;
             try columns.append(alloc, column);
             column_transferred = true;
             try index_keys.append(alloc, .{
                 .column = key_column,
+                .collation = key_collation,
                 .direction = generatedRelationalIndexKeyDirection(elements.directions[item_index]),
                 .nulls = generatedRelationalIndexKeyNulls(elements.nulls_orders[item_index]),
             });
             key_column_transferred = true;
+            key_collation_transferred = true;
             if (elements.directions[item_index] != null or elements.nulls_orders[item_index] != null) has_ordered_index_key_metadata = true;
             continue;
         }
         const simple_expression = try generatedCreateIndexSimpleExpression(tokens, item, expression_range, elements.expressions[item_index]);
         if (ast.unique) {
+            if ((try generatedCreateIndexElementCollationRange(tokens, item, expression_range)) != null) return error.UnsupportedSqlShape;
             if (simple_expression) |simple| {
                 const field = try alloc.dupe(u8, simple.field);
                 var field_transferred = false;
@@ -16918,12 +17192,17 @@ fn generatedCreateIndexPlanAlloc(
             const key_column = try alloc.dupe(u8, index_name);
             var key_column_transferred = false;
             errdefer if (!key_column_transferred) alloc.free(key_column);
+            const key_collation = try generatedCreateIndexElementCollationAlloc(alloc, tokens, item, expression_range);
+            var key_collation_transferred = false;
+            errdefer if (!key_collation_transferred) if (key_collation) |collation| alloc.free(collation);
             try index_keys.append(alloc, .{
                 .column = key_column,
+                .collation = key_collation,
                 .direction = generatedRelationalIndexKeyDirection(elements.directions[item_index]),
                 .nulls = generatedRelationalIndexKeyNulls(elements.nulls_orders[item_index]),
             });
             key_column_transferred = true;
+            key_collation_transferred = true;
             if (elements.directions[item_index] != null or elements.nulls_orders[item_index] != null) has_ordered_index_key_metadata = true;
         }
     }
@@ -17530,11 +17809,6 @@ fn appendFullTextIndexConfigOptions(
                 .boolean => |value| try appendJsonBoolField(alloc, out, first, "snippet", value),
                 else => return error.UnsupportedSqlShape,
             }
-        } else if (std.ascii.eqlIgnoreCase(option.name, "segment_lifecycle")) {
-            switch (option.value) {
-                .string => |value| try appendJsonStringField(alloc, out, first, "segment_lifecycle", value),
-                else => return error.UnsupportedSqlShape,
-            }
         } else {
             return error.UnsupportedSqlShape;
         }
@@ -17649,7 +17923,6 @@ fn derivedIndexConfigJsonFromOptionsAlloc(
             std.ascii.eqlIgnoreCase(option.name, "scoring") or
             std.ascii.eqlIgnoreCase(option.name, "highlight") or
             std.ascii.eqlIgnoreCase(option.name, "snippet") or
-            std.ascii.eqlIgnoreCase(option.name, "segment_lifecycle") or
             std.ascii.eqlIgnoreCase(option.name, "embedding_name") or
             std.ascii.eqlIgnoreCase(option.name, "dimension") or
             std.ascii.eqlIgnoreCase(option.name, "type_field") or
@@ -18074,6 +18347,14 @@ fn generatedInlinePayloadRangeAt(
 ) !?generated_parser.GeneratedSqlTokenRange {
     if (index >= ranges.len) return error.UnsupportedSqlShape;
     return ranges[index];
+}
+
+fn generatedInlineCheckPayloadExpressionAt(
+    expressions: []const generated_parser.GeneratedSqlExpressionAst,
+    index: usize,
+) !*const generated_parser.GeneratedSqlExpressionAst {
+    if (index >= expressions.len) return error.UnsupportedSqlShape;
+    return &expressions[index];
 }
 
 fn generatedConstraintLocalRange(
@@ -18667,6 +18948,7 @@ pub const DdlColumnDefinitionOptions = struct {
     generated_foreign_key_payload_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
     generated_foreign_key_not_valid_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
     generated_check_payload_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
+    generated_check_payload_expression: ?*const generated_parser.GeneratedSqlExpressionAst = null,
     generated_check_not_valid_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
     generated_period_payload_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
     generated_constraint_token_offset: usize = 0,
@@ -18681,6 +18963,7 @@ pub const DdlColumnDefinitionOptions = struct {
     generated_inline_foreign_key_payload_items: []const ?generated_parser.GeneratedSqlTokenRange = &.{},
     generated_inline_foreign_key_not_valid_items: []const ?generated_parser.GeneratedSqlTokenRange = &.{},
     generated_inline_check_payload_items: []const ?generated_parser.GeneratedSqlTokenRange = &.{},
+    generated_inline_check_payload_expressions: []const generated_parser.GeneratedSqlExpressionAst = &.{},
     generated_inline_check_not_valid_items: []const ?generated_parser.GeneratedSqlTokenRange = &.{},
     generated_inline_constraint_token_offset: usize = 0,
     generated_column_name_full_tokens: ?[]const grammar.Token = null,
@@ -18704,6 +18987,7 @@ pub const DdlColumnDefinitionOptions = struct {
 pub const DdlDomainOptions = struct {
     params: []const value_mod.SqlValue = &.{},
     realtime_ns: u64,
+    expression_options: DdlExpressionOptions,
 };
 
 pub const DdlExpressionOptions = struct {
@@ -18714,6 +18998,7 @@ pub const DdlExpressionOptions = struct {
     generated_scalar_subquery_token_offset: usize = 0,
     generated_default_value_full_tokens: ?[]const grammar.Token = null,
     generated_default_value_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
+    generated_default_value_ast: ?*const generated_parser.GeneratedSqlExpressionAst = null,
     generated_default_value_token_offset: usize = 0,
     generated_column_expression_full_tokens: ?[]const grammar.Token = null,
     generated_column_expression_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
@@ -18923,8 +19208,15 @@ fn parseDdlDefaultValueUntypedAlloc(
     const expected_start = options.generated_default_value_token_offset + pos.*;
     if (default_range.start != expected_start or default_range.end > full_tokens.len or default_range.end <= default_range.start) return error.UnsupportedSqlShape;
     if (default_range.start < options.generated_default_value_token_offset) return error.UnsupportedSqlShape;
+    try validateGeneratedDdlDefaultValueAst(options, full_tokens, default_range);
     const local_end = default_range.end - options.generated_default_value_token_offset;
     if (local_end > tokens.len or local_end <= pos.*) return error.UnsupportedSqlShape;
+    const retained_expression = options.generated_default_value_ast orelse return error.UnsupportedSqlShape;
+    if (retained_expression.kind == .array_constructor) {
+        const value_json = try generatedDdlArrayConstructorValueJsonAlloc(alloc, full_tokens, retained_expression.*);
+        pos.* = local_end;
+        return .{ .kind = .literal, .value_json = value_json };
+    }
     const value_tokens = tokens[pos.*..local_end];
     var value_pos: usize = 0;
     const value = try parseDdlDefaultValueUntypedPayloadAlloc(
@@ -18963,6 +19255,58 @@ fn parseDdlDefaultValueUntypedPayloadAlloc(
         generated_scalar_subquery_token_offset,
     )) |value| return value;
     return try parseDdlDefaultValueUntypedLiteralAlloc(alloc, tokens, pos);
+}
+
+fn validateGeneratedDdlDefaultValueAst(
+    options: DdlExpressionOptions,
+    full_tokens: []const grammar.Token,
+    default_range: generated_parser.GeneratedSqlTokenRange,
+) !void {
+    const expression = options.generated_default_value_ast orelse return error.UnsupportedSqlShape;
+    const expression_range = expression.tokens orelse return error.UnsupportedSqlShape;
+    if (!generatedDdlTokenRangeEqual(expression_range, default_range)) return error.UnsupportedSqlShape;
+    try validateGeneratedDdlDefaultValueExpressionKind(full_tokens, expression.*);
+}
+
+fn validateGeneratedDdlDefaultValueExpressionKind(
+    full_tokens: []const grammar.Token,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) !void {
+    switch (expression.kind) {
+        .token_range,
+        .current_date,
+        .current_timestamp,
+        .timestamp_literal,
+        .array_constructor,
+        => return,
+        .subquery => {
+            if (expression.subquery_select_tokens == null or expression.subquery_read_kind == null) return error.UnsupportedSqlShape;
+            return;
+        },
+        .function_call => {
+            const function_name = generatedDdlSingleTokenText(full_tokens, expression.function_name_tokens orelse return error.UnsupportedSqlShape);
+            if (generatedDdlDefaultValueFunctionSupported(function_name)) return;
+            return error.UnsupportedSqlShape;
+        },
+        .unary_negative => {
+            const operator_tokens = expression.operator_tokens orelse return error.UnsupportedSqlShape;
+            if (operator_tokens.end != operator_tokens.start + 1 or operator_tokens.end > full_tokens.len or full_tokens[operator_tokens.start].kind != .minus) return error.UnsupportedSqlShape;
+            const right = expression.right_expression orelse return error.UnsupportedSqlShape;
+            if (right.kind != .token_range) return error.UnsupportedSqlShape;
+            _ = right.tokens orelse return error.UnsupportedSqlShape;
+            return;
+        },
+        else => return error.UnsupportedSqlShape,
+    }
+}
+
+fn generatedDdlDefaultValueFunctionSupported(function_name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(function_name, "gen_random_uuid") or
+        std.ascii.eqlIgnoreCase(function_name, "uuid_generate_v4") or
+        std.ascii.eqlIgnoreCase(function_name, "now") or
+        std.ascii.eqlIgnoreCase(function_name, "convert_from") or
+        std.ascii.eqlIgnoreCase(function_name, "jsonb_build_object") or
+        std.ascii.eqlIgnoreCase(function_name, "to_jsonb");
 }
 
 fn generatedDdlScalarSubqueryDefaultForCurrentRangeAlloc(
@@ -19026,9 +19370,9 @@ fn generatedDdlScalarSubqueryDefaultValueAlloc(
     const query_json = try generatedDdlScalarSubqueryDefaultQueryJsonAlloc(alloc, tokens, item.read_ast.*);
     defer alloc.free(query_json);
     const wrapped = try std.fmt.allocPrint(alloc, "{{\"query\":{s}}}", .{query_json});
-    defer alloc.free(wrapped);
-    const normalized = try relational_rows.normalizeScalarSubqueryDefaultValueJsonAlloc(alloc, wrapped);
-    return .{ .kind = .scalar_subquery, .value_json = normalized };
+    errdefer alloc.free(wrapped);
+    try relational_rows.validateScalarSubqueryDefaultPayloadAlloc(alloc, wrapped);
+    return .{ .kind = .scalar_subquery, .value_json = wrapped };
 }
 
 fn generatedDdlScalarSubqueryDefaultQueryJsonAlloc(
@@ -19596,6 +19940,90 @@ fn generatedDdlWriteLiteralJson(
     }
 }
 
+fn generatedDdlArrayConstructorValueJsonAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) ![]const u8 {
+    if (expression.kind != .array_constructor) return error.UnsupportedSqlShape;
+    try expr_generated_validate.validateGeneratedExpressionPayloads(tokens, expression);
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try generatedDdlWriteArrayConstructorJson(&out.writer, tokens, expression);
+    return try out.toOwnedSlice();
+}
+
+fn generatedDdlWriteArrayConstructorJson(
+    writer: *std.Io.Writer,
+    tokens: []const grammar.Token,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) anyerror!void {
+    const expression_tokens = expression.tokens orelse return error.UnsupportedSqlShape;
+    if (expression_tokens.end <= expression_tokens.start + 2 or expression_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+    if (!tokens[expression_tokens.start].matchesKeywordTag(.array) or
+        tokens[expression_tokens.start + 1].kind != .lbracket or
+        tokens[expression_tokens.end - 1].kind != .rbracket)
+    {
+        return error.UnsupportedSqlShape;
+    }
+
+    const array_items = expression.array_items;
+    try writer.writeByte('[');
+    if (array_items.count == 0) {
+        if (expression.array_tokens != null or
+            array_items.items.len != 0 or
+            array_items.expression_items.len != 0 or
+            array_items.expressions.len != 0)
+        {
+            return error.UnsupportedSqlShape;
+        }
+    } else {
+        const array_tokens = expression.array_tokens orelse return error.UnsupportedSqlShape;
+        if (array_tokens.start != expression_tokens.start + 2 or array_tokens.end != expression_tokens.end - 1) return error.UnsupportedSqlShape;
+        if (array_items.items.len != array_items.count or
+            array_items.expression_items.len != array_items.count or
+            array_items.expressions.len != array_items.count)
+        {
+            return error.UnsupportedSqlShape;
+        }
+        for (array_items.items, array_items.expression_items, array_items.expressions, 0..) |item, expression_item, item_expression, index| {
+            const item_tokens = item_expression.tokens orelse return error.UnsupportedSqlShape;
+            if (!generatedDdlTokenRangeEqual(item, expression_item) or !generatedDdlTokenRangeEqual(item, item_tokens)) return error.UnsupportedSqlShape;
+            if (item.start < array_tokens.start or item.end > array_tokens.end or item.start >= item.end) return error.UnsupportedSqlShape;
+            if (index > 0) {
+                const previous = array_items.items[index - 1];
+                if (previous.end + 1 != item.start or previous.end >= tokens.len or tokens[previous.end].kind != .comma) return error.UnsupportedSqlShape;
+                try writer.writeByte(',');
+            }
+            try generatedDdlWriteDefaultExpressionJson(writer, tokens, item_expression);
+        }
+    }
+    try writer.writeByte(']');
+}
+
+fn generatedDdlWriteDefaultExpressionJson(
+    writer: *std.Io.Writer,
+    tokens: []const grammar.Token,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) anyerror!void {
+    switch (expression.kind) {
+        .token_range => try generatedDdlWriteLiteralJson(writer, tokens, expression.tokens orelse return error.UnsupportedSqlShape),
+        .unary_negative => {
+            const operator_tokens = expression.operator_tokens orelse return error.UnsupportedSqlShape;
+            if (operator_tokens.end != operator_tokens.start + 1 or operator_tokens.end > tokens.len or tokens[operator_tokens.start].kind != .minus) return error.UnsupportedSqlShape;
+            const right = expression.right_expression orelse return error.UnsupportedSqlShape;
+            const right_tokens = right.tokens orelse return error.UnsupportedSqlShape;
+            if (right.kind != .token_range or right_tokens.start != operator_tokens.end or right_tokens.end != operator_tokens.end + 1 or right_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+            if (tokens[right_tokens.start].kind != .number) return error.UnsupportedSqlShape;
+            try writer.writeByte('-');
+            try writer.writeAll(tokens[right_tokens.start].text);
+        },
+        .array_constructor => try generatedDdlWriteArrayConstructorJson(writer, tokens, expression),
+        else => return error.UnsupportedSqlShape,
+    }
+}
+
 fn generatedDdlParsePaginationNullableU32(
     tokens: []const grammar.Token,
     expression: generated_parser.GeneratedSqlExpressionAst,
@@ -19671,8 +20099,16 @@ fn parseDdlDefaultValueAlloc(
     const expected_start = options.generated_default_value_token_offset + pos.*;
     if (default_range.start != expected_start or default_range.end > full_tokens.len or default_range.end <= default_range.start) return error.UnsupportedSqlShape;
     if (default_range.start < options.generated_default_value_token_offset) return error.UnsupportedSqlShape;
+    try validateGeneratedDdlDefaultValueAst(options, full_tokens, default_range);
     const local_end = default_range.end - options.generated_default_value_token_offset;
     if (local_end > tokens.len or local_end <= pos.*) return error.UnsupportedSqlShape;
+    const retained_expression = options.generated_default_value_ast orelse return error.UnsupportedSqlShape;
+    if (retained_expression.kind == .array_constructor) {
+        if (field_type != .array) return error.InvalidSqlCatalog;
+        const value_json = try generatedDdlArrayConstructorValueJsonAlloc(alloc, full_tokens, retained_expression.*);
+        pos.* = local_end;
+        return .{ .kind = .literal, .value_json = value_json };
+    }
     const value_tokens = tokens[pos.*..local_end];
     var value_pos: usize = 0;
     const value = try parseDdlDefaultValueWithParamsAlloc(
@@ -19835,8 +20271,15 @@ fn generatedDdlGeneratedValueFromAstAlloc(
     tokens: []const grammar.Token,
     expression_range: generated_parser.GeneratedSqlTokenRange,
     expression_ast: generated_parser.GeneratedSqlExpressionAst,
+    options: DdlExpressionOptions,
 ) !runtime_schema.RelationalGeneratedValue {
     if (!generatedDdlTokenRangeEqual(expression_ast.tokens orelse return error.UnsupportedSqlShape, expression_range)) return error.UnsupportedSqlShape;
+    if (try generatedDdlRoutineRowExpressionFromAstAlloc(alloc, tokens, expression_ast, options)) |routine_expression| {
+        return .{
+            .op = .expression,
+            .expression = routine_expression,
+        };
+    }
     const expression = (try generatedCreateIndexRowExpressionAlloc(alloc, tokens, expression_ast)) orelse return error.UnsupportedSqlShape;
     var expression_transferred = false;
     errdefer if (!expression_transferred) runtime_schema.freeRelationalRowsExpression(alloc, expression);
@@ -19845,6 +20288,67 @@ fn generatedDdlGeneratedValueFromAstAlloc(
         .op = .expression,
         .expression = expression,
     };
+}
+
+fn generatedDdlRoutineRowExpressionFromAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+    options: DdlExpressionOptions,
+) anyerror!?db_mod.types.RelationalRowsExpression {
+    if (options.function_bindings.routine_expressions.len == 0) return null;
+    switch (expression.kind) {
+        .grouped => return try generatedDdlRoutineRowExpressionFromAstAlloc(alloc, tokens, (expression.inner_expression orelse return error.UnsupportedSqlShape).*, options),
+        .function_call => {},
+        else => return null,
+    }
+    if (expression.argument_distinct_tokens != null or
+        expression.argument_order_tokens != null or
+        expression.within_group_tokens != null or
+        expression.filter_tokens != null or
+        expression.over_tokens != null)
+    {
+        return null;
+    }
+    const name = generatedDdlSingleTokenText(tokens, expression.function_name_tokens orelse return error.UnsupportedSqlShape);
+    const arguments = expression.argument_items;
+    if (!generatedCreateIndexExpressionArgumentsValid(arguments)) return error.UnsupportedSqlShape;
+    const binding = try expr_row_parse.routineExpressionBinding(options.function_bindings.routine_expressions, name, arguments.count) orelse return null;
+
+    const operands = try alloc.alloc(db_mod.types.RelationalRowsExpression, arguments.count);
+    var initialized: usize = 0;
+    defer {
+        for (operands[0..initialized]) |operand| runtime_schema.freeRelationalRowsExpression(alloc, operand);
+        alloc.free(operands);
+    }
+    for (arguments.expressions, 0..) |argument, index| {
+        operands[index] = (try generatedDdlRoutineArgumentExpressionFromAstAlloc(alloc, tokens, argument, options)) orelse return error.UnsupportedSqlShape;
+        initialized += 1;
+    }
+
+    if (binding.null_input == .returns_null) {
+        for (operands) |operand| {
+            if (expr_row_parse.routineArgumentExpressionIsNullLiteral(operand)) {
+                return .{
+                    .kind = .value,
+                    .value_json = try alloc.dupe(u8, "null"),
+                };
+            }
+        }
+        return error.UnsupportedSqlShape;
+    }
+
+    return try expr_row_parse.cloneExpressionSubstitutingRoutineArgsAlloc(alloc, binding.expression, operands);
+}
+
+fn generatedDdlRoutineArgumentExpressionFromAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+    options: DdlExpressionOptions,
+) anyerror!?db_mod.types.RelationalRowsExpression {
+    if (try generatedDdlRoutineRowExpressionFromAstAlloc(alloc, tokens, expression, options)) |routine_expression| return routine_expression;
+    return try generatedCreateIndexRowExpressionAlloc(alloc, tokens, expression);
 }
 
 fn parseDdlGeneratedValueAlloc(
@@ -19862,17 +20366,7 @@ fn parseDdlGeneratedValueAlloc(
         const expression_start = pos.*;
         const close_index = findGeneratedMatchingParen(tokens, open_index, tokens.len) orelse return error.UnsupportedSqlShape;
         const expression_range = generated_parser.GeneratedSqlTokenRange{ .start = expression_start, .end = close_index };
-        const generated = if (expr_row_parse.peekRoutineExpressionCall(tokens, pos.*, options.function_bindings.routine_expressions)) blk: {
-            const expression = try parseDdlRoutineRowExpressionAlloc(alloc, tokens, pos, options);
-            var expression_transferred = false;
-            errdefer if (!expression_transferred) runtime_schema.freeRelationalRowsExpression(alloc, expression);
-            if (pos.* != close_index) return error.UnsupportedSqlShape;
-            expression_transferred = true;
-            break :blk runtime_schema.RelationalGeneratedValue{
-                .op = .expression,
-                .expression = expression,
-            };
-        } else blk: {
+        const generated = blk: {
             const expression_ast = options.generated_column_expression_ast orelse return error.UnsupportedSqlShape;
             const full_tokens = options.generated_column_expression_full_tokens orelse return error.UnsupportedSqlShape;
             const expected_range = options.generated_column_expression_tokens orelse return error.UnsupportedSqlShape;
@@ -19881,7 +20375,7 @@ fn parseDdlGeneratedValueAlloc(
                 .end = options.generated_column_expression_token_offset + expression_range.end,
             };
             if (!generatedDdlTokenRangeEqual(full_range, expected_range)) return error.UnsupportedSqlShape;
-            const value = try generatedDdlGeneratedValueFromAstAlloc(alloc, full_tokens, expected_range, expression_ast.*);
+            const value = try generatedDdlGeneratedValueFromAstAlloc(alloc, full_tokens, expected_range, expression_ast.*, options);
             pos.* = close_index;
             break :blk value;
         };
@@ -19924,29 +20418,162 @@ fn parseGeneratedDdlCheckConstraintAlloc(
         const range = try generatedInlinePayloadRangeAt(hooks.generated_inline_check_payload_items, index);
         const payload = range orelse return error.UnsupportedSqlShape;
         const full_tokens = hooks.generated_inline_constraint_full_tokens orelse return error.UnsupportedSqlShape;
+        const expression = try generatedInlineCheckPayloadExpressionAt(hooks.generated_inline_check_payload_expressions, index);
+        try validateGeneratedDdlCheckPayloadExpressionAst(full_tokens, payload, expression);
         const local = try generatedConstraintLocalRange(full_tokens, tokens, hooks.generated_inline_constraint_token_offset, payload, pos.*);
-        return try parseGeneratedDdlCheckConstraintLocalAlloc(alloc, tokens, pos, local, constraint_name, options);
+        const check = try generatedDdlCheckConstraintFromAstAlloc(alloc, full_tokens, payload, expression.*, constraint_name, options);
+        errdefer freeDdlRelationalCheck(alloc, check);
+        pos.* = local.end;
+        return check;
     }
     const full_tokens = hooks.generated_constraint_name_full_tokens orelse return error.UnsupportedSqlShape;
     const range = hooks.generated_check_payload_tokens orelse return error.UnsupportedSqlShape;
+    const expression = hooks.generated_check_payload_expression orelse return error.UnsupportedSqlShape;
+    try validateGeneratedDdlCheckPayloadExpressionAst(full_tokens, range, expression);
     const local = try generatedConstraintLocalRange(full_tokens, tokens, hooks.generated_constraint_token_offset, range, pos.*);
-    return try parseGeneratedDdlCheckConstraintLocalAlloc(alloc, tokens, pos, local, constraint_name, options);
+    const check = try generatedDdlCheckConstraintFromAstAlloc(alloc, full_tokens, range, expression.*, constraint_name, options);
+    errdefer freeDdlRelationalCheck(alloc, check);
+    pos.* = local.end;
+    return check;
 }
 
-fn parseGeneratedDdlCheckConstraintLocalAlloc(
+fn validateGeneratedDdlCheckPayloadExpressionAst(
+    full_tokens: []const grammar.Token,
+    payload: generated_parser.GeneratedSqlTokenRange,
+    expression: *const generated_parser.GeneratedSqlExpressionAst,
+) !void {
+    if (!generatedDdlTokenRangeEqual(expression.tokens orelse return error.UnsupportedSqlShape, payload)) return error.UnsupportedSqlShape;
+    try expr_generated_validate.validateGeneratedExpressionPayloads(full_tokens, expression.*);
+    if (payload.end > payload.start + 1 and
+        full_tokens[payload.start].kind == .lparen and
+        full_tokens[payload.end - 1].kind == .rparen and
+        expression.kind != .grouped)
+    {
+        return error.UnsupportedSqlShape;
+    }
+}
+
+fn generatedDdlCheckConstraintFromAstAlloc(
     alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-    local: generated_parser.GeneratedSqlTokenRange,
+    full_tokens: []const grammar.Token,
+    payload: generated_parser.GeneratedSqlTokenRange,
+    expression: generated_parser.GeneratedSqlExpressionAst,
     constraint_name: ?[]const u8,
     options: DdlExpressionOptions,
 ) !runtime_schema.RelationalCheck {
-    var local_pos: usize = 0;
-    const check = try parseDdlCheckConstraintAlloc(alloc, tokens[local.start..local.end], &local_pos, constraint_name, options);
-    errdefer freeDdlRelationalCheck(alloc, check);
-    if (local_pos != local.end - local.start) return error.UnsupportedSqlShape;
-    pos.* = local.end;
-    return check;
+    try validateGeneratedDdlCheckPayloadExpressionAst(full_tokens, payload, &expression);
+    const condition = try generatedDdlCheckExpressionConditionFromAstAlloc(alloc, full_tokens, expression, options);
+    defer plan_mod.freeExpressionCondition(alloc, condition);
+    return try makeDdlRelationalCheckFromExpressionConditionAlloc(alloc, constraint_name, condition);
+}
+
+fn generatedDdlCheckExpressionConditionFromAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+    options: DdlExpressionOptions,
+) anyerror!db_mod.types.RelationalRowsExpressionCondition {
+    switch (expression.kind) {
+        .grouped => return try generatedDdlCheckExpressionConditionFromAstAlloc(alloc, tokens, (expression.inner_expression orelse return error.UnsupportedSqlShape).*, options),
+        .logical_and, .logical_or, .logical_not => {
+            const boolean_expression = try generatedDdlCheckBooleanExpressionFromAstAlloc(alloc, tokens, expression, options);
+            return try expr_condition.booleanExpressionConditionAlloc(alloc, boolean_expression);
+        },
+        .comparison, .is_distinct_from, .is_not_distinct_from, .is_null, .is_not_null => {},
+        else => {
+            const boolean_expression = (try generatedDdlRoutineArgumentExpressionFromAstAlloc(alloc, tokens, expression, options)) orelse return error.UnsupportedSqlShape;
+            return try expr_condition.booleanExpressionConditionAlloc(alloc, boolean_expression);
+        },
+    }
+
+    const left = expression.left_expression orelse return error.UnsupportedSqlShape;
+    if (!generatedDdlTokenRangeEqual(left.tokens orelse return error.UnsupportedSqlShape, expression.left_tokens orelse return error.UnsupportedSqlShape)) return error.UnsupportedSqlShape;
+    const lhs = (try generatedDdlRoutineArgumentExpressionFromAstAlloc(alloc, tokens, left.*, options)) orelse return error.UnsupportedSqlShape;
+    var lhs_transferred = false;
+    errdefer if (!lhs_transferred) runtime_schema.freeRelationalRowsExpression(alloc, lhs);
+
+    const op = try generatedDdlCheckExpressionConditionOp(tokens, expression);
+    const rhs: []const db_mod.types.RelationalRowsExpression = switch (op) {
+        .is_null, .is_not_null => &.{},
+        else => blk: {
+            const right = expression.right_expression orelse return error.UnsupportedSqlShape;
+            if (!generatedDdlTokenRangeEqual(right.tokens orelse return error.UnsupportedSqlShape, expression.right_tokens orelse return error.UnsupportedSqlShape)) return error.UnsupportedSqlShape;
+            const out = try alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
+            var out_transferred = false;
+            errdefer if (!out_transferred) alloc.free(out);
+            out[0] = (try generatedDdlRoutineArgumentExpressionFromAstAlloc(alloc, tokens, right.*, options)) orelse return error.UnsupportedSqlShape;
+            out_transferred = true;
+            break :blk out;
+        },
+    };
+    var rhs_transferred = false;
+    errdefer if (!rhs_transferred and rhs.len > 0) {
+        for (rhs) |item| runtime_schema.freeRelationalRowsExpression(alloc, item);
+        alloc.free(rhs);
+    };
+
+    lhs_transferred = true;
+    rhs_transferred = true;
+    return .{
+        .lhs = lhs,
+        .op = op,
+        .rhs = rhs,
+    };
+}
+
+fn generatedDdlCheckBooleanExpressionFromAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+    options: DdlExpressionOptions,
+) anyerror!db_mod.types.RelationalRowsExpression {
+    switch (expression.kind) {
+        .grouped => return try generatedDdlCheckBooleanExpressionFromAstAlloc(alloc, tokens, (expression.inner_expression orelse return error.UnsupportedSqlShape).*, options),
+        .logical_not => {
+            const right = expression.right_expression orelse return error.UnsupportedSqlShape;
+            if (!generatedDdlTokenRangeEqual(right.tokens orelse return error.UnsupportedSqlShape, expression.right_tokens orelse return error.UnsupportedSqlShape)) return error.UnsupportedSqlShape;
+            const operand = try generatedDdlCheckBooleanExpressionFromAstAlloc(alloc, tokens, right.*, options);
+            return try expr_condition.booleanNotExpressionAlloc(alloc, operand);
+        },
+        .logical_and, .logical_or => {
+            const left = expression.left_expression orelse return error.UnsupportedSqlShape;
+            const right = expression.right_expression orelse return error.UnsupportedSqlShape;
+            if (!generatedDdlTokenRangeEqual(left.tokens orelse return error.UnsupportedSqlShape, expression.left_tokens orelse return error.UnsupportedSqlShape)) return error.UnsupportedSqlShape;
+            if (!generatedDdlTokenRangeEqual(right.tokens orelse return error.UnsupportedSqlShape, expression.right_tokens orelse return error.UnsupportedSqlShape)) return error.UnsupportedSqlShape;
+            const operands = try alloc.alloc(db_mod.types.RelationalRowsExpression, 2);
+            var initialized: usize = 0;
+            errdefer {
+                for (operands[0..initialized]) |operand| runtime_schema.freeRelationalRowsExpression(alloc, operand);
+                alloc.free(operands);
+            }
+            operands[0] = try generatedDdlCheckBooleanExpressionFromAstAlloc(alloc, tokens, left.*, options);
+            initialized += 1;
+            operands[1] = try generatedDdlCheckBooleanExpressionFromAstAlloc(alloc, tokens, right.*, options);
+            initialized += 1;
+            return .{
+                .kind = if (expression.kind == .logical_and) .bool_and else .bool_or,
+                .operands = operands,
+            };
+        },
+        else => {
+            const condition = try generatedDdlCheckExpressionConditionFromAstAlloc(alloc, tokens, expression, options);
+            return try expr_condition.booleanExpressionFromConditionAlloc(alloc, condition);
+        },
+    }
+}
+
+fn generatedDdlCheckExpressionConditionOp(
+    tokens: []const grammar.Token,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) !runtime_schema.RelationalCheckOp {
+    return switch (expression.kind) {
+        .comparison => try generatedCreateIndexWhereComparisonOp(tokens, expression.operator_tokens orelse return error.UnsupportedSqlShape),
+        .is_distinct_from => .is_distinct,
+        .is_not_distinct_from => .is_not_distinct,
+        .is_null => .is_null,
+        .is_not_null => .is_not_null,
+        else => error.UnsupportedSqlShape,
+    };
 }
 
 fn parseGeneratedOptionalDdlCheckNotValid(
@@ -20456,7 +21083,12 @@ fn parseDdlColumnDefinitionStandaloneAlloc(
     name_transferred = true;
     path_transferred = true;
 
-    while (!cursor.atEnd() and !cursor.peekKind(.comma) and !cursor.peekKind(.rparen) and !cursor.peekKind(.semicolon) and !cursor.peekKeyword("primary") and !cursor.peekKeyword("unique") and !cursor.peekKeyword("check") and !cursor.peekKeyword("references") and !cursor.peekKeyword("constraint")) {
+    while (!cursor.atEnd() and
+        !cursor.peekKind(.comma) and
+        !cursor.peekKind(.rparen) and
+        !cursor.peekKind(.semicolon) and
+        !generatedDdlInlineConstraintPrefixAt(pos.*, hooks))
+    {
         if (try parseOptionalGeneratedDdlColumnCollationAlloc(alloc, tokens, pos, column.field_type, column.array_item_type, hooks)) |collation| {
             if (column.collation != null) {
                 alloc.free(collation);
@@ -20480,6 +21112,16 @@ fn parseDdlColumnDefinitionStandaloneAlloc(
 
     column_transferred = true;
     return column;
+}
+
+fn generatedDdlInlineConstraintPrefixAt(pos: usize, hooks: DdlColumnDefinitionOptions) bool {
+    const full_tokens = hooks.generated_inline_constraint_full_tokens orelse return false;
+    const absolute_pos = hooks.generated_inline_constraint_token_offset + pos;
+    if (absolute_pos > full_tokens.len) return false;
+    for (hooks.generated_inline_constraint_prefix_items) |prefix| {
+        if (prefix.start == absolute_pos) return true;
+    }
+    return false;
 }
 
 fn parseOptionalGeneratedDdlColumnNullability(
@@ -20683,64 +21325,40 @@ fn generatedCreateTableColumnConstraintPrefixAlloc(
     pos: *usize,
     hooks: DdlColumnDefinitionOptions,
 ) !GeneratedCreateTableColumnConstraintPrefix {
-    if (hooks.generated_inline_constraint_full_tokens) |full_tokens| {
-        const absolute_pos = hooks.generated_inline_constraint_token_offset + pos.*;
-        if (hooks.generated_inline_constraint_prefix_items.len != hooks.generated_inline_constraint_name_items.len or
-            hooks.generated_inline_constraint_prefix_items.len != hooks.generated_inline_constraint_kind_items.len)
-        {
-            return error.UnsupportedSqlShape;
-        }
-        for (hooks.generated_inline_constraint_prefix_items, 0..) |prefix, index| {
-            if (prefix.start != absolute_pos) continue;
-            const kind_range = hooks.generated_inline_constraint_kind_items[index];
-            if (prefix.end > full_tokens.len or kind_range.end > full_tokens.len) return error.UnsupportedSqlShape;
-            if (kind_range.start < prefix.start or kind_range.end != prefix.end or kind_range.start >= kind_range.end) return error.UnsupportedSqlShape;
-            const local_kind_start = kind_range.start - hooks.generated_inline_constraint_token_offset;
-            const local_kind_end = kind_range.end - hooks.generated_inline_constraint_token_offset;
-            if (local_kind_end > tokens.len or local_kind_start < pos.*) return error.UnsupportedSqlShape;
-            if (hooks.generated_inline_constraint_name_items[index]) |name_range| {
-                if (name_range.start < hooks.generated_inline_constraint_token_offset or name_range.end > full_tokens.len) return error.UnsupportedSqlShape;
-                const local_name_start = name_range.start - hooks.generated_inline_constraint_token_offset;
-                const local_name_end = name_range.end - hooks.generated_inline_constraint_token_offset;
-                if (local_name_end > tokens.len or local_name_end != local_name_start + 1) return error.UnsupportedSqlShape;
-                if (local_name_start != pos.* + 1 or !tokens[pos.*].matchesKeywordTag(.constraint)) return error.UnsupportedSqlShape;
-                if (local_kind_start != local_name_end) return error.UnsupportedSqlShape;
-            } else if (local_kind_start != pos.*) {
-                return error.UnsupportedSqlShape;
-            }
-            const kind = try generatedCreateTableColumnConstraintKindFromRange(tokens[local_kind_start..local_kind_end]);
-            const constraint_name = if (hooks.generated_inline_constraint_name_items[index]) |name_range|
-                try generatedIdentifierAlloc(alloc, full_tokens, name_range)
-            else
-                null;
-            pos.* = local_kind_start;
-            return .{ .kind = kind, .constraint_name = constraint_name, .retained_inline_index = index };
-        }
+    const full_tokens = hooks.generated_inline_constraint_full_tokens orelse return error.UnsupportedSqlShape;
+    const absolute_pos = hooks.generated_inline_constraint_token_offset + pos.*;
+    if (hooks.generated_inline_constraint_prefix_items.len != hooks.generated_inline_constraint_name_items.len or
+        hooks.generated_inline_constraint_prefix_items.len != hooks.generated_inline_constraint_kind_items.len)
+    {
         return error.UnsupportedSqlShape;
     }
-
-    const cursor = parser.Cursor.init(tokens, pos);
-    const constraint_name: ?[]const u8 = if (cursor.matchKeyword("constraint"))
-        try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos)
-    else
-        null;
-    var constraint_name_transferred = false;
-    errdefer if (!constraint_name_transferred) if (constraint_name) |name| alloc.free(name);
-
-    const kind: GeneratedCreateTableColumnConstraintKind = if (cursor.peekKeyword("primary")) blk: {
-        break :blk .primary_key;
-    } else if (cursor.peekKeyword("unique")) blk: {
-        break :blk .unique;
-    } else if (cursor.peekKeyword("check")) blk: {
-        break :blk .check;
-    } else if (cursor.peekKeyword("references")) blk: {
-        break :blk .references;
-    } else {
-        return error.UnsupportedSqlShape;
-    };
-
-    constraint_name_transferred = true;
-    return .{ .kind = kind, .constraint_name = constraint_name };
+    for (hooks.generated_inline_constraint_prefix_items, 0..) |prefix, index| {
+        if (prefix.start != absolute_pos) continue;
+        const kind_range = hooks.generated_inline_constraint_kind_items[index];
+        if (prefix.end > full_tokens.len or kind_range.end > full_tokens.len) return error.UnsupportedSqlShape;
+        if (kind_range.start < prefix.start or kind_range.end != prefix.end or kind_range.start >= kind_range.end) return error.UnsupportedSqlShape;
+        const local_kind_start = kind_range.start - hooks.generated_inline_constraint_token_offset;
+        const local_kind_end = kind_range.end - hooks.generated_inline_constraint_token_offset;
+        if (local_kind_end > tokens.len or local_kind_start < pos.*) return error.UnsupportedSqlShape;
+        if (hooks.generated_inline_constraint_name_items[index]) |name_range| {
+            if (name_range.start < hooks.generated_inline_constraint_token_offset or name_range.end > full_tokens.len) return error.UnsupportedSqlShape;
+            const local_name_start = name_range.start - hooks.generated_inline_constraint_token_offset;
+            const local_name_end = name_range.end - hooks.generated_inline_constraint_token_offset;
+            if (local_name_end > tokens.len or local_name_end != local_name_start + 1) return error.UnsupportedSqlShape;
+            if (local_name_start != pos.* + 1 or !tokens[pos.*].matchesKeywordTag(.constraint)) return error.UnsupportedSqlShape;
+            if (local_kind_start != local_name_end) return error.UnsupportedSqlShape;
+        } else if (local_kind_start != pos.*) {
+            return error.UnsupportedSqlShape;
+        }
+        const kind = try generatedCreateTableColumnConstraintKindFromRange(tokens[local_kind_start..local_kind_end]);
+        const constraint_name = if (hooks.generated_inline_constraint_name_items[index]) |name_range|
+            try generatedIdentifierAlloc(alloc, full_tokens, name_range)
+        else
+            null;
+        pos.* = local_kind_start;
+        return .{ .kind = kind, .constraint_name = constraint_name, .retained_inline_index = index };
+    }
+    return error.UnsupportedSqlShape;
 }
 
 fn generatedCreateTableColumnConstraintKindFromRange(tokens: []const grammar.Token) !GeneratedCreateTableColumnConstraintKind {
@@ -20834,59 +21452,29 @@ fn generatedCreateTableElementPrefixAlloc(
     pos: *usize,
     hooks: DdlColumnDefinitionOptions,
 ) !GeneratedCreateTableElementPrefix {
-    if (hooks.generated_constraint_name_full_tokens) |full_tokens| {
-        const kind_range = hooks.generated_constraint_kind_tokens orelse return .{ .kind = .column };
-        if (kind_range.start < hooks.generated_constraint_token_offset or kind_range.end > full_tokens.len) return error.UnsupportedSqlShape;
-        const local_kind_start = kind_range.start - hooks.generated_constraint_token_offset;
-        const local_kind_end = kind_range.end - hooks.generated_constraint_token_offset;
-        if (local_kind_end > tokens.len or local_kind_start < pos.* or local_kind_start >= local_kind_end) return error.UnsupportedSqlShape;
-        if (local_kind_start == pos.*) {
-            if (hooks.generated_constraint_name_tokens != null) return error.UnsupportedSqlShape;
-        } else {
-            const name_range = hooks.generated_constraint_name_tokens orelse return error.UnsupportedSqlShape;
-            if (name_range.start < hooks.generated_constraint_token_offset or name_range.end > full_tokens.len) return error.UnsupportedSqlShape;
-            const local_name_start = name_range.start - hooks.generated_constraint_token_offset;
-            const local_name_end = name_range.end - hooks.generated_constraint_token_offset;
-            if (local_name_end > tokens.len or local_name_end != local_name_start + 1) return error.UnsupportedSqlShape;
-            if (local_name_start != pos.* + 1 or !tokens[pos.*].matchesKeywordTag(.constraint)) return error.UnsupportedSqlShape;
-            if (local_kind_start != local_name_end) return error.UnsupportedSqlShape;
-        }
-        const kind = try generatedCreateTableElementKindFromRange(tokens[local_kind_start..local_kind_end]);
-        const constraint_name = if (hooks.generated_constraint_name_tokens) |name_range|
-            try generatedIdentifierAlloc(alloc, full_tokens, name_range)
-        else
-            null;
-        pos.* = local_kind_start;
-        return .{ .kind = kind, .constraint_name = constraint_name };
+    const full_tokens = hooks.generated_constraint_name_full_tokens orelse return error.UnsupportedSqlShape;
+    const kind_range = hooks.generated_constraint_kind_tokens orelse return .{ .kind = .column };
+    if (kind_range.start < hooks.generated_constraint_token_offset or kind_range.end > full_tokens.len) return error.UnsupportedSqlShape;
+    const local_kind_start = kind_range.start - hooks.generated_constraint_token_offset;
+    const local_kind_end = kind_range.end - hooks.generated_constraint_token_offset;
+    if (local_kind_end > tokens.len or local_kind_start < pos.* or local_kind_start >= local_kind_end) return error.UnsupportedSqlShape;
+    if (local_kind_start == pos.*) {
+        if (hooks.generated_constraint_name_tokens != null) return error.UnsupportedSqlShape;
+    } else {
+        const name_range = hooks.generated_constraint_name_tokens orelse return error.UnsupportedSqlShape;
+        if (name_range.start < hooks.generated_constraint_token_offset or name_range.end > full_tokens.len) return error.UnsupportedSqlShape;
+        const local_name_start = name_range.start - hooks.generated_constraint_token_offset;
+        const local_name_end = name_range.end - hooks.generated_constraint_token_offset;
+        if (local_name_end > tokens.len or local_name_end != local_name_start + 1) return error.UnsupportedSqlShape;
+        if (local_name_start != pos.* + 1 or !tokens[pos.*].matchesKeywordTag(.constraint)) return error.UnsupportedSqlShape;
+        if (local_kind_start != local_name_end) return error.UnsupportedSqlShape;
     }
-
-    const cursor = parser.Cursor.init(tokens, pos);
-    const start = pos.*;
-    const constraint_name: ?[]const u8 = if (cursor.matchKeyword("constraint"))
-        try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos)
+    const kind = try generatedCreateTableElementKindFromRange(tokens[local_kind_start..local_kind_end]);
+    const constraint_name = if (hooks.generated_constraint_name_tokens) |name_range|
+        try generatedIdentifierAlloc(alloc, full_tokens, name_range)
     else
         null;
-    var constraint_name_transferred = false;
-    errdefer if (!constraint_name_transferred) if (constraint_name) |name| alloc.free(name);
-
-    const kind: GeneratedCreateTableElementKind = if (cursor.peekKeyword("period")) blk: {
-        break :blk .period;
-    } else if (cursor.peekKeyword("primary")) blk: {
-        break :blk .primary_key;
-    } else if (cursor.peekKeyword("unique")) blk: {
-        break :blk .unique;
-    } else if (cursor.peekKeyword("foreign")) blk: {
-        break :blk .foreign_key;
-    } else if (cursor.peekKeyword("check")) blk: {
-        break :blk .check;
-    } else if (constraint_name == null) blk: {
-        pos.* = start;
-        break :blk .column;
-    } else {
-        return error.UnsupportedSqlShape;
-    };
-
-    constraint_name_transferred = true;
+    pos.* = local_kind_start;
     return .{ .kind = kind, .constraint_name = constraint_name };
 }
 
@@ -21026,6 +21614,10 @@ fn parseGeneratedCreateTableDefinitionAlloc(
         item_hooks.expression_options.generated_default_value_token_offset = item.start;
         if (ast.alter_table_operation_default_value_items.len != 0) {
             item_hooks.expression_options.generated_default_value_tokens = ast.alter_table_operation_default_value_items[item_index];
+            item_hooks.expression_options.generated_default_value_ast = if (ast.alter_table_operation_default_value_items[item_index] != null)
+                &ast.alter_table_operation_default_value_expressions[item_index]
+            else
+                null;
         }
         item_hooks.generated_constraint_name_full_tokens = full_tokens;
         item_hooks.generated_constraint_token_offset = item.start;
@@ -21040,6 +21632,10 @@ fn parseGeneratedCreateTableDefinitionAlloc(
             item_hooks.generated_foreign_key_payload_tokens = ast.alter_table_operation_foreign_key_payload_items[item_index];
             item_hooks.generated_foreign_key_not_valid_tokens = ast.alter_table_operation_foreign_key_not_valid_items[item_index];
             item_hooks.generated_check_payload_tokens = ast.alter_table_operation_check_payload_items[item_index];
+            item_hooks.generated_check_payload_expression = if (ast.alter_table_operation_check_payload_items[item_index] != null)
+                &ast.alter_table_operation_check_payload_expressions[item_index]
+            else
+                null;
             item_hooks.generated_check_not_valid_tokens = ast.alter_table_operation_check_not_valid_items[item_index];
             item_hooks.generated_period_payload_tokens = ast.alter_table_operation_period_payload_items[item_index];
         }
@@ -21055,6 +21651,7 @@ fn parseGeneratedCreateTableDefinitionAlloc(
         item_hooks.generated_inline_foreign_key_payload_items = ast.alter_table_operation_inline_foreign_key_payload_items;
         item_hooks.generated_inline_foreign_key_not_valid_items = ast.alter_table_operation_inline_foreign_key_not_valid_items;
         item_hooks.generated_inline_check_payload_items = ast.alter_table_operation_inline_check_payload_items;
+        item_hooks.generated_inline_check_payload_expressions = ast.alter_table_operation_inline_check_payload_expressions;
         item_hooks.generated_inline_check_not_valid_items = ast.alter_table_operation_inline_check_not_valid_items;
         item_hooks.generated_column_name_full_tokens = full_tokens;
         item_hooks.generated_column_header_token_offset = item.start;
@@ -21427,7 +22024,7 @@ fn relationalCreateTablePlanFromGeneratedDdlAstAlloc(
         .returning_expression_qualifiers = hooks.returning_expression_qualifiers,
         .defer_row_expression_field_validation = hooks.defer_row_expression_field_validation,
     };
-    var local_hooks = parser_context.ParserState.ContextAccessors.ddlColumnDefinitionOptions(&state);
+    var local_hooks = makeDdlColumnDefinitionOptions(&state);
     local_hooks.expression_options.generated_scalar_subquery_defaults = hooks.expression_options.generated_scalar_subquery_defaults;
     local_hooks.expression_options.generated_scalar_subquery_full_tokens = hooks.expression_options.generated_scalar_subquery_full_tokens;
     local_hooks.expression_options.generated_scalar_subquery_token_offset = if (hooks.expression_options.generated_scalar_subquery_full_tokens) |scalar_full_tokens|
@@ -21630,7 +22227,7 @@ fn parseGeneratedRelationLifetimePlanAlloc(
         .returning_expression_qualifiers = hooks.returning_expression_qualifiers,
         .defer_row_expression_field_validation = hooks.defer_row_expression_field_validation,
     };
-    const local_hooks = parser_context.ParserState.ContextAccessors.ddlColumnDefinitionOptions(&state);
+    const local_hooks = makeDdlColumnDefinitionOptions(&state);
 
     const lifetime_kind = try parseGeneratedRelationLifetimeKind(tokens, &state.pos);
     var create_table = try parseGeneratedCreateTableDefinitionAlloc(alloc, tokens, ast, tokens, &state.pos, local_hooks);
@@ -22021,6 +22618,7 @@ fn generatedUnsupportedExpectedReason(kind: generated_parser.GeneratedSqlUnsuppo
         .alter_table_storage_parameters => .alter_table_storage_parameters_not_planned_by_generated_parser,
         .alter_table_tablespace => .alter_table_tablespace_not_planned_by_generated_parser,
         .alter_table_trigger_state => .alter_table_trigger_state_not_planned_by_generated_parser,
+        .alter_table_exclusion_constraint => .alter_table_exclusion_constraint_not_planned_by_generated_parser,
         .alter_text_search_configuration => .alter_text_search_configuration_not_planned_by_generated_parser,
         .alter_text_search_dictionary => .alter_text_search_dictionary_not_planned_by_generated_parser,
         .alter_text_search_parser => .alter_text_search_parser_not_planned_by_generated_parser,
@@ -22046,6 +22644,7 @@ fn generatedUnsupportedExpectedReason(kind: generated_parser.GeneratedSqlUnsuppo
         .create_server => .create_server_not_planned_by_generated_parser,
         .create_subscription => .create_subscription_not_planned_by_generated_parser,
         .create_statistics => .create_statistics_not_planned_by_generated_parser,
+        .create_table_exclusion_constraint => .create_table_exclusion_constraint_not_planned_by_generated_parser,
         .create_table_missing_as => .create_table_missing_as_not_planned_by_generated_parser,
         .create_text_search_configuration => .create_text_search_configuration_not_planned_by_generated_parser,
         .create_text_search_dictionary => .create_text_search_dictionary_not_planned_by_generated_parser,
@@ -23228,6 +23827,14 @@ fn validateGeneratedUnsupportedAlterTableOperationSubject(
             }
             return error.UnsupportedSqlShape;
         },
+        .alter_table_column_statistics => {
+            if (ast.alter_table_operation_subject_tokens != null) return error.UnsupportedSqlShape;
+            if (!generatedDdlUnsupportedAlterTableColumnStatisticsOperationIsValid(tokens, operation)) return error.UnsupportedSqlShape;
+        },
+        .alter_table_column_storage => {
+            if (ast.alter_table_operation_subject_tokens != null) return error.UnsupportedSqlShape;
+            if (!generatedDdlUnsupportedAlterTableColumnStorageOperationIsValid(tokens, operation)) return error.UnsupportedSqlShape;
+        },
         .alter_table_inheritance => {
             if (operation_end == start + 2 and tokens[start].matchesKeyword("inherit")) {
                 try validateGeneratedUnsupportedAlterTableSubjectAt(tokens, end, ast, start + 1);
@@ -23255,6 +23862,48 @@ fn validateGeneratedUnsupportedAlterTableOperationSubject(
             if (ast.alter_table_operation_subject_tokens != null) return error.UnsupportedSqlShape;
         },
     }
+}
+
+fn generatedDdlUnsupportedAlterTableColumnStatisticsOperationIsValid(
+    tokens: []const grammar.Token,
+    operation: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    var index = operation.start;
+    if (operation.end > tokens.len or index >= operation.end) return false;
+    if (!tokens[index].matchesKeywordTag(.alter)) return false;
+    index += 1;
+    if (index < operation.end and tokens[index].matchesKeywordTag(.column)) index += 1;
+    if (index >= operation.end or tokens[index].kind != .identifier) return false;
+    index += 1;
+    return index + 3 == operation.end and
+        tokens[index].matchesKeywordTag(.set) and
+        tokens[index + 1].matchesKeyword("statistics") and
+        tokens[index + 2].kind == .number;
+}
+
+fn generatedDdlUnsupportedAlterTableColumnStorageOperationIsValid(
+    tokens: []const grammar.Token,
+    operation: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    var index = operation.start;
+    if (operation.end > tokens.len or index >= operation.end) return false;
+    if (!tokens[index].matchesKeywordTag(.alter)) return false;
+    index += 1;
+    if (index < operation.end and tokens[index].matchesKeywordTag(.column)) index += 1;
+    if (index >= operation.end or tokens[index].kind != .identifier) return false;
+    index += 1;
+    return index + 3 == operation.end and
+        tokens[index].matchesKeywordTag(.set) and
+        tokens[index + 1].matchesKeyword("storage") and
+        generatedDdlUnsupportedAlterTableColumnStorageModeIsValid(tokens[index + 2]);
+}
+
+fn generatedDdlUnsupportedAlterTableColumnStorageModeIsValid(token: grammar.Token) bool {
+    return token.matchesKeywordTag(.default) or
+        token.matchesKeyword("plain") or
+        token.matchesKeyword("external") or
+        token.matchesKeyword("extended") or
+        token.matchesKeyword("main");
 }
 
 fn validateGeneratedUnsupportedAlterTableSubjectAt(
@@ -24185,7 +24834,7 @@ pub fn logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(
         .field_expression_qualifiers = state.field_expression_qualifiers,
         .returning_expression_qualifiers = state.returning_expression_qualifiers,
         .defer_row_expression_field_validation = state.defer_row_expression_field_validation,
-        .column_definition_options = parser_context.ParserState.ContextAccessors.ddlColumnDefinitionOptions(&state),
+        .column_definition_options = makeDdlColumnDefinitionOptions(&state),
         .domain_options = parser_context.ParserState.ContextAccessors.ddlDomainOptions(&state),
         .create_index_options = parser_context.ParserState.ContextAccessors.createIndexOptions(&state),
         .row_security_policy_options = parser_context.ParserState.ContextAccessors.rowSecurityPolicyOptions(&state),
@@ -24301,7 +24950,7 @@ fn runtimeDdlPlanParsedSqlWithFunctionBindingsAlloc(
         .field_expression_qualifiers = state.field_expression_qualifiers,
         .returning_expression_qualifiers = state.returning_expression_qualifiers,
         .defer_row_expression_field_validation = state.defer_row_expression_field_validation,
-        .column_definition_options = parser_context.ParserState.ContextAccessors.ddlColumnDefinitionOptions(&state),
+        .column_definition_options = makeDdlColumnDefinitionOptions(&state),
         .domain_options = parser_context.ParserState.ContextAccessors.ddlDomainOptions(&state),
         .create_index_options = parser_context.ParserState.ContextAccessors.createIndexOptions(&state),
         .row_security_policy_options = parser_context.ParserState.ContextAccessors.rowSecurityPolicyOptions(&state),
@@ -24677,6 +25326,26 @@ test "sql adapter ddl plan lowers create table ddl into typed schema plan" {
     ));
     try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanForTestAlloc(
         alloc,
+        "CREATE TABLE bad_generic_constraint_attribute (id uuid PRIMARY KEY BOGUS);",
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanForTestAlloc(
+        alloc,
+        "CREATE TABLE bad_table_generic_constraint_attribute (id uuid NOT NULL, CONSTRAINT bad_table_generic_constraint_attribute_pk PRIMARY KEY (id) BOGUS);",
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanForTestAlloc(
+        alloc,
+        "CREATE TABLE bad_table_malformed_constraint_timing (id uuid NOT NULL, CONSTRAINT bad_table_malformed_constraint_timing_pk PRIMARY KEY (id) INITIALLY BOGUS);",
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanForTestAlloc(
+        alloc,
+        "CREATE TABLE bad_generic_column_constraint_attribute (status text BOGUS tail);",
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanForTestAlloc(
+        alloc,
+        "CREATE TABLE bad_virtual_generated_column (status text, status_key text GENERATED ALWAYS AS (lower(status)) VIRTUAL);",
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanForTestAlloc(
+        alloc,
         "CREATE TABLE bad_primary_include_overlap (id uuid PRIMARY KEY INCLUDE (id));",
     ));
     try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanForTestAlloc(
@@ -24804,6 +25473,41 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
+    var collated = try runtimeDdlPlanForTestAlloc(
+        alloc,
+        "CREATE INDEX usage_records_status_c_idx ON usage_records (status COLLATE \"C\" DESC NULLS LAST);",
+    );
+    defer collated.deinit(alloc);
+    switch (collated) {
+        .create_index => |plan| {
+            try std.testing.expectEqualStrings("usage_records_status_c_idx", plan.index_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.index_keys.len);
+            try std.testing.expectEqualStrings("status", plan.index_keys[0].column);
+            try std.testing.expectEqualStrings("C", plan.index_keys[0].collation orelse return error.TestUnexpectedResult);
+            try std.testing.expectEqual(runtime_schema.RelationalIndexKeyDirection.desc, plan.index_keys[0].direction);
+            try std.testing.expectEqual(runtime_schema.RelationalIndexKeyNulls.last, plan.index_keys[0].nulls);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var unique_collated = try runtimeDdlPlanForTestAlloc(
+        alloc,
+        "CREATE UNIQUE INDEX usage_records_status_c_key ON usage_records (status COLLATE \"C\");",
+    );
+    defer unique_collated.deinit(alloc);
+    switch (unique_collated) {
+        .create_index => |plan| {
+            try std.testing.expect(plan.unique);
+            try std.testing.expectEqualStrings("usage_records_status_c_key", plan.index_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.columns.len);
+            try std.testing.expectEqualStrings("status", plan.columns[0]);
+            try std.testing.expectEqual(@as(usize, 1), plan.index_keys.len);
+            try std.testing.expectEqualStrings("status", plan.index_keys[0].column);
+            try std.testing.expectEqualStrings("C", plan.index_keys[0].collation orelse return error.TestUnexpectedResult);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     var covering = try runtimeDdlPlanForTestAlloc(
         alloc,
         "CREATE INDEX usage_records_status_cover_idx ON usage_records (status) INCLUDE (tenant_id, amount);",
@@ -24903,7 +25607,7 @@ test "sql adapter ddl plan lowers create index ddl" {
 
     var antfly_text_search_rich = try runtimeDdlPlanForTestAlloc(
         alloc,
-        "CREATE TEXT SEARCH docs_body_rich_fts ON docs (body) WITH (analyzer = 'standard', scoring = 'bm25', highlight = true, snippet = true, segment_lifecycle = 'merge_on_commit');",
+        "CREATE TEXT SEARCH docs_body_rich_fts ON docs (body) WITH (analyzer = 'standard', scoring = 'bm25', highlight = true, snippet = true);",
     );
     defer antfly_text_search_rich.deinit(alloc);
     switch (antfly_text_search_rich) {
@@ -24915,18 +25619,29 @@ test "sql adapter ddl plan lowers create index ddl" {
             try std.testing.expect(std.mem.indexOf(u8, config, "\"scoring\":\"bm25\"") != null);
             try std.testing.expect(std.mem.indexOf(u8, config, "\"highlight\":true") != null);
             try std.testing.expect(std.mem.indexOf(u8, config, "\"snippet\":true") != null);
-            try std.testing.expect(std.mem.indexOf(u8, config, "\"segment_lifecycle\":\"merge_on_commit\"") != null);
         },
         else => return error.TestUnexpectedResult,
     }
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanForTestAlloc(
-        alloc,
-        "CREATE TEXT SEARCH docs_bad_fts ON docs (body) WITH (backend = 'lucene');",
-    ));
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanForTestAlloc(
-        alloc,
-        "CREATE TEXT SEARCH docs_bad_fts ON docs (body) WITH (highlight = 'true');",
-    ));
+    const unsupported_text_search_options = [_]struct {
+        name: []const u8,
+        sql: []const u8,
+    }{
+        .{
+            .name = "method-local lifecycle",
+            .sql = "CREATE TEXT SEARCH docs_bad_fts ON docs (body) WITH (segment_lifecycle = 'merge_on_commit');",
+        },
+        .{
+            .name = "unknown backend option",
+            .sql = "CREATE TEXT SEARCH docs_bad_fts ON docs (body) WITH (backend = 'lucene');",
+        },
+        .{
+            .name = "highlight must be boolean",
+            .sql = "CREATE TEXT SEARCH docs_bad_fts ON docs (body) WITH (highlight = 'true');",
+        },
+    };
+    for (unsupported_text_search_options) |unsupported| {
+        try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanForTestAlloc(alloc, unsupported.sql));
+    }
 
     var derived_json_arrow_full_text = try runtimeDdlPlanForTestAlloc(
         alloc,
@@ -25006,23 +25721,44 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
-    var external_vector = try runtimeDdlPlanForTestAlloc(
-        alloc,
-        "CREATE INDEX docs_embedding_hnsw ON docs USING hnsw (embedding vector_cosine_ops) WITH (dimension = 1536, m = 16, ef_construction = 64);",
-    );
-    defer external_vector.deinit(alloc);
-    switch (external_vector) {
-        .create_index => |plan| {
-            try std.testing.expectEqual(DdlIndexMethod.hnsw, plan.method);
-            try std.testing.expectEqual(DdlIndexOpClass.vector_cosine_ops, plan.opclass);
-            const config = plan.derived_index_config_json orelse return error.TestUnexpectedResult;
-            try std.testing.expect(std.mem.indexOf(u8, config, "\"type\":\"embeddings\"") != null);
-            try std.testing.expect(std.mem.indexOf(u8, config, "\"field\":\"embedding\"") != null);
-            try std.testing.expect(std.mem.indexOf(u8, config, "\"external\":true") != null);
-            try std.testing.expect(std.mem.indexOf(u8, config, "\"metric\":\"cosine\"") != null);
-            try std.testing.expect(std.mem.indexOf(u8, config, "\"dimension\":1536") != null);
+    const vector_opclass_cases = [_]struct {
+        sql: []const u8,
+        opclass: DdlIndexOpClass,
+        metric_fragment: []const u8,
+    }{
+        .{
+            .sql = "CREATE INDEX docs_embedding_hnsw ON docs USING hnsw (embedding vector_cosine_ops) WITH (dimension = 1536, m = 16, ef_construction = 64);",
+            .opclass = .vector_cosine_ops,
+            .metric_fragment = "\"metric\":\"cosine\"",
         },
-        else => return error.TestUnexpectedResult,
+        .{
+            .sql = "CREATE INDEX docs_embedding_l2_hnsw ON docs USING hnsw (embedding vector_l2_ops) WITH (dimension = 1536);",
+            .opclass = .vector_l2_ops,
+            .metric_fragment = "\"metric\":\"l2_squared\"",
+        },
+        .{
+            .sql = "CREATE INDEX docs_embedding_ip_hnsw ON docs USING hnsw (embedding vector_ip_ops) WITH (dimension = 1536);",
+            .opclass = .vector_ip_ops,
+            .metric_fragment = "\"metric\":\"inner_product\"",
+        },
+    };
+    for (vector_opclass_cases) |case| {
+        var external_vector = try runtimeDdlPlanForTestAlloc(alloc, case.sql);
+        defer external_vector.deinit(alloc);
+        switch (external_vector) {
+            .create_index => |plan| {
+                try std.testing.expectEqual(DdlIndexMethod.hnsw, plan.method);
+                try std.testing.expectEqual(case.opclass, plan.opclass);
+                try std.testing.expectEqualStrings("embedding", plan.columns[0]);
+                const config = plan.derived_index_config_json orelse return error.TestUnexpectedResult;
+                try std.testing.expect(std.mem.indexOf(u8, config, "\"type\":\"embeddings\"") != null);
+                try std.testing.expect(std.mem.indexOf(u8, config, "\"field\":\"embedding\"") != null);
+                try std.testing.expect(std.mem.indexOf(u8, config, "\"external\":true") != null);
+                try std.testing.expect(std.mem.indexOf(u8, config, case.metric_fragment) != null);
+                try std.testing.expect(std.mem.indexOf(u8, config, "\"dimension\":1536") != null);
+            },
+            else => return error.TestUnexpectedResult,
+        }
     }
 
     var embedded_json_external_vector = try runtimeDdlPlanForTestAlloc(
@@ -26109,6 +26845,22 @@ test "sql adapter ddl plan lowers alter table ddl" {
         alloc,
         "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_cover_key UNIQUE (email) INCLUDE (email);",
     ));
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanForTestAlloc(
+        alloc,
+        "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_key UNIQUE (email) BOGUS;",
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanForTestAlloc(
+        alloc,
+        "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_key UNIQUE (email) INITIALLY BOGUS;",
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanForTestAlloc(
+        alloc,
+        "ALTER TABLE usage_records ADD COLUMN status text BOGUS tail;",
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanForTestAlloc(
+        alloc,
+        "ALTER TABLE usage_records ADD COLUMN status_key text GENERATED ALWAYS AS (lower(status)) VIRTUAL;",
+    ));
 
     var explicit_primary_key_timing = try runtimeDdlPlanForTestAlloc(
         alloc,
@@ -26726,6 +27478,119 @@ test "sql adapter ddl plan lowers updated-at trigger ddl into typed update polic
     }
 }
 
+const GeneratedCatalogOnlyMetadataMutation = enum {
+    missing_table_clone_source,
+    corrupt_table_clone_option,
+    corrupt_table_clone_action,
+    corrupt_table_clone_option_name,
+    corrupt_enum_name,
+    missing_enum_values,
+    corrupt_enum_value,
+    stale_alter_enum_tail,
+    missing_alter_enum_value,
+    missing_alter_enum_neighbor,
+    stale_drop_enum_cascade,
+    corrupt_domain_name,
+    corrupt_domain_tail,
+    missing_domain_type,
+    corrupt_domain_type,
+    corrupt_create_sequence_name,
+    missing_create_sequence_items,
+    corrupt_create_sequence_item,
+    stale_alter_sequence_tail,
+    missing_alter_sequence_items,
+    corrupt_alter_sequence_item,
+    stale_drop_sequence_cascade,
+};
+
+fn applyGeneratedCatalogOnlyMetadataMutation(
+    alloc: std.mem.Allocator,
+    parsed_len: usize,
+    ddl: *generated_parser.GeneratedSqlDdlAst,
+    mutation: GeneratedCatalogOnlyMetadataMutation,
+) !void {
+    switch (mutation) {
+        .missing_table_clone_source => ddl.create_table_like_source_tokens = null,
+        .corrupt_table_clone_option => {
+            if (ddl.create_table_like_option_items.items.len == 0) return error.TestUnexpectedResult;
+            ddl.create_table_like_option_items.items[0] = .{ .start = 10, .end = 11 };
+        },
+        .corrupt_table_clone_action => {
+            if (ddl.create_table_like_option_action_items.len == 0) return error.TestUnexpectedResult;
+            ddl.create_table_like_option_action_items[0].end += 1;
+        },
+        .corrupt_table_clone_option_name => {
+            if (ddl.create_table_like_option_name_items.len < 2) return error.TestUnexpectedResult;
+            ddl.create_table_like_option_name_items[1].start -= 1;
+        },
+        .corrupt_enum_name => ddl.object_name_tokens = .{ .start = 1, .end = 2 },
+        .missing_enum_values => {
+            try std.testing.expectEqual(@as(usize, 2), ddl.enum_value_items.count);
+            ddl.enum_value_items.deinit(alloc);
+            ddl.enum_value_items = .{};
+        },
+        .corrupt_enum_value => {
+            try std.testing.expectEqual(@as(usize, 2), ddl.enum_value_items.count);
+            ddl.enum_value_items.items[1].start += 1;
+        },
+        .stale_alter_enum_tail => ddl.alter_table_operation_tokens = .{ .start = 2, .end = parsed_len },
+        .missing_alter_enum_value => ddl.enum_value_tokens = null,
+        .missing_alter_enum_neighbor => ddl.enum_neighbor_value_tokens = null,
+        .stale_drop_enum_cascade => ddl.cascade = false,
+        .corrupt_domain_name => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_domain, ddl.kind);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl.object_name_tokens.?);
+            ddl.object_name_tokens = .{ .start = 1, .end = 2 };
+        },
+        .corrupt_domain_tail => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_domain, ddl.kind);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = parsed_len - 1 }, ddl.alter_table_operation_tokens.?);
+            ddl.alter_table_operation_tokens = .{ .start = 2, .end = parsed_len - 1 };
+        },
+        .missing_domain_type => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_domain, ddl.kind);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 4, .end = 5 }, ddl.domain_type_tokens.?);
+            ddl.domain_type_tokens = null;
+        },
+        .corrupt_domain_type => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_domain, ddl.kind);
+            ddl.domain_type_tokens = .{ .start = 2, .end = 3 };
+        },
+        .corrupt_create_sequence_name => ddl.object_name_tokens = .{ .start = 1, .end = 2 },
+        .missing_create_sequence_items, .missing_alter_sequence_items => {
+            try std.testing.expectEqual(@as(usize, 2), ddl.sequence_operation_items.count);
+            ddl.sequence_operation_items.deinit(alloc);
+            ddl.sequence_operation_items = .{};
+        },
+        .corrupt_create_sequence_item, .corrupt_alter_sequence_item => {
+            try std.testing.expectEqual(@as(usize, 2), ddl.sequence_operation_items.count);
+            ddl.sequence_operation_items.items[1].start += 1;
+        },
+        .stale_alter_sequence_tail => ddl.alter_table_operation_tokens = .{ .start = 2, .end = parsed_len },
+        .stale_drop_sequence_cascade => ddl.cascade = false,
+    }
+}
+
+fn expectGeneratedCatalogOnlyMetadataMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedCatalogOnlyMetadataMutation,
+    expect_logical_failure: bool,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .ddl => |*ddl| try applyGeneratedCatalogOnlyMetadataMutation(alloc, parsed.items().len, ddl, mutation),
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
+    if (expect_logical_failure) {
+        try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed, .{}));
+    }
+}
+
 test "sql adapter ddl plan lowers catalog-only ddl plans" {
     const alloc = std.testing.allocator;
 
@@ -26748,64 +27613,19 @@ test "sql adapter ddl plan lowers catalog-only ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var malformed_generated_table_clone_source = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE IF NOT EXISTS users_copy (LIKE users INCLUDING ALL EXCLUDING COMMENTS);");
-    defer malformed_generated_table_clone_source.deinit(alloc);
-    if (malformed_generated_table_clone_source.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.create_table_like_source_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_generated_table_clone_source));
-
-    var corrupt_generated_table_clone_option = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE IF NOT EXISTS users_copy (LIKE users INCLUDING ALL EXCLUDING COMMENTS);");
-    defer corrupt_generated_table_clone_option.deinit(alloc);
-    if (corrupt_generated_table_clone_option.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    if (ddl.create_table_like_option_items.items.len == 0) return error.TestUnexpectedResult;
-                    ddl.create_table_like_option_items.items[0] = .{ .start = 10, .end = 11 };
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &corrupt_generated_table_clone_option));
-
-    var corrupt_generated_table_clone_action = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE IF NOT EXISTS users_copy (LIKE users INCLUDING ALL EXCLUDING COMMENTS);");
-    defer corrupt_generated_table_clone_action.deinit(alloc);
-    if (corrupt_generated_table_clone_action.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    if (ddl.create_table_like_option_action_items.len == 0) return error.TestUnexpectedResult;
-                    ddl.create_table_like_option_action_items[0].end += 1;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &corrupt_generated_table_clone_action));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &corrupt_generated_table_clone_action, .{}));
-
-    var corrupt_generated_table_clone_option_name = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE IF NOT EXISTS users_copy (LIKE users INCLUDING ALL EXCLUDING COMMENTS);");
-    defer corrupt_generated_table_clone_option_name.deinit(alloc);
-    if (corrupt_generated_table_clone_option_name.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    if (ddl.create_table_like_option_name_items.len < 2) return error.TestUnexpectedResult;
-                    ddl.create_table_like_option_name_items[1].start -= 1;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &corrupt_generated_table_clone_option_name));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &corrupt_generated_table_clone_option_name, .{}));
+    const table_clone_sql = "CREATE TABLE IF NOT EXISTS users_copy (LIKE users INCLUDING ALL EXCLUDING COMMENTS);";
+    const table_clone_metadata_cases = [_]struct {
+        mutation: GeneratedCatalogOnlyMetadataMutation,
+        expect_logical_failure: bool = false,
+    }{
+        .{ .mutation = .missing_table_clone_source },
+        .{ .mutation = .corrupt_table_clone_option },
+        .{ .mutation = .corrupt_table_clone_action, .expect_logical_failure = true },
+        .{ .mutation = .corrupt_table_clone_option_name, .expect_logical_failure = true },
+    };
+    for (table_clone_metadata_cases) |case| {
+        try expectGeneratedCatalogOnlyMetadataMutationFails(alloc, table_clone_sql, case.mutation, case.expect_logical_failure);
+    }
 
     var create_view = try runtimeDdlPlanForTestAlloc(alloc, "CREATE VIEW users_v(user_id, contact_email) AS SELECT id, email FROM users;");
     defer create_view.deinit(alloc);
@@ -26902,95 +27722,21 @@ test "sql adapter ddl plan lowers catalog-only ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var malformed_generated_create_enum = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TYPE usage_status AS ENUM ('open', 'done');");
-    defer malformed_generated_create_enum.deinit(alloc);
-    if (malformed_generated_create_enum.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.object_name_tokens = .{ .start = 1, .end = 2 },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_generated_create_enum));
-
-    var malformed_generated_create_enum_values = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TYPE usage_status AS ENUM ('open', 'done');");
-    defer malformed_generated_create_enum_values.deinit(alloc);
-    if (malformed_generated_create_enum_values.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(@as(usize, 2), ddl.enum_value_items.count);
-                    ddl.enum_value_items.deinit(alloc);
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_generated_create_enum_values));
-
-    var corrupt_generated_create_enum_value = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TYPE usage_status AS ENUM ('open', 'done');");
-    defer corrupt_generated_create_enum_value.deinit(alloc);
-    if (corrupt_generated_create_enum_value.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(@as(usize, 2), ddl.enum_value_items.count);
-                    ddl.enum_value_items.items[1].start += 1;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &corrupt_generated_create_enum_value));
-
-    var malformed_generated_alter_enum = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TYPE usage_status ADD VALUE 'archived';");
-    defer malformed_generated_alter_enum.deinit(alloc);
-    if (malformed_generated_alter_enum.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.alter_table_operation_tokens = .{ .start = 2, .end = malformed_generated_alter_enum.items().len },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_generated_alter_enum));
-
-    var malformed_generated_alter_enum_value = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TYPE usage_status ADD VALUE 'archived';");
-    defer malformed_generated_alter_enum_value.deinit(alloc);
-    if (malformed_generated_alter_enum_value.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.enum_value_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_generated_alter_enum_value));
-
-    var malformed_generated_alter_enum_neighbor = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TYPE usage_status ADD VALUE IF NOT EXISTS 'archived' AFTER 'done';");
-    defer malformed_generated_alter_enum_neighbor.deinit(alloc);
-    if (malformed_generated_alter_enum_neighbor.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.enum_neighbor_value_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_generated_alter_enum_neighbor));
-
-    var malformed_generated_drop_enum_cascade = try tokenized.ParsedSql.initAlloc(alloc, "DROP TYPE IF EXISTS usage_status CASCADE;");
-    defer malformed_generated_drop_enum_cascade.deinit(alloc);
-    if (malformed_generated_drop_enum_cascade.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.cascade = false,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_generated_drop_enum_cascade));
+    const enum_metadata_cases = [_]struct {
+        sql: []const u8,
+        mutation: GeneratedCatalogOnlyMetadataMutation,
+    }{
+        .{ .sql = "CREATE TYPE usage_status AS ENUM ('open', 'done');", .mutation = .corrupt_enum_name },
+        .{ .sql = "CREATE TYPE usage_status AS ENUM ('open', 'done');", .mutation = .missing_enum_values },
+        .{ .sql = "CREATE TYPE usage_status AS ENUM ('open', 'done');", .mutation = .corrupt_enum_value },
+        .{ .sql = "ALTER TYPE usage_status ADD VALUE 'archived';", .mutation = .stale_alter_enum_tail },
+        .{ .sql = "ALTER TYPE usage_status ADD VALUE 'archived';", .mutation = .missing_alter_enum_value },
+        .{ .sql = "ALTER TYPE usage_status ADD VALUE IF NOT EXISTS 'archived' AFTER 'done';", .mutation = .missing_alter_enum_neighbor },
+        .{ .sql = "DROP TYPE IF EXISTS usage_status CASCADE;", .mutation = .stale_drop_enum_cascade },
+    };
+    for (enum_metadata_cases) |case| {
+        try expectGeneratedCatalogOnlyMetadataMutationFails(alloc, case.sql, case.mutation, false);
+    }
 
     var serial_identity = try runtimeDdlPlanForTestAlloc(alloc, "CREATE TABLE usage_records (id bigserial PRIMARY KEY, status text);");
     defer serial_identity.deinit(alloc);
@@ -27128,68 +27874,15 @@ test "sql adapter ddl plan lowers catalog-only ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var malformed_generated_create_domain_name = try tokenized.ParsedSql.initAlloc(alloc, "CREATE DOMAIN generated_amount AS numeric;");
-    defer malformed_generated_create_domain_name.deinit(alloc);
-    if (malformed_generated_create_domain_name.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_domain, ddl.kind);
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl.object_name_tokens.?);
-                    ddl.object_name_tokens = .{ .start = 1, .end = 2 };
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_generated_create_domain_name));
-
-    var malformed_generated_create_domain_tail = try tokenized.ParsedSql.initAlloc(alloc, "CREATE DOMAIN generated_amount AS numeric;");
-    defer malformed_generated_create_domain_tail.deinit(alloc);
-    if (malformed_generated_create_domain_tail.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_domain, ddl.kind);
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = malformed_generated_create_domain_tail.items().len - 1 }, ddl.alter_table_operation_tokens.?);
-                    ddl.alter_table_operation_tokens = .{ .start = 2, .end = malformed_generated_create_domain_tail.items().len - 1 };
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_generated_create_domain_tail));
-
-    var malformed_generated_create_domain_type = try tokenized.ParsedSql.initAlloc(alloc, "CREATE DOMAIN generated_amount AS numeric;");
-    defer malformed_generated_create_domain_type.deinit(alloc);
-    if (malformed_generated_create_domain_type.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_domain, ddl.kind);
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 4, .end = 5 }, ddl.domain_type_tokens.?);
-                    ddl.domain_type_tokens = null;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_generated_create_domain_type));
-
-    var malformed_generated_create_domain_type_value = try tokenized.ParsedSql.initAlloc(alloc, "CREATE DOMAIN generated_amount AS numeric;");
-    defer malformed_generated_create_domain_type_value.deinit(alloc);
-    if (malformed_generated_create_domain_type_value.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_domain, ddl.kind);
-                    ddl.domain_type_tokens = .{ .start = 2, .end = 3 };
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_generated_create_domain_type_value));
+    const domain_metadata_cases = [_]GeneratedCatalogOnlyMetadataMutation{
+        .corrupt_domain_name,
+        .corrupt_domain_tail,
+        .missing_domain_type,
+        .corrupt_domain_type,
+    };
+    for (domain_metadata_cases) |mutation| {
+        try expectGeneratedCatalogOnlyMetadataMutationFails(alloc, "CREATE DOMAIN generated_amount AS numeric;", mutation, false);
+    }
 
     var create_sequence = try runtimeDdlPlanForTestAlloc(alloc, "CREATE SEQUENCE public.users_owned_id_seq AS bigint START WITH 10 OWNED BY public.users.id;");
     defer create_sequence.deinit(alloc);
@@ -27247,104 +27940,166 @@ test "sql adapter ddl plan lowers catalog-only ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var malformed_generated_create_sequence = try tokenized.ParsedSql.initAlloc(alloc, "CREATE SEQUENCE users_owned_id_seq AS bigint START WITH 10;");
-    defer malformed_generated_create_sequence.deinit(alloc);
-    if (malformed_generated_create_sequence.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.object_name_tokens = .{ .start = 1, .end = 2 },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_generated_create_sequence));
-
-    var malformed_generated_create_sequence_items = try tokenized.ParsedSql.initAlloc(alloc, "CREATE SEQUENCE users_owned_id_seq AS bigint START WITH 10;");
-    defer malformed_generated_create_sequence_items.deinit(alloc);
-    if (malformed_generated_create_sequence_items.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(@as(usize, 2), ddl.sequence_operation_items.count);
-                    ddl.sequence_operation_items.deinit(alloc);
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_generated_create_sequence_items));
-
-    var corrupt_generated_create_sequence_item = try tokenized.ParsedSql.initAlloc(alloc, "CREATE SEQUENCE users_owned_id_seq AS bigint START WITH 10;");
-    defer corrupt_generated_create_sequence_item.deinit(alloc);
-    if (corrupt_generated_create_sequence_item.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(@as(usize, 2), ddl.sequence_operation_items.count);
-                    ddl.sequence_operation_items.items[1].start += 1;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &corrupt_generated_create_sequence_item));
-
-    var malformed_generated_alter_sequence = try tokenized.ParsedSql.initAlloc(alloc, "ALTER SEQUENCE users_owned_id_seq RESTART WITH 1000;");
-    defer malformed_generated_alter_sequence.deinit(alloc);
-    if (malformed_generated_alter_sequence.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.alter_table_operation_tokens = .{ .start = 2, .end = malformed_generated_alter_sequence.items().len },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_generated_alter_sequence));
-
-    var malformed_generated_alter_sequence_items = try tokenized.ParsedSql.initAlloc(alloc, "ALTER SEQUENCE IF EXISTS users_owned_id_seq AS integer OWNED BY NONE;");
-    defer malformed_generated_alter_sequence_items.deinit(alloc);
-    if (malformed_generated_alter_sequence_items.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(@as(usize, 2), ddl.sequence_operation_items.count);
-                    ddl.sequence_operation_items.deinit(alloc);
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_generated_alter_sequence_items));
-
-    var corrupt_generated_alter_sequence_item = try tokenized.ParsedSql.initAlloc(alloc, "ALTER SEQUENCE IF EXISTS users_owned_id_seq AS integer OWNED BY NONE;");
-    defer corrupt_generated_alter_sequence_item.deinit(alloc);
-    if (corrupt_generated_alter_sequence_item.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(@as(usize, 2), ddl.sequence_operation_items.count);
-                    ddl.sequence_operation_items.items[1].start += 1;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &corrupt_generated_alter_sequence_item));
-
-    var malformed_generated_drop_sequence_cascade = try tokenized.ParsedSql.initAlloc(alloc, "DROP SEQUENCE IF EXISTS users_owned_id_seq CASCADE;");
-    defer malformed_generated_drop_sequence_cascade.deinit(alloc);
-    if (malformed_generated_drop_sequence_cascade.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.cascade = false,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_generated_drop_sequence_cascade));
+    const sequence_metadata_cases = [_]struct {
+        sql: []const u8,
+        mutation: GeneratedCatalogOnlyMetadataMutation,
+    }{
+        .{ .sql = "CREATE SEQUENCE users_owned_id_seq AS bigint START WITH 10;", .mutation = .corrupt_create_sequence_name },
+        .{ .sql = "CREATE SEQUENCE users_owned_id_seq AS bigint START WITH 10;", .mutation = .missing_create_sequence_items },
+        .{ .sql = "CREATE SEQUENCE users_owned_id_seq AS bigint START WITH 10;", .mutation = .corrupt_create_sequence_item },
+        .{ .sql = "ALTER SEQUENCE users_owned_id_seq RESTART WITH 1000;", .mutation = .stale_alter_sequence_tail },
+        .{ .sql = "ALTER SEQUENCE IF EXISTS users_owned_id_seq AS integer OWNED BY NONE;", .mutation = .missing_alter_sequence_items },
+        .{ .sql = "ALTER SEQUENCE IF EXISTS users_owned_id_seq AS integer OWNED BY NONE;", .mutation = .corrupt_alter_sequence_item },
+        .{ .sql = "DROP SEQUENCE IF EXISTS users_owned_id_seq CASCADE;", .mutation = .stale_drop_sequence_cascade },
+    };
+    for (sequence_metadata_cases) |case| {
+        try expectGeneratedCatalogOnlyMetadataMutationFails(alloc, case.sql, case.mutation, false);
+    }
 
     try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanForTestAlloc(alloc, "CREATE SEQUENCE users_id_seq NO MINVALUE MINVALUE 1;"));
     try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanForTestAlloc(alloc, "CREATE SEQUENCE users_id_seq NO MAXVALUE MAXVALUE 100;"));
+}
+
+const GeneratedRoutineMetadataMutation = enum {
+    corrupt_create_name,
+    stale_create_tail,
+    corrupt_create_arg,
+    missing_returns,
+    missing_metadata,
+    missing_name,
+    corrupt_null_input,
+    stale_transform_count,
+    corrupt_transform_item,
+    stale_setting_count,
+    corrupt_setting_item,
+    missing_body,
+    corrupt_body_kind,
+    corrupt_body_expression,
+    corrupt_body_hook,
+    stale_body_perform_count,
+    stale_drop_signature,
+    corrupt_drop_arg,
+    stale_drop_cascade,
+    stale_returns_range,
+};
+
+fn applyGeneratedRoutineMetadataMutation(
+    alloc: std.mem.Allocator,
+    parsed_len: usize,
+    ddl: *generated_parser.GeneratedSqlDdlAst,
+    mutation: GeneratedRoutineMetadataMutation,
+) !void {
+    switch (mutation) {
+        .corrupt_create_name => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_function, ddl.kind);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl.object_name_tokens.?);
+            ddl.object_name_tokens = .{ .start = 1, .end = 2 };
+        },
+        .stale_create_tail => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_procedure, ddl.kind);
+            ddl.alter_table_operation_tokens = .{ .start = 2, .end = parsed_len - 1 };
+        },
+        .corrupt_create_arg => (ddl.routine_metadata orelse return error.TestUnexpectedResult).argument_items.items[0].start += 1,
+        .missing_returns => (ddl.routine_metadata orelse return error.TestUnexpectedResult).returns_type_tokens = null,
+        .missing_metadata => {
+            const routine_metadata = ddl.routine_metadata orelse return error.TestUnexpectedResult;
+            routine_metadata.deinit(alloc);
+            alloc.destroy(routine_metadata);
+            ddl.routine_metadata = null;
+        },
+        .missing_name => ddl.object_name_tokens = null,
+        .corrupt_null_input => (ddl.routine_metadata orelse return error.TestUnexpectedResult).null_input_tokens = .{ .start = 1, .end = 2 },
+        .stale_transform_count => {
+            const routine_metadata = ddl.routine_metadata orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(@as(usize, 2), routine_metadata.transform_type_items.count);
+            routine_metadata.transform_type_items.count += 1;
+        },
+        .corrupt_transform_item => {
+            const routine_metadata = ddl.routine_metadata orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(@as(usize, 2), routine_metadata.transform_type_items.count);
+            routine_metadata.transform_type_items.items[1].start += 1;
+        },
+        .stale_setting_count => {
+            const routine_metadata = ddl.routine_metadata orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(@as(usize, 1), routine_metadata.setting_items.count);
+            routine_metadata.setting_items.count += 1;
+        },
+        .corrupt_setting_item => {
+            const routine_metadata = ddl.routine_metadata orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(@as(usize, 1), routine_metadata.setting_items.count);
+            routine_metadata.setting_items.items[0].start += 1;
+        },
+        .missing_body => (ddl.routine_metadata orelse return error.TestUnexpectedResult).body_tokens = null,
+        .corrupt_body_kind => {
+            const routine_metadata = ddl.routine_metadata orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(generated_parser.GeneratedSqlRoutineBodyKind.sql_expression, routine_metadata.body_kind.?);
+            routine_metadata.body_kind = .plpgsql_procedure;
+        },
+        .corrupt_body_expression => {
+            const routine_metadata = ddl.routine_metadata orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 0, .end = 1 }, routine_metadata.body_expression.tokens.?);
+            routine_metadata.body_expression.tokens = .{ .start = 0, .end = 0 };
+        },
+        .corrupt_body_hook => {
+            const routine_metadata = ddl.routine_metadata orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(generated_parser.GeneratedSqlRoutineExecutionHook.trigger_return_new, routine_metadata.body_hook.?);
+            routine_metadata.body_hook = .trigger_return_old;
+        },
+        .stale_body_perform_count => {
+            const routine_metadata = ddl.routine_metadata orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(@as(usize, 1), routine_metadata.body_perform_call_count);
+            routine_metadata.body_perform_call_count += 1;
+        },
+        .stale_drop_signature => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.drop_function, ddl.kind);
+            ddl.alter_table_operation_tokens = .{ .start = 4, .end = parsed_len - 1 };
+        },
+        .corrupt_drop_arg => (ddl.routine_metadata orelse return error.TestUnexpectedResult).argument_items.items[0].start += 1,
+        .stale_drop_cascade => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.drop_procedure, ddl.kind);
+            try std.testing.expect(ddl.cascade);
+            ddl.cascade = false;
+        },
+        .stale_returns_range => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_function, ddl.kind);
+            const routine = ddl.routine_metadata orelse return error.TestUnexpectedResult;
+            _ = routine.returns_type_tokens orelse return error.TestUnexpectedResult;
+            routine.returns_type_tokens.?.end = routine.returns_type_tokens.?.start;
+        },
+    }
+}
+
+fn expectGeneratedRoutineMetadataMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedRoutineMetadataMutation,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .ddl => |*ddl| try applyGeneratedRoutineMetadataMutation(alloc, parsed.items().len, ddl, mutation),
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
+}
+
+fn expectGeneratedRoutineMetadataMutationFailsAtPublicBoundaries(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedRoutineMetadataMutation,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .ddl => |*ddl| try applyGeneratedRoutineMetadataMutation(alloc, parsed.items().len, ddl, mutation),
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed, .{}));
 }
 
 test "sql adapter ddl plan lowers routine catalog ddl plans" {
@@ -27486,372 +28241,38 @@ test "sql adapter ddl plan lowers routine catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var malformed_create_routine_name = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE FUNCTION generated_audit() RETURNS trigger LANGUAGE plpgsql;",
-    );
-    defer malformed_create_routine_name.deinit(alloc);
-    if (malformed_create_routine_name.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_function, ddl.kind);
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl.object_name_tokens.?);
-                    ddl.object_name_tokens = .{ .start = 1, .end = 2 };
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_create_routine_name));
+    const routine_metadata_cases = [_]struct {
+        sql: []const u8,
+        mutation: GeneratedRoutineMetadataMutation,
+    }{
+        .{ .sql = "CREATE FUNCTION generated_audit() RETURNS trigger LANGUAGE plpgsql;", .mutation = .corrupt_create_name },
+        .{ .sql = "CREATE PROCEDURE generated_rotate() LANGUAGE plpgsql;", .mutation = .stale_create_tail },
+        .{ .sql = "CREATE FUNCTION normalize_status(input text) RETURNS text LANGUAGE sql;", .mutation = .corrupt_create_arg },
+        .{ .sql = "CREATE FUNCTION normalize_status(input text) RETURNS text LANGUAGE sql;", .mutation = .missing_returns },
+        .{ .sql = "CREATE FUNCTION normalize_status(input text) RETURNS text LANGUAGE sql;", .mutation = .missing_metadata },
+        .{ .sql = "CREATE FUNCTION audit_options() RETURNS trigger LANGUAGE plpgsql STABLE SECURITY DEFINER CALLED ON NULL INPUT COST 10 ROWS 10 PARALLEL SAFE LEAKPROOF WINDOW SUPPORT audit_support;", .mutation = .missing_name },
+        .{ .sql = "CREATE FUNCTION audit_options() RETURNS trigger LANGUAGE plpgsql STABLE SECURITY DEFINER CALLED ON NULL INPUT COST 10 ROWS 10 PARALLEL SAFE LEAKPROOF WINDOW SUPPORT audit_support;", .mutation = .corrupt_null_input },
+        .{ .sql = "CREATE FUNCTION audit_options() RETURNS trigger LANGUAGE plpgsql TRANSFORM FOR TYPE jsonb, public.hstore SET search_path TO public;", .mutation = .stale_transform_count },
+        .{ .sql = "CREATE FUNCTION audit_options() RETURNS trigger LANGUAGE plpgsql TRANSFORM FOR TYPE jsonb, public.hstore SET search_path TO public;", .mutation = .corrupt_transform_item },
+        .{ .sql = "CREATE FUNCTION audit_options() RETURNS trigger LANGUAGE plpgsql TRANSFORM FOR TYPE jsonb, public.hstore SET search_path TO public;", .mutation = .stale_setting_count },
+        .{ .sql = "CREATE FUNCTION audit_options() RETURNS trigger LANGUAGE plpgsql TRANSFORM FOR TYPE jsonb, public.hstore SET search_path TO public;", .mutation = .corrupt_setting_item },
+        .{ .sql = "CREATE FUNCTION audit_perform_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN PERFORM audit_log(); RETURN NEW; END$$;", .mutation = .missing_body },
+        .{ .sql = "CREATE FUNCTION audit_sql_body() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;", .mutation = .corrupt_body_kind },
+        .{ .sql = "CREATE FUNCTION audit_sql_body() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;", .mutation = .corrupt_body_expression },
+        .{ .sql = "CREATE FUNCTION audit_perform_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN PERFORM audit_log(); RETURN NEW; END$$;", .mutation = .corrupt_body_hook },
+        .{ .sql = "CREATE PROCEDURE rotate_usage_perform() LANGUAGE plpgsql AS $$BEGIN PERFORM rotate_usage_now(); END$$;", .mutation = .stale_body_perform_count },
+        .{ .sql = "DROP FUNCTION IF EXISTS generated_audit(text) CASCADE;", .mutation = .stale_drop_signature },
+        .{ .sql = "DROP FUNCTION IF EXISTS generated_audit(text) CASCADE;", .mutation = .corrupt_drop_arg },
+        .{ .sql = "DROP PROCEDURE IF EXISTS generated_rotate(text) CASCADE;", .mutation = .stale_drop_cascade },
+    };
+    for (routine_metadata_cases) |case| {
+        try expectGeneratedRoutineMetadataMutationFails(alloc, case.sql, case.mutation);
+    }
 
-    var malformed_create_routine_tail = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE PROCEDURE generated_rotate() LANGUAGE plpgsql;",
-    );
-    defer malformed_create_routine_tail.deinit(alloc);
-    if (malformed_create_routine_tail.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_procedure, ddl.kind);
-                    ddl.alter_table_operation_tokens = .{ .start = 2, .end = malformed_create_routine_tail.items().len - 1 };
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_create_routine_tail));
-
-    var malformed_create_routine_args = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE FUNCTION normalize_status(input text) RETURNS text LANGUAGE sql;",
-    );
-    defer malformed_create_routine_args.deinit(alloc);
-    if (malformed_create_routine_args.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| (ddl.routine_metadata orelse return error.TestUnexpectedResult).argument_items.items[0].start += 1,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_create_routine_args));
-
-    var malformed_create_routine_returns = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE FUNCTION normalize_status(input text) RETURNS text LANGUAGE sql;",
-    );
-    defer malformed_create_routine_returns.deinit(alloc);
-    if (malformed_create_routine_returns.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| (ddl.routine_metadata orelse return error.TestUnexpectedResult).returns_type_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_create_routine_returns));
-
-    var malformed_create_routine_metadata = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE FUNCTION normalize_status(input text) RETURNS text LANGUAGE sql;",
-    );
-    defer malformed_create_routine_metadata.deinit(alloc);
-    if (malformed_create_routine_metadata.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    const routine_metadata = ddl.routine_metadata orelse return error.TestUnexpectedResult;
-                    routine_metadata.deinit(alloc);
-                    alloc.destroy(routine_metadata);
-                    ddl.routine_metadata = null;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_create_routine_metadata));
-
-    var malformed_create_routine_missing_name = try tokenized.ParsedSql.initAlloc(
+    try expectGeneratedDdlLogicalObjectNameMissingFails(
         alloc,
         "CREATE FUNCTION audit_options() RETURNS trigger LANGUAGE plpgsql STABLE SECURITY DEFINER CALLED ON NULL INPUT COST 10 ROWS 10 PARALLEL SAFE LEAKPROOF WINDOW SUPPORT audit_support;",
     );
-    defer malformed_create_routine_missing_name.deinit(alloc);
-    if (malformed_create_routine_missing_name.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.object_name_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_create_routine_missing_name));
-
-    var malformed_create_routine_null_input = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE FUNCTION audit_options() RETURNS trigger LANGUAGE plpgsql STABLE SECURITY DEFINER CALLED ON NULL INPUT COST 10 ROWS 10 PARALLEL SAFE LEAKPROOF WINDOW SUPPORT audit_support;",
-    );
-    defer malformed_create_routine_null_input.deinit(alloc);
-    if (malformed_create_routine_null_input.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| (ddl.routine_metadata orelse return error.TestUnexpectedResult).null_input_tokens = .{ .start = 1, .end = 2 },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_create_routine_null_input));
-
-    var malformed_create_routine_transforms = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE FUNCTION audit_options() RETURNS trigger LANGUAGE plpgsql TRANSFORM FOR TYPE jsonb, public.hstore SET search_path TO public;",
-    );
-    defer malformed_create_routine_transforms.deinit(alloc);
-    if (malformed_create_routine_transforms.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    const routine_metadata = ddl.routine_metadata orelse return error.TestUnexpectedResult;
-                    try std.testing.expectEqual(@as(usize, 2), routine_metadata.transform_type_items.count);
-                    routine_metadata.transform_type_items.count += 1;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_create_routine_transforms));
-
-    var corrupt_create_routine_transform_item = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE FUNCTION audit_options() RETURNS trigger LANGUAGE plpgsql TRANSFORM FOR TYPE jsonb, public.hstore SET search_path TO public;",
-    );
-    defer corrupt_create_routine_transform_item.deinit(alloc);
-    if (corrupt_create_routine_transform_item.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    const routine_metadata = ddl.routine_metadata orelse return error.TestUnexpectedResult;
-                    try std.testing.expectEqual(@as(usize, 2), routine_metadata.transform_type_items.count);
-                    routine_metadata.transform_type_items.items[1].start += 1;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &corrupt_create_routine_transform_item));
-
-    var malformed_create_routine_settings = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE FUNCTION audit_options() RETURNS trigger LANGUAGE plpgsql TRANSFORM FOR TYPE jsonb, public.hstore SET search_path TO public;",
-    );
-    defer malformed_create_routine_settings.deinit(alloc);
-    if (malformed_create_routine_settings.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    const routine_metadata = ddl.routine_metadata orelse return error.TestUnexpectedResult;
-                    try std.testing.expectEqual(@as(usize, 1), routine_metadata.setting_items.count);
-                    routine_metadata.setting_items.count += 1;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_create_routine_settings));
-
-    var corrupt_create_routine_setting_item = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE FUNCTION audit_options() RETURNS trigger LANGUAGE plpgsql TRANSFORM FOR TYPE jsonb, public.hstore SET search_path TO public;",
-    );
-    defer corrupt_create_routine_setting_item.deinit(alloc);
-    if (corrupt_create_routine_setting_item.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    const routine_metadata = ddl.routine_metadata orelse return error.TestUnexpectedResult;
-                    try std.testing.expectEqual(@as(usize, 1), routine_metadata.setting_items.count);
-                    routine_metadata.setting_items.items[0].start += 1;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &corrupt_create_routine_setting_item));
-
-    var malformed_create_routine_body = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE FUNCTION audit_perform_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN PERFORM audit_log(); RETURN NEW; END$$;",
-    );
-    defer malformed_create_routine_body.deinit(alloc);
-    if (malformed_create_routine_body.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| (ddl.routine_metadata orelse return error.TestUnexpectedResult).body_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_create_routine_body));
-
-    var corrupt_create_routine_body_kind = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE FUNCTION audit_sql_body() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;",
-    );
-    defer corrupt_create_routine_body_kind.deinit(alloc);
-    if (corrupt_create_routine_body_kind.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    const routine_metadata = ddl.routine_metadata orelse return error.TestUnexpectedResult;
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlRoutineBodyKind.sql_expression, routine_metadata.body_kind.?);
-                    routine_metadata.body_kind = .plpgsql_procedure;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &corrupt_create_routine_body_kind));
-
-    var corrupt_create_routine_body_expression = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE FUNCTION audit_sql_body() RETURNS integer LANGUAGE sql AS $$SELECT 1$$;",
-    );
-    defer corrupt_create_routine_body_expression.deinit(alloc);
-    if (corrupt_create_routine_body_expression.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    const routine_metadata = ddl.routine_metadata orelse return error.TestUnexpectedResult;
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 0, .end = 1 }, routine_metadata.body_expression.tokens.?);
-                    routine_metadata.body_expression.tokens = .{ .start = 0, .end = 0 };
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &corrupt_create_routine_body_expression));
-
-    var corrupt_create_routine_body_hook = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE FUNCTION audit_perform_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN PERFORM audit_log(); RETURN NEW; END$$;",
-    );
-    defer corrupt_create_routine_body_hook.deinit(alloc);
-    if (corrupt_create_routine_body_hook.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    const routine_metadata = ddl.routine_metadata orelse return error.TestUnexpectedResult;
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlRoutineExecutionHook.trigger_return_new, routine_metadata.body_hook.?);
-                    routine_metadata.body_hook = .trigger_return_old;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &corrupt_create_routine_body_hook));
-
-    var corrupt_create_routine_body_perform_count = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE PROCEDURE rotate_usage_perform() LANGUAGE plpgsql AS $$BEGIN PERFORM rotate_usage_now(); END$$;",
-    );
-    defer corrupt_create_routine_body_perform_count.deinit(alloc);
-    if (corrupt_create_routine_body_perform_count.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    const routine_metadata = ddl.routine_metadata orelse return error.TestUnexpectedResult;
-                    try std.testing.expectEqual(@as(usize, 1), routine_metadata.body_perform_call_count);
-                    routine_metadata.body_perform_call_count += 1;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &corrupt_create_routine_body_perform_count));
-
-    var missing_logical_routine_parallel = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE FUNCTION audit_options() RETURNS trigger LANGUAGE plpgsql STABLE SECURITY DEFINER CALLED ON NULL INPUT COST 10 ROWS 10 PARALLEL SAFE LEAKPROOF WINDOW SUPPORT audit_support;",
-    );
-    defer missing_logical_routine_parallel.deinit(alloc);
-    if (missing_logical_routine_parallel.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    ddl.object_name_tokens = null;
-                    var logical_state = parser_context.ParserState{
-                        .alloc = alloc,
-                        .tokens = missing_logical_routine_parallel.items(),
-                    };
-                    const options = DdlPlanParserOptions{
-                        .schema = logical_state.schema,
-                        .field_expression_qualifiers = logical_state.field_expression_qualifiers,
-                        .returning_expression_qualifiers = logical_state.returning_expression_qualifiers,
-                        .defer_row_expression_field_validation = logical_state.defer_row_expression_field_validation,
-                        .column_definition_options = parser_context.ParserState.ContextAccessors.ddlColumnDefinitionOptions(&logical_state),
-                        .domain_options = parser_context.ParserState.ContextAccessors.ddlDomainOptions(&logical_state),
-                        .create_index_options = parser_context.ParserState.ContextAccessors.createIndexOptions(&logical_state),
-                        .row_security_policy_options = parser_context.ParserState.ContextAccessors.rowSecurityPolicyOptions(&logical_state),
-                    };
-                    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanFromGeneratedAstAlloc(alloc, missing_logical_routine_parallel.items(), ddl.*, options));
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-
-    var malformed_drop_routine_signature = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "DROP FUNCTION IF EXISTS generated_audit(text) CASCADE;",
-    );
-    defer malformed_drop_routine_signature.deinit(alloc);
-    if (malformed_drop_routine_signature.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.drop_function, ddl.kind);
-                    ddl.alter_table_operation_tokens = .{ .start = 4, .end = malformed_drop_routine_signature.items().len - 1 };
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_drop_routine_signature));
-
-    var malformed_drop_routine_args = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "DROP FUNCTION IF EXISTS generated_audit(text) CASCADE;",
-    );
-    defer malformed_drop_routine_args.deinit(alloc);
-    if (malformed_drop_routine_args.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| (ddl.routine_metadata orelse return error.TestUnexpectedResult).argument_items.items[0].start += 1,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_drop_routine_args));
-
-    var malformed_drop_routine_cascade = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "DROP PROCEDURE IF EXISTS generated_rotate(text) CASCADE;",
-    );
-    defer malformed_drop_routine_cascade.deinit(alloc);
-    if (malformed_drop_routine_cascade.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.drop_procedure, ddl.kind);
-                    try std.testing.expect(ddl.cascade);
-                    ddl.cascade = false;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_drop_routine_cascade));
 
     try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanForTestAlloc(alloc, "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql SUPPORT audit_support SUPPORT audit_support;"));
     var create_procedure_arg = try runtimeDdlPlanForTestAlloc(alloc, "CREATE PROCEDURE rotate_usage_perform_arg() LANGUAGE plpgsql AS $$BEGIN PERFORM rotate_usage_now(1); END$$;");
@@ -27870,6 +28291,63 @@ test "sql adapter ddl plan lowers routine catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
     try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanForTestAlloc(alloc, "CALL rotate_usage(1);"));
+}
+
+const GeneratedRoleMetadataMutation = enum {
+    corrupt_create_name,
+    stale_alter_tail,
+    missing_alter_database,
+    missing_setting_name,
+    missing_setting_value,
+    stale_drop_if_exists,
+    stale_drop_tail,
+};
+
+fn applyGeneratedRoleMetadataMutation(
+    parsed_len: usize,
+    ddl: *generated_parser.GeneratedSqlDdlAst,
+    mutation: GeneratedRoleMetadataMutation,
+) !void {
+    switch (mutation) {
+        .corrupt_create_name => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_role, ddl.kind);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl.object_name_tokens.?);
+            ddl.object_name_tokens = .{ .start = 1, .end = 2 };
+        },
+        .stale_alter_tail => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_role, ddl.kind);
+            ddl.alter_table_operation_tokens = .{ .start = 2, .end = parsed_len - 1 };
+        },
+        .missing_alter_database => ddl.role_database_name_tokens = null,
+        .missing_setting_name => ddl.setting_name_tokens = null,
+        .missing_setting_value => ddl.setting_value_tokens = null,
+        .stale_drop_if_exists => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.drop_role, ddl.kind);
+            try std.testing.expect(ddl.if_exists);
+            ddl.if_exists = false;
+        },
+        .stale_drop_tail => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.drop_role, ddl.kind);
+            try std.testing.expect(ddl.alter_table_operation_tokens == null);
+            ddl.alter_table_operation_tokens = .{ .start = 2, .end = parsed_len - 1 };
+        },
+    }
+}
+
+fn expectGeneratedRoleMetadataMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedRoleMetadataMutation,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .ddl => |*ddl| try applyGeneratedRoleMetadataMutation(parsed.items().len, ddl, mutation),
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
 }
 
 test "sql adapter ddl plan lowers authorization catalog ddl plans" {
@@ -28057,125 +28535,83 @@ test "sql adapter ddl plan lowers authorization catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var malformed_create_role_name = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE ROLE generated_app_writer;",
-    );
-    defer malformed_create_role_name.deinit(alloc);
-    if (malformed_create_role_name.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_role, ddl.kind);
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl.object_name_tokens.?);
-                    ddl.object_name_tokens = .{ .start = 1, .end = 2 };
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_create_role_name));
+    const role_metadata_cases = [_]struct {
+        sql: []const u8,
+        mutation: GeneratedRoleMetadataMutation,
+    }{
+        .{ .sql = "CREATE ROLE generated_app_writer;", .mutation = .corrupt_create_name },
+        .{ .sql = "ALTER ROLE generated_app_writer RESET statement_timeout;", .mutation = .stale_alter_tail },
+        .{ .sql = "ALTER ROLE generated_app_writer IN DATABASE appdb SET app.tenant_id = current_setting('app.tenant_id');", .mutation = .missing_alter_database },
+        .{ .sql = "ALTER ROLE generated_app_writer RESET statement_timeout;", .mutation = .missing_setting_name },
+        .{ .sql = "ALTER ROLE generated_app_writer SET app.tenant_id = 'acme';", .mutation = .missing_setting_value },
+        .{ .sql = "DROP ROLE IF EXISTS generated_app_writer;", .mutation = .stale_drop_if_exists },
+        .{ .sql = "DROP ROLE generated_app_writer;", .mutation = .stale_drop_tail },
+    };
+    for (role_metadata_cases) |case| {
+        try expectGeneratedRoleMetadataMutationFails(alloc, case.sql, case.mutation);
+    }
+}
 
-    var malformed_alter_role_tail = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "ALTER ROLE generated_app_writer RESET statement_timeout;",
-    );
-    defer malformed_alter_role_tail.deinit(alloc);
-    if (malformed_alter_role_tail.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_role, ddl.kind);
-                    ddl.alter_table_operation_tokens = .{ .start = 2, .end = malformed_alter_role_tail.items().len - 1 };
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_alter_role_tail));
+const GeneratedPartitionMetadataMutation = enum {
+    missing_method,
+    corrupt_key_range,
+    corrupt_key_name,
+    missing_parent,
+    corrupt_create_lower_bound,
+    stale_attach_action,
+    corrupt_attach_lower_bound,
+    corrupt_detach_name,
+};
 
-    var missing_alter_role_database = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "ALTER ROLE generated_app_writer IN DATABASE appdb SET app.tenant_id = current_setting('app.tenant_id');",
-    );
-    defer missing_alter_role_database.deinit(alloc);
-    if (missing_alter_role_database.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.role_database_name_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_alter_role_database));
+fn applyGeneratedPartitionMetadataMutation(
+    ddl: *generated_parser.GeneratedSqlDdlAst,
+    mutation: GeneratedPartitionMetadataMutation,
+) !void {
+    switch (mutation) {
+        .missing_method => ddl.create_table_partition_method_tokens = null,
+        .corrupt_key_range => {
+            if (ddl.create_table_partition_key_items.items.len == 0) return error.TestUnexpectedResult;
+            ddl.create_table_partition_key_items.items[0] = .{ .start = 23, .end = 24 };
+        },
+        .corrupt_key_name => {
+            if (ddl.create_table_partition_key_name_items.len == 0) return error.TestUnexpectedResult;
+            ddl.create_table_partition_key_name_items[0].start -= 1;
+        },
+        .missing_parent => ddl.create_table_partition_of_parent_tokens = null,
+        .corrupt_create_lower_bound => ddl.create_table_partition_lower_bound_tokens = .{ .start = 14, .end = 15 },
+        .stale_attach_action => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlAlterTablePartitionAction.attach, ddl.alter_table_partition_action);
+            ddl.alter_table_partition_action = .detach;
+        },
+        .corrupt_attach_lower_bound => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 10, .end = 11 }, ddl.alter_table_partition_lower_bound_tokens.?);
+            ddl.alter_table_partition_lower_bound_tokens = .{ .start = 14, .end = 15 };
+        },
+        .corrupt_detach_name => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 6 }, ddl.alter_table_partition_name_tokens.?);
+            ddl.alter_table_partition_name_tokens = .{ .start = 4, .end = 6 };
+        },
+    }
+}
 
-    var missing_alter_role_setting = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "ALTER ROLE generated_app_writer RESET statement_timeout;",
-    );
-    defer missing_alter_role_setting.deinit(alloc);
-    if (missing_alter_role_setting.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.setting_name_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
+fn expectGeneratedPartitionMetadataMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedPartitionMetadataMutation,
+    expect_logical_failure: bool,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .ddl => |*ddl| try applyGeneratedPartitionMetadataMutation(ddl, mutation),
+            else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_alter_role_setting));
-
-    var missing_alter_role_value = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "ALTER ROLE generated_app_writer SET app.tenant_id = 'acme';",
-    );
-    defer missing_alter_role_value.deinit(alloc);
-    if (missing_alter_role_value.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.setting_value_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_alter_role_value));
-
-    var malformed_drop_role_if_exists = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "DROP ROLE IF EXISTS generated_app_writer;",
-    );
-    defer malformed_drop_role_if_exists.deinit(alloc);
-    if (malformed_drop_role_if_exists.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.drop_role, ddl.kind);
-                    try std.testing.expect(ddl.if_exists);
-                    ddl.if_exists = false;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_drop_role_if_exists));
-
-    var malformed_drop_role_tail = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "DROP ROLE generated_app_writer;",
-    );
-    defer malformed_drop_role_tail.deinit(alloc);
-    if (malformed_drop_role_tail.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.drop_role, ddl.kind);
-                    try std.testing.expect(ddl.alter_table_operation_tokens == null);
-                    ddl.alter_table_operation_tokens = .{ .start = 2, .end = malformed_drop_role_tail.items().len - 1 };
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_drop_role_tail));
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
+    if (expect_logical_failure) {
+        try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed, .{}));
+    }
 }
 
 test "sql adapter ddl plan lowers partition and row security catalog ddl plans" {
@@ -28196,48 +28632,6 @@ test "sql adapter ddl plan lowers partition and row security catalog ddl plans" 
         else => return error.TestUnexpectedResult,
     }
 
-    var missing_partition_method = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE usage_events (tenant_id text, id uuid, created_at timestamptz, PRIMARY KEY (tenant_id, id)) PARTITION BY RANGE (created_at);");
-    defer missing_partition_method.deinit(alloc);
-    if (missing_partition_method.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.create_table_partition_method_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_partition_method));
-
-    var corrupt_partition_key = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE usage_events (tenant_id text, id uuid, created_at timestamptz, PRIMARY KEY (tenant_id, id)) PARTITION BY RANGE (created_at);");
-    defer corrupt_partition_key.deinit(alloc);
-    if (corrupt_partition_key.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    if (ddl.create_table_partition_key_items.items.len == 0) return error.TestUnexpectedResult;
-                    ddl.create_table_partition_key_items.items[0] = .{ .start = 23, .end = 24 };
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &corrupt_partition_key));
-
-    var corrupt_partition_key_name = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE usage_events (tenant_id text, id uuid, created_at timestamptz, PRIMARY KEY (tenant_id, id)) PARTITION BY RANGE (created_at);");
-    defer corrupt_partition_key_name.deinit(alloc);
-    if (corrupt_partition_key_name.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    if (ddl.create_table_partition_key_name_items.len == 0) return error.TestUnexpectedResult;
-                    ddl.create_table_partition_key_name_items[0].start -= 1;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &corrupt_partition_key_name));
-
     var create_table_partition = try runtimeDdlPlanForTestAlloc(alloc, "CREATE TABLE usage_events_2026 PARTITION OF usage_events FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');");
     defer create_table_partition.deinit(alloc);
     switch (create_table_partition) {
@@ -28252,30 +28646,6 @@ test "sql adapter ddl plan lowers partition and row security catalog ddl plans" 
         },
         else => return error.TestUnexpectedResult,
     }
-
-    var missing_partition_parent = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE usage_events_2026 PARTITION OF usage_events FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');");
-    defer missing_partition_parent.deinit(alloc);
-    if (missing_partition_parent.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.create_table_partition_of_parent_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_partition_parent));
-
-    var corrupt_partition_lower_bound = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE usage_events_2026 PARTITION OF usage_events FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');");
-    defer corrupt_partition_lower_bound.deinit(alloc);
-    if (corrupt_partition_lower_bound.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.create_table_partition_lower_bound_tokens = .{ .start = 14, .end = 15 },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &corrupt_partition_lower_bound));
 
     var attach_partition = try runtimeDdlPlanForTestAlloc(alloc, "ALTER TABLE usage_events ATTACH PARTITION usage_events_2026 FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');");
     defer attach_partition.deinit(alloc);
@@ -28292,38 +28662,6 @@ test "sql adapter ddl plan lowers partition and row security catalog ddl plans" 
         else => return error.TestUnexpectedResult,
     }
 
-    var corrupt_attach_partition_action = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE usage_events ATTACH PARTITION usage_events_2026 FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');");
-    defer corrupt_attach_partition_action.deinit(alloc);
-    if (corrupt_attach_partition_action.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlAlterTablePartitionAction.attach, ddl.alter_table_partition_action);
-                    ddl.alter_table_partition_action = .detach;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &corrupt_attach_partition_action));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &corrupt_attach_partition_action, .{}));
-
-    var corrupt_attach_partition_lower_bound = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE usage_events ATTACH PARTITION usage_events_2026 FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');");
-    defer corrupt_attach_partition_lower_bound.deinit(alloc);
-    if (corrupt_attach_partition_lower_bound.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 10, .end = 11 }, ddl.alter_table_partition_lower_bound_tokens.?);
-                    ddl.alter_table_partition_lower_bound_tokens = .{ .start = 14, .end = 15 };
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &corrupt_attach_partition_lower_bound));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &corrupt_attach_partition_lower_bound, .{}));
-
     var detach_partition = try runtimeDdlPlanForTestAlloc(alloc, "ALTER TABLE usage_events DETACH PARTITION usage_events_2026;");
     defer detach_partition.deinit(alloc);
     switch (detach_partition) {
@@ -28337,21 +28675,26 @@ test "sql adapter ddl plan lowers partition and row security catalog ddl plans" 
         else => return error.TestUnexpectedResult,
     }
 
-    var corrupt_detach_partition_name = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE usage_events DETACH PARTITION usage_events_2026;");
-    defer corrupt_detach_partition_name.deinit(alloc);
-    if (corrupt_detach_partition_name.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 6 }, ddl.alter_table_partition_name_tokens.?);
-                    ddl.alter_table_partition_name_tokens = .{ .start = 4, .end = 6 };
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &corrupt_detach_partition_name));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &corrupt_detach_partition_name, .{}));
+    const partitioned_table_sql = "CREATE TABLE usage_events (tenant_id text, id uuid, created_at timestamptz, PRIMARY KEY (tenant_id, id)) PARTITION BY RANGE (created_at);";
+    const create_partition_sql = "CREATE TABLE usage_events_2026 PARTITION OF usage_events FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');";
+    const attach_partition_sql = "ALTER TABLE usage_events ATTACH PARTITION usage_events_2026 FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');";
+    const partition_metadata_cases = [_]struct {
+        sql: []const u8,
+        mutation: GeneratedPartitionMetadataMutation,
+        expect_logical_failure: bool = false,
+    }{
+        .{ .sql = partitioned_table_sql, .mutation = .missing_method },
+        .{ .sql = partitioned_table_sql, .mutation = .corrupt_key_range },
+        .{ .sql = partitioned_table_sql, .mutation = .corrupt_key_name },
+        .{ .sql = create_partition_sql, .mutation = .missing_parent },
+        .{ .sql = create_partition_sql, .mutation = .corrupt_create_lower_bound },
+        .{ .sql = attach_partition_sql, .mutation = .stale_attach_action, .expect_logical_failure = true },
+        .{ .sql = attach_partition_sql, .mutation = .corrupt_attach_lower_bound, .expect_logical_failure = true },
+        .{ .sql = "ALTER TABLE usage_events DETACH PARTITION usage_events_2026;", .mutation = .corrupt_detach_name, .expect_logical_failure = true },
+    };
+    for (partition_metadata_cases) |case| {
+        try expectGeneratedPartitionMetadataMutationFails(alloc, case.sql, case.mutation, case.expect_logical_failure);
+    }
 
     var enable_row_security = try runtimeDdlPlanForTestAlloc(alloc, "ALTER TABLE usage_records ENABLE ROW LEVEL SECURITY;");
     defer enable_row_security.deinit(alloc);
@@ -28439,6 +28782,46 @@ test "sql adapter ddl plan lowers partition and row security catalog ddl plans" 
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+const GeneratedTablespaceMetadataMutation = enum {
+    stale_alter_tail,
+    corrupt_create_name,
+    missing_create_location,
+    corrupt_create_location,
+    missing_rename_target,
+    stale_drop_if_exists,
+};
+
+fn applyGeneratedTablespaceMetadataMutation(
+    parsed_len: usize,
+    ddl: *generated_parser.GeneratedSqlDdlAst,
+    mutation: GeneratedTablespaceMetadataMutation,
+) void {
+    switch (mutation) {
+        .stale_alter_tail => ddl.alter_table_operation_tokens = .{ .start = 2, .end = parsed_len },
+        .corrupt_create_name => ddl.object_name_tokens = .{ .start = 3, .end = 4 },
+        .missing_create_location => ddl.tablespace_location_tokens = null,
+        .corrupt_create_location => ddl.tablespace_location_tokens = .{ .start = 3, .end = 4 },
+        .missing_rename_target => ddl.rename_target_tokens = null,
+        .stale_drop_if_exists => ddl.if_exists = false,
+    }
+}
+
+fn expectGeneratedTablespaceMetadataMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedTablespaceMetadataMutation,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .ddl => |*ddl| applyGeneratedTablespaceMetadataMutation(parsed.items().len, ddl, mutation),
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
 }
 
 test "sql adapter ddl plan lowers namespace database and tablespace catalog ddl plans" {
@@ -28565,77 +28948,151 @@ test "sql adapter ddl plan lowers namespace database and tablespace catalog ddl 
         else => return error.TestUnexpectedResult,
     }
 
-    var malformed_generated_tablespace = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLESPACE fastspace RENAME TO fastspace_archive;");
-    defer malformed_generated_tablespace.deinit(alloc);
-    if (malformed_generated_tablespace.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.alter_table_operation_tokens = .{ .start = 2, .end = malformed_generated_tablespace.items().len },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_generated_tablespace));
+    const create_tablespace_sql = "CREATE TABLESPACE fastspace LOCATION '/var/lib/antfly/fastspace';";
+    const alter_tablespace_sql = "ALTER TABLESPACE fastspace RENAME TO fastspace_archive;";
+    const tablespace_metadata_cases = [_]struct {
+        sql: []const u8,
+        mutation: GeneratedTablespaceMetadataMutation,
+    }{
+        .{ .sql = alter_tablespace_sql, .mutation = .stale_alter_tail },
+        .{ .sql = create_tablespace_sql, .mutation = .corrupt_create_name },
+        .{ .sql = create_tablespace_sql, .mutation = .missing_create_location },
+        .{ .sql = create_tablespace_sql, .mutation = .corrupt_create_location },
+        .{ .sql = alter_tablespace_sql, .mutation = .missing_rename_target },
+        .{ .sql = "DROP TABLESPACE IF EXISTS fastspace_archive;", .mutation = .stale_drop_if_exists },
+    };
+    for (tablespace_metadata_cases) |case| {
+        try expectGeneratedTablespaceMetadataMutationFails(alloc, case.sql, case.mutation);
+    }
+}
 
-    var malformed_generated_create_tablespace_name = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLESPACE fastspace LOCATION '/var/lib/antfly/fastspace';");
-    defer malformed_generated_create_tablespace_name.deinit(alloc);
-    if (malformed_generated_create_tablespace_name.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.object_name_tokens = .{ .start = 3, .end = 4 },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_generated_create_tablespace_name));
+const GeneratedPublicationMetadataMutation = enum {
+    malformed_operation,
+    missing_name,
+    missing_tables,
+    stale_options,
+    missing_rename_target,
+    missing_owner,
+    stale_drop_if_exists,
+    stale_table_count,
+};
 
-    var malformed_generated_create_tablespace_location = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLESPACE fastspace LOCATION '/var/lib/antfly/fastspace';");
-    defer malformed_generated_create_tablespace_location.deinit(alloc);
-    if (malformed_generated_create_tablespace_location.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.tablespace_location_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_generated_create_tablespace_location));
+fn applyGeneratedPublicationMetadataMutation(
+    alloc: std.mem.Allocator,
+    parsed: *tokenized.ParsedSql,
+    ddl: *generated_parser.GeneratedSqlDdlAst,
+    mutation: GeneratedPublicationMetadataMutation,
+) !void {
+    switch (mutation) {
+        .malformed_operation => ddl.alter_table_operation_tokens = .{ .start = 2, .end = parsed.items().len },
+        .missing_name => ddl.object_name_tokens = null,
+        .missing_tables => {
+            ddl.publication_table_items.deinit(alloc);
+            ddl.publication_table_items = .{};
+        },
+        .stale_options => {
+            if (ddl.publication_option_items.count != 2) return error.TestUnexpectedResult;
+            ddl.publication_option_items.items[1] = ddl.publication_option_items.items[0];
+        },
+        .missing_rename_target => ddl.rename_target_tokens = null,
+        .missing_owner => ddl.privilege_principal_tokens = null,
+        .stale_drop_if_exists => ddl.if_exists = false,
+        .stale_table_count => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_publication, ddl.kind);
+            try std.testing.expect(ddl.publication_table_items.count != 0);
+            ddl.publication_table_items.count = 0;
+        },
+    }
+}
 
-    var corrupt_generated_create_tablespace_location = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLESPACE fastspace LOCATION '/var/lib/antfly/fastspace';");
-    defer corrupt_generated_create_tablespace_location.deinit(alloc);
-    if (corrupt_generated_create_tablespace_location.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.tablespace_location_tokens = .{ .start = 3, .end = 4 },
-                else => return error.TestUnexpectedResult,
-            }
+fn expectGeneratedPublicationMetadataMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedPublicationMetadataMutation,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .ddl => |*ddl| try applyGeneratedPublicationMetadataMutation(alloc, &parsed, ddl, mutation),
+            else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &corrupt_generated_create_tablespace_location));
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
+}
 
-    var malformed_generated_tablespace_target = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLESPACE fastspace RENAME TO fastspace_archive;");
-    defer malformed_generated_tablespace_target.deinit(alloc);
-    if (malformed_generated_tablespace_target.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.rename_target_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
+fn expectGeneratedPublicationMetadataMutationFailsAtPublicBoundaries(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedPublicationMetadataMutation,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .ddl => |*ddl| try applyGeneratedPublicationMetadataMutation(alloc, &parsed, ddl, mutation),
+            else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_generated_tablespace_target));
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed, .{}));
+}
 
-    var malformed_generated_drop_tablespace_exists = try tokenized.ParsedSql.initAlloc(alloc, "DROP TABLESPACE IF EXISTS fastspace_archive;");
-    defer malformed_generated_drop_tablespace_exists.deinit(alloc);
-    if (malformed_generated_drop_tablespace_exists.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.if_exists = false,
-                else => return error.TestUnexpectedResult,
-            }
+const GeneratedSubscriptionMetadataMutation = enum {
+    missing_connection,
+    missing_name,
+    stale_bool_option,
+    stale_json_option,
+    malformed_name,
+    missing_enabled,
+    missing_rename_target,
+    missing_owner,
+    missing_publications,
+    malformed_drop_name,
+};
+
+fn applyGeneratedSubscriptionMetadataMutation(
+    alloc: std.mem.Allocator,
+    ddl: *generated_parser.GeneratedSqlDdlAst,
+    mutation: GeneratedSubscriptionMetadataMutation,
+) !void {
+    switch (mutation) {
+        .missing_connection => ddl.subscription_connection_value_tokens = null,
+        .missing_name => ddl.object_name_tokens = null,
+        .stale_bool_option => {
+            if (ddl.subscription_option_items.count != 14) return error.TestUnexpectedResult;
+            ddl.subscription_option_items.items[9] = ddl.subscription_option_items.items[1];
+        },
+        .stale_json_option => {
+            if (ddl.subscription_option_items.count != 14) return error.TestUnexpectedResult;
+            ddl.subscription_option_items.items[12] = ddl.subscription_option_items.items[13];
+        },
+        .malformed_name => ddl.object_name_tokens = .{ .start = 3, .end = 4 },
+        .missing_enabled => ddl.subscription_enabled = null,
+        .missing_rename_target => ddl.rename_target_tokens = null,
+        .missing_owner => ddl.privilege_principal_tokens = null,
+        .missing_publications => {
+            ddl.subscription_publication_items.deinit(alloc);
+            ddl.subscription_publication_items = .{};
+        },
+        .malformed_drop_name => ddl.object_name_tokens = .{ .start = 2, .end = 3 },
+    }
+}
+
+fn expectGeneratedSubscriptionMetadataMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedSubscriptionMetadataMutation,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .ddl => |*ddl| try applyGeneratedSubscriptionMetadataMutation(alloc, ddl, mutation),
+            else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_generated_drop_tablespace_exists));
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
 }
 
 test "sql adapter ddl plan lowers notification and logical replication catalog ddl plans" {
@@ -29068,432 +29525,111 @@ test "sql adapter ddl plan lowers notification and logical replication catalog d
         else => return error.TestUnexpectedResult,
     }
 
-    var malformed_publication = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE PUBLICATION usage_pub FOR TABLE usage_records;",
-    );
-    defer malformed_publication.deinit(alloc);
-    if (malformed_publication.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.alter_table_operation_tokens = .{ .start = 2, .end = malformed_publication.items().len },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_publication));
+    const create_publication_table_sql = "CREATE PUBLICATION usage_pub FOR TABLE usage_records;";
+    const create_publication_filtered_table_sql = "CREATE PUBLICATION usage_pub FOR TABLE usage_records (id, status) WHERE (status = 'open');";
+    const create_publication_options_sql = "CREATE PUBLICATION usage_pub FOR TABLE usage_records WITH (publish = 'insert, update', publish_via_partition_root = true);";
+    const alter_publication_tables_sql = "ALTER PUBLICATION usage_pub DROP TABLE usage_events;";
+    const alter_publication_options_sql = "ALTER PUBLICATION usage_pub SET (publish = 'insert, update', publish_via_partition_root = false);";
+    const publication_metadata_cases = [_]struct {
+        sql: []const u8,
+        mutation: GeneratedPublicationMetadataMutation,
+    }{
+        .{ .sql = create_publication_table_sql, .mutation = .malformed_operation },
+        .{ .sql = create_publication_table_sql, .mutation = .missing_name },
+        .{ .sql = create_publication_filtered_table_sql, .mutation = .missing_tables },
+        .{ .sql = "CREATE PUBLICATION usage_pub FOR TABLE usage_records WITH (publish = 'insert, update');", .mutation = .missing_name },
+        .{ .sql = create_publication_options_sql, .mutation = .stale_options },
+        .{ .sql = alter_publication_tables_sql, .mutation = .missing_tables },
+        .{ .sql = alter_publication_options_sql, .mutation = .missing_name },
+        .{ .sql = "ALTER PUBLICATION usage_pub RENAME TO usage_pub_archive;", .mutation = .missing_rename_target },
+        .{ .sql = "ALTER PUBLICATION usage_pub OWNER TO app_role;", .mutation = .missing_owner },
+        .{ .sql = "DROP PUBLICATION IF EXISTS usage_pub;", .mutation = .stale_drop_if_exists },
+    };
+    for (publication_metadata_cases) |case| {
+        try expectGeneratedPublicationMetadataMutationFails(alloc, case.sql, case.mutation);
+    }
 
-    var malformed_publication_name = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE PUBLICATION usage_pub FOR TABLE usage_records;",
-    );
-    defer malformed_publication_name.deinit(alloc);
-    if (malformed_publication_name.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.object_name_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_publication_name));
+    try expectGeneratedDdlLogicalObjectNameMissingFails(alloc, alter_publication_options_sql);
 
-    var missing_publication_tables = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE PUBLICATION usage_pub FOR TABLE usage_records (id, status) WHERE (status = 'open');",
-    );
-    defer missing_publication_tables.deinit(alloc);
-    if (missing_publication_tables.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    ddl.publication_table_items.deinit(alloc);
-                    ddl.publication_table_items = .{};
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_publication_tables));
+    const create_subscription_sql = "CREATE SUBSCRIPTION usage_sub CONNECTION 'host=localhost dbname=usage' PUBLICATION usage_pub;";
+    const create_subscription_options_sql = "CREATE SUBSCRIPTION usage_sub CONNECTION 'host=localhost dbname=usage' PUBLICATION usage_pub WITH (copy_data = false, connect = false, binary = true, create_slot = false, enabled = false, two_phase = false, disable_on_error = false, synchronous_commit = 'remote_write', streaming = 'parallel', password_required = false, run_as_owner = true, failover = true, origin = 'none', slot_name = 'usage_slot');";
+    const alter_subscription_connection_sql = "ALTER SUBSCRIPTION usage_sub CONNECTION 'host=replica';";
+    const subscription_metadata_cases = [_]struct {
+        sql: []const u8,
+        mutation: GeneratedSubscriptionMetadataMutation,
+    }{
+        .{ .sql = create_subscription_sql, .mutation = .missing_connection },
+        .{ .sql = create_subscription_options_sql, .mutation = .missing_name },
+        .{ .sql = create_subscription_options_sql, .mutation = .stale_bool_option },
+        .{ .sql = create_subscription_options_sql, .mutation = .stale_json_option },
+        .{ .sql = create_subscription_sql, .mutation = .malformed_name },
+        .{ .sql = "ALTER SUBSCRIPTION usage_sub DISABLE;", .mutation = .missing_enabled },
+        .{ .sql = alter_subscription_connection_sql, .mutation = .missing_connection },
+        .{ .sql = "ALTER SUBSCRIPTION usage_sub RENAME TO usage_sub_archive;", .mutation = .missing_rename_target },
+        .{ .sql = "ALTER SUBSCRIPTION usage_sub OWNER TO app_role;", .mutation = .missing_owner },
+        .{ .sql = "ALTER SUBSCRIPTION usage_sub SKIP (lsn = '0/14C0378');", .mutation = .missing_name },
+        .{ .sql = "ALTER SUBSCRIPTION usage_sub REFRESH PUBLICATION WITH (copy_data = false);", .mutation = .missing_name },
+        .{ .sql = "ALTER SUBSCRIPTION usage_sub SET (slot_name = 'usage_slot', copy_data = false);", .mutation = .missing_name },
+        .{ .sql = "ALTER SUBSCRIPTION usage_sub SET PUBLICATION usage_pub, usage_audit_pub WITH (copy_data = true);", .mutation = .missing_publications },
+        .{ .sql = "ALTER SUBSCRIPTION usage_sub ADD PUBLICATION usage_new_pub WITH (copy_data = false);", .mutation = .missing_publications },
+        .{ .sql = "DROP SUBSCRIPTION IF EXISTS usage_sub;", .mutation = .malformed_drop_name },
+    };
+    for (subscription_metadata_cases) |case| {
+        try expectGeneratedSubscriptionMetadataMutationFails(alloc, case.sql, case.mutation);
+    }
+}
 
-    var missing_publication_name = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE PUBLICATION usage_pub FOR TABLE usage_records WITH (publish = 'insert, update');",
-    );
-    defer missing_publication_name.deinit(alloc);
-    if (missing_publication_name.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.object_name_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_publication_name));
+const GeneratedTypeSystemMetadataMutation = enum {
+    missing_collation_name,
+    corrupt_collation_options,
+    missing_operator_name,
+    corrupt_operator_options,
+    corrupt_operator_args,
+    corrupt_aggregate_args,
+    corrupt_aggregate_options,
+    corrupt_drop_aggregate_args,
+    missing_cast_source,
+    corrupt_cast_args,
+    missing_drop_cast_target,
+    stale_collation_alter_tail,
+    missing_collation_rename_target,
+};
 
-    var stale_publication_options = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE PUBLICATION usage_pub FOR TABLE usage_records WITH (publish = 'insert, update', publish_via_partition_root = true);",
-    );
-    defer stale_publication_options.deinit(alloc);
-    if (stale_publication_options.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    if (ddl.publication_option_items.count != 2) return error.TestUnexpectedResult;
-                    ddl.publication_option_items.items[1] = ddl.publication_option_items.items[0];
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_publication_options));
+fn applyGeneratedTypeSystemMetadataMutation(
+    parsed_len: usize,
+    ddl: *generated_parser.GeneratedSqlDdlAst,
+    mutation: GeneratedTypeSystemMetadataMutation,
+) void {
+    switch (mutation) {
+        .missing_collation_name => ddl.object_name_tokens = null,
+        .corrupt_collation_options => ddl.collation_option_items.items[0].start += 1,
+        .missing_operator_name => ddl.operator_name_tokens = null,
+        .corrupt_operator_options => ddl.operator_option_items.items[0].start += 1,
+        .corrupt_operator_args => ddl.operator_argument_items.items[0].start += 1,
+        .corrupt_aggregate_args, .corrupt_drop_aggregate_args => ddl.aggregate_argument_items.items[0].start += 1,
+        .corrupt_aggregate_options => ddl.aggregate_option_items.items[0].start += 1,
+        .missing_cast_source => ddl.cast_source_type_tokens = null,
+        .corrupt_cast_args => ddl.cast_function_argument_items.items[0].start += 1,
+        .missing_drop_cast_target => ddl.cast_target_type_tokens = null,
+        .stale_collation_alter_tail => ddl.alter_table_operation_tokens = .{ .start = 2, .end = parsed_len },
+        .missing_collation_rename_target => ddl.rename_target_tokens = null,
+    }
+}
 
-    var missing_alter_publication_tables = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "ALTER PUBLICATION usage_pub DROP TABLE usage_events;",
-    );
-    defer missing_alter_publication_tables.deinit(alloc);
-    if (missing_alter_publication_tables.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    ddl.publication_table_items.deinit(alloc);
-                    ddl.publication_table_items = .{};
-                },
-                else => return error.TestUnexpectedResult,
-            }
+fn expectGeneratedTypeSystemMetadataMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedTypeSystemMetadataMutation,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .ddl => |*ddl| applyGeneratedTypeSystemMetadataMutation(parsed.items().len, ddl, mutation),
+            else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_alter_publication_tables));
-
-    var missing_alter_publication_options = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "ALTER PUBLICATION usage_pub SET (publish = 'insert, update', publish_via_partition_root = false);",
-    );
-    defer missing_alter_publication_options.deinit(alloc);
-    if (missing_alter_publication_options.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.object_name_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_alter_publication_options));
-
-    var missing_logical_alter_publication_options = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "ALTER PUBLICATION usage_pub SET (publish = 'insert, update', publish_via_partition_root = false);",
-    );
-    defer missing_logical_alter_publication_options.deinit(alloc);
-    if (missing_logical_alter_publication_options.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    ddl.object_name_tokens = null;
-                    var logical_state = parser_context.ParserState{
-                        .alloc = alloc,
-                        .tokens = missing_logical_alter_publication_options.items(),
-                    };
-                    const options = DdlPlanParserOptions{
-                        .schema = logical_state.schema,
-                        .field_expression_qualifiers = logical_state.field_expression_qualifiers,
-                        .returning_expression_qualifiers = logical_state.returning_expression_qualifiers,
-                        .defer_row_expression_field_validation = logical_state.defer_row_expression_field_validation,
-                        .column_definition_options = parser_context.ParserState.ContextAccessors.ddlColumnDefinitionOptions(&logical_state),
-                        .domain_options = parser_context.ParserState.ContextAccessors.ddlDomainOptions(&logical_state),
-                        .create_index_options = parser_context.ParserState.ContextAccessors.createIndexOptions(&logical_state),
-                        .row_security_policy_options = parser_context.ParserState.ContextAccessors.rowSecurityPolicyOptions(&logical_state),
-                    };
-                    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanFromGeneratedAstAlloc(alloc, missing_logical_alter_publication_options.items(), ddl.*, options));
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-
-    var missing_alter_publication_rename = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "ALTER PUBLICATION usage_pub RENAME TO usage_pub_archive;",
-    );
-    defer missing_alter_publication_rename.deinit(alloc);
-    if (missing_alter_publication_rename.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.rename_target_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_alter_publication_rename));
-
-    var missing_alter_publication_owner = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "ALTER PUBLICATION usage_pub OWNER TO app_role;",
-    );
-    defer missing_alter_publication_owner.deinit(alloc);
-    if (missing_alter_publication_owner.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.privilege_principal_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_alter_publication_owner));
-
-    var missing_subscription_connection = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE SUBSCRIPTION usage_sub CONNECTION 'host=localhost dbname=usage' PUBLICATION usage_pub;",
-    );
-    defer missing_subscription_connection.deinit(alloc);
-    if (missing_subscription_connection.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.subscription_connection_value_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_subscription_connection));
-
-    var missing_subscription_options = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE SUBSCRIPTION usage_sub CONNECTION 'host=localhost dbname=usage' PUBLICATION usage_pub WITH (copy_data = false, connect = false, binary = true, create_slot = false, enabled = false, two_phase = false, disable_on_error = false, synchronous_commit = 'remote_write', streaming = 'parallel', password_required = false, run_as_owner = true, failover = true, origin = 'none', slot_name = 'usage_slot');",
-    );
-    defer missing_subscription_options.deinit(alloc);
-    if (missing_subscription_options.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.object_name_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_subscription_options));
-
-    var stale_subscription_bool_option = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE SUBSCRIPTION usage_sub CONNECTION 'host=localhost dbname=usage' PUBLICATION usage_pub WITH (copy_data = false, connect = false, binary = true, create_slot = false, enabled = false, two_phase = false, disable_on_error = false, synchronous_commit = 'remote_write', streaming = 'parallel', password_required = false, run_as_owner = true, failover = true, origin = 'none', slot_name = 'usage_slot');",
-    );
-    defer stale_subscription_bool_option.deinit(alloc);
-    if (stale_subscription_bool_option.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    if (ddl.subscription_option_items.count != 14) return error.TestUnexpectedResult;
-                    ddl.subscription_option_items.items[9] = ddl.subscription_option_items.items[1];
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_subscription_bool_option));
-
-    var stale_subscription_json_option = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE SUBSCRIPTION usage_sub CONNECTION 'host=localhost dbname=usage' PUBLICATION usage_pub WITH (copy_data = false, connect = false, binary = true, create_slot = false, enabled = false, two_phase = false, disable_on_error = false, synchronous_commit = 'remote_write', streaming = 'parallel', password_required = false, run_as_owner = true, failover = true, origin = 'none', slot_name = 'usage_slot');",
-    );
-    defer stale_subscription_json_option.deinit(alloc);
-    if (stale_subscription_json_option.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    if (ddl.subscription_option_items.count != 14) return error.TestUnexpectedResult;
-                    ddl.subscription_option_items.items[12] = ddl.subscription_option_items.items[13];
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_subscription_json_option));
-
-    var malformed_subscription_name = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE SUBSCRIPTION usage_sub CONNECTION 'host=localhost dbname=usage' PUBLICATION usage_pub;",
-    );
-    defer malformed_subscription_name.deinit(alloc);
-    if (malformed_subscription_name.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.object_name_tokens = .{ .start = 3, .end = 4 },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_subscription_name));
-
-    var missing_subscription_enabled = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "ALTER SUBSCRIPTION usage_sub DISABLE;",
-    );
-    defer missing_subscription_enabled.deinit(alloc);
-    if (missing_subscription_enabled.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.subscription_enabled = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_subscription_enabled));
-
-    var missing_alter_subscription_connection = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "ALTER SUBSCRIPTION usage_sub CONNECTION 'host=replica';",
-    );
-    defer missing_alter_subscription_connection.deinit(alloc);
-    if (missing_alter_subscription_connection.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.subscription_connection_value_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_alter_subscription_connection));
-
-    var missing_alter_subscription_rename = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "ALTER SUBSCRIPTION usage_sub RENAME TO usage_sub_archive;",
-    );
-    defer missing_alter_subscription_rename.deinit(alloc);
-    if (missing_alter_subscription_rename.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.rename_target_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_alter_subscription_rename));
-
-    var missing_alter_subscription_owner = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "ALTER SUBSCRIPTION usage_sub OWNER TO app_role;",
-    );
-    defer missing_alter_subscription_owner.deinit(alloc);
-    if (missing_alter_subscription_owner.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.privilege_principal_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_alter_subscription_owner));
-
-    var missing_alter_subscription_skip = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "ALTER SUBSCRIPTION usage_sub SKIP (lsn = '0/14C0378');",
-    );
-    defer missing_alter_subscription_skip.deinit(alloc);
-    if (missing_alter_subscription_skip.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.object_name_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_alter_subscription_skip));
-
-    var missing_alter_subscription_refresh_options = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "ALTER SUBSCRIPTION usage_sub REFRESH PUBLICATION WITH (copy_data = false);",
-    );
-    defer missing_alter_subscription_refresh_options.deinit(alloc);
-    if (missing_alter_subscription_refresh_options.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.object_name_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_alter_subscription_refresh_options));
-
-    var missing_alter_subscription_options = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "ALTER SUBSCRIPTION usage_sub SET (slot_name = 'usage_slot', copy_data = false);",
-    );
-    defer missing_alter_subscription_options.deinit(alloc);
-    if (missing_alter_subscription_options.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.object_name_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_alter_subscription_options));
-
-    var missing_alter_subscription_publications = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "ALTER SUBSCRIPTION usage_sub SET PUBLICATION usage_pub, usage_audit_pub WITH (copy_data = true);",
-    );
-    defer missing_alter_subscription_publications.deinit(alloc);
-    if (missing_alter_subscription_publications.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    ddl.subscription_publication_items.deinit(alloc);
-                    ddl.subscription_publication_items = .{};
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_alter_subscription_publications));
-
-    var missing_add_subscription_publications = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "ALTER SUBSCRIPTION usage_sub ADD PUBLICATION usage_new_pub WITH (copy_data = false);",
-    );
-    defer missing_add_subscription_publications.deinit(alloc);
-    if (missing_add_subscription_publications.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    ddl.subscription_publication_items.deinit(alloc);
-                    ddl.subscription_publication_items = .{};
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_add_subscription_publications));
-
-    var malformed_drop_publication_exists = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "DROP PUBLICATION IF EXISTS usage_pub;",
-    );
-    defer malformed_drop_publication_exists.deinit(alloc);
-    if (malformed_drop_publication_exists.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.if_exists = false,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_drop_publication_exists));
-
-    var malformed_drop_subscription_name = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "DROP SUBSCRIPTION IF EXISTS usage_sub;",
-    );
-    defer malformed_drop_subscription_name.deinit(alloc);
-    if (malformed_drop_subscription_name.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.object_name_tokens = .{ .start = 2, .end = 3 },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_drop_subscription_name));
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
 }
 
 test "sql adapter ddl plan lowers type system catalog ddl plans" {
@@ -29547,30 +29683,6 @@ test "sql adapter ddl plan lowers type system catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var malformed_generated_create_collation_name = try tokenized.ParsedSql.initAlloc(alloc, "CREATE COLLATION case_insensitive (provider = icu, locale = 'und-u-ks-level2');");
-    defer malformed_generated_create_collation_name.deinit(alloc);
-    if (malformed_generated_create_collation_name.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.object_name_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_generated_create_collation_name));
-
-    var malformed_generated_create_collation_options = try tokenized.ParsedSql.initAlloc(alloc, "CREATE COLLATION case_insensitive (provider = icu, locale = 'und-u-ks-level2');");
-    defer malformed_generated_create_collation_options.deinit(alloc);
-    if (malformed_generated_create_collation_options.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.collation_option_items.items[0].start += 1,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_generated_create_collation_options));
-
     var create_operator = try runtimeDdlPlanForTestAlloc(alloc, "CREATE OPERATOR === (FUNCTION = text_eq, LEFTARG = text, RIGHTARG = text);");
     defer create_operator.deinit(alloc);
     switch (create_operator) {
@@ -29620,42 +29732,6 @@ test "sql adapter ddl plan lowers type system catalog ddl plans" {
         },
         else => return error.TestUnexpectedResult,
     }
-
-    var malformed_generated_create_operator_name = try tokenized.ParsedSql.initAlloc(alloc, "CREATE OPERATOR === (FUNCTION = text_eq, LEFTARG = text, RIGHTARG = text);");
-    defer malformed_generated_create_operator_name.deinit(alloc);
-    if (malformed_generated_create_operator_name.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.operator_name_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_generated_create_operator_name));
-
-    var malformed_generated_create_operator_options = try tokenized.ParsedSql.initAlloc(alloc, "CREATE OPERATOR === (FUNCTION = text_eq, LEFTARG = text, RIGHTARG = text);");
-    defer malformed_generated_create_operator_options.deinit(alloc);
-    if (malformed_generated_create_operator_options.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.operator_option_items.items[0].start += 1,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_generated_create_operator_options));
-
-    var malformed_generated_drop_operator_args = try tokenized.ParsedSql.initAlloc(alloc, "DROP OPERATOR IF EXISTS === (text, text);");
-    defer malformed_generated_drop_operator_args.deinit(alloc);
-    if (malformed_generated_drop_operator_args.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.operator_argument_items.items[0].start += 1,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_generated_drop_operator_args));
 
     var create_aggregate = try runtimeDdlPlanForTestAlloc(alloc, "CREATE AGGREGATE first_value_text(text) (SFUNC = first_sfunc, STYPE = text);");
     defer create_aggregate.deinit(alloc);
@@ -29707,42 +29783,6 @@ test "sql adapter ddl plan lowers type system catalog ddl plans" {
         },
         else => return error.TestUnexpectedResult,
     }
-
-    var malformed_generated_create_aggregate_args = try tokenized.ParsedSql.initAlloc(alloc, "CREATE AGGREGATE first_value_text(text) (SFUNC = first_sfunc, STYPE = text);");
-    defer malformed_generated_create_aggregate_args.deinit(alloc);
-    if (malformed_generated_create_aggregate_args.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.aggregate_argument_items.items[0].start += 1,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_generated_create_aggregate_args));
-
-    var malformed_generated_create_aggregate_options = try tokenized.ParsedSql.initAlloc(alloc, "CREATE AGGREGATE first_value_text(text) (SFUNC = first_sfunc, STYPE = text);");
-    defer malformed_generated_create_aggregate_options.deinit(alloc);
-    if (malformed_generated_create_aggregate_options.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.aggregate_option_items.items[0].start += 1,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_generated_create_aggregate_options));
-
-    var malformed_generated_drop_aggregate_args = try tokenized.ParsedSql.initAlloc(alloc, "DROP AGGREGATE IF EXISTS first_value_text(text);");
-    defer malformed_generated_drop_aggregate_args.deinit(alloc);
-    if (malformed_generated_drop_aggregate_args.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.aggregate_argument_items.items[0].start += 1,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_generated_drop_aggregate_args));
 
     var create_cast = try runtimeDdlPlanForTestAlloc(alloc, "CREATE CAST (jsonb AS text) WITH FUNCTION jsonb_to_text(jsonb) AS ASSIGNMENT;");
     defer create_cast.deinit(alloc);
@@ -29796,65 +29836,27 @@ test "sql adapter ddl plan lowers type system catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var malformed_generated_create_cast_source = try tokenized.ParsedSql.initAlloc(alloc, "CREATE CAST (jsonb AS text) WITH FUNCTION jsonb_to_text(jsonb) AS ASSIGNMENT;");
-    defer malformed_generated_create_cast_source.deinit(alloc);
-    if (malformed_generated_create_cast_source.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.cast_source_type_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_generated_create_cast_source));
-
-    var malformed_generated_create_cast_args = try tokenized.ParsedSql.initAlloc(alloc, "CREATE CAST (jsonb AS text) WITH FUNCTION jsonb_to_text(jsonb) AS ASSIGNMENT;");
-    defer malformed_generated_create_cast_args.deinit(alloc);
-    if (malformed_generated_create_cast_args.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.cast_function_argument_items.items[0].start += 1,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_generated_create_cast_args));
-
-    var malformed_generated_drop_cast_target = try tokenized.ParsedSql.initAlloc(alloc, "DROP CAST IF EXISTS (jsonb AS text);");
-    defer malformed_generated_drop_cast_target.deinit(alloc);
-    if (malformed_generated_drop_cast_target.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.cast_target_type_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_generated_drop_cast_target));
-
-    var malformed_generated_collation = try tokenized.ParsedSql.initAlloc(alloc, "ALTER COLLATION case_insensitive RENAME TO ci_text;");
-    defer malformed_generated_collation.deinit(alloc);
-    if (malformed_generated_collation.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.alter_table_operation_tokens = .{ .start = 2, .end = malformed_generated_collation.items().len },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_generated_collation));
-
-    var malformed_generated_collation_target = try tokenized.ParsedSql.initAlloc(alloc, "ALTER COLLATION case_insensitive RENAME TO ci_text;");
-    defer malformed_generated_collation_target.deinit(alloc);
-    if (malformed_generated_collation_target.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.rename_target_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_generated_collation_target));
+    const type_system_metadata_cases = [_]struct {
+        sql: []const u8,
+        mutation: GeneratedTypeSystemMetadataMutation,
+    }{
+        .{ .sql = "CREATE COLLATION case_insensitive (provider = icu, locale = 'und-u-ks-level2');", .mutation = .missing_collation_name },
+        .{ .sql = "CREATE COLLATION case_insensitive (provider = icu, locale = 'und-u-ks-level2');", .mutation = .corrupt_collation_options },
+        .{ .sql = "CREATE OPERATOR === (FUNCTION = text_eq, LEFTARG = text, RIGHTARG = text);", .mutation = .missing_operator_name },
+        .{ .sql = "CREATE OPERATOR === (FUNCTION = text_eq, LEFTARG = text, RIGHTARG = text);", .mutation = .corrupt_operator_options },
+        .{ .sql = "DROP OPERATOR IF EXISTS === (text, text);", .mutation = .corrupt_operator_args },
+        .{ .sql = "CREATE AGGREGATE first_value_text(text) (SFUNC = first_sfunc, STYPE = text);", .mutation = .corrupt_aggregate_args },
+        .{ .sql = "CREATE AGGREGATE first_value_text(text) (SFUNC = first_sfunc, STYPE = text);", .mutation = .corrupt_aggregate_options },
+        .{ .sql = "DROP AGGREGATE IF EXISTS first_value_text(text);", .mutation = .corrupt_drop_aggregate_args },
+        .{ .sql = "CREATE CAST (jsonb AS text) WITH FUNCTION jsonb_to_text(jsonb) AS ASSIGNMENT;", .mutation = .missing_cast_source },
+        .{ .sql = "CREATE CAST (jsonb AS text) WITH FUNCTION jsonb_to_text(jsonb) AS ASSIGNMENT;", .mutation = .corrupt_cast_args },
+        .{ .sql = "DROP CAST IF EXISTS (jsonb AS text);", .mutation = .missing_drop_cast_target },
+        .{ .sql = "ALTER COLLATION case_insensitive RENAME TO ci_text;", .mutation = .stale_collation_alter_tail },
+        .{ .sql = "ALTER COLLATION case_insensitive RENAME TO ci_text;", .mutation = .missing_collation_rename_target },
+    };
+    for (type_system_metadata_cases) |case| {
+        try expectGeneratedTypeSystemMetadataMutationFails(alloc, case.sql, case.mutation);
+    }
 }
 
 test "sql adapter ddl plan lowers maintenance job ddl plans" {
@@ -30166,6 +30168,38 @@ test "sql adapter ddl plan lowers session catalog ddl plans" {
     }
 }
 
+fn expectGeneratedSessionNameTokensMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    name_tokens: generated_parser.GeneratedSqlTokenRange,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .session => |*session_ast| session_ast.name_tokens = name_tokens,
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
+}
+
+fn expectGeneratedStatementMissingAstFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            generated_ast.deinit(alloc);
+            generated_statement.ast = null;
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed, .{}));
+}
+
 test "sql adapter generated session AST lowers to session catalog plans" {
     const alloc = std.testing.allocator;
 
@@ -30204,20 +30238,7 @@ test "sql adapter generated session AST lowers to session catalog plans" {
         sessionCatalogPlanFromGeneratedAstAlloc(alloc, parsed_stale_generated_setting.items(), stale_generated_setting_ast),
     );
 
-    var parsed_stale_generated_search_path = try tokenized.ParsedSql.initAlloc(alloc, "SET search_path TO public;");
-    defer parsed_stale_generated_search_path.deinit(alloc);
-    if (parsed_stale_generated_search_path.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .session => |*session| session.name_tokens = .{ .start = 1, .end = 3 },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        runtimeDdlPlanParsedSqlAlloc(alloc, &parsed_stale_generated_search_path),
-    );
+    try expectGeneratedSessionNameTokensMutationFails(alloc, "SET search_path TO public;", .{ .start = 1, .end = 3 });
 
     stale_generated_setting_ast = switch ((parsed_stale_generated_setting.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
         .session => |ast| ast,
@@ -30265,6 +30286,67 @@ test "sql adapter generated session AST lowers to session catalog plans" {
         defer generated.deinit(alloc);
         try std.testing.expectEqual(case.tag, std.meta.activeTag(generated));
     }
+}
+
+const GeneratedExtensionMetadataMutation = enum {
+    missing_create_name,
+    missing_create_version,
+    missing_create_schema,
+    corrupt_update_version,
+    missing_update_version,
+    stale_update_latest_version,
+    missing_drop_name,
+    stale_drop_if_exists,
+    stale_drop_cascade,
+};
+
+fn applyGeneratedExtensionMetadataMutation(
+    ast: *generated_parser.GeneratedSqlAst,
+    mutation: GeneratedExtensionMetadataMutation,
+) !void {
+    switch (mutation) {
+        .missing_create_name,
+        .missing_create_version,
+        .missing_create_schema,
+        .missing_drop_name,
+        .stale_drop_if_exists,
+        .stale_drop_cascade,
+        => switch (ast.*) {
+            .extension_index => |*extension| switch (mutation) {
+                .missing_create_name, .missing_drop_name => extension.object_name_tokens = null,
+                .missing_create_version => extension.version_tokens = null,
+                .missing_create_schema => extension.schema_name_tokens = null,
+                .stale_drop_if_exists => extension.if_exists = false,
+                .stale_drop_cascade => extension.cascade = false,
+                else => unreachable,
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        .corrupt_update_version, .missing_update_version, .stale_update_latest_version => switch (ast.*) {
+            .ddl => |*ddl| switch (mutation) {
+                .corrupt_update_version => ddl.version_tokens = .{ .start = 4, .end = 5 },
+                .missing_update_version => ddl.version_tokens = null,
+                .stale_update_latest_version => ddl.version_tokens = .{ .start = 3, .end = 4 },
+                else => unreachable,
+            },
+            else => return error.TestUnexpectedResult,
+        },
+    }
+}
+
+fn expectGeneratedExtensionMetadataMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedExtensionMetadataMutation,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            try applyGeneratedExtensionMetadataMutation(generated_ast, mutation);
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
 }
 
 test "sql adapter ddl plan lowers transaction control and protocol ddl plans" {
@@ -30443,6 +30525,39 @@ test "sql adapter generated advisory lock AST fails closed at public boundary" {
     try expectGeneratedAdvisoryLockAstMutationFails(alloc, .non_integer_argument);
 }
 
+const GeneratedTransactionBoundaryAstMutation = enum {
+    stale_statement_span,
+    stale_command_span,
+    stale_kind,
+    missing_tail,
+    stale_tail,
+};
+
+fn expectGeneratedTransactionBoundaryAstMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedTransactionBoundaryAstMutation,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    const raw = parsed.generated_statement orelse return error.TestUnexpectedResult;
+    var ast = switch (raw.ast orelse return error.TestUnexpectedResult) {
+        .transaction => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    switch (mutation) {
+        .stale_statement_span => ast.statement_span.start += 1,
+        .stale_command_span => ast.command_span.end += 1,
+        .stale_kind => ast.kind = .commit,
+        .missing_tail => ast.boundary_tail_tokens = null,
+        .stale_tail => ast.boundary_tail_tokens = .{ .start = 0, .end = 1 },
+    }
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        transactionBoundaryPlanFromGeneratedAst(alloc, parsed.items(), ast),
+    );
+}
+
 test "sql adapter generated transaction AST lowers to transaction boundary plans" {
     const alloc = std.testing.allocator;
 
@@ -30471,69 +30586,47 @@ test "sql adapter generated transaction AST lowers to transaction boundary plans
         }
     }
 
-    var malformed_span = try tokenized.ParsedSql.initAlloc(alloc, "BEGIN;");
-    defer malformed_span.deinit(alloc);
-    const malformed_span_raw = malformed_span.generated_statement orelse return error.TestUnexpectedResult;
-    var malformed_span_ast = switch (malformed_span_raw.ast orelse return error.TestUnexpectedResult) {
-        .transaction => |ast| ast,
-        else => return error.TestUnexpectedResult,
+    const boundary_mutation_cases = [_]struct {
+        sql: []const u8,
+        mutation: GeneratedTransactionBoundaryAstMutation,
+    }{
+        .{ .sql = "BEGIN;", .mutation = .stale_statement_span },
+        .{ .sql = "COMMIT;", .mutation = .stale_command_span },
+        .{ .sql = "ROLLBACK;", .mutation = .stale_kind },
+        .{ .sql = "COMMIT WORK;", .mutation = .missing_tail },
+        .{ .sql = "ROLLBACK TRANSACTION;", .mutation = .stale_tail },
     };
-    malformed_span_ast.statement_span.start += 1;
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        transactionBoundaryPlanFromGeneratedAst(alloc, malformed_span.items(), malformed_span_ast),
-    );
+    for (boundary_mutation_cases) |case| {
+        try expectGeneratedTransactionBoundaryAstMutationFails(alloc, case.sql, case.mutation);
+    }
+}
 
-    var malformed_command = try tokenized.ParsedSql.initAlloc(alloc, "COMMIT;");
-    defer malformed_command.deinit(alloc);
-    const malformed_command_raw = malformed_command.generated_statement orelse return error.TestUnexpectedResult;
-    var malformed_command_ast = switch (malformed_command_raw.ast orelse return error.TestUnexpectedResult) {
-        .transaction => |ast| ast,
-        else => return error.TestUnexpectedResult,
-    };
-    malformed_command_ast.command_span.end += 1;
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        transactionBoundaryPlanFromGeneratedAst(alloc, malformed_command.items(), malformed_command_ast),
-    );
+const GeneratedTransactionModeAstMutation = enum {
+    missing_mode,
+    stale_mode_end,
+    stale_mode_range,
+};
 
-    var mismatched_kind = try tokenized.ParsedSql.initAlloc(alloc, "ROLLBACK;");
-    defer mismatched_kind.deinit(alloc);
-    const mismatched_kind_raw = mismatched_kind.generated_statement orelse return error.TestUnexpectedResult;
-    var mismatched_kind_ast = switch (mismatched_kind_raw.ast orelse return error.TestUnexpectedResult) {
+fn expectGeneratedTransactionModeAstMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedTransactionModeAstMutation,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    const raw = parsed.generated_statement orelse return error.TestUnexpectedResult;
+    var ast = switch (raw.ast orelse return error.TestUnexpectedResult) {
         .transaction => |ast| ast,
         else => return error.TestUnexpectedResult,
     };
-    mismatched_kind_ast.kind = .commit;
+    switch (mutation) {
+        .missing_mode => ast.mode_tokens = null,
+        .stale_mode_end => ast.mode_tokens.?.end += 1,
+        .stale_mode_range => ast.mode_tokens = .{ .start = 2, .end = 3 },
+    }
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        transactionBoundaryPlanFromGeneratedAst(alloc, mismatched_kind.items(), mismatched_kind_ast),
-    );
-
-    var missing_tail = try tokenized.ParsedSql.initAlloc(alloc, "COMMIT WORK;");
-    defer missing_tail.deinit(alloc);
-    const missing_tail_raw = missing_tail.generated_statement orelse return error.TestUnexpectedResult;
-    var missing_tail_ast = switch (missing_tail_raw.ast orelse return error.TestUnexpectedResult) {
-        .transaction => |ast| ast,
-        else => return error.TestUnexpectedResult,
-    };
-    missing_tail_ast.boundary_tail_tokens = null;
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        transactionBoundaryPlanFromGeneratedAst(alloc, missing_tail.items(), missing_tail_ast),
-    );
-
-    var malformed_tail = try tokenized.ParsedSql.initAlloc(alloc, "ROLLBACK TRANSACTION;");
-    defer malformed_tail.deinit(alloc);
-    const malformed_tail_raw = malformed_tail.generated_statement orelse return error.TestUnexpectedResult;
-    var malformed_tail_ast = switch (malformed_tail_raw.ast orelse return error.TestUnexpectedResult) {
-        .transaction => |ast| ast,
-        else => return error.TestUnexpectedResult,
-    };
-    malformed_tail_ast.boundary_tail_tokens = .{ .start = 0, .end = 1 };
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        transactionBoundaryPlanFromGeneratedAst(alloc, malformed_tail.items(), malformed_tail_ast),
+        transactionControlPlanFromGeneratedAstAlloc(alloc, parsed.items(), ast),
     );
 }
 
@@ -30587,43 +30680,43 @@ test "sql adapter generated transaction AST lowers to transaction mode plans" {
         runtimeDdlPlanForTestAlloc(alloc, "SET TRANSACTION READ ONLY READ WRITE;"),
     );
 
-    var missing_mode = try tokenized.ParsedSql.initAlloc(alloc, "SET TRANSACTION READ ONLY;");
-    defer missing_mode.deinit(alloc);
-    const missing_mode_raw = missing_mode.generated_statement orelse return error.TestUnexpectedResult;
-    var missing_mode_ast = switch (missing_mode_raw.ast orelse return error.TestUnexpectedResult) {
-        .transaction => |ast| ast,
-        else => return error.TestUnexpectedResult,
+    const mode_mutation_cases = [_]struct {
+        sql: []const u8,
+        mutation: GeneratedTransactionModeAstMutation,
+    }{
+        .{ .sql = "SET TRANSACTION READ ONLY;", .mutation = .missing_mode },
+        .{ .sql = "SET TRANSACTION READ ONLY;", .mutation = .stale_mode_end },
+        .{ .sql = "BEGIN READ ONLY;", .mutation = .stale_mode_range },
     };
-    missing_mode_ast.mode_tokens = null;
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        transactionControlPlanFromGeneratedAstAlloc(alloc, missing_mode.items(), missing_mode_ast),
-    );
+    for (mode_mutation_cases) |case| {
+        try expectGeneratedTransactionModeAstMutationFails(alloc, case.sql, case.mutation);
+    }
+}
 
-    var stale_mode_end = try tokenized.ParsedSql.initAlloc(alloc, "SET TRANSACTION READ ONLY;");
-    defer stale_mode_end.deinit(alloc);
-    const stale_mode_end_raw = stale_mode_end.generated_statement orelse return error.TestUnexpectedResult;
-    var stale_mode_end_ast = switch (stale_mode_end_raw.ast orelse return error.TestUnexpectedResult) {
-        .transaction => |ast| ast,
-        else => return error.TestUnexpectedResult,
-    };
-    stale_mode_end_ast.mode_tokens.?.end += 1;
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        transactionControlPlanFromGeneratedAstAlloc(alloc, stale_mode_end.items(), stale_mode_end_ast),
-    );
+const GeneratedConstraintModeAstMutation = enum {
+    missing_mode,
+    malformed_name,
+};
 
-    var malformed_mode = try tokenized.ParsedSql.initAlloc(alloc, "BEGIN READ ONLY;");
-    defer malformed_mode.deinit(alloc);
-    const malformed_mode_raw = malformed_mode.generated_statement orelse return error.TestUnexpectedResult;
-    var malformed_mode_ast = switch (malformed_mode_raw.ast orelse return error.TestUnexpectedResult) {
+fn expectGeneratedConstraintModeAstMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedConstraintModeAstMutation,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    const raw = parsed.generated_statement orelse return error.TestUnexpectedResult;
+    var ast = switch (raw.ast orelse return error.TestUnexpectedResult) {
         .transaction => |ast| ast,
         else => return error.TestUnexpectedResult,
     };
-    malformed_mode_ast.mode_tokens = .{ .start = 2, .end = 3 };
+    switch (mutation) {
+        .missing_mode => ast.constraint_mode = null,
+        .malformed_name => ast.constraint_name_items[0].start = 1,
+    }
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        transactionControlPlanFromGeneratedAstAlloc(alloc, malformed_mode.items(), malformed_mode_ast),
+        transactionControlPlanFromGeneratedAstAlloc(alloc, parsed.items(), ast),
     );
 }
 
@@ -30660,30 +30753,34 @@ test "sql adapter generated transaction AST lowers to constraint mode plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var missing_metadata = try tokenized.ParsedSql.initAlloc(alloc, "SET CONSTRAINTS ALL DEFERRED;");
-    defer missing_metadata.deinit(alloc);
-    const missing_metadata_raw = missing_metadata.generated_statement orelse return error.TestUnexpectedResult;
-    var missing_metadata_ast = switch (missing_metadata_raw.ast orelse return error.TestUnexpectedResult) {
-        .transaction => |ast| ast,
-        else => return error.TestUnexpectedResult,
-    };
-    missing_metadata_ast.constraint_mode = null;
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        transactionControlPlanFromGeneratedAstAlloc(alloc, missing_metadata.items(), missing_metadata_ast),
-    );
+    try expectGeneratedConstraintModeAstMutationFails(alloc, "SET CONSTRAINTS ALL DEFERRED;", .missing_mode);
+    try expectGeneratedConstraintModeAstMutationFails(alloc, "SET CONSTRAINTS usage_fk DEFERRED;", .malformed_name);
+}
 
-    var malformed_name = try tokenized.ParsedSql.initAlloc(alloc, "SET CONSTRAINTS usage_fk DEFERRED;");
-    defer malformed_name.deinit(alloc);
-    const malformed_name_raw = malformed_name.generated_statement orelse return error.TestUnexpectedResult;
-    var malformed_name_ast = switch (malformed_name_raw.ast orelse return error.TestUnexpectedResult) {
+const GeneratedSavepointAstMutation = enum {
+    missing_name,
+    malformed_name,
+};
+
+fn expectGeneratedSavepointAstMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedSavepointAstMutation,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    const raw = parsed.generated_statement orelse return error.TestUnexpectedResult;
+    var ast = switch (raw.ast orelse return error.TestUnexpectedResult) {
         .transaction => |ast| ast,
         else => return error.TestUnexpectedResult,
     };
-    malformed_name_ast.constraint_name_items[0].start = 1;
+    switch (mutation) {
+        .missing_name => ast.name_tokens = null,
+        .malformed_name => ast.name_tokens = .{ .start = 2, .end = 3 },
+    }
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        transactionControlPlanFromGeneratedAstAlloc(alloc, malformed_name.items(), malformed_name_ast),
+        transactionControlPlanFromGeneratedAstAlloc(alloc, parsed.items(), ast),
     );
 }
 
@@ -30718,31 +30815,61 @@ test "sql adapter generated savepoint transaction AST lowers to savepoint plans"
         }
     }
 
-    var missing_name = try tokenized.ParsedSql.initAlloc(alloc, "SAVEPOINT before_retry;");
-    defer missing_name.deinit(alloc);
-    const missing_name_raw = missing_name.generated_statement orelse return error.TestUnexpectedResult;
-    var missing_name_ast = switch (missing_name_raw.ast orelse return error.TestUnexpectedResult) {
-        .transaction => |ast| ast,
-        else => return error.TestUnexpectedResult,
-    };
-    missing_name_ast.name_tokens = null;
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        transactionControlPlanFromGeneratedAstAlloc(alloc, missing_name.items(), missing_name_ast),
-    );
+    try expectGeneratedSavepointAstMutationFails(alloc, "SAVEPOINT before_retry;", .missing_name);
+    try expectGeneratedSavepointAstMutationFails(alloc, "ROLLBACK TO SAVEPOINT before_retry;", .malformed_name);
+}
 
-    var malformed_name = try tokenized.ParsedSql.initAlloc(alloc, "ROLLBACK TO SAVEPOINT before_retry;");
-    defer malformed_name.deinit(alloc);
-    const malformed_name_raw = malformed_name.generated_statement orelse return error.TestUnexpectedResult;
-    var malformed_name_ast = switch (malformed_name_raw.ast orelse return error.TestUnexpectedResult) {
-        .transaction => |ast| ast,
-        else => return error.TestUnexpectedResult,
-    };
-    malformed_name_ast.name_tokens = .{ .start = 2, .end = 3 };
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        transactionControlPlanFromGeneratedAstAlloc(alloc, malformed_name.items(), malformed_name_ast),
-    );
+const GeneratedSimpleDdlMetadataMutation = enum {
+    stale_alter_database_operation_tail,
+    missing_alter_database_setting_name,
+    missing_alter_database_setting_value,
+    stale_rename_schema_operation_tail,
+    missing_rename_schema_target,
+};
+
+fn applyGeneratedSimpleDdlMetadataMutation(
+    item_count: usize,
+    ddl: *generated_parser.GeneratedSqlDdlAst,
+    mutation: GeneratedSimpleDdlMetadataMutation,
+) !void {
+    switch (mutation) {
+        .stale_alter_database_operation_tail => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_database, ddl.kind);
+            ddl.alter_table_operation_tokens = .{ .start = 2, .end = item_count };
+        },
+        .missing_alter_database_setting_name => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_database, ddl.kind);
+            ddl.setting_name_tokens = null;
+        },
+        .missing_alter_database_setting_value => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_database, ddl.kind);
+            ddl.setting_value_tokens = null;
+        },
+        .stale_rename_schema_operation_tail => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_schema, ddl.kind);
+            ddl.alter_table_operation_tokens = .{ .start = 2, .end = item_count };
+        },
+        .missing_rename_schema_target => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_schema, ddl.kind);
+            ddl.rename_target_tokens = null;
+        },
+    }
+}
+
+fn expectGeneratedSimpleDdlMetadataMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedSimpleDdlMetadataMutation,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .ddl => |*ddl| try applyGeneratedSimpleDdlMetadataMutation(parsed.items().len, ddl, mutation),
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
 }
 
 test "sql adapter generated simple DDL AST lowers to catalog plans" {
@@ -30826,41 +30953,17 @@ test "sql adapter generated simple DDL AST lowers to catalog plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var malformed_alter_database = try tokenized.ParsedSql.initAlloc(alloc, "ALTER DATABASE tenant_ops SET timezone TO 'UTC';");
-    defer malformed_alter_database.deinit(alloc);
-    if (malformed_alter_database.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.alter_table_operation_tokens = .{ .start = 2, .end = malformed_alter_database.items().len },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_alter_database));
-
-    var malformed_alter_database_setting_name = try tokenized.ParsedSql.initAlloc(alloc, "ALTER DATABASE tenant_ops SET timezone TO 'UTC';");
-    defer malformed_alter_database_setting_name.deinit(alloc);
-    if (malformed_alter_database_setting_name.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.setting_name_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_alter_database_setting_name));
-
-    var malformed_alter_database_setting_value = try tokenized.ParsedSql.initAlloc(alloc, "ALTER DATABASE tenant_ops SET timezone TO 'UTC';");
-    defer malformed_alter_database_setting_value.deinit(alloc);
-    if (malformed_alter_database_setting_value.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.setting_value_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_alter_database_setting_value));
+    const simple_ddl_metadata_cases = [_]struct {
+        sql: []const u8,
+        mutation: GeneratedSimpleDdlMetadataMutation,
+    }{
+        .{ .sql = "ALTER DATABASE tenant_ops SET timezone TO 'UTC';", .mutation = .stale_alter_database_operation_tail },
+        .{ .sql = "ALTER DATABASE tenant_ops SET timezone TO 'UTC';", .mutation = .missing_alter_database_setting_name },
+        .{ .sql = "ALTER DATABASE tenant_ops SET timezone TO 'UTC';", .mutation = .missing_alter_database_setting_value },
+    };
+    for (simple_ddl_metadata_cases) |case| {
+        try expectGeneratedSimpleDdlMetadataMutationFails(alloc, case.sql, case.mutation);
+    }
 
     var generated_create_schema = try generatedSimpleDdlPlanForTestAlloc(alloc, "CREATE SCHEMA IF NOT EXISTS public.analytics;");
     defer generated_create_schema.deinit(alloc);
@@ -30902,29 +31005,16 @@ test "sql adapter generated simple DDL AST lowers to catalog plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var malformed_rename_schema = try tokenized.ParsedSql.initAlloc(alloc, "ALTER SCHEMA analytics RENAME TO reporting;");
-    defer malformed_rename_schema.deinit(alloc);
-    if (malformed_rename_schema.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.alter_table_operation_tokens = .{ .start = 2, .end = malformed_rename_schema.items().len },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_rename_schema));
-
-    var malformed_rename_schema_target = try tokenized.ParsedSql.initAlloc(alloc, "ALTER SCHEMA analytics RENAME TO reporting;");
-    defer malformed_rename_schema_target.deinit(alloc);
-    if (malformed_rename_schema_target.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.rename_target_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_rename_schema_target));
+    try expectGeneratedSimpleDdlMetadataMutationFails(
+        alloc,
+        "ALTER SCHEMA analytics RENAME TO reporting;",
+        .stale_rename_schema_operation_tail,
+    );
+    try expectGeneratedSimpleDdlMetadataMutationFails(
+        alloc,
+        "ALTER SCHEMA analytics RENAME TO reporting;",
+        .missing_rename_schema_target,
+    );
 
     var generated_create_extension = try generatedSimpleDdlPlanForTestAlloc(alloc, "CREATE EXTENSION postgis VERSION '3.4.0';");
     defer generated_create_extension.deinit(alloc);
@@ -30940,41 +31030,23 @@ test "sql adapter generated simple DDL AST lowers to catalog plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var malformed_create_extension_name = try tokenized.ParsedSql.initAlloc(alloc, "CREATE EXTENSION postgis VERSION '3.4.0';");
-    defer malformed_create_extension_name.deinit(alloc);
-    if (malformed_create_extension_name.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .extension_index => |*ddl| ddl.object_name_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_create_extension_name));
-
-    var missing_create_extension_version = try tokenized.ParsedSql.initAlloc(alloc, "CREATE EXTENSION postgis VERSION '3.4.0';");
-    defer missing_create_extension_version.deinit(alloc);
-    if (missing_create_extension_version.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .extension_index => |*ddl| ddl.version_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_create_extension_version));
-
-    var missing_create_extension_schema = try tokenized.ParsedSql.initAlloc(alloc, "CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;");
-    defer missing_create_extension_schema.deinit(alloc);
-    if (missing_create_extension_schema.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .extension_index => |*ddl| ddl.schema_name_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_create_extension_schema));
+    const extension_metadata_cases = [_]struct {
+        sql: []const u8,
+        mutation: GeneratedExtensionMetadataMutation,
+    }{
+        .{ .sql = "CREATE EXTENSION postgis VERSION '3.4.0';", .mutation = .missing_create_name },
+        .{ .sql = "CREATE EXTENSION postgis VERSION '3.4.0';", .mutation = .missing_create_version },
+        .{ .sql = "CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;", .mutation = .missing_create_schema },
+        .{ .sql = "ALTER EXTENSION postgis UPDATE TO '3.5.0';", .mutation = .corrupt_update_version },
+        .{ .sql = "ALTER EXTENSION postgis UPDATE TO '3.5.0';", .mutation = .missing_update_version },
+        .{ .sql = "ALTER EXTENSION postgis UPDATE;", .mutation = .stale_update_latest_version },
+        .{ .sql = "DROP EXTENSION IF EXISTS postgis CASCADE;", .mutation = .missing_drop_name },
+        .{ .sql = "DROP EXTENSION IF EXISTS postgis CASCADE;", .mutation = .stale_drop_if_exists },
+        .{ .sql = "DROP EXTENSION IF EXISTS postgis CASCADE;", .mutation = .stale_drop_cascade },
+    };
+    for (extension_metadata_cases) |case| {
+        try expectGeneratedExtensionMetadataMutationFails(alloc, case.sql, case.mutation);
+    }
 
     var generated_update_extension = try generatedSimpleDdlPlanForTestAlloc(alloc, "ALTER EXTENSION postgis UPDATE TO '3.5.0';");
     defer generated_update_extension.deinit(alloc);
@@ -31002,42 +31074,6 @@ test "sql adapter generated simple DDL AST lowers to catalog plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var malformed_update_extension = try tokenized.ParsedSql.initAlloc(alloc, "ALTER EXTENSION postgis UPDATE TO '3.5.0';");
-    defer malformed_update_extension.deinit(alloc);
-    if (malformed_update_extension.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.version_tokens = .{ .start = 4, .end = 5 },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_update_extension));
-
-    var missing_version_update_extension = try tokenized.ParsedSql.initAlloc(alloc, "ALTER EXTENSION postgis UPDATE TO '3.5.0';");
-    defer missing_version_update_extension.deinit(alloc);
-    if (missing_version_update_extension.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.version_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_version_update_extension));
-
-    var stale_latest_update_extension = try tokenized.ParsedSql.initAlloc(alloc, "ALTER EXTENSION postgis UPDATE;");
-    defer stale_latest_update_extension.deinit(alloc);
-    if (stale_latest_update_extension.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.version_tokens = .{ .start = 3, .end = 4 },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_latest_update_extension));
-
     var generated_drop_extension = try generatedSimpleDdlPlanForTestAlloc(alloc, "DROP EXTENSION IF EXISTS postgis CASCADE;");
     defer generated_drop_extension.deinit(alloc);
     switch (generated_drop_extension) {
@@ -31051,42 +31087,6 @@ test "sql adapter generated simple DDL AST lowers to catalog plans" {
         },
         else => return error.TestUnexpectedResult,
     }
-
-    var malformed_drop_extension_name = try tokenized.ParsedSql.initAlloc(alloc, "DROP EXTENSION IF EXISTS postgis CASCADE;");
-    defer malformed_drop_extension_name.deinit(alloc);
-    if (malformed_drop_extension_name.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .extension_index => |*ddl| ddl.object_name_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_drop_extension_name));
-
-    var stale_drop_extension_if_exists = try tokenized.ParsedSql.initAlloc(alloc, "DROP EXTENSION IF EXISTS postgis CASCADE;");
-    defer stale_drop_extension_if_exists.deinit(alloc);
-    if (stale_drop_extension_if_exists.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .extension_index => |*ddl| ddl.if_exists = false,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_drop_extension_if_exists));
-
-    var stale_drop_extension_cascade = try tokenized.ParsedSql.initAlloc(alloc, "DROP EXTENSION IF EXISTS postgis CASCADE;");
-    defer stale_drop_extension_cascade.deinit(alloc);
-    if (stale_drop_extension_cascade.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .extension_index => |*ddl| ddl.cascade = false,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_drop_extension_cascade));
 
     try std.testing.expectError(error.UnsupportedSqlShape, generatedSimpleDdlPlanForTestAlloc(alloc, "CREATE DATABASE tenant_ops WITH OWNER app;"));
 
@@ -31109,6 +31109,739 @@ test "sql adapter generated simple DDL AST lowers to catalog plans" {
         error.UnsupportedSqlShape,
         simpleDdlPlanFromGeneratedAstAlloc(alloc, mismatched_kind.items(), mismatched_kind_ast),
     );
+}
+
+const GeneratedDefaultMetadataMutation = enum {
+    missing_create_table_value_range,
+    missing_create_table_clause_range,
+    missing_create_table_expression_tokens,
+    stale_create_table_expression_range,
+    stale_create_table_expression_kind,
+    stale_create_table_array_item_expression_kind,
+    stale_add_column_value_range,
+    stale_add_column_expression_kind,
+    stale_add_column_array_item_expression_kind,
+    stale_alter_set_default_expression_kind,
+    stale_alter_set_default_array_item_expression_kind,
+};
+
+fn mutateGeneratedDefaultArrayItemExpressionKind(
+    expressions: []generated_parser.GeneratedSqlExpressionAst,
+    expression_index: usize,
+) !void {
+    if (expression_index >= expressions.len) return error.TestUnexpectedResult;
+    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.array_constructor, expressions[expression_index].kind);
+    if (expressions[expression_index].array_items.expressions.len == 0) return error.TestUnexpectedResult;
+    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.token_range, expressions[expression_index].array_items.expressions[0].kind);
+    expressions[expression_index].array_items.expressions[0].kind = .additive;
+}
+
+fn applyGeneratedDefaultMetadataMutation(
+    ddl: *generated_parser.GeneratedSqlDdlAst,
+    mutation: GeneratedDefaultMetadataMutation,
+) !void {
+    switch (mutation) {
+        .missing_create_table_value_range => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl.kind);
+            if (ddl.alter_table_operation_default_value_items.len != 2) return error.TestUnexpectedResult;
+            try std.testing.expect(ddl.alter_table_operation_default_value_items[1] != null);
+            ddl.alter_table_operation_default_value_items[1] = null;
+        },
+        .missing_create_table_clause_range => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl.kind);
+            if (ddl.alter_table_operation_column_default_clause_items.len != 2) return error.TestUnexpectedResult;
+            try std.testing.expect(ddl.alter_table_operation_column_default_clause_items[1] != null);
+            ddl.alter_table_operation_column_default_clause_items[1] = null;
+        },
+        .missing_create_table_expression_tokens => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl.kind);
+            if (ddl.alter_table_operation_default_value_expressions.len != 2) return error.TestUnexpectedResult;
+            try std.testing.expect(ddl.alter_table_operation_default_value_expressions[1].tokens != null);
+            ddl.alter_table_operation_default_value_expressions[1].tokens = null;
+        },
+        .stale_create_table_expression_range => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl.kind);
+            if (ddl.alter_table_operation_default_value_expressions.len != 2) return error.TestUnexpectedResult;
+            var expression_range = ddl.alter_table_operation_default_value_expressions[1].tokens orelse return error.TestUnexpectedResult;
+            expression_range.start -= 1;
+            ddl.alter_table_operation_default_value_expressions[1].tokens = expression_range;
+        },
+        .stale_create_table_expression_kind => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl.kind);
+            if (ddl.alter_table_operation_default_value_expressions.len != 2) return error.TestUnexpectedResult;
+            try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.token_range, ddl.alter_table_operation_default_value_expressions[1].kind);
+            ddl.alter_table_operation_default_value_expressions[1].kind = .additive;
+        },
+        .stale_create_table_array_item_expression_kind => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl.kind);
+            try mutateGeneratedDefaultArrayItemExpressionKind(ddl.alter_table_operation_default_value_expressions, 1);
+        },
+        .stale_add_column_value_range => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+            if (ddl.alter_table_operation_default_value_items.len != 1) return error.TestUnexpectedResult;
+            try std.testing.expect(ddl.alter_table_operation_default_value_items[0] != null);
+            ddl.alter_table_operation_default_value_items[0].?.end += 1;
+        },
+        .stale_add_column_expression_kind => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+            if (ddl.alter_table_operation_default_value_expressions.len != 1) return error.TestUnexpectedResult;
+            try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.token_range, ddl.alter_table_operation_default_value_expressions[0].kind);
+            ddl.alter_table_operation_default_value_expressions[0].kind = .additive;
+        },
+        .stale_add_column_array_item_expression_kind => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+            try mutateGeneratedDefaultArrayItemExpressionKind(ddl.alter_table_operation_default_value_expressions, 0);
+        },
+        .stale_alter_set_default_expression_kind => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+            if (ddl.alter_table_operation_default_value_expressions.len != 1) return error.TestUnexpectedResult;
+            try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.token_range, ddl.alter_table_operation_default_value_expressions[0].kind);
+            ddl.alter_table_operation_default_value_expressions[0].kind = .additive;
+        },
+        .stale_alter_set_default_array_item_expression_kind => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+            try mutateGeneratedDefaultArrayItemExpressionKind(ddl.alter_table_operation_default_value_expressions, 0);
+        },
+    }
+}
+
+fn expectGeneratedDefaultMetadataMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedDefaultMetadataMutation,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .ddl => |*ddl| try applyGeneratedDefaultMetadataMutation(ddl, mutation),
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed, .{}));
+}
+
+const GeneratedColumnMetadataMutation = enum {
+    missing_create_table_expression_range,
+    missing_create_table_clause_range,
+    stale_create_table_expression_range,
+    stale_create_table_expression_kind,
+    stale_add_column_expression_kind,
+};
+
+fn applyGeneratedColumnMetadataMutation(
+    ddl: *generated_parser.GeneratedSqlDdlAst,
+    mutation: GeneratedColumnMetadataMutation,
+) !void {
+    switch (mutation) {
+        .missing_create_table_expression_range => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl.kind);
+            if (ddl.alter_table_operation_generated_expression_items.len < 2) return error.TestUnexpectedResult;
+            ddl.alter_table_operation_generated_expression_items[1] = null;
+        },
+        .missing_create_table_clause_range => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl.kind);
+            if (ddl.alter_table_operation_column_generated_clause_items.len < 2) return error.TestUnexpectedResult;
+            ddl.alter_table_operation_column_generated_clause_items[1] = null;
+        },
+        .stale_create_table_expression_range => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl.kind);
+            if (ddl.alter_table_operation_generated_expression_items.len < 2) return error.TestUnexpectedResult;
+            ddl.alter_table_operation_generated_expression_items[1].?.start += 1;
+        },
+        .stale_create_table_expression_kind => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl.kind);
+            if (ddl.alter_table_operation_generated_expressions.len < 2) return error.TestUnexpectedResult;
+            try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.function_call, ddl.alter_table_operation_generated_expressions[1].kind);
+            ddl.alter_table_operation_generated_expressions[1].kind = .token_range;
+        },
+        .stale_add_column_expression_kind => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+            if (ddl.alter_table_operation_generated_expressions.len != 1) return error.TestUnexpectedResult;
+            try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.function_call, ddl.alter_table_operation_generated_expressions[0].kind);
+            ddl.alter_table_operation_generated_expressions[0].kind = .token_range;
+        },
+    }
+}
+
+fn expectGeneratedColumnMetadataMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedColumnMetadataMutation,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .ddl => |*ddl| try applyGeneratedColumnMetadataMutation(ddl, mutation),
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed, .{}));
+}
+
+fn expectGeneratedColumnSubqueryUnsupportedFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    expected_expression_count: usize,
+    expression_index: usize,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .ddl => |ddl| {
+                try std.testing.expectEqual(expected_expression_count, ddl.alter_table_operation_generated_expressions.len);
+                try std.testing.expect(expression_index < ddl.alter_table_operation_generated_expressions.len);
+                try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.subquery, ddl.alter_table_operation_generated_expressions[expression_index].kind);
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed, .{}));
+}
+
+fn expectGeneratedColumnExpressionItemMissingFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .ddl => |*ddl| {
+                if (ddl.alter_table_operation_generated_expression_items.len == 0) return error.TestUnexpectedResult;
+                ddl.alter_table_operation_generated_expression_items[0] = null;
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed, .{}));
+}
+
+const GeneratedIdentityColumnMetadataMutation = enum {
+    missing_clause,
+    stale_clause,
+};
+
+fn expectGeneratedIdentityColumnMetadataMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedIdentityColumnMetadataMutation,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .ddl => |*ddl| {
+                if (ddl.alter_table_operation_column_identity_clause_items.len < 1) return error.TestUnexpectedResult;
+                try std.testing.expect(ddl.alter_table_operation_column_identity_clause_items[0] != null);
+                switch (mutation) {
+                    .missing_clause => ddl.alter_table_operation_column_identity_clause_items[0] = null,
+                    .stale_clause => ddl.alter_table_operation_column_identity_clause_items[0].?.end -= 1,
+                }
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed, .{}));
+}
+
+const GeneratedCreateTableItemMetadataMutation = enum {
+    missing_items,
+    corrupt_first_item,
+    stale_count,
+    stale_second_item,
+};
+
+fn applyGeneratedCreateTableItemMetadataMutation(
+    ddl: *generated_parser.GeneratedSqlDdlAst,
+    mutation: GeneratedCreateTableItemMetadataMutation,
+) !void {
+    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl.kind);
+    switch (mutation) {
+        .missing_items => {
+            ddl.alter_table_operation_items = .{};
+            ddl.alter_table_operation_tokens = null;
+        },
+        .corrupt_first_item => {
+            if (ddl.alter_table_operation_items.first_tokens) |*first_item| {
+                first_item.start += 1;
+            } else return error.TestUnexpectedResult;
+        },
+        .stale_count => ddl.alter_table_operation_items.count -= 1,
+        .stale_second_item => ddl.alter_table_operation_items.items[1].start += 1,
+    }
+}
+
+fn expectGeneratedCreateTableItemMetadataMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedCreateTableItemMetadataMutation,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .ddl => |*ddl| try applyGeneratedCreateTableItemMetadataMutation(ddl, mutation),
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed, .{}));
+}
+
+const GeneratedCreateTableStorageParameterMutation = enum {
+    missing_tail,
+    corrupt_item,
+    corrupt_name,
+    corrupt_value,
+    missing_system_versioned_tail,
+};
+
+fn applyGeneratedCreateTableStorageParameterMutation(
+    ddl: *generated_parser.GeneratedSqlDdlAst,
+    mutation: GeneratedCreateTableStorageParameterMutation,
+) !void {
+    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl.kind);
+    switch (mutation) {
+        .missing_tail => ddl.create_table_storage_parameter_tokens = null,
+        .corrupt_item => {
+            if (ddl.create_table_storage_parameter_items.first_tokens) |*first_item| {
+                first_item.start += 1;
+            } else return error.TestUnexpectedResult;
+        },
+        .corrupt_name => {
+            if (ddl.create_table_storage_parameter_name_items.len == 0) return error.TestUnexpectedResult;
+            ddl.create_table_storage_parameter_name_items[0].end += 1;
+        },
+        .corrupt_value => {
+            if (ddl.create_table_storage_parameter_value_items.len == 0) return error.TestUnexpectedResult;
+            ddl.create_table_storage_parameter_value_items[0].start -= 1;
+        },
+        .missing_system_versioned_tail => ddl.create_table_system_versioned_tokens = null,
+    }
+}
+
+fn expectGeneratedCreateTableStorageParameterMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedCreateTableStorageParameterMutation,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .ddl => |*ddl| try applyGeneratedCreateTableStorageParameterMutation(ddl, mutation),
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed, .{}));
+}
+
+fn expectGeneratedDdlObjectNameMetadataMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    expect_logical_failure: bool,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .ddl => |*ddl| ddl.object_name_tokens = .{ .start = 1, .end = 2 },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
+    if (expect_logical_failure) {
+        try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed, .{}));
+    }
+}
+
+fn expectGeneratedDdlCommandSpanMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .ddl => |*ddl| ddl.command_span.end += 1,
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed, .{}));
+}
+
+fn expectGeneratedDdlLogicalObjectNameMissingFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .ddl => |*ddl| {
+                ddl.object_name_tokens = null;
+                try std.testing.expectError(
+                    error.UnsupportedSqlShape,
+                    logicalDdlPlanFromGeneratedAstAlloc(
+                        alloc,
+                        parsed.items(),
+                        ddl.*,
+                        defaultDdlPlanParserOptionsForTest(alloc, parsed.items()),
+                    ),
+                );
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+}
+
+const GeneratedAlterTableOperationMetadataMutation = enum {
+    stale_operation_tail,
+    stale_second_operation_item,
+};
+
+fn expectGeneratedAlterTableOperationMetadataMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedAlterTableOperationMetadataMutation,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .ddl => |*ddl| switch (mutation) {
+                .stale_operation_tail => ddl.alter_table_operation_tokens.?.start += 1,
+                .stale_second_operation_item => ddl.alter_table_operation_items.items[1].start += 1,
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed, .{}));
+}
+
+const GeneratedAlterRewriteMetadataMutation = enum {
+    missing_expression,
+    stale_expression,
+};
+
+fn expectGeneratedAlterRewriteMetadataMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedAlterRewriteMetadataMutation,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .ddl => |*ddl| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+                if (ddl.alter_table_operation_rewrite_expression_items.len == 0) return error.TestUnexpectedResult;
+                switch (mutation) {
+                    .missing_expression => ddl.alter_table_operation_rewrite_expression_items[0] = null,
+                    .stale_expression => ddl.alter_table_operation_rewrite_expression_items[0].?.start += 1,
+                }
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed, .{}));
+}
+
+const GeneratedColumnDefinitionMetadataMutation = enum {
+    missing_create_table_column_name,
+    stale_add_column_type,
+    missing_create_table_nullability,
+    stale_add_column_nullability,
+    missing_create_table_collation,
+    stale_add_column_collation,
+};
+
+fn applyGeneratedColumnDefinitionMetadataMutation(
+    ddl: *generated_parser.GeneratedSqlDdlAst,
+    mutation: GeneratedColumnDefinitionMetadataMutation,
+) !void {
+    switch (mutation) {
+        .missing_create_table_column_name => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl.kind);
+            if (ddl.alter_table_operation_column_name_items.len != 2) return error.TestUnexpectedResult;
+            if (ddl.alter_table_operation_column_type_items.len != 2) return error.TestUnexpectedResult;
+            try std.testing.expect(ddl.alter_table_operation_column_name_items[1] != null);
+            try std.testing.expect(ddl.alter_table_operation_column_type_items[1] != null);
+            ddl.alter_table_operation_column_name_items[1] = null;
+        },
+        .stale_add_column_type => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+            if (ddl.alter_table_operation_column_type_items.len != 1) return error.TestUnexpectedResult;
+            try std.testing.expect(ddl.alter_table_operation_column_type_items[0] != null);
+            ddl.alter_table_operation_column_type_items[0].?.end += 1;
+        },
+        .missing_create_table_nullability => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl.kind);
+            if (ddl.alter_table_operation_column_nullability_items.len != 2) return error.TestUnexpectedResult;
+            try std.testing.expect(ddl.alter_table_operation_column_nullability_items[0] != null);
+            ddl.alter_table_operation_column_nullability_items[0] = null;
+        },
+        .stale_add_column_nullability => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+            if (ddl.alter_table_operation_column_nullability_items.len != 1) return error.TestUnexpectedResult;
+            try std.testing.expect(ddl.alter_table_operation_column_nullability_items[0] != null);
+            ddl.alter_table_operation_column_nullability_items[0].?.end -= 1;
+        },
+        .missing_create_table_collation => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl.kind);
+            if (ddl.alter_table_operation_column_collation_items.len != 2) return error.TestUnexpectedResult;
+            try std.testing.expect(ddl.alter_table_operation_column_collation_items[0] != null);
+            ddl.alter_table_operation_column_collation_items[0] = null;
+        },
+        .stale_add_column_collation => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+            if (ddl.alter_table_operation_column_collation_items.len != 1) return error.TestUnexpectedResult;
+            try std.testing.expect(ddl.alter_table_operation_column_collation_items[0] != null);
+            ddl.alter_table_operation_column_collation_items[0].?.end -= 1;
+        },
+    }
+}
+
+fn expectGeneratedColumnDefinitionMetadataMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedColumnDefinitionMetadataMutation,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .ddl => |*ddl| try applyGeneratedColumnDefinitionMetadataMutation(ddl, mutation),
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed, .{}));
+}
+
+const GeneratedTableConstraintMetadataMutation = enum {
+    missing_create_table_constraint_kind,
+    stale_alter_table_constraint_name,
+    stale_alter_table_unique_include,
+    missing_alter_table_unique_not_valid,
+    missing_alter_table_foreign_key_payload,
+    stale_alter_table_foreign_key_not_valid,
+    missing_alter_table_check_payload,
+    stale_alter_table_check_payload_expression_kind,
+    missing_alter_table_check_payload_expression_tokens,
+    missing_alter_table_check_payload_operator_tokens,
+    stale_create_table_check_payload_expression_kind,
+    stale_alter_table_check_not_valid,
+};
+
+fn applyGeneratedTableConstraintMetadataMutation(
+    ddl: *generated_parser.GeneratedSqlDdlAst,
+    mutation: GeneratedTableConstraintMetadataMutation,
+) !void {
+    switch (mutation) {
+        .missing_create_table_constraint_kind => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl.kind);
+            if (ddl.alter_table_operation_constraint_kind_items.len != 2) return error.TestUnexpectedResult;
+            try std.testing.expect(ddl.alter_table_operation_constraint_kind_items[1] != null);
+            ddl.alter_table_operation_constraint_kind_items[1] = null;
+        },
+        .stale_alter_table_constraint_name => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+            if (ddl.alter_table_operation_constraint_name_items.len != 1) return error.TestUnexpectedResult;
+            try std.testing.expect(ddl.alter_table_operation_constraint_name_items[0] != null);
+            ddl.alter_table_operation_constraint_name_items[0].?.start -= 1;
+        },
+        .stale_alter_table_unique_include => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+            if (ddl.alter_table_operation_constraint_include_items.len != 1) return error.TestUnexpectedResult;
+            try std.testing.expect(ddl.alter_table_operation_constraint_include_items[0] != null);
+            ddl.alter_table_operation_constraint_include_items[0].?.end -= 1;
+        },
+        .missing_alter_table_unique_not_valid => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+            if (ddl.alter_table_operation_constraint_not_valid_items.len != 1) return error.TestUnexpectedResult;
+            try std.testing.expect(ddl.alter_table_operation_constraint_not_valid_items[0] != null);
+            ddl.alter_table_operation_constraint_not_valid_items[0] = null;
+        },
+        .missing_alter_table_foreign_key_payload => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+            if (ddl.alter_table_operation_foreign_key_payload_items.len != 1) return error.TestUnexpectedResult;
+            try std.testing.expect(ddl.alter_table_operation_foreign_key_payload_items[0] != null);
+            ddl.alter_table_operation_foreign_key_payload_items[0] = null;
+        },
+        .stale_alter_table_foreign_key_not_valid => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+            if (ddl.alter_table_operation_foreign_key_not_valid_items.len != 1) return error.TestUnexpectedResult;
+            try std.testing.expect(ddl.alter_table_operation_foreign_key_not_valid_items[0] != null);
+            ddl.alter_table_operation_foreign_key_not_valid_items[0].?.end -= 1;
+        },
+        .missing_alter_table_check_payload => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+            if (ddl.alter_table_operation_check_payload_items.len != 1) return error.TestUnexpectedResult;
+            try std.testing.expect(ddl.alter_table_operation_check_payload_items[0] != null);
+            ddl.alter_table_operation_check_payload_items[0] = null;
+        },
+        .stale_alter_table_check_payload_expression_kind => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+            if (ddl.alter_table_operation_check_payload_expressions.len != 1) return error.TestUnexpectedResult;
+            ddl.alter_table_operation_check_payload_expressions[0].kind = .token_range;
+        },
+        .missing_alter_table_check_payload_expression_tokens => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+            if (ddl.alter_table_operation_check_payload_expressions.len != 1) return error.TestUnexpectedResult;
+            ddl.alter_table_operation_check_payload_expressions[0].tokens = null;
+        },
+        .missing_alter_table_check_payload_operator_tokens => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+            if (ddl.alter_table_operation_check_payload_expressions.len != 1) return error.TestUnexpectedResult;
+            const grouped = &ddl.alter_table_operation_check_payload_expressions[0];
+            const comparison = grouped.inner_expression orelse return error.TestUnexpectedResult;
+            comparison.operator_tokens = null;
+        },
+        .stale_create_table_check_payload_expression_kind => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl.kind);
+            if (ddl.alter_table_operation_check_payload_expressions.len != 2) return error.TestUnexpectedResult;
+            ddl.alter_table_operation_check_payload_expressions[1].kind = .token_range;
+        },
+        .stale_alter_table_check_not_valid => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+            if (ddl.alter_table_operation_check_not_valid_items.len != 1) return error.TestUnexpectedResult;
+            try std.testing.expect(ddl.alter_table_operation_check_not_valid_items[0] != null);
+            ddl.alter_table_operation_check_not_valid_items[0].?.end -= 1;
+        },
+    }
+}
+
+fn expectGeneratedTableConstraintMetadataMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedTableConstraintMetadataMutation,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .ddl => |*ddl| try applyGeneratedTableConstraintMetadataMutation(ddl, mutation),
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed, .{}));
+}
+
+const GeneratedInlineConstraintMetadataMutation = enum {
+    missing_create_table_inline_constraint_kind,
+    stale_create_table_inline_constraint_name,
+    missing_add_column_inline_foreign_key_payload,
+    stale_add_column_inline_foreign_key_not_valid,
+    missing_add_column_inline_check_payload,
+    stale_add_column_inline_check_payload_expression_kind,
+    stale_create_table_inline_check_payload_expression_kind,
+    stale_add_column_inline_check_not_valid,
+    stale_add_column_inline_constraint_kind,
+    stale_create_table_inline_timing,
+    missing_add_column_inline_not_valid,
+};
+
+fn applyGeneratedInlineConstraintMetadataMutation(
+    ddl: *generated_parser.GeneratedSqlDdlAst,
+    mutation: GeneratedInlineConstraintMetadataMutation,
+) !void {
+    switch (mutation) {
+        .missing_create_table_inline_constraint_kind => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl.kind);
+            if (ddl.alter_table_operation_inline_constraint_items.count != 2) return error.TestUnexpectedResult;
+            if (ddl.alter_table_operation_inline_constraint_kind_items.len != 2) return error.TestUnexpectedResult;
+            ddl.alter_table_operation_inline_constraint_kind_items[0].end -= 1;
+        },
+        .stale_create_table_inline_constraint_name => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl.kind);
+            if (ddl.alter_table_operation_inline_constraint_name_items.len != 2) return error.TestUnexpectedResult;
+            try std.testing.expect(ddl.alter_table_operation_inline_constraint_name_items[0] != null);
+            ddl.alter_table_operation_inline_constraint_name_items[0].?.start -= 1;
+        },
+        .missing_add_column_inline_foreign_key_payload => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+            if (ddl.alter_table_operation_inline_foreign_key_payload_items.len != 1) return error.TestUnexpectedResult;
+            try std.testing.expect(ddl.alter_table_operation_inline_foreign_key_payload_items[0] != null);
+            ddl.alter_table_operation_inline_foreign_key_payload_items[0] = null;
+        },
+        .stale_add_column_inline_foreign_key_not_valid => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+            if (ddl.alter_table_operation_inline_foreign_key_not_valid_items.len != 1) return error.TestUnexpectedResult;
+            try std.testing.expect(ddl.alter_table_operation_inline_foreign_key_not_valid_items[0] != null);
+            ddl.alter_table_operation_inline_foreign_key_not_valid_items[0].?.start -= 1;
+        },
+        .missing_add_column_inline_check_payload => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+            if (ddl.alter_table_operation_inline_check_payload_items.len != 1) return error.TestUnexpectedResult;
+            try std.testing.expect(ddl.alter_table_operation_inline_check_payload_items[0] != null);
+            ddl.alter_table_operation_inline_check_payload_items[0] = null;
+        },
+        .stale_add_column_inline_check_payload_expression_kind => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+            if (ddl.alter_table_operation_inline_check_payload_expressions.len != 1) return error.TestUnexpectedResult;
+            ddl.alter_table_operation_inline_check_payload_expressions[0].kind = .token_range;
+        },
+        .stale_create_table_inline_check_payload_expression_kind => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl.kind);
+            if (ddl.alter_table_operation_inline_check_payload_expressions.len != 1) return error.TestUnexpectedResult;
+            ddl.alter_table_operation_inline_check_payload_expressions[0].kind = .token_range;
+        },
+        .stale_add_column_inline_check_not_valid => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+            if (ddl.alter_table_operation_inline_check_not_valid_items.len != 1) return error.TestUnexpectedResult;
+            try std.testing.expect(ddl.alter_table_operation_inline_check_not_valid_items[0] != null);
+            ddl.alter_table_operation_inline_check_not_valid_items[0].?.start -= 1;
+        },
+        .stale_add_column_inline_constraint_kind => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+            if (ddl.alter_table_operation_inline_constraint_items.count != 1) return error.TestUnexpectedResult;
+            if (ddl.alter_table_operation_inline_constraint_kind_items.len != 1) return error.TestUnexpectedResult;
+            ddl.alter_table_operation_inline_constraint_kind_items[0].start -= 1;
+        },
+        .stale_create_table_inline_timing => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl.kind);
+            if (ddl.alter_table_operation_inline_constraint_timing_items.len != 1) return error.TestUnexpectedResult;
+            try std.testing.expect(ddl.alter_table_operation_inline_constraint_timing_items[0] != null);
+            ddl.alter_table_operation_inline_constraint_timing_items[0].?.start += 1;
+        },
+        .missing_add_column_inline_not_valid => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
+            if (ddl.alter_table_operation_inline_constraint_not_valid_items.len != 1) return error.TestUnexpectedResult;
+            try std.testing.expect(ddl.alter_table_operation_inline_constraint_not_valid_items[0] != null);
+            ddl.alter_table_operation_inline_constraint_not_valid_items[0] = null;
+        },
+    }
+}
+
+fn expectGeneratedInlineConstraintMetadataMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedInlineConstraintMetadataMutation,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .ddl => |*ddl| try applyGeneratedInlineConstraintMetadataMutation(ddl, mutation),
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed, .{}));
 }
 
 test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
@@ -31191,64 +31924,16 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
         else => return error.TestUnexpectedResult,
     }
 
-    var missing_generated_create_table_items = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text PRIMARY KEY, status text NOT NULL);");
-    defer missing_generated_create_table_items.deinit(alloc);
-    if (missing_generated_create_table_items.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    ddl.alter_table_operation_items = .{};
-                    ddl.alter_table_operation_tokens = null;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_generated_create_table_items));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_generated_create_table_items, .{}));
-
-    var corrupt_generated_create_table_item = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text PRIMARY KEY, status text NOT NULL);");
-    defer corrupt_generated_create_table_item.deinit(alloc);
-    if (corrupt_generated_create_table_item.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    if (ddl.alter_table_operation_items.first_tokens) |*first_item| {
-                        first_item.start += 1;
-                    } else return error.TestUnexpectedResult;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &corrupt_generated_create_table_item));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &corrupt_generated_create_table_item, .{}));
-
-    var stale_generated_create_table_count = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text PRIMARY KEY, status text NOT NULL);");
-    defer stale_generated_create_table_count.deinit(alloc);
-    if (stale_generated_create_table_count.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.alter_table_operation_items.count -= 1,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_generated_create_table_count));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &stale_generated_create_table_count, .{}));
-
-    var stale_generated_create_table_second_item = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text PRIMARY KEY, status text NOT NULL);");
-    defer stale_generated_create_table_second_item.deinit(alloc);
-    if (stale_generated_create_table_second_item.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.alter_table_operation_items.items[1].start += 1,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_generated_create_table_second_item));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &stale_generated_create_table_second_item, .{}));
+    const create_table_items_sql = "CREATE TABLE generated_usage_records (id text PRIMARY KEY, status text NOT NULL);";
+    const create_table_item_list_metadata_cases = [_]GeneratedCreateTableItemMetadataMutation{
+        .missing_items,
+        .corrupt_first_item,
+        .stale_count,
+    };
+    for (create_table_item_list_metadata_cases) |mutation| {
+        try expectGeneratedCreateTableItemMetadataMutationFails(alloc, create_table_items_sql, mutation);
+    }
+    try expectGeneratedCreateTableItemMetadataMutationFails(alloc, create_table_items_sql, .stale_second_item);
 
     var runtime_generated_column_table = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text, status_key text GENERATED ALWAYS AS (lower(id)) STORED);");
     defer runtime_generated_column_table.deinit(alloc);
@@ -31264,53 +31949,207 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
         else => return error.TestUnexpectedResult,
     }
 
-    var missing_generated_column_expression = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text, status_key text GENERATED ALWAYS AS (lower(id)) STORED);");
-    defer missing_generated_column_expression.deinit(alloc);
-    if (missing_generated_column_expression.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    if (ddl.alter_table_operation_generated_expression_items.len < 2) return error.TestUnexpectedResult;
-                    ddl.alter_table_operation_generated_expression_items[1] = null;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_generated_column_expression));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_generated_column_expression, .{}));
+    const create_table_generated_cast_column_sql = "CREATE TABLE generated_usage_records (id text, amount numeric, amount_text text GENERATED ALWAYS AS (CAST(amount AS text)) STORED);";
+    var runtime_generated_cast_column_table = try tokenized.ParsedSql.initAlloc(alloc, create_table_generated_cast_column_sql);
+    defer runtime_generated_cast_column_table.deinit(alloc);
+    var runtime_generated_cast_column_table_plan = try runtimeDdlPlanParsedSqlAlloc(alloc, &runtime_generated_cast_column_table);
+    defer runtime_generated_cast_column_table_plan.deinit(alloc);
+    switch (runtime_generated_cast_column_table_plan) {
+        .create_table => |plan| {
+            try std.testing.expectEqual(@as(usize, 3), plan.columns.len);
+            try std.testing.expectEqualStrings("amount_text", plan.columns[2].name);
+            try std.testing.expect(plan.columns[2].generated != null);
+            try expectGeneratedCastExpressionForTest(plan.columns[2].generated.?, .text, "amount");
+            const applied = try runtimeSchemaFromCreateTablePlanAlloc(alloc, plan);
+            defer runtime_schema.freeSchema(alloc, applied);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 
-    var missing_generated_column_clause = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text, status_key text GENERATED ALWAYS AS (lower(id)) STORED);");
-    defer missing_generated_column_clause.deinit(alloc);
-    if (missing_generated_column_clause.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    if (ddl.alter_table_operation_column_generated_clause_items.len < 2) return error.TestUnexpectedResult;
-                    ddl.alter_table_operation_column_generated_clause_items[1] = null;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_generated_column_clause));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_generated_column_clause, .{}));
+    const create_table_generated_temporal_column_sql = "CREATE TABLE generated_usage_records (id text, amount numeric, amount_bucket timestamptz GENERATED ALWAYS AS (date_bin(INTERVAL '1 hour', amount, 0)) STORED);";
+    var runtime_generated_temporal_column_table = try tokenized.ParsedSql.initAlloc(alloc, create_table_generated_temporal_column_sql);
+    defer runtime_generated_temporal_column_table.deinit(alloc);
+    var runtime_generated_temporal_column_table_plan = try runtimeDdlPlanParsedSqlAlloc(alloc, &runtime_generated_temporal_column_table);
+    defer runtime_generated_temporal_column_table_plan.deinit(alloc);
+    switch (runtime_generated_temporal_column_table_plan) {
+        .create_table => |plan| {
+            try std.testing.expectEqual(@as(usize, 3), plan.columns.len);
+            try std.testing.expectEqualStrings("amount_bucket", plan.columns[2].name);
+            try std.testing.expect(plan.columns[2].generated != null);
+            try expectGeneratedDateBinExpressionForTest(plan.columns[2].generated.?, "amount");
+            const applied = try runtimeSchemaFromCreateTablePlanAlloc(alloc, plan);
+            defer runtime_schema.freeSchema(alloc, applied);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 
-    var stale_generated_column_expression = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text, status_key text GENERATED ALWAYS AS (lower(id)) STORED);");
-    defer stale_generated_column_expression.deinit(alloc);
-    if (stale_generated_column_expression.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    if (ddl.alter_table_operation_generated_expression_items.len < 2) return error.TestUnexpectedResult;
-                    ddl.alter_table_operation_generated_expression_items[1].?.start += 1;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_generated_column_expression));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &stale_generated_column_expression, .{}));
+    const create_table_generated_array_column_sql = "CREATE TABLE generated_usage_records (id text, tags text[] GENERATED ALWAYS AS (ARRAY['new','hot']) STORED);";
+    var runtime_generated_array_column_table = try tokenized.ParsedSql.initAlloc(alloc, create_table_generated_array_column_sql);
+    defer runtime_generated_array_column_table.deinit(alloc);
+    var runtime_generated_array_column_table_plan = try runtimeDdlPlanParsedSqlAlloc(alloc, &runtime_generated_array_column_table);
+    defer runtime_generated_array_column_table_plan.deinit(alloc);
+    switch (runtime_generated_array_column_table_plan) {
+        .create_table => |plan| {
+            try std.testing.expectEqual(@as(usize, 2), plan.columns.len);
+            try std.testing.expectEqualStrings("tags", plan.columns[1].name);
+            try std.testing.expect(plan.columns[1].generated != null);
+            try expectGeneratedArrayLiteralExpressionForTest(plan.columns[1].generated.?, "[\"new\",\"hot\"]");
+            const applied = try runtimeSchemaFromCreateTablePlanAlloc(alloc, plan);
+            defer runtime_schema.freeSchema(alloc, applied);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const create_table_generated_array_function_column_sql =
+        \\CREATE TABLE generated_usage_records (
+        \\  id text,
+        \\  tags text[] GENERATED ALWAYS AS (string_to_array(id, ',')) STORED,
+        \\  tag_count numeric GENERATED ALWAYS AS (array_length(tags, 1)) STORED,
+        \\  tag_text text GENERATED ALWAYS AS (array_to_string(tags, ',')) STORED
+        \\);
+    ;
+    var runtime_generated_array_function_column_table = try tokenized.ParsedSql.initAlloc(alloc, create_table_generated_array_function_column_sql);
+    defer runtime_generated_array_function_column_table.deinit(alloc);
+    var runtime_generated_array_function_column_table_plan = try runtimeDdlPlanParsedSqlAlloc(alloc, &runtime_generated_array_function_column_table);
+    defer runtime_generated_array_function_column_table_plan.deinit(alloc);
+    switch (runtime_generated_array_function_column_table_plan) {
+        .create_table => |plan| {
+            try std.testing.expectEqual(@as(usize, 4), plan.columns.len);
+            try expectGeneratedArrayFunctionExpressionForTest(plan.columns[1].generated.?, .string_to_array, @as(usize, 2));
+            try expectGeneratedArrayFunctionExpressionForTest(plan.columns[2].generated.?, .array_length, @as(usize, 1));
+            try expectGeneratedArrayFunctionExpressionForTest(plan.columns[3].generated.?, .array_to_string, @as(usize, 2));
+            const applied = try runtimeSchemaFromCreateTablePlanAlloc(alloc, plan);
+            defer runtime_schema.freeSchema(alloc, applied);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var runtime_generated_array_function_type_mismatch_table = try runtimeDdlPlanForTestAlloc(
+        alloc,
+        "CREATE TABLE generated_usage_records (id text, tags text[] GENERATED ALWAYS AS (array_length(tags, 1)) STORED);",
+    );
+    defer runtime_generated_array_function_type_mismatch_table.deinit(alloc);
+    switch (runtime_generated_array_function_type_mismatch_table) {
+        .create_table => |plan| try std.testing.expectError(error.InvalidSqlCatalog, runtimeSchemaFromCreateTablePlanAlloc(alloc, plan)),
+        else => return error.TestUnexpectedResult,
+    }
+
+    var runtime_generated_nondeterministic_column_table = try runtimeDdlPlanForTestAlloc(
+        alloc,
+        "CREATE TABLE generated_usage_records (id text, planned_at timestamptz GENERATED ALWAYS AS (CURRENT_TIMESTAMP(6)) STORED);",
+    );
+    defer runtime_generated_nondeterministic_column_table.deinit(alloc);
+    switch (runtime_generated_nondeterministic_column_table) {
+        .create_table => |plan| try std.testing.expectError(error.InvalidSqlCatalog, runtimeSchemaFromCreateTablePlanAlloc(alloc, plan)),
+        else => return error.TestUnexpectedResult,
+    }
+
+    var runtime_generated_cast_type_mismatch_table = try runtimeDdlPlanForTestAlloc(
+        alloc,
+        "CREATE TABLE generated_usage_records (id text, amount numeric, amount_text text GENERATED ALWAYS AS (CAST(amount AS numeric)) STORED);",
+    );
+    defer runtime_generated_cast_type_mismatch_table.deinit(alloc);
+    switch (runtime_generated_cast_type_mismatch_table) {
+        .create_table => |plan| try std.testing.expectError(error.InvalidSqlCatalog, runtimeSchemaFromCreateTablePlanAlloc(alloc, plan)),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const create_table_generated_column_sql = "CREATE TABLE generated_usage_records (id text, status_key text GENERATED ALWAYS AS (lower(id)) STORED);";
+    const add_generated_column_sql = "ALTER TABLE generated_usage_records ADD COLUMN status_key text GENERATED ALWAYS AS (lower(id)) STORED;";
+    const add_generated_cast_column_sql = "ALTER TABLE generated_usage_records ADD COLUMN amount_text text GENERATED ALWAYS AS (CAST(amount AS text)) STORED;";
+    var runtime_generated_cast_add_column = try tokenized.ParsedSql.initAlloc(alloc, add_generated_cast_column_sql);
+    defer runtime_generated_cast_add_column.deinit(alloc);
+    var runtime_generated_cast_add_column_plan = try runtimeDdlPlanParsedSqlAlloc(alloc, &runtime_generated_cast_add_column);
+    defer runtime_generated_cast_add_column_plan.deinit(alloc);
+    switch (runtime_generated_cast_add_column_plan) {
+        .alter_table => |plan| switch (plan.operations[0]) {
+            .add_column => |operation| {
+                try std.testing.expectEqualStrings("amount_text", operation.column.name);
+                try std.testing.expect(operation.column.generated != null);
+                try expectGeneratedCastExpressionForTest(operation.column.generated.?, .text, "amount");
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const generated_column_metadata_cases = [_]struct {
+        sql: []const u8,
+        mutation: GeneratedColumnMetadataMutation,
+    }{
+        .{ .sql = create_table_generated_column_sql, .mutation = .missing_create_table_expression_range },
+        .{ .sql = create_table_generated_column_sql, .mutation = .missing_create_table_clause_range },
+        .{ .sql = create_table_generated_column_sql, .mutation = .stale_create_table_expression_range },
+        .{ .sql = create_table_generated_column_sql, .mutation = .stale_create_table_expression_kind },
+        .{ .sql = add_generated_column_sql, .mutation = .stale_add_column_expression_kind },
+    };
+    for (generated_column_metadata_cases) |case| {
+        try expectGeneratedColumnMetadataMutationFails(alloc, case.sql, case.mutation);
+    }
+    try expectGeneratedDdlExpressionKindMutationFailsAtPublicBoundaries(
+        alloc,
+        create_table_generated_cast_column_sql,
+        2,
+        .cast,
+        .token_range,
+        .{},
+    );
+    try expectGeneratedDdlExpressionKindMutationFailsAtPublicBoundaries(
+        alloc,
+        create_table_generated_temporal_column_sql,
+        2,
+        .function_call,
+        .token_range,
+        .{},
+    );
+    try expectGeneratedDdlExpressionKindMutationFailsAtPublicBoundaries(
+        alloc,
+        create_table_generated_array_column_sql,
+        1,
+        .array_constructor,
+        .token_range,
+        .{},
+    );
+    try expectGeneratedDdlExpressionKindMutationFailsAtPublicBoundaries(
+        alloc,
+        create_table_generated_array_function_column_sql,
+        1,
+        .function_call,
+        .token_range,
+        .{},
+    );
+    try expectGeneratedDdlExpressionKindMutationFailsAtPublicBoundaries(
+        alloc,
+        add_generated_cast_column_sql,
+        0,
+        .cast,
+        .token_range,
+        .{},
+    );
+
+    const identity_column_metadata_cases = [_]struct {
+        sql: []const u8,
+        mutation: GeneratedIdentityColumnMetadataMutation,
+    }{
+        .{ .sql = "CREATE TABLE generated_usage_records (id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, status text);", .mutation = .missing_clause },
+        .{ .sql = "CREATE TABLE generated_usage_records (id bigint GENERATED ALWAYS AS IDENTITY (START WITH 100) PRIMARY KEY, status text);", .mutation = .stale_clause },
+    };
+    for (identity_column_metadata_cases) |case| {
+        try expectGeneratedIdentityColumnMetadataMutationFails(alloc, case.sql, case.mutation);
+    }
+
+    try expectGeneratedColumnSubqueryUnsupportedFails(
+        alloc,
+        "CREATE TABLE generated_usage_records (id text, status_key text GENERATED ALWAYS AS ((SELECT lower(id) FROM generated_usage_records LIMIT 1)) STORED);",
+        2,
+        1,
+    );
+    try expectGeneratedColumnSubqueryUnsupportedFails(
+        alloc,
+        "ALTER TABLE generated_usage_records ADD COLUMN status_key text GENERATED ALWAYS AS ((SELECT lower(id) FROM generated_usage_records LIMIT 1)) STORED;",
+        1,
+        0,
+    );
 
     var runtime_create_table_relational_tail = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records_tail (id text PRIMARY KEY) WITH (antfly.storage_mode = 'relational') WITH SYSTEM VERSIONING;");
     defer runtime_create_table_relational_tail.deinit(alloc);
@@ -31325,80 +32164,22 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
         else => return error.TestUnexpectedResult,
     }
 
-    var missing_generated_create_table_storage_tail = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records_tail (id text PRIMARY KEY) WITH (antfly.storage_mode = 'relational');");
-    defer missing_generated_create_table_storage_tail.deinit(alloc);
-    if (missing_generated_create_table_storage_tail.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.create_table_storage_parameter_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_generated_create_table_storage_tail));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_generated_create_table_storage_tail, .{}));
+    const create_table_storage_sql = "CREATE TABLE generated_usage_records_tail (id text PRIMARY KEY) WITH (antfly.storage_mode = 'relational');";
+    const create_table_storage_metadata_cases = [_]GeneratedCreateTableStorageParameterMutation{
+        .missing_tail,
+        .corrupt_item,
+        .corrupt_name,
+        .corrupt_value,
+    };
+    for (create_table_storage_metadata_cases) |mutation| {
+        try expectGeneratedCreateTableStorageParameterMutationFails(alloc, create_table_storage_sql, mutation);
+    }
 
-    var corrupt_generated_create_table_storage_item = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records_tail (id text PRIMARY KEY) WITH (antfly.storage_mode = 'relational');");
-    defer corrupt_generated_create_table_storage_item.deinit(alloc);
-    if (corrupt_generated_create_table_storage_item.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    if (ddl.create_table_storage_parameter_items.first_tokens) |*first_item| {
-                        first_item.start += 1;
-                    } else return error.TestUnexpectedResult;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &corrupt_generated_create_table_storage_item));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &corrupt_generated_create_table_storage_item, .{}));
-
-    var corrupt_generated_create_table_storage_name = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records_tail (id text PRIMARY KEY) WITH (antfly.storage_mode = 'relational');");
-    defer corrupt_generated_create_table_storage_name.deinit(alloc);
-    if (corrupt_generated_create_table_storage_name.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    if (ddl.create_table_storage_parameter_name_items.len == 0) return error.TestUnexpectedResult;
-                    ddl.create_table_storage_parameter_name_items[0].end += 1;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &corrupt_generated_create_table_storage_name));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &corrupt_generated_create_table_storage_name, .{}));
-
-    var corrupt_generated_create_table_storage_value = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records_tail (id text PRIMARY KEY) WITH (antfly.storage_mode = 'relational');");
-    defer corrupt_generated_create_table_storage_value.deinit(alloc);
-    if (corrupt_generated_create_table_storage_value.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    if (ddl.create_table_storage_parameter_value_items.len == 0) return error.TestUnexpectedResult;
-                    ddl.create_table_storage_parameter_value_items[0].start -= 1;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &corrupt_generated_create_table_storage_value));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &corrupt_generated_create_table_storage_value, .{}));
-
-    var missing_generated_create_table_system_tail = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records_tail (id text PRIMARY KEY) WITH SYSTEM VERSIONING;");
-    defer missing_generated_create_table_system_tail.deinit(alloc);
-    if (missing_generated_create_table_system_tail.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.create_table_system_versioned_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_generated_create_table_system_tail));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_generated_create_table_system_tail, .{}));
+    try expectGeneratedCreateTableStorageParameterMutationFails(
+        alloc,
+        "CREATE TABLE generated_usage_records_tail (id text PRIMARY KEY) WITH SYSTEM VERSIONING;",
+        .missing_system_versioned_tail,
+    );
 
     var runtime_create_table_check = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text PRIMARY KEY, status text, CONSTRAINT generated_usage_records_status_check CHECK (status != 'deleted'));");
     defer runtime_create_table_check.deinit(alloc);
@@ -31441,64 +32222,12 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
         else => return error.TestUnexpectedResult,
     }
 
-    var missing_generated_temp_table_items = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TEMP TABLE generated_usage_session_records (id text PRIMARY KEY, status text);");
-    defer missing_generated_temp_table_items.deinit(alloc);
-    if (missing_generated_temp_table_items.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    ddl.alter_table_operation_items = .{};
-                    ddl.alter_table_operation_tokens = null;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_generated_temp_table_items));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_generated_temp_table_items, .{}));
+    const temp_table_items_sql = "CREATE TEMP TABLE generated_usage_session_records (id text PRIMARY KEY, status text);";
+    for (create_table_item_list_metadata_cases) |mutation| {
+        try expectGeneratedCreateTableItemMetadataMutationFails(alloc, temp_table_items_sql, mutation);
+    }
 
-    var corrupt_generated_temp_table_item = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TEMP TABLE generated_usage_session_records (id text PRIMARY KEY, status text);");
-    defer corrupt_generated_temp_table_item.deinit(alloc);
-    if (corrupt_generated_temp_table_item.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    if (ddl.alter_table_operation_items.first_tokens) |*first_item| {
-                        first_item.start += 1;
-                    } else return error.TestUnexpectedResult;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &corrupt_generated_temp_table_item));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &corrupt_generated_temp_table_item, .{}));
-
-    var stale_generated_temp_table_count = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TEMP TABLE generated_usage_session_records (id text PRIMARY KEY, status text);");
-    defer stale_generated_temp_table_count.deinit(alloc);
-    if (stale_generated_temp_table_count.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.alter_table_operation_items.count -= 1,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_generated_temp_table_count));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &stale_generated_temp_table_count, .{}));
-
-    var malformed_generated_create_table_entry = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text PRIMARY KEY, status text NOT NULL);");
-    defer malformed_generated_create_table_entry.deinit(alloc);
-    if (malformed_generated_create_table_entry.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.command_span.end += 1,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_generated_create_table_entry));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &malformed_generated_create_table_entry, .{}));
+    try expectGeneratedDdlCommandSpanMutationFails(alloc, "CREATE TABLE generated_usage_records (id text PRIMARY KEY, status text NOT NULL);");
 
     var runtime_create_function = try tokenized.ParsedSql.initAlloc(alloc, "CREATE OR REPLACE FUNCTION touch_generated_usage() RETURNS trigger LANGUAGE plpgsql;");
     defer runtime_create_function.deinit(alloc);
@@ -31609,64 +32338,16 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
         else => return error.TestUnexpectedResult,
     }
 
-    var malformed_generated_serial_table = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_serial_records (id bigserial PRIMARY KEY, status text);");
-    defer malformed_generated_serial_table.deinit(alloc);
-    if (malformed_generated_serial_table.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.object_name_tokens = .{ .start = 1, .end = 2 },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_generated_serial_table));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &malformed_generated_serial_table, .{}));
+    try expectGeneratedDdlObjectNameMetadataMutationFails(
+        alloc,
+        "CREATE TABLE generated_serial_records (id bigserial PRIMARY KEY, status text);",
+        true,
+    );
 
-    var missing_generated_serial_items = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_serial_records (id bigserial PRIMARY KEY, status text);");
-    defer missing_generated_serial_items.deinit(alloc);
-    if (missing_generated_serial_items.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    ddl.alter_table_operation_items = .{};
-                    ddl.alter_table_operation_tokens = null;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_generated_serial_items));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_generated_serial_items, .{}));
-
-    var corrupt_generated_serial_item = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_serial_records (id bigserial PRIMARY KEY, status text);");
-    defer corrupt_generated_serial_item.deinit(alloc);
-    if (corrupt_generated_serial_item.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    if (ddl.alter_table_operation_items.first_tokens) |*first_item| {
-                        first_item.start += 1;
-                    } else return error.TestUnexpectedResult;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &corrupt_generated_serial_item));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &corrupt_generated_serial_item, .{}));
-
-    var stale_generated_serial_count = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_serial_records (id bigserial PRIMARY KEY, status text);");
-    defer stale_generated_serial_count.deinit(alloc);
-    if (stale_generated_serial_count.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.alter_table_operation_items.count -= 1,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_generated_serial_count));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &stale_generated_serial_count, .{}));
+    const serial_table_items_sql = "CREATE TABLE generated_serial_records (id bigserial PRIMARY KEY, status text);";
+    for (create_table_item_list_metadata_cases) |mutation| {
+        try expectGeneratedCreateTableItemMetadataMutationFails(alloc, serial_table_items_sql, mutation);
+    }
 
     var runtime_serial_named_column = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_serial_named_column (\"serial\" text, status text);");
     defer runtime_serial_named_column.deinit(alloc);
@@ -31710,37 +32391,15 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
         else => return error.TestUnexpectedResult,
     }
 
-    var malformed_create_index_elements = try tokenized.ParsedSql.initAlloc(alloc, "CREATE UNIQUE INDEX generated_usage_status_idx ON generated_usage_records (status) INCLUDE (tenant_id);");
-    defer malformed_create_index_elements.deinit(alloc);
-    if (malformed_create_index_elements.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .extension_index => |*ddl| ddl.index_elements_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_create_index_elements));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &malformed_create_index_elements, .{}));
-
-    var corrupt_create_index_elements = try tokenized.ParsedSql.initAlloc(alloc, "CREATE UNIQUE INDEX generated_usage_status_idx ON generated_usage_records (status) INCLUDE (tenant_id);");
-    defer corrupt_create_index_elements.deinit(alloc);
-    if (corrupt_create_index_elements.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .extension_index => |*ddl| ddl.index_elements_tokens = .{ .start = 8, .end = 9 },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &corrupt_create_index_elements));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &corrupt_create_index_elements, .{}));
-
+    try expectGeneratedIndexAstMutationFails(alloc, "CREATE UNIQUE INDEX generated_usage_status_idx ON generated_usage_records (status) INCLUDE (tenant_id);", .missing_elements);
+    try expectGeneratedIndexAstMutationFails(alloc, "CREATE UNIQUE INDEX generated_usage_status_idx ON generated_usage_records (status) INCLUDE (tenant_id);", .corrupt_elements);
     try expectGeneratedIndexAstMutationFails(alloc, "CREATE UNIQUE INDEX generated_usage_status_idx ON generated_usage_records (status) INCLUDE (tenant_id);", .missing_include);
     try expectGeneratedIndexAstMutationFails(alloc, "CREATE UNIQUE INDEX generated_usage_status_idx ON generated_usage_records (status) INCLUDE (tenant_id);", .missing_element_items);
     try expectGeneratedIndexAstMutationFails(alloc, "CREATE UNIQUE INDEX generated_usage_status_idx ON generated_usage_records (status) INCLUDE (tenant_id);", .corrupt_element_expression);
     try expectGeneratedIndexAstMutationFails(alloc, "CREATE UNIQUE INDEX generated_usage_lower_email_key ON generated_usage_records (lower(email));", .corrupt_element_expression);
     try expectGeneratedIndexAstMutationFails(alloc, "CREATE INDEX generated_usage_status_replace_idx ON generated_usage_records (replace(status, 'old', 'new'));", .corrupt_element_expression);
+    try expectGeneratedIndexAstMutationFails(alloc, "CREATE UNIQUE INDEX generated_usage_metadata_source_key ON generated_usage_records (jsonb_extract_path_text(metadata, 'source'));", .corrupt_element_expression);
+    try expectGeneratedIndexAstMutationFails(alloc, "CREATE UNIQUE INDEX generated_usage_tags_count_key ON generated_usage_records (array_length(tags, 1));", .corrupt_element_expression);
     try expectGeneratedIndexAstMutationFails(alloc, "CREATE UNIQUE INDEX generated_prices_sku_valid_time_key ON generated_prices (sku, valid_time WITHOUT OVERLAPS);", .corrupt_element_expression);
     try expectGeneratedIndexAstMutationFails(alloc, "CREATE UNIQUE INDEX generated_usage_status_idx ON generated_usage_records (status) INCLUDE (tenant_id);", .missing_include_items);
     try expectGeneratedIndexAstMutationFails(alloc, "CREATE UNIQUE INDEX generated_usage_status_idx ON generated_usage_records (status) INCLUDE (tenant_id);", .corrupt_include);
@@ -31814,6 +32473,108 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
         else => return error.TestUnexpectedResult,
     }
 
+    var runtime_null_safe_partial_index = try tokenized.ParsedSql.initAlloc(alloc, "CREATE UNIQUE INDEX generated_usage_active_email_key ON generated_usage_records (email) WHERE lower(status) IS NOT DISTINCT FROM 'active';");
+    defer runtime_null_safe_partial_index.deinit(alloc);
+    var runtime_null_safe_partial_index_plan = try runtimeDdlPlanParsedSqlAlloc(alloc, &runtime_null_safe_partial_index);
+    defer runtime_null_safe_partial_index_plan.deinit(alloc);
+    switch (runtime_null_safe_partial_index_plan) {
+        .create_index => |plan| {
+            try std.testing.expectEqualStrings("generated_usage_active_email_key", plan.index_name);
+            try std.testing.expectEqualStrings("generated_usage_records", plan.table_name);
+            try std.testing.expect(plan.unique);
+            try std.testing.expectEqual(@as(usize, 1), plan.columns.len);
+            try std.testing.expectEqual(@as(usize, 0), plan.where.len);
+            try std.testing.expectEqual(@as(usize, 1), plan.where_expressions.len);
+            try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.lower, plan.where_expressions[0].lhs.kind);
+            try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_not_distinct, plan.where_expressions[0].op);
+            try std.testing.expectEqualStrings("\"active\"", plan.where_expressions[0].rhs[0].value_json);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var runtime_operator_partial_index = try tokenized.ParsedSql.initAlloc(alloc, "CREATE UNIQUE INDEX generated_usage_amount_email_key ON generated_usage_records (email) WHERE amount + bonus > 10;");
+    defer runtime_operator_partial_index.deinit(alloc);
+    var runtime_operator_partial_index_plan = try runtimeDdlPlanParsedSqlAlloc(alloc, &runtime_operator_partial_index);
+    defer runtime_operator_partial_index_plan.deinit(alloc);
+    switch (runtime_operator_partial_index_plan) {
+        .create_index => |plan| {
+            try std.testing.expectEqualStrings("generated_usage_amount_email_key", plan.index_name);
+            try std.testing.expectEqualStrings("generated_usage_records", plan.table_name);
+            try std.testing.expect(plan.unique);
+            try std.testing.expectEqual(@as(usize, 1), plan.columns.len);
+            try std.testing.expectEqual(@as(usize, 0), plan.where.len);
+            try std.testing.expectEqual(@as(usize, 1), plan.where_expressions.len);
+            try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.add, plan.where_expressions[0].lhs.kind);
+            try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, plan.where_expressions[0].op);
+            try std.testing.expectEqualStrings("10", plan.where_expressions[0].rhs[0].value_json);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var runtime_function_partial_index = try tokenized.ParsedSql.initAlloc(alloc, "CREATE UNIQUE INDEX generated_usage_metadata_email_key ON generated_usage_records (email) WHERE jsonb_array_length(metadata) > 0;");
+    defer runtime_function_partial_index.deinit(alloc);
+    var runtime_function_partial_index_plan = try runtimeDdlPlanParsedSqlAlloc(alloc, &runtime_function_partial_index);
+    defer runtime_function_partial_index_plan.deinit(alloc);
+    switch (runtime_function_partial_index_plan) {
+        .create_index => |plan| {
+            try std.testing.expectEqualStrings("generated_usage_metadata_email_key", plan.index_name);
+            try std.testing.expectEqualStrings("generated_usage_records", plan.table_name);
+            try std.testing.expect(plan.unique);
+            try std.testing.expectEqual(@as(usize, 1), plan.columns.len);
+            try std.testing.expectEqual(@as(usize, 0), plan.where.len);
+            try std.testing.expectEqual(@as(usize, 1), plan.where_expressions.len);
+            try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.json_array_length, plan.where_expressions[0].lhs.kind);
+            try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, plan.where_expressions[0].op);
+            try std.testing.expectEqualStrings("0", plan.where_expressions[0].rhs[0].value_json);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    try expectGeneratedIndexExpressionUnsupportedFails(
+        alloc,
+        "CREATE UNIQUE INDEX generated_usage_case_email_key ON generated_usage_records (CASE WHEN status = 'active' THEN email ELSE id END);",
+        .case_expression,
+    );
+    try expectGeneratedIndexExpressionUnsupportedFails(
+        alloc,
+        "CREATE UNIQUE INDEX generated_usage_current_day_key ON generated_usage_records (CURRENT_DATE);",
+        .current_date,
+    );
+    try expectGeneratedIndexExpressionUnsupportedFails(
+        alloc,
+        "CREATE UNIQUE INDEX generated_usage_current_timestamp_key ON generated_usage_records (CURRENT_TIMESTAMP(6));",
+        .current_timestamp,
+    );
+    try expectGeneratedIndexWhereExpressionUnsupportedFails(
+        alloc,
+        "CREATE UNIQUE INDEX generated_usage_status_or_key ON generated_usage_records (email) WHERE status = 'active' OR status = 'pending';",
+        .logical_or,
+    );
+    try expectGeneratedIndexWhereExpressionUnsupportedFails(
+        alloc,
+        "CREATE UNIQUE INDEX generated_usage_status_not_key ON generated_usage_records (email) WHERE NOT (status = 'archived');",
+        .logical_not,
+    );
+    try expectGeneratedIndexWhereExpressionUnsupportedFails(
+        alloc,
+        "CREATE UNIQUE INDEX generated_usage_status_like_key ON generated_usage_records (email) WHERE status LIKE 'act%';",
+        .like,
+    );
+    try expectGeneratedIndexWhereExpressionUnsupportedFails(
+        alloc,
+        "CREATE UNIQUE INDEX generated_usage_status_in_key ON generated_usage_records (email) WHERE status IN ('active', 'pending');",
+        .in_list,
+    );
+    try expectGeneratedIndexMethodUnsupportedFails(
+        alloc,
+        "CREATE INDEX generated_usage_status_hash_idx ON generated_usage_records USING hash (status);",
+        "hash",
+    );
+    try expectGeneratedIndexOptionsUnsupportedFails(
+        alloc,
+        "CREATE INDEX generated_usage_status_fillfactor_idx ON generated_usage_records USING btree (status) WITH (fillfactor = 70);",
+    );
+
     var runtime_drop_index = try tokenized.ParsedSql.initAlloc(alloc, "DROP INDEX IF EXISTS generated_usage_status_idx RESTRICT;");
     defer runtime_drop_index.deinit(alloc);
     var runtime_drop_index_plan = try runtimeDdlPlanParsedSqlAlloc(alloc, &runtime_drop_index);
@@ -31866,509 +32627,155 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
         else => return error.TestUnexpectedResult,
     }
 
-    var missing_alter_rewrite_expression = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ALTER COLUMN amount TYPE numeric USING amount + 1;");
-    defer missing_alter_rewrite_expression.deinit(alloc);
-    if (missing_alter_rewrite_expression.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
-                    if (ddl.alter_table_operation_rewrite_expression_items.len == 0) return error.TestUnexpectedResult;
-                    ddl.alter_table_operation_rewrite_expression_items[0] = null;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_alter_rewrite_expression));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_alter_rewrite_expression, .{}));
+    const alter_rewrite_metadata_cases = [_]GeneratedAlterRewriteMetadataMutation{
+        .missing_expression,
+        .stale_expression,
+    };
+    for (alter_rewrite_metadata_cases) |mutation| {
+        try expectGeneratedAlterRewriteMetadataMutationFails(
+            alloc,
+            "ALTER TABLE generated_usage_records ALTER COLUMN amount TYPE numeric USING amount + 1;",
+            mutation,
+        );
+    }
 
-    var stale_alter_rewrite_expression = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ALTER COLUMN amount TYPE numeric USING amount + 1;");
-    defer stale_alter_rewrite_expression.deinit(alloc);
-    if (stale_alter_rewrite_expression.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
-                    if (ddl.alter_table_operation_rewrite_expression_items.len == 0) return error.TestUnexpectedResult;
-                    ddl.alter_table_operation_rewrite_expression_items[0].?.start += 1;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_alter_rewrite_expression));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &stale_alter_rewrite_expression, .{}));
+    const column_definition_metadata_cases = [_]struct {
+        sql: []const u8,
+        mutation: GeneratedColumnDefinitionMetadataMutation,
+    }{
+        .{ .sql = "CREATE TABLE generated_usage_records (id text, status text DEFAULT 'pending');", .mutation = .missing_create_table_column_name },
+        .{ .sql = "ALTER TABLE generated_usage_records ADD COLUMN status text DEFAULT 'pending';", .mutation = .stale_add_column_type },
+        .{ .sql = "CREATE TABLE generated_usage_records (id text NOT NULL, status text);", .mutation = .missing_create_table_nullability },
+        .{ .sql = "ALTER TABLE generated_usage_records ADD COLUMN status text NOT NULL;", .mutation = .stale_add_column_nullability },
+        .{ .sql = "CREATE TABLE generated_usage_records (id text COLLATE \"C\", status text);", .mutation = .missing_create_table_collation },
+        .{ .sql = "ALTER TABLE generated_usage_records ADD COLUMN status text COLLATE \"C\";", .mutation = .stale_add_column_collation },
+    };
+    for (column_definition_metadata_cases) |case| {
+        try expectGeneratedColumnDefinitionMetadataMutationFails(alloc, case.sql, case.mutation);
+    }
 
-    var missing_create_table_column_name = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text, status text DEFAULT 'pending');");
-    defer missing_create_table_column_name.deinit(alloc);
-    if (missing_create_table_column_name.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl.kind);
-                    if (ddl.alter_table_operation_column_name_items.len != 2) return error.TestUnexpectedResult;
-                    if (ddl.alter_table_operation_column_type_items.len != 2) return error.TestUnexpectedResult;
-                    try std.testing.expect(ddl.alter_table_operation_column_name_items[1] != null);
-                    try std.testing.expect(ddl.alter_table_operation_column_type_items[1] != null);
-                    ddl.alter_table_operation_column_name_items[1] = null;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_create_table_column_name));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_create_table_column_name, .{}));
+    const create_table_unique_constraint_sql = "CREATE TABLE generated_usage_records (id text, CONSTRAINT generated_usage_status_key UNIQUE (status));";
+    const alter_table_unique_constraint_sql = "ALTER TABLE generated_usage_records ADD CONSTRAINT generated_usage_status_key UNIQUE (status);";
+    const alter_table_unique_include_constraint_sql = "ALTER TABLE generated_usage_records ADD CONSTRAINT generated_usage_status_key UNIQUE (tenant_id) INCLUDE (status) NOT VALID;";
+    const alter_table_foreign_key_constraint_sql = "ALTER TABLE generated_usage_records ADD CONSTRAINT generated_usage_tenant_fk FOREIGN KEY (tenant_id) REFERENCES tenants (id) NOT VALID;";
+    const alter_table_check_constraint_sql = "ALTER TABLE generated_usage_records ADD CONSTRAINT generated_usage_amount_check CHECK (amount >= 0) NOT VALID;";
+    const create_table_check_constraint_sql = "CREATE TABLE generated_usage_records (amount int, CONSTRAINT generated_usage_amount_check CHECK (amount >= 0));";
+    const table_constraint_metadata_cases = [_]struct {
+        sql: []const u8,
+        mutation: GeneratedTableConstraintMetadataMutation,
+    }{
+        .{ .sql = create_table_unique_constraint_sql, .mutation = .missing_create_table_constraint_kind },
+        .{ .sql = alter_table_unique_constraint_sql, .mutation = .stale_alter_table_constraint_name },
+        .{ .sql = alter_table_unique_include_constraint_sql, .mutation = .stale_alter_table_unique_include },
+        .{ .sql = alter_table_unique_include_constraint_sql, .mutation = .missing_alter_table_unique_not_valid },
+        .{ .sql = alter_table_foreign_key_constraint_sql, .mutation = .missing_alter_table_foreign_key_payload },
+        .{ .sql = alter_table_foreign_key_constraint_sql, .mutation = .stale_alter_table_foreign_key_not_valid },
+        .{ .sql = alter_table_check_constraint_sql, .mutation = .missing_alter_table_check_payload },
+        .{ .sql = alter_table_check_constraint_sql, .mutation = .stale_alter_table_check_payload_expression_kind },
+        .{ .sql = alter_table_check_constraint_sql, .mutation = .missing_alter_table_check_payload_expression_tokens },
+        .{ .sql = alter_table_check_constraint_sql, .mutation = .missing_alter_table_check_payload_operator_tokens },
+        .{ .sql = create_table_check_constraint_sql, .mutation = .stale_create_table_check_payload_expression_kind },
+        .{ .sql = alter_table_check_constraint_sql, .mutation = .stale_alter_table_check_not_valid },
+    };
+    for (table_constraint_metadata_cases) |case| {
+        try expectGeneratedTableConstraintMetadataMutationFails(alloc, case.sql, case.mutation);
+    }
 
-    var stale_add_column_type = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD COLUMN status text DEFAULT 'pending';");
-    defer stale_add_column_type.deinit(alloc);
-    if (stale_add_column_type.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
-                    if (ddl.alter_table_operation_column_type_items.len != 1) return error.TestUnexpectedResult;
-                    try std.testing.expect(ddl.alter_table_operation_column_type_items[0] != null);
-                    ddl.alter_table_operation_column_type_items[0].?.end += 1;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_add_column_type));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &stale_add_column_type, .{}));
+    const create_table_inline_unique_sql = "CREATE TABLE generated_usage_records (id text CONSTRAINT generated_usage_id_pk PRIMARY KEY, status text UNIQUE);";
+    const add_column_inline_foreign_key_sql = "ALTER TABLE generated_usage_records ADD COLUMN tenant_id text REFERENCES tenants (id) NOT VALID;";
+    const add_column_inline_check_sql = "ALTER TABLE generated_usage_records ADD COLUMN amount int CHECK (amount >= 0) NOT VALID;";
+    const create_table_inline_check_sql = "CREATE TABLE generated_usage_records (amount int CHECK (amount >= 0));";
+    const add_column_inline_unique_sql = "ALTER TABLE generated_usage_records ADD COLUMN status text UNIQUE;";
+    const create_table_inline_timing_sql = "CREATE TABLE generated_usage_records (tenant_id text, email text UNIQUE INCLUDE (tenant_id) DEFERRABLE INITIALLY DEFERRED);";
+    const add_column_inline_unique_not_valid_sql = "ALTER TABLE generated_usage_records ADD COLUMN email text UNIQUE INCLUDE (tenant_id) NOT VALID;";
+    const inline_constraint_metadata_cases = [_]struct {
+        sql: []const u8,
+        mutation: GeneratedInlineConstraintMetadataMutation,
+    }{
+        .{ .sql = create_table_inline_unique_sql, .mutation = .missing_create_table_inline_constraint_kind },
+        .{ .sql = create_table_inline_unique_sql, .mutation = .stale_create_table_inline_constraint_name },
+        .{ .sql = add_column_inline_foreign_key_sql, .mutation = .missing_add_column_inline_foreign_key_payload },
+        .{ .sql = add_column_inline_foreign_key_sql, .mutation = .stale_add_column_inline_foreign_key_not_valid },
+        .{ .sql = add_column_inline_check_sql, .mutation = .missing_add_column_inline_check_payload },
+        .{ .sql = add_column_inline_check_sql, .mutation = .stale_add_column_inline_check_payload_expression_kind },
+        .{ .sql = create_table_inline_check_sql, .mutation = .stale_create_table_inline_check_payload_expression_kind },
+        .{ .sql = add_column_inline_check_sql, .mutation = .stale_add_column_inline_check_not_valid },
+        .{ .sql = add_column_inline_unique_sql, .mutation = .stale_add_column_inline_constraint_kind },
+        .{ .sql = create_table_inline_timing_sql, .mutation = .stale_create_table_inline_timing },
+        .{ .sql = add_column_inline_unique_not_valid_sql, .mutation = .missing_add_column_inline_not_valid },
+    };
+    for (inline_constraint_metadata_cases) |case| {
+        try expectGeneratedInlineConstraintMetadataMutationFails(alloc, case.sql, case.mutation);
+    }
 
-    var missing_create_table_nullability = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text NOT NULL, status text);");
-    defer missing_create_table_nullability.deinit(alloc);
-    if (missing_create_table_nullability.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl.kind);
-                    if (ddl.alter_table_operation_column_nullability_items.len != 2) return error.TestUnexpectedResult;
-                    try std.testing.expect(ddl.alter_table_operation_column_nullability_items[0] != null);
-                    ddl.alter_table_operation_column_nullability_items[0] = null;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_create_table_nullability));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_create_table_nullability, .{}));
+    const create_table_default_sql = "CREATE TABLE generated_usage_records (id text, status text DEFAULT 'pending');";
+    const add_column_default_sql = "ALTER TABLE generated_usage_records ADD COLUMN status text DEFAULT 'pending';";
+    const alter_set_default_sql = "ALTER TABLE generated_usage_records ALTER COLUMN status SET DEFAULT 'pending';";
+    const create_table_array_default_sql = "CREATE TABLE generated_usage_records (id text, tags text[] DEFAULT ARRAY['new','hot']);";
+    const add_column_array_default_sql = "ALTER TABLE generated_usage_records ADD COLUMN tags text[] DEFAULT ARRAY['new','hot'];";
+    const alter_set_array_default_sql = "ALTER TABLE generated_usage_records ALTER COLUMN tags SET DEFAULT ARRAY['new','hot'];";
+    var runtime_create_table_array_default = try runtimeDdlPlanForTestAlloc(alloc, create_table_array_default_sql);
+    defer runtime_create_table_array_default.deinit(alloc);
+    switch (runtime_create_table_array_default) {
+        .create_table => |plan| {
+            try std.testing.expectEqual(@as(usize, 2), plan.columns.len);
+            try std.testing.expectEqual(runtime_schema.AntflyType.array, plan.columns[1].field_type);
+            try std.testing.expect(plan.columns[1].default_value != null);
+            try std.testing.expectEqual(runtime_schema.RelationalDefaultKind.literal, plan.columns[1].default_value.?.kind);
+            try std.testing.expectEqualStrings("[\"new\",\"hot\"]", plan.columns[1].default_value.?.value_json);
+            const schema = try runtimeSchemaFromCreateTablePlanAlloc(alloc, plan);
+            defer runtime_schema.freeSchema(alloc, schema);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 
-    var stale_add_column_nullability = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD COLUMN status text NOT NULL;");
-    defer stale_add_column_nullability.deinit(alloc);
-    if (stale_add_column_nullability.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
-                    if (ddl.alter_table_operation_column_nullability_items.len != 1) return error.TestUnexpectedResult;
-                    try std.testing.expect(ddl.alter_table_operation_column_nullability_items[0] != null);
-                    ddl.alter_table_operation_column_nullability_items[0].?.end -= 1;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_add_column_nullability));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &stale_add_column_nullability, .{}));
+    var runtime_add_column_array_default = try runtimeDdlPlanForTestAlloc(alloc, add_column_array_default_sql);
+    defer runtime_add_column_array_default.deinit(alloc);
+    switch (runtime_add_column_array_default) {
+        .alter_table => |plan| switch (plan.operations[0]) {
+            .add_column => |operation| {
+                try std.testing.expectEqual(runtime_schema.AntflyType.array, operation.column.field_type);
+                try std.testing.expect(operation.column.default_value != null);
+                try std.testing.expectEqualStrings("[\"new\",\"hot\"]", operation.column.default_value.?.value_json);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
 
-    var missing_create_table_collation = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text COLLATE \"C\", status text);");
-    defer missing_create_table_collation.deinit(alloc);
-    if (missing_create_table_collation.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl.kind);
-                    if (ddl.alter_table_operation_column_collation_items.len != 2) return error.TestUnexpectedResult;
-                    try std.testing.expect(ddl.alter_table_operation_column_collation_items[0] != null);
-                    ddl.alter_table_operation_column_collation_items[0] = null;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_create_table_collation));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_create_table_collation, .{}));
+    var runtime_alter_set_array_default = try runtimeDdlPlanForTestAlloc(alloc, alter_set_array_default_sql);
+    defer runtime_alter_set_array_default.deinit(alloc);
+    switch (runtime_alter_set_array_default) {
+        .alter_table => |plan| switch (plan.operations[0]) {
+            .alter_column_default => |operation| {
+                const default_value = operation.default_value orelse return error.TestUnexpectedResult;
+                try std.testing.expectEqual(runtime_schema.RelationalDefaultKind.literal, default_value.kind);
+                try std.testing.expectEqualStrings("[\"new\",\"hot\"]", default_value.value_json);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
 
-    var stale_add_column_collation = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD COLUMN status text COLLATE \"C\";");
-    defer stale_add_column_collation.deinit(alloc);
-    if (stale_add_column_collation.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
-                    if (ddl.alter_table_operation_column_collation_items.len != 1) return error.TestUnexpectedResult;
-                    try std.testing.expect(ddl.alter_table_operation_column_collation_items[0] != null);
-                    ddl.alter_table_operation_column_collation_items[0].?.end -= 1;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_add_column_collation));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &stale_add_column_collation, .{}));
-
-    var missing_create_table_constraint_kind = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text, CONSTRAINT generated_usage_status_key UNIQUE (status));");
-    defer missing_create_table_constraint_kind.deinit(alloc);
-    if (missing_create_table_constraint_kind.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl.kind);
-                    if (ddl.alter_table_operation_constraint_kind_items.len != 2) return error.TestUnexpectedResult;
-                    try std.testing.expect(ddl.alter_table_operation_constraint_kind_items[1] != null);
-                    ddl.alter_table_operation_constraint_kind_items[1] = null;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_create_table_constraint_kind));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_create_table_constraint_kind, .{}));
-
-    var stale_alter_table_constraint_name = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD CONSTRAINT generated_usage_status_key UNIQUE (status);");
-    defer stale_alter_table_constraint_name.deinit(alloc);
-    if (stale_alter_table_constraint_name.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
-                    if (ddl.alter_table_operation_constraint_name_items.len != 1) return error.TestUnexpectedResult;
-                    try std.testing.expect(ddl.alter_table_operation_constraint_name_items[0] != null);
-                    ddl.alter_table_operation_constraint_name_items[0].?.start -= 1;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_alter_table_constraint_name));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &stale_alter_table_constraint_name, .{}));
-
-    var stale_alter_table_unique_include = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD CONSTRAINT generated_usage_status_key UNIQUE (tenant_id) INCLUDE (status) NOT VALID;");
-    defer stale_alter_table_unique_include.deinit(alloc);
-    if (stale_alter_table_unique_include.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
-                    if (ddl.alter_table_operation_constraint_include_items.len != 1) return error.TestUnexpectedResult;
-                    try std.testing.expect(ddl.alter_table_operation_constraint_include_items[0] != null);
-                    ddl.alter_table_operation_constraint_include_items[0].?.end -= 1;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_alter_table_unique_include));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &stale_alter_table_unique_include, .{}));
-
-    var missing_alter_table_unique_not_valid = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD CONSTRAINT generated_usage_status_key UNIQUE (tenant_id) INCLUDE (status) NOT VALID;");
-    defer missing_alter_table_unique_not_valid.deinit(alloc);
-    if (missing_alter_table_unique_not_valid.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
-                    if (ddl.alter_table_operation_constraint_not_valid_items.len != 1) return error.TestUnexpectedResult;
-                    try std.testing.expect(ddl.alter_table_operation_constraint_not_valid_items[0] != null);
-                    ddl.alter_table_operation_constraint_not_valid_items[0] = null;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_alter_table_unique_not_valid));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_alter_table_unique_not_valid, .{}));
-
-    var missing_alter_table_foreign_key_payload = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD CONSTRAINT generated_usage_tenant_fk FOREIGN KEY (tenant_id) REFERENCES tenants (id) NOT VALID;");
-    defer missing_alter_table_foreign_key_payload.deinit(alloc);
-    if (missing_alter_table_foreign_key_payload.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
-                    if (ddl.alter_table_operation_foreign_key_payload_items.len != 1) return error.TestUnexpectedResult;
-                    try std.testing.expect(ddl.alter_table_operation_foreign_key_payload_items[0] != null);
-                    ddl.alter_table_operation_foreign_key_payload_items[0] = null;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_alter_table_foreign_key_payload));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_alter_table_foreign_key_payload, .{}));
-
-    var stale_alter_table_foreign_key_not_valid = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD CONSTRAINT generated_usage_tenant_fk FOREIGN KEY (tenant_id) REFERENCES tenants (id) NOT VALID;");
-    defer stale_alter_table_foreign_key_not_valid.deinit(alloc);
-    if (stale_alter_table_foreign_key_not_valid.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
-                    if (ddl.alter_table_operation_foreign_key_not_valid_items.len != 1) return error.TestUnexpectedResult;
-                    try std.testing.expect(ddl.alter_table_operation_foreign_key_not_valid_items[0] != null);
-                    ddl.alter_table_operation_foreign_key_not_valid_items[0].?.end -= 1;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_alter_table_foreign_key_not_valid));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &stale_alter_table_foreign_key_not_valid, .{}));
-
-    var missing_alter_table_check_payload = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD CONSTRAINT generated_usage_amount_check CHECK (amount >= 0) NOT VALID;");
-    defer missing_alter_table_check_payload.deinit(alloc);
-    if (missing_alter_table_check_payload.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
-                    if (ddl.alter_table_operation_check_payload_items.len != 1) return error.TestUnexpectedResult;
-                    try std.testing.expect(ddl.alter_table_operation_check_payload_items[0] != null);
-                    ddl.alter_table_operation_check_payload_items[0] = null;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_alter_table_check_payload));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_alter_table_check_payload, .{}));
-
-    var stale_alter_table_check_not_valid = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD CONSTRAINT generated_usage_amount_check CHECK (amount >= 0) NOT VALID;");
-    defer stale_alter_table_check_not_valid.deinit(alloc);
-    if (stale_alter_table_check_not_valid.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
-                    if (ddl.alter_table_operation_check_not_valid_items.len != 1) return error.TestUnexpectedResult;
-                    try std.testing.expect(ddl.alter_table_operation_check_not_valid_items[0] != null);
-                    ddl.alter_table_operation_check_not_valid_items[0].?.end -= 1;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_alter_table_check_not_valid));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &stale_alter_table_check_not_valid, .{}));
-
-    var missing_create_table_inline_constraint_kind = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text CONSTRAINT generated_usage_id_pk PRIMARY KEY, status text UNIQUE);");
-    defer missing_create_table_inline_constraint_kind.deinit(alloc);
-    if (missing_create_table_inline_constraint_kind.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl.kind);
-                    if (ddl.alter_table_operation_inline_constraint_items.count != 2) return error.TestUnexpectedResult;
-                    if (ddl.alter_table_operation_inline_constraint_kind_items.len != 2) return error.TestUnexpectedResult;
-                    ddl.alter_table_operation_inline_constraint_kind_items[0].end -= 1;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_create_table_inline_constraint_kind));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_create_table_inline_constraint_kind, .{}));
-
-    var stale_create_table_inline_constraint_name = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text CONSTRAINT generated_usage_id_pk PRIMARY KEY, status text UNIQUE);");
-    defer stale_create_table_inline_constraint_name.deinit(alloc);
-    if (stale_create_table_inline_constraint_name.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl.kind);
-                    if (ddl.alter_table_operation_inline_constraint_name_items.len != 2) return error.TestUnexpectedResult;
-                    try std.testing.expect(ddl.alter_table_operation_inline_constraint_name_items[0] != null);
-                    ddl.alter_table_operation_inline_constraint_name_items[0].?.start -= 1;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_create_table_inline_constraint_name));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &stale_create_table_inline_constraint_name, .{}));
-
-    var missing_add_column_inline_foreign_key_payload = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD COLUMN tenant_id text REFERENCES tenants (id) NOT VALID;");
-    defer missing_add_column_inline_foreign_key_payload.deinit(alloc);
-    if (missing_add_column_inline_foreign_key_payload.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
-                    if (ddl.alter_table_operation_inline_foreign_key_payload_items.len != 1) return error.TestUnexpectedResult;
-                    try std.testing.expect(ddl.alter_table_operation_inline_foreign_key_payload_items[0] != null);
-                    ddl.alter_table_operation_inline_foreign_key_payload_items[0] = null;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_add_column_inline_foreign_key_payload));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_add_column_inline_foreign_key_payload, .{}));
-
-    var stale_add_column_inline_foreign_key_not_valid = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD COLUMN tenant_id text REFERENCES tenants (id) NOT VALID;");
-    defer stale_add_column_inline_foreign_key_not_valid.deinit(alloc);
-    if (stale_add_column_inline_foreign_key_not_valid.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
-                    if (ddl.alter_table_operation_inline_foreign_key_not_valid_items.len != 1) return error.TestUnexpectedResult;
-                    try std.testing.expect(ddl.alter_table_operation_inline_foreign_key_not_valid_items[0] != null);
-                    ddl.alter_table_operation_inline_foreign_key_not_valid_items[0].?.start -= 1;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_add_column_inline_foreign_key_not_valid));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &stale_add_column_inline_foreign_key_not_valid, .{}));
-
-    var missing_add_column_inline_check_payload = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD COLUMN amount int CHECK (amount >= 0) NOT VALID;");
-    defer missing_add_column_inline_check_payload.deinit(alloc);
-    if (missing_add_column_inline_check_payload.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
-                    if (ddl.alter_table_operation_inline_check_payload_items.len != 1) return error.TestUnexpectedResult;
-                    try std.testing.expect(ddl.alter_table_operation_inline_check_payload_items[0] != null);
-                    ddl.alter_table_operation_inline_check_payload_items[0] = null;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_add_column_inline_check_payload));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_add_column_inline_check_payload, .{}));
-
-    var stale_add_column_inline_check_not_valid = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD COLUMN amount int CHECK (amount >= 0) NOT VALID;");
-    defer stale_add_column_inline_check_not_valid.deinit(alloc);
-    if (stale_add_column_inline_check_not_valid.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
-                    if (ddl.alter_table_operation_inline_check_not_valid_items.len != 1) return error.TestUnexpectedResult;
-                    try std.testing.expect(ddl.alter_table_operation_inline_check_not_valid_items[0] != null);
-                    ddl.alter_table_operation_inline_check_not_valid_items[0].?.start -= 1;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_add_column_inline_check_not_valid));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &stale_add_column_inline_check_not_valid, .{}));
-
-    var stale_add_column_inline_constraint_kind = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD COLUMN status text UNIQUE;");
-    defer stale_add_column_inline_constraint_kind.deinit(alloc);
-    if (stale_add_column_inline_constraint_kind.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
-                    if (ddl.alter_table_operation_inline_constraint_items.count != 1) return error.TestUnexpectedResult;
-                    if (ddl.alter_table_operation_inline_constraint_kind_items.len != 1) return error.TestUnexpectedResult;
-                    ddl.alter_table_operation_inline_constraint_kind_items[0].start -= 1;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_add_column_inline_constraint_kind));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &stale_add_column_inline_constraint_kind, .{}));
-
-    var stale_create_table_inline_timing = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (tenant_id text, email text UNIQUE INCLUDE (tenant_id) DEFERRABLE INITIALLY DEFERRED);");
-    defer stale_create_table_inline_timing.deinit(alloc);
-    if (stale_create_table_inline_timing.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl.kind);
-                    if (ddl.alter_table_operation_inline_constraint_timing_items.len != 1) return error.TestUnexpectedResult;
-                    try std.testing.expect(ddl.alter_table_operation_inline_constraint_timing_items[0] != null);
-                    ddl.alter_table_operation_inline_constraint_timing_items[0].?.start += 1;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_create_table_inline_timing));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &stale_create_table_inline_timing, .{}));
-
-    var missing_add_column_inline_not_valid = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD COLUMN email text UNIQUE INCLUDE (tenant_id) NOT VALID;");
-    defer missing_add_column_inline_not_valid.deinit(alloc);
-    if (missing_add_column_inline_not_valid.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
-                    if (ddl.alter_table_operation_inline_constraint_not_valid_items.len != 1) return error.TestUnexpectedResult;
-                    try std.testing.expect(ddl.alter_table_operation_inline_constraint_not_valid_items[0] != null);
-                    ddl.alter_table_operation_inline_constraint_not_valid_items[0] = null;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_add_column_inline_not_valid));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_add_column_inline_not_valid, .{}));
-
-    var missing_create_table_default = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text, status text DEFAULT 'pending');");
-    defer missing_create_table_default.deinit(alloc);
-    if (missing_create_table_default.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl.kind);
-                    if (ddl.alter_table_operation_default_value_items.len != 2) return error.TestUnexpectedResult;
-                    try std.testing.expect(ddl.alter_table_operation_default_value_items[1] != null);
-                    ddl.alter_table_operation_default_value_items[1] = null;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_create_table_default));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_create_table_default, .{}));
-
-    var missing_create_table_default_clause = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text, status text DEFAULT 'pending');");
-    defer missing_create_table_default_clause.deinit(alloc);
-    if (missing_create_table_default_clause.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl.kind);
-                    if (ddl.alter_table_operation_column_default_clause_items.len != 2) return error.TestUnexpectedResult;
-                    try std.testing.expect(ddl.alter_table_operation_column_default_clause_items[1] != null);
-                    ddl.alter_table_operation_column_default_clause_items[1] = null;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_create_table_default_clause));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_create_table_default_clause, .{}));
-
-    var stale_add_column_default = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD COLUMN status text DEFAULT 'pending';");
-    defer stale_add_column_default.deinit(alloc);
-    if (stale_add_column_default.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl.kind);
-                    if (ddl.alter_table_operation_default_value_items.len != 1) return error.TestUnexpectedResult;
-                    try std.testing.expect(ddl.alter_table_operation_default_value_items[0] != null);
-                    ddl.alter_table_operation_default_value_items[0].?.end += 1;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_add_column_default));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &stale_add_column_default, .{}));
+    const default_metadata_cases = [_]struct {
+        sql: []const u8,
+        mutation: GeneratedDefaultMetadataMutation,
+    }{
+        .{ .sql = create_table_default_sql, .mutation = .missing_create_table_value_range },
+        .{ .sql = create_table_default_sql, .mutation = .missing_create_table_clause_range },
+        .{ .sql = create_table_default_sql, .mutation = .missing_create_table_expression_tokens },
+        .{ .sql = create_table_default_sql, .mutation = .stale_create_table_expression_range },
+        .{ .sql = create_table_default_sql, .mutation = .stale_create_table_expression_kind },
+        .{ .sql = create_table_array_default_sql, .mutation = .stale_create_table_array_item_expression_kind },
+        .{ .sql = add_column_default_sql, .mutation = .stale_add_column_value_range },
+        .{ .sql = add_column_default_sql, .mutation = .stale_add_column_expression_kind },
+        .{ .sql = add_column_array_default_sql, .mutation = .stale_add_column_array_item_expression_kind },
+        .{ .sql = alter_set_default_sql, .mutation = .stale_alter_set_default_expression_kind },
+        .{ .sql = alter_set_array_default_sql, .mutation = .stale_alter_set_default_array_item_expression_kind },
+    };
+    for (default_metadata_cases) |case| {
+        try expectGeneratedDefaultMetadataMutationFails(alloc, case.sql, case.mutation);
+    }
 
     var runtime_multi_alter_table = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD COLUMN notes text, DROP COLUMN IF EXISTS old_status RESTRICT;");
     defer runtime_multi_alter_table.deinit(alloc);
@@ -32406,66 +32813,19 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
         else => return error.TestUnexpectedResult,
     }
 
-    var malformed_generated_alter_table_entry = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD COLUMN status text;");
-    defer malformed_generated_alter_table_entry.deinit(alloc);
-    if (malformed_generated_alter_table_entry.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.alter_table_operation_tokens.?.start += 1,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_generated_alter_table_entry));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &malformed_generated_alter_table_entry, .{}));
+    try expectGeneratedAlterTableOperationMetadataMutationFails(
+        alloc,
+        "ALTER TABLE generated_usage_records ADD COLUMN status text;",
+        .stale_operation_tail,
+    );
+    try expectGeneratedAlterTableOperationMetadataMutationFails(
+        alloc,
+        "ALTER TABLE generated_usage_records ADD COLUMN notes text, DROP COLUMN IF EXISTS old_status RESTRICT;",
+        .stale_second_operation_item,
+    );
 
-    var malformed_generated_alter_table_item = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD COLUMN notes text, DROP COLUMN IF EXISTS old_status RESTRICT;");
-    defer malformed_generated_alter_table_item.deinit(alloc);
-    if (malformed_generated_alter_table_item.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.alter_table_operation_items.items[1].start += 1,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_generated_alter_table_item));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &malformed_generated_alter_table_item, .{}));
-
-    var stale_generated_publication_table_count = try tokenized.ParsedSql.initAlloc(alloc, "CREATE PUBLICATION usage_pub FOR TABLE usage_records, usage_events");
-    defer stale_generated_publication_table_count.deinit(alloc);
-    if (stale_generated_publication_table_count.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_publication, ddl.kind);
-                    try std.testing.expect(ddl.publication_table_items.count != 0);
-                    ddl.publication_table_items.count = 0;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_generated_publication_table_count));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &stale_generated_publication_table_count, .{}));
-
-    var malformed_generated_routine_returns = try tokenized.ParsedSql.initAlloc(alloc, "CREATE FUNCTION audit_usage() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$");
-    defer malformed_generated_routine_returns.deinit(alloc);
-    if (malformed_generated_routine_returns.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_function, ddl.kind);
-                    const routine = ddl.routine_metadata orelse return error.TestUnexpectedResult;
-                    _ = routine.returns_type_tokens orelse return error.TestUnexpectedResult;
-                    routine.returns_type_tokens.?.end = routine.returns_type_tokens.?.start;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_generated_routine_returns));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &malformed_generated_routine_returns, .{}));
+    try expectGeneratedPublicationMetadataMutationFailsAtPublicBoundaries(alloc, "CREATE PUBLICATION usage_pub FOR TABLE usage_records, usage_events", .stale_table_count);
+    try expectGeneratedRoutineMetadataMutationFailsAtPublicBoundaries(alloc, "CREATE FUNCTION audit_usage() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$", .stale_returns_range);
 
     var runtime_row_security = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ENABLE ROW LEVEL SECURITY;");
     defer runtime_row_security.deinit(alloc);
@@ -32494,52 +32854,12 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
     } else return error.TestUnexpectedResult;
     try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &mismatched_generated_row_security));
 
-    var malformed_generated_ddl = try tokenized.ParsedSql.initAlloc(alloc, "CREATE DATABASE tenant_ops;");
-    defer malformed_generated_ddl.deinit(alloc);
-    if (malformed_generated_ddl.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.object_name_tokens = .{ .start = 1, .end = 2 },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_generated_ddl));
+    try expectGeneratedDdlObjectNameMetadataMutationFails(alloc, "CREATE DATABASE tenant_ops;", false);
+    try expectGeneratedDdlObjectNameMetadataMutationFails(alloc, "ALTER TABLE generated_usage_records DISABLE ROW LEVEL SECURITY;", false);
 
-    var malformed_generated_row_security = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records DISABLE ROW LEVEL SECURITY;");
-    defer malformed_generated_row_security.deinit(alloc);
-    if (malformed_generated_row_security.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.object_name_tokens = .{ .start = 1, .end = 2 },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_generated_row_security));
+    try expectGeneratedSessionNameTokensMutationFails(alloc, "SET search_path TO public;", .{ .start = 0, .end = 1 });
 
-    var malformed_generated_session = try tokenized.ParsedSql.initAlloc(alloc, "SET search_path TO public;");
-    defer malformed_generated_session.deinit(alloc);
-    if (malformed_generated_session.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .session => |*session_ast| session_ast.name_tokens = .{ .start = 0, .end = 1 },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_generated_session));
-
-    var missing_ast_session = try tokenized.ParsedSql.initAlloc(alloc, "SET search_path TO public;");
-    defer missing_ast_session.deinit(alloc);
-    if (missing_ast_session.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            generated_ast.deinit(alloc);
-            generated_statement.ast = null;
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_ast_session));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_ast_session, .{}));
+    try expectGeneratedStatementMissingAstFails(alloc, "SET search_path TO public;");
 }
 
 test "sql adapter generated unsupported trigger diagnostics reject corrupted parsed AST payloads" {
@@ -32635,6 +32955,18 @@ test "sql adapter generated unsupported routine and alter table diagnostics vali
     try expectGeneratedUnsupportedCatalogPayloadMutationFails(alloc, alter_table_owner_sql, .alter_table_owner, .alter_table_operation_start);
     try expectGeneratedUnsupportedCatalogPayloadMutationFails(alloc, alter_table_owner_sql, .alter_table_owner, .alter_table_operation_kind);
     try expectGeneratedUnsupportedCatalogPayloadMutationFails(alloc, alter_table_owner_sql, .alter_table_owner, .alter_table_operation_subject_start);
+
+    const alter_table_column_statistics_sql = "ALTER TABLE usage_records ALTER COLUMN status SET STATISTICS 100";
+    try expectGeneratedUnsupportedCatalogPayloadMutationFails(alloc, alter_table_column_statistics_sql, .alter_table_column_statistics, .alter_table_name_start);
+    try expectGeneratedUnsupportedCatalogPayloadMutationFails(alloc, alter_table_column_statistics_sql, .alter_table_column_statistics, .alter_table_operation_start);
+    try expectGeneratedUnsupportedCatalogPayloadMutationFails(alloc, alter_table_column_statistics_sql, .alter_table_column_statistics, .alter_table_operation_kind);
+    try expectGeneratedUnsupportedCatalogPayloadMutationFails(alloc, alter_table_column_statistics_sql, .alter_table_column_statistics, .stale_alter_table_operation_subject_payload);
+
+    const alter_table_column_storage_sql = "ALTER TABLE usage_records ALTER COLUMN metadata SET STORAGE EXTENDED";
+    try expectGeneratedUnsupportedCatalogPayloadMutationFails(alloc, alter_table_column_storage_sql, .alter_table_column_storage, .alter_table_name_start);
+    try expectGeneratedUnsupportedCatalogPayloadMutationFails(alloc, alter_table_column_storage_sql, .alter_table_column_storage, .alter_table_operation_start);
+    try expectGeneratedUnsupportedCatalogPayloadMutationFails(alloc, alter_table_column_storage_sql, .alter_table_column_storage, .alter_table_operation_kind);
+    try expectGeneratedUnsupportedCatalogPayloadMutationFails(alloc, alter_table_column_storage_sql, .alter_table_column_storage, .stale_alter_table_operation_subject_payload);
 }
 
 test "sql adapter generated create table and index AST lowers to DDL plans" {
@@ -32674,7 +33006,7 @@ test "sql adapter generated create table and index AST lowers to DDL plans" {
             .field_expression_qualifiers = malformed_command_state.field_expression_qualifiers,
             .returning_expression_qualifiers = malformed_command_state.returning_expression_qualifiers,
             .defer_row_expression_field_validation = malformed_command_state.defer_row_expression_field_validation,
-            .column_definition_options = parser_context.ParserState.ContextAccessors.ddlColumnDefinitionOptions(&malformed_command_state),
+            .column_definition_options = makeDdlColumnDefinitionOptions(&malformed_command_state),
             .domain_options = parser_context.ParserState.ContextAccessors.ddlDomainOptions(&malformed_command_state),
             .create_index_options = parser_context.ParserState.ContextAccessors.createIndexOptions(&malformed_command_state),
             .row_security_policy_options = parser_context.ParserState.ContextAccessors.rowSecurityPolicyOptions(&malformed_command_state),
@@ -32697,7 +33029,7 @@ test "sql adapter generated create table and index AST lowers to DDL plans" {
             .field_expression_qualifiers = mismatched_kind_state.field_expression_qualifiers,
             .returning_expression_qualifiers = mismatched_kind_state.returning_expression_qualifiers,
             .defer_row_expression_field_validation = mismatched_kind_state.defer_row_expression_field_validation,
-            .column_definition_options = parser_context.ParserState.ContextAccessors.ddlColumnDefinitionOptions(&mismatched_kind_state),
+            .column_definition_options = makeDdlColumnDefinitionOptions(&mismatched_kind_state),
             .domain_options = parser_context.ParserState.ContextAccessors.ddlDomainOptions(&mismatched_kind_state),
             .create_index_options = parser_context.ParserState.ContextAccessors.createIndexOptions(&mismatched_kind_state),
             .row_security_policy_options = parser_context.ParserState.ContextAccessors.rowSecurityPolicyOptions(&mismatched_kind_state),
@@ -32783,7 +33115,7 @@ test "sql adapter generated create table and index AST lowers to DDL plans" {
             switch (generated.operations[0]) {
                 .add_column => |operation| {
                     try std.testing.expectEqualStrings("status", operation.column.name);
-                    try std.testing.expectEqual(runtime_schema.RelationalType.keyword, operation.column.field_type);
+                    try std.testing.expectEqual(runtime_schema.AntflyType.keyword, operation.column.field_type);
                 },
                 else => return error.TestUnexpectedResult,
             }
@@ -32892,24 +33224,10 @@ test "sql adapter generated create table and index AST lowers to DDL plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var missing_alter_generated_expression = try tokenized.ParsedSql.initAlloc(
+    try expectGeneratedColumnExpressionItemMissingFails(
         alloc,
         "ALTER TABLE usage_records ADD COLUMN tenant_status_key text GENERATED ALWAYS AS (concat(tenant_id, ':', status)) STORED;",
     );
-    defer missing_alter_generated_expression.deinit(alloc);
-    if (missing_alter_generated_expression.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    if (ddl.alter_table_operation_generated_expression_items.len == 0) return error.TestUnexpectedResult;
-                    ddl.alter_table_operation_generated_expression_items[0] = null;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_alter_generated_expression));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_alter_generated_expression, .{}));
 
     const covering_partial_sql = "CREATE UNIQUE INDEX usage_records_status_active_idx ON usage_records (status) INCLUDE (tenant_id, amount) WHERE deleted_at IS NULL;";
     var generated_covering_partial = try generatedDdlPlanForTestAlloc(alloc, covering_partial_sql);
@@ -32945,15 +33263,135 @@ test "sql adapter generated create table and index AST lowers to DDL plans" {
             try std.testing.expectEqual(@as(usize, 1), generated.columns.len);
             try std.testing.expectEqualStrings("tenant_id", generated.columns[0]);
             try std.testing.expectEqual(@as(usize, 1), generated.expressions.len);
-            try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.lower, generated.expressions[0].op);
+            try std.testing.expectEqual(runtime_schema.UniqueExpressionOp.lower, generated.expressions[0].op);
             try std.testing.expectEqualStrings("email", generated.expressions[0].field);
             try std.testing.expectEqual(@as(usize, 0), generated.where.len);
             try std.testing.expectEqual(@as(usize, 1), generated.where_expressions.len);
-            try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionOp.eq, generated.where_expressions[0].op);
+            try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, generated.where_expressions[0].op);
             try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, generated.where_expressions[0].lhs.kind);
         },
         else => return error.TestUnexpectedResult,
     }
+
+    const null_safe_partial_sql = "CREATE UNIQUE INDEX users_lower_email_active_nullsafe_key ON users (email) WHERE lower(status) IS DISTINCT FROM 'archived';";
+    var generated_null_safe_partial = try generatedDdlPlanForTestAlloc(alloc, null_safe_partial_sql);
+    defer generated_null_safe_partial.deinit(alloc);
+    switch (generated_null_safe_partial) {
+        .create_index => |generated| {
+            try std.testing.expectEqualStrings("users_lower_email_active_nullsafe_key", generated.index_name);
+            try std.testing.expectEqualStrings("users", generated.table_name);
+            try std.testing.expect(generated.unique);
+            try std.testing.expectEqual(@as(usize, 1), generated.columns.len);
+            try std.testing.expectEqualStrings("email", generated.columns[0]);
+            try std.testing.expectEqual(@as(usize, 0), generated.where.len);
+            try std.testing.expectEqual(@as(usize, 1), generated.where_expressions.len);
+            try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_distinct, generated.where_expressions[0].op);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, generated.where_expressions[0].lhs.kind);
+            try std.testing.expectEqualStrings("\"archived\"", generated.where_expressions[0].rhs[0].value_json);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const operator_partial_sql = "CREATE UNIQUE INDEX users_amount_email_key ON users (email) WHERE amount + bonus > 10;";
+    var generated_operator_partial = try generatedDdlPlanForTestAlloc(alloc, operator_partial_sql);
+    defer generated_operator_partial.deinit(alloc);
+    switch (generated_operator_partial) {
+        .create_index => |generated| {
+            try std.testing.expectEqualStrings("users_amount_email_key", generated.index_name);
+            try std.testing.expectEqualStrings("users", generated.table_name);
+            try std.testing.expect(generated.unique);
+            try std.testing.expectEqual(@as(usize, 1), generated.columns.len);
+            try std.testing.expectEqualStrings("email", generated.columns[0]);
+            try std.testing.expectEqual(@as(usize, 0), generated.where.len);
+            try std.testing.expectEqual(@as(usize, 1), generated.where_expressions.len);
+            try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, generated.where_expressions[0].op);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, generated.where_expressions[0].lhs.kind);
+            try std.testing.expectEqualStrings("10", generated.where_expressions[0].rhs[0].value_json);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const function_partial_sql = "CREATE UNIQUE INDEX users_metadata_email_key ON users (email) WHERE jsonb_array_length(metadata) > 0;";
+    var generated_function_partial = try generatedDdlPlanForTestAlloc(alloc, function_partial_sql);
+    defer generated_function_partial.deinit(alloc);
+    switch (generated_function_partial) {
+        .create_index => |generated| {
+            try std.testing.expectEqualStrings("users_metadata_email_key", generated.index_name);
+            try std.testing.expectEqualStrings("users", generated.table_name);
+            try std.testing.expect(generated.unique);
+            try std.testing.expectEqual(@as(usize, 1), generated.columns.len);
+            try std.testing.expectEqualStrings("email", generated.columns[0]);
+            try std.testing.expectEqual(@as(usize, 0), generated.where.len);
+            try std.testing.expectEqual(@as(usize, 1), generated.where_expressions.len);
+            try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, generated.where_expressions[0].op);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.json_array_length, generated.where_expressions[0].lhs.kind);
+            try std.testing.expectEqualStrings("0", generated.where_expressions[0].rhs[0].value_json);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const json_expression_index_sql = "CREATE UNIQUE INDEX users_metadata_source_key ON users (jsonb_extract_path_text(metadata, 'source'));";
+    var generated_json_expression_index = try generatedDdlPlanForTestAlloc(alloc, json_expression_index_sql);
+    defer generated_json_expression_index.deinit(alloc);
+    switch (generated_json_expression_index) {
+        .create_index => |generated| {
+            try std.testing.expectEqualStrings("users_metadata_source_key", generated.index_name);
+            try std.testing.expect(generated.unique);
+            try std.testing.expectEqual(@as(usize, 0), generated.columns.len);
+            try std.testing.expectEqual(@as(usize, 1), generated.expressions.len);
+            try std.testing.expectEqual(runtime_schema.UniqueExpressionOp.expression, generated.expressions[0].op);
+            const expression = generated.expressions[0].expression orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.json_extract, expression.kind);
+            try std.testing.expect(expression.json_as_text);
+            try std.testing.expectEqualStrings("source", expression.json_path);
+            try std.testing.expectEqual(@as(usize, 1), expression.operands.len);
+            try std.testing.expectEqualStrings("metadata", expression.operands[0].field);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const array_expression_index_sql = "CREATE UNIQUE INDEX users_tags_count_key ON users (array_length(tags, 1));";
+    var generated_array_expression_index = try generatedDdlPlanForTestAlloc(alloc, array_expression_index_sql);
+    defer generated_array_expression_index.deinit(alloc);
+    switch (generated_array_expression_index) {
+        .create_index => |generated| {
+            try std.testing.expectEqualStrings("users_tags_count_key", generated.index_name);
+            try std.testing.expect(generated.unique);
+            try std.testing.expectEqual(@as(usize, 0), generated.columns.len);
+            try std.testing.expectEqual(@as(usize, 1), generated.expressions.len);
+            try std.testing.expectEqual(runtime_schema.UniqueExpressionOp.expression, generated.expressions[0].op);
+            const expression = generated.expressions[0].expression orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_length, expression.kind);
+            try std.testing.expectEqual(@as(usize, 2), expression.operands.len);
+            try std.testing.expectEqualStrings("tags", expression.operands[0].field);
+            try std.testing.expectEqualStrings("1", expression.operands[1].value_json);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+const GeneratedPreparedTransactionMetadataMutation = enum {
+    malformed_gid,
+    stale_kind,
+};
+
+fn expectGeneratedPreparedTransactionMetadataMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedPreparedTransactionMetadataMutation,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .prepared_transaction => |*prepared_transaction| switch (mutation) {
+                .malformed_gid => prepared_transaction.gid_tokens = .{ .start = 1, .end = 2 },
+                .stale_kind => prepared_transaction.kind = .rollback,
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
 }
 
 test "sql adapter ddl plan lowers prepared transaction ddl plans" {
@@ -33013,29 +33451,8 @@ test "sql adapter ddl plan lowers prepared transaction ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var malformed_gid = try tokenized.ParsedSql.initAlloc(alloc, "COMMIT PREPARED 'usage_batch';");
-    defer malformed_gid.deinit(alloc);
-    if (malformed_gid.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .prepared_transaction => |*prepared_transaction| prepared_transaction.gid_tokens = .{ .start = 1, .end = 2 },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_gid));
-
-    var malformed_kind = try tokenized.ParsedSql.initAlloc(alloc, "COMMIT PREPARED 'usage_batch';");
-    defer malformed_kind.deinit(alloc);
-    if (malformed_kind.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .prepared_transaction => |*prepared_transaction| prepared_transaction.kind = .rollback,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_kind));
+    try expectGeneratedPreparedTransactionMetadataMutationFails(alloc, "COMMIT PREPARED 'usage_batch';", .malformed_gid);
+    try expectGeneratedPreparedTransactionMetadataMutationFails(alloc, "COMMIT PREPARED 'usage_batch';", .stale_kind);
 }
 
 test "sql adapter ddl plan lowers prepared statement cursor and savepoint ddl plans" {
@@ -33263,6 +33680,80 @@ test "sql adapter ddl plan lowers prepared statement cursor and savepoint ddl pl
     }
 }
 
+const GeneratedPreparedStatementAstMutation = enum {
+    stale_inner_dml_kind,
+    stale_inner_ddl_name,
+    stale_statement_span,
+    stale_command_span,
+    stale_prepare_layout,
+    stale_deallocate_prepare_layout,
+    stale_kind,
+};
+
+fn applyGeneratedPreparedStatementAstMutation(
+    parsed_len: usize,
+    ast: *generated_parser.GeneratedSqlPreparedAst,
+    mutation: GeneratedPreparedStatementAstMutation,
+) !void {
+    switch (mutation) {
+        .stale_inner_dml_kind => {
+            const inner_ast = ast.inner_statement_ast orelse return error.TestUnexpectedResult;
+            switch (inner_ast.*) {
+                .dml => |*dml_ast| dml_ast.kind = .delete,
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        .stale_inner_ddl_name => {
+            const inner_ast = ast.inner_statement_ast orelse return error.TestUnexpectedResult;
+            switch (inner_ast.*) {
+                .ddl => |*ddl_ast| ddl_ast.object_name_tokens = .{
+                    .start = parsed_len,
+                    .end = parsed_len + 1,
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        .stale_statement_span => ast.statement_span.start += 1,
+        .stale_command_span => ast.command_span.end += 1,
+        .stale_prepare_layout => ast.inner_statement_tokens.?.start -= 1,
+        .stale_deallocate_prepare_layout => ast.name_tokens = .{ .start = 1, .end = 3 },
+        .stale_kind => ast.kind = .execute,
+    }
+}
+
+fn expectGeneratedPreparedStatementAstMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedPreparedStatementAstMutation,
+    public_boundary: bool,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    const raw = parsed.generated_statement orelse return error.TestUnexpectedResult;
+    if (public_boundary) {
+        if (raw.ast) |generated_ast| switch (generated_ast) {
+            .prepared => |prepared_ast| {
+                var ast = prepared_ast;
+                try applyGeneratedPreparedStatementAstMutation(parsed.items().len, &ast, mutation);
+                parsed.generated_statement.?.ast = .{ .prepared = ast };
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+        try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
+        return;
+    }
+
+    var ast = switch (raw.ast orelse return error.TestUnexpectedResult) {
+        .prepared => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    try applyGeneratedPreparedStatementAstMutation(parsed.items().len, &ast, mutation);
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        preparedStatementPlanFromGeneratedAstAlloc(alloc, &parsed, ast),
+    );
+}
+
 test "sql adapter generated prepared AST lowers to prepared statement plans" {
     const alloc = std.testing.allocator;
 
@@ -33349,26 +33840,22 @@ test "sql adapter generated prepared AST lowers to prepared statement plans" {
         }
     }
 
-    var stale_prepared_dml = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "PREPARE stale_update_plan AS UPDATE usage_records SET status = 'done' WHERE id = 'u1';",
-    );
-    defer stale_prepared_dml.deinit(alloc);
-    if (stale_prepared_dml.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .prepared => |*prepared_ast| {
-                    const inner_ast = prepared_ast.inner_statement_ast orelse return error.TestUnexpectedResult;
-                    switch (inner_ast.*) {
-                        .dml => |*dml_ast| dml_ast.kind = .delete,
-                        else => return error.TestUnexpectedResult,
-                    }
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_prepared_dml));
+    const prepared_public_boundary_cases = [_]struct {
+        sql: []const u8,
+        mutation: GeneratedPreparedStatementAstMutation,
+    }{
+        .{
+            .sql = "PREPARE stale_update_plan AS UPDATE usage_records SET status = 'done' WHERE id = 'u1';",
+            .mutation = .stale_inner_dml_kind,
+        },
+        .{
+            .sql = "PREPARE stale_create_table_plan AS CREATE TABLE prepared_usage_records (id uuid);",
+            .mutation = .stale_inner_ddl_name,
+        },
+    };
+    for (prepared_public_boundary_cases) |case| {
+        try expectGeneratedPreparedStatementAstMutationFails(alloc, case.sql, case.mutation, true);
+    }
 
     var generated_prepare_ddl = try generatedPreparedStatementPlanForTestAlloc(
         alloc,
@@ -33385,30 +33872,6 @@ test "sql adapter generated prepared AST lowers to prepared statement plans" {
         },
         else => return error.TestUnexpectedResult,
     }
-
-    var stale_prepared_ddl = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "PREPARE stale_create_table_plan AS CREATE TABLE prepared_usage_records (id uuid);",
-    );
-    defer stale_prepared_ddl.deinit(alloc);
-    if (stale_prepared_ddl.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .prepared => |*prepared_ast| {
-                    const inner_ast = prepared_ast.inner_statement_ast orelse return error.TestUnexpectedResult;
-                    switch (inner_ast.*) {
-                        .ddl => |*ddl_ast| ddl_ast.object_name_tokens = .{
-                            .start = stale_prepared_ddl.items().len,
-                            .end = stale_prepared_ddl.items().len + 1,
-                        },
-                        else => return error.TestUnexpectedResult,
-                    }
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_prepared_ddl));
 
     var generated_execute = try generatedPreparedStatementPlanForTestAlloc(alloc, "EXECUTE usage_plan('open', 10);");
     defer generated_execute.deinit(alloc);
@@ -33437,70 +33900,19 @@ test "sql adapter generated prepared AST lowers to prepared statement plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var malformed_span = try tokenized.ParsedSql.initAlloc(alloc, "PREPARE usage_plan AS SELECT id FROM usage_records;");
-    defer malformed_span.deinit(alloc);
-    const malformed_span_raw = malformed_span.generated_statement orelse return error.TestUnexpectedResult;
-    var malformed_span_ast = switch (malformed_span_raw.ast orelse return error.TestUnexpectedResult) {
-        .prepared => |ast| ast,
-        else => return error.TestUnexpectedResult,
+    const prepared_direct_cases = [_]struct {
+        sql: []const u8,
+        mutation: GeneratedPreparedStatementAstMutation,
+    }{
+        .{ .sql = "PREPARE usage_plan AS SELECT id FROM usage_records;", .mutation = .stale_statement_span },
+        .{ .sql = "EXECUTE usage_plan('open');", .mutation = .stale_command_span },
+        .{ .sql = "PREPARE usage_plan(text) AS SELECT id FROM usage_records;", .mutation = .stale_prepare_layout },
+        .{ .sql = "DEALLOCATE PREPARE usage_plan;", .mutation = .stale_deallocate_prepare_layout },
+        .{ .sql = "DEALLOCATE usage_plan;", .mutation = .stale_kind },
     };
-    malformed_span_ast.statement_span.start += 1;
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        preparedStatementPlanFromGeneratedAstAlloc(alloc, &malformed_span, malformed_span_ast),
-    );
-
-    var malformed_command = try tokenized.ParsedSql.initAlloc(alloc, "EXECUTE usage_plan('open');");
-    defer malformed_command.deinit(alloc);
-    const malformed_command_raw = malformed_command.generated_statement orelse return error.TestUnexpectedResult;
-    var malformed_command_ast = switch (malformed_command_raw.ast orelse return error.TestUnexpectedResult) {
-        .prepared => |ast| ast,
-        else => return error.TestUnexpectedResult,
-    };
-    malformed_command_ast.command_span.end += 1;
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        preparedStatementPlanFromGeneratedAstAlloc(alloc, &malformed_command, malformed_command_ast),
-    );
-
-    var malformed_prepare_layout = try tokenized.ParsedSql.initAlloc(alloc, "PREPARE usage_plan(text) AS SELECT id FROM usage_records;");
-    defer malformed_prepare_layout.deinit(alloc);
-    const malformed_prepare_layout_raw = malformed_prepare_layout.generated_statement orelse return error.TestUnexpectedResult;
-    var malformed_prepare_layout_ast = switch (malformed_prepare_layout_raw.ast orelse return error.TestUnexpectedResult) {
-        .prepared => |ast| ast,
-        else => return error.TestUnexpectedResult,
-    };
-    malformed_prepare_layout_ast.inner_statement_tokens.?.start -= 1;
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        preparedStatementPlanFromGeneratedAstAlloc(alloc, &malformed_prepare_layout, malformed_prepare_layout_ast),
-    );
-
-    var malformed_deallocate_prepare_layout = try tokenized.ParsedSql.initAlloc(alloc, "DEALLOCATE PREPARE usage_plan;");
-    defer malformed_deallocate_prepare_layout.deinit(alloc);
-    const malformed_deallocate_prepare_layout_raw = malformed_deallocate_prepare_layout.generated_statement orelse return error.TestUnexpectedResult;
-    var malformed_deallocate_prepare_layout_ast = switch (malformed_deallocate_prepare_layout_raw.ast orelse return error.TestUnexpectedResult) {
-        .prepared => |ast| ast,
-        else => return error.TestUnexpectedResult,
-    };
-    malformed_deallocate_prepare_layout_ast.name_tokens = .{ .start = 1, .end = 3 };
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        preparedStatementPlanFromGeneratedAstAlloc(alloc, &malformed_deallocate_prepare_layout, malformed_deallocate_prepare_layout_ast),
-    );
-
-    var mismatched_kind = try tokenized.ParsedSql.initAlloc(alloc, "DEALLOCATE usage_plan;");
-    defer mismatched_kind.deinit(alloc);
-    const mismatched_kind_raw = mismatched_kind.generated_statement orelse return error.TestUnexpectedResult;
-    var mismatched_kind_ast = switch (mismatched_kind_raw.ast orelse return error.TestUnexpectedResult) {
-        .prepared => |ast| ast,
-        else => return error.TestUnexpectedResult,
-    };
-    mismatched_kind_ast.kind = .execute;
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        preparedStatementPlanFromGeneratedAstAlloc(alloc, &mismatched_kind, mismatched_kind_ast),
-    );
+    for (prepared_direct_cases) |case| {
+        try expectGeneratedPreparedStatementAstMutationFails(alloc, case.sql, case.mutation, false);
+    }
 }
 
 fn generatedPreparedStatementPlanForTestAlloc(alloc: std.mem.Allocator, sql: []const u8) !PreparedStatementPlan {
@@ -33525,6 +33937,56 @@ fn expectGeneratedUnaryExpressionForTest(
     try std.testing.expectEqual(@as(usize, 1), expression.operands.len);
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.field, expression.operands[0].kind);
     try std.testing.expectEqualStrings(field, expression.operands[0].field);
+}
+
+fn expectGeneratedCastExpressionForTest(
+    generated: runtime_schema.RelationalGeneratedValue,
+    cast_type: db_mod.types.RelationalRowsExpressionCastType,
+    field: []const u8,
+) !void {
+    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.expression, generated.op);
+    const expression = generated.expression orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.cast, expression.kind);
+    try std.testing.expectEqual(cast_type, expression.cast_type orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqual(@as(usize, 1), expression.operands.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.field, expression.operands[0].kind);
+    try std.testing.expectEqualStrings(field, expression.operands[0].field);
+}
+
+fn expectGeneratedDateBinExpressionForTest(
+    generated: runtime_schema.RelationalGeneratedValue,
+    field: []const u8,
+) !void {
+    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.expression, generated.op);
+    const expression = generated.expression orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.date_bin, expression.kind);
+    try std.testing.expectEqual(@as(usize, 3), expression.operands.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.interval_ns, expression.operands[0].kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.field, expression.operands[1].kind);
+    try std.testing.expectEqualStrings(field, expression.operands[1].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.value, expression.operands[2].kind);
+    try std.testing.expectEqualStrings("0", expression.operands[2].value_json);
+}
+
+fn expectGeneratedArrayLiteralExpressionForTest(
+    generated: runtime_schema.RelationalGeneratedValue,
+    value_json: []const u8,
+) !void {
+    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.expression, generated.op);
+    const expression = generated.expression orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.value, expression.kind);
+    try std.testing.expectEqualStrings(value_json, expression.value_json);
+}
+
+fn expectGeneratedArrayFunctionExpressionForTest(
+    generated: runtime_schema.RelationalGeneratedValue,
+    kind: db_mod.types.RelationalRowsExpressionKind,
+    operands_len: usize,
+) !void {
+    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.expression, generated.op);
+    const expression = generated.expression orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(kind, expression.kind);
+    try std.testing.expectEqual(operands_len, expression.operands.len);
 }
 
 fn expectGeneratedConcatExpressionForTest(
@@ -33607,7 +34069,7 @@ fn ddlPlanParserOptionsForTest(alloc: std.mem.Allocator, tokens: []const grammar
         .field_expression_qualifiers = state.field_expression_qualifiers,
         .returning_expression_qualifiers = state.returning_expression_qualifiers,
         .defer_row_expression_field_validation = state.defer_row_expression_field_validation,
-        .column_definition_options = parser_context.ParserState.ContextAccessors.ddlColumnDefinitionOptions(&state),
+        .column_definition_options = makeDdlColumnDefinitionOptions(&state),
         .domain_options = parser_context.ParserState.ContextAccessors.ddlDomainOptions(&state),
         .create_index_options = parser_context.ParserState.ContextAccessors.createIndexOptions(&state),
         .row_security_policy_options = parser_context.ParserState.ContextAccessors.rowSecurityPolicyOptions(&state),
@@ -33653,6 +34115,7 @@ const ScalarSubqueryDefaultDdlAstMutation = enum {
     missing_operation_items,
     operation_starts_inside_default,
     mismatched_statement_kind,
+    missing_retained_child,
     stale_default_query_range,
     missing_child_projection,
     stale_child_projection_expression,
@@ -33673,6 +34136,10 @@ fn applyScalarSubqueryDefaultDdlAstMutation(
         .missing_operation_items => ddl_ast.alter_table_operation_items.count = 0,
         .operation_starts_inside_default => ddl_ast.alter_table_operation_items.items[0].start = 8,
         .mismatched_statement_kind => ddl_ast.kind = .drop_table,
+        .missing_retained_child => {
+            ddl_ast.scalar_subquery_default_count = 0;
+            ddl_ast.scalar_subquery_default_items = &.{};
+        },
         .stale_default_query_range => ddl_ast.scalar_subquery_default_items[0].query_tokens.end -= 1,
         .missing_child_projection => ddl_ast.scalar_subquery_default_items[0].read_ast.projection_items.count = 0,
         .stale_child_projection_expression => {
@@ -34187,6 +34654,7 @@ test "sql adapter ddl plan rejects corrupted generated scalar subquery default m
     try expectGeneratedScalarSubqueryDefaultDdlMutationFails(alloc, scalar_default_sql, .missing_operation_items);
     try expectGeneratedScalarSubqueryDefaultDdlMutationFails(alloc, scalar_default_sql, .operation_starts_inside_default);
     try expectGeneratedScalarSubqueryDefaultDdlMutationFails(alloc, scalar_default_sql, .mismatched_statement_kind);
+    try expectGeneratedScalarSubqueryDefaultDdlMutationFails(alloc, scalar_default_sql, .missing_retained_child);
     try expectGeneratedScalarSubqueryDefaultDdlMutationFails(alloc, scalar_default_sql, .stale_default_query_range);
     try expectGeneratedScalarSubqueryDefaultDdlMutationFails(alloc, scalar_default_sql, .missing_child_projection);
     try expectGeneratedScalarSubqueryDefaultDdlMutationFails(alloc, scalar_default_sql, .missing_child_source);
@@ -34194,17 +34662,6 @@ test "sql adapter ddl plan rejects corrupted generated scalar subquery default m
     try expectGeneratedScalarSubqueryDefaultDdlMutationFails(alloc, scalar_default_sql, .stale_child_where_expression);
     try expectGeneratedScalarSubqueryDefaultDdlMutationFails(alloc, ordered_scalar_default_sql, .stale_child_order_item);
     try expectGeneratedScalarSubqueryDefaultDdlMutationFails(alloc, scalar_default_sql, .stale_child_limit_expression);
-
-    var missing_retained_child = try tokenized.ParsedSql.initAlloc(alloc, scalar_default_sql);
-    defer missing_retained_child.deinit(alloc);
-    const missing_retained_child_raw = missing_retained_child.generated_statement orelse return error.TestUnexpectedResult;
-    var missing_retained_child_ast = try generatedDdlCompatibleAst(missing_retained_child_raw.ast orelse return error.TestUnexpectedResult);
-    missing_retained_child_ast.scalar_subquery_default_count = 0;
-    missing_retained_child_ast.scalar_subquery_default_items = &.{};
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        runtimeDdlPlanFromGeneratedAstAlloc(alloc, missing_retained_child.items(), missing_retained_child_ast, ddlPlanParserOptionsForTest(alloc, missing_retained_child.items())),
-    );
 
     const expression_default_sql = "CREATE TABLE usage_records (id uuid PRIMARY KEY, status text DEFAULT (SELECT lower(status) AS status_key FROM usage_records WHERE id = 'u2' ORDER BY id LIMIT 1));";
     try expectGeneratedScalarSubqueryDefaultDdlMutationFails(alloc, expression_default_sql, .stale_child_projection_expression);
@@ -34302,6 +34759,7 @@ const GeneratedUnsupportedCatalogPayloadMutation = enum {
     alter_table_operation_start,
     alter_table_operation_kind,
     alter_table_operation_subject_start,
+    stale_alter_table_operation_subject_payload,
     stale_routine_payload,
 };
 
@@ -34353,6 +34811,7 @@ fn expectGeneratedUnsupportedCatalogPayloadMutationFails(
                             const range = unsupported.alter_table_operation_subject_tokens orelse return error.TestUnexpectedResult;
                             unsupported.alter_table_operation_subject_tokens = .{ .start = range.start - 1, .end = range.end };
                         },
+                        .stale_alter_table_operation_subject_payload => unsupported.alter_table_operation_subject_tokens = subject,
                         .stale_routine_payload => unsupported.routine_name_tokens = subject,
                     }
                     try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedUnsupportedCatalogAst(parsed.items(), unsupported.*, boundary));
@@ -34366,6 +34825,8 @@ fn expectGeneratedUnsupportedCatalogPayloadMutationFails(
 }
 
 const GeneratedIndexAstMutation = enum {
+    missing_elements,
+    corrupt_elements,
     missing_element_items,
     corrupt_element_expression,
     missing_include,
@@ -34397,6 +34858,8 @@ fn expectGeneratedIndexAstMutationFails(
         if (generated_statement.ast) |*generated_ast| {
             switch (generated_ast.*) {
                 .extension_index => |*ddl| switch (mutation) {
+                    .missing_elements => ddl.index_elements_tokens = null,
+                    .corrupt_elements => ddl.index_elements_tokens = .{ .start = 8, .end = 9 },
                     .missing_element_items => {
                         ddl.index_element_items.deinit(alloc);
                         ddl.index_element_items = .{};
@@ -34435,6 +34898,98 @@ fn expectGeneratedIndexAstMutationFails(
     try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed, .{}));
 }
 
+fn expectGeneratedIndexExpressionUnsupportedFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    expected_kind: generated_parser.GeneratedSqlExpressionKind,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+
+    const generated_statement = parsed.generated_statement orelse return error.TestUnexpectedResult;
+    const generated_ast = generated_statement.ast orelse return error.TestUnexpectedResult;
+    switch (generated_ast) {
+        .extension_index => |ddl| {
+            try std.testing.expectEqual(@as(usize, 1), ddl.index_element_items.count);
+            try std.testing.expectEqual(@as(usize, 1), ddl.index_element_items.expressions.len);
+            try std.testing.expectEqual(expected_kind, ddl.index_element_items.expressions[0].kind);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed, .{}));
+}
+
+fn expectGeneratedIndexWhereExpressionUnsupportedFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    expected_kind: generated_parser.GeneratedSqlExpressionKind,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+
+    const generated_statement = parsed.generated_statement orelse return error.TestUnexpectedResult;
+    const generated_ast = generated_statement.ast orelse return error.TestUnexpectedResult;
+    switch (generated_ast) {
+        .extension_index => |ddl| {
+            const where_range = ddl.index_where_tokens orelse return error.TestUnexpectedResult;
+            const expression_tokens = ddl.index_where_expression.tokens orelse return error.TestUnexpectedResult;
+            try std.testing.expect(generatedDdlTokenRangeEqual(where_range, expression_tokens));
+            try std.testing.expectEqual(expected_kind, ddl.index_where_expression.kind);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed, .{}));
+}
+
+fn expectGeneratedIndexMethodUnsupportedFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    expected_method: []const u8,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+
+    const generated_statement = parsed.generated_statement orelse return error.TestUnexpectedResult;
+    const generated_ast = generated_statement.ast orelse return error.TestUnexpectedResult;
+    switch (generated_ast) {
+        .extension_index => |ddl| {
+            const method_range = ddl.index_method_tokens orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(@as(usize, 1), method_range.end - method_range.start);
+            try std.testing.expectEqualStrings(expected_method, parsed.items()[method_range.start].text);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed, .{}));
+}
+
+fn expectGeneratedIndexOptionsUnsupportedFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+
+    const generated_statement = parsed.generated_statement orelse return error.TestUnexpectedResult;
+    const generated_ast = generated_statement.ast orelse return error.TestUnexpectedResult;
+    switch (generated_ast) {
+        .extension_index => |ddl| {
+            const options_range = ddl.index_options_tokens orelse return error.TestUnexpectedResult;
+            try std.testing.expect(options_range.start < options_range.end);
+            try std.testing.expect(parsed.items()[options_range.start].matchesKeywordTag(.with));
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed, .{}));
+}
+
 fn generatedGraphDdlPlanForTestAlloc(alloc: std.mem.Allocator, sql: []const u8) !DdlPlan {
     var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
     defer parsed.deinit(alloc);
@@ -34444,6 +34999,39 @@ fn generatedGraphDdlPlanForTestAlloc(alloc: std.mem.Allocator, sql: []const u8) 
         else => return error.UnsupportedSqlShape,
     };
     return try graphDdlPlanFromGeneratedAstAlloc(alloc, parsed.items(), graph_ast);
+}
+
+const GeneratedGraphDdlAstMutation = enum {
+    stale_statement_span,
+    stale_command_span,
+    missing_algorithm,
+    missing_edge_target,
+    missing_extraction_target,
+};
+
+fn expectGeneratedGraphDdlAstMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedGraphDdlAstMutation,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    const raw = parsed.generated_statement orelse return error.TestUnexpectedResult;
+    var ast = switch (raw.ast orelse return error.TestUnexpectedResult) {
+        .graph => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    switch (mutation) {
+        .stale_statement_span => ast.statement_span.start += 1,
+        .stale_command_span => ast.command_span.end += 1,
+        .missing_algorithm => ast.algorithm_tokens = null,
+        .missing_edge_target => ast.edge_target_tokens = null,
+        .missing_extraction_target => ast.extraction_target_tokens = null,
+    }
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        graphDdlPlanFromGeneratedAstAlloc(alloc, parsed.items(), ast),
+    );
 }
 
 test "sql adapter ddl plan lowers generated graph AST into typed index plans" {
@@ -34536,70 +35124,43 @@ test "sql adapter ddl plan lowers generated graph AST into typed index plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var malformed_graph_span = try tokenized.ParsedSql.initAlloc(alloc, graph_index_sql);
-    defer malformed_graph_span.deinit(alloc);
-    const malformed_graph_span_raw = malformed_graph_span.generated_statement orelse return error.TestUnexpectedResult;
-    var malformed_graph_span_ast = switch (malformed_graph_span_raw.ast orelse return error.TestUnexpectedResult) {
-        .graph => |ast| ast,
-        else => return error.TestUnexpectedResult,
+    const graph_metadata_cases = [_]struct {
+        sql: []const u8,
+        mutation: GeneratedGraphDdlAstMutation,
+    }{
+        .{ .sql = graph_index_sql, .mutation = .stale_statement_span },
+        .{ .sql = graph_alter_metric_sql, .mutation = .stale_command_span },
+        .{ .sql = graph_alter_metric_sql, .mutation = .missing_algorithm },
+        .{ .sql = graph_index_sql, .mutation = .missing_edge_target },
+        .{ .sql = graph_extraction_sql, .mutation = .missing_extraction_target },
     };
-    malformed_graph_span_ast.statement_span.start += 1;
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        graphDdlPlanFromGeneratedAstAlloc(alloc, malformed_graph_span.items(), malformed_graph_span_ast),
-    );
+    for (graph_metadata_cases) |case| {
+        try expectGeneratedGraphDdlAstMutationFails(alloc, case.sql, case.mutation);
+    }
+}
 
-    var malformed_graph_command = try tokenized.ParsedSql.initAlloc(alloc, graph_alter_metric_sql);
-    defer malformed_graph_command.deinit(alloc);
-    const malformed_graph_command_raw = malformed_graph_command.generated_statement orelse return error.TestUnexpectedResult;
-    var malformed_graph_command_ast = switch (malformed_graph_command_raw.ast orelse return error.TestUnexpectedResult) {
-        .graph => |ast| ast,
-        else => return error.TestUnexpectedResult,
-    };
-    malformed_graph_command_ast.command_span.end += 1;
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        graphDdlPlanFromGeneratedAstAlloc(alloc, malformed_graph_command.items(), malformed_graph_command_ast),
-    );
-
-    var malformed_graph_range = try tokenized.ParsedSql.initAlloc(alloc, graph_alter_metric_sql);
-    defer malformed_graph_range.deinit(alloc);
-    const malformed_graph_range_raw = malformed_graph_range.generated_statement orelse return error.TestUnexpectedResult;
-    var malformed_graph_range_ast = switch (malformed_graph_range_raw.ast orelse return error.TestUnexpectedResult) {
-        .graph => |ast| ast,
-        else => return error.TestUnexpectedResult,
-    };
-    malformed_graph_range_ast.algorithm_tokens = null;
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        graphDdlPlanFromGeneratedAstAlloc(alloc, malformed_graph_range.items(), malformed_graph_range_ast),
-    );
-
-    var malformed_graph_edge = try tokenized.ParsedSql.initAlloc(alloc, graph_index_sql);
-    defer malformed_graph_edge.deinit(alloc);
-    const malformed_graph_edge_raw = malformed_graph_edge.generated_statement orelse return error.TestUnexpectedResult;
-    var malformed_graph_edge_ast = switch (malformed_graph_edge_raw.ast orelse return error.TestUnexpectedResult) {
-        .graph => |ast| ast,
-        else => return error.TestUnexpectedResult,
-    };
-    malformed_graph_edge_ast.edge_target_tokens = null;
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        graphDdlPlanFromGeneratedAstAlloc(alloc, malformed_graph_edge.items(), malformed_graph_edge_ast),
-    );
-
-    var malformed_graph_extraction = try tokenized.ParsedSql.initAlloc(alloc, graph_extraction_sql);
-    defer malformed_graph_extraction.deinit(alloc);
-    const malformed_graph_extraction_raw = malformed_graph_extraction.generated_statement orelse return error.TestUnexpectedResult;
-    var malformed_graph_extraction_ast = switch (malformed_graph_extraction_raw.ast orelse return error.TestUnexpectedResult) {
-        .graph => |ast| ast,
-        else => return error.TestUnexpectedResult,
-    };
-    malformed_graph_extraction_ast.extraction_target_tokens = null;
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        graphDdlPlanFromGeneratedAstAlloc(alloc, malformed_graph_extraction.items(), malformed_graph_extraction_ast),
-    );
+fn expectGeneratedDdlExpressionKindMutationFailsAtPublicBoundaries(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    expression_index: usize,
+    expected_kind: generated_parser.GeneratedSqlExpressionKind,
+    mutated_kind: generated_parser.GeneratedSqlExpressionKind,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .ddl => |*ddl| {
+                if (ddl.alter_table_operation_generated_expressions.len <= expression_index) return error.TestUnexpectedResult;
+                try std.testing.expectEqual(expected_kind, ddl.alter_table_operation_generated_expressions[expression_index].kind);
+                ddl.alter_table_operation_generated_expressions[expression_index].kind = mutated_kind;
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed, function_bindings));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed, function_bindings));
 }
 
 test "sql adapter ddl plan lowers routine expression bindings into ddl plans" {
@@ -34641,6 +35202,15 @@ test "sql adapter ddl plan lowers routine expression bindings into ddl plans" {
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, generated_expression.kind);
     try std.testing.expectEqual(@as(usize, 1), generated_expression.operands.len);
     try std.testing.expectEqualStrings("status", generated_expression.operands[0].field);
+
+    try expectGeneratedDdlExpressionKindMutationFailsAtPublicBoundaries(
+        alloc,
+        "CREATE TABLE usage_records (id text PRIMARY KEY, status text, status_key text GENERATED ALWAYS AS (normalize_status(status)) STORED);",
+        2,
+        .function_call,
+        .token_range,
+        .{ .routine_expressions = &bindings },
+    );
 
     var rewrite_table = try runtimeDdlPlanWithFunctionBindingsForTestAlloc(
         alloc,
@@ -34700,6 +35270,54 @@ test "sql adapter ddl plan lowers routine expression bindings into ddl plans" {
     try std.testing.expectEqualStrings("status", routine_policy_expression.lhs.operands[0].field);
 }
 
+const GeneratedMaterializedViewMetadataMutation = enum {
+    corrupt_create_columns,
+    missing_create_query,
+    missing_create_population,
+    corrupt_create_data_clause,
+    stale_drop_cascade,
+    missing_refresh_operation,
+    missing_refresh_concurrently,
+    stale_refresh_population,
+    stale_kind,
+    corrupt_subject,
+};
+
+fn applyGeneratedMaterializedViewMetadataMutation(
+    parsed_len: usize,
+    ddl: *generated_parser.GeneratedSqlDdlAst,
+    mutation: GeneratedMaterializedViewMetadataMutation,
+) !void {
+    switch (mutation) {
+        .corrupt_create_columns => (ddl.view_metadata orelse return error.TestUnexpectedResult).column_items.items[0].start += 1,
+        .missing_create_query => (ddl.view_metadata orelse return error.TestUnexpectedResult).query_tokens = null,
+        .missing_create_population => ddl.materialized_view_populate = null,
+        .corrupt_create_data_clause => ddl.materialized_view_data_clause_tokens.?.start += 1,
+        .stale_drop_cascade => ddl.cascade = false,
+        .missing_refresh_operation => ddl.alter_table_operation_tokens = null,
+        .missing_refresh_concurrently => ddl.materialized_view_concurrently = null,
+        .stale_refresh_population => ddl.materialized_view_populate = false,
+        .stale_kind => ddl.kind = .drop_materialized_view,
+        .corrupt_subject => ddl.object_name_tokens = .{ .start = 2, .end = parsed_len },
+    }
+}
+
+fn expectGeneratedMaterializedViewMetadataMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedMaterializedViewMetadataMutation,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .ddl => |*ddl| try applyGeneratedMaterializedViewMetadataMutation(parsed.items().len, ddl, mutation),
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
+}
+
 test "sql adapter generated materialized view DDL AST lowers to catalog plans" {
     const alloc = std.testing.allocator;
 
@@ -34742,65 +35360,24 @@ test "sql adapter generated materialized view DDL AST lowers to catalog plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var malformed_create_columns = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE MATERIALIZED VIEW users_mv(user_id, contact_email) AS SELECT id, email FROM users;",
-    );
-    defer malformed_create_columns.deinit(alloc);
-    if (malformed_create_columns.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| (ddl.view_metadata orelse return error.TestUnexpectedResult).column_items.items[0].start += 1,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_create_columns));
-
-    var malformed_create_query = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE MATERIALIZED VIEW users_mv AS SELECT id FROM users;",
-    );
-    defer malformed_create_query.deinit(alloc);
-    if (malformed_create_query.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| (ddl.view_metadata orelse return error.TestUnexpectedResult).query_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_create_query));
-
-    var missing_create_population = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE MATERIALIZED VIEW users_mv AS SELECT id FROM users WITH NO DATA;",
-    );
-    defer missing_create_population.deinit(alloc);
-    if (missing_create_population.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.materialized_view_populate = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_create_population));
-
-    var corrupt_create_data_clause = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE MATERIALIZED VIEW users_mv AS SELECT id FROM users WITH NO DATA;",
-    );
-    defer corrupt_create_data_clause.deinit(alloc);
-    if (corrupt_create_data_clause.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.materialized_view_data_clause_tokens.?.start += 1,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &corrupt_create_data_clause));
+    const materialized_view_metadata_cases = [_]struct {
+        sql: []const u8,
+        mutation: GeneratedMaterializedViewMetadataMutation,
+    }{
+        .{ .sql = "CREATE MATERIALIZED VIEW users_mv(user_id, contact_email) AS SELECT id, email FROM users;", .mutation = .corrupt_create_columns },
+        .{ .sql = "CREATE MATERIALIZED VIEW users_mv AS SELECT id FROM users;", .mutation = .missing_create_query },
+        .{ .sql = "CREATE MATERIALIZED VIEW users_mv AS SELECT id FROM users WITH NO DATA;", .mutation = .missing_create_population },
+        .{ .sql = "CREATE MATERIALIZED VIEW users_mv AS SELECT id FROM users WITH NO DATA;", .mutation = .corrupt_create_data_clause },
+        .{ .sql = "DROP MATERIALIZED VIEW IF EXISTS users_mv CASCADE;", .mutation = .stale_drop_cascade },
+        .{ .sql = "REFRESH MATERIALIZED VIEW CONCURRENTLY users_mv WITH NO DATA;", .mutation = .missing_refresh_operation },
+        .{ .sql = "REFRESH MATERIALIZED VIEW CONCURRENTLY users_mv WITH NO DATA;", .mutation = .missing_refresh_concurrently },
+        .{ .sql = "REFRESH MATERIALIZED VIEW users_mv;", .mutation = .stale_refresh_population },
+        .{ .sql = "CREATE MATERIALIZED VIEW users_mv AS SELECT id FROM users;", .mutation = .stale_kind },
+        .{ .sql = "DROP MATERIALIZED VIEW users_mv;", .mutation = .corrupt_subject },
+    };
+    for (materialized_view_metadata_cases) |case| {
+        try expectGeneratedMaterializedViewMetadataMutationFails(alloc, case.sql, case.mutation);
+    }
 
     var drop_sql = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -34821,21 +35398,6 @@ test "sql adapter generated materialized view DDL AST lowers to catalog plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var malformed_drop_cascade = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "DROP MATERIALIZED VIEW IF EXISTS users_mv CASCADE;",
-    );
-    defer malformed_drop_cascade.deinit(alloc);
-    if (malformed_drop_cascade.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.cascade = false,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_drop_cascade));
-
     var refresh_sql = try tokenized.ParsedSql.initAlloc(
         alloc,
         "REFRESH MATERIALIZED VIEW CONCURRENTLY users_mv WITH NO DATA;",
@@ -34855,81 +35417,6 @@ test "sql adapter generated materialized view DDL AST lowers to catalog plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var malformed_refresh_operation = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "REFRESH MATERIALIZED VIEW CONCURRENTLY users_mv WITH NO DATA;",
-    );
-    defer malformed_refresh_operation.deinit(alloc);
-    if (malformed_refresh_operation.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.alter_table_operation_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_refresh_operation));
-
-    var missing_refresh_concurrently = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "REFRESH MATERIALIZED VIEW CONCURRENTLY users_mv WITH NO DATA;",
-    );
-    defer missing_refresh_concurrently.deinit(alloc);
-    if (missing_refresh_concurrently.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.materialized_view_concurrently = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_refresh_concurrently));
-
-    var stale_refresh_population = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "REFRESH MATERIALIZED VIEW users_mv;",
-    );
-    defer stale_refresh_population.deinit(alloc);
-    if (stale_refresh_population.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.materialized_view_populate = false,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_refresh_population));
-
-    var malformed_kind = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE MATERIALIZED VIEW users_mv AS SELECT id FROM users;",
-    );
-    defer malformed_kind.deinit(alloc);
-    if (malformed_kind.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.kind = .drop_materialized_view,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_kind));
-
-    var malformed_subject = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "DROP MATERIALIZED VIEW users_mv;",
-    );
-    defer malformed_subject.deinit(alloc);
-    if (malformed_subject.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.object_name_tokens = .{ .start = 2, .end = malformed_subject.items().len },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_subject));
-
     var unsupported_alter_sql = try tokenized.ParsedSql.initAlloc(
         alloc,
         "ALTER MATERIALIZED VIEW users_mv RENAME TO users_mv_v2;",
@@ -34940,6 +35427,59 @@ test "sql adapter generated materialized view DDL AST lowers to catalog plans" {
         else => return error.TestUnexpectedResult,
     }
     try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &unsupported_alter_sql));
+}
+
+const GeneratedViewMetadataMutation = enum {
+    corrupt_create_columns,
+    missing_create_query,
+    missing_query_read,
+    stale_query_read,
+    missing_rename_target,
+    stale_replace,
+    stale_alter_operation,
+};
+
+fn applyGeneratedViewMetadataMutation(
+    alloc: std.mem.Allocator,
+    parsed_len: usize,
+    ddl: *generated_parser.GeneratedSqlDdlAst,
+    mutation: GeneratedViewMetadataMutation,
+) !void {
+    switch (mutation) {
+        .corrupt_create_columns => (ddl.view_metadata orelse return error.TestUnexpectedResult).column_items.items[0].start += 1,
+        .missing_create_query => (ddl.view_metadata orelse return error.TestUnexpectedResult).query_tokens = null,
+        .missing_query_read => {
+            const metadata = ddl.view_metadata orelse return error.TestUnexpectedResult;
+            const read = metadata.query_read orelse return error.TestUnexpectedResult;
+            read.deinit(alloc);
+            alloc.destroy(read);
+            metadata.query_read = null;
+        },
+        .stale_query_read => {
+            const metadata = ddl.view_metadata orelse return error.TestUnexpectedResult;
+            const read = metadata.query_read orelse return error.TestUnexpectedResult;
+            read.projection_items.count += 1;
+        },
+        .missing_rename_target => ddl.rename_target_tokens = null,
+        .stale_replace => ddl.replace_existing = false,
+        .stale_alter_operation => ddl.alter_table_operation_tokens = .{ .start = 2, .end = parsed_len },
+    }
+}
+
+fn expectGeneratedViewMetadataMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedViewMetadataMutation,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .ddl => |*ddl| try applyGeneratedViewMetadataMutation(alloc, parsed.items().len, ddl, mutation),
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
 }
 
 test "sql adapter generated view DDL AST lowers to catalog plans" {
@@ -34967,75 +35507,22 @@ test "sql adapter generated view DDL AST lowers to catalog plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var malformed_create_columns = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE VIEW users_v(user_id) AS SELECT id FROM users;",
-    );
-    defer malformed_create_columns.deinit(alloc);
-    if (malformed_create_columns.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| (ddl.view_metadata orelse return error.TestUnexpectedResult).column_items.items[0].start += 1,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_create_columns));
-
-    var malformed_create_query = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE VIEW users_v AS SELECT id AS user_id FROM users;",
-    );
-    defer malformed_create_query.deinit(alloc);
-    if (malformed_create_query.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| (ddl.view_metadata orelse return error.TestUnexpectedResult).query_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_create_query));
-
-    var missing_query_read = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE VIEW users_v AS SELECT id AS user_id FROM users;",
-    );
-    defer missing_query_read.deinit(alloc);
-    if (missing_query_read.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    const metadata = ddl.view_metadata orelse return error.TestUnexpectedResult;
-                    const read = metadata.query_read orelse return error.TestUnexpectedResult;
-                    read.deinit(alloc);
-                    alloc.destroy(read);
-                    metadata.query_read = null;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_query_read));
-
-    var stale_query_read = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE VIEW users_v AS SELECT id AS user_id FROM users;",
-    );
-    defer stale_query_read.deinit(alloc);
-    if (stale_query_read.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    const metadata = ddl.view_metadata orelse return error.TestUnexpectedResult;
-                    const read = metadata.query_read orelse return error.TestUnexpectedResult;
-                    read.projection_items.count += 1;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_query_read));
+    const view_query_sql = "CREATE VIEW users_v AS SELECT id AS user_id FROM users;";
+    const view_metadata_cases = [_]struct {
+        sql: []const u8,
+        mutation: GeneratedViewMetadataMutation,
+    }{
+        .{ .sql = "CREATE VIEW users_v(user_id) AS SELECT id FROM users;", .mutation = .corrupt_create_columns },
+        .{ .sql = view_query_sql, .mutation = .missing_create_query },
+        .{ .sql = view_query_sql, .mutation = .missing_query_read },
+        .{ .sql = view_query_sql, .mutation = .stale_query_read },
+        .{ .sql = "ALTER VIEW users_v RENAME TO users_active_v;", .mutation = .missing_rename_target },
+        .{ .sql = "CREATE OR REPLACE VIEW users_v AS SELECT id AS user_id FROM users;", .mutation = .stale_replace },
+        .{ .sql = "ALTER VIEW users_v RENAME TO users_active_v;", .mutation = .stale_alter_operation },
+    };
+    for (view_metadata_cases) |case| {
+        try expectGeneratedViewMetadataMutationFails(alloc, case.sql, case.mutation);
+    }
 
     var rename_sql = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -35055,21 +35542,6 @@ test "sql adapter generated view DDL AST lowers to catalog plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var malformed_rename_sql = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "ALTER VIEW users_v RENAME TO users_active_v;",
-    );
-    defer malformed_rename_sql.deinit(alloc);
-    if (malformed_rename_sql.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.rename_target_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_rename_sql));
-
     var drop_sql = try tokenized.ParsedSql.initAlloc(
         alloc,
         "DROP VIEW IF EXISTS users_v CASCADE;",
@@ -35088,36 +35560,77 @@ test "sql adapter generated view DDL AST lowers to catalog plans" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
 
-    var malformed_replace = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE OR REPLACE VIEW users_v AS SELECT id AS user_id FROM users;",
-    );
-    defer malformed_replace.deinit(alloc);
-    if (malformed_replace.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.replace_existing = false,
-                else => return error.TestUnexpectedResult,
-            }
+const GeneratedDomainMetadataMutation = enum {
+    missing_default_payload,
+    stale_option_kind,
+    missing_check_payload,
+    missing_check_payload_expression,
+    stale_check_payload_expression_kind,
+    corrupt_create_name,
+    missing_create_type,
+    corrupt_create_options,
+    stale_alter_tail,
+    corrupt_alter_items,
+    stale_drop_cascade,
+};
+
+fn applyGeneratedDomainMetadataMutation(
+    parsed_len: usize,
+    ddl: *generated_parser.GeneratedSqlDdlAst,
+    mutation: GeneratedDomainMetadataMutation,
+) !void {
+    switch (mutation) {
+        .missing_default_payload => {
+            if (ddl.domain_operation_default_value_items.len != 3) return error.TestUnexpectedResult;
+            try std.testing.expect(ddl.domain_operation_default_value_items[0] != null);
+            ddl.domain_operation_default_value_items[0] = null;
+        },
+        .stale_option_kind => {
+            if (ddl.domain_operation_kind_items.len != 3) return error.TestUnexpectedResult;
+            ddl.domain_operation_kind_items[2].start -= 1;
+        },
+        .missing_check_payload => {
+            if (ddl.domain_operation_check_payload_items.len != 3) return error.TestUnexpectedResult;
+            try std.testing.expect(ddl.domain_operation_check_payload_items[2] != null);
+            ddl.domain_operation_check_payload_items[2] = null;
+        },
+        .missing_check_payload_expression => {
+            if (ddl.domain_operation_check_payload_expressions.len != 3) return error.TestUnexpectedResult;
+            ddl.domain_operation_check_payload_expressions[2].tokens = null;
+        },
+        .stale_check_payload_expression_kind => {
+            if (ddl.domain_operation_check_payload_expressions.len != 3) return error.TestUnexpectedResult;
+            ddl.domain_operation_check_payload_expressions[2].kind = .token_range;
+        },
+        .corrupt_create_name => ddl.object_name_tokens = .{ .start = 1, .end = 2 },
+        .missing_create_type => ddl.domain_type_tokens = null,
+        .corrupt_create_options => ddl.domain_operation_items.items[0].start += 1,
+        .stale_alter_tail => ddl.alter_table_operation_tokens = .{ .start = 2, .end = parsed_len },
+        .corrupt_alter_items => ddl.domain_operation_items.items[0].start += 1,
+        .stale_drop_cascade => ddl.cascade = false,
+    }
+}
+
+fn expectGeneratedDomainMetadataMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedDomainMetadataMutation,
+    expect_logical_failure: bool,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .ddl => |*ddl| try applyGeneratedDomainMetadataMutation(parsed.items().len, ddl, mutation),
+            else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_replace));
-
-    var malformed_operation = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "ALTER VIEW users_v RENAME TO users_active_v;",
-    );
-    defer malformed_operation.deinit(alloc);
-    if (malformed_operation.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.alter_table_operation_tokens = .{ .start = 2, .end = malformed_operation.items().len },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_operation));
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
+    if (expect_logical_failure) {
+        try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed, .{}));
+    }
 }
 
 test "sql adapter generated domain DDL AST lowers to catalog plans" {
@@ -35164,64 +35677,27 @@ test "sql adapter generated domain DDL AST lowers to catalog plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var missing_domain_default_payload = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE DOMAIN generated_amount AS numeric DEFAULT 0 NOT NULL CONSTRAINT generated_amount_positive CHECK (VALUE >= 0);",
-    );
-    defer missing_domain_default_payload.deinit(alloc);
-    if (missing_domain_default_payload.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    if (ddl.domain_operation_default_value_items.len != 3) return error.TestUnexpectedResult;
-                    try std.testing.expect(ddl.domain_operation_default_value_items[0] != null);
-                    ddl.domain_operation_default_value_items[0] = null;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_domain_default_payload));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_domain_default_payload, .{}));
-
-    var stale_domain_option_kind = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE DOMAIN generated_amount AS numeric DEFAULT 0 NOT NULL CONSTRAINT generated_amount_positive CHECK (VALUE >= 0);",
-    );
-    defer stale_domain_option_kind.deinit(alloc);
-    if (stale_domain_option_kind.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    if (ddl.domain_operation_kind_items.len != 3) return error.TestUnexpectedResult;
-                    ddl.domain_operation_kind_items[2].start -= 1;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_domain_option_kind));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &stale_domain_option_kind, .{}));
-
-    var missing_domain_check_payload = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE DOMAIN generated_amount AS numeric DEFAULT 0 NOT NULL CONSTRAINT generated_amount_positive CHECK (VALUE >= 0);",
-    );
-    defer missing_domain_check_payload.deinit(alloc);
-    if (missing_domain_check_payload.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    if (ddl.domain_operation_check_payload_items.len != 3) return error.TestUnexpectedResult;
-                    try std.testing.expect(ddl.domain_operation_check_payload_items[2] != null);
-                    ddl.domain_operation_check_payload_items[2] = null;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_domain_check_payload));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_domain_check_payload, .{}));
+    const domain_options_sql = "CREATE DOMAIN generated_amount AS numeric DEFAULT 0 NOT NULL CONSTRAINT generated_amount_positive CHECK (VALUE >= 0);";
+    const generated_domain_metadata_cases = [_]struct {
+        sql: []const u8,
+        mutation: GeneratedDomainMetadataMutation,
+        expect_logical_failure: bool = false,
+    }{
+        .{ .sql = domain_options_sql, .mutation = .missing_default_payload, .expect_logical_failure = true },
+        .{ .sql = domain_options_sql, .mutation = .stale_option_kind, .expect_logical_failure = true },
+        .{ .sql = domain_options_sql, .mutation = .missing_check_payload, .expect_logical_failure = true },
+        .{ .sql = domain_options_sql, .mutation = .missing_check_payload_expression, .expect_logical_failure = true },
+        .{ .sql = domain_options_sql, .mutation = .stale_check_payload_expression_kind, .expect_logical_failure = true },
+        .{ .sql = "CREATE DOMAIN positive_amount AS numeric;", .mutation = .corrupt_create_name },
+        .{ .sql = "CREATE DOMAIN positive_amount AS numeric;", .mutation = .missing_create_type },
+        .{ .sql = "CREATE DOMAIN positive_amount AS numeric CHECK (VALUE > 0);", .mutation = .corrupt_create_options },
+        .{ .sql = "ALTER DOMAIN positive_amount SET NOT NULL;", .mutation = .stale_alter_tail },
+        .{ .sql = "ALTER DOMAIN positive_amount SET NOT NULL, SET DEFAULT 42, DROP DEFAULT;", .mutation = .corrupt_alter_items },
+        .{ .sql = "DROP DOMAIN IF EXISTS positive_amount CASCADE;", .mutation = .stale_drop_cascade },
+    };
+    for (generated_domain_metadata_cases) |case| {
+        try expectGeneratedDomainMetadataMutationFails(alloc, case.sql, case.mutation, case.expect_logical_failure);
+    }
 
     var alter_sql = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -35259,96 +35735,73 @@ test "sql adapter generated domain DDL AST lowers to catalog plans" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
 
-    var malformed_create = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE DOMAIN positive_amount AS numeric;",
-    );
-    defer malformed_create.deinit(alloc);
-    if (malformed_create.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.object_name_tokens = .{ .start = 1, .end = 2 },
-                else => return error.TestUnexpectedResult,
-            }
+const GeneratedRowPolicyMetadataMutation = enum {
+    stale_kind,
+    malformed_table,
+    missing_mode,
+    missing_command,
+    missing_using,
+    missing_check,
+    missing_roles,
+    corrupt_roles,
+    stale_alter_roles,
+};
+
+fn applyGeneratedRowPolicyMetadataMutation(
+    ddl: *generated_parser.GeneratedSqlDdlAst,
+    mutation: GeneratedRowPolicyMetadataMutation,
+) void {
+    switch (mutation) {
+        .stale_kind => ddl.kind = .drop_policy,
+        .malformed_table => ddl.index_table_tokens = .{ .start = 2, .end = 3 },
+        .missing_mode => ddl.policy_mode_tokens = null,
+        .missing_command => ddl.policy_command_tokens = null,
+        .missing_using => ddl.policy_using_predicate_tokens = null,
+        .missing_check => ddl.policy_check_predicate_tokens = null,
+        .missing_roles => ddl.policy_role_targets_present = false,
+        .corrupt_roles => ddl.policy_role_target_items.items[0].start += 1,
+        .stale_alter_roles => ddl.policy_role_targets_present = true,
+    }
+}
+
+fn expectGeneratedRowPolicyMetadataMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedRowPolicyMetadataMutation,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .ddl => |*ddl| applyGeneratedRowPolicyMetadataMutation(ddl, mutation),
+            else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_create));
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
+}
 
-    var malformed_create_type = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE DOMAIN positive_amount AS numeric;",
-    );
-    defer malformed_create_type.deinit(alloc);
-    if (malformed_create_type.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.domain_type_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
+fn expectGeneratedRowPolicyLogicalUsingMissingFails(alloc: std.mem.Allocator, sql: []const u8) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .ddl => |*ddl| {
+                ddl.policy_using_predicate_tokens = null;
+                try std.testing.expectError(
+                    error.UnsupportedSqlShape,
+                    logicalDdlPlanFromGeneratedAstAlloc(
+                        alloc,
+                        parsed.items(),
+                        ddl.*,
+                        defaultDdlPlanParserOptionsForTest(alloc, parsed.items()),
+                    ),
+                );
+            },
+            else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_create_type));
-
-    var malformed_create_options = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE DOMAIN positive_amount AS numeric CHECK (VALUE > 0);",
-    );
-    defer malformed_create_options.deinit(alloc);
-    if (malformed_create_options.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.domain_operation_items.items[0].start += 1,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_create_options));
-
-    var malformed_alter = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "ALTER DOMAIN positive_amount SET NOT NULL;",
-    );
-    defer malformed_alter.deinit(alloc);
-    if (malformed_alter.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.alter_table_operation_tokens = .{ .start = 2, .end = malformed_alter.items().len },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_alter));
-
-    var malformed_alter_items = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "ALTER DOMAIN positive_amount SET NOT NULL, SET DEFAULT 42, DROP DEFAULT;",
-    );
-    defer malformed_alter_items.deinit(alloc);
-    if (malformed_alter_items.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.domain_operation_items.items[0].start += 1,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_alter_items));
-
-    var malformed_drop_cascade = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "DROP DOMAIN IF EXISTS positive_amount CASCADE;",
-    );
-    defer malformed_drop_cascade.deinit(alloc);
-    if (malformed_drop_cascade.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.cascade = false,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_drop_cascade));
 }
 
 test "sql adapter generated row policy DDL AST lowers to catalog plans" {
@@ -35437,163 +35890,123 @@ test "sql adapter generated row policy DDL AST lowers to catalog plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var malformed_kind = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE POLICY usage_records_targeted_policy ON usage_records USING (tenant_id = 'tenant-a');",
-    );
-    defer malformed_kind.deinit(alloc);
-    if (malformed_kind.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.kind = .drop_policy,
-                else => return error.TestUnexpectedResult,
-            }
+    const create_policy_using_sql = "CREATE POLICY usage_records_targeted_policy ON usage_records USING (tenant_id = 'tenant-a');";
+    const create_policy_roles_sql = "CREATE POLICY usage_records_targeted_policy ON usage_records TO app_reader, app_writer USING (tenant_id = current_setting('app.tenant_id'));";
+    const alter_policy_check_sql = "ALTER POLICY usage_records_tenant_policy ON usage_records WITH CHECK (status = 'ready');";
+    const row_policy_metadata_cases = [_]struct {
+        sql: []const u8,
+        mutation: GeneratedRowPolicyMetadataMutation,
+    }{
+        .{ .sql = create_policy_using_sql, .mutation = .stale_kind },
+        .{ .sql = "DROP POLICY usage_records_tenant_policy ON usage_records;", .mutation = .malformed_table },
+        .{ .sql = "CREATE POLICY usage_records_targeted_policy ON usage_records AS RESTRICTIVE USING (tenant_id = 'tenant-a');", .mutation = .missing_mode },
+        .{ .sql = "CREATE POLICY usage_records_targeted_policy ON usage_records FOR SELECT USING (tenant_id = 'tenant-a');", .mutation = .missing_command },
+        .{ .sql = create_policy_using_sql, .mutation = .missing_using },
+        .{ .sql = "CREATE POLICY usage_records_targeted_policy ON usage_records USING (tenant_id = 'tenant-a') WITH CHECK (status = 'active');", .mutation = .missing_check },
+        .{ .sql = create_policy_roles_sql, .mutation = .missing_roles },
+        .{ .sql = create_policy_roles_sql, .mutation = .corrupt_roles },
+        .{ .sql = alter_policy_check_sql, .mutation = .stale_alter_roles },
+    };
+    for (row_policy_metadata_cases) |case| {
+        try expectGeneratedRowPolicyMetadataMutationFails(alloc, case.sql, case.mutation);
+    }
+
+    try expectGeneratedRowPolicyLogicalUsingMissingFails(alloc, create_policy_using_sql);
+}
+
+const GeneratedCommentMetadataMutation = enum {
+    stale_target,
+    missing_value,
+    missing_constraint_parent,
+    stale_function_signature,
+};
+
+fn applyGeneratedCommentMetadataMutation(
+    ddl: *generated_parser.GeneratedSqlDdlAst,
+    mutation: GeneratedCommentMetadataMutation,
+) !void {
+    switch (mutation) {
+        .stale_target => ddl.comment_target = .index,
+        .missing_value => ddl.comment_value_tokens = null,
+        .missing_constraint_parent => ddl.comment_parent_table_tokens = null,
+        .stale_function_signature => {
+            const routine_metadata = ddl.routine_metadata orelse return error.TestUnexpectedResult;
+            routine_metadata.argument_items.count = 1;
+        },
+    }
+}
+
+fn expectGeneratedCommentMetadataMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedCommentMetadataMutation,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .ddl => |*ddl| try applyGeneratedCommentMetadataMutation(ddl, mutation),
+            else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_kind));
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
+}
 
-    var malformed_table = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "DROP POLICY usage_records_tenant_policy ON usage_records;",
-    );
-    defer malformed_table.deinit(alloc);
-    if (malformed_table.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.index_table_tokens = .{ .start = 2, .end = 3 },
-                else => return error.TestUnexpectedResult,
-            }
+const GeneratedSecurityLabelMetadataMutation = enum {
+    missing_provider,
+    stale_signature,
+};
+
+fn applyGeneratedSecurityLabelMetadataMutation(
+    ddl: *generated_parser.GeneratedSqlDdlAst,
+    mutation: GeneratedSecurityLabelMetadataMutation,
+) !void {
+    switch (mutation) {
+        .missing_provider => ddl.security_label_provider_tokens = null,
+        .stale_signature => {
+            const routine_metadata = ddl.routine_metadata orelse return error.TestUnexpectedResult;
+            routine_metadata.argument_items.count = 0;
+        },
+    }
+}
+
+fn expectGeneratedSecurityLabelMetadataMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedSecurityLabelMetadataMutation,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .ddl => |*ddl| try applyGeneratedSecurityLabelMetadataMutation(ddl, mutation),
+            else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_table));
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
+}
 
-    var missing_policy_mode = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE POLICY usage_records_targeted_policy ON usage_records AS RESTRICTIVE USING (tenant_id = 'tenant-a');",
-    );
-    defer missing_policy_mode.deinit(alloc);
-    if (missing_policy_mode.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.policy_mode_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_policy_mode));
-
-    var missing_policy_command = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE POLICY usage_records_targeted_policy ON usage_records FOR SELECT USING (tenant_id = 'tenant-a');",
-    );
-    defer missing_policy_command.deinit(alloc);
-    if (missing_policy_command.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.policy_command_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_policy_command));
-
-    var missing_policy_using = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE POLICY usage_records_targeted_policy ON usage_records USING (tenant_id = 'tenant-a');",
-    );
-    defer missing_policy_using.deinit(alloc);
-    if (missing_policy_using.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.policy_using_predicate_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_policy_using));
-
-    var missing_policy_check = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE POLICY usage_records_targeted_policy ON usage_records USING (tenant_id = 'tenant-a') WITH CHECK (status = 'active');",
-    );
-    defer missing_policy_check.deinit(alloc);
-    if (missing_policy_check.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.policy_check_predicate_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_policy_check));
-
-    var missing_policy_roles = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE POLICY usage_records_targeted_policy ON usage_records TO app_reader, app_writer USING (tenant_id = current_setting('app.tenant_id'));",
-    );
-    defer missing_policy_roles.deinit(alloc);
-    if (missing_policy_roles.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.policy_role_targets_present = false,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_policy_roles));
-
-    var corrupt_policy_roles = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE POLICY usage_records_targeted_policy ON usage_records TO app_reader, app_writer USING (tenant_id = current_setting('app.tenant_id'));",
-    );
-    defer corrupt_policy_roles.deinit(alloc);
-    if (corrupt_policy_roles.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.policy_role_target_items.items[0].start += 1,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &corrupt_policy_roles));
-
-    var stale_alter_policy_roles = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "ALTER POLICY usage_records_tenant_policy ON usage_records WITH CHECK (status = 'ready');",
-    );
-    defer stale_alter_policy_roles.deinit(alloc);
-    if (stale_alter_policy_roles.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.policy_role_targets_present = true,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_alter_policy_roles));
-
-    var missing_logical_policy_using = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE POLICY usage_records_targeted_policy ON usage_records USING (tenant_id = 'tenant-a');",
-    );
-    defer missing_logical_policy_using.deinit(alloc);
-    if (missing_logical_policy_using.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    ddl.policy_using_predicate_tokens = null;
-                    try std.testing.expectError(
-                        error.UnsupportedSqlShape,
-                        logicalDdlPlanFromGeneratedAstAlloc(
-                            alloc,
-                            missing_logical_policy_using.items(),
-                            ddl.*,
-                            defaultDdlPlanParserOptionsForTest(alloc, missing_logical_policy_using.items()),
-                        ),
-                    );
-                },
-                else => return error.TestUnexpectedResult,
-            }
+fn expectGeneratedLogicalCommentValueNullMetadataFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .ddl => |*ddl| {
+                ddl.comment_value_is_null = null;
+                try std.testing.expectError(
+                    error.UnsupportedSqlShape,
+                    logicalDdlPlanFromGeneratedAstAlloc(
+                        alloc,
+                        parsed.items(),
+                        ddl.*,
+                        defaultDdlPlanParserOptionsForTest(alloc, parsed.items()),
+                    ),
+                );
+            },
+            else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
 }
@@ -35712,93 +36125,21 @@ test "sql adapter generated comment DDL AST lowers to catalog plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var stale_comment_target = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "COMMENT ON TABLE usage_records IS 'usage';",
-    );
-    defer stale_comment_target.deinit(alloc);
-    if (stale_comment_target.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.comment_target = .index,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_comment_target));
+    const comment_table_sql = "COMMENT ON TABLE usage_records IS 'usage';";
+    const comment_metadata_cases = [_]struct {
+        sql: []const u8,
+        mutation: GeneratedCommentMetadataMutation,
+    }{
+        .{ .sql = comment_table_sql, .mutation = .stale_target },
+        .{ .sql = comment_table_sql, .mutation = .missing_value },
+        .{ .sql = "COMMENT ON CONSTRAINT usage_records_status_check ON usage_records IS 'valid status';", .mutation = .missing_constraint_parent },
+        .{ .sql = "COMMENT ON FUNCTION normalize_status(text, integer) IS 'normalizes status';", .mutation = .stale_function_signature },
+    };
+    for (comment_metadata_cases) |case| {
+        try expectGeneratedCommentMetadataMutationFails(alloc, case.sql, case.mutation);
+    }
 
-    var missing_comment_value = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "COMMENT ON TABLE usage_records IS 'usage';",
-    );
-    defer missing_comment_value.deinit(alloc);
-    if (missing_comment_value.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.comment_value_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_comment_value));
-
-    var missing_constraint_parent = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "COMMENT ON CONSTRAINT usage_records_status_check ON usage_records IS 'valid status';",
-    );
-    defer missing_constraint_parent.deinit(alloc);
-    if (missing_constraint_parent.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.comment_parent_table_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_constraint_parent));
-
-    var stale_function_signature = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "COMMENT ON FUNCTION normalize_status(text, integer) IS 'normalizes status';",
-    );
-    defer stale_function_signature.deinit(alloc);
-    if (stale_function_signature.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    const routine_metadata = ddl.routine_metadata orelse return error.TestUnexpectedResult;
-                    routine_metadata.argument_items.count = 1;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_function_signature));
-
-    var missing_logical_value = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "COMMENT ON TABLE usage_records IS 'usage';",
-    );
-    defer missing_logical_value.deinit(alloc);
-    if (missing_logical_value.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    ddl.comment_value_is_null = null;
-                    try std.testing.expectError(
-                        error.UnsupportedSqlShape,
-                        logicalDdlPlanFromGeneratedAstAlloc(
-                            alloc,
-                            missing_logical_value.items(),
-                            ddl.*,
-                            defaultDdlPlanParserOptionsForTest(alloc, missing_logical_value.items()),
-                        ),
-                    );
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
+    try expectGeneratedLogicalCommentValueNullMetadataFails(alloc, comment_table_sql);
 }
 
 test "sql adapter generated security label DDL AST lowers to catalog plans" {
@@ -35839,61 +36180,92 @@ test "sql adapter generated security label DDL AST lowers to catalog plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var stale_provider = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "SECURITY LABEL FOR selinux ON TABLE usage_records IS 'internal';",
-    );
-    defer stale_provider.deinit(alloc);
-    if (stale_provider.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.security_label_provider_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
+    const security_label_metadata_cases = [_]struct {
+        sql: []const u8,
+        mutation: GeneratedSecurityLabelMetadataMutation,
+    }{
+        .{ .sql = "SECURITY LABEL FOR selinux ON TABLE usage_records IS 'internal';", .mutation = .missing_provider },
+        .{ .sql = "SECURITY LABEL ON PROCEDURE rotate_usage(integer) IS 'internal';", .mutation = .stale_signature },
+    };
+    for (security_label_metadata_cases) |case| {
+        try expectGeneratedSecurityLabelMetadataMutationFails(alloc, case.sql, case.mutation);
+    }
+
+    try expectGeneratedLogicalCommentValueNullMetadataFails(alloc, "SECURITY LABEL ON TABLE usage_records IS 'internal';");
+}
+
+const GeneratedPrivilegeMetadataMutation = enum {
+    corrupt_privilege,
+    missing_principal,
+    stale_principal_list,
+    stale_grant_option,
+    stale_revoke_grant_option,
+    missing_revoke_cascade,
+    stale_all_tables,
+    missing_default_schema,
+    stale_default_grant_option,
+};
+
+fn applyGeneratedPrivilegeMetadataMutation(
+    alloc: std.mem.Allocator,
+    ddl: *generated_parser.GeneratedSqlDdlAst,
+    mutation: GeneratedPrivilegeMetadataMutation,
+) !void {
+    switch (mutation) {
+        .corrupt_privilege => ddl.privilege_items.items[0].start += 1,
+        .missing_principal => ddl.privilege_principal_tokens = null,
+        .stale_principal_list => {
+            if (ddl.privilege_principal_items.count != 2) return error.TestUnexpectedResult;
+            ddl.privilege_principal_items.items[1] = ddl.privilege_principal_items.items[0];
+        },
+        .stale_grant_option => ddl.privilege_with_grant_option = false,
+        .stale_revoke_grant_option => ddl.privilege_revoke_grant_option_for = false,
+        .missing_revoke_cascade => ddl.privilege_revoke_cascade = null,
+        .stale_all_tables => ddl.privilege_all_tables_in_schema = true,
+        .missing_default_schema => {
+            ddl.default_privilege_schema_items.deinit(alloc);
+            ddl.default_privilege_schema_items = .{};
+        },
+        .stale_default_grant_option => ddl.privilege_with_grant_option = false,
+    }
+}
+
+fn expectGeneratedPrivilegeMetadataMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedPrivilegeMetadataMutation,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .ddl => |*ddl| try applyGeneratedPrivilegeMetadataMutation(alloc, ddl, mutation),
+            else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_provider));
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
+}
 
-    var stale_signature = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "SECURITY LABEL ON PROCEDURE rotate_usage(integer) IS 'internal';",
-    );
-    defer stale_signature.deinit(alloc);
-    if (stale_signature.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    const routine_metadata = ddl.routine_metadata orelse return error.TestUnexpectedResult;
-                    routine_metadata.argument_items.count = 0;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_signature));
-
-    var missing_logical_value = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "SECURITY LABEL ON TABLE usage_records IS 'internal';",
-    );
-    defer missing_logical_value.deinit(alloc);
-    if (missing_logical_value.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    ddl.comment_value_is_null = null;
-                    try std.testing.expectError(
-                        error.UnsupportedSqlShape,
-                        logicalDdlPlanFromGeneratedAstAlloc(
-                            alloc,
-                            missing_logical_value.items(),
-                            ddl.*,
-                            defaultDdlPlanParserOptionsForTest(alloc, missing_logical_value.items()),
-                        ),
-                    );
-                },
-                else => return error.TestUnexpectedResult,
-            }
+fn expectGeneratedPrivilegeLogicalPrincipalMissingFails(alloc: std.mem.Allocator, sql: []const u8) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .ddl => |*ddl| {
+                ddl.privilege_principal_tokens = null;
+                ddl.privilege_principal_items.deinit(alloc);
+                ddl.privilege_principal_items = .{};
+                try std.testing.expectError(
+                    error.UnsupportedSqlShape,
+                    logicalDdlPlanFromGeneratedAstAlloc(
+                        alloc,
+                        parsed.items(),
+                        ddl.*,
+                        defaultDdlPlanParserOptionsForTest(alloc, parsed.items()),
+                    ),
+                );
+            },
+            else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
 }
@@ -36103,173 +36475,180 @@ test "sql adapter generated privilege DDL AST lowers to authorization plans" {
         else => return error.TestUnexpectedResult,
     }
 
-    var corrupt_privilege = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "GRANT SELECT, INSERT ON TABLE usage_records TO app_writer;",
-    );
-    defer corrupt_privilege.deinit(alloc);
-    if (corrupt_privilege.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.privilege_items.items[0].start += 1,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &corrupt_privilege));
+    const privilege_metadata_cases = [_]struct {
+        sql: []const u8,
+        mutation: GeneratedPrivilegeMetadataMutation,
+    }{
+        .{ .sql = "GRANT SELECT, INSERT ON TABLE usage_records TO app_writer;", .mutation = .corrupt_privilege },
+        .{ .sql = "GRANT SELECT ON TABLE usage_records TO app_writer;", .mutation = .missing_principal },
+        .{ .sql = "GRANT SELECT ON TABLE usage_records TO app_reader, app_writer;", .mutation = .stale_principal_list },
+        .{ .sql = "GRANT SELECT ON TABLE usage_records TO app_writer WITH GRANT OPTION;", .mutation = .stale_grant_option },
+        .{ .sql = "REVOKE GRANT OPTION FOR INSERT ON TABLE usage_records FROM app_writer;", .mutation = .stale_revoke_grant_option },
+        .{ .sql = "REVOKE INSERT ON TABLE usage_records FROM app_writer CASCADE;", .mutation = .missing_revoke_cascade },
+        .{ .sql = "GRANT SELECT ON TABLE usage_records TO app_writer;", .mutation = .stale_all_tables },
+        .{ .sql = "ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA public GRANT SELECT ON TABLES TO readonly;", .mutation = .missing_default_schema },
+        .{ .sql = "ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO readonly WITH GRANT OPTION;", .mutation = .stale_default_grant_option },
+    };
+    for (privilege_metadata_cases) |case| {
+        try expectGeneratedPrivilegeMetadataMutationFails(alloc, case.sql, case.mutation);
+    }
 
-    var missing_principal = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "GRANT SELECT ON TABLE usage_records TO app_writer;",
-    );
-    defer missing_principal.deinit(alloc);
-    if (missing_principal.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.privilege_principal_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_principal));
+    try expectGeneratedPrivilegeLogicalPrincipalMissingFails(alloc, "REVOKE INSERT ON TABLE usage_records FROM app_writer;");
+}
 
-    var stale_principal_list = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "GRANT SELECT ON TABLE usage_records TO app_reader, app_writer;",
-    );
-    defer stale_principal_list.deinit(alloc);
-    if (stale_principal_list.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    if (ddl.privilege_principal_items.count != 2) return error.TestUnexpectedResult;
-                    ddl.privilege_principal_items.items[1] = ddl.privilege_principal_items.items[0];
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_principal_list));
+const GeneratedUtilityUnsupportedMetadataMutation = enum {
+    stale_kind,
+    malformed_call_subject,
+    stale_call_routine_name,
+    missing_call_routine_name,
+    malformed_lock_subject,
+    stale_lock_table_item,
+    stale_lock_mode,
+};
 
-    var stale_grant_option = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "GRANT SELECT ON TABLE usage_records TO app_writer WITH GRANT OPTION;",
-    );
-    defer stale_grant_option.deinit(alloc);
-    if (stale_grant_option.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.privilege_with_grant_option = false,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_grant_option));
+fn applyGeneratedUtilityUnsupportedMetadataMutation(
+    item_count: usize,
+    unsupported: *generated_parser.GeneratedSqlUnsupportedAst,
+    mutation: GeneratedUtilityUnsupportedMetadataMutation,
+) void {
+    switch (mutation) {
+        .stale_kind => unsupported.kind = .grant,
+        .malformed_call_subject => unsupported.subject_tokens = .{ .start = 0, .end = item_count },
+        .stale_call_routine_name => unsupported.routine_name_tokens = .{ .start = 0, .end = 1 },
+        .missing_call_routine_name => unsupported.routine_name_tokens = null,
+        .malformed_lock_subject => unsupported.subject_tokens = .{ .start = 0, .end = item_count },
+        .stale_lock_table_item => unsupported.table_lock_table_items.items[0] = .{ .start = 0, .end = 1 },
+        .stale_lock_mode => unsupported.table_lock_mode = .exclusive,
+    }
+}
 
-    var stale_revoke_grant_option = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "REVOKE GRANT OPTION FOR INSERT ON TABLE usage_records FROM app_writer;",
-    );
-    defer stale_revoke_grant_option.deinit(alloc);
-    if (stale_revoke_grant_option.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.privilege_revoke_grant_option_for = false,
-                else => return error.TestUnexpectedResult,
-            }
+fn expectGeneratedUtilityUnsupportedMetadataMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedUtilityUnsupportedMetadataMutation,
+    expect_logical_failure: bool,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .unsupported => |*unsupported| applyGeneratedUtilityUnsupportedMetadataMutation(parsed.items().len, unsupported, mutation),
+            else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_revoke_grant_option));
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
+    if (expect_logical_failure) {
+        try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed, .{}));
+    }
+}
 
-    var stale_revoke_cascade = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "REVOKE INSERT ON TABLE usage_records FROM app_writer CASCADE;",
-    );
-    defer stale_revoke_cascade.deinit(alloc);
-    if (stale_revoke_cascade.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.privilege_revoke_cascade = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_revoke_cascade));
+const GeneratedRoleGrantMetadataMutation = enum {
+    missing_granted_role,
+    stale_admin_option,
+    stale_revoke_admin_option,
+    missing_revoke_cascade,
+};
 
-    var stale_all_tables = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "GRANT SELECT ON TABLE usage_records TO app_writer;",
-    );
-    defer stale_all_tables.deinit(alloc);
-    if (stale_all_tables.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.privilege_all_tables_in_schema = true,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_all_tables));
+fn applyGeneratedRoleGrantMetadataMutation(
+    alloc: std.mem.Allocator,
+    ddl: *generated_parser.GeneratedSqlDdlAst,
+    mutation: GeneratedRoleGrantMetadataMutation,
+) !void {
+    try std.testing.expect(ddl.privilege_role_grant);
+    switch (mutation) {
+        .missing_granted_role => {
+            ddl.privilege_items.deinit(alloc);
+            ddl.privilege_items = .{};
+        },
+        .stale_admin_option => ddl.privilege_with_admin_option = false,
+        .stale_revoke_admin_option => ddl.privilege_revoke_admin_option_for = false,
+        .missing_revoke_cascade => ddl.privilege_revoke_cascade = null,
+    }
+}
 
-    var stale_default_schema = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA public GRANT SELECT ON TABLES TO readonly;",
-    );
-    defer stale_default_schema.deinit(alloc);
-    if (stale_default_schema.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    ddl.default_privilege_schema_items.deinit(alloc);
-                    ddl.default_privilege_schema_items = .{};
-                },
-                else => return error.TestUnexpectedResult,
-            }
+fn expectGeneratedRoleGrantMetadataMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedRoleGrantMetadataMutation,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .ddl => |*ddl| try applyGeneratedRoleGrantMetadataMutation(alloc, ddl, mutation),
+            else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_default_schema));
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
+}
 
-    var stale_default_grant_option = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO readonly WITH GRANT OPTION;",
-    );
-    defer stale_default_grant_option.deinit(alloc);
-    if (stale_default_grant_option.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| ddl.privilege_with_grant_option = false,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_default_grant_option));
+const GeneratedTriggerUnsupportedMetadataMutation = enum {
+    malformed_runtime_subject,
+    malformed_create_subject,
+    stale_create_metadata,
+    malformed_drop_subject,
+    stale_drop_metadata,
+};
 
-    var missing_logical_principal = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "REVOKE INSERT ON TABLE usage_records FROM app_writer;",
-    );
-    defer missing_logical_principal.deinit(alloc);
-    if (missing_logical_principal.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    ddl.privilege_principal_tokens = null;
-                    ddl.privilege_principal_items.deinit(alloc);
-                    ddl.privilege_principal_items = .{};
-                    try std.testing.expectError(
-                        error.UnsupportedSqlShape,
-                        logicalDdlPlanFromGeneratedAstAlloc(
-                            alloc,
-                            missing_logical_principal.items(),
-                            ddl.*,
-                            defaultDdlPlanParserOptionsForTest(alloc, missing_logical_principal.items()),
-                        ),
-                    );
-                },
-                else => return error.TestUnexpectedResult,
-            }
+fn applyGeneratedTriggerUnsupportedMetadataMutation(
+    item_count: usize,
+    unsupported: *generated_parser.GeneratedSqlUnsupportedAst,
+    mutation: GeneratedTriggerUnsupportedMetadataMutation,
+) !void {
+    switch (mutation) {
+        .malformed_runtime_subject => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlUnsupportedKind.create_trigger, unsupported.kind);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 2, .end = item_count - 1 }, unsupported.subject_tokens.?);
+            unsupported.subject_tokens = .{ .start = 1, .end = item_count - 1 };
+        },
+        .malformed_create_subject => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlUnsupportedKind.create_trigger, unsupported.kind);
+            unsupported.subject_tokens = .{ .start = 1, .end = item_count - 1 };
+        },
+        .stale_create_metadata => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlUnsupportedKind.create_trigger, unsupported.kind);
+            unsupported.trigger_table_tokens = unsupported.trigger_name_tokens;
+        },
+        .malformed_drop_subject => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlUnsupportedKind.drop_trigger, unsupported.kind);
+            unsupported.subject_tokens = .{ .start = 1, .end = item_count - 1 };
+        },
+        .stale_drop_metadata => {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlUnsupportedKind.drop_trigger, unsupported.kind);
+            try std.testing.expect(unsupported.trigger_if_exists);
+            unsupported.trigger_if_exists = false;
+        },
+    }
+}
+
+fn expectGeneratedTriggerUnsupportedMetadataMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedTriggerUnsupportedMetadataMutation,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .unsupported => |*unsupported| try applyGeneratedTriggerUnsupportedMetadataMutation(parsed.items().len, unsupported, mutation),
+            else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
+
+    switch (mutation) {
+        .malformed_runtime_subject => try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed)),
+        .malformed_create_subject, .malformed_drop_subject => try std.testing.expectError(error.UnsupportedSqlShape, lowerRoutineTriggerCatalogPlanParsedSqlAlloc(
+            alloc,
+            &parsed,
+        )),
+        .stale_create_metadata, .stale_drop_metadata => {
+            try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
+            try std.testing.expectError(error.UnsupportedSqlShape, lowerRoutineTriggerCatalogPlanParsedSqlAlloc(
+                alloc,
+                &parsed,
+            ));
+        },
+    }
 }
 
 test "sql adapter generated utility unsupported AST lowers to typed catalog plans" {
@@ -36467,116 +36846,28 @@ test "sql adapter generated utility unsupported AST lowers to typed catalog plan
     try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &unsupported_alter_trigger));
     try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &unsupported_alter_trigger, .{}));
 
-    var malformed_kind = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CALL rotate_usage();",
-    );
-    defer malformed_kind.deinit(alloc);
-    if (malformed_kind.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .unsupported => |*unsupported| unsupported.kind = .grant,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_kind));
-
-    var malformed_call_subject = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CALL rotate_usage();",
-    );
-    defer malformed_call_subject.deinit(alloc);
-    if (malformed_call_subject.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .unsupported => |*unsupported| unsupported.subject_tokens = .{ .start = 0, .end = malformed_call_subject.items().len },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_call_subject));
-
-    var stale_call_routine_name = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CALL rotate_usage();",
-    );
-    defer stale_call_routine_name.deinit(alloc);
-    if (stale_call_routine_name.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .unsupported => |*unsupported| unsupported.routine_name_tokens = .{ .start = 0, .end = 1 },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_call_routine_name));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &stale_call_routine_name, .{}));
-
-    var missing_call_routine_name = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CALL rotate_usage();",
-    );
-    defer missing_call_routine_name.deinit(alloc);
-    if (missing_call_routine_name.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .unsupported => |*unsupported| unsupported.routine_name_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_call_routine_name));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_call_routine_name, .{}));
-
-    var malformed_lock_subject = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "LOCK TABLE usage_records IN SHARE MODE;",
-    );
-    defer malformed_lock_subject.deinit(alloc);
-    if (malformed_lock_subject.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .unsupported => |*unsupported| unsupported.subject_tokens = .{ .start = 0, .end = malformed_lock_subject.items().len },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_lock_subject));
-
-    var stale_lock_table_item = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "LOCK TABLE usage_records IN SHARE MODE;",
-    );
-    defer stale_lock_table_item.deinit(alloc);
-    if (stale_lock_table_item.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .unsupported => |*unsupported| unsupported.table_lock_table_items.items[0] = .{ .start = 0, .end = 1 },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_lock_table_item));
-
-    var stale_lock_mode = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "LOCK TABLE usage_records IN SHARE MODE;",
-    );
-    defer stale_lock_mode.deinit(alloc);
-    if (stale_lock_mode.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .unsupported => |*unsupported| unsupported.table_lock_mode = .exclusive,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_lock_mode));
+    const call_sql = "CALL rotate_usage();";
+    const lock_sql = "LOCK TABLE usage_records IN SHARE MODE;";
+    const utility_unsupported_metadata_cases = [_]struct {
+        sql: []const u8,
+        mutation: GeneratedUtilityUnsupportedMetadataMutation,
+        expect_logical_failure: bool = false,
+    }{
+        .{ .sql = call_sql, .mutation = .stale_kind },
+        .{ .sql = call_sql, .mutation = .malformed_call_subject },
+        .{ .sql = call_sql, .mutation = .stale_call_routine_name, .expect_logical_failure = true },
+        .{ .sql = call_sql, .mutation = .missing_call_routine_name, .expect_logical_failure = true },
+        .{ .sql = lock_sql, .mutation = .malformed_lock_subject },
+        .{ .sql = lock_sql, .mutation = .stale_lock_table_item },
+        .{ .sql = lock_sql, .mutation = .stale_lock_mode },
+    };
+    for (utility_unsupported_metadata_cases) |case| {
+        try expectGeneratedUtilityUnsupportedMetadataMutationFails(alloc, case.sql, case.mutation, case.expect_logical_failure);
+    }
 
     var call_logical_sql = try tokenized.ParsedSql.initAlloc(
         alloc,
-        "CALL rotate_usage();",
+        call_sql,
     );
     defer call_logical_sql.deinit(alloc);
     var call_logical = try logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &call_logical_sql, .{});
@@ -36592,190 +36883,139 @@ test "sql adapter generated utility unsupported AST lowers to typed catalog plan
         else => return error.TestUnexpectedResult,
     }
 
-    var malformed_role_grant = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "GRANT app_reader TO app_writer;",
-    );
-    defer malformed_role_grant.deinit(alloc);
-    if (malformed_role_grant.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expect(ddl.privilege_role_grant);
-                    ddl.privilege_items.deinit(alloc);
-                    ddl.privilege_items = .{};
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_role_grant));
+    const role_grant_metadata_cases = [_]struct {
+        sql: []const u8,
+        mutation: GeneratedRoleGrantMetadataMutation,
+    }{
+        .{ .sql = "GRANT app_reader TO app_writer;", .mutation = .missing_granted_role },
+        .{ .sql = "GRANT app_reader TO app_writer WITH ADMIN OPTION;", .mutation = .stale_admin_option },
+        .{ .sql = "REVOKE ADMIN OPTION FOR app_reader FROM app_writer CASCADE;", .mutation = .stale_revoke_admin_option },
+        .{ .sql = "REVOKE app_reader FROM app_writer RESTRICT;", .mutation = .missing_revoke_cascade },
+    };
+    for (role_grant_metadata_cases) |case| {
+        try expectGeneratedRoleGrantMetadataMutationFails(alloc, case.sql, case.mutation);
+    }
 
-    var stale_role_admin_option = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "GRANT app_reader TO app_writer WITH ADMIN OPTION;",
-    );
-    defer stale_role_admin_option.deinit(alloc);
-    if (stale_role_admin_option.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expect(ddl.privilege_role_grant);
-                    ddl.privilege_with_admin_option = false;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_role_admin_option));
+    const trigger_metadata_cases = [_]struct {
+        sql: []const u8,
+        mutation: GeneratedTriggerUnsupportedMetadataMutation,
+    }{
+        .{
+            .sql = "CREATE TRIGGER update_timestamp BEFORE UPDATE ON usage_records EXECUTE FUNCTION touch_updated_at('updated_at_ns');",
+            .mutation = .malformed_runtime_subject,
+        },
+        .{
+            .sql = "CREATE TRIGGER usage_audit BEFORE INSERT ON usage_records FOR EACH ROW EXECUTE FUNCTION audit_usage();",
+            .mutation = .malformed_create_subject,
+        },
+        .{
+            .sql = "CREATE TRIGGER usage_audit BEFORE INSERT ON usage_records FOR EACH ROW EXECUTE FUNCTION audit_usage();",
+            .mutation = .stale_create_metadata,
+        },
+        .{
+            .sql = "DROP TRIGGER IF EXISTS usage_audit ON usage_records;",
+            .mutation = .malformed_drop_subject,
+        },
+        .{
+            .sql = "DROP TRIGGER IF EXISTS usage_audit ON usage_records;",
+            .mutation = .stale_drop_metadata,
+        },
+    };
+    for (trigger_metadata_cases) |case| {
+        try expectGeneratedTriggerUnsupportedMetadataMutationFails(alloc, case.sql, case.mutation);
+    }
+}
 
-    var stale_role_revoke_admin_option = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "REVOKE ADMIN OPTION FOR app_reader FROM app_writer CASCADE;",
-    );
-    defer stale_role_revoke_admin_option.deinit(alloc);
-    if (stale_role_revoke_admin_option.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expect(ddl.privilege_role_grant);
-                    ddl.privilege_revoke_admin_option_for = false;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_role_revoke_admin_option));
+const GeneratedNotificationUnsupportedMetadataMutation = enum {
+    stale_kind,
+    malformed_subject,
+    stale_listen_channel,
+    missing_notify_payload,
+    stale_unlisten_all,
+};
 
-    var stale_role_revoke_cascade = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "REVOKE app_reader FROM app_writer RESTRICT;",
-    );
-    defer stale_role_revoke_cascade.deinit(alloc);
-    if (stale_role_revoke_cascade.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    try std.testing.expect(ddl.privilege_role_grant);
-                    ddl.privilege_revoke_cascade = null;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_role_revoke_cascade));
+fn applyGeneratedNotificationUnsupportedMetadataMutation(
+    item_count: usize,
+    unsupported: *generated_parser.GeneratedSqlUnsupportedAst,
+    mutation: GeneratedNotificationUnsupportedMetadataMutation,
+) void {
+    switch (mutation) {
+        .stale_kind => unsupported.kind = .listen,
+        .malformed_subject => unsupported.subject_tokens = .{ .start = 0, .end = item_count },
+        .stale_listen_channel => unsupported.notification_channel_tokens = .{ .start = 0, .end = 1 },
+        .missing_notify_payload => unsupported.notification_payload_tokens = null,
+        .stale_unlisten_all => unsupported.notification_unlisten_all = false,
+    }
+}
 
-    var malformed_trigger_subject = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE TRIGGER update_timestamp BEFORE UPDATE ON usage_records EXECUTE FUNCTION touch_updated_at('updated_at_ns');",
-    );
-    defer malformed_trigger_subject.deinit(alloc);
-    if (malformed_trigger_subject.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .unsupported => |*unsupported| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlUnsupportedKind.create_trigger, unsupported.kind);
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 2, .end = malformed_trigger_subject.items().len - 1 }, unsupported.subject_tokens.?);
-                    unsupported.subject_tokens = .{ .start = 1, .end = malformed_trigger_subject.items().len - 1 };
-                },
-                else => return error.TestUnexpectedResult,
-            }
+fn expectGeneratedNotificationUnsupportedMetadataMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedNotificationUnsupportedMetadataMutation,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .unsupported => |*unsupported| applyGeneratedNotificationUnsupportedMetadataMutation(parsed.items().len, unsupported, mutation),
+            else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_trigger_subject));
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
+}
 
-    var malformed_trigger_only_create_subject = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE TRIGGER usage_audit BEFORE INSERT ON usage_records FOR EACH ROW EXECUTE FUNCTION audit_usage();",
-    );
-    defer malformed_trigger_only_create_subject.deinit(alloc);
-    if (malformed_trigger_only_create_subject.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .unsupported => |*unsupported| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlUnsupportedKind.create_trigger, unsupported.kind);
-                    unsupported.subject_tokens = .{ .start = 1, .end = malformed_trigger_only_create_subject.items().len - 1 };
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerRoutineTriggerCatalogPlanParsedSqlAlloc(
-        alloc,
-        &malformed_trigger_only_create_subject,
-    ));
+const GeneratedMaintenanceUnsupportedMetadataMutation = enum {
+    stale_kind,
+    malformed_subject,
+    missing_name,
+    stale_vacuum_full,
+    stale_analyze_column,
+    stale_reindex_target,
+    stale_cluster_index,
+};
 
-    var stale_trigger_only_create_metadata = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CREATE TRIGGER usage_audit BEFORE INSERT ON usage_records FOR EACH ROW EXECUTE FUNCTION audit_usage();",
-    );
-    defer stale_trigger_only_create_metadata.deinit(alloc);
-    if (stale_trigger_only_create_metadata.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .unsupported => |*unsupported| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlUnsupportedKind.create_trigger, unsupported.kind);
-                    unsupported.trigger_table_tokens = unsupported.trigger_name_tokens;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(
-        alloc,
-        &stale_trigger_only_create_metadata,
-    ));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerRoutineTriggerCatalogPlanParsedSqlAlloc(
-        alloc,
-        &stale_trigger_only_create_metadata,
-    ));
+fn applyGeneratedMaintenanceUnsupportedMetadataMutation(
+    item_count: usize,
+    unsupported: *generated_parser.GeneratedSqlUnsupportedAst,
+    mutation: GeneratedMaintenanceUnsupportedMetadataMutation,
+) void {
+    switch (mutation) {
+        .stale_kind => unsupported.kind = .analyze,
+        .malformed_subject => unsupported.subject_tokens = .{ .start = 0, .end = item_count },
+        .missing_name => unsupported.maintenance_name_tokens = null,
+        .stale_vacuum_full => unsupported.maintenance_vacuum_full = false,
+        .stale_analyze_column => unsupported.maintenance_column_items.items[0] = unsupported.maintenance_name_tokens.?,
+        .stale_reindex_target => unsupported.maintenance_reindex_target = .index,
+        .stale_cluster_index => unsupported.maintenance_secondary_name_tokens = unsupported.maintenance_name_tokens,
+    }
+}
 
-    var malformed_trigger_only_drop_subject = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "DROP TRIGGER IF EXISTS usage_audit ON usage_records;",
-    );
-    defer malformed_trigger_only_drop_subject.deinit(alloc);
-    if (malformed_trigger_only_drop_subject.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .unsupported => |*unsupported| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlUnsupportedKind.drop_trigger, unsupported.kind);
-                    unsupported.subject_tokens = .{ .start = 1, .end = malformed_trigger_only_drop_subject.items().len - 1 };
-                },
-                else => return error.TestUnexpectedResult,
-            }
+fn expectGeneratedMaintenanceUnsupportedMetadataMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedMaintenanceUnsupportedMetadataMutation,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .unsupported => |*unsupported| applyGeneratedMaintenanceUnsupportedMetadataMutation(parsed.items().len, unsupported, mutation),
+            else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerRoutineTriggerCatalogPlanParsedSqlAlloc(
-        alloc,
-        &malformed_trigger_only_drop_subject,
-    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
+}
 
-    var stale_trigger_only_drop_metadata = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "DROP TRIGGER IF EXISTS usage_audit ON usage_records;",
-    );
-    defer stale_trigger_only_drop_metadata.deinit(alloc);
-    if (stale_trigger_only_drop_metadata.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .unsupported => |*unsupported| {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlUnsupportedKind.drop_trigger, unsupported.kind);
-                    try std.testing.expect(unsupported.trigger_if_exists);
-                    unsupported.trigger_if_exists = false;
-                },
-                else => return error.TestUnexpectedResult,
-            }
+fn expectGeneratedMaintenanceUnsupportedLogicalSubjectMutationFails(alloc: std.mem.Allocator, sql: []const u8) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .unsupported => |*unsupported| unsupported.subject_tokens = .{ .start = 0, .end = parsed.items().len },
+            else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(
-        alloc,
-        &stale_trigger_only_drop_metadata,
-    ));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerRoutineTriggerCatalogPlanParsedSqlAlloc(
-        alloc,
-        &stale_trigger_only_drop_metadata,
-    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed, .{}));
 }
 
 test "sql adapter generated notification unsupported AST lowers to catalog plans" {
@@ -36850,110 +37090,22 @@ test "sql adapter generated notification unsupported AST lowers to catalog plans
         else => return error.TestUnexpectedResult,
     }
 
-    var malformed_kind = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "NOTIFY usage_events;",
-    );
-    defer malformed_kind.deinit(alloc);
-    if (malformed_kind.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .unsupported => |*unsupported| unsupported.kind = .listen,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_kind));
+    const notification_metadata_cases = [_]struct {
+        sql: []const u8,
+        mutation: GeneratedNotificationUnsupportedMetadataMutation,
+    }{
+        .{ .sql = "NOTIFY usage_events;", .mutation = .stale_kind },
+        .{ .sql = "UNLISTEN usage_events;", .mutation = .malformed_subject },
+        .{ .sql = "LISTEN usage_events;", .mutation = .stale_listen_channel },
+        .{ .sql = "NOTIFY usage_events, 'updated';", .mutation = .missing_notify_payload },
+        .{ .sql = "UNLISTEN *;", .mutation = .stale_unlisten_all },
+    };
+    for (notification_metadata_cases) |case| {
+        try expectGeneratedNotificationUnsupportedMetadataMutationFails(alloc, case.sql, case.mutation);
+    }
 
-    var malformed_subject = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "UNLISTEN usage_events;",
-    );
-    defer malformed_subject.deinit(alloc);
-    if (malformed_subject.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .unsupported => |*unsupported| unsupported.subject_tokens = .{ .start = 0, .end = malformed_subject.items().len },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_subject));
-
-    var stale_listen_channel = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "LISTEN usage_events;",
-    );
-    defer stale_listen_channel.deinit(alloc);
-    if (stale_listen_channel.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .unsupported => |*unsupported| unsupported.notification_channel_tokens = .{ .start = 0, .end = 1 },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_listen_channel));
-
-    var missing_notify_payload = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "NOTIFY usage_events, 'updated';",
-    );
-    defer missing_notify_payload.deinit(alloc);
-    if (missing_notify_payload.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .unsupported => |*unsupported| unsupported.notification_payload_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_notify_payload));
-
-    var stale_unlisten_all = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "UNLISTEN *;",
-    );
-    defer stale_unlisten_all.deinit(alloc);
-    if (stale_unlisten_all.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .unsupported => |*unsupported| unsupported.notification_unlisten_all = false,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_unlisten_all));
-
-    var stale_reindex_kind = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "REINDEX TABLE usage_records;",
-    );
-    defer stale_reindex_kind.deinit(alloc);
-    if (stale_reindex_kind.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .unsupported => |*unsupported| unsupported.kind = .cluster,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_reindex_kind));
-
-    var stale_cluster_subject = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CLUSTER usage_records USING usage_records_status_idx;",
-    );
-    defer stale_cluster_subject.deinit(alloc);
-    if (stale_cluster_subject.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .unsupported => |*unsupported| unsupported.subject_tokens = .{ .start = 0, .end = stale_cluster_subject.items().len },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_cluster_subject));
+    try expectGeneratedMaintenanceUnsupportedMetadataMutationFails(alloc, "REINDEX TABLE usage_records;", .stale_kind);
+    try expectGeneratedMaintenanceUnsupportedMetadataMutationFails(alloc, "CLUSTER usage_records USING usage_records_status_idx;", .malformed_subject);
 }
 
 test "sql adapter generated maintenance unsupported AST lowers to catalog plans" {
@@ -37001,14 +37153,14 @@ test "sql adapter generated maintenance unsupported AST lowers to catalog plans"
         else => return error.TestUnexpectedResult,
     }
 
-    var vacuum_legacy_options_sql = try tokenized.ParsedSql.initAlloc(
+    var vacuum_keyword_options_sql = try tokenized.ParsedSql.initAlloc(
         alloc,
         "VACUUM FULL FREEZE VERBOSE usage_records;",
     );
-    defer vacuum_legacy_options_sql.deinit(alloc);
-    var vacuum_legacy_options_plan = try runtimeDdlPlanParsedSqlAlloc(alloc, &vacuum_legacy_options_sql);
-    defer vacuum_legacy_options_plan.deinit(alloc);
-    switch (vacuum_legacy_options_plan) {
+    defer vacuum_keyword_options_sql.deinit(alloc);
+    var vacuum_keyword_options_plan = try runtimeDdlPlanParsedSqlAlloc(alloc, &vacuum_keyword_options_sql);
+    defer vacuum_keyword_options_plan.deinit(alloc);
+    switch (vacuum_keyword_options_plan) {
         .maintenance_job => |maintenance| switch (maintenance) {
             .vacuum => |vacuum| {
                 try std.testing.expectEqualStrings("usage_records", vacuum.table_name);
@@ -37117,125 +37269,22 @@ test "sql adapter generated maintenance unsupported AST lowers to catalog plans"
         else => return error.TestUnexpectedResult,
     }
 
-    var malformed_kind = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "VACUUM usage_records;",
-    );
-    defer malformed_kind.deinit(alloc);
-    if (malformed_kind.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .unsupported => |*unsupported| unsupported.kind = .analyze,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_kind));
-
-    var malformed_subject = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "REINDEX TABLE usage_records;",
-    );
-    defer malformed_subject.deinit(alloc);
-    if (malformed_subject.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .unsupported => |*unsupported| unsupported.subject_tokens = .{ .start = 0, .end = malformed_subject.items().len },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_subject));
-
-    var missing_vacuum_name = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "VACUUM usage_records;",
-    );
-    defer missing_vacuum_name.deinit(alloc);
-    if (missing_vacuum_name.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .unsupported => |*unsupported| unsupported.maintenance_name_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_vacuum_name));
-
-    var stale_vacuum_option = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "VACUUM FULL usage_records;",
-    );
-    defer stale_vacuum_option.deinit(alloc);
-    if (stale_vacuum_option.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .unsupported => |*unsupported| unsupported.maintenance_vacuum_full = false,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_vacuum_option));
-
-    var stale_analyze_column = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "ANALYZE VERBOSE usage_records (status, amount);",
-    );
-    defer stale_analyze_column.deinit(alloc);
-    if (stale_analyze_column.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .unsupported => |*unsupported| unsupported.maintenance_column_items.items[0] = unsupported.maintenance_name_tokens.?,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_analyze_column));
-
-    var stale_reindex_target = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "REINDEX TABLE usage_records;",
-    );
-    defer stale_reindex_target.deinit(alloc);
-    if (stale_reindex_target.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .unsupported => |*unsupported| unsupported.maintenance_reindex_target = .index,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_reindex_target));
-
-    var missing_reindex_name = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "REINDEX TABLE usage_records;",
-    );
-    defer missing_reindex_name.deinit(alloc);
-    if (missing_reindex_name.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .unsupported => |*unsupported| unsupported.maintenance_name_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_reindex_name));
-
-    var stale_cluster_index = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CLUSTER usage_records USING usage_records_status_idx;",
-    );
-    defer stale_cluster_index.deinit(alloc);
-    if (stale_cluster_index.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .unsupported => |*unsupported| unsupported.maintenance_secondary_name_tokens = unsupported.maintenance_name_tokens,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_cluster_index));
+    const maintenance_metadata_cases = [_]struct {
+        sql: []const u8,
+        mutation: GeneratedMaintenanceUnsupportedMetadataMutation,
+    }{
+        .{ .sql = "VACUUM usage_records;", .mutation = .stale_kind },
+        .{ .sql = "REINDEX TABLE usage_records;", .mutation = .malformed_subject },
+        .{ .sql = "VACUUM usage_records;", .mutation = .missing_name },
+        .{ .sql = "VACUUM FULL usage_records;", .mutation = .stale_vacuum_full },
+        .{ .sql = "ANALYZE VERBOSE usage_records (status, amount);", .mutation = .stale_analyze_column },
+        .{ .sql = "REINDEX TABLE usage_records;", .mutation = .stale_reindex_target },
+        .{ .sql = "REINDEX TABLE usage_records;", .mutation = .missing_name },
+        .{ .sql = "CLUSTER usage_records USING usage_records_status_idx;", .mutation = .stale_cluster_index },
+    };
+    for (maintenance_metadata_cases) |case| {
+        try expectGeneratedMaintenanceUnsupportedMetadataMutationFails(alloc, case.sql, case.mutation);
+    }
 }
 
 test "sql adapter logical ddl plan accepts validated generated unsupported maintenance without vacuum analyze wrapper fallback" {
@@ -37278,20 +37327,7 @@ test "sql adapter logical ddl plan accepts validated generated unsupported maint
         else => return error.TestUnexpectedResult,
     }
 
-    var corrupt_subject = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "VACUUM usage_records;",
-    );
-    defer corrupt_subject.deinit(alloc);
-    if (corrupt_subject.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .unsupported => |*unsupported| unsupported.subject_tokens = .{ .start = 0, .end = corrupt_subject.items().len },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &corrupt_subject, .{}));
+    try expectGeneratedMaintenanceUnsupportedLogicalSubjectMutationFails(alloc, "VACUUM usage_records;");
 
     var reindex = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -37340,6 +37376,42 @@ test "sql adapter logical ddl plan accepts validated generated unsupported maint
         stripped_generated.generated_statement = null;
     } else return error.TestUnexpectedResult;
     try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stripped_generated));
+}
+
+const GeneratedCursorSavepointMetadataMutation = enum {
+    stale_fetch_kind,
+    malformed_cursor_tail,
+    missing_cursor_portal,
+    stale_cursor_subject,
+    missing_cursor_subject_ast,
+    malformed_savepoint_name,
+};
+
+fn expectGeneratedCursorSavepointMetadataMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedCursorSavepointMetadataMutation,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .cursor => |*cursor| switch (mutation) {
+                .stale_fetch_kind => cursor.kind = .close,
+                .malformed_cursor_tail => cursor.tail_tokens = .{ .start = 0, .end = parsed.items().len },
+                .missing_cursor_portal => cursor.portal_name_tokens = null,
+                .stale_cursor_subject => cursor.subject_tokens = cursor.tail_tokens,
+                .missing_cursor_subject_ast => cursor.subject_ast = null,
+                .malformed_savepoint_name => return error.TestUnexpectedResult,
+            },
+            .transaction => |*transaction| switch (mutation) {
+                .malformed_savepoint_name => transaction.name_tokens = .{ .start = 0, .end = parsed.items().len },
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
 }
 
 test "sql adapter generated cursor and savepoint transaction AST lowers to catalog plans" {
@@ -37454,95 +37526,60 @@ test "sql adapter generated cursor and savepoint transaction AST lowers to catal
         else => return error.TestUnexpectedResult,
     }
 
-    var malformed_kind = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "FETCH usage_cursor;",
-    );
-    defer malformed_kind.deinit(alloc);
-    if (malformed_kind.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .cursor => |*cursor| cursor.kind = .close,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_kind));
+    const cursor_savepoint_metadata_cases = [_]struct {
+        sql: []const u8,
+        mutation: GeneratedCursorSavepointMetadataMutation,
+    }{
+        .{ .sql = "FETCH usage_cursor;", .mutation = .stale_fetch_kind },
+        .{ .sql = "CLOSE usage_cursor;", .mutation = .malformed_cursor_tail },
+        .{ .sql = "DECLARE usage_cursor CURSOR FOR SELECT id FROM usage_records ORDER BY id;", .mutation = .missing_cursor_portal },
+        .{ .sql = "DECLARE usage_cursor CURSOR FOR SELECT id FROM usage_records ORDER BY id;", .mutation = .stale_cursor_subject },
+        .{ .sql = "DECLARE usage_cursor CURSOR FOR SELECT id FROM usage_records ORDER BY id;", .mutation = .missing_cursor_subject_ast },
+        .{ .sql = "SAVEPOINT before_retry;", .mutation = .malformed_savepoint_name },
+    };
+    for (cursor_savepoint_metadata_cases) |case| {
+        try expectGeneratedCursorSavepointMetadataMutationFails(alloc, case.sql, case.mutation);
+    }
+}
 
-    var malformed_cursor_tail = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "CLOSE usage_cursor;",
-    );
-    defer malformed_cursor_tail.deinit(alloc);
-    if (malformed_cursor_tail.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .cursor => |*cursor| cursor.tail_tokens = .{ .start = 0, .end = malformed_cursor_tail.items().len },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_cursor_tail));
+const GeneratedBulkUnsupportedMetadataMutation = enum {
+    stale_kind,
+    malformed_subject,
+    missing_table,
+    stale_endpoint_kind,
+    stale_columns,
+    missing_format,
+};
 
-    var missing_cursor_portal = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "DECLARE usage_cursor CURSOR FOR SELECT id FROM usage_records ORDER BY id;",
-    );
-    defer missing_cursor_portal.deinit(alloc);
-    if (missing_cursor_portal.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .cursor => |*cursor| cursor.portal_name_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_cursor_portal));
+fn applyGeneratedBulkUnsupportedMetadataMutation(
+    item_count: usize,
+    unsupported: *generated_parser.GeneratedSqlUnsupportedAst,
+    mutation: GeneratedBulkUnsupportedMetadataMutation,
+) void {
+    switch (mutation) {
+        .stale_kind => unsupported.kind = .vacuum,
+        .malformed_subject => unsupported.subject_tokens = .{ .start = 0, .end = item_count },
+        .missing_table => unsupported.bulk_table_tokens = null,
+        .stale_endpoint_kind => unsupported.bulk_endpoint_kind = .file,
+        .stale_columns => unsupported.bulk_column_items.items[0].start = 0,
+        .missing_format => unsupported.bulk_format_tokens = null,
+    }
+}
 
-    var stale_cursor_subject = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "DECLARE usage_cursor CURSOR FOR SELECT id FROM usage_records ORDER BY id;",
-    );
-    defer stale_cursor_subject.deinit(alloc);
-    if (stale_cursor_subject.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .cursor => |*cursor| cursor.subject_tokens = cursor.tail_tokens,
-                else => return error.TestUnexpectedResult,
-            }
+fn expectGeneratedBulkUnsupportedMetadataMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedBulkUnsupportedMetadataMutation,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .unsupported => |*unsupported| applyGeneratedBulkUnsupportedMetadataMutation(parsed.items().len, unsupported, mutation),
+            else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_cursor_subject));
-
-    var missing_cursor_subject_ast = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "DECLARE usage_cursor CURSOR FOR SELECT id FROM usage_records ORDER BY id;",
-    );
-    defer missing_cursor_subject_ast.deinit(alloc);
-    if (missing_cursor_subject_ast.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .cursor => |*cursor| cursor.subject_ast = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_cursor_subject_ast));
-
-    var malformed_subject = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "SAVEPOINT before_retry;",
-    );
-    defer malformed_subject.deinit(alloc);
-    if (malformed_subject.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .transaction => |*transaction| transaction.name_tokens = .{ .start = 0, .end = malformed_subject.items().len },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_subject));
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
 }
 
 test "sql adapter generated copy unsupported AST lowers to bulk io plan" {
@@ -37653,21 +37690,6 @@ test "sql adapter generated copy unsupported AST lowers to bulk io plan" {
         else => return error.TestUnexpectedResult,
     }
 
-    var malformed_kind = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "COPY usage_records FROM STDIN;",
-    );
-    defer malformed_kind.deinit(alloc);
-    if (malformed_kind.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .unsupported => |*unsupported| unsupported.kind = .vacuum,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_kind));
-
     try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanForTestAlloc(
         alloc,
         "COPY usage_records TO STDOUT WITH (FORCE_NOT_NULL (id));",
@@ -37681,80 +37703,21 @@ test "sql adapter generated copy unsupported AST lowers to bulk io plan" {
         "COPY usage_records FROM STDIN WITH (OIDS true);",
     ));
 
-    var malformed_subject = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "COPY usage_records FROM STDIN;",
-    );
-    defer malformed_subject.deinit(alloc);
-    if (malformed_subject.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .unsupported => |*unsupported| unsupported.subject_tokens = .{ .start = 0, .end = malformed_subject.items().len },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &malformed_subject));
-
-    var missing_bulk_table = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "COPY usage_records FROM STDIN;",
-    );
-    defer missing_bulk_table.deinit(alloc);
-    if (missing_bulk_table.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .unsupported => |*unsupported| unsupported.bulk_table_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_bulk_table));
-
-    var stale_bulk_endpoint = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "COPY usage_records FROM STDIN;",
-    );
-    defer stale_bulk_endpoint.deinit(alloc);
-    if (stale_bulk_endpoint.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .unsupported => |*unsupported| unsupported.bulk_endpoint_kind = .file,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_bulk_endpoint));
-
-    var stale_bulk_columns = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "COPY usage_records (id, status) FROM STDIN;",
-    );
-    defer stale_bulk_columns.deinit(alloc);
-    if (stale_bulk_columns.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .unsupported => |*unsupported| unsupported.bulk_column_items.items[0].start = 0,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_bulk_columns));
-
-    var missing_bulk_format = try tokenized.ParsedSql.initAlloc(
-        alloc,
-        "COPY usage_records FROM STDIN WITH (FORMAT csv);",
-    );
-    defer missing_bulk_format.deinit(alloc);
-    if (missing_bulk_format.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .unsupported => |*unsupported| unsupported.bulk_format_tokens = null,
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_bulk_format));
+    const copy_stdin_sql = "COPY usage_records FROM STDIN;";
+    const bulk_metadata_cases = [_]struct {
+        sql: []const u8,
+        mutation: GeneratedBulkUnsupportedMetadataMutation,
+    }{
+        .{ .sql = copy_stdin_sql, .mutation = .stale_kind },
+        .{ .sql = copy_stdin_sql, .mutation = .malformed_subject },
+        .{ .sql = copy_stdin_sql, .mutation = .missing_table },
+        .{ .sql = copy_stdin_sql, .mutation = .stale_endpoint_kind },
+        .{ .sql = "COPY usage_records (id, status) FROM STDIN;", .mutation = .stale_columns },
+        .{ .sql = "COPY usage_records FROM STDIN WITH (FORMAT csv);", .mutation = .missing_format },
+    };
+    for (bulk_metadata_cases) |case| {
+        try expectGeneratedBulkUnsupportedMetadataMutationFails(alloc, case.sql, case.mutation);
+    }
 }
 
 test "sql adapter ddl plan rejects unsupported ddl shapes explicitly" {
@@ -37769,6 +37732,29 @@ test "sql adapter ddl plan rejects unsupported ddl shapes explicitly" {
         else => return error.TestUnexpectedResult,
     }
     try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &generated_unsupported));
+
+    const exclusion_cases = [_]struct {
+        sql: []const u8,
+        kind: generated_parser.GeneratedSqlUnsupportedKind,
+    }{
+        .{
+            .sql = "CREATE TABLE usage_ranges (room text, EXCLUDE (room WITH =))",
+            .kind = .create_table_exclusion_constraint,
+        },
+        .{
+            .sql = "ALTER TABLE usage_ranges ADD EXCLUDE (room WITH =)",
+            .kind = .alter_table_exclusion_constraint,
+        },
+    };
+    for (exclusion_cases) |case| {
+        var parsed_exclusion = try tokenized.ParsedSql.initAlloc(alloc, case.sql);
+        defer parsed_exclusion.deinit(alloc);
+        switch (parsed_exclusion.statement) {
+            .unsupported => |statement| try std.testing.expectEqual(case.kind, statement.kind),
+            else => return error.TestUnexpectedResult,
+        }
+        try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed_exclusion));
+    }
 
     var replace_if_not_exists = try runtimeDdlPlanForTestAlloc(
         alloc,
@@ -38072,6 +38058,41 @@ test "sql adapter ddl plan preserves named inline create table constraints" {
     }
 }
 
+const GeneratedPeriodPayloadMetadataMutation = enum {
+    missing_payload,
+    stale_payload,
+};
+
+fn expectGeneratedPeriodPayloadMetadataMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    mutation: GeneratedPeriodPayloadMetadataMutation,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .ddl => |*ddl| {
+                var mutated = false;
+                for (ddl.alter_table_operation_period_payload_items) |*payload| {
+                    if (payload.*) |*range| {
+                        switch (mutation) {
+                            .missing_payload => payload.* = null,
+                            .stale_payload => range.start += 1,
+                        }
+                        mutated = true;
+                        break;
+                    }
+                }
+                if (!mutated) return error.TestUnexpectedResult;
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &parsed));
+    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed, .{}));
+}
+
 test "sql adapter ddl plan lowers application-time temporal table constraints" {
     const alloc = std.testing.allocator;
     var lowered = try runtimeDdlPlanForTestAlloc(
@@ -38112,35 +38133,15 @@ test "sql adapter ddl plan lowers application-time temporal table constraints" {
     try std.testing.expectEqualStrings("valid_time", runtime.periods[0].name);
     try std.testing.expectEqualStrings("valid_time", runtime.primary_key.?.without_overlaps_period.?);
 
-    var missing_period_payload = try tokenized.ParsedSql.initAlloc(alloc,
+    const create_period_payload_sql =
         \\CREATE TABLE account_prices (
         \\  tenant_id text NOT NULL,
         \\  valid_from timestamptz NOT NULL,
         \\  valid_to timestamptz NOT NULL,
         \\  PERIOD FOR valid_time (valid_from, valid_to)
         \\);
-    );
-    defer missing_period_payload.deinit(alloc);
-    if (missing_period_payload.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    var cleared = false;
-                    for (ddl.alter_table_operation_period_payload_items) |*payload| {
-                        if (payload.* != null) {
-                            payload.* = null;
-                            cleared = true;
-                            break;
-                        }
-                    }
-                    if (!cleared) return error.TestUnexpectedResult;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &missing_period_payload));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &missing_period_payload, .{}));
+    ;
+    try expectGeneratedPeriodPayloadMetadataMutationFails(alloc, create_period_payload_sql, .missing_payload);
 
     var child = try runtimeDdlPlanForTestAlloc(
         alloc,
@@ -38224,28 +38225,11 @@ test "sql adapter ddl plan lowers application-time temporal table constraints" {
         else => return error.TestUnexpectedResult,
     }
 
-    var stale_alter_period_payload = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE account_prices ADD PERIOD FOR sell_time (valid_from, valid_to);");
-    defer stale_alter_period_payload.deinit(alloc);
-    if (stale_alter_period_payload.generated_statement) |*generated_statement| {
-        if (generated_statement.ast) |*generated_ast| {
-            switch (generated_ast.*) {
-                .ddl => |*ddl| {
-                    var corrupted = false;
-                    for (ddl.alter_table_operation_period_payload_items) |*payload| {
-                        if (payload.*) |*range| {
-                            range.start += 1;
-                            corrupted = true;
-                            break;
-                        }
-                    }
-                    if (!corrupted) return error.TestUnexpectedResult;
-                },
-                else => return error.TestUnexpectedResult,
-            }
-        } else return error.TestUnexpectedResult;
-    } else return error.TestUnexpectedResult;
-    try std.testing.expectError(error.UnsupportedSqlShape, runtimeDdlPlanParsedSqlAlloc(alloc, &stale_alter_period_payload));
-    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &stale_alter_period_payload, .{}));
+    try expectGeneratedPeriodPayloadMetadataMutationFails(
+        alloc,
+        "ALTER TABLE account_prices ADD PERIOD FOR sell_time (valid_from, valid_to);",
+        .stale_payload,
+    );
 }
 
 test "sql adapter ddl plan parses ddl known defaults and types privately" {
@@ -39528,6 +39512,37 @@ pub fn relationalAccessMethodForCreateIndex(plan: CreateIndexPlan) !runtime_sche
     };
 }
 
+pub fn relationalPlannerCapabilitiesForCreateIndex(
+    plan: CreateIndexPlan,
+    access_method: runtime_schema.RelationalIndexAccessMethod,
+) runtime_schema.RelationalIndexPlannerCapabilities {
+    return switch (access_method) {
+        .scalar_column => .{
+            .equality = true,
+            .range = true,
+        },
+        .ordered_tuple => .{
+            .equality = true,
+            .range = true,
+            .ordering = true,
+            .covering = plan.include_columns.len != 0,
+        },
+        .text_search => .{
+            .full_text = true,
+            .rank = true,
+        },
+        .algebraic_filter => .{
+            .equality = true,
+            .prefix = true,
+            .array = plan.opclass == .array_ops or plan.opclass == .default,
+            .json = plan.opclass == .jsonb_path_ops or plan.opclass == .default,
+            .algebraic_dictionary = true,
+            .algebraic_fact = true,
+            .algebraic_path = true,
+        },
+    };
+}
+
 pub fn createIndexPlanIsSchemaDerivedAlgebraic(plan: CreateIndexPlan) bool {
     if (plan.method != .antfly_algebraic) return false;
     if (plan.unique or plan.opclass != .default) return false;
@@ -39555,6 +39570,12 @@ pub fn stableSecondaryIndexGeneration(plan: CreateIndexPlan) u64 {
     hashPlanU64(&hasher, @intCast(plan.index_keys.len));
     for (plan.index_keys) |key| {
         hashPlanField(&hasher, key.column);
+        if (key.collation) |collation| {
+            hasher.update(&.{1});
+            hashPlanField(&hasher, collation);
+        } else {
+            hasher.update(&.{0});
+        }
         hashPlanU64(&hasher, @intFromEnum(key.direction));
         hashPlanU64(&hasher, @intFromEnum(key.nulls));
     }
@@ -40121,8 +40142,17 @@ pub fn cloneDdlUniqueExpressions(alloc: std.mem.Allocator, expressions: []const 
 }
 
 pub fn cloneDdlRelationalIndexKey(alloc: std.mem.Allocator, key: runtime_schema.RelationalIndexKey) !runtime_schema.RelationalIndexKey {
+    const column = try alloc.dupe(u8, key.column);
+    var column_transferred = false;
+    errdefer if (!column_transferred) alloc.free(column);
+    const collation = if (key.collation) |source_collation| try alloc.dupe(u8, source_collation) else null;
+    var collation_transferred = false;
+    errdefer if (!collation_transferred) if (collation) |owned_collation| alloc.free(owned_collation);
+    column_transferred = true;
+    collation_transferred = true;
     return .{
-        .column = try alloc.dupe(u8, key.column),
+        .column = column,
+        .collation = collation,
         .direction = key.direction,
         .nulls = key.nulls,
     };
@@ -40138,6 +40168,41 @@ pub fn cloneDdlRelationalIndexKeys(alloc: std.mem.Allocator, keys: []const runti
     }
     for (keys, 0..) |key, i| {
         out[i] = try cloneDdlRelationalIndexKey(alloc, key);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn cloneDdlRelationalIndexOwnerRange(
+    alloc: std.mem.Allocator,
+    range: runtime_schema.RelationalIndexOwnerRange,
+) !runtime_schema.RelationalIndexOwnerRange {
+    const start = try alloc.dupe(u8, range.start);
+    errdefer alloc.free(start);
+    const end = try alloc.dupe(u8, range.end);
+    errdefer alloc.free(end);
+    const range_id = if (range.range_id) |id| try alloc.dupe(u8, id) else null;
+    return .{
+        .start = start,
+        .end = end,
+        .range_id = range_id,
+        .placement_generation = range.placement_generation,
+    };
+}
+
+fn cloneDdlRelationalIndexOwnerRanges(
+    alloc: std.mem.Allocator,
+    ranges: []const runtime_schema.RelationalIndexOwnerRange,
+) ![]const runtime_schema.RelationalIndexOwnerRange {
+    if (ranges.len == 0) return &.{};
+    const out = try alloc.alloc(runtime_schema.RelationalIndexOwnerRange, ranges.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |range| freeDdlRelationalIndexOwnerRange(alloc, range);
+        alloc.free(out);
+    }
+    for (ranges, 0..) |range, i| {
+        out[i] = try cloneDdlRelationalIndexOwnerRange(alloc, range);
         initialized += 1;
     }
     return out;
@@ -40212,6 +40277,9 @@ pub fn cloneDdlRelationalIndex(alloc: std.mem.Allocator, index: runtime_schema.R
     out.lifecycle = index.lifecycle;
     out.generation = index.generation;
     out.schema_fingerprint = if (index.schema_fingerprint) |fingerprint| try alloc.dupe(u8, fingerprint) else null;
+    out.owner_ranges = try cloneDdlRelationalIndexOwnerRanges(alloc, index.owner_ranges);
+    out.generation_record = if (index.generation_record) |record| try cloneDdlRelationalIndexGenerationRecord(alloc, record) else null;
+    out.planner_capabilities = index.planner_capabilities;
     out.where = try cloneDdlUniquePredicates(alloc, index.where);
     out.where_expressions = try plan_mod.cloneExpressionConditionsAlloc(alloc, index.where_expressions);
     return out;
@@ -40435,11 +40503,29 @@ pub fn freeDdlGeneratedValue(alloc: std.mem.Allocator, generated: runtime_schema
 
 pub fn freeDdlRelationalIndexKey(alloc: std.mem.Allocator, key: runtime_schema.RelationalIndexKey) void {
     alloc.free(key.column);
+    if (key.collation) |collation| alloc.free(collation);
 }
 
 pub fn freeDdlRelationalIndexKeys(alloc: std.mem.Allocator, keys: []const runtime_schema.RelationalIndexKey) void {
     for (keys) |key| freeDdlRelationalIndexKey(alloc, key);
     if (keys.len > 0) alloc.free(keys);
+}
+
+fn freeDdlRelationalIndexOwnerRange(
+    alloc: std.mem.Allocator,
+    range: runtime_schema.RelationalIndexOwnerRange,
+) void {
+    alloc.free(range.start);
+    alloc.free(range.end);
+    if (range.range_id) |range_id| alloc.free(range_id);
+}
+
+fn freeDdlRelationalIndexOwnerRanges(
+    alloc: std.mem.Allocator,
+    ranges: []const runtime_schema.RelationalIndexOwnerRange,
+) void {
+    for (ranges) |range| freeDdlRelationalIndexOwnerRange(alloc, range);
+    if (ranges.len > 0) alloc.free(ranges);
 }
 
 pub fn freeDdlPrimaryKey(alloc: std.mem.Allocator, primary_key: runtime_schema.PrimaryKey) void {
@@ -40480,9 +40566,33 @@ pub fn freeDdlRelationalIndex(alloc: std.mem.Allocator, index: runtime_schema.Re
     freeStringSlice(alloc, index.include_columns);
     freeDdlRelationalIndexKeys(alloc, index.keys);
     if (index.schema_fingerprint) |fingerprint| alloc.free(fingerprint);
+    freeDdlRelationalIndexOwnerRanges(alloc, index.owner_ranges);
+    if (index.generation_record) |record| freeDdlRelationalIndexGenerationRecord(alloc, record);
     freeDdlUniquePredicates(alloc, index.where);
     freeExpressionConditions(alloc, index.where_expressions);
     if (index.where_expressions.len > 0) alloc.free(index.where_expressions);
+}
+
+fn cloneDdlRelationalIndexGenerationRecord(
+    alloc: std.mem.Allocator,
+    record: runtime_schema.RelationalIndexGenerationRecord,
+) !runtime_schema.RelationalIndexGenerationRecord {
+    return .{
+        .generation = record.generation,
+        .owner_ranges = try cloneDdlRelationalIndexOwnerRanges(alloc, record.owner_ranges),
+        .lifecycle = record.lifecycle,
+        .lag = record.lag,
+        .failure_reason = if (record.failure_reason) |reason| try alloc.dupe(u8, reason) else null,
+        .ready_watermark = record.ready_watermark,
+    };
+}
+
+fn freeDdlRelationalIndexGenerationRecord(
+    alloc: std.mem.Allocator,
+    record: runtime_schema.RelationalIndexGenerationRecord,
+) void {
+    freeDdlRelationalIndexOwnerRanges(alloc, record.owner_ranges);
+    if (record.failure_reason) |reason| alloc.free(reason);
 }
 
 pub fn clearDdlRelationalIndexes(alloc: std.mem.Allocator, indexes: []const runtime_schema.RelationalIndex) void {
@@ -41177,6 +41287,71 @@ test "SQL adapter DDL table clone plans own strings and expose all options" {
         .options = all,
     };
     clone.deinit(alloc);
+}
+
+test "SQL adapter DDL runtime schema clone preserves relational index durable fields" {
+    const alloc = std.testing.allocator;
+
+    const source_schema: runtime_schema.TableSchema = .{
+        .storage_mode = .relational,
+        .default_type = "row",
+        .relational_indexes = &.{
+            .{
+                .name = "orders_status_idx",
+                .owner_kind = .relational_column,
+                .owner_name = "status",
+                .access_method = .ordered_tuple,
+                .columns = &.{"status"},
+                .keys = &.{.{
+                    .column = "status",
+                }},
+                .lifecycle = .catching_up,
+                .generation = 42,
+                .schema_fingerprint = "secondary-index-v1:orders_status_idx",
+                .owner_ranges = &.{
+                    .{
+                        .start = "row:a",
+                        .end = "row:m",
+                        .range_id = "range-a",
+                        .placement_generation = 7,
+                    },
+                    .{
+                        .start = "row:m",
+                        .end = "",
+                    },
+                },
+                .planner_capabilities = .{
+                    .equality = true,
+                    .range = true,
+                    .ordering = true,
+                    .covering = true,
+                },
+            },
+        },
+    };
+
+    const cloned = try cloneRelationalRuntimeSchemaAlloc(alloc, source_schema);
+    defer runtime_schema.freeSchema(alloc, cloned);
+
+    try std.testing.expectEqual(@as(usize, 1), cloned.relational_indexes.len);
+    const index = cloned.relational_indexes[0];
+    try std.testing.expectEqualStrings("orders_status_idx", index.name);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexLifecycle.catching_up, index.lifecycle);
+    try std.testing.expectEqual(@as(u64, 42), index.generation);
+    try std.testing.expectEqualStrings("secondary-index-v1:orders_status_idx", index.schema_fingerprint.?);
+    try std.testing.expectEqual(@as(usize, 2), index.owner_ranges.len);
+    try std.testing.expectEqualStrings("row:a", index.owner_ranges[0].start);
+    try std.testing.expectEqualStrings("row:m", index.owner_ranges[0].end);
+    try std.testing.expectEqualStrings("range-a", index.owner_ranges[0].range_id.?);
+    try std.testing.expectEqual(@as(u64, 7), index.owner_ranges[0].placement_generation);
+    try std.testing.expectEqualStrings("row:m", index.owner_ranges[1].start);
+    try std.testing.expectEqualStrings("", index.owner_ranges[1].end);
+    try std.testing.expect(index.owner_ranges[1].range_id == null);
+    try std.testing.expect(index.planner_capabilities.equality);
+    try std.testing.expect(index.planner_capabilities.range);
+    try std.testing.expect(index.planner_capabilities.ordering);
+    try std.testing.expect(index.planner_capabilities.covering);
+    try std.testing.expect(!index.planner_capabilities.full_text);
 }
 
 test "SQL adapter DDL drop table and index plans own strings" {

@@ -21,3 +21,4 @@ pub const ExtractionRelation = types.ExtractionRelation;
 pub const ExtractionClassification = types.ExtractionClassification;
 pub const ExtractionObject = types.ExtractionObject;
 pub const ExtractionResponse = types.ExtractionResponse;
+pub const ExtractionResponseObject = types.ExtractionResponseObject;

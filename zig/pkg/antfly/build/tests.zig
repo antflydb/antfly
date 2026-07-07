@@ -1961,6 +1961,7 @@ pub const APITestFilters = struct {
     pub const sql_api_parity = [_][]const u8{
         "postgres sql adapter classifies application parity corpus",
         "postgres sql adapter rejects data-driven application edge cases explicitly",
+        "postgres sql adapter lowered indexed read selects ordered tuple stream",
         "catalog apply applies incremental ddl plans to public schema json",
         "relational rows unique selector",
         "relational rows conflict target upsert",

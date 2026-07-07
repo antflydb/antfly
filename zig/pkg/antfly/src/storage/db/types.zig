@@ -1352,6 +1352,8 @@ pub const RelationalRowsQueryRequest = struct {
     json_path_eq: []const RelationalRowsJsonPathEqPredicate = &.{},
     json_path_exists: []const RelationalRowsJsonPathExistsPredicate = &.{},
     text_patterns: []const RelationalRowsTextPatternPredicate = &.{},
+    primary_text_index_name: ?[]const u8 = null,
+    full_text: ?TextQuery = null,
     or_predicates: []const RelationalRowsPredicateGroup = &.{},
     not_predicates: []const RelationalRowsPredicateGroup = &.{},
     access_or_predicates: []const RelationalRowsAccessPredicateGroup = &.{},
@@ -1425,6 +1427,8 @@ pub const RelationalRowsQueryRequest = struct {
             alloc.free(predicate.pattern);
         }
         if (self.text_patterns.len > 0) alloc.free(self.text_patterns);
+        if (self.primary_text_index_name) |index_name| alloc.free(@constCast(index_name));
+        if (self.full_text) |*query| query.deinit(alloc);
         for (self.or_predicates) |group| {
             for (group.predicates) |predicate| freeRelationalRowsRequestPredicate(alloc, predicate);
             if (group.predicates.len > 0) alloc.free(group.predicates);
@@ -1872,6 +1876,7 @@ pub const RelationalRowsQueryResult = struct {
         scalar_doc_set,
         array_doc_set,
         json_doc_set,
+        text_search_doc_set,
         mixed_doc_set,
         ordered_tuple_doc_set,
         ordered_tuple_stream,
@@ -1896,9 +1901,121 @@ pub const RelationalRowsQueryResult = struct {
         ordered_tuple_collation_not_supported,
     };
 
+    pub const UnsupportedReason = enum {
+        none,
+        unsupported_access_method,
+        predicate_not_proven,
+        ordering_not_covered,
+        index_not_ready,
+        stale_generation,
+        access_method_capability_mismatch,
+
+        pub fn name(self: @This()) []const u8 {
+            return switch (self) {
+                .none => "none",
+                .unsupported_access_method => "unsupported-access-method",
+                .predicate_not_proven => "predicate-not-proven",
+                .ordering_not_covered => "ordering-not-covered",
+                .index_not_ready => "index-not-ready",
+                .stale_generation => "stale-generation",
+                .access_method_capability_mismatch => "access-method-capability-mismatch",
+            };
+        }
+
+        pub fn jsonStringify(self: @This(), jw: anytype) !void {
+            try jw.write(self.name());
+        }
+
+        pub fn jsonParse(_: Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+            const s = switch (try source.next()) {
+                .string => |value| value,
+                else => return error.UnexpectedToken,
+            };
+            const map = std.StaticStringMap(@This()).initComptime(.{
+                .{ "none", .none },
+                .{ "unsupported-access-method", .unsupported_access_method },
+                .{ "unsupported_access_method", .unsupported_access_method },
+                .{ "predicate-not-proven", .predicate_not_proven },
+                .{ "predicate_not_proven", .predicate_not_proven },
+                .{ "ordering-not-covered", .ordering_not_covered },
+                .{ "ordering_not_covered", .ordering_not_covered },
+                .{ "index-not-ready", .index_not_ready },
+                .{ "index_not_ready", .index_not_ready },
+                .{ "stale-generation", .stale_generation },
+                .{ "stale_generation", .stale_generation },
+                .{ "access-method-capability-mismatch", .access_method_capability_mismatch },
+                .{ "access_method_capability_mismatch", .access_method_capability_mismatch },
+            });
+            return map.get(s) orelse error.UnexpectedToken;
+        }
+    };
+
+    pub const CandidateStreamStopReason = enum {
+        none,
+        sink_stop,
+        page_full,
+
+        pub fn name(self: @This()) []const u8 {
+            return switch (self) {
+                .none => "none",
+                .sink_stop => "sink-stop",
+                .page_full => "page-full",
+            };
+        }
+
+        pub fn jsonStringify(self: @This(), jw: anytype) !void {
+            try jw.write(self.name());
+        }
+
+        pub fn jsonParse(_: Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+            const s = switch (try source.next()) {
+                .string => |value| value,
+                else => return error.UnexpectedToken,
+            };
+            const map = std.StaticStringMap(@This()).initComptime(.{
+                .{ "none", .none },
+                .{ "sink-stop", .sink_stop },
+                .{ "sink_stop", .sink_stop },
+                .{ "page-full", .page_full },
+                .{ "page_full", .page_full },
+            });
+            return map.get(s) orelse error.UnexpectedToken;
+        }
+    };
+
+    pub fn unsupportedReasonForFallback(reason: FallbackReason) UnsupportedReason {
+        return switch (reason) {
+            .none,
+            .ordered_tuple_skipped_for_exact_paged_total,
+            .ordered_tuple_candidate_gate,
+            .ordered_tuple_materialization_cap,
+            => .none,
+
+            .ordered_tuple_predicate_not_proven => .predicate_not_proven,
+
+            .ordered_tuple_ordering_not_covered,
+            .ordered_tuple_order_field_not_covered,
+            .ordered_tuple_order_direction_not_covered,
+            .ordered_tuple_order_nulls_not_covered,
+            .ordered_tuple_order_collation_not_covered,
+            .ordered_tuple_order_tiebreaker_not_covered,
+            => .ordering_not_covered,
+
+            .ordered_tuple_index_not_ready => .index_not_ready,
+            .ordered_tuple_stale_generation => .stale_generation,
+
+            .ordered_tuple_access_method_mismatch => .unsupported_access_method,
+
+            .ordered_tuple_no_usable_bounds,
+            .ordered_tuple_collation_not_supported,
+            => .access_method_capability_mismatch,
+        };
+    }
+
     pub const Profile = struct {
         access_method: AccessMethod = .unknown,
         fallback_reason: FallbackReason = .none,
+        unsupported_reason: UnsupportedReason = .none,
         ordered_tuple_plan_selected: bool = false,
         ordered_tuple_catalog_ordinal: u32 = 0,
         ordered_tuple_index_generation: u64 = 0,
@@ -1916,12 +2033,21 @@ pub const RelationalRowsQueryResult = struct {
         scalar_candidate_sets: u32 = 0,
         array_candidate_sets: u32 = 0,
         json_candidate_sets: u32 = 0,
+        text_search_candidate_sets: u32 = 0,
         mixed_candidate_sets: u32 = 0,
         ordered_tuple_candidate_sets: u32 = 0,
         selected_candidate_estimated_rows: u64 = 0,
         estimated_candidate_rows: u64 = 0,
+        base_scan_rows: u64 = 0,
+        selected_candidate_selectivity_ppm: u64 = 0,
+        ordered_tuple_probe_selectivity_ppm: u64 = 0,
+        total_mode: RelationalRowsQueryRequest.TotalMode = .exact,
+        count_only: bool = false,
         index_entries_scanned: u64 = 0,
         candidate_rows: u64 = 0,
+        candidate_stream_emitted: u64 = 0,
+        retained_candidate_rows: u64 = 0,
+        candidate_stream_stop_reason: CandidateStreamStopReason = .none,
         candidate_gate_limit: u64 = 0,
         candidate_gate_observed: u64 = 0,
         candidate_gate_exceeded: bool = false,
@@ -1930,7 +2056,29 @@ pub const RelationalRowsQueryResult = struct {
         residual_rechecks: u64 = 0,
         covering_payload_rows: u64 = 0,
         covering_payload_rechecked_rows: u64 = 0,
+        covering_payload_hydration_avoided_rows: u64 = 0,
+        covering_payload_fallback_metadata_missing_rows: u64 = 0,
+        covering_payload_fallback_row_generation_mismatch_rows: u64 = 0,
+        covering_payload_fallback_index_generation_mismatch_rows: u64 = 0,
+        covering_payload_fallback_schema_fingerprint_mismatch_rows: u64 = 0,
+        covering_payload_fallback_residual_predicate_rows: u64 = 0,
+        covering_payload_fallback_projection_shape_rows: u64 = 0,
         projected_rows: u64 = 0,
+        routed_materialization_fallbacks: u64 = 0,
+        routed_materialized_rows: u64 = 0,
+        routed_materialized_bytes: u64 = 0,
+        routed_spill_count: u64 = 0,
+        routed_spilled_rows: u64 = 0,
+        routed_spilled_bytes: u64 = 0,
+
+        pub fn unsupportedReason(self: @This()) UnsupportedReason {
+            if (self.unsupported_reason != .none) return self.unsupported_reason;
+            return RelationalRowsQueryResult.unsupportedReasonForFallback(self.fallback_reason);
+        }
+
+        pub fn refreshUnsupportedReason(self: *@This()) void {
+            self.unsupported_reason = RelationalRowsQueryResult.unsupportedReasonForFallback(self.fallback_reason);
+        }
     };
 
     rows: [][]const u8 = &.{},
@@ -3188,6 +3336,7 @@ pub const ForeignKeyParentCheck = struct {
     parent_table: []const u8,
     parent_key: []const u8,
     parent_constraint_name: ?[]const u8 = null,
+    ordered_parent_tuple: ?[]const u8 = null,
     child_period_start_json: ?[]const u8 = null,
     child_period_end_json: ?[]const u8 = null,
     timing: Timing = .immediate,
@@ -3207,6 +3356,7 @@ pub const ForeignKeyParentDeleteCheck = struct {
     constraint_name: []const u8,
     parent_table: []const u8,
     parent_key: []const u8,
+    ordered_child_tuple: ?[]const u8 = null,
     timing: ForeignKeyParentCheck.Timing = .immediate,
     operation: Operation = .delete,
 };
@@ -4292,6 +4442,13 @@ pub const DBIndexStats = struct {
     catch_up_phase: DenseCatchUpStats.Phase = .idle,
     catch_up_applied_sequence: u64 = 0,
     catch_up_target_sequence: u64 = 0,
+    relational_generation_present: bool = false,
+    relational_generation_record_valid: bool = false,
+    relational_generation: u64 = 0,
+    relational_generation_lifecycle: schema_mod.RelationalIndexLifecycle = .ready,
+    relational_generation_lag: u64 = 0,
+    relational_generation_ready_watermark: u64 = 0,
+    relational_generation_catch_up_required: bool = false,
     text_merge: TextMergeStats = .{},
     hbc_cache: HbcCacheStats = .{},
     hbc_posting: HbcPostingStats = .{},

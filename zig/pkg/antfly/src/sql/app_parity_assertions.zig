@@ -147,9 +147,9 @@ pub fn expectAppParityQueryFunctionParsedSqlEntry(
         .ptr = &resolver_state,
         .vtable = &.{ .resolve_dense_query = appParityResolveDenseQuery },
     };
-    var lowered = try query_function.lowerAntflyQueryFunctionParsedSqlAlloc(alloc, semantic_resolver, parsed_sql);
+    var lowered = try query_function.lowerAntflyQueryFunctionReadParsedSqlAlloc(alloc, semantic_resolver, parsed_sql);
     defer lowered.deinit(alloc);
-    const fingerprint = try corpus.queryFunctionFingerprintAlloc(alloc, lowered);
+    const fingerprint = try corpus.queryFunctionFingerprintAlloc(alloc, lowered.request);
     defer alloc.free(fingerprint);
     try expectAppParityPlan(entry.plan, fingerprint);
 }

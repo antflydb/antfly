@@ -498,6 +498,64 @@ test "relational table full-text search loads stored_data from base rows" {
     try std.testing.expectEqualStrings("row:a", geo_bbox_filtered.hits[0].id);
 }
 
+test "relational table full-text backfill indexes committed base rows" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const DB = @import("mod.zig").DB;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "row:committed",
+            .value = "{\"title\":\"packed row backfill\",\"status\":\"ready\",\"amount\":12}",
+        }},
+        .sync_level = .write,
+    });
+
+    const row_key = try relational_store_mod.rowKeyAlloc(alloc, "row:committed");
+    defer alloc.free(row_key);
+    const packed_row = try relational_store_mod.getRawAlloc(alloc, db.core.store, row_key) orelse return error.TestUnexpectedResult;
+    defer alloc.free(packed_row);
+    try std.testing.expect(packed_row.len > 0);
+
+    try db.addIndex(.{
+        .name = "ft_backfill",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    var result = try db.search(alloc, .{
+        .index_name = "ft_backfill",
+        .query = .{ .match = .{ .field = "title", .text = "backfill" } },
+        .include_stored = true,
+        .limit = 10,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("row:committed", result.hits[0].id);
+    try std.testing.expect(result.hits[0].stored_data != null);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, result.hits[0].stored_data.?, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("packed row backfill", parsed.value.object.get("title").?.string);
+    try std.testing.expectEqualStrings("ready", parsed.value.object.get("status").?.string);
+}
+
 test "relational column filter pushdown declines stale identity generations" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
@@ -2973,7 +3031,8 @@ pub fn Impl(comptime DB: type) type {
             implications: relational_store_mod.PredicateImplications,
             columns: []const schema_mod.RelationalColumn,
         ) !bool {
-            if (index.lifecycle != .ready) return false;
+            const lifecycle = schema_mod.relationalIndexLifecycle(index) orelse return false;
+            if (lifecycle != .ready) return false;
             if (!relationalScalarIndexKeysUsableForQuery(index, column)) return false;
             if (!(try relational_store_mod.predicatesImplyUniqueWhereWithColumns(alloc, implications.predicates, index.where, columns))) return false;
             return try self.relationalRowsExpressionPredicatesImply(alloc, implications, index.where_expressions);

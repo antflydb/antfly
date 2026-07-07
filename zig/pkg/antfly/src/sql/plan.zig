@@ -1392,6 +1392,12 @@ pub const CteSelectParserHooks = struct {
         []const db_mod.types.RelationalRowsCte,
         ?*const generated_parser.GeneratedSqlCteAst,
     ) anyerror!LoweredSelect,
+    parse_select_generated: ?*const fn (
+        *anyopaque,
+        []const Token,
+        []const db_mod.types.RelationalRowsCte,
+        *const generated_parser.GeneratedSqlReadAst,
+    ) anyerror!LoweredSelect = null,
     parse_join: *const fn (
         *anyopaque,
         []const Token,
@@ -3146,7 +3152,7 @@ fn parseJoinWithCtes(hooks: JoinPlanParserHooks, ctes: []const db_mod.types.Rela
     return try hooks.parse_join(hooks.ptr);
 }
 
-pub fn parseWindowPlanAlloc(
+pub fn lowerTokenizedWindowPlanAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
     pos: *usize,
@@ -3188,7 +3194,7 @@ pub fn parseWindowPlanAlloc(
     return final;
 }
 
-pub fn parseAggregatePlanAlloc(
+pub fn lowerTokenizedAggregatePlanAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
     pos: *usize,
@@ -3246,7 +3252,7 @@ pub fn parseAggregatePlanAlloc(
     };
 }
 
-pub fn parseLateralPlanAlloc(
+pub fn lowerTokenizedLateralPlanAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
     pos: *usize,
@@ -3272,7 +3278,7 @@ pub fn parseLateralPlanAlloc(
     return final;
 }
 
-pub fn parseJoinPlanAlloc(
+pub fn lowerTokenizedJoinPlanAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
     pos: *usize,
@@ -3433,7 +3439,7 @@ pub fn parseSetOperationResultTailAlloc(
     };
 }
 
-pub fn parseSetOperationPlanAlloc(
+pub fn lowerTokenizedSetOperationPlanAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
     pos: *usize,
@@ -4283,7 +4289,7 @@ fn parseGeneratedRecursiveCteMemberProjectionsAlloc(
     return try projections.toOwnedSlice(alloc);
 }
 
-pub fn parseRecursiveCtePlanAlloc(
+pub fn lowerTokenizedRecursiveCtePlanAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
     pos: *usize,
@@ -6325,28 +6331,6 @@ pub fn selectSourceAliasTailKeyword(token: Token) bool {
         token.matchesKeywordTag(.except);
 }
 
-fn parseDmlTargetAliasAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-) !TableAlias {
-    _ = parser.matchKeywordTag(tokens, pos, .only);
-    const name = try grammar.parseSqlTableReferenceIdentifierOwnedAlloc(alloc, tokens, pos);
-    var name_transferred = false;
-    errdefer if (!name_transferred) alloc.free(name);
-    const alias = if (parser.matchKeywordTag(tokens, pos, .as))
-        try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos)
-    else if (parser.peekKind(tokens, pos.*, .identifier) and !nextIsDmlTargetTailKeyword(tokens, pos.*))
-        try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos)
-    else
-        try alloc.dupe(u8, name);
-    var alias_transferred = false;
-    errdefer if (!alias_transferred) alloc.free(alias);
-    name_transferred = true;
-    alias_transferred = true;
-    return .{ .name = name, .alias = alias };
-}
-
 pub fn nextIsDmlTargetTailKeyword(tokens: []const Token, pos: usize) bool {
     if (nextIsJoinClauseKeyword(tokens, pos)) return true;
     if (pos >= tokens.len) return false;
@@ -7027,16 +7011,6 @@ test "sql adapter plan parses relation aliases and qualified projections" {
     defer freeTableAlias(alloc, no_alias);
     try std.testing.expectEqual(@as(usize, 1), no_alias_pos);
     try std.testing.expectEqualStrings("usage_records", no_alias.alias);
-
-    const dml_target_tokens = [_]Token{
-        .{ .kind = .identifier, .text = "usage_records" },
-        .{ .kind = .identifier, .text = "set" },
-    };
-    var dml_target_pos: usize = 0;
-    const dml_target = try parseDmlTargetAliasAlloc(alloc, &dml_target_tokens, &dml_target_pos);
-    defer freeTableAlias(alloc, dml_target);
-    try std.testing.expectEqual(@as(usize, 1), dml_target_pos);
-    try std.testing.expectEqualStrings("usage_records", dml_target.alias);
 
     const select_tokens = [_]Token{
         .{ .kind = .identifier, .text = "select" },

@@ -333,6 +333,7 @@ pub const TokenKeyword = enum {
     skip,
     semantic_search,
     some,
+    soundex,
     source,
     sources,
     split_part,
@@ -566,6 +567,7 @@ test "sql adapter tokens match keyword tags without treating quoted identifiers 
     try std.testing.expectEqual(TokenKeyword.@"or", keywordFromIdentifier("OR").?);
     try std.testing.expectEqual(TokenKeyword.operator, keywordFromIdentifier("OPERATOR").?);
     try std.testing.expectEqual(TokenKeyword.some, keywordFromIdentifier("SOME").?);
+    try std.testing.expectEqual(TokenKeyword.soundex, keywordFromIdentifier("SOUNDEX").?);
     try std.testing.expectEqual(TokenKeyword.match, keywordFromIdentifier("MATCH").?);
     try std.testing.expectEqual(TokenKeyword.matched, keywordFromIdentifier("MATCHED").?);
     try std.testing.expectEqual(TokenKeyword.md5, keywordFromIdentifier("MD5").?);

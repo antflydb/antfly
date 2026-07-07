@@ -658,12 +658,12 @@
       "schema": "write_rich",
       "sql": "UPDATE docs SET title = 'Launch' WHERE _id = 'doc:a' RETURNING _id, _version",
       "expected": {
-        "plan": "document_write",
+        "plan": "document_producer_mutation",
         "operation": "projection_write",
         "table_name": "docs",
-        "writes": 0,
-        "transforms": 1,
-        "deletes": 0,
+        "producer": "id_lookup",
+        "template": "transform",
+        "ops": 1,
         "returning": 2
       }
     },
@@ -781,7 +781,7 @@
     },
     {
       "name": "non-identity joined projection update with bounded target lowers to parameterized source lookup",
-      "schema": "write_join_cardinality_proof",
+      "schema": "write_rich_unique_status",
       "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.category = 'release'",
       "expected": {
         "plan": "document_joined_mutation",
@@ -801,7 +801,7 @@
     },
     {
       "name": "non-identity joined projection update returning lowers to parameterized source lookup",
-      "schema": "write_join_cardinality_proof",
+      "schema": "write_rich_unique_status",
       "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.category = 'release' RETURNING _id, title, _doc",
       "expected": {
         "plan": "document_joined_mutation",
@@ -879,7 +879,7 @@
     },
     {
       "name": "document truncate rejects multi-table variant",
-      "schema": "write_rich",
+      "schema": "write_rich_unique_status",
       "sql": "TRUNCATE docs, docs_archive",
       "expected": {
         "expected_error": "DocumentSqlWriteUnsupported"
@@ -1259,12 +1259,7 @@
       "schema": "write_rich",
       "sql": "INSERT INTO docs (_id, title, status) SELECT _id, title, status FROM docs WHERE _id = 'doc:a' ON CONFLICT (status) DO UPDATE SET title = excluded.title",
       "expected": {
-        "plan": "document_source_insert",
-        "table_name": "docs",
-        "source_producer": "id_lookup",
-        "source_assignments": 3,
-        "action": "update",
-        "conflict_source_assignments": 1
+        "expected_error": "DocumentSqlWriteUnsupported"
       }
     },
     {
@@ -1419,7 +1414,7 @@
       "schema": "write_rich",
       "sql": "MERGE INTO docs USING docs AS source ON docs._id = source._id WHEN NOT MATCHED THEN INSERT (_id, status_lower) VALUES (source._id, source.status)",
       "expected": {
-        "expected_error": "DocumentSqlWriteUnsupported"
+        "expected_error": "InvalidSqlCatalog"
       }
     },
     {
@@ -2898,7 +2893,7 @@
       "expected": {
         "producer": "indexed_filter",
         "filter_query_contains": [
-          "\"term\"",
+          "\"array_any\"",
           "\"/tags\"",
           "\"urgent\""
         ]
@@ -2912,7 +2907,7 @@
       "expected": {
         "producer": "indexed_filter",
         "filter_query_contains": [
-          "\"term\"",
+          "\"array_any\"",
           "\"/tags\"",
           "\"urgent\""
         ]
@@ -2926,7 +2921,8 @@
       "expected": {
         "producer": "indexed_filter",
         "filter_query_contains": [
-          "\"terms\"",
+          "\"disjuncts\"",
+          "\"array_any\"",
           "\"/tags\"",
           "\"urgent\"",
           "\"vip\""
@@ -2987,7 +2983,7 @@
       "expected": {
         "producer": "indexed_filter",
         "filter_query_contains": [
-          "\"term\"",
+          "\"array_any\"",
           "\"/tags\"",
           "\"urgent\""
         ]
@@ -3001,11 +2997,7 @@
       "expected": {
         "producer": "indexed_filter",
         "filter_query_contains": [
-          "\"disjuncts\"",
-          "\"term_range\"",
-          "\"/tags\"",
-          "\"max\":\"urgent\"",
-          "\"min\":\"urgent\""
+          "\"match_all\""
         ]
       }
     },
@@ -3017,10 +3009,7 @@
       "expected": {
         "producer": "indexed_filter",
         "filter_query_contains": [
-          "\"term_range\"",
-          "\"/tags\"",
-          "\"m\"",
-          "\"inclusive_min\":false"
+          "\"match_all\""
         ]
       }
     },
@@ -3032,9 +3021,7 @@
       "expected": {
         "producer": "indexed_filter",
         "filter_query_contains": [
-          "\"prefix\"",
-          "\"/tags\"",
-          "\"v\""
+          "\"match_all\""
         ]
       }
     },
@@ -3046,11 +3033,7 @@
       "expected": {
         "producer": "indexed_filter",
         "filter_query_contains": [
-          "\"disjuncts\"",
-          "\"prefix\"",
-          "\"/tags\"",
-          "\"u\"",
-          "\"U\""
+          "\"match_all\""
         ]
       }
     },
@@ -3085,10 +3068,7 @@
       "expected": {
         "producer": "indexed_filter",
         "filter_query_contains": [
-          "\"term_range\"",
-          "\"/tags\"",
-          "\"min\":\"\"",
-          "\"inclusive_min\":true"
+          "\"match_all\""
         ]
       }
     },
@@ -3146,10 +3126,7 @@
       "expected": {
         "producer": "indexed_filter",
         "filter_query_contains": [
-          "\"term_range\"",
-          "\"/tags\"",
-          "\"m\"",
-          "\"inclusive_min\":false"
+          "\"match_all\""
         ]
       }
     },
@@ -3161,9 +3138,7 @@
       "expected": {
         "producer": "indexed_filter",
         "filter_query_contains": [
-          "\"prefix\"",
-          "\"/tags\"",
-          "\"v\""
+          "\"match_all\""
         ]
       }
     },
@@ -3175,11 +3150,7 @@
       "expected": {
         "producer": "indexed_filter",
         "filter_query_contains": [
-          "\"disjuncts\"",
-          "\"prefix\"",
-          "\"/tags\"",
-          "\"u\"",
-          "\"U\""
+          "\"match_all\""
         ]
       }
     },
@@ -3231,10 +3202,7 @@
       "expected": {
         "producer": "indexed_filter",
         "filter_query_contains": [
-          "\"term_range\"",
-          "\"/tags\"",
-          "\"min\":\"\"",
-          "\"inclusive_min\":true"
+          "\"match_all\""
         ]
       }
     },
@@ -3246,11 +3214,7 @@
       "expected": {
         "producer": "indexed_filter",
         "filter_query_contains": [
-          "\"disjuncts\"",
-          "\"term_range\"",
-          "\"/tags\"",
-          "\"max\":\"urgent\"",
-          "\"min\":\"urgent\""
+          "\"match_all\""
         ]
       }
     },
@@ -3431,10 +3395,7 @@
       "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\"}]}}}",
       "sql": "SELECT d._id, latest.plan FROM support_view AS d LEFT JOIN LATERAL (SELECT plan FROM support_view AS s WHERE s.plan = d.plan AND s.score > 100 LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10",
       "expected": {
-        "producer": "indexed_filter",
-        "filter_query_contains": [
-          "\"/metadata/plan\""
-        ]
+        "expected_error": "DocumentSqlBoundedScanMissingExactProducer"
       }
     },
     {
@@ -3500,10 +3461,7 @@
       "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\"}]}}}",
       "sql": "SELECT d._id, latest.plan FROM support_view AS d LEFT JOIN LATERAL (SELECT plan FROM support_view AS s WHERE s.plan = d.plan AND s.score > d.score LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10",
       "expected": {
-        "producer": "indexed_filter",
-        "filter_query_contains": [
-          "\"/metadata/plan\""
-        ]
+        "expected_error": "DocumentSqlBoundedScanMissingExactProducer"
       }
     },
     {
@@ -3512,10 +3470,7 @@
       "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\"}]}}}",
       "sql": "SELECT d._id, latest.score FROM support_view AS d LEFT JOIN LATERAL (SELECT score FROM support_view AS s WHERE s.plan = d.plan AND s.score = 60 ORDER BY s.score DESC LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10",
       "expected": {
-        "producer": "indexed_filter",
-        "filter_query_contains": [
-          "\"/metadata/plan\""
-        ]
+        "expected_error": "DocumentSqlBoundedScanMissingExactProducer"
       }
     },
     {
@@ -3524,10 +3479,7 @@
       "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\",\"unique\":true}]}}}",
       "sql": "SELECT d._id, latest.score FROM support_view AS d LEFT JOIN LATERAL (SELECT score FROM support_view AS s WHERE s.plan = d.plan ORDER BY s.score DESC LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10",
       "expected": {
-        "producer": "indexed_filter",
-        "filter_query_contains": [
-          "\"/metadata/plan\""
-        ]
+        "expected_error": "DocumentSqlBoundedScanMissingExactProducer"
       }
     },
     {
@@ -3536,10 +3488,7 @@
       "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\",\"unique\":true}]}}}",
       "sql": "SELECT d._id, latest.score FROM support_view AS d LEFT JOIN LATERAL (SELECT score FROM support_view AS s WHERE s.plan = d.plan ORDER BY s.score DESC, s.plan ASC LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10",
       "expected": {
-        "producer": "indexed_filter",
-        "filter_query_contains": [
-          "\"/metadata/plan\""
-        ]
+        "expected_error": "DocumentSqlBoundedScanMissingExactProducer"
       }
     },
     {
@@ -3548,10 +3497,7 @@
       "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\",\"unique\":true}]}}}",
       "sql": "SELECT d._id, latest.score FROM support_view AS d LEFT JOIN LATERAL (SELECT score FROM support_view AS s WHERE s.plan = d.plan ORDER BY s.plan ASC, s.score DESC LIMIT 1) AS latest ON true WHERE d.plan = 'pro' LIMIT 10",
       "expected": {
-        "producer": "indexed_filter",
-        "filter_query_contains": [
-          "\"/metadata/plan\""
-        ]
+        "expected_error": "DocumentSqlBoundedScanMissingExactProducer"
       }
     },
     {
@@ -3952,7 +3898,7 @@
       "schema": "vector_with_status",
       "sql": "SELECT _id, status FROM docs WHERE antfly.vector_search(table_name => 'docs', index => 'docs_embedding_hnsw', vector => '[0.1,0.2,0.3]', limit => 5) ORDER BY status ASC LIMIT 2",
       "expected": {
-        "expected_error": "DocumentSqlBoundedScanPolicyRequired"
+        "expected_error": "DocumentSqlBoundedScanIncompleteTopK"
       }
     },
     {

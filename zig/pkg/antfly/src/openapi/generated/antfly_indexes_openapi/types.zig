@@ -221,6 +221,69 @@ pub const AlgebraicIndexStatsIndexType = enum {
     }
 };
 
+pub const AlgebraicIndexStatsPlannerLastDecision = enum {
+    selected,
+    fallback,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .selected => "selected",
+            .fallback => "fallback",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "selected", .selected },
+            .{ "fallback", .fallback },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Stable planner unsupported bucket for the latest fallback decision.
+pub const AlgebraicIndexStatsPlannerLastUnsupportedReason = enum {
+    unsupported_access_method,
+    index_not_ready,
+    stale_generation,
+    predicate_not_proven,
+    ordering_not_covered,
+    access_method_capability_mismatch,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .unsupported_access_method => "unsupported-access-method",
+            .index_not_ready => "index-not-ready",
+            .stale_generation => "stale-generation",
+            .predicate_not_proven => "predicate-not-proven",
+            .ordering_not_covered => "ordering-not-covered",
+            .access_method_capability_mismatch => "access-method-capability-mismatch",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "unsupported-access-method", .unsupported_access_method },
+            .{ "index-not-ready", .index_not_ready },
+            .{ "stale-generation", .stale_generation },
+            .{ "predicate-not-proven", .predicate_not_proven },
+            .{ "ordering-not-covered", .ordering_not_covered },
+            .{ "access-method-capability-mismatch", .access_method_capability_mismatch },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Compact public statistics for an algebraic sidecar index. Detailed runtime, adaptive, and materialization records remain internal diagnostics.
 pub const AlgebraicIndexStats = struct {
     /// Discriminator for the index stats variant.
@@ -244,8 +307,10 @@ pub const AlgebraicIndexStats = struct {
     capability_lifecycle_status: ?[]const u8 = null,
     planner_selected: ?i64 = null,
     planner_fallback_count: ?i64 = null,
-    planner_last_decision: ?[]const u8 = null,
+    planner_last_decision: ?AlgebraicIndexStatsPlannerLastDecision = null,
     planner_last_fallback_reason: ?[]const u8 = null,
+    /// Stable planner unsupported bucket for the latest fallback decision.
+    planner_last_unsupported_reason: ?AlgebraicIndexStatsPlannerLastUnsupportedReason = null,
     /// Latest algebraic planner scan-row estimate for the last selected or fallback decision.
     planner_last_estimated_scan_rows: ?i64 = null,
     /// Latest algebraic planner result-bucket estimate for the last selected or fallback decision.
@@ -392,6 +457,32 @@ pub const AntflyType = enum {
     }
 };
 
+/// Topology constraint for this edge type: - tree: Single parent per node, no cycles - graph: No constraints (default)
+pub const EdgeTypeConfigTopology = enum {
+    tree,
+    graph,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .tree => "tree",
+            .graph => "graph",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "tree", .tree },
+            .{ "graph", .graph },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Configuration for a specific edge type
 pub const EdgeTypeConfig = struct {
     /// Edge type name (e.g., 'cites', 'similar_to')
@@ -399,7 +490,7 @@ pub const EdgeTypeConfig = struct {
     /// Document field containing target node key(s) for automatic edge creation. Supports string (single target) or array of strings (multiple targets). When omitted, edges must be provided explicitly via _edges.
     field: ?[]const u8 = null,
     /// Topology constraint for this edge type: - tree: Single parent per node, no cycles - graph: No constraints (default)
-    topology: ?[]const u8 = null,
+    topology: ?EdgeTypeConfigTopology = null,
     /// Maximum allowed edge weight
     max_weight: ?f64 = null,
     /// Minimum allowed edge weight
@@ -410,10 +501,41 @@ pub const EdgeTypeConfig = struct {
     required_metadata: ?[]const []const u8 = null,
 };
 
+pub const GraphMetricRuntimeStatsRole = enum {
+    combined,
+    coordinator,
+    worker,
+    worker_pool,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .combined => "combined",
+            .coordinator => "coordinator",
+            .worker => "worker",
+            .worker_pool => "worker_pool",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "combined", .combined },
+            .{ "coordinator", .coordinator },
+            .{ "worker", .worker },
+            .{ "worker_pool", .worker_pool },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Summarized graph metric maintenance runtime state. Identity fields are stable hashes, not raw process or owner identifiers.
 pub const GraphMetricRuntimeStats = struct {
     enabled: ?bool = null,
-    role: ?[]const u8 = null,
+    role: ?GraphMetricRuntimeStatsRole = null,
     runtime_id_hash: ?i64 = null,
     owner_id_hash: ?i64 = null,
     lease_key_hash: ?i64 = null,
@@ -614,12 +736,80 @@ pub const NodeFilter = struct {
     filter_prefix: ?[]const u8 = null,
 };
 
+pub const GraphMetricBuildPageStatusState = enum {
+    pending,
+    leased,
+    complete,
+    failed,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .pending => "pending",
+            .leased => "leased",
+            .complete => "complete",
+            .failed => "failed",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "pending", .pending },
+            .{ "leased", .leased },
+            .{ "complete", .complete },
+            .{ "failed", .failed },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const GraphMetricBuildPageStatusRangeKind = enum {
+    full,
+    reverse_edges,
+    nodes,
+    scores,
+    contributions,
+    job_control,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .full => "full",
+            .reverse_edges => "reverse_edges",
+            .nodes => "nodes",
+            .scores => "scores",
+            .contributions => "contributions",
+            .job_control => "job_control",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "full", .full },
+            .{ "reverse_edges", .reverse_edges },
+            .{ "nodes", .nodes },
+            .{ "scores", .scores },
+            .{ "contributions", .contributions },
+            .{ "job_control", .job_control },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const GraphMetricBuildPageStatus = struct {
     phase: []const u8,
     iteration: i64,
     page_id: i64,
-    state: []const u8,
-    range_kind: []const u8,
+    state: GraphMetricBuildPageStatusState,
+    range_kind: GraphMetricBuildPageStatusRangeKind,
     /// Worker id that owns or last failed this page.
     worker_id: ?[]const u8 = null,
     /// Unix epoch milliseconds when the page lease expires, or 0 when not leased.
@@ -636,23 +826,108 @@ pub const GraphMetricBuildPageStatus = struct {
     last_error: ?[]const u8 = null,
 };
 
+pub const GraphMetricEventKind = enum {
+    publish,
+    delete,
+    pause,
+    @"resume",
+    failed,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .publish => "publish",
+            .delete => "delete",
+            .pause => "pause",
+            .@"resume" => "resume",
+            .failed => "failed",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "publish", .publish },
+            .{ "delete", .delete },
+            .{ "pause", .pause },
+            .{ "resume", .@"resume" },
+            .{ "failed", .failed },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const GraphMetricEvent = struct {
     sequence: i64,
-    kind: []const u8,
+    kind: GraphMetricEventKind,
     at_ms: i64,
     target_edge_generation: i64,
     published_generation: i64,
     score_count: i64,
 };
 
+pub const GraphMetricEdgeFilterStatusMode = enum {
+    all,
+    types,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .all => "all",
+            .types => "types",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "all", .all },
+            .{ "types", .types },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const GraphMetricEdgeFilterStatus = struct {
-    mode: []const u8,
+    mode: GraphMetricEdgeFilterStatusMode,
     types: ?[]const []const u8 = null,
 };
 
 pub const GraphMetricScore = struct {
     node: []const u8,
     score: f64,
+};
+
+/// Whether stale published generations are acceptable or the metric must be fresh.
+pub const GraphMetricRerankMetricFreshness = enum {
+    published,
+    fresh,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .published => "published",
+            .fresh => "fresh",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "published", .published },
+            .{ "fresh", .fresh },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 pub const GraphMetricRerank = struct {
@@ -667,18 +942,114 @@ pub const GraphMetricRerank = struct {
     /// Metric feature value to use for hits that do not have a score in the published metric generation.
     missing_score: ?f64 = null,
     /// Whether stale published generations are acceptable or the metric must be fresh.
-    metric_freshness: ?[]const u8 = null,
+    metric_freshness: ?GraphMetricRerankMetricFreshness = null,
+};
+
+pub const GraphMetricOrderDirection = enum {
+    asc,
+    desc,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .asc => "asc",
+            .desc => "desc",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "asc", .asc },
+            .{ "desc", .desc },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const GraphMetricOrderNulls = enum {
+    first,
+    last,
+    nulls_first,
+    nulls_last,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .first => "first",
+            .last => "last",
+            .nulls_first => "nulls_first",
+            .nulls_last => "nulls_last",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "first", .first },
+            .{ "last", .last },
+            .{ "nulls_first", .nulls_first },
+            .{ "nulls_last", .nulls_last },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 pub const GraphMetricOrder = struct {
     metric: []const u8,
-    direction: ?[]const u8 = null,
-    nulls: ?[]const u8 = null,
+    direction: ?GraphMetricOrderDirection = null,
+    nulls: ?GraphMetricOrderNulls = null,
+};
+
+pub const GraphMetricFilterOp = enum {
+    @">",
+    @">=",
+    @"<",
+    @"<=",
+    @"=",
+    @"==",
+    @"!=",
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .@">" => ">",
+            .@">=" => ">=",
+            .@"<" => "<",
+            .@"<=" => "<=",
+            .@"=" => "=",
+            .@"==" => "==",
+            .@"!=" => "!=",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ ">", .@">" },
+            .{ ">=", .@">=" },
+            .{ "<", .@"<" },
+            .{ "<=", .@"<=" },
+            .{ "=", .@"=" },
+            .{ "==", .@"==" },
+            .{ "!=", .@"!=" },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 pub const GraphMetricFilter = struct {
     metric: []const u8,
-    op: []const u8,
+    op: GraphMetricFilterOp,
     value: f64,
 };
 
@@ -957,9 +1328,70 @@ pub const GraphQueryParams = struct {
     algorithm_params: ?std.json.Value = null,
 };
 
+pub const GraphMetricStatusPhase = enum {
+    idle,
+    computing,
+    publishing,
+    complete,
+    prepare_generation,
+    scan_edges_and_out_degree,
+    initialize_ranks,
+    iterate_contributions,
+    reduce_ranks,
+    hits_hub_contributions,
+    hits_hub_reduce_ranks,
+    check_convergence,
+    publish_generation,
+    cleanup_old_generations,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .idle => "idle",
+            .computing => "computing",
+            .publishing => "publishing",
+            .complete => "complete",
+            .prepare_generation => "prepare_generation",
+            .scan_edges_and_out_degree => "scan_edges_and_out_degree",
+            .initialize_ranks => "initialize_ranks",
+            .iterate_contributions => "iterate_contributions",
+            .reduce_ranks => "reduce_ranks",
+            .hits_hub_contributions => "hits_hub_contributions",
+            .hits_hub_reduce_ranks => "hits_hub_reduce_ranks",
+            .check_convergence => "check_convergence",
+            .publish_generation => "publish_generation",
+            .cleanup_old_generations => "cleanup_old_generations",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "idle", .idle },
+            .{ "computing", .computing },
+            .{ "publishing", .publishing },
+            .{ "complete", .complete },
+            .{ "prepare_generation", .prepare_generation },
+            .{ "scan_edges_and_out_degree", .scan_edges_and_out_degree },
+            .{ "initialize_ranks", .initialize_ranks },
+            .{ "iterate_contributions", .iterate_contributions },
+            .{ "reduce_ranks", .reduce_ranks },
+            .{ "hits_hub_contributions", .hits_hub_contributions },
+            .{ "hits_hub_reduce_ranks", .hits_hub_reduce_ranks },
+            .{ "check_convergence", .check_convergence },
+            .{ "publish_generation", .publish_generation },
+            .{ "cleanup_old_generations", .cleanup_old_generations },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const GraphMetricStatus = struct {
     state: []const u8,
-    phase: []const u8,
+    phase: GraphMetricStatusPhase,
     edge_filter: ?GraphMetricEdgeFilterStatus = null,
     /// Version of the published graph metric metadata schema.
     metadata_version: ?i64 = null,
@@ -1227,9 +1659,37 @@ pub const RelationalIndexStats = struct {
     lifecycle: ?[]const u8 = null,
     ready: ?bool = null,
     generation: ?i64 = null,
+    lag: ?i64 = null,
+    ready_watermark: ?i64 = null,
     schema_fingerprint: ?[]const u8 = null,
     rebuild: ?RelationalIndexRebuildStatus = null,
     repair: ?RelationalIndexRepairStatus = null,
+};
+
+/// Freshness mode for projected, ordered, and filtered graph metrics
+pub const GraphQueryMetricFreshness = enum {
+    published,
+    fresh,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .published => "published",
+            .fresh => "fresh",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "published", .published },
+            .{ "fresh", .fresh },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// Declarative graph query to execute after full-text/vector searches
@@ -1260,7 +1720,7 @@ pub const GraphQuery = struct {
     /// Filter graph result nodes by graph metric scores
     where_metric: ?[]const GraphMetricFilter = null,
     /// Freshness mode for projected, ordered, and filtered graph metrics
-    metric_freshness: ?[]const u8 = null,
+    metric_freshness: ?GraphQueryMetricFreshness = null,
     /// Include graph metric status metadata in the graph result
     include_metric_status: ?bool = null,
 };
@@ -1290,6 +1750,15 @@ pub const IndexStats = union(enum) {
     algebraic_index_stats: AlgebraicIndexStats,
     relational_index_stats: RelationalIndexStats,
 
+    fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
+        const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
+        defer allocator.free(encoded);
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.UnexpectedToken,
+        };
+    }
+
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
         const disc_val = source.object.get("index_type") orelse return error.MissingField;
@@ -1298,19 +1767,19 @@ pub const IndexStats = union(enum) {
             else => return error.UnexpectedToken,
         };
         if (std.mem.eql(u8, disc_str, "full_text")) {
-            return .{ .full_text_index_stats = try std.json.parseFromValueLeaky(FullTextIndexStats, allocator, source, options) };
+            return .{ .full_text_index_stats = try parseUnionVariantFromValue(FullTextIndexStats, allocator, source, options) };
         }
         if (std.mem.eql(u8, disc_str, "embeddings")) {
-            return .{ .embeddings_index_stats = try std.json.parseFromValueLeaky(EmbeddingsIndexStats, allocator, source, options) };
+            return .{ .embeddings_index_stats = try parseUnionVariantFromValue(EmbeddingsIndexStats, allocator, source, options) };
         }
         if (std.mem.eql(u8, disc_str, "graph")) {
-            return .{ .graph_index_stats = try std.json.parseFromValueLeaky(GraphIndexStats, allocator, source, options) };
+            return .{ .graph_index_stats = try parseUnionVariantFromValue(GraphIndexStats, allocator, source, options) };
         }
         if (std.mem.eql(u8, disc_str, "algebraic")) {
-            return .{ .algebraic_index_stats = try std.json.parseFromValueLeaky(AlgebraicIndexStats, allocator, source, options) };
+            return .{ .algebraic_index_stats = try parseUnionVariantFromValue(AlgebraicIndexStats, allocator, source, options) };
         }
         if (std.mem.eql(u8, disc_str, "relational")) {
-            return .{ .relational_index_stats = try std.json.parseFromValueLeaky(RelationalIndexStats, allocator, source, options) };
+            return .{ .relational_index_stats = try parseUnionVariantFromValue(RelationalIndexStats, allocator, source, options) };
         }
         return error.UnexpectedToken;
     }

@@ -24,8 +24,36 @@ pub const StandbyBootstrapRequest = struct {
     content_root: ?[]const u8 = null,
 };
 
+pub const ReadCheckRequestConsistency = enum {
+    stale_ok,
+    at_least_lsn,
+    primary,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .stale_ok => "stale_ok",
+            .at_least_lsn => "at_least_lsn",
+            .primary => "primary",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "stale_ok", .stale_ok },
+            .{ "at_least_lsn", .at_least_lsn },
+            .{ "primary", .primary },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const ReadCheckRequest = struct {
-    consistency: ?[]const u8 = null,
+    consistency: ?ReadCheckRequestConsistency = null,
     required_lsn: ?i64 = null,
     required_metadata_lsn: ?i64 = null,
     metadata_applied_lsn: ?i64 = null,
@@ -48,6 +76,38 @@ pub const PromotionAssessRequest = struct {
     use_current_fence: bool,
 };
 
+/// Explicit promotion mode for automation. `blocked` means the assessment is not promotable. `safe` means fencing is confirmed and all required/applied LSN evidence is present without forcing. `forced` means force was requested but no data loss is indicated. `lossy` means force was requested and data loss is possible.
+pub const HAPromotionAssessmentMode = enum {
+    blocked,
+    safe,
+    forced,
+    lossy,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .blocked => "blocked",
+            .safe => "safe",
+            .forced => "forced",
+            .lossy => "lossy",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "blocked", .blocked },
+            .{ "safe", .safe },
+            .{ "forced", .forced },
+            .{ "lossy", .lossy },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const HAPromotionAssessment = struct {
     required_lsn: i64,
     received_lsn: i64,
@@ -57,12 +117,40 @@ pub const HAPromotionAssessment = struct {
     fencing_confirmed: bool,
     force: bool,
     /// Explicit promotion mode for automation. `blocked` means the assessment is not promotable. `safe` means fencing is confirmed and all required/applied LSN evidence is present without forcing. `forced` means force was requested but no data loss is indicated. `lossy` means force was requested and data loss is possible.
-    mode: []const u8,
+    mode: HAPromotionAssessmentMode,
     data_loss_possible: bool,
     safe: bool,
     requires_fencing: bool,
     requires_force: bool,
     can_promote: bool,
+};
+
+pub const HASlotSnapshotStatus = enum {
+    healthy,
+    lagging,
+    reseed_required,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .healthy => "healthy",
+            .lagging => "lagging",
+            .reseed_required => "reseed_required",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "healthy", .healthy },
+            .{ "lagging", .lagging },
+            .{ "reseed_required", .reseed_required },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 pub const HASlotSnapshot = struct {
@@ -78,7 +166,7 @@ pub const HASlotSnapshot = struct {
     apply_lag_lsn: i64,
     safe_read_lag_lsn: i64,
     retention_lag_lsn: i64,
-    status: []const u8,
+    status: HASlotSnapshotStatus,
     last_error: ?[]const u8 = null,
 };
 
@@ -92,10 +180,97 @@ pub const HARetentionSnapshot = struct {
     reseed_recommended: i64,
 };
 
+pub const HADurabilityDecisionStatus = enum {
+    satisfied,
+    would_block,
+    fail_closed,
+    degraded_to_async,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .satisfied => "satisfied",
+            .would_block => "would_block",
+            .fail_closed => "fail_closed",
+            .degraded_to_async => "degraded_to_async",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "satisfied", .satisfied },
+            .{ "would_block", .would_block },
+            .{ "fail_closed", .fail_closed },
+            .{ "degraded_to_async", .degraded_to_async },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const HADurabilityDecisionMode = enum {
+    async,
+    remote_write,
+    remote_apply,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .async => "async",
+            .remote_write => "remote_write",
+            .remote_apply => "remote_apply",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "async", .async },
+            .{ "remote_write", .remote_write },
+            .{ "remote_apply", .remote_apply },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const HADurabilityDecisionSelection = enum {
+    any,
+    first,
+    all,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .any => "any",
+            .first => "first",
+            .all => "all",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "any", .any },
+            .{ "first", .first },
+            .{ "all", .all },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const HADurabilityDecision = struct {
-    status: []const u8,
-    mode: []const u8,
-    selection: []const u8,
+    status: HADurabilityDecisionStatus,
+    mode: HADurabilityDecisionMode,
+    selection: HADurabilityDecisionSelection,
     target_lsn: i64,
     progress_lsn: i64,
     missing_lsn_count: i64,
@@ -104,9 +279,68 @@ pub const HADurabilityDecision = struct {
     candidate_count: i64,
 };
 
+pub const HAReadDecisionAction = enum {
+    serve_standby,
+    wait_for_apply,
+    wait_for_metadata,
+    route_to_primary,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .serve_standby => "serve_standby",
+            .wait_for_apply => "wait_for_apply",
+            .wait_for_metadata => "wait_for_metadata",
+            .route_to_primary => "route_to_primary",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "serve_standby", .serve_standby },
+            .{ "wait_for_apply", .wait_for_apply },
+            .{ "wait_for_metadata", .wait_for_metadata },
+            .{ "route_to_primary", .route_to_primary },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const HAReadDecisionConsistency = enum {
+    stale_ok,
+    at_least_lsn,
+    primary,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .stale_ok => "stale_ok",
+            .at_least_lsn => "at_least_lsn",
+            .primary => "primary",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "stale_ok", .stale_ok },
+            .{ "at_least_lsn", .at_least_lsn },
+            .{ "primary", .primary },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const HAReadDecision = struct {
-    action: []const u8,
-    consistency: []const u8,
+    action: HAReadDecisionAction,
+    consistency: HAReadDecisionConsistency,
     required_lsn: ?i64 = null,
     required_metadata_lsn: ?i64 = null,
     received_lsn: i64,
@@ -130,17 +364,104 @@ pub const BaseBackupStartRequest = struct {
     manifest_id: []const u8,
 };
 
+/// Durability mode to require before acknowledging the commit.
+pub const HASyncPolicyMode = enum {
+    async,
+    remote_write,
+    remote_apply,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .async => "async",
+            .remote_write => "remote_write",
+            .remote_apply => "remote_apply",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "async", .async },
+            .{ "remote_write", .remote_write },
+            .{ "remote_apply", .remote_apply },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// How named standbys are selected to satisfy the policy.
+pub const HASyncPolicySelection = enum {
+    any,
+    first,
+    all,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .any => "any",
+            .first => "first",
+            .all => "all",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "any", .any },
+            .{ "first", .first },
+            .{ "all", .all },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Caller-visible action when synchronous durability is not currently satisfied.
+pub const HASyncPolicyFailurePolicy = enum {
+    block,
+    fail_closed,
+    degrade_to_async,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .block => "block",
+            .fail_closed => "fail_closed",
+            .degrade_to_async => "degrade_to_async",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "block", .block },
+            .{ "fail_closed", .fail_closed },
+            .{ "degrade_to_async", .degrade_to_async },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const HASyncPolicy = struct {
     /// Durability mode to require before acknowledging the commit.
-    mode: []const u8,
+    mode: HASyncPolicyMode,
     /// How named standbys are selected to satisfy the policy.
-    selection: ?[]const u8 = null,
+    selection: ?HASyncPolicySelection = null,
     /// Number of eligible standbys required for `any` selection.
     required: ?i64 = null,
     /// Ordered candidate standby names for synchronous commit.
     standby_names: ?[]const HASlotName = null,
     /// Caller-visible action when synchronous durability is not currently satisfied.
-    failure_policy: ?[]const u8 = null,
+    failure_policy: ?HASyncPolicyFailurePolicy = null,
 };
 
 pub const HAReplicationSlot = struct {
@@ -157,15 +478,103 @@ pub const HAReplicationSlot = struct {
     dropped: ?bool = null,
 };
 
+/// Typed HA action that produced this response.
+pub const HAActionReceiptActionKind = enum {
+    replication_slot_create,
+    replication_slot_pause,
+    replication_slot_resume,
+    replication_slot_drop,
+    base_backup_begin,
+    base_backup_finish,
+    standby_bootstrap,
+    fence_acquire,
+    promotion_assess,
+    promotion,
+    rejoin_assess,
+    rejoin_rewind,
+    rejoin_reseed,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .replication_slot_create => "replication_slot_create",
+            .replication_slot_pause => "replication_slot_pause",
+            .replication_slot_resume => "replication_slot_resume",
+            .replication_slot_drop => "replication_slot_drop",
+            .base_backup_begin => "base_backup_begin",
+            .base_backup_finish => "base_backup_finish",
+            .standby_bootstrap => "standby_bootstrap",
+            .fence_acquire => "fence_acquire",
+            .promotion_assess => "promotion_assess",
+            .promotion => "promotion",
+            .rejoin_assess => "rejoin_assess",
+            .rejoin_rewind => "rejoin_rewind",
+            .rejoin_reseed => "rejoin_reseed",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "replication_slot_create", .replication_slot_create },
+            .{ "replication_slot_pause", .replication_slot_pause },
+            .{ "replication_slot_resume", .replication_slot_resume },
+            .{ "replication_slot_drop", .replication_slot_drop },
+            .{ "base_backup_begin", .base_backup_begin },
+            .{ "base_backup_finish", .base_backup_finish },
+            .{ "standby_bootstrap", .standby_bootstrap },
+            .{ "fence_acquire", .fence_acquire },
+            .{ "promotion_assess", .promotion_assess },
+            .{ "promotion", .promotion },
+            .{ "rejoin_assess", .rejoin_assess },
+            .{ "rejoin_rewind", .rejoin_rewind },
+            .{ "rejoin_reseed", .rejoin_reseed },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Idempotency state for this action response.
+pub const HAActionReceiptState = enum {
+    assessed,
+    applied,
+    already_applied,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .assessed => "assessed",
+            .applied => "applied",
+            .already_applied => "already_applied",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "assessed", .assessed },
+            .{ "applied", .applied },
+            .{ "already_applied", .already_applied },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const HAActionReceipt = struct {
     /// Stable action correlation id derived from the acted-on HA resource and boundary values.
     action_id: []const u8,
     /// Typed HA action that produced this response.
-    action_kind: []const u8,
+    action_kind: HAActionReceiptActionKind,
     /// Node id, slot name, manifest id, or promotion boundary acted on by this node-local endpoint.
     target: []const u8,
     /// Idempotency state for this action response.
-    state: []const u8,
+    state: HAActionReceiptState,
     /// Node id for the node-local admin endpoint that produced this receipt.
     node_id: HANodeID,
 };
@@ -195,9 +604,89 @@ pub const HARejoinReseedResult = struct {
     base_backup_required: bool,
 };
 
+pub const HARejoinAssessmentAction = enum {
+    reject_unfenced,
+    already_current,
+    rewind,
+    reseed,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .reject_unfenced => "reject_unfenced",
+            .already_current => "already_current",
+            .rewind => "rewind",
+            .reseed => "reseed",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "reject_unfenced", .reject_unfenced },
+            .{ "already_current", .already_current },
+            .{ "rewind", .rewind },
+            .{ "reseed", .reseed },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const HARejoinAssessmentReason = enum {
+    no_fence,
+    current_timeline,
+    parent_timeline_retained,
+    parent_timeline_wal_expired,
+    incompatible_timeline,
+    wrong_old_primary,
+    wrong_cluster,
+    wrong_shard,
+    wrong_table,
+    local_lsn_before_fork,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .no_fence => "no_fence",
+            .current_timeline => "current_timeline",
+            .parent_timeline_retained => "parent_timeline_retained",
+            .parent_timeline_wal_expired => "parent_timeline_wal_expired",
+            .incompatible_timeline => "incompatible_timeline",
+            .wrong_old_primary => "wrong_old_primary",
+            .wrong_cluster => "wrong_cluster",
+            .wrong_shard => "wrong_shard",
+            .wrong_table => "wrong_table",
+            .local_lsn_before_fork => "local_lsn_before_fork",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "no_fence", .no_fence },
+            .{ "current_timeline", .current_timeline },
+            .{ "parent_timeline_retained", .parent_timeline_retained },
+            .{ "parent_timeline_wal_expired", .parent_timeline_wal_expired },
+            .{ "incompatible_timeline", .incompatible_timeline },
+            .{ "wrong_old_primary", .wrong_old_primary },
+            .{ "wrong_cluster", .wrong_cluster },
+            .{ "wrong_shard", .wrong_shard },
+            .{ "wrong_table", .wrong_table },
+            .{ "local_lsn_before_fork", .local_lsn_before_fork },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const HARejoinAssessment = struct {
-    action: []const u8,
-    reason: []const u8,
+    action: HARejoinAssessmentAction,
+    reason: HARejoinAssessmentReason,
     former_node_id: HANodeID,
     target_timeline_id: i64,
     target_epoch: i64,
@@ -217,14 +706,95 @@ pub const HARejoinAssessment = struct {
     data_loss_discarded: bool,
 };
 
+pub const WriteCheckRequestRole = enum {
+    primary,
+    standby,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .primary => "primary",
+            .standby => "standby",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "primary", .primary },
+            .{ "standby", .standby },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const WriteCheckRequest = struct {
-    role: []const u8,
+    role: WriteCheckRequestRole,
     expected_identity: ?HAIdentity = null,
 };
 
+pub const OwnerJobCheckRequestRole = enum {
+    primary,
+    standby,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .primary => "primary",
+            .standby => "standby",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "primary", .primary },
+            .{ "standby", .standby },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const OwnerJobCheckRequestKind = enum {
+    compaction_publish,
+    derived_effect_writer,
+    enrichment_writer,
+    retention_advance,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .compaction_publish => "compaction_publish",
+            .derived_effect_writer => "derived_effect_writer",
+            .enrichment_writer => "enrichment_writer",
+            .retention_advance => "retention_advance",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "compaction_publish", .compaction_publish },
+            .{ "derived_effect_writer", .derived_effect_writer },
+            .{ "enrichment_writer", .enrichment_writer },
+            .{ "retention_advance", .retention_advance },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const OwnerJobCheckRequest = struct {
-    role: []const u8,
-    kind: []const u8,
+    role: OwnerJobCheckRequestRole,
+    kind: OwnerJobCheckRequestKind,
     expected_identity: ?HAIdentity = null,
 };
 
@@ -266,8 +836,30 @@ pub const HAPromotionResult = struct {
     data_loss_possible: bool,
 };
 
+pub const HAStandbySnapshotRole = enum {
+    standby,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .standby => "standby",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "standby", .standby },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const HAStandbySnapshot = struct {
-    role: []const u8,
+    role: HAStandbySnapshotRole,
     /// Node id for the node-local admin endpoint that produced this status snapshot.
     node_id: HANodeID,
     identity: HAIdentity,
@@ -297,8 +889,30 @@ pub const HAPromotionHandoff = struct {
     next_lsn: i64,
 };
 
+pub const HAPrimarySnapshotRole = enum {
+    primary,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .primary => "primary",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "primary", .primary },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const HAPrimarySnapshot = struct {
-    role: []const u8,
+    role: HAPrimarySnapshotRole,
     /// Node id for the node-local admin endpoint that produced this status snapshot.
     node_id: HANodeID,
     identity: HAIdentity,
@@ -308,9 +922,40 @@ pub const HAPrimarySnapshot = struct {
     durability: ?HADurabilityDecision = null,
 };
 
+pub const HACommitGateAction = enum {
+    acknowledge,
+    wait_for_standby,
+    reject,
+    acknowledge_degraded,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .acknowledge => "acknowledge",
+            .wait_for_standby => "wait_for_standby",
+            .reject => "reject",
+            .acknowledge_degraded => "acknowledge_degraded",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "acknowledge", .acknowledge },
+            .{ "wait_for_standby", .wait_for_standby },
+            .{ "reject", .reject },
+            .{ "acknowledge_degraded", .acknowledge_degraded },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const HACommitGate = struct {
     target_lsn: i64,
-    action: []const u8,
+    action: HACommitGateAction,
     durability: HADurabilityDecision,
 };
 
@@ -324,11 +969,85 @@ pub const CommitCheckRequest = struct {
     sync_policy: HASyncPolicy,
 };
 
+pub const CommitAppendRequestKind = enum {
+    batch_mutation,
+    metadata_mutation,
+    derived_effect,
+    backup_start,
+    backup_end,
+    checkpoint,
+    manifest,
+    truncate,
+    timeline_switch,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .batch_mutation => "batch_mutation",
+            .metadata_mutation => "metadata_mutation",
+            .derived_effect => "derived_effect",
+            .backup_start => "backup_start",
+            .backup_end => "backup_end",
+            .checkpoint => "checkpoint",
+            .manifest => "manifest",
+            .truncate => "truncate",
+            .timeline_switch => "timeline_switch",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "batch_mutation", .batch_mutation },
+            .{ "metadata_mutation", .metadata_mutation },
+            .{ "derived_effect", .derived_effect },
+            .{ "backup_start", .backup_start },
+            .{ "backup_end", .backup_end },
+            .{ "checkpoint", .checkpoint },
+            .{ "manifest", .manifest },
+            .{ "truncate", .truncate },
+            .{ "timeline_switch", .timeline_switch },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const CommitAppendRequestPayloadCodec = enum {
+    raw,
+    json,
+    binary,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .raw => "raw",
+            .json => "json",
+            .binary => "binary",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "raw", .raw },
+            .{ "json", .json },
+            .{ "binary", .binary },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const CommitAppendRequest = struct {
     /// Logical WAL/effects payload to append.
     payload: []const u8,
-    kind: ?[]const u8 = null,
-    payload_codec: ?[]const u8 = null,
+    kind: ?CommitAppendRequestKind = null,
+    payload_codec: ?CommitAppendRequestPayloadCodec = null,
     shard_id: ?i64 = null,
     table_id: ?i64 = null,
     commit_timestamp_ns: ?i64 = null,
@@ -340,10 +1059,41 @@ pub const HAReplicationSlotListResponse = struct {
     slots: []const HAReplicationSlot,
 };
 
+pub const HAReplicationSlotActionResponseSlotAction = enum {
+    create,
+    pause,
+    @"resume",
+    drop,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .create => "create",
+            .pause => "pause",
+            .@"resume" => "resume",
+            .drop => "drop",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "create", .create },
+            .{ "pause", .pause },
+            .{ "resume", .@"resume" },
+            .{ "drop", .drop },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const HAReplicationSlotActionResponse = struct {
     schema_version: i64,
     action: HAActionReceipt,
-    slot_action: []const u8,
+    slot_action: HAReplicationSlotActionResponseSlotAction,
     slot: HAReplicationSlot,
 };
 
@@ -434,19 +1184,168 @@ pub const HAStandbyStatusResponse = struct {
     snapshot: HAStandbySnapshot,
 };
 
+pub const HAWriteDecisionRole = enum {
+    primary,
+    standby,
+    promoted_standby,
+    fenced_primary,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .primary => "primary",
+            .standby => "standby",
+            .promoted_standby => "promoted_standby",
+            .fenced_primary => "fenced_primary",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "primary", .primary },
+            .{ "standby", .standby },
+            .{ "promoted_standby", .promoted_standby },
+            .{ "fenced_primary", .fenced_primary },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const HAWriteDecisionAction = enum {
+    allow_write,
+    reject_read_only_standby,
+    open_promoted_primary,
+    reject_fenced_primary,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .allow_write => "allow_write",
+            .reject_read_only_standby => "reject_read_only_standby",
+            .open_promoted_primary => "open_promoted_primary",
+            .reject_fenced_primary => "reject_fenced_primary",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "allow_write", .allow_write },
+            .{ "reject_read_only_standby", .reject_read_only_standby },
+            .{ "open_promoted_primary", .open_promoted_primary },
+            .{ "reject_fenced_primary", .reject_fenced_primary },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const HAWriteDecision = struct {
-    role: []const u8,
-    action: []const u8,
+    role: HAWriteDecisionRole,
+    action: HAWriteDecisionAction,
     identity: HAIdentity,
     durable_lsn: i64,
     next_lsn: i64,
     promotion_handoff: ?HAPromotionHandoff = null,
 };
 
+pub const HAOwnerJobDecisionKind = enum {
+    compaction_publish,
+    derived_effect_writer,
+    enrichment_writer,
+    retention_advance,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .compaction_publish => "compaction_publish",
+            .derived_effect_writer => "derived_effect_writer",
+            .enrichment_writer => "enrichment_writer",
+            .retention_advance => "retention_advance",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "compaction_publish", .compaction_publish },
+            .{ "derived_effect_writer", .derived_effect_writer },
+            .{ "enrichment_writer", .enrichment_writer },
+            .{ "retention_advance", .retention_advance },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const HAOwnerJobDecisionRole = enum {
+    primary,
+    standby,
+    promoted_standby,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .primary => "primary",
+            .standby => "standby",
+            .promoted_standby => "promoted_standby",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "primary", .primary },
+            .{ "standby", .standby },
+            .{ "promoted_standby", .promoted_standby },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const HAOwnerJobDecisionAction = enum {
+    run,
+    disable_on_standby,
+    open_promoted_primary,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .run => "run",
+            .disable_on_standby => "disable_on_standby",
+            .open_promoted_primary => "open_promoted_primary",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "run", .run },
+            .{ "disable_on_standby", .disable_on_standby },
+            .{ "open_promoted_primary", .open_promoted_primary },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const HAOwnerJobDecision = struct {
-    kind: []const u8,
-    role: []const u8,
-    action: []const u8,
+    kind: HAOwnerJobDecisionKind,
+    role: HAOwnerJobDecisionRole,
+    action: HAOwnerJobDecisionAction,
     identity: HAIdentity,
     durable_lsn: i64,
     next_lsn: i64,

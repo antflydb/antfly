@@ -37,13 +37,6 @@ const value_mod = @import("value.zig");
 
 const Token = token_mod.Token;
 
-fn generatedReadProjectionContainsSubquery(read: *const generated_parser.GeneratedSqlReadAst) bool {
-    for (read.projection_items.expressions) |expression| {
-        if (lower_expr.generatedExpressionContainsSubquery(expression)) return true;
-    }
-    return false;
-}
-
 pub const ParserState = struct {
     pub const ContextAccessors = ParserContextAccessors(@This());
 
@@ -161,27 +154,12 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             };
         }
 
-        pub fn joinedMutationSourceParserContextHooks(ptr: *ParserType) lower_dml.JoinedMutationSourceParserContextHooks {
-            return .{
-                .ptr = ptr,
-                .get_context = Accessors.getJoinedMutationSourceParserContextHook,
-                .set_context = Accessors.setJoinedMutationSourceParserContextHook,
-            };
-        }
-
-        pub fn semiJoinSourceQueryParserContextHooks(ptr: *ParserType) lower_dml.SemiJoinSourceQueryParserContextHooks {
-            return .{
-                .ptr = ptr,
-                .get_context = Accessors.getSemiJoinSourceQueryParserContextHook,
-                .set_context = Accessors.setSemiJoinSourceQueryParserContextHook,
-            };
-        }
-
         pub fn cteSelectParserHooks(ptr: *ParserType) plan.CteSelectParserHooks {
             return .{
                 .ptr = ptr,
                 .generated_read_ast = ptr.generated_read_ast,
                 .parse_select = Accessors.parseCteSelectHook,
+                .parse_select_generated = Accessors.parseCteSelectGeneratedHook,
                 .parse_join = Accessors.parseCteJoinHook,
             };
         }
@@ -191,6 +169,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
                 .ptr = ptr,
                 .generated_read_ast = ptr.generated_read_ast,
                 .parse_select = Accessors.parseJoinCteSelectHook,
+                .parse_select_generated = Accessors.parseJoinCteSelectGeneratedHook,
                 .parse_join = Accessors.parseJoinCteJoinHook,
             };
         }
@@ -278,48 +257,6 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             };
         }
 
-        pub fn updateJoinedMutationSourceParserHooks(ptr: *ParserType) lower_dml.JoinedMutationSourceParserHooks {
-            return .{
-                .ptr = ptr,
-                .parse_joined_mutation_source = Accessors.lowerUpdateJoinedMutationSourceWithCtesHook,
-            };
-        }
-
-        pub fn deleteJoinedMutationSourceParserHooks(ptr: *ParserType) lower_dml.JoinedMutationSourceParserHooks {
-            return .{
-                .ptr = ptr,
-                .parse_joined_mutation_source = Accessors.lowerDeleteJoinedMutationSourceWithCtesHook,
-            };
-        }
-
-        pub fn insertSourceParserHooks(ptr: *ParserType) lower_dml.InsertSourceParserHooks {
-            return .{
-                .ptr = ptr,
-                .params = ptr.params,
-                .schema = ptr.schema,
-                .joined_source_schema = ptr.joined_source_schema,
-                .insert_source_allows_different_table = ptr.insert_source_allows_different_table,
-                .defer_row_expression_field_validation = ptr.defer_row_expression_field_validation,
-                .conflict_context_hooks = Accessors.conflictClauseParserContextHooks(ptr),
-                .conflict_target_options = Accessors.conflictTargetParserOptions(ptr),
-                .conflict_assignment_hooks = Accessors.conflictUpdateSetAssignmentParserOptions(ptr, &.{}, &.{}),
-                .generated_dml_ast = ptr.generated_dml_ast,
-                .generated_conflict_assignment_items = ptr.generated_assignment_items,
-                .generated_conflict_assignments_tokens = ptr.generated_conflict_assignments_tokens,
-                .generated_conflict_action_tokens = ptr.generated_conflict_action_tokens,
-                .generated_conflict_action_kind = ptr.generated_conflict_action_kind,
-                .generated_insert_column_items = ptr.generated_insert_column_items,
-                .conflict_condition_options = Accessors.conflictAssignmentExpressionParserOptions(ptr),
-                .conflict_dispatch_options = Accessors.conflictExpressionDispatchOptions(ptr),
-                .fixed_binary_hooks = Accessors.fixedBinaryRowExpressionParserOptions(ptr),
-                .bare_boolean_hooks = Accessors.bareBooleanWhereExpressionParserOptions(ptr),
-                .expression_alternatives_hooks = Accessors.expressionWhereConditionAlternativesParserHooks(ptr),
-                .expression_condition_hooks = Accessors.expressionWhereConditionsParserHooks(ptr),
-                .returning_hooks = Accessors.returningProjectionParserOptions(ptr),
-                .parse_select = Accessors.parseInsertSourceSelectHook,
-            };
-        }
-
         pub fn rowExpressionTypeContext(ptr: *ParserType) expr_type.RowExpressionTypeContext {
             return expr_type.rowExpressionTypeContext(
                 ptr.alloc,
@@ -329,36 +266,21 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             );
         }
 
-        pub fn ddlColumnDefinitionOptions(ptr: *ParserType) ddl_plan.DdlColumnDefinitionOptions {
-            return .{
-                .schema = ptr.schema,
-                .params = ptr.params,
-                .function_bindings = ptr.function_bindings,
-                .field_expression_qualifiers = ptr.field_expression_qualifiers,
-                .returning_expression_qualifiers = ptr.returning_expression_qualifiers,
-                .defer_row_expression_field_validation = ptr.defer_row_expression_field_validation,
-                .expression_options = Accessors.ddlExpressionOptions(ptr),
-            };
-        }
-
         pub fn ddlDomainOptions(ptr: *ParserType) ddl_plan.DdlDomainOptions {
             return .{
                 .params = ptr.params,
                 .realtime_ns = value_mod.currentRealtimeNs(),
-            };
-        }
-
-        pub fn ddlExpressionOptions(ptr: *ParserType) ddl_plan.DdlExpressionOptions {
-            return .{
-                .params = ptr.params,
-                .realtime_ns = value_mod.currentRealtimeNs(),
-                .function_bindings = ptr.function_bindings,
-                .context_hooks = Accessors.selectParserContextHooks(ptr),
-                .row_expression_hooks = Accessors.rowExpressionParserHooks(ptr),
-                .arithmetic_hooks = Accessors.arithmeticExpressionParserHooks(ptr),
-                .variadic_hooks = Accessors.variadicRowExpressionParserHooks(ptr),
-                .routine_expression = Accessors.routineExpressionRowExpressionParserOptions(ptr),
-                .condition_alternatives = Accessors.expressionWhereConditionAlternativesParserHooks(ptr),
+                .expression_options = .{
+                    .params = ptr.params,
+                    .realtime_ns = value_mod.currentRealtimeNs(),
+                    .function_bindings = ptr.function_bindings,
+                    .context_hooks = Accessors.selectParserContextHooks(ptr),
+                    .row_expression_hooks = Accessors.rowExpressionParserHooks(ptr),
+                    .arithmetic_hooks = Accessors.arithmeticExpressionParserHooks(ptr),
+                    .variadic_hooks = Accessors.variadicRowExpressionParserHooks(ptr),
+                    .routine_expression = Accessors.routineExpressionRowExpressionParserOptions(ptr),
+                    .condition_alternatives = Accessors.expressionWhereConditionAlternativesParserHooks(ptr),
+                },
             };
         }
 
@@ -538,29 +460,6 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             };
         }
 
-        pub fn returningProjectionParserOptions(ptr: *ParserType) expr_projection.ReturningProjectionParserOptions {
-            return .{
-                .params = ptr.params,
-                .function_bindings = ptr.function_bindings,
-                .field_source = expr_type.rowExpressionFieldSourceOrDefault(ptr.row_expression_field_source_override),
-                .context_hooks = Accessors.selectParserContextHooks(ptr),
-                .select_item_options = Accessors.selectItemParserOptions(ptr),
-                .generated_returning_items = ptr.generated_returning_items,
-            };
-        }
-
-        pub fn joinedMutationReturningProjectionParserOptions(ptr: *ParserType) expr_projection.JoinedMutationReturningProjectionParserOptions {
-            return .{
-                .params = ptr.params,
-                .function_bindings = ptr.function_bindings,
-                .field_source = expr_type.rowExpressionFieldSourceOrDefault(ptr.row_expression_field_source_override),
-                .select_context_hooks = Accessors.selectParserContextHooks(ptr),
-                .joined_context_hooks = Accessors.joinedExpressionParserContextHooks(ptr),
-                .select_item_options = Accessors.selectItemParserOptions(ptr),
-                .generated_returning_items = ptr.generated_returning_items,
-            };
-        }
-
         pub fn orderByParserOptions(ptr: *ParserType) expr_order.ByParserOptions {
             return .{
                 .schema = ptr.schema,
@@ -576,6 +475,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
 
         pub fn orderExpressionParserOptions(ptr: *ParserType) expr_order.OrderExpressionParserOptions {
             return .{
+                .params = ptr.params,
                 .field_source = expr_type.rowExpressionFieldSourceOrDefault(ptr.row_expression_field_source_override),
                 .row_expression_hooks = Accessors.rowExpressionParserHooks(ptr),
                 .arithmetic_hooks = Accessors.arithmeticExpressionParserHooks(ptr),
@@ -591,6 +491,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
                 .function_bindings = ptr.function_bindings,
                 .order_expression_hooks = Accessors.orderExpressionParserOptions(ptr),
                 .aggregate_input = .{
+                    .params = ptr.params,
                     .context_hooks = Accessors.selectParserContextHooks(ptr),
                     .row_expression_hooks = Accessors.rowExpressionParserHooks(ptr),
                     .arithmetic_hooks = Accessors.arithmeticExpressionParserHooks(ptr),
@@ -626,6 +527,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
 
         pub fn expressionWhereConditionsParserHooks(ptr: *ParserType) expr_where_condition.ExpressionWhereConditionsParserOptions {
             return .{
+                .params = ptr.params,
                 .select_context_hooks = Accessors.selectParserContextHooks(ptr),
                 .joined_context_hooks = Accessors.joinedExpressionParserContextHooks(ptr),
                 .row_expression_hooks = Accessors.rowExpressionParserHooks(ptr),
@@ -636,6 +538,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
 
         pub fn expressionWhereConditionAlternativesParserHooks(ptr: *ParserType) expr_where_condition.ExpressionWhereConditionAlternativesParserOptions {
             return .{
+                .params = ptr.params,
                 .select_context_hooks = Accessors.selectParserContextHooks(ptr),
                 .joined_context_hooks = Accessors.joinedExpressionParserContextHooks(ptr),
                 .row_expression_hooks = Accessors.rowExpressionParserHooks(ptr),
@@ -815,147 +718,6 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             return try lower_expr.parseLateralAlloc(ptr.alloc, ptr.tokens, &ptr.pos, Accessors.lateralParserOptions(ptr));
         }
 
-        pub fn conflictTargetParserOptions(ptr: *ParserType) lower_dml.ConflictTargetParserOptions {
-            return .{
-                .type_context = Accessors.rowExpressionTypeContext(ptr),
-                .defer_row_expression_field_validation = ptr.defer_row_expression_field_validation,
-                .case_expression_hooks = Accessors.caseExpressionParserHooks(ptr),
-                .generated_target_tokens = ptr.generated_conflict_target_tokens,
-                .generated_target_kind = ptr.generated_conflict_target_kind,
-                .generated_target_items = ptr.generated_conflict_target_items,
-                .generated_where_tokens = ptr.generated_conflict_target_where_tokens,
-                .generated_where_expression = ptr.generated_conflict_target_where_expression,
-            };
-        }
-
-        pub fn conflictJsonSetSqlValueParserOptions(
-            ptr: *ParserType,
-            insert_columns: []const []const u8,
-        ) lower_dml.JsonSetSqlValueParserOptions {
-            return .{
-                .params = ptr.params,
-                .schema = ptr.schema,
-                .conflict_existing_qualifiers = ptr.conflict_existing_qualifiers,
-                .insert_columns = insert_columns,
-                .type_context = Accessors.rowExpressionTypeContext(ptr),
-                .defer_row_expression_field_validation = ptr.defer_row_expression_field_validation,
-                .row_expression_hooks = Accessors.rowExpressionParserHooks(ptr),
-                .arithmetic_hooks = Accessors.arithmeticExpressionParserHooks(ptr),
-                .variadic_hooks = Accessors.variadicRowExpressionParserHooks(ptr),
-                .conflict_dispatch_options = Accessors.conflictExpressionDispatchOptions(ptr),
-            };
-        }
-
-        pub fn conflictUpdateAssignmentValueParserOptions(
-            ptr: *ParserType,
-            insert_columns: []const []const u8,
-            insert_values: []const []const u8,
-        ) lower_dml.ConflictUpdateAssignmentValueParserOptions {
-            return .{
-                .schema = ptr.schema,
-                .params = ptr.params,
-                .insert_columns = insert_columns,
-                .insert_values = insert_values,
-                .realtime_ns = value_mod.currentRealtimeNs(),
-                .default_context = ptr.default_context,
-                .json_set = Accessors.conflictJsonSetSqlValueParserOptions(ptr, insert_columns),
-                .expression_options = .{
-                    .type_context = Accessors.rowExpressionTypeContext(ptr),
-                    .assignment_options = Accessors.conflictAssignmentExpressionParserOptions(ptr),
-                },
-            };
-        }
-
-        pub fn conflictUpdateSetAssignmentParserOptions(
-            ptr: *ParserType,
-            insert_columns: []const []const u8,
-            insert_values: []const []const u8,
-        ) lower_dml.ConflictUpdateSetAssignmentParserOptions {
-            return .{
-                .value = Accessors.conflictUpdateAssignmentValueParserOptions(ptr, insert_columns, insert_values),
-                .primary_key_assignment = .{ .allow_and_mark = .{
-                    .allow = ptr.allow_primary_key_assignment,
-                    .saw = &ptr.saw_primary_key_assignment,
-                } },
-            };
-        }
-
-        pub fn conflictAssignmentExpressionParserOptions(ptr: *ParserType) lower_dml.ConflictAssignmentExpressionParserOptions {
-            return .{
-                .params = ptr.params,
-                .schema = ptr.schema,
-                .conflict_existing_qualifiers = ptr.conflict_existing_qualifiers,
-                .type_context = Accessors.rowExpressionTypeContext(ptr),
-                .defer_row_expression_field_validation = ptr.defer_row_expression_field_validation,
-                .dispatch_options = Accessors.conflictExpressionDispatchOptions(ptr),
-                .generated_action_where_tokens = ptr.generated_conflict_action_where_tokens,
-                .generated_expression_ast = ptr.generated_conflict_action_where_expression,
-            };
-        }
-
-        pub fn conflictExpressionDispatchOptions(ptr: *ParserType) lower_dml.ConflictExpressionDispatchOptions {
-            return .{
-                .array_length = Accessors.conflictArrayLengthExpressionParserOptions(ptr),
-                .case_fold = Accessors.conflictCaseFoldExpressionParserOptions(ptr),
-            };
-        }
-
-        pub fn conflictArrayLengthExpressionParserOptions(ptr: *ParserType) lower_dml.ConflictArrayLengthExpressionParserOptions {
-            return .{
-                .schema = ptr.schema,
-                .conflict_existing_qualifiers = ptr.conflict_existing_qualifiers,
-            };
-        }
-
-        pub fn conflictCaseFoldExpressionParserOptions(ptr: *ParserType) lower_dml.ConflictCaseFoldExpressionParserOptions {
-            return .{
-                .period_bound = .{
-                    .schema = ptr.schema,
-                    .field_expression_qualifiers = ptr.field_expression_qualifiers,
-                    .returning_expression_qualifiers = ptr.returning_expression_qualifiers,
-                    .defer_row_expression_field_validation = ptr.defer_row_expression_field_validation,
-                    .field_source = expr_type.rowExpressionFieldSourceOrDefault(ptr.row_expression_field_source_override),
-                },
-            };
-        }
-
-        pub fn joinedMutationJsonSetSqlValueParserOptions(ptr: *ParserType) lower_dml.JoinedMutationJsonSetSqlValueParserOptions {
-            return .{
-                .params = ptr.params,
-                .pending_joined_source_alias = ptr.pending_joined_source_alias,
-                .row_expression_options = .{
-                    .context_hooks = Accessors.joinedExpressionParserContextHooks(ptr),
-                    .row_expression_hooks = Accessors.rowExpressionParserHooks(ptr),
-                    .arithmetic_hooks = Accessors.arithmeticExpressionParserHooks(ptr),
-                    .variadic_hooks = Accessors.variadicRowExpressionParserHooks(ptr),
-                },
-            };
-        }
-
-        pub fn joinedMutationAssignmentValueParserOptions(ptr: *ParserType) lower_dml.JoinedMutationAssignmentValueParserOptions {
-            return .{
-                .json_set = Accessors.joinedMutationJsonSetSqlValueParserOptions(ptr),
-                .assignment_expression = Accessors.joinedMutationAssignmentExpressionParserOptions(ptr),
-            };
-        }
-
-        pub fn joinedMutationAssignmentExpressionParserOptions(ptr: *ParserType) lower_dml.JoinedMutationAssignmentExpressionParserOptions {
-            return .{
-                .pending_joined_source_alias = ptr.pending_joined_source_alias,
-                .type_context = Accessors.rowExpressionTypeContext(ptr),
-                .row_expression_options = .{
-                    .context_hooks = Accessors.joinedExpressionParserContextHooks(ptr),
-                    .row_expression_hooks = Accessors.rowExpressionParserHooks(ptr),
-                    .arithmetic_hooks = Accessors.arithmeticExpressionParserHooks(ptr),
-                    .variadic_hooks = Accessors.variadicRowExpressionParserHooks(ptr),
-                },
-                .boolean_expression_options = .{
-                    .context_hooks = Accessors.joinedExpressionParserContextHooks(ptr),
-                    .boolean_hooks = Accessors.booleanRowExpressionParserHooks(ptr),
-                },
-            };
-        }
-
         pub fn mergeAssignmentParserOptions(ptr: *ParserType) lower_dml.MergeAssignmentParserOptions {
             return .{
                 .assignment_expression = Accessors.mergeAssignmentExpressionParserOptions(ptr),
@@ -1001,156 +763,21 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             };
         }
 
-        pub fn mergeMutationParserOptions(ptr: *ParserType) lower_dml.MergeMutationParserOptions {
-            return .{
-                .params = ptr.params,
-                .schema = ptr.schema,
-                .function_bindings = ptr.function_bindings,
-                .joined_source_schema = ptr.joined_source_schema,
-                .defer_row_expression_field_validation = ptr.defer_row_expression_field_validation,
-                .context_hooks = Accessors.mergeMutationParserContextHooks(ptr),
-                .condition_options = Accessors.mergeArmConditionParserOptions(ptr),
-                .assignment_options = Accessors.mergeAssignmentParserOptions(ptr),
-                .generated_dml_ast = ptr.generated_dml_ast,
-                .generated_merge_arms = ptr.generated_merge_arms,
-                .mutation_context_hooks = Accessors.mutationSourceParserContextHooks(ptr),
-                .mutation_assignment_value_hooks = Accessors.conflictUpdateAssignmentValueParserOptions(ptr, &.{}, &.{}),
-                .fixed_binary_hooks = Accessors.fixedBinaryRowExpressionParserOptions(ptr),
-                .bare_boolean_hooks = Accessors.bareBooleanWhereExpressionParserOptions(ptr),
-                .expression_alternatives_hooks = Accessors.expressionWhereConditionAlternativesParserHooks(ptr),
-                .expression_condition_hooks = Accessors.expressionWhereConditionsParserHooks(ptr),
-                .order_expression_hooks = Accessors.orderExpressionParserOptions(ptr),
-                .returning_hooks = Accessors.returningProjectionParserOptions(ptr),
-                .realtime_ns = value_mod.currentRealtimeNs(),
-            };
-        }
-
-        pub fn updateJoinedMutationSourceParserOptions(
-            ptr: *ParserType,
-            ctes: []const db_mod.types.RelationalRowsCte,
-            base_table_name: ?*?[]const u8,
-        ) !lower_dml.UpdateJoinedMutationSourceParserOptions {
-            return .{
-                .params = ptr.params,
-                .schema = ptr.schema,
-                .joined_source_schema = ptr.joined_source_schema,
-                .row_claim = try lower_dml.mutationRowClaimAlloc(ptr.alloc, ptr.mutation_claim, false),
-                .ctes = ctes,
-                .base_table_name = base_table_name,
-                .string_to_array_predicate_is_containment = expr_predicate.stringToArrayPredicateIsContainment(ptr.tokens, ptr.pos),
-                .context_hooks = Accessors.joinedMutationSourceParserContextHooks(ptr),
-                .assignment_options = Accessors.joinedMutationAssignmentValueParserOptions(ptr),
-                .generated_assignment_items = ptr.generated_assignment_items,
-                .generated_dml_ast = ptr.generated_dml_ast,
-                .source_query_context_hooks = Accessors.semiJoinSourceQueryParserContextHooks(ptr),
-                .fixed_binary_hooks = Accessors.fixedBinaryRowExpressionParserOptions(ptr),
-                .bare_boolean_hooks = Accessors.bareBooleanWhereExpressionParserOptions(ptr),
-                .expression_alternatives_hooks = Accessors.expressionWhereConditionAlternativesParserHooks(ptr),
-                .expression_condition_hooks = Accessors.expressionWhereConditionsParserHooks(ptr),
-                .expression_where_options = Accessors.joinedMutationExpressionWhereOptions(ptr),
-                .order_expression_hooks = Accessors.orderExpressionParserOptions(ptr),
-                .returning_hooks = Accessors.returningProjectionParserOptions(ptr),
-                .joined_returning_hooks = Accessors.joinedMutationReturningProjectionParserOptions(ptr),
-                .realtime_ns = value_mod.currentRealtimeNs(),
-                .field_expression_qualifiers = ptr.field_expression_qualifiers,
-                .returning_expression_qualifiers = ptr.returning_expression_qualifiers,
-                .defer_row_expression_field_validation = ptr.defer_row_expression_field_validation,
-            };
-        }
-
-        pub fn deleteJoinedMutationSourceParserOptions(
-            ptr: *ParserType,
-            ctes: []const db_mod.types.RelationalRowsCte,
-            base_table_name: ?*?[]const u8,
-        ) !lower_dml.DeleteJoinedMutationSourceParserOptions {
-            return .{
-                .params = ptr.params,
-                .schema = ptr.schema,
-                .joined_source_schema = ptr.joined_source_schema,
-                .row_claim = try lower_dml.mutationRowClaimAlloc(ptr.alloc, ptr.mutation_claim, false),
-                .ctes = ctes,
-                .base_table_name = base_table_name,
-                .string_to_array_predicate_is_containment = expr_predicate.stringToArrayPredicateIsContainment(ptr.tokens, ptr.pos),
-                .context_hooks = Accessors.joinedMutationSourceParserContextHooks(ptr),
-                .generated_dml_ast = ptr.generated_dml_ast,
-                .source_query_context_hooks = Accessors.semiJoinSourceQueryParserContextHooks(ptr),
-                .fixed_binary_hooks = Accessors.fixedBinaryRowExpressionParserOptions(ptr),
-                .bare_boolean_hooks = Accessors.bareBooleanWhereExpressionParserOptions(ptr),
-                .expression_alternatives_hooks = Accessors.expressionWhereConditionAlternativesParserHooks(ptr),
-                .expression_condition_hooks = Accessors.expressionWhereConditionsParserHooks(ptr),
-                .expression_where_options = Accessors.joinedMutationExpressionWhereOptions(ptr),
-                .order_expression_hooks = Accessors.orderExpressionParserOptions(ptr),
-                .returning_hooks = Accessors.returningProjectionParserOptions(ptr),
-                .joined_returning_hooks = Accessors.joinedMutationReturningProjectionParserOptions(ptr),
-                .realtime_ns = value_mod.currentRealtimeNs(),
-                .field_expression_qualifiers = ptr.field_expression_qualifiers,
-                .returning_expression_qualifiers = ptr.returning_expression_qualifiers,
-                .defer_row_expression_field_validation = ptr.defer_row_expression_field_validation,
-            };
-        }
-
-        pub fn insertParserOptions(ptr: *ParserType) lower_dml.InsertParserOptions {
-            return .{
-                .params = ptr.params,
-                .schema = ptr.schema,
-                .unique_resolver = ptr.unique_resolver,
-                .default_context = ptr.default_context,
-                .type_context = Accessors.rowExpressionTypeContext(ptr),
-                .defer_row_expression_field_validation = ptr.defer_row_expression_field_validation,
-                .target_options = Accessors.conflictTargetParserOptions(ptr),
-                .assignment_value_hooks = Accessors.conflictUpdateAssignmentValueParserOptions(ptr, &.{}, &.{}),
-                .generated_conflict_assignment_items = ptr.generated_assignment_items,
-                .generated_conflict_assignments_tokens = ptr.generated_conflict_assignments_tokens,
-                .generated_conflict_action_tokens = ptr.generated_conflict_action_tokens,
-                .generated_conflict_action_kind = ptr.generated_conflict_action_kind,
-                .condition_options = Accessors.conflictAssignmentExpressionParserOptions(ptr),
-                .dispatch_options = Accessors.conflictExpressionDispatchOptions(ptr),
-                .returning_hooks = Accessors.returningProjectionParserOptions(ptr),
-                .realtime_ns = value_mod.currentRealtimeNs(),
-            };
-        }
-
-        pub fn mutationSourceParserOptions(ptr: *ParserType) !lower_dml.MutationSourceParserOptions {
-            return .{
-                .params = ptr.params,
-                .schema = ptr.schema,
-                .row_claim = try lower_dml.mutationRowClaimAlloc(ptr.alloc, ptr.mutation_claim, false),
-                .realtime_ns = value_mod.currentRealtimeNs(),
-                .defer_row_expression_field_validation = ptr.defer_row_expression_field_validation,
-                .context_hooks = Accessors.mutationSourceParserContextHooks(ptr),
-                .assignment_value_hooks = Accessors.conflictUpdateAssignmentValueParserOptions(ptr, &.{}, &.{}),
-                .generated_assignment_items = ptr.generated_assignment_items,
-                .generated_dml_ast = ptr.generated_dml_ast,
-                .fixed_binary_hooks = Accessors.fixedBinaryRowExpressionParserOptions(ptr),
-                .bare_boolean_hooks = Accessors.bareBooleanWhereExpressionParserOptions(ptr),
-                .expression_alternatives_hooks = Accessors.expressionWhereConditionAlternativesParserHooks(ptr),
-                .expression_condition_hooks = Accessors.expressionWhereConditionsParserHooks(ptr),
-                .function_bindings = ptr.function_bindings,
-                .order_expression_hooks = Accessors.orderExpressionParserOptions(ptr),
-                .returning_hooks = Accessors.returningProjectionParserOptions(ptr),
-            };
-        }
-
         pub fn parseInsertSourceSelectHook(
             ptr: *anyopaque,
             tokens: []const Token,
             schema: runtime_schema.TableSchema,
         ) anyerror!plan.LoweredSelect {
             const self: *ParserType = @ptrCast(@alignCast(ptr));
-            var generated_source_ast: ?*const generated_parser.GeneratedSqlReadAst = null;
-            if (self.generated_dml_ast) |dml_ast| {
-                const source_range = dml_ast.source_tokens orelse return error.UnsupportedSqlShape;
-                const source_read_body = dml_ast.source_read orelse return error.UnsupportedSqlShape;
-                const source_read = source_read_body.read_ast orelse return error.UnsupportedSqlShape;
-                if (generatedReadProjectionContainsSubquery(source_read)) {
-                    if (tokens.len == 0 or source_range.end <= source_range.start or source_range.end - source_range.start != tokens.len) return error.UnsupportedSqlShape;
-                    if (source_range.end > self.tokens.len) return error.UnsupportedSqlShape;
-                    if (self.tokens[source_range.start].source_start != tokens[0].source_start) return error.UnsupportedSqlShape;
-                    if (self.tokens[source_range.end - 1].source_end != tokens[tokens.len - 1].source_end) return error.UnsupportedSqlShape;
-                    try generated_read_validate.validateGeneratedReadAstPayloads(tokens, source_read.*);
-                    generated_source_ast = source_read;
-                }
-            }
+            const dml_ast = self.generated_dml_ast orelse return error.UnsupportedSqlShape;
+            const source_range = dml_ast.source_tokens orelse return error.UnsupportedSqlShape;
+            const source_read_body = dml_ast.source_read orelse return error.UnsupportedSqlShape;
+            const generated_source_ast = source_read_body.read_ast orelse return error.UnsupportedSqlShape;
+            if (tokens.len == 0 or source_range.end <= source_range.start or source_range.end - source_range.start != tokens.len) return error.UnsupportedSqlShape;
+            if (source_range.end > self.tokens.len) return error.UnsupportedSqlShape;
+            if (self.tokens[source_range.start].source_start != tokens[0].source_start) return error.UnsupportedSqlShape;
+            if (self.tokens[source_range.end - 1].source_end != tokens[tokens.len - 1].source_end) return error.UnsupportedSqlShape;
+            try generated_read_validate.validateGeneratedReadAstPayloads(tokens, generated_source_ast.*);
             var sub = ParserType{
                 .alloc = self.alloc,
                 .tokens = tokens,
@@ -1163,32 +790,24 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             return try Accessors.parseSelect(&sub);
         }
 
-        pub fn lowerUpdateJoinedMutationSourceWithCtesHook(
+        pub fn parseInsertSourceSelectGeneratedHook(
             ptr: *anyopaque,
-            ctes: []const db_mod.types.RelationalRowsCte,
-            base_table_name: ?*?[]const u8,
-        ) anyerror!plan.LoweredJoinedMutationSource {
+            tokens: []const Token,
+            schema: runtime_schema.TableSchema,
+            generated_read_ast: *const generated_parser.GeneratedSqlReadAst,
+        ) anyerror!plan.LoweredSelect {
             const self: *ParserType = @ptrCast(@alignCast(ptr));
-            return try lower_dml.lowerUpdateJoinedMutationSourceWithCtesAlloc(
-                self.alloc,
-                self.tokens,
-                &self.pos,
-                try Accessors.updateJoinedMutationSourceParserOptions(self, ctes, base_table_name),
-            );
-        }
-
-        pub fn lowerDeleteJoinedMutationSourceWithCtesHook(
-            ptr: *anyopaque,
-            ctes: []const db_mod.types.RelationalRowsCte,
-            base_table_name: ?*?[]const u8,
-        ) anyerror!plan.LoweredJoinedMutationSource {
-            const self: *ParserType = @ptrCast(@alignCast(ptr));
-            return try lower_dml.lowerDeleteJoinedMutationSourceWithCtesAlloc(
-                self.alloc,
-                self.tokens,
-                &self.pos,
-                try Accessors.deleteJoinedMutationSourceParserOptions(self, ctes, base_table_name),
-            );
+            try generated_read_validate.validateGeneratedReadAstPayloads(tokens, generated_read_ast.*);
+            var sub = ParserType{
+                .alloc = self.alloc,
+                .tokens = tokens,
+                .schema = schema,
+                .params = self.params,
+                .function_bindings = self.function_bindings,
+                .unique_resolver = self.unique_resolver,
+                .generated_read_ast = generated_read_ast,
+            };
+            return try Accessors.parseSelect(&sub);
         }
 
         pub fn parseLateralSubqueryHook(
@@ -1331,6 +950,27 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             return try Accessors.parseSelect(&sub);
         }
 
+        pub fn parseCteSelectGeneratedHook(
+            ptr: *anyopaque,
+            tokens: []const Token,
+            available_ctes: []const db_mod.types.RelationalRowsCte,
+            generated_read_ast: *const generated_parser.GeneratedSqlReadAst,
+        ) anyerror!plan.LoweredSelect {
+            const self: *ParserType = @ptrCast(@alignCast(ptr));
+            try generated_read_validate.validateGeneratedReadAstPayloads(tokens, generated_read_ast.*);
+            var sub = ParserType{
+                .alloc = self.alloc,
+                .tokens = tokens,
+                .schema = self.schema,
+                .params = self.params,
+                .function_bindings = self.function_bindings,
+                .unique_resolver = self.unique_resolver,
+                .available_ctes = available_ctes,
+                .generated_read_ast = generated_read_ast,
+            };
+            return try Accessors.parseSelect(&sub);
+        }
+
         pub fn parseJoinCteSelectHook(
             ptr: *anyopaque,
             tokens: []const Token,
@@ -1352,6 +992,27 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
                 .unique_resolver = self.unique_resolver,
                 .available_ctes = available_ctes,
                 .generated_read_ast = if (generated_body_ast) |*ast| ast else null,
+            };
+            return try Accessors.parseSelect(&sub);
+        }
+
+        pub fn parseJoinCteSelectGeneratedHook(
+            ptr: *anyopaque,
+            tokens: []const Token,
+            available_ctes: []const db_mod.types.RelationalRowsCte,
+            generated_read_ast: *const generated_parser.GeneratedSqlReadAst,
+        ) anyerror!plan.LoweredSelect {
+            const self: *ParserType = @ptrCast(@alignCast(ptr));
+            try generated_read_validate.validateGeneratedReadAstPayloads(tokens, generated_read_ast.*);
+            var sub = ParserType{
+                .alloc = self.alloc,
+                .tokens = tokens,
+                .schema = self.joined_source_schema orelse self.schema,
+                .params = self.params,
+                .function_bindings = self.function_bindings,
+                .unique_resolver = self.unique_resolver,
+                .available_ctes = available_ctes,
+                .generated_read_ast = generated_read_ast,
             };
             return try Accessors.parseSelect(&sub);
         }
@@ -1805,18 +1466,24 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             self.available_ctes = context.available_ctes;
         }
 
-        pub fn getJoinedMutationSourceParserContextHook(ptr: *anyopaque) lower_dml.JoinedMutationSourceParserContext {
+        pub fn getJoinedMutationSourceSchemaHook(ptr: *anyopaque) ?runtime_schema.TableSchema {
             const self: *ParserType = @ptrCast(@alignCast(ptr));
-            return .{
-                .joined_source_schema = self.joined_source_schema,
-                .pending_joined_source_alias = self.pending_joined_source_alias,
-            };
+            return self.joined_source_schema;
         }
 
-        pub fn setJoinedMutationSourceParserContextHook(ptr: *anyopaque, context: lower_dml.JoinedMutationSourceParserContext) void {
+        pub fn setJoinedMutationSourceSchemaHook(ptr: *anyopaque, schema: ?runtime_schema.TableSchema) void {
             const self: *ParserType = @ptrCast(@alignCast(ptr));
-            self.joined_source_schema = context.joined_source_schema;
-            self.pending_joined_source_alias = context.pending_joined_source_alias;
+            self.joined_source_schema = schema;
+        }
+
+        pub fn getPendingJoinedSourceAliasHook(ptr: *anyopaque) ?[]const u8 {
+            const self: *ParserType = @ptrCast(@alignCast(ptr));
+            return self.pending_joined_source_alias;
+        }
+
+        pub fn setPendingJoinedSourceAliasHook(ptr: *anyopaque, alias: ?[]const u8) void {
+            const self: *ParserType = @ptrCast(@alignCast(ptr));
+            self.pending_joined_source_alias = alias;
         }
 
         pub fn getJoinedExpressionParserContextHook(ptr: *anyopaque) expr_row_parse.JoinedExpressionParserContext {
@@ -1849,18 +1516,24 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             self.joined_source_schema = context.joined_source_schema;
         }
 
-        pub fn getSemiJoinSourceQueryParserContextHook(ptr: *anyopaque) lower_dml.SemiJoinSourceQueryParserContext {
+        pub fn getSemiJoinSourceQuerySchemaHook(ptr: *anyopaque) runtime_schema.TableSchema {
             const self: *ParserType = @ptrCast(@alignCast(ptr));
-            return .{
-                .schema = self.schema,
-                .field_expression_qualifiers = self.field_expression_qualifiers,
-            };
+            return self.schema;
         }
 
-        pub fn setSemiJoinSourceQueryParserContextHook(ptr: *anyopaque, context: lower_dml.SemiJoinSourceQueryParserContext) void {
+        pub fn setSemiJoinSourceQuerySchemaHook(ptr: *anyopaque, schema: runtime_schema.TableSchema) void {
             const self: *ParserType = @ptrCast(@alignCast(ptr));
-            self.schema = context.schema;
-            self.field_expression_qualifiers = context.field_expression_qualifiers;
+            self.schema = schema;
+        }
+
+        pub fn getSemiJoinSourceQueryFieldExpressionQualifiersHook(ptr: *anyopaque) []const []const u8 {
+            const self: *ParserType = @ptrCast(@alignCast(ptr));
+            return self.field_expression_qualifiers;
+        }
+
+        pub fn setSemiJoinSourceQueryFieldExpressionQualifiersHook(ptr: *anyopaque, qualifiers: []const []const u8) void {
+            const self: *ParserType = @ptrCast(@alignCast(ptr));
+            self.field_expression_qualifiers = qualifiers;
         }
 
         pub fn getSelectParserContextHook(ptr: *anyopaque) expr_row_parse.SelectParserContext {

@@ -870,8 +870,9 @@ fn appendRelationalCatalogIndexStatus(
         .unique_constraint => "unique_constraint",
         .table => "table",
     };
+    const lifecycle = storage_schema.relationalIndexLifecycle(index) orelse .rebuild_required;
     try out.appendSlice(alloc, "{\"config\":{");
-    try appendRelationalIndexConfigPrefix(alloc, out, index.name, source, index.access_method, index.lifecycle, index.generation, index.schema_fingerprint);
+    try appendRelationalIndexConfigPrefix(alloc, out, index.name, source, index.access_method, lifecycle, index.generation, index.schema_fingerprint);
     switch (index.owner_kind) {
         .relational_column => {
             try out.appendSlice(alloc, ",\"column\":");
@@ -902,9 +903,9 @@ fn appendRelationalCatalogIndexStatus(
     try appendIntValue(alloc, out, @intCast(index.where_expressions.len));
     if (index.unique) try out.appendSlice(alloc, ",\"unique\":true");
     try out.appendSlice(alloc, "},\"status\":");
-    try appendRelationalIndexRuntimeStatus(alloc, out, snapshot, table, index.name, index.access_method, index.lifecycle, index.generation, index.schema_fingerprint, repair_records);
+    try appendRelationalIndexRuntimeStatus(alloc, out, snapshot, table, index.name, index.access_method, lifecycle, index.generation, index.generation_record, index.schema_fingerprint, repair_records);
     try out.appendSlice(alloc, ",\"shard_status\":");
-    try appendRelationalIndexRuntimeStatus(alloc, out, snapshot, table, index.name, index.access_method, index.lifecycle, index.generation, index.schema_fingerprint, repair_records);
+    try appendRelationalIndexRuntimeStatus(alloc, out, snapshot, table, index.name, index.access_method, lifecycle, index.generation, index.generation_record, index.schema_fingerprint, repair_records);
     try out.append(alloc, '}');
 }
 
@@ -946,6 +947,7 @@ fn appendRelationalIndexRuntimeStatus(
     access_method: storage_schema.RelationalIndexAccessMethod,
     lifecycle: storage_schema.RelationalIndexLifecycle,
     generation: u64,
+    generation_record: ?storage_schema.RelationalIndexGenerationRecord,
     schema_fingerprint: ?[]const u8,
     repair_records: []const db_mod.DB.RelationalIndexRepairJobRecord,
 ) !void {
@@ -986,6 +988,10 @@ fn appendRelationalIndexRuntimeStatus(
     try out.appendSlice(alloc, if (lifecycle == .ready and stale_generation_range_count == 0 and invalid_range_count == 0) "true" else "false");
     try out.appendSlice(alloc, ",\"generation\":");
     try appendIntValue(alloc, out, generation);
+    try out.appendSlice(alloc, ",\"lag\":");
+    try appendIntValue(alloc, out, if (generation_record) |record| record.lag else 0);
+    try out.appendSlice(alloc, ",\"ready_watermark\":");
+    try appendIntValue(alloc, out, if (generation_record) |record| record.ready_watermark else 0);
     try out.appendSlice(alloc, ",\"schema_fingerprint\":");
     if (schema_fingerprint) |fingerprint| {
         try appendJsonString(alloc, out, fingerprint);
@@ -1144,6 +1150,10 @@ fn appendRelationalIndexKeysOrColumns(
             if (i > 0) try out.append(alloc, ',');
             try out.appendSlice(alloc, "{\"column\":");
             try appendJsonString(alloc, out, key.column);
+            if (key.collation) |collation| {
+                try out.appendSlice(alloc, ",\"collation\":");
+                try appendJsonString(alloc, out, collation);
+            }
             try out.appendSlice(alloc, ",\"direction\":");
             try appendJsonString(alloc, out, @tagName(key.direction));
             try out.appendSlice(alloc, ",\"nulls\":");
@@ -1393,8 +1403,9 @@ fn appendAlgebraicIndexStatsFields(
         .capability_lifecycle_status = item.algebraic_capability_lifecycle_status orelse "current",
         .planner_selected = saturatingI64(item.algebraic_planner_selected),
         .planner_fallback_count = saturatingI64(item.algebraic_planner_fallback_count),
-        .planner_last_decision = item.algebraic_planner_last_decision,
+        .planner_last_decision = plannerLastDecision(item.algebraic_planner_last_decision),
         .planner_last_fallback_reason = item.algebraic_planner_last_fallback_reason,
+        .planner_last_unsupported_reason = plannerUnsupportedReasonBucket(item.algebraic_planner_last_fallback_reason),
         .planner_last_estimated_scan_rows = if (item.algebraic_planner_last_estimated_scan_rows) |value| saturatingI64(value) else null,
         .planner_last_estimated_result_buckets = if (item.algebraic_planner_last_estimated_result_buckets) |value| saturatingI64(value) else null,
         .planner_lifecycle_ready = item.algebraic_planner_lifecycle_ready,
@@ -1418,6 +1429,78 @@ fn appendAlgebraicIndexStatsFields(
     if (encoded.len <= 2) return;
     try out.append(alloc, ',');
     try out.appendSlice(alloc, encoded[1 .. encoded.len - 1]);
+}
+
+fn plannerLastDecision(decision: ?[]const u8) ?indexes_openapi.AlgebraicIndexStatsPlannerLastDecision {
+    const value = decision orelse return null;
+    if (std.mem.eql(u8, value, "selected")) return .selected;
+    if (std.mem.eql(u8, value, "fallback")) return .fallback;
+    return null;
+}
+
+fn plannerUnsupportedReasonBucket(fallback_reason: ?[]const u8) ?indexes_openapi.AlgebraicIndexStatsPlannerLastUnsupportedReason {
+    const reason = fallback_reason orelse return null;
+    if (reason.len == 0) return null;
+
+    if (std.mem.indexOf(u8, reason, "not_ready") != null) return .index_not_ready;
+    if (std.mem.indexOf(u8, reason, "lifecycle_not_ready") != null) return .index_not_ready;
+    if (std.mem.indexOf(u8, reason, "stale") != null) return .stale_generation;
+    if (std.mem.indexOf(u8, reason, "predicate") != null) return .predicate_not_proven;
+    if (std.mem.indexOf(u8, reason, "order") != null) return .ordering_not_covered;
+    if (std.mem.indexOf(u8, reason, "unsupported_access_method") != null) return .unsupported_access_method;
+    if (std.mem.indexOf(u8, reason, "access_method_mismatch") != null) return .unsupported_access_method;
+
+    return .access_method_capability_mismatch;
+}
+
+test "algebraic index status encoder emits stable planner unsupported buckets" {
+    const alloc = std.testing.allocator;
+
+    const Case = struct {
+        fallback_reason: []const u8,
+        unsupported_reason: []const u8,
+    };
+    const cases = [_]Case{
+        .{
+            .fallback_reason = "schema_lifecycle_not_ready",
+            .unsupported_reason = "\"planner_last_unsupported_reason\":\"index-not-ready\"",
+        },
+        .{
+            .fallback_reason = "capability_generation_stale",
+            .unsupported_reason = "\"planner_last_unsupported_reason\":\"stale-generation\"",
+        },
+        .{
+            .fallback_reason = "partial_predicate_not_proven",
+            .unsupported_reason = "\"planner_last_unsupported_reason\":\"predicate-not-proven\"",
+        },
+        .{
+            .fallback_reason = "sort_order_not_covered",
+            .unsupported_reason = "\"planner_last_unsupported_reason\":\"ordering-not-covered\"",
+        },
+        .{
+            .fallback_reason = "unsupported_access_method",
+            .unsupported_reason = "\"planner_last_unsupported_reason\":\"unsupported-access-method\"",
+        },
+        .{
+            .fallback_reason = "no_materialization",
+            .unsupported_reason = "\"planner_last_unsupported_reason\":\"access-method-capability-mismatch\"",
+        },
+    };
+
+    for (cases) |case| {
+        var out = std.ArrayListUnmanaged(u8).empty;
+        defer out.deinit(alloc);
+        try appendAlgebraicIndexStatsFields(alloc, &out, db_mod.types.DBIndexStats{
+            .name = "alg",
+            .kind = .algebraic,
+            .algebraic_planner_last_decision = "fallback",
+            .algebraic_planner_last_fallback_reason = case.fallback_reason,
+        });
+        try std.testing.expect(std.mem.indexOf(u8, out.items, case.unsupported_reason) != null);
+    }
+
+    try std.testing.expect(plannerUnsupportedReasonBucket(null) == null);
+    try std.testing.expect(plannerUnsupportedReasonBucket("") == null);
 }
 
 fn saturatingI64(value: u64) i64 {
@@ -3440,7 +3523,7 @@ test "index encoders expose relational schema index status" {
         .table_id = 42,
         .name = "orders",
         .schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"status":{"type":"keyword"},"created_at":{"type":"datetime"}},"required":["id","tenant_id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"orders_tenant_status_key","columns":["tenant_id","status"],"include_columns":["created_at"]}],"relational_indexes":[{"name":"tenant_status_idx","owner_kind":"relational_column","owner_name":"tenant_id","access_method":"ordered_tuple","columns":["tenant_id"],"include_columns":["id"],"keys":[{"column":"tenant_id"},{"column":"status","direction":"desc","nulls":"last"}],"lifecycle":"building","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_status","where":{"all":[{"field":"tenant_id","op":"is_not_null"}]}},{"name":"orders_tenant_status_key","owner_kind":"unique_constraint","owner_name":"orders_tenant_status_key","access_method":"ordered_tuple","unique":true,"columns":["tenant_id","status"],"include_columns":["created_at"],"keys":[{"column":"tenant_id"},{"column":"status"}],"lifecycle":"ready","generation":9,"schema_fingerprint":"secondary-index-v1:unique_tenant_status"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"status":{"type":"keyword"},"created_at":{"type":"datetime"},"body":{"type":"text"}},"required":["id","tenant_id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"orders_tenant_status_key","columns":["tenant_id","status"],"include_columns":["created_at"]}],"relational_indexes":[{"name":"tenant_status_idx","owner_kind":"relational_column","owner_name":"tenant_id","access_method":"ordered_tuple","columns":["tenant_id"],"include_columns":["id"],"keys":[{"column":"tenant_id"},{"column":"status","direction":"desc","nulls":"last"}],"lifecycle":"building","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_status","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"building","lag":13,"ready_watermark":99},"where":{"all":[{"field":"tenant_id","op":"is_not_null"}]}},{"name":"orders_body_text_idx","owner_kind":"relational_column","owner_name":"body","access_method":"text_search","method_config":{"type":"full_text","field":"body","analyzer":"standard"},"columns":["body"],"lifecycle":"catching_up","generation":10,"schema_fingerprint":"secondary-index-v1:body_text","generation_record":{"generation":10,"owner_ranges":[],"lifecycle":"catching_up","lag":21,"ready_watermark":144}},{"name":"orders_schema_algebraic_idx","owner_kind":"table","owner_name":"__antfly_table__","access_method":"algebraic_filter","method_config":{"type":"algebraic","derive_from_schema":true},"lifecycle":"building","generation":11,"schema_fingerprint":"secondary-index-v1:schema_algebraic","generation_record":{"generation":11,"owner_ranges":[],"lifecycle":"building","lag":34,"ready_watermark":233}},{"name":"orders_tenant_status_key","owner_kind":"unique_constraint","owner_name":"orders_tenant_status_key","access_method":"ordered_tuple","unique":true,"columns":["tenant_id","status"],"include_columns":["created_at"],"keys":[{"column":"tenant_id"},{"column":"status"}],"lifecycle":"ready","generation":9,"schema_fingerprint":"secondary-index-v1:unique_tenant_status","generation_record":{"generation":9,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":123}}]}
         ,
         .indexes_json = "{}",
     };
@@ -3543,6 +3626,9 @@ test "index encoders expose relational schema index status" {
         },
     };
     const RelationalStatusEnvelope = struct {
+        config: struct {
+            name: []const u8,
+        },
         status: indexes_openapi.IndexStats,
     };
 
@@ -3550,7 +3636,34 @@ test "index encoders expose relational schema index status" {
     defer alloc.free(encoded);
     var parsed_list = try std.json.parseFromSlice([]RelationalStatusEnvelope, alloc, encoded, .{ .ignore_unknown_fields = true });
     defer parsed_list.deinit();
-    try std.testing.expectEqual(@as(usize, 2), parsed_list.value.len);
+    try std.testing.expectEqual(@as(usize, 4), parsed_list.value.len);
+    const StatusExpect = struct {
+        fn expectLagAndWatermark(items: []const RelationalStatusEnvelope, name: []const u8, lag: i64, ready_watermark: i64) !void {
+            for (items) |item| {
+                if (!std.mem.eql(u8, item.config.name, name)) continue;
+                const status = switch (item.status) {
+                    .relational_index_stats => |relational_status| relational_status,
+                    else => return error.TestUnexpectedResult,
+                };
+                try std.testing.expectEqual(@as(?i64, lag), status.lag);
+                try std.testing.expectEqual(@as(?i64, ready_watermark), status.ready_watermark);
+                return;
+            }
+            return error.TestUnexpectedResult;
+        }
+    };
+    const expected_generation_status = [_]struct {
+        name: []const u8,
+        lag: i64,
+        ready_watermark: i64,
+    }{
+        .{ .name = "tenant_status_idx", .lag = 13, .ready_watermark = 99 },
+        .{ .name = "orders_body_text_idx", .lag = 21, .ready_watermark = 144 },
+        .{ .name = "orders_schema_algebraic_idx", .lag = 34, .ready_watermark = 233 },
+    };
+    for (expected_generation_status) |expected| {
+        try StatusExpect.expectLagAndWatermark(parsed_list.value, expected.name, expected.lag, expected.ready_watermark);
+    }
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"type\":\"relational\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"name\":\"tenant_status_idx\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"source\":\"column\"") != null);
@@ -3564,6 +3677,16 @@ test "index encoders expose relational schema index status" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"predicate_count\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"index_type\":\"relational\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"ready\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"lag\":13") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"ready_watermark\":99") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"name\":\"orders_body_text_idx\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"access_method\":\"text_search\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"lag\":21") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"ready_watermark\":144") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"name\":\"orders_schema_algebraic_idx\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"access_method\":\"algebraic_filter\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"lag\":34") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"ready_watermark\":233") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"range_count\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"matching_generation_range_count\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"stale_generation_range_count\":1") != null);
@@ -4033,6 +4156,7 @@ test "index encoders expose compact algebraic public status" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"planner_fallback_count\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"planner_last_decision\":\"fallback\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"planner_last_fallback_reason\":\"schema_lifecycle_not_ready\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"planner_last_unsupported_reason\":\"index-not-ready\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"planner_last_estimated_scan_rows\":61") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"planner_last_estimated_result_buckets\":8") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"planner_lifecycle_ready\":false") != null);

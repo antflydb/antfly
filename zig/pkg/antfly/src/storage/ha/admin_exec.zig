@@ -219,21 +219,21 @@ fn renderJsonWithContextAlloc(alloc: Allocator, maybe_ctx: ?Context, result: Res
 
 fn renderSlotActionJsonAlloc(alloc: Allocator, node_id: []const u8, result: admin.SlotResult) ![]u8 {
     const action_kind = switch (result) {
-        .create => "replication_slot_create",
-        .pause => "replication_slot_pause",
-        .@"resume" => "replication_slot_resume",
-        .drop => "replication_slot_drop",
+        .create => admin_api.HAActionReceiptActionKind.replication_slot_create,
+        .pause => admin_api.HAActionReceiptActionKind.replication_slot_pause,
+        .@"resume" => admin_api.HAActionReceiptActionKind.replication_slot_resume,
+        .drop => admin_api.HAActionReceiptActionKind.replication_slot_drop,
     };
     const slot_name = switch (result) {
         inline else => |slot| slot.slot_name,
     };
     const slot_action = switch (result) {
-        .create => "create",
-        .pause => "pause",
-        .@"resume" => "resume",
-        .drop => "drop",
+        .create => admin_api.HAReplicationSlotActionResponseSlotAction.create,
+        .pause => admin_api.HAReplicationSlotActionResponseSlotAction.pause,
+        .@"resume" => admin_api.HAReplicationSlotActionResponseSlotAction.@"resume",
+        .drop => admin_api.HAReplicationSlotActionResponseSlotAction.drop,
     };
-    const action_id = try std.fmt.allocPrint(alloc, "{s}:{s}", .{ action_kind, slot_name });
+    const action_id = try std.fmt.allocPrint(alloc, "{s}:{s}", .{ @tagName(action_kind), slot_name });
     defer alloc.free(action_id);
     return try std.json.Stringify.valueAlloc(alloc, admin_api.HAReplicationSlotActionResponse{
         .schema_version = 1,
@@ -241,7 +241,7 @@ fn renderSlotActionJsonAlloc(alloc: Allocator, node_id: []const u8, result: admi
             .action_id = action_id,
             .action_kind = action_kind,
             .target = slot_name,
-            .state = "applied",
+            .state = .applied,
             .node_id = node_id,
         },
         .slot_action = slot_action,
@@ -265,7 +265,7 @@ fn renderSeedBeginJsonAlloc(alloc: Allocator, node_id: []const u8, response: pri
     defer alloc.free(action_id);
     return try std.json.Stringify.valueAlloc(alloc, admin_api.HABaseBackupBeginResponse{
         .schema_version = 1,
-        .action = adminActionReceipt(action_id, "base_backup_begin", response.manifest_id, "applied", node_id),
+        .action = adminActionReceipt(action_id, .base_backup_begin, response.manifest_id, .applied, node_id),
         .slot_name = response.slot_name,
         .manifest_id = response.manifest_id,
         .backup_lsn = try adminI64(response.backup_lsn),
@@ -278,7 +278,7 @@ fn renderSeedFinishJsonAlloc(alloc: Allocator, node_id: []const u8, response: Se
     defer alloc.free(action_id);
     return try std.json.Stringify.valueAlloc(alloc, admin_api.HABaseBackupFinishResponse{
         .schema_version = 1,
-        .action = adminActionReceipt(action_id, "base_backup_finish", response.manifest_id, "applied", node_id),
+        .action = adminActionReceipt(action_id, .base_backup_finish, response.manifest_id, .applied, node_id),
         .manifest_id = response.manifest_id,
         .backup_lsn = try adminI64(response.backup_lsn),
         .end_record_lsn = try adminI64(response.end_record_lsn),
@@ -290,7 +290,7 @@ fn renderSeedBootstrapJsonAlloc(alloc: Allocator, node_id: []const u8, response:
     defer alloc.free(action_id);
     return try std.json.Stringify.valueAlloc(alloc, admin_api.HAStandbyBootstrapResponse{
         .schema_version = 1,
-        .action = adminActionReceipt(action_id, "standby_bootstrap", response.manifest_id, "applied", node_id),
+        .action = adminActionReceipt(action_id, .standby_bootstrap, response.manifest_id, .applied, node_id),
         .manifest_id = response.manifest_id,
         .backup_lsn = try adminI64(response.backup_lsn),
         .checkpoint_lsn = try adminI64(response.checkpoint_lsn),
@@ -354,7 +354,7 @@ fn renderFenceAcquireJsonAlloc(alloc: Allocator, result: admin.FenceReceiptResul
     defer alloc.free(action_id);
     return try std.json.Stringify.valueAlloc(alloc, admin_api.HAFenceResponse{
         .schema_version = 1,
-        .action = adminActionReceipt(action_id, "fence_acquire", result.receipt.promoted_node_id, "applied", result.receipt.promoted_node_id),
+        .action = adminActionReceipt(action_id, .fence_acquire, result.receipt.promoted_node_id, .applied, result.receipt.promoted_node_id),
         .receipt = try adminFenceReceipt(result.receipt),
     }, .{});
 }
@@ -372,7 +372,7 @@ fn renderPromotionJsonAlloc(alloc: Allocator, result: admin.FencedPromotionResul
     defer alloc.free(action_id);
     return try std.json.Stringify.valueAlloc(alloc, admin_api.HAPromotionResponse{
         .schema_version = 1,
-        .action = adminActionReceipt(action_id, "promotion", result.promoted_node_id, "applied", result.promoted_node_id),
+        .action = adminActionReceipt(action_id, .promotion, result.promoted_node_id, .applied, result.promoted_node_id),
         .assessment = try adminPromotionAssessment(result.assessment),
         .promotion = .{
             .node_id = result.promoted_node_id,
@@ -393,7 +393,7 @@ fn renderRejoinAssessJsonAlloc(alloc: Allocator, assessment: rejoin.Assessment) 
     defer alloc.free(action_id);
     return try std.json.Stringify.valueAlloc(alloc, admin_api.HARejoinAssessResponse{
         .schema_version = 1,
-        .action = adminActionReceipt(action_id, "rejoin_assess", assessment.former_node_id, "assessed", assessment.former_node_id),
+        .action = adminActionReceipt(action_id, .rejoin_assess, assessment.former_node_id, .assessed, assessment.former_node_id),
         .assessment = try adminRejoinAssessment(assessment),
     }, .{});
 }
@@ -403,7 +403,7 @@ fn renderRejoinRewindJsonAlloc(alloc: Allocator, result: RejoinRewindResult) ![]
     defer alloc.free(action_id);
     return try std.json.Stringify.valueAlloc(alloc, admin_api.HARejoinAssessResponse{
         .schema_version = 1,
-        .action = adminActionReceipt(action_id, "rejoin_rewind", result.assessment.former_node_id, "applied", result.assessment.former_node_id),
+        .action = adminActionReceipt(action_id, .rejoin_rewind, result.assessment.former_node_id, .applied, result.assessment.former_node_id),
         .assessment = try adminRejoinAssessment(result.assessment),
         .rewind = try adminRejoinRewindResult(result.rewind),
     }, .{});
@@ -414,7 +414,7 @@ fn renderRejoinReseedJsonAlloc(alloc: Allocator, node_id: []const u8, result: Re
     defer alloc.free(action_id);
     return try std.json.Stringify.valueAlloc(alloc, admin_api.HARejoinAssessResponse{
         .schema_version = 1,
-        .action = adminActionReceipt(action_id, "rejoin_reseed", result.assessment.former_node_id, "applied", node_id),
+        .action = adminActionReceipt(action_id, .rejoin_reseed, result.assessment.former_node_id, .applied, node_id),
         .assessment = try adminRejoinAssessment(result.assessment),
         .reseed = try adminRejoinReseedResult(result.reseed),
     }, .{});
@@ -431,9 +431,9 @@ fn renderPromotionAssessJsonAlloc(
         .schema_version = 1,
         .action = .{
             .action_id = action_id,
-            .action_kind = "promotion_assess",
+            .action_kind = .promotion_assess,
             .target = node_id,
-            .state = "assessed",
+            .state = .assessed,
             .node_id = node_id,
         },
         .assessment = try adminPromotionAssessment(assessment),
@@ -449,7 +449,12 @@ fn adminPromotionAssessment(assessment: status.PromotionAssessment) !admin_api.H
         .caught_up_to_received = assessment.caught_up_to_received,
         .fencing_confirmed = assessment.fencing_confirmed,
         .force = assessment.force,
-        .mode = @tagName(assessment.mode),
+        .mode = switch (assessment.mode) {
+            .blocked => .blocked,
+            .safe => .safe,
+            .forced => .forced,
+            .lossy => .lossy,
+        },
         .data_loss_possible = assessment.data_loss_possible,
         .safe = assessment.safe,
         .requires_fencing = assessment.requires_fencing,
@@ -465,9 +470,9 @@ fn adminI64(value: u64) !i64 {
 
 fn adminActionReceipt(
     action_id: []const u8,
-    action_kind: []const u8,
+    action_kind: admin_api.HAActionReceiptActionKind,
     target: []const u8,
-    state: []const u8,
+    state: admin_api.HAActionReceiptState,
     node_id: []const u8,
 ) admin_api.HAActionReceipt {
     return .{
@@ -527,7 +532,7 @@ fn adminIdentity(identity: standby_mod.Identity) !admin_api.HAIdentity {
 
 fn adminPrimarySnapshot(alloc: Allocator, snapshot: status.PrimarySnapshot, node_id: []const u8) !admin_api.HAPrimarySnapshot {
     return .{
-        .role = @tagName(snapshot.role),
+        .role = .primary,
         .node_id = node_id,
         .identity = try adminIdentity(snapshot.identity),
         .current_lsn = try adminI64(snapshot.current_lsn),
@@ -539,7 +544,7 @@ fn adminPrimarySnapshot(alloc: Allocator, snapshot: status.PrimarySnapshot, node
 
 fn adminStandbySnapshot(snapshot: status.StandbySnapshot, node_id: []const u8) !admin_api.HAStandbySnapshot {
     return .{
-        .role = @tagName(snapshot.role),
+        .role = .standby,
         .node_id = node_id,
         .identity = try adminIdentity(snapshot.identity),
         .received_lsn = try adminI64(snapshot.received_lsn),
@@ -576,7 +581,11 @@ fn adminSlotSnapshots(alloc: Allocator, slots: []const status.SlotSnapshot) ![]a
             .apply_lag_lsn = try adminI64(slot.apply_lag_lsn),
             .safe_read_lag_lsn = try adminI64(slot.safe_read_lag_lsn),
             .retention_lag_lsn = try adminI64(slot.retention_lag_lsn),
-            .status = @tagName(slot.status),
+            .status = switch (slot.status) {
+                .healthy => .healthy,
+                .lagging => .lagging,
+                .reseed_required => .reseed_required,
+            },
             .last_error = slot.last_error,
         };
     }
@@ -598,16 +607,34 @@ fn adminRetentionSnapshot(snapshot: slot_store.RetentionSnapshot) !admin_api.HAR
 fn adminCommitGate(gate: commit_gate.GateResult) !admin_api.HACommitGate {
     return .{
         .target_lsn = try adminI64(gate.target_lsn),
-        .action = @tagName(gate.action),
+        .action = switch (gate.action) {
+            .acknowledge => .acknowledge,
+            .wait_for_standby => .wait_for_standby,
+            .reject => .reject,
+            .acknowledge_degraded => .acknowledge_degraded,
+        },
         .durability = try adminDurabilityDecision(gate.decision),
     };
 }
 
 fn adminDurabilityDecision(decision: primary_mod.DurabilityDecision) !admin_api.HADurabilityDecision {
     return .{
-        .status = @tagName(decision.status),
-        .mode = @tagName(decision.mode),
-        .selection = @tagName(decision.selection),
+        .status = switch (decision.status) {
+            .satisfied => .satisfied,
+            .would_block => .would_block,
+            .fail_closed => .fail_closed,
+            .degraded_to_async => .degraded_to_async,
+        },
+        .mode = switch (decision.mode) {
+            .async => .async,
+            .remote_write => .remote_write,
+            .remote_apply => .remote_apply,
+        },
+        .selection = switch (decision.selection) {
+            .any => .any,
+            .first => .first,
+            .all => .all,
+        },
         .target_lsn = try adminI64(decision.target_lsn),
         .progress_lsn = try adminI64(decision.progress_lsn),
         .missing_lsn_count = try adminI64(decision.missing_lsn_count),
@@ -619,8 +646,17 @@ fn adminDurabilityDecision(decision: primary_mod.DurabilityDecision) !admin_api.
 
 fn adminReadDecision(decision: read_gate.Decision) !admin_api.HAReadDecision {
     return .{
-        .action = @tagName(decision.action),
-        .consistency = @tagName(decision.consistency),
+        .action = switch (decision.action) {
+            .serve_standby => .serve_standby,
+            .wait_for_apply => .wait_for_apply,
+            .wait_for_metadata => .wait_for_metadata,
+            .route_to_primary => .route_to_primary,
+        },
+        .consistency = switch (decision.consistency) {
+            .stale_ok => .stale_ok,
+            .at_least_lsn => .at_least_lsn,
+            .primary => .primary,
+        },
         .required_lsn = if (decision.required_lsn) |value| try adminI64(value) else null,
         .required_metadata_lsn = if (decision.required_metadata_lsn) |value| try adminI64(value) else null,
         .received_lsn = try adminI64(decision.received_lsn),
@@ -635,8 +671,18 @@ fn adminReadDecision(decision: read_gate.Decision) !admin_api.HAReadDecision {
 
 fn adminWriteDecision(decision: write_gate.Decision) !admin_api.HAWriteDecision {
     return .{
-        .role = @tagName(decision.role),
-        .action = @tagName(decision.action),
+        .role = switch (decision.role) {
+            .primary => .primary,
+            .standby => .standby,
+            .promoted_standby => .promoted_standby,
+            .fenced_primary => .fenced_primary,
+        },
+        .action = switch (decision.action) {
+            .allow_write => .allow_write,
+            .reject_read_only_standby => .reject_read_only_standby,
+            .open_promoted_primary => .open_promoted_primary,
+            .reject_fenced_primary => .reject_fenced_primary,
+        },
         .identity = try adminIdentity(decision.identity),
         .durable_lsn = try adminI64(decision.durable_lsn),
         .next_lsn = try adminI64(decision.next_lsn),
@@ -646,9 +692,22 @@ fn adminWriteDecision(decision: write_gate.Decision) !admin_api.HAWriteDecision 
 
 fn adminOwnerJobDecision(decision: owner_job_gate.Decision) !admin_api.HAOwnerJobDecision {
     return .{
-        .kind = @tagName(decision.kind),
-        .role = @tagName(decision.role),
-        .action = @tagName(decision.action),
+        .kind = switch (decision.kind) {
+            .compaction_publish => .compaction_publish,
+            .derived_effect_writer => .derived_effect_writer,
+            .enrichment_writer => .enrichment_writer,
+            .retention_advance => .retention_advance,
+        },
+        .role = switch (decision.role) {
+            .primary => .primary,
+            .standby => .standby,
+            .promoted_standby => .promoted_standby,
+        },
+        .action = switch (decision.action) {
+            .run => .run,
+            .disable_on_standby => .disable_on_standby,
+            .open_promoted_primary => .open_promoted_primary,
+        },
         .identity = try adminIdentity(decision.identity),
         .durable_lsn = try adminI64(decision.durable_lsn),
         .next_lsn = try adminI64(decision.next_lsn),
@@ -684,8 +743,24 @@ fn adminFenceReceipt(receipt: fencing.Receipt) !admin_api.HAFenceReceipt {
 
 fn adminRejoinAssessment(assessment: rejoin.Assessment) !admin_api.HARejoinAssessment {
     return .{
-        .action = @tagName(assessment.action),
-        .reason = @tagName(assessment.reason),
+        .action = switch (assessment.action) {
+            .reject_unfenced => .reject_unfenced,
+            .already_current => .already_current,
+            .rewind => .rewind,
+            .reseed => .reseed,
+        },
+        .reason = switch (assessment.reason) {
+            .no_fence => .no_fence,
+            .current_timeline => .current_timeline,
+            .parent_timeline_retained => .parent_timeline_retained,
+            .parent_timeline_wal_expired => .parent_timeline_wal_expired,
+            .incompatible_timeline => .incompatible_timeline,
+            .wrong_old_primary => .wrong_old_primary,
+            .wrong_cluster => .wrong_cluster,
+            .wrong_shard => .wrong_shard,
+            .wrong_table => .wrong_table,
+            .local_lsn_before_fork => .local_lsn_before_fork,
+        },
         .former_node_id = assessment.former_node_id,
         .target_timeline_id = try adminI64(assessment.target_timeline_id),
         .target_epoch = try adminI64(assessment.target_epoch),

@@ -443,6 +443,14 @@ components:
         generation:
           type: integer
           format: uint64
+        lag:
+          type: integer
+          format: uint64
+          description: "Shared generation-record catch-up lag for the schema-backed access method."
+        ready_watermark:
+          type: integer
+          format: uint64
+          description: "Shared generation-record watermark through which the access method is ready."
         schema_fingerprint:
           type: string
           nullable: true
@@ -539,6 +547,17 @@ components:
         planner_last_fallback_reason:
           x-go-type-skip-optional-pointer: true
           type: string
+        planner_last_unsupported_reason:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: "Stable planner unsupported bucket for the latest fallback decision."
+          enum:
+            - unsupported-access-method
+            - index-not-ready
+            - stale-generation
+            - predicate-not-proven
+            - ordering-not-covered
+            - access-method-capability-mismatch
         planner_last_estimated_scan_rows:
           x-go-type-skip-optional-pointer: true
           type: integer

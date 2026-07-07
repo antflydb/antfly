@@ -26,10 +26,32 @@ pub const TermQuery = struct {
     boost: ?Boost = null,
 };
 
+pub const MultiMatchBodyType = enum {
+    bool_prefix,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .bool_prefix => "bool_prefix",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "bool_prefix", .bool_prefix },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const MultiMatchBody = struct {
     query: []const u8,
     fields: []const []const u8,
-    type: []const u8,
+    type: MultiMatchBodyType,
     boost: ?Boost = null,
 };
 
@@ -128,6 +150,31 @@ pub const GeoDistanceQuery = struct {
     boost: ?Boost = null,
 };
 
+pub const MatchQueryOperator = enum {
+    @"or",
+    @"and",
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .@"or" => "or",
+            .@"and" => "and",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "or", .@"or" },
+            .{ "and", .@"and" },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const MatchQuery = struct {
     match: []const u8,
     field: ?[]const u8 = null,
@@ -135,7 +182,7 @@ pub const MatchQuery = struct {
     boost: ?Boost = null,
     prefix_length: ?i32 = null,
     fuzziness: ?Fuzziness = null,
-    operator: ?[]const u8 = null,
+    operator: ?MatchQueryOperator = null,
 };
 
 pub const MatchPhraseQuery = struct {
@@ -174,9 +221,37 @@ pub const GeoBoundingPolygonQuery = struct {
     boost: ?Boost = null,
 };
 
+pub const GeoShapeGeometryRelation = enum {
+    intersects,
+    contains,
+    within,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .intersects => "intersects",
+            .contains => "contains",
+            .within => "within",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "intersects", .intersects },
+            .{ "contains", .contains },
+            .{ "within", .within },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const GeoShapeGeometry = struct {
     shape: GeoShape,
-    relation: []const u8,
+    relation: GeoShapeGeometryRelation,
 };
 
 pub const MultiMatchQuery = struct {
@@ -236,8 +311,17 @@ pub const Query = union(enum) {
     multi_match_query: *MultiMatchQuery,
     query_string_query: *QueryStringQuery,
 
+    fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
+        const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
+        defer allocator.free(encoded);
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.UnexpectedToken,
+        };
+    }
+
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+        const parsed = parseUnionVariantFromValue(T, allocator, source, options) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return null,
         };

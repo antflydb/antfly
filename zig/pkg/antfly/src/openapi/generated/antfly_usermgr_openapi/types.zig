@@ -83,11 +83,43 @@ pub const RoleAssignment = struct {
     role: []const u8,
 };
 
+/// Conservative subject classification inferred from user records and subject prefixes.
+pub const AuthSubjectKind = enum {
+    user,
+    role,
+    group,
+    subject,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .user => "user",
+            .role => "role",
+            .group => "group",
+            .subject => "subject",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "user", .user },
+            .{ "role", .role },
+            .{ "group", .group },
+            .{ "subject", .subject },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const AuthSubject = struct {
     /// Casbin subject name.
     subject: []const u8,
     /// Conservative subject classification inferred from user records and subject prefixes.
-    kind: []const u8,
+    kind: AuthSubjectKind,
 };
 
 pub const UpdatePasswordRequest = struct {

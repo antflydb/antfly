@@ -351,17 +351,17 @@ pub fn requireAntflyQueryFunctionStringArg(args: []const SqlQueryFunctionArg, na
     return value;
 }
 
-pub fn lowerAntflyQueryFunctionSqlAlloc(
+fn lowerAntflyQueryFunctionSqlForTestAlloc(
     alloc: std.mem.Allocator,
     semantic_resolver: ?query_contract.SemanticResolver,
     sql: []const u8,
 ) !query_contract.OwnedQueryRequest {
     var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
     defer parsed_sql.deinit(alloc);
-    return try lowerAntflyQueryFunctionParsedSqlAlloc(alloc, semantic_resolver, &parsed_sql);
+    return try lowerAntflyQueryFunctionParsedSqlForTestAlloc(alloc, semantic_resolver, &parsed_sql);
 }
 
-pub fn lowerAntflyQueryFunctionParsedSqlAlloc(
+fn lowerAntflyQueryFunctionParsedSqlForTestAlloc(
     alloc: std.mem.Allocator,
     semantic_resolver: ?query_contract.SemanticResolver,
     parsed_sql: *const tokenized.ParsedSql,
@@ -2066,7 +2066,7 @@ test "sql adapter query function lowers antfly query functions into native searc
         .vtable = &.{ .resolve_dense_query = Resolver.resolve },
     };
 
-    var full_text = try lowerAntflyQueryFunctionSqlAlloc(
+    var full_text = try lowerAntflyQueryFunctionSqlForTestAlloc(
         alloc,
         null,
         "SELECT * FROM antfly.full_text_search(table_name => 'docs', index => 'docs_body_fts', field => 'body', query => 'refund policy', limit => 5);",
@@ -2090,7 +2090,7 @@ test "sql adapter query function lowers antfly query functions into native searc
     try std.testing.expectEqualStrings("body", full_text_expression.req.full_text.?.match.field);
     try std.testing.expectEqualStrings("refund policy", full_text_expression.req.full_text.?.match.text);
 
-    var semantic = try lowerAntflyQueryFunctionSqlAlloc(
+    var semantic = try lowerAntflyQueryFunctionSqlForTestAlloc(
         alloc,
         resolver,
         "SELECT * FROM antfly.semantic_search(table => 'docs', index => 'docs_body_semantic', query => 'automatic embeddings', limit => 7);",
@@ -2101,7 +2101,7 @@ test "sql adapter query function lowers antfly query functions into native searc
     try std.testing.expectEqual(@as(u32, 7), semantic.req.dense_queries[0].query.k);
     try std.testing.expectEqual(@as(usize, 3), semantic.req.dense_queries[0].query.vector.len);
 
-    var vector = try lowerAntflyQueryFunctionSqlAlloc(
+    var vector = try lowerAntflyQueryFunctionSqlForTestAlloc(
         alloc,
         null,
         "SELECT * FROM antfly.vector_search(table_name = 'docs', index = 'docs_embedding_hnsw', vector = '[1.0,0.0,0.5]', limit = 3);",
@@ -2112,7 +2112,7 @@ test "sql adapter query function lowers antfly query functions into native searc
     try std.testing.expectEqual(@as(u32, 3), vector.req.dense_queries[0].query.k);
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), vector.req.dense_queries[0].query.vector[2], 0.0001);
 
-    var traverse = try lowerAntflyQueryFunctionSqlAlloc(
+    var traverse = try lowerAntflyQueryFunctionSqlForTestAlloc(
         alloc,
         null,
         "SELECT * FROM antfly.graph_traverse(table_name => 'docs', name => 'citation_walk', index => 'docs_edge_graph', start => 'doc:root', direction => 'out', edge_types => 'cites, references', max_depth => 2, max_results => 11, metrics => 'pagerank', freshness => 'fresh', include_metric_status => true, include_paths => true);",
@@ -2142,7 +2142,7 @@ test "sql adapter query function lowers antfly query functions into native searc
     try std.testing.expectEqualStrings("pagerank", traverse_query.metrics[0].name);
     try std.testing.expect(traverse_query.metrics[0].freshness == .fresh);
 
-    var shortest_path = try lowerAntflyQueryFunctionSqlAlloc(
+    var shortest_path = try lowerAntflyQueryFunctionSqlForTestAlloc(
         alloc,
         null,
         "SELECT * FROM antfly.graph_shortest_path(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', target => 'doc:z', direction => 'both', max_depth => 4, weight_mode => 'min_weight');",
@@ -2163,7 +2163,7 @@ test "sql adapter query function lowers antfly query functions into native searc
         else => return error.TestUnexpectedResult,
     }
 
-    var k_shortest_paths = try lowerAntflyQueryFunctionSqlAlloc(
+    var k_shortest_paths = try lowerAntflyQueryFunctionSqlForTestAlloc(
         alloc,
         null,
         "SELECT * FROM antfly.graph_k_shortest_paths(table_name => 'docs', index => 'docs_edge_graph', result_ref => '$full_text_results', target_result_ref => '$graph_results.targets', start_limit => 5, target_limit => 2, k => 3, max_depth => 6);",
@@ -2189,7 +2189,7 @@ test "sql adapter query function lowers antfly query functions into native searc
         else => return error.TestUnexpectedResult,
     }
 
-    var graph_match = try lowerAntflyQueryFunctionSqlAlloc(
+    var graph_match = try lowerAntflyQueryFunctionSqlForTestAlloc(
         alloc,
         null,
         "SELECT * FROM antfly.graph_match(table_name => 'docs', name => 'citation_pattern', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites|references {min_weight:0.25,max_weight:2.5}*1..3]->(b)<-[:mentions {weight >= 0.1, weight <= 1.0}]-(c)', return => 'b,c', metrics => 'pagerank', order_metric => 'pagerank', order_direction => 'desc', order_nulls => 'last', where_metric => 'pagerank', where_op => '>=', where_value => 0.25, freshness => 'published', include_metric_status => true, fields => 'title,url', max_results => 17);",
@@ -2247,7 +2247,7 @@ test "sql adapter query function lowers antfly query functions into native searc
     try std.testing.expectEqual(@as(@TypeOf(graph_match_expression.req.graph_queries[0].query.query_type), .pattern), graph_match_expression.req.graph_queries[0].query.query_type);
     try std.testing.expectEqual(@as(u32, 5), graph_match_expression.req.graph_queries[0].query.params.max_results);
 
-    var graph_match_ref = try lowerAntflyQueryFunctionSqlAlloc(
+    var graph_match_ref = try lowerAntflyQueryFunctionSqlForTestAlloc(
         alloc,
         null,
         "SELECT * FROM antfly.graph_match(table_name => 'docs', graph_index => 'docs_edge_graph', result_ref => '$full_text_results', start_limit => 4, pattern => '(seed)--(neighbor)', return_aliases => 'neighbor');",
@@ -2268,7 +2268,7 @@ test "sql adapter query function lowers antfly query functions into native searc
 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        lowerAntflyQueryFunctionSqlAlloc(
+        lowerAntflyQueryFunctionSqlForTestAlloc(
             alloc,
             null,
             "SELECT * FROM antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', pattern => '(a)');",
@@ -2276,7 +2276,7 @@ test "sql adapter query function lowers antfly query functions into native searc
     );
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        lowerAntflyQueryFunctionSqlAlloc(
+        lowerAntflyQueryFunctionSqlForTestAlloc(
             alloc,
             null,
             "SELECT * FROM antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', pattern => '(a:Document)-[:cites]->(b)');",
@@ -2284,7 +2284,7 @@ test "sql adapter query function lowers antfly query functions into native searc
     );
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        lowerAntflyQueryFunctionSqlAlloc(
+        lowerAntflyQueryFunctionSqlForTestAlloc(
             alloc,
             null,
             "SELECT * FROM antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', pattern => '(a)-[:cites|]->(b)');",
@@ -2292,7 +2292,7 @@ test "sql adapter query function lowers antfly query functions into native searc
     );
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        lowerAntflyQueryFunctionSqlAlloc(
+        lowerAntflyQueryFunctionSqlForTestAlloc(
             alloc,
             null,
             "SELECT * FROM antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', pattern => '(a)-[:cites*0]->(b)');",
@@ -2300,7 +2300,7 @@ test "sql adapter query function lowers antfly query functions into native searc
     );
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        lowerAntflyQueryFunctionSqlAlloc(
+        lowerAntflyQueryFunctionSqlForTestAlloc(
             alloc,
             null,
             "SELECT * FROM antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', pattern => '(a)-[:cites*3..1]->(b)');",
@@ -2308,7 +2308,7 @@ test "sql adapter query function lowers antfly query functions into native searc
     );
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        lowerAntflyQueryFunctionSqlAlloc(
+        lowerAntflyQueryFunctionSqlForTestAlloc(
             alloc,
             null,
             "SELECT * FROM antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', pattern => '(a)-[:cites {min_weight:3,max_weight:1}]->(b)');",
@@ -2316,7 +2316,7 @@ test "sql adapter query function lowers antfly query functions into native searc
     );
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        lowerAntflyQueryFunctionSqlAlloc(
+        lowerAntflyQueryFunctionSqlForTestAlloc(
             alloc,
             null,
             "SELECT * FROM antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', pattern => '(a)-[:cites {confidence:0.7}]->(b)');",
@@ -2324,7 +2324,7 @@ test "sql adapter query function lowers antfly query functions into native searc
     );
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        lowerAntflyQueryFunctionSqlAlloc(
+        lowerAntflyQueryFunctionSqlForTestAlloc(
             alloc,
             null,
             "SELECT * FROM antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', pattern => '(a)-[:cites {min_weight:bad}]->(b)');",
@@ -2332,7 +2332,7 @@ test "sql adapter query function lowers antfly query functions into native searc
     );
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        lowerAntflyQueryFunctionSqlAlloc(
+        lowerAntflyQueryFunctionSqlForTestAlloc(
             alloc,
             null,
             "SELECT * FROM antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', pattern => '(a)-[:cites]->(b)', where_metric => 'pagerank', where_op => '>=');",
@@ -2340,14 +2340,14 @@ test "sql adapter query function lowers antfly query functions into native searc
     );
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        lowerAntflyQueryFunctionSqlAlloc(
+        lowerAntflyQueryFunctionSqlForTestAlloc(
             alloc,
             null,
             "SELECT * FROM antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', pattern => '(a)-[:cites]->(b)', order_direction => 'desc');",
         ),
     );
 
-    var graph_metric = try lowerAntflyQueryFunctionSqlAlloc(
+    var graph_metric = try lowerAntflyQueryFunctionSqlForTestAlloc(
         alloc,
         null,
         "SELECT * FROM antfly.graph_metric(table_name => 'docs', index => 'docs_edge_graph', metric => 'pagerank', top_k => 2, freshness => 'fresh');",
@@ -2392,7 +2392,7 @@ test "sql adapter query function lowers antfly query functions into native searc
         else => return error.TestUnexpectedResult,
     }
 
-    var rerank = try lowerAntflyQueryFunctionSqlAlloc(
+    var rerank = try lowerAntflyQueryFunctionSqlForTestAlloc(
         alloc,
         null,
         "SELECT * FROM antfly.graph_metric_rerank(table_name => 'docs', full_text_index => 'docs_body_fts', field => 'body', query => 'refund', graph_index => 'docs_edge_graph', graph_metric => 'pagerank', weight => 1.5, base_weight => 0.25);",
@@ -2404,7 +2404,7 @@ test "sql adapter query function lowers antfly query functions into native searc
     try std.testing.expectApproxEqAbs(@as(f64, 1.5), rerank.req.graph_metric_rerank.?.weight, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f64, 0.25), rerank.req.graph_metric_rerank.?.base_weight, 0.0001);
 
-    var hybrid = try lowerAntflyQueryFunctionSqlAlloc(
+    var hybrid = try lowerAntflyQueryFunctionSqlForTestAlloc(
         alloc,
         resolver,
         "SELECT * FROM antfly.hybrid_search(table_name => 'docs', full_text_index => 'docs_body_fts', semantic_index => 'docs_body_semantic', graph_index => 'docs_edge_graph', graph_metric => 'pagerank', field => 'body', query => 'hybrid refund', fusion => 'rrf', limit => 9);",
@@ -2417,7 +2417,7 @@ test "sql adapter query function lowers antfly query functions into native searc
     try std.testing.expect(hybrid.req.merge_config != null);
     try std.testing.expectEqual(@as(u32, 9), hybrid.req.limit);
 
-    var structured_hybrid = try lowerAntflyQueryFunctionSqlAlloc(alloc, resolver,
+    var structured_hybrid = try lowerAntflyQueryFunctionSqlForTestAlloc(alloc, resolver,
         \\SELECT * FROM antfly.hybrid_search(table_name => 'docs', query => 'hybrid refund', fusion => 'rrf', window_size => 25, sources_json => '[{"kind":"full_text","index":"docs_body_fts","field":"body","weight":0.25},{"kind":"semantic","index":"docs_body_semantic","weight":0.6},{"kind":"graph_metric","index":"docs_edge_graph","metric":"pagerank","weight":0.15,"base_weight":0.5,"missing_score":0.1,"freshness":"fresh"}]', limit => 9);
     );
     defer structured_hybrid.deinit(alloc);
@@ -2442,7 +2442,7 @@ test "sql adapter query function lowers antfly query functions into native searc
     try expectMergeWeight(structured_merge.weights, "docs_body_semantic", 0.6);
     try expectMergeWeight(structured_merge.weights, "graph_metric_rerank", 0.15);
 
-    var helper_hybrid = try lowerAntflyQueryFunctionSqlAlloc(alloc, resolver,
+    var helper_hybrid = try lowerAntflyQueryFunctionSqlForTestAlloc(alloc, resolver,
         \\SELECT * FROM antfly.hybrid_search(table_name => 'docs', query => 'hybrid refund', fusion => 'rrf', window_size => 25, sources => ARRAY[antfly.source('docs_body_fts', field => 'body', weight => 0.25), antfly.source('docs_body_semantic', weight => 0.6), antfly.source('docs_edge_graph', metric => 'pagerank', weight => 0.15, base_weight => 0.5, missing_score => 0.1, freshness => 'fresh')], limit => 9);
     );
     defer helper_hybrid.deinit(alloc);

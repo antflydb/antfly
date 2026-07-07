@@ -168,7 +168,7 @@ fn encodeChunkRequest(alloc: Allocator, cfg: chunking_types.Config, input: Remot
                 config: inference_api.ChunkConfig,
             }{
                 .input = .{
-                    .type = "media",
+                    .type = .media,
                     .data = data_b64,
                     .mime_type = binary.mime_type,
                 },

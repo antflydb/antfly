@@ -28,6 +28,7 @@ const plan = @import("plan.zig");
 const relational_rows = @import("relational_rows.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const source_binding = @import("source_binding.zig");
+const sql_statement_kind = @import("statement_kind.zig");
 const table_catalog = @import("../metadata/catalog/source.zig");
 const tokenized = @import("tokenized.zig");
 const value_mod = @import("value.zig");
@@ -46,13 +47,13 @@ const sql_adapter = struct {
     const lowerDocumentAggregatePlanWithOptionalIndexesAndVirtualSchemaCapabilitiesParsedSqlAlloc = document_plan.lowerDocumentAggregatePlanWithOptionalIndexesAndVirtualSchemaCapabilitiesParsedSqlAlloc;
     const lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc = document_plan.lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc;
     const lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc = document_plan.lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc;
-    const parseAggregatePlanAlloc = plan.parseAggregatePlanAlloc;
-    const parseJoinPlanAlloc = plan.parseJoinPlanAlloc;
-    const parseLateralPlanAlloc = plan.parseLateralPlanAlloc;
-    const parseQueryPlanAlloc = lower_expr.parseQueryPlanAlloc;
-    const parseRecursiveCtePlanAlloc = plan.parseRecursiveCtePlanAlloc;
-    const parseSetOperationPlanAlloc = plan.parseSetOperationPlanAlloc;
-    const parseWindowPlanAlloc = plan.parseWindowPlanAlloc;
+    const lowerTokenizedAggregatePlanAlloc = plan.lowerTokenizedAggregatePlanAlloc;
+    const lowerTokenizedJoinPlanAlloc = plan.lowerTokenizedJoinPlanAlloc;
+    const lowerTokenizedLateralPlanAlloc = plan.lowerTokenizedLateralPlanAlloc;
+    const lowerTokenizedQueryPlanAlloc = lower_expr.lowerTokenizedQueryPlanAlloc;
+    const lowerTokenizedRecursiveCtePlanAlloc = plan.lowerTokenizedRecursiveCtePlanAlloc;
+    const lowerTokenizedSetOperationPlanAlloc = plan.lowerTokenizedSetOperationPlanAlloc;
+    const lowerTokenizedWindowPlanAlloc = plan.lowerTokenizedWindowPlanAlloc;
     const tokensStartWithKeywordTag = parser_mod.tokensStartWithKeywordTag;
 };
 
@@ -167,7 +168,7 @@ pub fn lowerSelectParsedSqlAlloc(
         .params = params,
         .generated_read_ast = generated_read_ast,
     };
-    var lowered = sql_adapter.parseQueryPlanAlloc(
+    var lowered = sql_adapter.lowerTokenizedQueryPlanAlloc(
         alloc,
         tokens,
         &parser.pos,
@@ -270,7 +271,7 @@ pub fn lowerQueryPlanWithOptionalSourceSchemaParsedSqlAlloc(
         .function_bindings = function_bindings,
         .generated_read_ast = generated_read_ast,
     };
-    var lowered = sql_adapter.parseQueryPlanAlloc(
+    var lowered = sql_adapter.lowerTokenizedQueryPlanAlloc(
         alloc,
         tokens,
         &parser.pos,
@@ -462,7 +463,7 @@ pub fn lowerRecursiveCtePlanParsedSqlAlloc(
         .function_bindings = function_bindings,
         .generated_read_ast = generated_read_ast,
     };
-    return try sql_adapter.parseRecursiveCtePlanAlloc(alloc, tokens, &parser.pos, Parser.ContextAccessors.recursiveCteParserHooks(&parser));
+    return try sql_adapter.lowerTokenizedRecursiveCtePlanAlloc(alloc, tokens, &parser.pos, Parser.ContextAccessors.recursiveCteParserHooks(&parser));
 }
 
 pub fn lowerSetOperationPlanAlloc(
@@ -586,7 +587,7 @@ pub fn lowerSetOperationPlanWithOptionalSourceSchemaParsedSqlAlloc(
         .generated_read_ast = generated_read_ast,
         .function_bindings = function_bindings,
     };
-    return try sql_adapter.parseSetOperationPlanAlloc(
+    return try sql_adapter.lowerTokenizedSetOperationPlanAlloc(
         alloc,
         tokens,
         &parser.pos,
@@ -828,6 +829,7 @@ fn lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(
     const read_kind = parsed_sql.readStatementKindIncludingGeneratedAst() orelse
         parsed_sql.generatedReadStatementKind() orelse
         parsed_sql.readStatementKind() orelse
+        try generatedDocumentReadStatementKind(parsed_sql) orelse
         return error.UnsupportedSqlShape;
     return switch (read_kind) {
         .aggregate => .{
@@ -869,6 +871,43 @@ fn lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(
     };
 }
 
+fn generatedDocumentReadStatementKind(parsed_sql: *const sql_adapter.ParsedSql) !?sql_statement_kind.SqlReadStatementKind {
+    if (parsed_sql.generatedStatementKind() != .read) return null;
+    const generated_statement = parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    const generated_ast = generated_statement.ast orelse return error.UnsupportedSqlShape;
+    return switch (generated_ast) {
+        .read => |read| blk: {
+            try lowering_context.validateGeneratedReadAstForStatement(parsed_sql.items(), read);
+            break :blk try documentStatementKindForGeneratedRead(read);
+        },
+        else => error.UnsupportedSqlShape,
+    };
+}
+
+fn documentStatementKindForGeneratedRead(read: *const sql_adapter.generated_parser.GeneratedSqlReadAst) !sql_statement_kind.SqlReadStatementKind {
+    return switch (read.kind) {
+        .query => .query,
+        .aggregate => .aggregate,
+        .join => .join,
+        .lateral => .lateral,
+        .window => .window,
+        .set_operation => .set_operation,
+        .cte => {
+            if (read.cte_recursive) return .recursive_cte;
+            const final_kind = read.cte_final_kind orelse return error.UnsupportedSqlShape;
+            return switch (final_kind) {
+                .query => .query,
+                .aggregate => .aggregate,
+                .join => .join,
+                .lateral => .lateral,
+                .window => .window,
+                .set_operation => .set_operation,
+                .cte => error.UnsupportedSqlShape,
+            };
+        },
+    };
+}
+
 pub fn lowerWindowPlanAlloc(
     alloc: std.mem.Allocator,
     sql: []const u8,
@@ -901,7 +940,7 @@ pub fn lowerWindowPlanParsedSqlAlloc(
         .params = params,
         .generated_read_ast = generated_read_ast,
     };
-    var lowered = sql_adapter.parseWindowPlanAlloc(
+    var lowered = sql_adapter.lowerTokenizedWindowPlanAlloc(
         alloc,
         tokens,
         &parser.pos,
@@ -991,7 +1030,7 @@ pub fn lowerAggregatePlanParsedSqlAlloc(
         .params = params,
         .generated_read_ast = generated_read_ast,
     };
-    var lowered = sql_adapter.parseAggregatePlanAlloc(
+    var lowered = sql_adapter.lowerTokenizedAggregatePlanAlloc(
         alloc,
         tokens,
         &parser.pos,
@@ -1065,7 +1104,7 @@ pub fn lowerJoinWithSchemasParsedSqlAlloc(
         .params = params,
         .generated_read_ast = generated_read_ast,
     };
-    var lowered = sql_adapter.parseJoinPlanAlloc(
+    var lowered = sql_adapter.lowerTokenizedJoinPlanAlloc(
         alloc,
         tokens,
         &parser.pos,
@@ -1139,7 +1178,7 @@ pub fn lowerLateralPlanWithSchemasParsedSqlAlloc(
         .params = params,
         .generated_read_ast = generated_read_ast,
     };
-    var lowered = sql_adapter.parseLateralPlanAlloc(
+    var lowered = sql_adapter.lowerTokenizedLateralPlanAlloc(
         alloc,
         tokens,
         &parser.pos,
@@ -1225,5 +1264,368 @@ test "read lowerers validate retained generated ast before typed planning" {
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerQueryPlanWithFunctionBindingsParsedSqlAlloc(alloc, &parsed_sql, schema, &.{}, .{}),
+    );
+}
+
+test "select projection lowerer fails closed on malformed retained expression payloads" {
+    const alloc = std.testing.allocator;
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = &.{
+            .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
+            .{ .name = "kind", .path = "kind", .field_type = .keyword },
+        },
+        .primary_key = .{ .columns = &.{"id"} },
+    };
+
+    var missing_projection_expression = try sql_adapter.ParsedSql.initAlloc(
+        alloc,
+        "SELECT lower(kind) AS kind_key FROM usage_records WHERE kind = 'order'",
+    );
+    defer missing_projection_expression.deinit(alloc);
+
+    var lowered = try lowerQueryPlanWithFunctionBindingsParsedSqlAlloc(alloc, &missing_projection_expression, schema, &.{}, .{});
+    defer lowered.deinit(alloc);
+
+    if (missing_projection_expression.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                try std.testing.expectEqual(@as(usize, 1), read.projection_items.count);
+                try std.testing.expectEqual(read.projection_items.count, read.projection_items.expressions.len);
+                read.projection_items.expressions = &.{};
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerQueryPlanWithFunctionBindingsParsedSqlAlloc(alloc, &missing_projection_expression, schema, &.{}, .{}),
+    );
+
+    var stale_projection_expression = try sql_adapter.ParsedSql.initAlloc(
+        alloc,
+        "SELECT lower(kind) AS kind_key FROM usage_records WHERE kind = 'order'",
+    );
+    defer stale_projection_expression.deinit(alloc);
+
+    var stale_lowered = try lowerQueryPlanWithFunctionBindingsParsedSqlAlloc(alloc, &stale_projection_expression, schema, &.{}, .{});
+    defer stale_lowered.deinit(alloc);
+
+    if (stale_projection_expression.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                try std.testing.expectEqual(@as(usize, 1), read.projection_items.count);
+                try std.testing.expectEqual(read.projection_items.count, read.projection_items.expressions.len);
+                _ = read.where_expression.tokens orelse return error.TestUnexpectedResult;
+                read.projection_items.expressions[0] = read.where_expression;
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerQueryPlanWithFunctionBindingsParsedSqlAlloc(alloc, &stale_projection_expression, schema, &.{}, .{}),
+    );
+}
+
+test "where predicate lowerer fails closed on malformed retained expression payloads" {
+    const alloc = std.testing.allocator;
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = &.{
+            .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
+            .{ .name = "kind", .path = "kind", .field_type = .keyword },
+        },
+        .primary_key = .{ .columns = &.{"id"} },
+    };
+
+    var missing_where_expression = try sql_adapter.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE lower(kind) = 'order'",
+    );
+    defer missing_where_expression.deinit(alloc);
+
+    var lowered = try lowerQueryPlanWithFunctionBindingsParsedSqlAlloc(alloc, &missing_where_expression, schema, &.{}, .{});
+    defer lowered.deinit(alloc);
+
+    if (missing_where_expression.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                _ = read.where_tokens orelse return error.TestUnexpectedResult;
+                _ = read.where_expression.tokens orelse return error.TestUnexpectedResult;
+                read.where_expression = .{};
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerQueryPlanWithFunctionBindingsParsedSqlAlloc(alloc, &missing_where_expression, schema, &.{}, .{}),
+    );
+
+    var stale_where_expression = try sql_adapter.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE lower(kind) = 'order'",
+    );
+    defer stale_where_expression.deinit(alloc);
+
+    var stale_lowered = try lowerQueryPlanWithFunctionBindingsParsedSqlAlloc(alloc, &stale_where_expression, schema, &.{}, .{});
+    defer stale_lowered.deinit(alloc);
+
+    if (stale_where_expression.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                _ = read.where_tokens orelse return error.TestUnexpectedResult;
+                _ = read.where_expression.tokens orelse return error.TestUnexpectedResult;
+                try std.testing.expectEqual(@as(usize, 1), read.projection_items.count);
+                try std.testing.expectEqual(read.projection_items.count, read.projection_items.expressions.len);
+                read.where_expression = read.projection_items.expressions[0];
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerQueryPlanWithFunctionBindingsParsedSqlAlloc(alloc, &stale_where_expression, schema, &.{}, .{}),
+    );
+}
+
+test "order by lowerer fails closed on malformed retained expression payloads" {
+    const alloc = std.testing.allocator;
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = &.{
+            .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
+            .{ .name = "kind", .path = "kind", .field_type = .keyword },
+        },
+        .primary_key = .{ .columns = &.{"id"} },
+    };
+
+    var missing_order_expression = try sql_adapter.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records ORDER BY lower(kind)",
+    );
+    defer missing_order_expression.deinit(alloc);
+
+    var lowered = try lowerQueryPlanWithFunctionBindingsParsedSqlAlloc(alloc, &missing_order_expression, schema, &.{}, .{});
+    defer lowered.deinit(alloc);
+
+    if (missing_order_expression.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                _ = read.order_tokens orelse return error.TestUnexpectedResult;
+                try std.testing.expectEqual(@as(usize, 1), read.order_items.count);
+                try std.testing.expectEqual(read.order_items.count, read.order_items.expressions.len);
+                read.order_items.expressions = &.{};
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerQueryPlanWithFunctionBindingsParsedSqlAlloc(alloc, &missing_order_expression, schema, &.{}, .{}),
+    );
+
+    var stale_order_expression = try sql_adapter.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records ORDER BY lower(kind)",
+    );
+    defer stale_order_expression.deinit(alloc);
+
+    var stale_lowered = try lowerQueryPlanWithFunctionBindingsParsedSqlAlloc(alloc, &stale_order_expression, schema, &.{}, .{});
+    defer stale_lowered.deinit(alloc);
+
+    if (stale_order_expression.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                _ = read.order_tokens orelse return error.TestUnexpectedResult;
+                try std.testing.expectEqual(@as(usize, 1), read.order_items.count);
+                try std.testing.expectEqual(read.order_items.count, read.order_items.expressions.len);
+                try std.testing.expectEqual(@as(usize, 1), read.projection_items.count);
+                try std.testing.expectEqual(read.projection_items.count, read.projection_items.expressions.len);
+                read.order_items.expressions[0] = read.projection_items.expressions[0];
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerQueryPlanWithFunctionBindingsParsedSqlAlloc(alloc, &stale_order_expression, schema, &.{}, .{}),
+    );
+}
+
+test "aggregate group having and order lowerers fail closed on malformed retained expression payloads" {
+    const alloc = std.testing.allocator;
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = &.{
+            .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
+            .{ .name = "kind", .path = "kind", .field_type = .keyword },
+            .{ .name = "amount", .path = "amount", .field_type = .numeric },
+        },
+        .primary_key = .{ .columns = &.{"id"} },
+    };
+
+    var missing_group_expression = try sql_adapter.ParsedSql.initAlloc(
+        alloc,
+        "SELECT lower(kind) AS kind_key, COUNT(*) AS row_count FROM usage_records GROUP BY lower(kind) HAVING COUNT(*) > 0 ORDER BY lower(kind)",
+    );
+    defer missing_group_expression.deinit(alloc);
+
+    var lowered = try lowerAggregatePlanParsedSqlAlloc(alloc, &missing_group_expression, schema, &.{});
+    defer lowered.deinit(alloc);
+
+    if (missing_group_expression.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                _ = read.group_tokens orelse return error.TestUnexpectedResult;
+                try std.testing.expectEqual(@as(usize, 1), read.group_items.count);
+                try std.testing.expectEqual(read.group_items.count, read.group_items.expressions.len);
+                read.group_items.expressions = &.{};
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerAggregatePlanParsedSqlAlloc(alloc, &missing_group_expression, schema, &.{}),
+    );
+
+    var stale_group_expression = try sql_adapter.ParsedSql.initAlloc(
+        alloc,
+        "SELECT lower(kind) AS kind_key, COUNT(*) AS row_count FROM usage_records GROUP BY lower(kind) HAVING COUNT(*) > 0 ORDER BY lower(kind)",
+    );
+    defer stale_group_expression.deinit(alloc);
+
+    var stale_group_lowered = try lowerAggregatePlanParsedSqlAlloc(alloc, &stale_group_expression, schema, &.{});
+    defer stale_group_lowered.deinit(alloc);
+
+    if (stale_group_expression.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                _ = read.group_tokens orelse return error.TestUnexpectedResult;
+                try std.testing.expectEqual(@as(usize, 1), read.group_items.count);
+                try std.testing.expectEqual(read.group_items.count, read.group_items.expressions.len);
+                try std.testing.expect(read.projection_items.expressions.len >= 1);
+                read.group_items.expressions[0] = read.projection_items.expressions[0];
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerAggregatePlanParsedSqlAlloc(alloc, &stale_group_expression, schema, &.{}),
+    );
+
+    var missing_having_expression = try sql_adapter.ParsedSql.initAlloc(
+        alloc,
+        "SELECT lower(kind) AS kind_key, COUNT(*) AS row_count FROM usage_records GROUP BY lower(kind) HAVING COUNT(*) > 0 ORDER BY lower(kind)",
+    );
+    defer missing_having_expression.deinit(alloc);
+
+    var missing_having_lowered = try lowerAggregatePlanParsedSqlAlloc(alloc, &missing_having_expression, schema, &.{});
+    defer missing_having_lowered.deinit(alloc);
+
+    if (missing_having_expression.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                _ = read.having_tokens orelse return error.TestUnexpectedResult;
+                _ = read.having_expression.tokens orelse return error.TestUnexpectedResult;
+                read.having_expression = .{};
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerAggregatePlanParsedSqlAlloc(alloc, &missing_having_expression, schema, &.{}),
+    );
+
+    var stale_having_expression = try sql_adapter.ParsedSql.initAlloc(
+        alloc,
+        "SELECT lower(kind) AS kind_key, COUNT(*) AS row_count FROM usage_records GROUP BY lower(kind) HAVING COUNT(*) > 0 ORDER BY lower(kind)",
+    );
+    defer stale_having_expression.deinit(alloc);
+
+    var stale_having_lowered = try lowerAggregatePlanParsedSqlAlloc(alloc, &stale_having_expression, schema, &.{});
+    defer stale_having_lowered.deinit(alloc);
+
+    if (stale_having_expression.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                _ = read.having_tokens orelse return error.TestUnexpectedResult;
+                _ = read.having_expression.tokens orelse return error.TestUnexpectedResult;
+                try std.testing.expect(read.group_items.expressions.len >= 1);
+                read.having_expression = read.group_items.expressions[0];
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerAggregatePlanParsedSqlAlloc(alloc, &stale_having_expression, schema, &.{}),
+    );
+
+    var missing_aggregate_order_expression = try sql_adapter.ParsedSql.initAlloc(
+        alloc,
+        "SELECT lower(kind) AS kind_key, COUNT(*) AS row_count FROM usage_records GROUP BY lower(kind) HAVING COUNT(*) > 0 ORDER BY lower(kind)",
+    );
+    defer missing_aggregate_order_expression.deinit(alloc);
+
+    var missing_order_lowered = try lowerAggregatePlanParsedSqlAlloc(alloc, &missing_aggregate_order_expression, schema, &.{});
+    defer missing_order_lowered.deinit(alloc);
+
+    if (missing_aggregate_order_expression.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                _ = read.order_tokens orelse return error.TestUnexpectedResult;
+                try std.testing.expectEqual(@as(usize, 1), read.order_items.count);
+                try std.testing.expectEqual(read.order_items.count, read.order_items.expressions.len);
+                read.order_items.expressions = &.{};
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerAggregatePlanParsedSqlAlloc(alloc, &missing_aggregate_order_expression, schema, &.{}),
+    );
+
+    var stale_aggregate_order_expression = try sql_adapter.ParsedSql.initAlloc(
+        alloc,
+        "SELECT lower(kind) AS kind_key, COUNT(*) AS row_count FROM usage_records GROUP BY lower(kind) HAVING COUNT(*) > 0 ORDER BY lower(kind)",
+    );
+    defer stale_aggregate_order_expression.deinit(alloc);
+
+    var stale_order_lowered = try lowerAggregatePlanParsedSqlAlloc(alloc, &stale_aggregate_order_expression, schema, &.{});
+    defer stale_order_lowered.deinit(alloc);
+
+    if (stale_aggregate_order_expression.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                _ = read.order_tokens orelse return error.TestUnexpectedResult;
+                try std.testing.expectEqual(@as(usize, 1), read.order_items.count);
+                try std.testing.expectEqual(read.order_items.count, read.order_items.expressions.len);
+                try std.testing.expect(read.projection_items.expressions.len >= 1);
+                read.order_items.expressions[0] = read.projection_items.expressions[0];
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerAggregatePlanParsedSqlAlloc(alloc, &stale_aggregate_order_expression, schema, &.{}),
     );
 }

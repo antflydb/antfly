@@ -4,10 +4,10 @@
     {
       "id": "generated-ast-dispatch",
       "grammar_slices_bullet": "Replace generated-covered token scans/string probes with generated AST dispatch or generated unsupported diagnostics.",
-      "status": "fixture_enforced",
-      "evidence_file": "zig/pkg/antfly/src/sql/fixtures/sql_compatibility_wrappers.json",
-      "evidence_symbol": "sql_compatibility_wrappers",
-      "completion_condition": "Every generated-covered wrapper is removed or reclassified as an explicit compatibility contract outside generated grammar coverage."
+      "status": "complete",
+      "evidence_file": "zig/pkg/antfly/src/sql/fixtures/sql_cutover_contracts.json",
+      "evidence_symbol": "sql_cutover_contracts",
+      "completion_condition": "No generated-covered contract remains in the parser cutover inventory; runtime bounded-scan contracts live in document_sql_bounded_scan_inventory.json."
     },
     {
       "id": "retained-ast-corruption-boundary",
@@ -26,15 +26,7 @@
       "completion_condition": "New grammar terminal patches carry lexer, generated-token bridge, valid syntax, malformed syntax, and contextual identifier fixtures together."
     }
   ],
-  "wrappers": [
-    {
-      "wrapper_id": "document-query-bounded-scan-runtime",
-      "family": "query",
-      "requirement_id": "generated-ast-dispatch",
-      "legacy_admission": "compatibility_contract",
-      "public_boundary_corruption_required": false
-    }
-  ],
+  "contracts": [],
   "families": [
     {
       "family": "backups",

@@ -2518,7 +2518,10 @@ pub fn parseRowExpressionOperandAlloc(
         field_source,
     )) |expression| return expression;
 
-    const value_json = try value_mod.parseJsonValueAlloc(alloc, tokens, pos, params);
+    const value_json = if (parser.peekKeywordTag(tokens, pos.*, .array))
+        try value_mod.parseSqlArrayConstructorJsonAlloc(alloc, tokens, pos, params)
+    else
+        try value_mod.parseJsonValueAlloc(alloc, tokens, pos, params);
     errdefer alloc.free(value_json);
     return .{ .kind = .value, .value_json = value_json };
 }

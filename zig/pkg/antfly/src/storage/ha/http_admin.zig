@@ -337,7 +337,7 @@ pub const Server = struct {
             .create => |slot| blk: {
                 const action_id = try std.fmt.allocPrint(self.alloc, "replication_slot_create:{s}", .{parsed.value.slot_name});
                 defer self.alloc.free(action_id);
-                break :blk try self.handleTypedJson(try slotActionDocument(action_id, "replication_slot_create", parsed.value.slot_name, node_id, "create", slot, null));
+                break :blk try self.handleTypedJson(try slotActionDocument(action_id, .replication_slot_create, parsed.value.slot_name, node_id, .create, slot, null));
             },
             else => unreachable,
         };
@@ -356,27 +356,27 @@ pub const Server = struct {
             return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
         };
         const action_kind = switch (action) {
-            .create => "replication_slot_create",
-            .pause => "replication_slot_pause",
-            .@"resume" => "replication_slot_resume",
-            .drop => "replication_slot_drop",
+            .create => admin_api.HAActionReceiptActionKind.replication_slot_create,
+            .pause => admin_api.HAActionReceiptActionKind.replication_slot_pause,
+            .@"resume" => admin_api.HAActionReceiptActionKind.replication_slot_resume,
+            .drop => admin_api.HAActionReceiptActionKind.replication_slot_drop,
         };
         return switch (result) {
             .create => unreachable,
             .pause => |slot| blk: {
-                const action_id = try std.fmt.allocPrint(self.alloc, "{s}:{s}", .{ action_kind, slot_name });
+                const action_id = try std.fmt.allocPrint(self.alloc, "{s}:{s}", .{ @tagName(action_kind), slot_name });
                 defer self.alloc.free(action_id);
-                break :blk try self.handleTypedJson(try slotActionDocument(action_id, action_kind, slot_name, node_id, "pause", slot, slot.dropped));
+                break :blk try self.handleTypedJson(try slotActionDocument(action_id, action_kind, slot_name, node_id, .pause, slot, slot.dropped));
             },
             .@"resume" => |slot| blk: {
-                const action_id = try std.fmt.allocPrint(self.alloc, "{s}:{s}", .{ action_kind, slot_name });
+                const action_id = try std.fmt.allocPrint(self.alloc, "{s}:{s}", .{ @tagName(action_kind), slot_name });
                 defer self.alloc.free(action_id);
-                break :blk try self.handleTypedJson(try slotActionDocument(action_id, action_kind, slot_name, node_id, "resume", slot, slot.dropped));
+                break :blk try self.handleTypedJson(try slotActionDocument(action_id, action_kind, slot_name, node_id, .@"resume", slot, slot.dropped));
             },
             .drop => |slot| blk: {
-                const action_id = try std.fmt.allocPrint(self.alloc, "{s}:{s}", .{ action_kind, slot_name });
+                const action_id = try std.fmt.allocPrint(self.alloc, "{s}:{s}", .{ @tagName(action_kind), slot_name });
                 defer self.alloc.free(action_id);
-                break :blk try self.handleTypedJson(try slotActionDocument(action_id, action_kind, slot_name, node_id, "drop", slot, slot.dropped));
+                break :blk try self.handleTypedJson(try slotActionDocument(action_id, action_kind, slot_name, node_id, .drop, slot, slot.dropped));
             },
         };
     }
@@ -549,9 +549,9 @@ pub const Server = struct {
             .schema_version = 1,
             .action = .{
                 .action_id = action_id,
-                .action_kind = "base_backup_begin",
+                .action_kind = .base_backup_begin,
                 .target = result.manifest_id,
-                .state = "applied",
+                .state = .applied,
                 .node_id = node_id,
             },
             .slot_name = result.slot_name,
@@ -592,9 +592,9 @@ pub const Server = struct {
                     .schema_version = 1,
                     .action = .{
                         .action_id = action_id,
-                        .action_kind = "base_backup_finish",
+                        .action_kind = .base_backup_finish,
                         .target = seed.manifest_id,
-                        .state = "applied",
+                        .state = .applied,
                         .node_id = node_id,
                     },
                     .manifest_id = seed.manifest_id,
@@ -644,9 +644,9 @@ pub const Server = struct {
                     .schema_version = 1,
                     .action = .{
                         .action_id = action_id,
-                        .action_kind = "standby_bootstrap",
+                        .action_kind = .standby_bootstrap,
                         .target = seed.manifest_id,
-                        .state = "applied",
+                        .state = .applied,
                         .node_id = node_id,
                     },
                     .manifest_id = seed.manifest_id,
@@ -694,9 +694,9 @@ pub const Server = struct {
             .schema_version = 1,
             .action = .{
                 .action_id = action_id,
-                .action_kind = "fence_acquire",
+                .action_kind = .fence_acquire,
                 .target = result.receipt.promoted_node_id,
-                .state = "applied",
+                .state = .applied,
                 .node_id = result.receipt.promoted_node_id,
             },
             .receipt = try adminFenceReceipt(result.receipt),
@@ -740,9 +740,9 @@ pub const Server = struct {
                     .schema_version = 1,
                     .action = .{
                         .action_id = action_id,
-                        .action_kind = "promotion_assess",
+                        .action_kind = .promotion_assess,
                         .target = node_id,
-                        .state = "assessed",
+                        .state = .assessed,
                         .node_id = node_id,
                     },
                     .assessment = try adminPromotionAssessment(assessment),
@@ -849,9 +849,9 @@ pub const Server = struct {
                     .schema_version = 1,
                     .action = .{
                         .action_id = action_id,
-                        .action_kind = "rejoin_rewind",
+                        .action_kind = .rejoin_rewind,
                         .target = assessment.former_node_id,
-                        .state = "applied",
+                        .state = .applied,
                         .node_id = assessment.former_node_id,
                     },
                     .assessment = try adminRejoinAssessment(assessment),
@@ -871,9 +871,9 @@ pub const Server = struct {
                     .schema_version = 1,
                     .action = .{
                         .action_id = action_id,
-                        .action_kind = "rejoin_reseed",
+                        .action_kind = .rejoin_reseed,
                         .target = assessment.former_node_id,
-                        .state = "applied",
+                        .state = .applied,
                         .node_id = node_id,
                     },
                     .assessment = try adminRejoinAssessment(assessment),
@@ -888,9 +888,9 @@ pub const Server = struct {
             .schema_version = 1,
             .action = .{
                 .action_id = action_id,
-                .action_kind = "rejoin_assess",
+                .action_kind = .rejoin_assess,
                 .target = assessment.former_node_id,
-                .state = "assessed",
+                .state = .assessed,
                 .node_id = assessment.former_node_id,
             },
             .assessment = try adminRejoinAssessment(assessment),
@@ -1083,9 +1083,9 @@ fn promotionDocument(alloc: Allocator, result: ha_admin.FencedPromotionResult) !
         .schema_version = 1,
         .action = .{
             .action_id = action_id,
-            .action_kind = "promotion",
+            .action_kind = .promotion,
             .target = target,
-            .state = "applied",
+            .state = .applied,
             .node_id = result.promoted_node_id,
         },
         .assessment = try adminPromotionAssessment(result.assessment),
@@ -1106,16 +1106,34 @@ fn promotionDocument(alloc: Allocator, result: ha_admin.FencedPromotionResult) !
 fn adminCommitGate(gate: commit_gate.GateResult) !admin_api.HACommitGate {
     return .{
         .target_lsn = try adminI64(gate.target_lsn),
-        .action = @tagName(gate.action),
+        .action = switch (gate.action) {
+            .acknowledge => .acknowledge,
+            .wait_for_standby => .wait_for_standby,
+            .reject => .reject,
+            .acknowledge_degraded => .acknowledge_degraded,
+        },
         .durability = try adminDurabilityDecision(gate.decision),
     };
 }
 
 fn adminDurabilityDecision(decision: primary_mod.DurabilityDecision) !admin_api.HADurabilityDecision {
     return .{
-        .status = @tagName(decision.status),
-        .mode = @tagName(decision.mode),
-        .selection = @tagName(decision.selection),
+        .status = switch (decision.status) {
+            .satisfied => .satisfied,
+            .would_block => .would_block,
+            .fail_closed => .fail_closed,
+            .degraded_to_async => .degraded_to_async,
+        },
+        .mode = switch (decision.mode) {
+            .async => .async,
+            .remote_write => .remote_write,
+            .remote_apply => .remote_apply,
+        },
+        .selection = switch (decision.selection) {
+            .any => .any,
+            .first => .first,
+            .all => .all,
+        },
         .target_lsn = try adminI64(decision.target_lsn),
         .progress_lsn = try adminI64(decision.progress_lsn),
         .missing_lsn_count = try adminI64(decision.missing_lsn_count),
@@ -1127,8 +1145,17 @@ fn adminDurabilityDecision(decision: primary_mod.DurabilityDecision) !admin_api.
 
 fn adminReadDecision(decision: read_gate.Decision) !admin_api.HAReadDecision {
     return .{
-        .action = @tagName(decision.action),
-        .consistency = @tagName(decision.consistency),
+        .action = switch (decision.action) {
+            .serve_standby => .serve_standby,
+            .wait_for_apply => .wait_for_apply,
+            .wait_for_metadata => .wait_for_metadata,
+            .route_to_primary => .route_to_primary,
+        },
+        .consistency = switch (decision.consistency) {
+            .stale_ok => .stale_ok,
+            .at_least_lsn => .at_least_lsn,
+            .primary => .primary,
+        },
         .required_lsn = if (decision.required_lsn) |value| try adminI64(value) else null,
         .required_metadata_lsn = if (decision.required_metadata_lsn) |value| try adminI64(value) else null,
         .received_lsn = try adminI64(decision.received_lsn),
@@ -1143,8 +1170,18 @@ fn adminReadDecision(decision: read_gate.Decision) !admin_api.HAReadDecision {
 
 fn adminWriteDecision(decision: write_gate.Decision) !admin_api.HAWriteDecision {
     return .{
-        .role = @tagName(decision.role),
-        .action = @tagName(decision.action),
+        .role = switch (decision.role) {
+            .primary => .primary,
+            .standby => .standby,
+            .promoted_standby => .promoted_standby,
+            .fenced_primary => .fenced_primary,
+        },
+        .action = switch (decision.action) {
+            .allow_write => .allow_write,
+            .reject_read_only_standby => .reject_read_only_standby,
+            .open_promoted_primary => .open_promoted_primary,
+            .reject_fenced_primary => .reject_fenced_primary,
+        },
         .identity = try adminIdentity(decision.identity),
         .durable_lsn = try adminI64(decision.durable_lsn),
         .next_lsn = try adminI64(decision.next_lsn),
@@ -1154,9 +1191,22 @@ fn adminWriteDecision(decision: write_gate.Decision) !admin_api.HAWriteDecision 
 
 fn adminOwnerJobDecision(decision: owner_job_gate.Decision) !admin_api.HAOwnerJobDecision {
     return .{
-        .kind = @tagName(decision.kind),
-        .role = @tagName(decision.role),
-        .action = @tagName(decision.action),
+        .kind = switch (decision.kind) {
+            .compaction_publish => .compaction_publish,
+            .derived_effect_writer => .derived_effect_writer,
+            .enrichment_writer => .enrichment_writer,
+            .retention_advance => .retention_advance,
+        },
+        .role = switch (decision.role) {
+            .primary => .primary,
+            .standby => .standby,
+            .promoted_standby => .promoted_standby,
+        },
+        .action = switch (decision.action) {
+            .run => .run,
+            .disable_on_standby => .disable_on_standby,
+            .open_promoted_primary => .open_promoted_primary,
+        },
         .identity = try adminIdentity(decision.identity),
         .durable_lsn = try adminI64(decision.durable_lsn),
         .next_lsn = try adminI64(decision.next_lsn),
@@ -1174,7 +1224,7 @@ fn adminPromotionHandoff(handoff: standby_mod.PromotionHandoff) !admin_api.HAPro
 
 fn adminPrimarySnapshot(alloc: Allocator, snapshot: status_mod.PrimarySnapshot, node_id: []const u8) !admin_api.HAPrimarySnapshot {
     return .{
-        .role = @tagName(snapshot.role),
+        .role = .primary,
         .node_id = node_id,
         .identity = try adminIdentity(snapshot.identity),
         .current_lsn = try adminI64(snapshot.current_lsn),
@@ -1186,7 +1236,7 @@ fn adminPrimarySnapshot(alloc: Allocator, snapshot: status_mod.PrimarySnapshot, 
 
 fn adminStandbySnapshot(snapshot: status_mod.StandbySnapshot, node_id: []const u8) !admin_api.HAStandbySnapshot {
     return .{
-        .role = @tagName(snapshot.role),
+        .role = .standby,
         .node_id = node_id,
         .identity = try adminIdentity(snapshot.identity),
         .received_lsn = try adminI64(snapshot.received_lsn),
@@ -1223,7 +1273,11 @@ fn adminSlotSnapshots(alloc: Allocator, slots: []const status_mod.SlotSnapshot) 
             .apply_lag_lsn = try adminI64(slot.apply_lag_lsn),
             .safe_read_lag_lsn = try adminI64(slot.safe_read_lag_lsn),
             .retention_lag_lsn = try adminI64(slot.retention_lag_lsn),
-            .status = @tagName(slot.status),
+            .status = switch (slot.status) {
+                .healthy => .healthy,
+                .lagging => .lagging,
+                .reseed_required => .reseed_required,
+            },
             .last_error = slot.last_error,
         };
     }
@@ -1251,7 +1305,12 @@ fn adminPromotionAssessment(assessment: status_mod.PromotionAssessment) !admin_a
         .caught_up_to_received = assessment.caught_up_to_received,
         .fencing_confirmed = assessment.fencing_confirmed,
         .force = assessment.force,
-        .mode = @tagName(assessment.mode),
+        .mode = switch (assessment.mode) {
+            .blocked => .blocked,
+            .safe => .safe,
+            .forced => .forced,
+            .lossy => .lossy,
+        },
         .data_loss_possible = assessment.data_loss_possible,
         .safe = assessment.safe,
         .requires_fencing = assessment.requires_fencing,
@@ -1262,8 +1321,24 @@ fn adminPromotionAssessment(assessment: status_mod.PromotionAssessment) !admin_a
 
 fn adminRejoinAssessment(assessment: rejoin.Assessment) !admin_api.HARejoinAssessment {
     return .{
-        .action = @tagName(assessment.action),
-        .reason = @tagName(assessment.reason),
+        .action = switch (assessment.action) {
+            .reject_unfenced => .reject_unfenced,
+            .already_current => .already_current,
+            .rewind => .rewind,
+            .reseed => .reseed,
+        },
+        .reason = switch (assessment.reason) {
+            .no_fence => .no_fence,
+            .current_timeline => .current_timeline,
+            .parent_timeline_retained => .parent_timeline_retained,
+            .parent_timeline_wal_expired => .parent_timeline_wal_expired,
+            .incompatible_timeline => .incompatible_timeline,
+            .wrong_old_primary => .wrong_old_primary,
+            .wrong_cluster => .wrong_cluster,
+            .wrong_shard => .wrong_shard,
+            .wrong_table => .wrong_table,
+            .local_lsn_before_fork => .local_lsn_before_fork,
+        },
         .former_node_id = assessment.former_node_id,
         .target_timeline_id = try adminI64(assessment.target_timeline_id),
         .target_epoch = try adminI64(assessment.target_epoch),
@@ -1361,10 +1436,10 @@ fn slotListDocuments(alloc: Allocator, snapshot: status_mod.PrimarySnapshot) ![]
 
 fn slotActionDocument(
     action_id: []const u8,
-    action_kind: []const u8,
+    action_kind: admin_api.HAActionReceiptActionKind,
     target: []const u8,
     node_id: []const u8,
-    action: []const u8,
+    action: admin_api.HAReplicationSlotActionResponseSlotAction,
     slot: anytype,
     dropped: ?bool,
 ) !admin_api.HAReplicationSlotActionResponse {
@@ -1374,7 +1449,7 @@ fn slotActionDocument(
             .action_id = action_id,
             .action_kind = action_kind,
             .target = target,
-            .state = "applied",
+            .state = .applied,
             .node_id = node_id,
         },
         .slot_action = action,
@@ -1522,7 +1597,7 @@ const OwnerJobGateRequest = struct {
 };
 
 fn syncPolicyFromOpenApi(policy: admin_api.HASyncPolicy) !primary_mod.SyncPolicy {
-    const selection = if (policy.selection) |raw| try parseStandbySelectionQuery(raw) else .any;
+    const selection = if (policy.selection) |raw| try parseStandbySelectionQuery(@tagName(raw)) else .any;
     const standby_names = policy.standby_names orelse &.{};
     if (selection == .all and (policy.required != null or standby_names.len == 0)) return error.InvalidAdminRequest;
     const required = if (selection == .all) standby_names.len else if (policy.required) |value| blk: {
@@ -1535,17 +1610,17 @@ fn syncPolicyFromOpenApi(policy: admin_api.HASyncPolicy) !primary_mod.SyncPolicy
     }
 
     return .{
-        .mode = try parseDurabilityModeQuery(policy.mode),
+        .mode = try parseDurabilityModeQuery(@tagName(policy.mode)),
         .selection = selection,
         .required = required,
         .standby_names = standby_names,
-        .failure_policy = if (policy.failure_policy) |raw| try parseFailurePolicyQuery(raw) else .block,
+        .failure_policy = if (policy.failure_policy) |raw| try parseFailurePolicyQuery(@tagName(raw)) else .block,
     };
 }
 
 fn readRequestFromOpenApi(request: admin_api.ReadCheckRequest) !read_gate.Request {
     return .{
-        .consistency = if (request.consistency) |raw| try parseReadConsistency(raw) else .stale_ok,
+        .consistency = if (request.consistency) |raw| try parseReadConsistency(@tagName(raw)) else .stale_ok,
         .required_lsn = if (request.required_lsn) |value| try uint64FromJson(value) else null,
         .required_metadata_lsn = if (request.required_metadata_lsn) |value| try uint64FromJson(value) else null,
         .metadata_applied_lsn = if (request.metadata_applied_lsn) |value| try uint64FromJson(value) else null,
@@ -1554,7 +1629,7 @@ fn readRequestFromOpenApi(request: admin_api.ReadCheckRequest) !read_gate.Reques
 
 fn writeRequestFromOpenApi(request: admin_api.WriteCheckRequest) !WriteGateRequest {
     return .{
-        .role = try parseGateRole(request.role),
+        .role = try parseGateRole(@tagName(request.role)),
         .request = .{
             .expected_identity = if (request.expected_identity) |identity| try adminIdentityFromOpenApi(identity) else null,
         },
@@ -1563,9 +1638,9 @@ fn writeRequestFromOpenApi(request: admin_api.WriteCheckRequest) !WriteGateReque
 
 fn ownerJobRequestFromOpenApi(request: admin_api.OwnerJobCheckRequest) !OwnerJobGateRequest {
     return .{
-        .role = try parseGateRole(request.role),
+        .role = try parseGateRole(@tagName(request.role)),
         .request = .{
-            .kind = try parseOwnerJobKind(request.kind),
+            .kind = try parseOwnerJobKind(@tagName(request.kind)),
             .expected_identity = if (request.expected_identity) |identity| try adminIdentityFromOpenApi(identity) else null,
         },
     };
@@ -1594,8 +1669,8 @@ fn parseOwnerJobKind(raw: []const u8) !owner_job_gate.JobKind {
 
 fn appendOptionsFromOpenApi(request: admin_api.CommitAppendRequest) !primary_mod.AppendOptions {
     return .{
-        .kind = if (request.kind) |raw| try parseRecordKind(raw) else .batch_mutation,
-        .payload_codec = if (request.payload_codec) |raw| try parsePayloadCodec(raw) else .raw,
+        .kind = if (request.kind) |raw| try parseRecordKind(@tagName(raw)) else .batch_mutation,
+        .payload_codec = if (request.payload_codec) |raw| try parsePayloadCodec(@tagName(raw)) else .raw,
         .shard_id = if (request.shard_id) |value| try uint64FromJson(value) else null,
         .table_id = if (request.table_id) |value| try uint64FromJson(value) else null,
         .commit_timestamp_ns = request.commit_timestamp_ns orelse 0,
@@ -3463,27 +3538,27 @@ test "storage.ha http admin decodes sync policy query values" {
 
 test "storage.ha http admin decodes OpenAPI ALL sync policy" {
     const all_policy = try syncPolicyFromOpenApi(.{
-        .mode = "remote_apply",
-        .selection = "all",
+        .mode = .remote_apply,
+        .selection = .all,
         .standby_names = &.{ "standby-a", "standby-b" },
     });
     try std.testing.expectEqual(primary_mod.StandbySelection.all, all_policy.selection);
     try std.testing.expectEqual(@as(usize, 2), all_policy.required);
 
     try std.testing.expectError(error.InvalidAdminRequest, syncPolicyFromOpenApi(.{
-        .mode = "remote_apply",
-        .selection = "all",
+        .mode = .remote_apply,
+        .selection = .all,
         .required = 1,
         .standby_names = &.{"standby-a"},
     }));
     try std.testing.expectError(error.InvalidAdminRequest, syncPolicyFromOpenApi(.{
-        .mode = "remote_apply",
-        .selection = "all",
+        .mode = .remote_apply,
+        .selection = .all,
         .standby_names = &.{},
     }));
     try std.testing.expectError(error.InvalidAdminRequest, syncPolicyFromOpenApi(.{
-        .mode = "remote_apply",
-        .selection = "any",
+        .mode = .remote_apply,
+        .selection = .any,
         .standby_names = &.{"standby bad"},
     }));
 }
@@ -3491,7 +3566,7 @@ test "storage.ha http admin decodes OpenAPI ALL sync policy" {
 test "storage.ha http admin preserves omitted commit append shard and table defaults" {
     const implicit = try appendOptionsFromOpenApi(.{
         .payload = "implicit",
-        .sync_policy = .{ .mode = "async" },
+        .sync_policy = .{ .mode = .async },
     });
     try std.testing.expect(implicit.shard_id == null);
     try std.testing.expect(implicit.table_id == null);
@@ -3500,7 +3575,7 @@ test "storage.ha http admin preserves omitted commit append shard and table defa
         .payload = "explicit",
         .shard_id = 0,
         .table_id = 20,
-        .sync_policy = .{ .mode = "async" },
+        .sync_policy = .{ .mode = .async },
     });
     try std.testing.expectEqual(@as(?u64, 0), explicit.shard_id);
     try std.testing.expectEqual(@as(?u64, 20), explicit.table_id);

@@ -6500,6 +6500,47 @@ That SQL shape lowers to a table-owned `relational_indexes` entry with
 columns; it is a schema-derived fact/doc-set capability, not a scalar
 `ordered_tuple` index.
 
+The relational algebraic physical namespace is owned by the relational index
+generation, not by ad hoc query text. Keys are component-encoded under the
+algebraic index namespace and include the algebraic index name, physical format
+version, logical row family, and the family-specific identity. The logical row
+families are:
+
+- Dictionary rows: `lexicon | dictionary_identity | label` and optional
+  dictionary summary rows such as `lexicon_fst | dictionary_identity`.
+  `dictionary_identity` is a canonical tuple containing dictionary version,
+  scope, field or path, label kind, analyzer or canonicalization policy, value
+  kind, and coercion policy. Analyzer-backed text dictionaries, canonical scalar
+  dictionaries, path dictionaries, and graph-label dictionaries therefore share
+  a collision-resistant identity without encoding backend implementation names
+  in the relational catalog.
+- Fact rows: `docfact | doc_key`, plus lookup rows such as
+  `docfact_scalar | role | field | scalar | doc_key`,
+  `docfact_scalar_ord | role | field | scalar | doc_ordinal`,
+  `docfact_field | role | field | doc_key`, and
+  `docfact_field_ord | role | field | doc_ordinal`. These rows are derived only
+  from committed packed relational rows and must be regenerated from the row
+  source during rebuild or repair.
+- Path rows: `pathfact | doc_key`, `pathfact_ord | doc_ordinal`, and lookup
+  rows such as `path_lookup | path | kind | value | doc_key` and
+  `path_lookup_ord | path | kind | value | doc_ordinal`. Promoted path
+  materializations add the materialization id ahead of the path component:
+  `promoted_path_lookup | materialization_id | path | kind | value | doc_key`.
+- Posting rows: `postings | dictionary_identity | label | doc_key` and
+  `postings_ord | dictionary_identity | label | doc_ordinal`. Posting rows are
+  the doc-set producing surface for equality and prefix-like algebraic
+  selectors; trie/FST/bitmap backends may accelerate the dictionary or posting
+  scan only if they preserve the same dictionary identity, generation,
+  visibility, and authoritative row-recheck contract.
+
+All algebraic dictionary, fact, path, and posting rows are generation-scoped by
+the owning `relational_indexes` entry. Query planning may use them only when
+the catalog generation record is valid and ready for the covered owner range.
+Foreground writes may maintain non-ready `building` or `catching_up` generations
+only as convergence work; stale, invalid, dropping, failed, or malformed
+generation records fail closed and must be rebuilt or repaired from committed
+rows before becoming plannable.
+
 When users request explicit algebraic materializations, the catalog should lower
 them to native grouped folds or expression folds over the committed `RowSource`.
 That keeps SQL aggregates, migration backfills, embedded-JSON projections, REST

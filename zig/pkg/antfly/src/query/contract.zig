@@ -2044,7 +2044,7 @@ pub fn parseQueryRequest(
     req.graph_metric_queries = try parseGraphMetricQueriesAlloc(alloc, body);
     req.graph_metric_rerank = try parseGraphMetricRerankAlloc(alloc, body);
     if (request.expand_strategy) |expand_strategy| {
-        req.expand_strategy = try parseExpandStrategy(expand_strategy);
+        req.expand_strategy = expandStrategy(expand_strategy);
     }
 
     return .{
@@ -2111,7 +2111,7 @@ fn buildPreflightSearchRequestAlloc(
     req.sparse_queries = vector_queries.sparse;
     req.graph_queries = try buildGraphQueries(alloc, request);
     if (request.expand_strategy) |expand_strategy| {
-        req.expand_strategy = try parseExpandStrategy(expand_strategy);
+        req.expand_strategy = expandStrategy(expand_strategy);
     }
 
     return .{
@@ -3261,11 +3261,12 @@ fn parseAlgebraicAggregationJoinAlloc(
 ) !db_mod.algebraic.ir.JoinRef {
     if (join.name.len == 0 or join.group_side.len == 0 or join.measure_side.len == 0) return error.InvalidQueryRequest;
     const kind: db_mod.algebraic.join.TemporalMode = if (join.kind) |value| blk: {
-        if (std.mem.eql(u8, value, "none")) break :blk .none;
-        if (std.mem.eql(u8, value, "bucket")) break :blk .bucket;
-        if (std.mem.eql(u8, value, "window")) break :blk .window;
-        if (std.mem.eql(u8, value, "bucket_window")) break :blk .bucket_window;
-        return error.InvalidQueryRequest;
+        break :blk switch (value) {
+            .none => .none,
+            .bucket => .bucket,
+            .window => .window,
+            .bucket_window => .bucket_window,
+        };
     } else .none;
     return .{
         .name = try alloc.dupe(u8, join.name),
@@ -3599,6 +3600,25 @@ fn graphMetricPhaseName(phase: graph_mod.GraphIndex.GraphMetricBuildPhase) []con
     };
 }
 
+fn graphMetricStatusPhase(phase: graph_mod.GraphIndex.GraphMetricBuildPhase) indexes_openapi.GraphMetricStatusPhase {
+    return switch (phase) {
+        .idle => .idle,
+        .computing => .computing,
+        .publishing => .publishing,
+        .complete => .complete,
+        .prepare_generation => .prepare_generation,
+        .scan_edges_and_out_degree => .scan_edges_and_out_degree,
+        .initialize_ranks => .initialize_ranks,
+        .iterate_contributions => .iterate_contributions,
+        .reduce_ranks => .reduce_ranks,
+        .hits_hub_contributions => .hits_hub_contributions,
+        .hits_hub_reduce_ranks => .hits_hub_reduce_ranks,
+        .check_convergence => .check_convergence,
+        .publish_generation => .publish_generation,
+        .cleanup_old_generations => .cleanup_old_generations,
+    };
+}
+
 fn toOpenApiGraphMetricStatusMap(
     alloc: std.mem.Allocator,
     statuses: []const db_mod.types.GraphMetricStatus,
@@ -3618,7 +3638,7 @@ fn toOpenApiGraphMetricStatus(
 ) !indexes_openapi.GraphMetricStatus {
     return .{
         .state = graphMetricStateName(status.state),
-        .phase = graphMetricPhaseName(status.phase),
+        .phase = graphMetricStatusPhase(status.phase),
         .edge_filter = toOpenApiGraphMetricEdgeFilterStatus(status.edge_filter),
         .metadata_version = @intCast(status.metadata_version),
         .maintenance_paused = status.maintenance_paused,
@@ -3661,8 +3681,8 @@ fn toOpenApiGraphMetricBuildPageStatuses(
             .phase = graphMetricPhaseName(page.phase),
             .iteration = @intCast(page.iteration),
             .page_id = saturatingI64(page.page_id),
-            .state = @tagName(page.state),
-            .range_kind = @tagName(page.range_kind),
+            .state = std.meta.stringToEnum(indexes_openapi.GraphMetricBuildPageStatusState, @tagName(page.state)) orelse return error.InvalidQueryRequest,
+            .range_kind = std.meta.stringToEnum(indexes_openapi.GraphMetricBuildPageStatusRangeKind, @tagName(page.range_kind)) orelse return error.InvalidQueryRequest,
             .worker_id = if (page.worker_id.len > 0) page.worker_id else null,
             .lease_expires_at_ms = saturatingI64(page.lease_expires_at_ms),
             .attempt = saturatingI64(page.attempt),
@@ -3699,7 +3719,7 @@ fn toOpenApiGraphMetricEventValue(
 ) indexes_openapi.GraphMetricEvent {
     return .{
         .sequence = saturatingI64(event.sequence),
-        .kind = graphMetricEventKindName(event.kind),
+        .kind = graphMetricEventKind(event.kind),
         .at_ms = saturatingI64(event.at_ms),
         .target_edge_generation = saturatingI64(event.target_edge_generation),
         .published_generation = saturatingI64(event.published_generation),
@@ -3707,13 +3727,13 @@ fn toOpenApiGraphMetricEventValue(
     };
 }
 
-fn graphMetricEventKindName(kind: graph_mod.GraphIndex.GraphMetricEventKind) []const u8 {
+fn graphMetricEventKind(kind: graph_mod.GraphIndex.GraphMetricEventKind) indexes_openapi.GraphMetricEventKind {
     return switch (kind) {
-        .publish => "publish",
-        .delete => "delete",
-        .pause => "pause",
-        .@"resume" => "resume",
-        .failed => "failed",
+        .publish => .publish,
+        .delete => .delete,
+        .pause => .pause,
+        .@"resume" => .@"resume",
+        .failed => .failed,
     };
 }
 
@@ -3735,8 +3755,17 @@ fn toOpenApiGraphMetricEdgeFilterStatus(
     filter: graph_mod.GraphMetricEdgeFilter,
 ) indexes_openapi.GraphMetricEdgeFilterStatus {
     return .{
-        .mode = @tagName(filter.mode),
+        .mode = graphMetricEdgeFilterStatusMode(filter.mode),
         .types = if (filter.mode == .types and filter.types.len > 0) filter.types else null,
+    };
+}
+
+fn graphMetricEdgeFilterStatusMode(
+    mode: graph_mod.GraphMetricEdgeFilterMode,
+) indexes_openapi.GraphMetricEdgeFilterStatusMode {
+    return switch (mode) {
+        .all => .all,
+        .types => .types,
     };
 }
 
@@ -4590,8 +4619,35 @@ fn parseSupportedFullTextQuery(alloc: std.mem.Allocator, query: std.json.Value, 
         return error.UnsupportedQueryRequest;
     }
     _ = limit;
+    if (query.object.get("query")) |query_text| {
+        if (query_text != .string) return error.InvalidQueryRequest;
+        return try parseQueryStringTextQuery(
+            alloc,
+            query_text.string,
+            try parseOptionalQueryStringBoost(query.object.get("boost")),
+            try parseOptionalQueryStringDefaultOperator(query.object.get("default_operator")),
+        );
+    }
     if (try parseDirectDslTextQuery(alloc, query)) |direct| return direct;
     return try parseGeneratedBleveTextQuery(alloc, query);
+}
+
+fn parseOptionalQueryStringBoost(value: ?std.json.Value) !f32 {
+    const raw = value orelse return 1.0;
+    return switch (raw) {
+        .integer => |integer| @floatFromInt(integer),
+        .float => |float| @floatCast(float),
+        .number_string => |text| std.fmt.parseFloat(f32, text) catch return error.UnsupportedQueryRequest,
+        else => error.UnsupportedQueryRequest,
+    };
+}
+
+fn parseOptionalQueryStringDefaultOperator(value: ?std.json.Value) !?[]const u8 {
+    const raw = value orelse return null;
+    return switch (raw) {
+        .string => |text| text,
+        else => error.UnsupportedQueryRequest,
+    };
 }
 
 fn parseDirectDslTextQuery(alloc: std.mem.Allocator, query: std.json.Value) anyerror!?db_mod.types.TextQuery {
@@ -5027,7 +5083,7 @@ fn parseGeneratedBleveQueryValue(alloc: std.mem.Allocator, query: query_openapi.
         .multi_match_query => |multi_match| try public_text_query_mod.parseMultiMatchBoolPrefixQueryAlloc(
             alloc,
             multi_match.multi_match.query,
-            multi_match.multi_match.type,
+            multiMatchBodyTypeName(multi_match.multi_match.type),
             multi_match.multi_match.fields,
             if (multi_match.multi_match.boost) |boost| @floatCast(boost) else 1.0,
         ),
@@ -5568,7 +5624,7 @@ fn parseGraphQuery(
         if (fields.len > 0) alloc.free(fields);
     }
     const metric_freshness = if (query.metric_freshness) |freshness|
-        try parseGraphMetricFreshnessString(freshness)
+        graphMetricFreshness(freshness)
     else
         graph_query_mod.GraphMetricFreshness.published;
     const metrics = if (query.metrics) |requested_metrics|
@@ -5631,6 +5687,19 @@ fn parseGraphMetricFreshnessString(value: []const u8) !graph_query_mod.GraphMetr
     return error.InvalidQueryRequest;
 }
 
+fn multiMatchBodyTypeName(value: query_openapi.MultiMatchBodyType) []const u8 {
+    return switch (value) {
+        .bool_prefix => "bool_prefix",
+    };
+}
+
+fn graphMetricFreshness(value: indexes_openapi.GraphQueryMetricFreshness) graph_query_mod.GraphMetricFreshness {
+    return switch (value) {
+        .published => .published,
+        .fresh => .fresh,
+    };
+}
+
 fn parseGraphMetricReads(
     alloc: std.mem.Allocator,
     values: []const []const u8,
@@ -5668,8 +5737,8 @@ fn parseGraphMetricOrders(
         if (value.metric.len == 0) return error.InvalidQueryRequest;
         out[i] = .{
             .name = try alloc.dupe(u8, value.metric),
-            .direction = try parseGraphMetricOrderDirection(value.direction orelse "desc"),
-            .nulls = try parseGraphMetricNullOrder(value.nulls orelse "last"),
+            .direction = graphMetricOrderDirection(value.direction orelse .desc),
+            .nulls = graphMetricNullOrder(value.nulls orelse .last),
             .freshness = freshness,
         };
         initialized += 1;
@@ -5677,10 +5746,24 @@ fn parseGraphMetricOrders(
     return out;
 }
 
+fn graphMetricOrderDirection(value: indexes_openapi.GraphMetricOrderDirection) graph_query_mod.GraphMetricOrderDirection {
+    return switch (value) {
+        .asc => .asc,
+        .desc => .desc,
+    };
+}
+
 fn parseGraphMetricOrderDirection(value: []const u8) !graph_query_mod.GraphMetricOrderDirection {
     if (std.mem.eql(u8, value, "asc")) return .asc;
     if (std.mem.eql(u8, value, "desc")) return .desc;
     return error.InvalidQueryRequest;
+}
+
+fn graphMetricNullOrder(value: indexes_openapi.GraphMetricOrderNulls) graph_query_mod.GraphMetricNullOrder {
+    return switch (value) {
+        .first, .nulls_first => .first,
+        .last, .nulls_last => .last,
+    };
 }
 
 fn parseGraphMetricNullOrder(value: []const u8) !graph_query_mod.GraphMetricNullOrder {
@@ -5704,13 +5787,24 @@ fn parseGraphMetricFilters(
         if (value.metric.len == 0) return error.InvalidQueryRequest;
         out[i] = .{
             .name = try alloc.dupe(u8, value.metric),
-            .op = try parseGraphMetricFilterOp(value.op),
+            .op = graphMetricFilterOp(value.op),
             .value = value.value,
             .freshness = freshness,
         };
         initialized += 1;
     }
     return out;
+}
+
+fn graphMetricFilterOp(value: indexes_openapi.GraphMetricFilterOp) graph_query_mod.GraphMetricFilterOp {
+    return switch (value) {
+        .@">" => .gt,
+        .@">=" => .gte,
+        .@"<" => .lt,
+        .@"<=" => .lte,
+        .@"=", .@"==" => .eq,
+        .@"!=" => .neq,
+    };
 }
 
 fn parseGraphMetricFilterOp(value: []const u8) !graph_query_mod.GraphMetricFilterOp {
@@ -5873,6 +5967,13 @@ fn parseExpandStrategy(text: []const u8) !graph_query_mod.ExpandStrategy {
     if (std.mem.eql(u8, text, "union")) return .@"union";
     if (std.mem.eql(u8, text, "intersection")) return .intersection;
     return error.UnsupportedQueryRequest;
+}
+
+fn expandStrategy(value: metadata_openapi.QueryRequestExpandStrategy) graph_query_mod.ExpandStrategy {
+    return switch (value) {
+        .@"union" => .@"union",
+        .intersection => .intersection,
+    };
 }
 
 fn appendUniqueOwnedString(

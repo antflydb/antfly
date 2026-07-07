@@ -600,14 +600,14 @@ const Connection = struct {
         }
         try cursor.expectEnd();
 
-        const owned_portal_source = try self.alloc.dupe(u8, statement.parsed_sql.sql());
-        var source_transferred = false;
-        errdefer if (!source_transferred) self.alloc.free(owned_portal_source);
-        var portal_parsed_sql = try sql_adapter.ParsedSql.initFromTokenSliceAlloc(self.alloc, owned_portal_source, statement.parsed_sql.items());
+        var portal_parsed_sql = try statement.parsed_sql.cloneWithOwnedSqlAlloc(self.alloc);
         var parsed_transferred = false;
-        errdefer if (!parsed_transferred) portal_parsed_sql.deinit(self.alloc);
+        errdefer if (!parsed_transferred) {
+            const owned_portal_source = portal_parsed_sql.sql();
+            portal_parsed_sql.deinit(self.alloc);
+            self.alloc.free(@constCast(owned_portal_source));
+        };
         try self.setPortal(portal_name, .{ .parsed_sql = portal_parsed_sql, .params = params, .result_formats = result_formats });
-        source_transferred = true;
         parsed_transferred = true;
         params_transferred = true;
         result_formats_transferred = true;

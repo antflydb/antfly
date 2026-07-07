@@ -44,6 +44,7 @@ pub const UniquePredicateWhereExpressionParserOptions = struct {
 };
 
 pub const ExpressionWhereConditionRowParserOptions = struct {
+    params: []const value_mod.SqlValue = &.{},
     select_context_hooks: ?expr_row_parse.SelectParserContextHooks = null,
     joined_context_hooks: ?expr_row_parse.JoinedExpressionParserContextHooks = null,
     generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst = null,
@@ -75,7 +76,8 @@ fn parseExpressionWhereConditionRowExpressionAlloc(
     );
     errdefer freeExpression(alloc, expression);
     if (options.require_exact_generated_expression) {
-        try expr_generated_validate.validateGeneratedRowExpressionIdentityStrict(
+        try expr_generated_validate.validateGeneratedRowExpressionIdentityStrictWithContext(
+            .{ .alloc = alloc, .params = options.params },
             tokens,
             start,
             pos.*,
@@ -234,6 +236,7 @@ pub fn parseExpressionNotWhereWithGeneratedAlloc(
             var hooks_with_generated = hooks;
             if (generated_expression_ast != null) {
                 hooks_with_generated.generated_expression_ast = try expr_generated_validate.generatedPredicateExpressionAtStart(tokens, pos.*, generated_expression_ast);
+                hooks_with_generated.require_exact_generated_expression = true;
             }
             try parseExpressionWhereConditionAlternativesAlloc(
                 alloc,
@@ -444,6 +447,7 @@ pub fn parseExpressionWhereConditionsWithTableQualifiersAlloc(
     const context = options.context_hooks.get_context(options.context_hooks.ptr);
     var condition_hooks = options.condition_hooks;
     condition_hooks.generated_expression_ast = options.generated_expression_ast;
+    condition_hooks.require_exact_generated_expression = options.generated_expression_ast != null;
     return try parseExpressionWhereConditionsAlloc(
         alloc,
         tokens,
@@ -510,6 +514,7 @@ pub fn parseExpressionOrWhereWithGeneratedAlloc(
                 var hooks_with_generated = hooks;
                 if (generated_expression_ast != null) {
                     hooks_with_generated.generated_expression_ast = try expr_generated_validate.generatedPredicateExpressionAtStart(tokens, pos.*, generated_expression_ast);
+                    hooks_with_generated.require_exact_generated_expression = true;
                 }
                 try parseExpressionWhereConditionAlternativesAlloc(
                     alloc,

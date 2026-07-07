@@ -22,6 +22,7 @@ const docstore_mod = @import("../docstore.zig");
 const doc_set = @import("doc_set.zig");
 const db_query_projection = @import("query/projection.zig");
 const internal_keys = @import("../internal_keys.zig");
+const doc_identity = @import("doc_identity.zig");
 const mapper = @import("document_mapper.zig");
 const platform_clock = @import("../../platform/clock.zig");
 const relational_collation = @import("relational_collation.zig");
@@ -543,6 +544,7 @@ pub const QueryCandidate = struct {
     json: []u8,
     version: u64 = 0,
     order_keys: []QueryOrderKey = &.{},
+    text_score: ?f32 = null,
     ordinal: usize,
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
@@ -552,6 +554,26 @@ pub const QueryCandidate = struct {
         self.* = undefined;
     }
 };
+
+fn cloneQueryCandidateAlloc(
+    alloc: Allocator,
+    candidate: QueryCandidate,
+) !QueryCandidate {
+    const doc_key = try alloc.dupe(u8, candidate.doc_key);
+    errdefer alloc.free(doc_key);
+    const json = try alloc.dupe(u8, candidate.json);
+    errdefer alloc.free(json);
+    const order_keys = try cloneQueryOrderKeysAlloc(alloc, candidate.order_keys);
+    errdefer freeQueryOrderKeySlice(alloc, order_keys);
+    return .{
+        .doc_key = doc_key,
+        .json = json,
+        .version = candidate.version,
+        .order_keys = order_keys,
+        .text_score = candidate.text_score,
+        .ordinal = candidate.ordinal,
+    };
+}
 
 pub const OutputRowOrderCandidate = struct {
     index: usize,
@@ -564,12 +586,52 @@ pub const OutputRowOrderCandidate = struct {
     }
 };
 
+const relational_rows_text_score_field = "_score";
+const relational_rows_text_snippet_field = "_snippet";
+const relational_rows_text_highlight_field = "_highlight";
+
+fn isRelationalRowsTextScoreField(field: []const u8) bool {
+    return std.mem.eql(u8, field, relational_rows_text_score_field);
+}
+
+fn isRelationalRowsReservedTextProjectionField(field: []const u8) bool {
+    return isRelationalRowsTextScoreField(field) or
+        std.mem.eql(u8, field, relational_rows_text_snippet_field) or
+        std.mem.eql(u8, field, relational_rows_text_highlight_field);
+}
+
+fn relationalRowsQuerySelectsTextScore(req: types.RelationalRowsQueryRequest) bool {
+    if (req.select_all) return false;
+    for (req.select) |field| {
+        if (isRelationalRowsTextScoreField(field)) return true;
+    }
+    return false;
+}
+
+fn relationalRowsQuerySelectsReservedTextProjection(req: types.RelationalRowsQueryRequest) bool {
+    if (req.select_all) return false;
+    for (req.select) |field| {
+        if (isRelationalRowsReservedTextProjectionField(field)) return true;
+    }
+    return false;
+}
+
 pub const QuerySortContext = struct {
     order_by: []const types.RelationalRowsQueryOrder,
 };
 
 pub fn queryCandidateLessThan(ctx: QuerySortContext, lhs: QueryCandidate, rhs: QueryCandidate) bool {
-    return queryOrderedCandidatesLessThan(ctx.order_by, lhs.order_keys, lhs.ordinal, rhs.order_keys, rhs.ordinal);
+    for (ctx.order_by, 0..) |order, i| {
+        const comparison = compareQueryOrderKeysWithCollation(lhs.order_keys[i], rhs.order_keys[i], order.collation);
+        if (comparison == .eq) continue;
+        return switch (order.direction) {
+            .asc => comparison == .lt,
+            .desc => comparison == .gt,
+        };
+    }
+    if (lhs.doc_key.len != 0 and rhs.doc_key.len != 0 and !std.mem.eql(u8, lhs.doc_key, rhs.doc_key))
+        return std.mem.lessThan(u8, lhs.doc_key, rhs.doc_key);
+    return lhs.ordinal < rhs.ordinal;
 }
 
 pub fn outputRowOrderCandidateLessThan(ctx: QuerySortContext, lhs: OutputRowOrderCandidate, rhs: OutputRowOrderCandidate) bool {
@@ -1467,6 +1529,37 @@ fn queryFromSourceRowsWithSyntheticPrefixAndColumnsAlloc(
     defer freeResolvedQueryOrdersWithSourceCollations(alloc, order_by);
     local_req.order_by = order_by;
 
+    if (sourceRowsCanUseCountOnlyResult(local_req)) {
+        var total: u32 = 0;
+        for (source_rows) |row_json| {
+            if (try queryJsonMatchesRequestWithColumns(alloc, row_json, local_req, source_columns, now_ns)) {
+                total = std.math.add(u32, total, 1) catch return error.UnsupportedQueryRequest;
+            }
+        }
+        return .{
+            .rows = &.{},
+            .total = total,
+            .total_exact = true,
+            .include_profile = local_req.profile,
+            .profile = .{
+                .total_mode = local_req.total_mode,
+                .count_only = true,
+            },
+        };
+    }
+
+    if (sourceRowsCanUseBoundedSortedResult(local_req)) {
+        return try queryFromSourceRowsBoundedSortedWithColumnsAlloc(
+            alloc,
+            source_name,
+            source_rows,
+            source_columns,
+            local_req,
+            synthetic_prefix,
+            now_ns,
+        );
+    }
+
     var rows = std.ArrayListUnmanaged(QueryCandidate).empty;
     defer {
         for (rows.items) |*row| row.deinit(alloc);
@@ -1480,6 +1573,186 @@ fn queryFromSourceRowsWithSyntheticPrefixAndColumnsAlloc(
     }
 
     return try buildQueryResultFromCandidatesWithColumnsStaticAlloc(alloc, local_req, rows.items, source_columns, now_ns);
+}
+
+fn sourceRowsCanUseCountOnlyResult(req: types.RelationalRowsQueryRequest) bool {
+    return req.total_mode == .exact and
+        req.limit != null and
+        req.limit.? == 0 and
+        req.row_claim == null and
+        !queryHasDistinctOn(req);
+}
+
+fn sourceRowsCanUseBoundedSortedResult(req: types.RelationalRowsQueryRequest) bool {
+    return req.order_by.len != 0 and
+        req.limit != null and
+        req.limit.? > 0 and
+        req.row_claim == null and
+        !queryHasDistinctOn(req) and
+        req.scalar_subqueries.len == 0;
+}
+
+fn sourceRowsBoundedSortedRetainedLimit(req: types.RelationalRowsQueryRequest) !usize {
+    return std.math.add(usize, @as(usize, req.offset), @as(usize, req.limit orelse return error.UnsupportedQueryRequest)) catch error.UnsupportedQueryRequest;
+}
+
+fn queryFromSourceRowsBoundedSortedWithColumnsAlloc(
+    alloc: Allocator,
+    source_name: []const u8,
+    source_rows: []const []const u8,
+    source_columns: []const schema_mod.RelationalColumn,
+    req: types.RelationalRowsQueryRequest,
+    synthetic_prefix: []const u8,
+    now_ns: u64,
+) !types.RelationalRowsQueryResult {
+    var acc = BoundedSortedSourceRowsAccumulator{
+        .req = req,
+        .retained_limit = try sourceRowsBoundedSortedRetainedLimit(req),
+        .profile = .{
+            .access_method = .base_scan,
+            .total_mode = req.total_mode,
+            .base_scan_rows = @intCast(source_rows.len),
+            .candidate_rows = @intCast(source_rows.len),
+        },
+    };
+    errdefer acc.deinit(alloc);
+
+    for (source_rows, 0..) |row_json, ordinal| {
+        if (!(try queryJsonMatchesRequestWithColumns(alloc, row_json, req, source_columns, now_ns))) continue;
+        acc.profile.candidate_stream_emitted += 1;
+        try acc.appendRow(alloc, source_name, row_json, synthetic_prefix, ordinal, now_ns);
+    }
+
+    return try acc.toResult(alloc, now_ns);
+}
+
+const BoundedSortedSourceRowsAccumulator = struct {
+    req: types.RelationalRowsQueryRequest,
+    retained_limit: usize,
+    rows: std.ArrayListUnmanaged(QueryCandidate) = .empty,
+    total: u32 = 0,
+    profile: types.RelationalRowsQueryResult.Profile = .{},
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        for (self.rows.items) |*row| row.deinit(alloc);
+        self.rows.deinit(alloc);
+        self.* = undefined;
+    }
+
+    fn appendRow(
+        self: *@This(),
+        alloc: Allocator,
+        source_name: []const u8,
+        row_json: []const u8,
+        synthetic_prefix: []const u8,
+        ordinal: usize,
+        now_ns: u64,
+    ) !void {
+        const next_total = std.math.cast(u32, @as(usize, self.total) + 1) orelse return error.UnsupportedQueryRequest;
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidQueryRequest;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidQueryRequest;
+
+        const order_keys = try queryOrderKeysAlloc(alloc, parsed.value, self.req.order_by, now_ns);
+        var order_keys_transferred = false;
+        errdefer if (!order_keys_transferred) freeQueryOrderKeySlice(alloc, order_keys);
+
+        const synthetic_key = try std.fmt.allocPrint(alloc, "{s}:{s}:{d}", .{ synthetic_prefix, source_name, ordinal });
+        var key_transferred = false;
+        errdefer if (!key_transferred) alloc.free(synthetic_key);
+        const materialized = try alloc.dupe(u8, row_json);
+        var materialized_transferred = false;
+        errdefer if (!materialized_transferred) alloc.free(materialized);
+
+        try self.rows.append(alloc, .{
+            .doc_key = synthetic_key,
+            .json = materialized,
+            .version = 0,
+            .order_keys = order_keys,
+            .ordinal = ordinal,
+        });
+        key_transferred = true;
+        materialized_transferred = true;
+        order_keys_transferred = true;
+        self.total = next_total;
+
+        if (self.rows.items.len > self.retained_limit) {
+            std.sort.pdq(QueryCandidate, self.rows.items, QuerySortContext{ .order_by = self.req.order_by }, queryCandidateLessThan);
+            var dropped = self.rows.pop().?;
+            dropped.deinit(alloc);
+        }
+        self.profile.retained_candidate_rows = @max(self.profile.retained_candidate_rows, @as(u64, @intCast(self.rows.items.len)));
+    }
+
+    fn toResult(
+        self: *@This(),
+        alloc: Allocator,
+        now_ns: u64,
+    ) !types.RelationalRowsQueryResult {
+        defer {
+            for (self.rows.items) |*row| row.deinit(alloc);
+            self.rows.deinit(alloc);
+            self.rows = .empty;
+        }
+        std.sort.pdq(QueryCandidate, self.rows.items, QuerySortContext{ .order_by = self.req.order_by }, queryCandidateLessThan);
+        const start = @min(@as(usize, self.req.offset), self.rows.items.len);
+        const limited_len = if (self.req.limit) |limit|
+            @min(@as(usize, limit), self.rows.items.len - start)
+        else
+            self.rows.items.len - start;
+
+        var out_rows = std.ArrayListUnmanaged([]const u8).empty;
+        errdefer {
+            for (out_rows.items) |row| alloc.free(@constCast(row));
+            out_rows.deinit(alloc);
+        }
+        for (self.rows.items[start .. start + limited_len]) |row| {
+            const projected = try projectQueryCandidateStaticAlloc(alloc, row.doc_key, row.json, self.req, now_ns);
+            var projected_transferred = false;
+            errdefer if (!projected_transferred) alloc.free(projected);
+            try out_rows.append(alloc, projected);
+            projected_transferred = true;
+            self.profile.projected_rows += 1;
+        }
+
+        const total_shape = sourceRowsQueryTotalShape(self.total, out_rows.items.len, self.req.offset, self.req.limit, self.req.total_mode);
+        self.profile.refreshUnsupportedReason();
+        return .{
+            .rows = try out_rows.toOwnedSlice(alloc),
+            .total = total_shape.total,
+            .total_exact = total_shape.total_exact,
+            .include_profile = self.req.profile,
+            .profile = self.profile,
+        };
+    }
+};
+
+const SourceRowsQueryTotalShape = struct {
+    total: u32,
+    total_exact: bool,
+};
+
+fn sourceRowsQueryTotalShape(
+    exact_total: u32,
+    returned_len: usize,
+    offset: u32,
+    limit: ?u32,
+    total_mode: types.RelationalRowsQueryRequest.TotalMode,
+) SourceRowsQueryTotalShape {
+    switch (total_mode) {
+        .exact => return .{ .total = exact_total, .total_exact = true },
+        .bounded => {
+            const page_limit = limit orelse return .{ .total = exact_total, .total_exact = true };
+            if (returned_len < @as(usize, page_limit)) return .{ .total = exact_total, .total_exact = true };
+            const bound = @min(@as(u64, exact_total), @as(u64, offset) + @as(u64, page_limit));
+            return .{ .total = @intCast(bound), .total_exact = false };
+        },
+        .none => {
+            const page_limit = limit orelse return .{ .total = exact_total, .total_exact = true };
+            if (returned_len < @as(usize, page_limit)) return .{ .total = exact_total, .total_exact = true };
+            return .{ .total = @intCast(returned_len), .total_exact = false };
+        },
+    }
 }
 
 pub fn queryJsonMatchesRequest(
@@ -1499,7 +1772,7 @@ pub fn queryJsonMatchesRequestWithColumns(
     now_ns: u64,
 ) !bool {
     if (req.subquery_predicates.len != 0) return error.UnsupportedQueryRequest;
-    if (req.predicates.len == 0 and req.array_any.len == 0 and req.array_contains.len == 0 and req.array_eq.len == 0 and req.in_predicates.len == 0 and req.json_contains.len == 0 and req.json_path_eq.len == 0 and req.json_path_exists.len == 0 and req.text_patterns.len == 0 and req.or_predicates.len == 0 and req.not_predicates.len == 0 and req.access_or_predicates.len == 0 and req.access_not_predicates.len == 0 and req.expression_predicates.len == 0 and req.expression_or_predicates.len == 0 and req.expression_not_predicates.len == 0 and req.expression_array_contains.len == 0) return true;
+    if (req.predicates.len == 0 and req.array_any.len == 0 and req.array_contains.len == 0 and req.array_eq.len == 0 and req.in_predicates.len == 0 and req.json_contains.len == 0 and req.json_path_eq.len == 0 and req.json_path_exists.len == 0 and req.text_patterns.len == 0 and req.full_text == null and req.or_predicates.len == 0 and req.not_predicates.len == 0 and req.access_or_predicates.len == 0 and req.access_not_predicates.len == 0 and req.expression_predicates.len == 0 and req.expression_or_predicates.len == 0 and req.expression_not_predicates.len == 0 and req.expression_array_contains.len == 0) return true;
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
@@ -5123,7 +5396,7 @@ fn expectOrderedUniqueEntryAndNoDedicatedOwner(
         return error.TestUnexpectedResult;
     };
     const index = relational_store_mod.relationalIndexForUniqueConstraint(runtime_schema.relational_indexes, constraint, .ordered_tuple) orelse return error.TestUnexpectedResult;
-    if (index.lifecycle != .ready) return error.TestUnexpectedResult;
+    if (!relationalIndexReady(index)) return error.TestUnexpectedResult;
     if (index.keys.len == 0 and constraint.expressions.len == 0) return error.TestUnexpectedResult;
 
     const logical_tuple = (try relational_store_mod.uniqueConstraintTupleValueWithColumnsAlloc(alloc, row_value, constraint, runtime_schema.relational_columns)) orelse return error.TestExpectedEqual;
@@ -5318,6 +5591,16 @@ const OrderedTuplePredicateSetProbe = union(enum) {
 const ordered_tuple_exact_unordered_unpaged_candidate_gate: usize = 32;
 const ordered_tuple_exact_unordered_candidate_page_multiplier: usize = 4;
 const ordered_tuple_bounded_unordered_candidate_gate: usize = 4096;
+const ordered_tuple_candidate_selectivity_threshold_ppm: u64 = 250_000;
+const OrderedTupleCandidateGateKind = enum {
+    materialization_cap,
+    selectivity_budget,
+};
+
+const OrderedTupleCandidateGate = struct {
+    limit: usize,
+    kind: OrderedTupleCandidateGateKind,
+};
 
 fn setRelationalRowsProfileAccessMethod(
     profile: ?*types.RelationalRowsQueryResult.Profile,
@@ -5335,6 +5618,7 @@ fn setRelationalRowsProfileAccessMethod(
             .scalar_doc_set,
             .array_doc_set,
             .json_doc_set,
+            .text_search_doc_set,
             .mixed_doc_set,
             => {
                 if (out.access_method == .unknown or out.access_method == .resolved_doc_set) out.access_method = method;
@@ -5342,6 +5626,10 @@ fn setRelationalRowsProfileAccessMethod(
             .ordered_tuple_doc_set => {
                 if (out.access_method != .ordered_tuple_stream) out.access_method = .ordered_tuple_doc_set;
                 clearRelationalRowsProfileOrderedTupleFallbackOnSelection(out);
+                if (out.fallback_reason == .ordered_tuple_order_field_not_covered) {
+                    out.fallback_reason = .none;
+                    out.refreshUnsupportedReason();
+                }
             },
             .ordered_tuple_stream => {
                 out.access_method = .ordered_tuple_stream;
@@ -5355,15 +5643,17 @@ fn clearRelationalRowsProfileOrderedTupleFallbackOnSelection(
     profile: *types.RelationalRowsQueryResult.Profile,
 ) void {
     switch (profile.fallback_reason) {
-        .ordered_tuple_ordering_not_covered,
         .ordered_tuple_order_field_not_covered,
         .ordered_tuple_order_direction_not_covered,
         .ordered_tuple_order_nulls_not_covered,
         .ordered_tuple_order_collation_not_covered,
         .ordered_tuple_order_tiebreaker_not_covered,
         .ordered_tuple_collation_not_supported,
-        => {},
-        else => profile.fallback_reason = .none,
+        => profile.refreshUnsupportedReason(),
+        else => {
+            profile.fallback_reason = .none;
+            profile.refreshUnsupportedReason();
+        },
     }
 }
 
@@ -5373,10 +5663,16 @@ fn addRelationalRowsPlannedCandidateSetProfile(
 ) void {
     if (profile) |out| {
         out.planned_candidate_sets +|= 1;
+        if (planned.access_method != .ordered_tuple_doc_set) {
+            if (planned.estimated_cardinality) |cardinality| {
+                out.estimated_candidate_rows +|= @intCast(cardinality);
+            }
+        }
         switch (planned.access_method) {
             .scalar_doc_set => out.scalar_candidate_sets +|= 1,
             .array_doc_set => out.array_candidate_sets +|= 1,
             .json_doc_set => out.json_candidate_sets +|= 1,
+            .text_search_doc_set => out.text_search_candidate_sets +|= 1,
             .mixed_doc_set => out.mixed_candidate_sets +|= 1,
             .ordered_tuple_doc_set => out.ordered_tuple_candidate_sets +|= 1,
             else => {},
@@ -5392,8 +5688,51 @@ fn setRelationalRowsSelectedCandidateSetProfile(
         setRelationalRowsProfileAccessMethod(profile, planned.access_method);
         if (planned.estimated_cardinality) |cardinality| {
             out.selected_candidate_estimated_rows = @intCast(cardinality);
+            setRelationalRowsProfileSelectedCandidateSelectivity(out);
         }
     }
+}
+
+fn relationalRowsSelectivityPpm(numerator: u64, denominator: u64) u64 {
+    if (denominator == 0) return 0;
+    return std.math.divCeil(u64, numerator *| 1_000_000, denominator) catch std.math.maxInt(u64);
+}
+
+fn setRelationalRowsProfileBaseScanRows(
+    profile: ?*types.RelationalRowsQueryResult.Profile,
+    rows: usize,
+) void {
+    if (profile) |out| {
+        out.base_scan_rows = @max(out.base_scan_rows, @as(u64, @intCast(rows)));
+        setRelationalRowsProfileSelectedCandidateSelectivity(out);
+        setRelationalRowsProfileOrderedTupleProbeSelectivity(out);
+    }
+}
+
+fn setRelationalRowsProfileEstimatedBaseScanRows(
+    profile: ?*types.RelationalRowsQueryResult.Profile,
+    rows: ?u64,
+) void {
+    const row_count = rows orelse return;
+    if (profile) |out| {
+        out.base_scan_rows = @max(out.base_scan_rows, row_count);
+        setRelationalRowsProfileSelectedCandidateSelectivity(out);
+        setRelationalRowsProfileOrderedTupleProbeSelectivity(out);
+    }
+}
+
+fn setRelationalRowsProfileSelectedCandidateSelectivity(
+    profile: *types.RelationalRowsQueryResult.Profile,
+) void {
+    if (profile.base_scan_rows == 0 or profile.selected_candidate_estimated_rows == 0) return;
+    profile.selected_candidate_selectivity_ppm = relationalRowsSelectivityPpm(profile.selected_candidate_estimated_rows, profile.base_scan_rows);
+}
+
+fn setRelationalRowsProfileOrderedTupleProbeSelectivity(
+    profile: *types.RelationalRowsQueryResult.Profile,
+) void {
+    if (profile.base_scan_rows == 0 or profile.candidate_gate_observed == 0) return;
+    profile.ordered_tuple_probe_selectivity_ppm = relationalRowsSelectivityPpm(profile.candidate_gate_observed, profile.base_scan_rows);
 }
 
 fn addRelationalRowsOrderedTupleScanStats(
@@ -5405,6 +5744,7 @@ fn addRelationalRowsOrderedTupleScanStats(
         out.index_entries_scanned += stats.index_entries_scanned;
         out.candidate_rows += stats.candidate_rows;
         out.iterator_seeks += stats.iterator_seeks;
+        setRelationalRowsProfileOrderedTupleProbeSelectivity(out);
     }
 }
 
@@ -5441,7 +5781,10 @@ fn setRelationalRowsProfileFallback(
     reason: types.RelationalRowsQueryResult.FallbackReason,
 ) void {
     if (profile) |out| {
-        if (out.fallback_reason == .none) out.fallback_reason = reason;
+        if (out.fallback_reason == .none) {
+            out.fallback_reason = reason;
+            out.refreshUnsupportedReason();
+        }
     }
 }
 
@@ -5503,23 +5846,25 @@ fn setRelationalRowsProfileCandidateGate(
         out.candidate_gate_observed = @intCast(observed);
         out.candidate_gate_exceeded = out.candidate_gate_exceeded or exceeded;
         out.estimated_candidate_rows = @max(out.estimated_candidate_rows, @as(u64, @intCast(observed)));
+        setRelationalRowsProfileOrderedTupleProbeSelectivity(out);
     }
 }
 
 fn setRelationalRowsProfileOrderedTupleProbeGate(
     profile: ?*types.RelationalRowsQueryResult.Profile,
     req: types.RelationalRowsQueryRequest,
+    base_rows: ?u64,
     observed: usize,
     exceeded: bool,
 ) void {
-    const limit = orderedTupleCandidateSetProbeLimit(req) orelse return;
-    setRelationalRowsProfileCandidateGate(profile, limit, observed, exceeded);
+    const gate = orderedTupleCandidateSetProbeGate(req, base_rows) orelse return;
+    setRelationalRowsProfileCandidateGate(profile, gate.limit, observed, exceeded);
 }
 
 fn orderedTupleSchemaHasActiveIndex(runtime_schema: schema_mod.TableSchema) bool {
     for (runtime_schema.relational_indexes) |index| {
         if (index.owner_kind != .relational_column) continue;
-        if (index.access_method != .ordered_tuple or index.lifecycle != .ready or index.keys.len < 2) continue;
+        if (index.access_method != .ordered_tuple or !relationalIndexReady(index) or index.keys.len < 2) continue;
         if (relationalIndexOwnerColumn(runtime_schema, index) != null) return true;
     }
     return false;
@@ -5571,7 +5916,7 @@ fn orderedTupleUniqueConstraintOwnerLookupSupported(
     if (constraint.validation_state != .enforced) return false;
     if (constraint.without_overlaps_period != null) return false;
     if (index.access_method != .ordered_tuple) return false;
-    if (index.lifecycle != .ready) return false;
+    if (!relationalIndexReady(index)) return false;
     if (index.generation == 0) return false;
     const fingerprint = index.schema_fingerprint orelse return false;
     if (fingerprint.len == 0) return false;
@@ -5640,6 +5985,49 @@ fn uniqueExpressionDirectPredicateCount(
     return count;
 }
 
+fn uniqueExpressionReferencedByPredicates(
+    expression: schema_mod.UniqueExpression,
+    expression_predicates: []const types.RelationalRowsExpressionCondition,
+) bool {
+    for (expression_predicates) |condition| {
+        if (uniqueExpressionMatchesRowsExpression(expression, condition.lhs)) return true;
+        for (condition.rhs) |rhs| {
+            if (uniqueExpressionMatchesRowsExpression(expression, rhs)) return true;
+        }
+    }
+    return false;
+}
+
+fn uniqueExpressionsReferencedByPredicates(
+    expressions: []const schema_mod.UniqueExpression,
+    expression_predicates: []const types.RelationalRowsExpressionCondition,
+) bool {
+    for (expressions) |expression| {
+        if (uniqueExpressionReferencedByPredicates(expression, expression_predicates)) return true;
+    }
+    return false;
+}
+
+fn orderedTupleExpressionOwnerLookupFallbackReason(
+    constraint: schema_mod.UniqueConstraint,
+    index: schema_mod.RelationalIndex,
+    predicates: []const schema_mod.RelationalCheck,
+    expression_predicates: []const types.RelationalRowsExpressionCondition,
+    generation_usable: bool,
+) ?types.RelationalRowsQueryResult.FallbackReason {
+    if (constraint.expressions.len == 0) return null;
+    if (!uniqueExpressionsReferencedByPredicates(constraint.expressions, expression_predicates)) return null;
+    if (index.access_method != .ordered_tuple) return .ordered_tuple_access_method_mismatch;
+    if (!generation_usable) return .ordered_tuple_stale_generation;
+    if (!relationalIndexReady(index)) return .ordered_tuple_index_not_ready;
+    if (index.generation == 0) return .ordered_tuple_stale_generation;
+    const fingerprint = index.schema_fingerprint orelse return .ordered_tuple_stale_generation;
+    if (fingerprint.len == 0) return .ordered_tuple_stale_generation;
+    if (!orderedTupleUniqueExpressionIndexKeysMatchColumns(constraint, index)) return .ordered_tuple_access_method_mismatch;
+    if (!uniqueExpressionsKnownByPredicates(constraint.expressions, predicates, expression_predicates)) return .ordered_tuple_predicate_not_proven;
+    return null;
+}
+
 fn uniqueExpressionMatchesRowsExpression(
     expression: schema_mod.UniqueExpression,
     row_expression: types.RelationalRowsExpression,
@@ -5650,6 +6038,125 @@ fn uniqueExpressionMatchesRowsExpression(
         .md5 => uniqueSimpleFieldExpressionMatchesRowsExpression(.md5, expression.field, row_expression),
         .expression => if (expression.expression) |expected| expressionEqual(expected, row_expression) else false,
     };
+}
+
+fn generatedColumnMatchesRowsExpression(
+    generated: schema_mod.RelationalGeneratedValue,
+    row_expression: types.RelationalRowsExpression,
+) bool {
+    return switch (generated.op) {
+        .lower => if (generated.field) |field| uniqueSimpleFieldExpressionMatchesRowsExpression(.lower, field, row_expression) else false,
+        .upper => if (generated.field) |field| uniqueSimpleFieldExpressionMatchesRowsExpression(.upper, field, row_expression) else false,
+        .md5 => if (generated.field) |field| uniqueSimpleFieldExpressionMatchesRowsExpression(.md5, field, row_expression) else false,
+        .expression => if (generated.expression) |expected| expressionEqual(expected, row_expression) else false,
+        else => false,
+    };
+}
+
+fn generatedColumnForRowsExpression(
+    runtime_schema: schema_mod.TableSchema,
+    row_expression: types.RelationalRowsExpression,
+) ?schema_mod.RelationalColumn {
+    for (runtime_schema.relational_columns) |column| {
+        const generated = column.generated orelse continue;
+        if (generatedColumnMatchesRowsExpression(generated, row_expression)) return column;
+    }
+    return null;
+}
+
+fn invertedRelationalCheckOp(op: schema_mod.RelationalCheckOp) ?schema_mod.RelationalCheckOp {
+    return switch (op) {
+        .eq => .eq,
+        .gt => .lt,
+        .gte => .lte,
+        .lt => .gt,
+        .lte => .gte,
+        else => null,
+    };
+}
+
+fn generatedExpressionPredicateAlias(
+    runtime_schema: schema_mod.TableSchema,
+    condition: types.RelationalRowsExpressionCondition,
+) ?schema_mod.RelationalCheck {
+    if (condition.rhs.len != 1) return null;
+    if (condition.rhs[0].kind == .value) {
+        const column = generatedColumnForRowsExpression(runtime_schema, condition.lhs) orelse return null;
+        const op = switch (condition.op) {
+            .eq, .gt, .gte, .lt, .lte => condition.op,
+            else => return null,
+        };
+        return .{
+            .name = "",
+            .field = column.name,
+            .op = op,
+            .value_json = condition.rhs[0].value_json,
+        };
+    }
+    if (condition.lhs.kind == .value) {
+        const column = generatedColumnForRowsExpression(runtime_schema, condition.rhs[0]) orelse return null;
+        return .{
+            .name = "",
+            .field = column.name,
+            .op = invertedRelationalCheckOp(condition.op) orelse return null,
+            .value_json = condition.lhs.value_json,
+        };
+    }
+    return null;
+}
+
+fn appendGeneratedExpressionPredicateAliasesAlloc(
+    alloc: Allocator,
+    runtime_schema: schema_mod.TableSchema,
+    req: types.RelationalRowsQueryRequest,
+) !?[]schema_mod.RelationalCheck {
+    if (req.expression_predicates.len == 0) return null;
+    var aliases = std.ArrayListUnmanaged(schema_mod.RelationalCheck).empty;
+    errdefer aliases.deinit(alloc);
+    for (req.expression_predicates) |condition| {
+        const alias = generatedExpressionPredicateAlias(runtime_schema, condition) orelse continue;
+        try aliases.append(alloc, alias);
+    }
+    if (aliases.items.len == 0) return null;
+
+    const out = try alloc.alloc(schema_mod.RelationalCheck, req.predicates.len + aliases.items.len);
+    @memcpy(out[0..req.predicates.len], req.predicates);
+    @memcpy(out[req.predicates.len..], aliases.items);
+    aliases.deinit(alloc);
+    return out;
+}
+
+fn generatedExpressionOrderAliasesAlloc(
+    alloc: Allocator,
+    runtime_schema: schema_mod.TableSchema,
+    order_by: []const types.RelationalRowsQueryOrder,
+) !?[]types.RelationalRowsQueryOrder {
+    var changed = false;
+    for (order_by) |order| {
+        const expression = order.expression orelse continue;
+        if (generatedColumnForRowsExpression(runtime_schema, expression) != null) {
+            changed = true;
+            break;
+        }
+    }
+    if (!changed) return null;
+
+    const out = try alloc.alloc(types.RelationalRowsQueryOrder, order_by.len);
+    for (order_by, 0..) |order, i| {
+        if (order.expression) |expression| {
+            if (generatedColumnForRowsExpression(runtime_schema, expression)) |column| {
+                out[i] = .{
+                    .field = column.name,
+                    .direction = order.direction,
+                    .null_test = order.null_test,
+                    .collation = order.collation orelse column.collation,
+                };
+                continue;
+            }
+        }
+        out[i] = order;
+    }
+    return out;
 }
 
 fn uniqueSimpleFieldExpressionMatchesRowsExpression(
@@ -5675,32 +6182,61 @@ fn orderedTupleRequestedPageWidth(req: types.RelationalRowsQueryRequest) ?usize 
     return @as(usize, req.offset) +| @as(usize, limit);
 }
 
-fn orderedTupleCandidateSetGate(req: types.RelationalRowsQueryRequest) usize {
-    if (req.order_by.len != 0 or queryHasDistinctOn(req) or req.row_claim != null) return std.math.maxInt(usize);
-    const materialization_cap = ordered_tuple_bounded_unordered_candidate_gate;
-    if (req.total_mode == .exact) {
-        const page_gate = if (orderedTupleRequestedPageWidth(req)) |page_width|
-            @max(@as(usize, 1), page_width *| ordered_tuple_exact_unordered_candidate_page_multiplier)
-        else
-            ordered_tuple_exact_unordered_unpaged_candidate_gate;
-        return @max(page_gate, materialization_cap);
-    }
-    const page_gate = if (orderedTupleRequestedPageWidth(req)) |page_width|
-        @max(ordered_tuple_exact_unordered_unpaged_candidate_gate, page_width *| ordered_tuple_exact_unordered_candidate_page_multiplier)
-    else
-        materialization_cap;
-    return @min(page_gate, materialization_cap);
+fn orderedTupleCandidateSelectivityBudget(base_rows: u64) usize {
+    const budget = std.math.divCeil(u64, base_rows *| ordered_tuple_candidate_selectivity_threshold_ppm, 1_000_000) catch std.math.maxInt(u64);
+    return relationalRowsSaturatingUsize(budget);
 }
 
-fn orderedTupleCandidateSetUsableForQuery(req: types.RelationalRowsQueryRequest, set: *const doc_set.ResolvedDocSet) bool {
+fn orderedTupleCandidateSetProbeGate(req: types.RelationalRowsQueryRequest, base_rows: ?u64) ?OrderedTupleCandidateGate {
+    if (req.order_by.len != 0 or queryHasDistinctOn(req) or req.row_claim != null) return null;
+    const materialization_cap = ordered_tuple_bounded_unordered_candidate_gate;
+    const page_floor = if (orderedTupleRequestedPageWidth(req)) |page_width|
+        @max(@as(usize, 1), page_width *| ordered_tuple_exact_unordered_candidate_page_multiplier)
+    else
+        ordered_tuple_exact_unordered_unpaged_candidate_gate;
+    const selectivity_limit = if (base_rows) |row_count| blk: {
+        if (row_count == 0) break :blk @as(usize, 0);
+        break :blk @max(page_floor, orderedTupleCandidateSelectivityBudget(row_count));
+    } else materialization_cap;
+
+    if (selectivity_limit < materialization_cap) {
+        return .{ .limit = selectivity_limit, .kind = .selectivity_budget };
+    }
+    return .{ .limit = materialization_cap, .kind = .materialization_cap };
+}
+
+fn orderedTupleCandidateSetGate(req: types.RelationalRowsQueryRequest, base_rows: ?u64) usize {
+    const gate = orderedTupleCandidateSetProbeGate(req, base_rows) orelse return std.math.maxInt(usize);
+    return gate.limit;
+}
+
+fn orderedTupleCandidateSetUsableForQuery(req: types.RelationalRowsQueryRequest, set: *const doc_set.ResolvedDocSet, base_rows: ?u64) bool {
     if (req.order_by.len != 0 or queryHasDistinctOn(req) or req.row_claim != null) return true;
     const cardinality = set.estimatedCardinality() orelse return false;
-    return cardinality <= orderedTupleCandidateSetGate(req);
+    if (cardinality > orderedTupleCandidateSetGate(req, base_rows)) return false;
+    if (base_rows) |row_count| {
+        if (row_count == 0) return cardinality == 0;
+        const selectivity_ppm = relationalRowsSelectivityPpm(@intCast(cardinality), row_count);
+        return selectivity_ppm <= ordered_tuple_candidate_selectivity_threshold_ppm or
+            cardinality <= orderedTupleCandidateSetGate(req, base_rows);
+    }
+    return true;
 }
 
-fn orderedTupleCandidateSetProbeLimit(req: types.RelationalRowsQueryRequest) ?usize {
-    if (req.order_by.len != 0 or queryHasDistinctOn(req) or req.row_claim != null) return null;
-    return orderedTupleCandidateSetGate(req);
+fn orderedTupleCandidateSetProbeLimit(req: types.RelationalRowsQueryRequest, base_rows: ?u64) ?usize {
+    const gate = orderedTupleCandidateSetProbeGate(req, base_rows) orelse return null;
+    return gate.limit;
+}
+
+fn orderedTupleCandidateGateExceededFallbackReason(
+    req: types.RelationalRowsQueryRequest,
+    base_rows: ?u64,
+) types.RelationalRowsQueryResult.FallbackReason {
+    const gate = orderedTupleCandidateSetProbeGate(req, base_rows) orelse return .ordered_tuple_materialization_cap;
+    return switch (gate.kind) {
+        .materialization_cap => .ordered_tuple_materialization_cap,
+        .selectivity_budget => .ordered_tuple_candidate_gate,
+    };
 }
 
 fn orderedTupleIndexKeyNullsFirst(index_key: schema_mod.RelationalIndexKey) bool {
@@ -5743,10 +6279,7 @@ fn orderedTuplePlanOrderFallbackReason(
     if (req.order_by.len == 0) return .ordered_tuple_ordering_not_covered;
     if (queryHasDistinctOn(req) or req.row_claim != null or req.scalar_subqueries.len != 0) return .ordered_tuple_ordering_not_covered;
 
-    var prefix_len = orderedTupleIndexPrefixLen(runtime_schema, req.predicates, plan.index.keys);
-    if (orderedTupleFoldedEqualityPrefixIndex(runtime_schema, req.predicates, plan.index.keys[0..prefix_len])) |index| {
-        prefix_len = index + 1;
-    }
+    const prefix_len = orderedTupleIndexPrefixLen(runtime_schema, req.predicates, plan.index.keys);
 
     var key_index = prefix_len;
     var order_index: usize = 0;
@@ -5779,6 +6312,79 @@ fn orderedTuplePlanOrderFallbackReason(
         if (equalityPredicateForColumn(runtime_schema, req.predicates, remaining_key.column) == null) return .ordered_tuple_order_tiebreaker_not_covered;
     }
     return null;
+}
+
+fn orderedTupleCandidateOrderFallbackReason(
+    runtime_schema: schema_mod.TableSchema,
+    req: types.RelationalRowsQueryRequest,
+    candidate: OrderedTupleIndexCandidate,
+) ?types.RelationalRowsQueryResult.FallbackReason {
+    if (req.order_by.len == 0) return .ordered_tuple_ordering_not_covered;
+    if (queryHasDistinctOn(req) or req.row_claim != null or req.scalar_subqueries.len != 0) return .ordered_tuple_ordering_not_covered;
+
+    var key_index = candidate.equality_prefix_len;
+    var order_index: usize = 0;
+    while (order_index < req.order_by.len) {
+        if (key_index >= candidate.index.keys.len) return .ordered_tuple_order_field_not_covered;
+        const index_key = candidate.index.keys[key_index];
+
+        var explicit_nulls_first: ?bool = null;
+        const possible_null_order = req.order_by[order_index];
+        if (possible_null_order.null_test) |null_test| {
+            if (null_test != .is_null) return .ordered_tuple_order_field_not_covered;
+            if (orderedTupleOrderFieldFallbackReason(runtime_schema, index_key, possible_null_order)) |reason| return reason;
+            explicit_nulls_first = possible_null_order.direction == .desc;
+            order_index += 1;
+            if (order_index >= req.order_by.len) return .ordered_tuple_order_field_not_covered;
+        }
+
+        const order = req.order_by[order_index];
+        if (order.null_test != null) return .ordered_tuple_order_field_not_covered;
+        if (orderedTupleOrderFieldFallbackReason(runtime_schema, index_key, order)) |reason| return reason;
+        if (!orderedTupleIndexKeyDirectionMatchesOrder(index_key, order)) return .ordered_tuple_order_direction_not_covered;
+        const query_nulls_first = explicit_nulls_first orelse orderedTupleQueryOrderNullsFirst(order);
+        if (orderedTupleIndexKeyNullsFirst(index_key) != query_nulls_first) return .ordered_tuple_order_nulls_not_covered;
+
+        order_index += 1;
+        key_index += 1;
+    }
+    while (key_index < candidate.index.keys.len) : (key_index += 1) {
+        const remaining_key = candidate.index.keys[key_index];
+        if (equalityPredicateForColumn(runtime_schema, req.predicates, remaining_key.column) == null) return .ordered_tuple_order_tiebreaker_not_covered;
+    }
+    return null;
+}
+
+fn orderedTupleUnplannedExpressionOrderFallbackReason(
+    runtime_schema: schema_mod.TableSchema,
+    req: types.RelationalRowsQueryRequest,
+) ?types.RelationalRowsQueryResult.FallbackReason {
+    if (req.order_by.len == 0) return null;
+    var has_expression_order = false;
+    for (req.order_by) |order| {
+        if (order.expression != null) {
+            has_expression_order = true;
+            break;
+        }
+    }
+    if (!has_expression_order) return null;
+
+    for (runtime_schema.relational_indexes) |index| {
+        if (index.access_method != .ordered_tuple) continue;
+        if (index.owner_kind != .unique_constraint) continue;
+        if (index.expressions.len == 0) continue;
+        if (!relationalIndexReady(index)) continue;
+        if (index.generation == 0) continue;
+        const fingerprint = index.schema_fingerprint orelse continue;
+        if (fingerprint.len == 0) continue;
+        return .ordered_tuple_order_field_not_covered;
+    }
+    return null;
+}
+
+fn relationalIndexReady(index: schema_mod.RelationalIndex) bool {
+    const lifecycle = schema_mod.relationalIndexLifecycle(index) orelse return false;
+    return lifecycle == .ready;
 }
 
 fn optionalBytesEqual(left: ?[]const u8, right: ?[]const u8) bool {
@@ -5870,7 +6476,7 @@ fn orderedTupleIndexCapabilityForQueryAlloc(
 ) !OrderedTupleIndexCapability {
     if (!generation_usable) return .{ .rejected = .generation_not_current };
     if (!relationalIndexOwnerMatchesColumn(index, owner_column)) return .{ .rejected = .not_indexed };
-    if (index.lifecycle != .ready) return .{ .rejected = .not_ready };
+    if (!relationalIndexReady(index)) return .{ .rejected = .not_ready };
     if (index.keys.len < 2) return .{ .rejected = .no_ordered_keys };
     if (index.access_method != .ordered_tuple) return .{ .rejected = .access_method_mismatch };
     if (index.generation == 0) return .{ .rejected = .generation_not_current };
@@ -5891,10 +6497,7 @@ fn orderedTupleIndexCapabilityForQueryAlloc(
         .catalog_ordinal = catalog_ordinal,
         .equality_prefix_len = prefix_len,
     };
-    const folded_prefix_index = orderedTupleFoldedEqualityPrefixIndex(runtime_schema, predicates, index.keys[0..prefix_len]);
-    if (folded_prefix_index) |prefix_index| {
-        candidate.equality_prefix_len = prefix_index + 1;
-    } else if (prefix_len < index.keys.len and orderedTupleIndexRangeKeyPlannerUsable(index.keys[prefix_len])) {
+    if (prefix_len < index.keys.len and orderedTupleIndexRangeKeyPlannerUsable(index.keys[prefix_len])) {
         const range = orderedTupleRangePredicatesForColumn(alloc, runtime_schema, predicates, index.keys[prefix_len].column);
         if (range.hasAny()) {
             candidate.range_key_index = prefix_len;
@@ -5971,29 +6574,22 @@ fn appendOrderedTupleFoldedEqualityComponentPrefix(
     const effective_collation = predicate.collation orelse column.collation;
     if (effective_collation == null or !relational_collation.isCaseInsensitive(effective_collation.?)) return error.InvalidQueryRequest;
 
-    var scalar_prefix = std.ArrayListUnmanaged(u8).empty;
-    defer scalar_prefix.deinit(alloc);
-    for (parsed.value.string) |byte| try scalar_prefix.append(alloc, std.ascii.toLower(byte));
-    try scalar_prefix.append(alloc, 0);
+    var scalar = std.ArrayListUnmanaged(u8).empty;
+    defer scalar.deinit(alloc);
+    for (parsed.value.string) |byte| try scalar.append(alloc, std.ascii.toLower(byte));
 
-    var scalar_encoded_prefix = std.ArrayListUnmanaged(u8).empty;
-    defer scalar_encoded_prefix.deinit(alloc);
-    const scalar_start = scalar_encoded_prefix.items.len;
-    try scalar_encoded_prefix.resize(alloc, scalar_start + internal_keys.encodedBodyLen(scalar_prefix.items));
-    _ = internal_keys.encodeBody(scalar_encoded_prefix.items[scalar_start..], scalar_prefix.items);
-
-    var component_prefix = std.ArrayListUnmanaged(u8).empty;
-    defer component_prefix.deinit(alloc);
-    try component_prefix.append(alloc, 0x10);
+    var component = std.ArrayListUnmanaged(u8).empty;
+    defer component.deinit(alloc);
+    try component.append(alloc, 0x10);
     if (index_key.direction == .desc) {
-        for (scalar_encoded_prefix.items) |byte| try component_prefix.append(alloc, ~byte);
+        var encoded_scalar = std.ArrayListUnmanaged(u8).empty;
+        defer encoded_scalar.deinit(alloc);
+        try internal_keys.appendEncodedComponent(&encoded_scalar, alloc, scalar.items);
+        for (encoded_scalar.items) |byte| try component.append(alloc, ~byte);
     } else {
-        try component_prefix.appendSlice(alloc, scalar_prefix.items);
+        try component.appendSlice(alloc, scalar.items);
     }
-
-    const start = out.items.len;
-    try out.resize(alloc, start + internal_keys.encodedBodyLen(component_prefix.items));
-    _ = internal_keys.encodeBody(out.items[start..], component_prefix.items);
+    try internal_keys.appendEncodedComponent(out, alloc, component.items);
 }
 
 fn orderedTupleEqualityScanPrefixAlloc(
@@ -6002,18 +6598,28 @@ fn orderedTupleEqualityScanPrefixAlloc(
     predicates: []const schema_mod.RelationalCheck,
     index_keys: []const schema_mod.RelationalIndexKey,
 ) ![]u8 {
-    if (orderedTupleFoldedEqualityPrefixIndex(runtime_schema, predicates, index_keys)) |folded_index| {
-        var out = std.ArrayListUnmanaged(u8).empty;
-        errdefer out.deinit(alloc);
-        if (folded_index > 0) {
-            const exact_prefix = try orderedTupleExactEqualityPrefixAlloc(alloc, runtime_schema, predicates, index_keys[0..folded_index]);
+    if (orderedTupleFoldedEqualityPrefixIndex(runtime_schema, predicates, index_keys) == null)
+        return orderedTupleExactEqualityPrefixAlloc(alloc, runtime_schema, predicates, index_keys);
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    var exact_start: usize = 0;
+    for (index_keys, 0..) |index_key, i| {
+        if (!orderedTupleEqualityKeyNeedsFoldedPrefix(runtime_schema, predicates, index_key)) continue;
+        if (exact_start < i) {
+            const exact_prefix = try orderedTupleExactEqualityPrefixAlloc(alloc, runtime_schema, predicates, index_keys[exact_start..i]);
             defer alloc.free(exact_prefix);
             try out.appendSlice(alloc, exact_prefix);
         }
-        try appendOrderedTupleFoldedEqualityComponentPrefix(alloc, &out, runtime_schema, predicates, index_keys[folded_index]);
-        return try out.toOwnedSlice(alloc);
+        try appendOrderedTupleFoldedEqualityComponentPrefix(alloc, &out, runtime_schema, predicates, index_key);
+        exact_start = i + 1;
     }
-    return orderedTupleExactEqualityPrefixAlloc(alloc, runtime_schema, predicates, index_keys);
+    if (exact_start < index_keys.len) {
+        const exact_suffix = try orderedTupleExactEqualityPrefixAlloc(alloc, runtime_schema, predicates, index_keys[exact_start..]);
+        defer alloc.free(exact_suffix);
+        try out.appendSlice(alloc, exact_suffix);
+    }
+    return try out.toOwnedSlice(alloc);
 }
 
 fn orderedTupleNonNullComponentDomainPrefixAlloc(
@@ -6087,6 +6693,28 @@ fn uniqueConstraintColumnsWithIndexAlloc(
         .lower, .upper, .md5 => try appendUniqueConstraintColumn(alloc, runtime_schema, &columns, expression.field),
         .expression => if (expression.expression) |row_expression| try appendExpressionColumnsAlloc(alloc, runtime_schema, &columns, row_expression) else return error.InvalidQueryRequest,
     };
+    for (index.where) |predicate| try appendUniqueConstraintColumn(alloc, runtime_schema, &columns, predicate.field);
+    for (index.where_expressions) |condition| try appendExpressionConditionColumnsAlloc(alloc, runtime_schema, &columns, condition);
+    return try columns.toOwnedSlice(alloc);
+}
+
+fn uniqueConstraintColumnsWithIndexAndExpressionValuesAlloc(
+    alloc: Allocator,
+    runtime_schema: schema_mod.TableSchema,
+    constraint: schema_mod.UniqueConstraint,
+    index: schema_mod.RelationalIndex,
+    expression_value_jsons: []const ?[]const u8,
+) ![]schema_mod.RelationalColumn {
+    var columns = std.ArrayListUnmanaged(schema_mod.RelationalColumn).empty;
+    errdefer columns.deinit(alloc);
+    for (constraint.columns) |field| try appendUniqueConstraintColumn(alloc, runtime_schema, &columns, field);
+    for (constraint.expressions, 0..) |expression, expression_index| {
+        if (expression_index < expression_value_jsons.len and expression_value_jsons[expression_index] != null) continue;
+        switch (expression.op) {
+            .lower, .upper, .md5 => try appendUniqueConstraintColumn(alloc, runtime_schema, &columns, expression.field),
+            .expression => if (expression.expression) |row_expression| try appendExpressionColumnsAlloc(alloc, runtime_schema, &columns, row_expression) else return error.InvalidQueryRequest,
+        }
+    }
     for (index.where) |predicate| try appendUniqueConstraintColumn(alloc, runtime_schema, &columns, predicate.field);
     for (index.where_expressions) |condition| try appendExpressionConditionColumnsAlloc(alloc, runtime_schema, &columns, condition);
     return try columns.toOwnedSlice(alloc);
@@ -6774,6 +7402,84 @@ fn asciiLowerAlloc(alloc: Allocator, value: []const u8) ![]u8 {
     return folded;
 }
 
+fn relationalRowsTextSnippetAlloc(
+    alloc: Allocator,
+    row: std.json.Value,
+    maybe_query: ?types.TextQuery,
+) !?[]u8 {
+    const query = maybe_query orelse return null;
+    const spec = relationalRowsTextSnippetSpec(query) orelse return null;
+    const value = jsonValueAtPath(row, spec.field) orelse return null;
+    if (value.* != .string) return null;
+    const source = value.string;
+    if (source.len == 0) return null;
+
+    const needle = std.mem.trim(u8, spec.needle, &std.ascii.whitespace);
+    const match_at = if (needle.len == 0) null else asciiIndexOfIgnoreCase(source, needle);
+    const context: usize = 48;
+    const start = if (match_at) |index| if (index > context) index - context else 0 else 0;
+    const raw_end = if (match_at) |index| @min(source.len, index + needle.len + context) else @min(source.len, 160);
+    const end = @max(start, raw_end);
+    const prefix = start != 0;
+    const suffix = end < source.len;
+
+    if (!prefix and !suffix) return try alloc.dupe(u8, source[start..end]);
+    if (prefix and suffix) return try std.fmt.allocPrint(alloc, "...{s}...", .{source[start..end]});
+    if (prefix) return try std.fmt.allocPrint(alloc, "...{s}", .{source[start..end]});
+    return try std.fmt.allocPrint(alloc, "{s}...", .{source[start..end]});
+}
+
+fn relationalRowsTextHighlightJsonAlloc(
+    alloc: Allocator,
+    row: std.json.Value,
+    maybe_query: ?types.TextQuery,
+) !?[]u8 {
+    const query = maybe_query orelse return null;
+    const spec = relationalRowsTextSnippetSpec(query) orelse return null;
+    const value = jsonValueAtPath(row, spec.field) orelse return null;
+    if (value.* != .string) return null;
+    const source = value.string;
+    const needle = std.mem.trim(u8, spec.needle, &std.ascii.whitespace);
+    if (source.len == 0 or needle.len == 0) return null;
+    const start = asciiIndexOfIgnoreCase(source, needle) orelse return null;
+    const end = start + needle.len;
+    return try std.fmt.allocPrint(
+        alloc,
+        "{{\"field\":{f},\"term\":{f},\"start\":{d},\"end\":{d}}}",
+        .{ std.json.fmt(spec.field, .{}), std.json.fmt(source[start..end], .{}), start, end },
+    );
+}
+
+const RelationalRowsTextSnippetSpec = struct {
+    field: []const u8,
+    needle: []const u8,
+};
+
+fn relationalRowsTextSnippetSpec(query: types.TextQuery) ?RelationalRowsTextSnippetSpec {
+    return switch (query) {
+        .term => |term| .{ .field = term.field, .needle = term.term },
+        .match => |match| .{ .field = match.field, .needle = match.text },
+        .match_phrase => |phrase| .{ .field = phrase.field, .needle = phrase.text },
+        .fuzzy => |fuzzy| .{ .field = fuzzy.field, .needle = fuzzy.term },
+        .prefix => |prefix| .{ .field = prefix.field, .needle = prefix.prefix },
+        .phrase => |phrase| if (phrase.terms.len > 0)
+            .{ .field = phrase.field, .needle = phrase.terms[0] }
+        else
+            null,
+        else => null,
+    };
+}
+
+fn asciiIndexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0) return 0;
+    if (needle.len > haystack.len) return null;
+    var index: usize = 0;
+    while (index + needle.len <= haystack.len) : (index += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[index .. index + needle.len], needle)) return index;
+    }
+    return null;
+}
+
 pub fn projectQueryCandidateStaticAlloc(
     alloc: Allocator,
     doc_key: []const u8,
@@ -6781,8 +7487,19 @@ pub fn projectQueryCandidateStaticAlloc(
     req: types.RelationalRowsQueryRequest,
     now_ns: u64,
 ) ![]u8 {
+    return try projectQueryCandidateStaticWithScoreAlloc(alloc, doc_key, row_json, req, now_ns, null);
+}
+
+fn projectQueryCandidateStaticWithScoreAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    row_json: []const u8,
+    req: types.RelationalRowsQueryRequest,
+    now_ns: u64,
+    text_score: ?f32,
+) ![]u8 {
     if (req.scalar_subqueries.len != 0) return error.UnsupportedQueryRequest;
-    if (req.json_extract.len == 0 and req.array_length.len == 0 and req.coalesce.len == 0 and req.field_aliases.len == 0 and req.expressions.len == 0) {
+    if (req.json_extract.len == 0 and req.array_length.len == 0 and req.coalesce.len == 0 and req.field_aliases.len == 0 and req.expressions.len == 0 and !relationalRowsQuerySelectsReservedTextProjection(req)) {
         return try db_query_projection.projectLookupStoredBytes(alloc, doc_key, row_json, .{
             .fields = req.select,
             .include_all_fields = req.select_all,
@@ -6816,7 +7533,27 @@ pub fn projectQueryCandidateStaticAlloc(
             if (!first) try writer.writeByte(',');
             first = false;
             try writer.print("{f}:", .{std.json.fmt(field, .{})});
-            if (jsonValueAtPath(parsed.value, field)) |selected| {
+            if (isRelationalRowsTextScoreField(field)) {
+                if (text_score) |score| {
+                    try writer.print("{d}", .{score});
+                } else {
+                    try writer.writeAll("null");
+                }
+            } else if (std.mem.eql(u8, field, relational_rows_text_snippet_field)) {
+                if (try relationalRowsTextSnippetAlloc(alloc, parsed.value, req.full_text)) |snippet| {
+                    defer alloc.free(snippet);
+                    try writer.print("{f}", .{std.json.fmt(snippet, .{})});
+                } else {
+                    try writer.writeAll("null");
+                }
+            } else if (std.mem.eql(u8, field, relational_rows_text_highlight_field)) {
+                if (try relationalRowsTextHighlightJsonAlloc(alloc, parsed.value, req.full_text)) |highlight| {
+                    defer alloc.free(highlight);
+                    try writer.writeAll(highlight);
+                } else {
+                    try writer.writeAll("null");
+                }
+            } else if (jsonValueAtPath(parsed.value, field)) |selected| {
                 try std.json.Stringify.value(selected.*, .{}, writer);
             } else {
                 try writer.writeAll("null");
@@ -8584,7 +9321,7 @@ const JoinRowsAccumulator = struct {
     }
 };
 
-fn joinOnExpressionPredicatesPass(
+pub fn joinOnExpressionPredicatesPass(
     alloc: Allocator,
     left_row: std.json.Value,
     left_columns: []const schema_mod.RelationalColumn,
@@ -8609,7 +9346,7 @@ fn joinOnExpressionPredicatesPass(
     return true;
 }
 
-fn joinMatchPredicatesPass(
+pub fn joinMatchPredicatesPass(
     alloc: Allocator,
     left_row: std.json.Value,
     left_columns: []const schema_mod.RelationalColumn,
@@ -8859,7 +9596,7 @@ fn lateralMatchPredicatesPass(
     return try lateralMatchPredicatesPassWithColumns(alloc, left_row, &.{}, right_row_json, &.{}, req, now_ns);
 }
 
-fn lateralMatchPredicatesPassWithColumns(
+pub fn lateralMatchPredicatesPassWithColumns(
     alloc: Allocator,
     left_row: std.json.Value,
     left_columns: []const schema_mod.RelationalColumn,
@@ -10454,6 +11191,7 @@ pub fn validateQueryAgainstSchema(
     for (req.json_path_eq) |predicate| try validateSchemaField(runtime_schema, predicate.field);
     for (req.json_path_exists) |predicate| try validateSchemaField(runtime_schema, predicate.field);
     for (req.text_patterns) |predicate| try validateSchemaField(runtime_schema, predicate.field);
+    try validateRelationalRowsFullTextAccessMethod(runtime_schema, req);
     for (req.or_predicates) |group| {
         for (group.predicates) |predicate| try validateSchemaField(runtime_schema, predicate.field);
     }
@@ -10475,7 +11213,10 @@ pub fn validateQueryAgainstSchema(
         try validateQueryAgainstSchema(runtime_schema, predicate.query);
     }
     if (!req.select_all) {
-        for (req.select) |field| try validateSchemaField(runtime_schema, field);
+        for (req.select) |field| {
+            if (isRelationalRowsReservedTextProjectionField(field)) continue;
+            try validateSchemaField(runtime_schema, field);
+        }
     }
     for (req.distinct_on) |field| try validateSchemaField(runtime_schema, field);
     for (req.distinct_on_expressions) |expression| try validateExpressionAgainstSchema(runtime_schema, expression);
@@ -10492,6 +11233,141 @@ pub fn validateQueryAgainstSchema(
     }
     for (req.field_aliases) |projection| try validateSchemaField(runtime_schema, projection.field);
     for (req.expressions) |projection| try validateExpressionAgainstSchemaWithScalarOutputs(runtime_schema, projection.expression, req.scalar_subqueries);
+}
+
+const RelationalRowsTextSearchReadiness = enum {
+    ready,
+    not_found,
+    not_ready,
+    stale_generation,
+};
+
+fn validateRelationalRowsFullTextAccessMethod(
+    runtime_schema: schema_mod.TableSchema,
+    req: types.RelationalRowsQueryRequest,
+) !void {
+    const query = req.full_text orelse return;
+    try validateTextQueryFieldsAgainstSchema(runtime_schema, query);
+    return switch (relationalRowsTextSearchReadiness(runtime_schema, req)) {
+        .ready => {},
+        .not_found, .not_ready, .stale_generation => error.IndexUnavailable,
+    };
+}
+
+fn relationalRowsTextSearchReadiness(
+    runtime_schema: schema_mod.TableSchema,
+    req: types.RelationalRowsQueryRequest,
+) RelationalRowsTextSearchReadiness {
+    const query = req.full_text orelse return .ready;
+    var saw_not_ready = false;
+    var saw_stale = false;
+    for (runtime_schema.relational_indexes) |index| {
+        if (!relationalTextSearchIndexMatchesRequest(index, req.primary_text_index_name, query)) continue;
+        if (!schema_mod.relationalIndexGenerationRecordValid(index)) {
+            saw_stale = true;
+            continue;
+        }
+        const record = index.generation_record.?;
+        if (record.lifecycle != .ready or record.lag != 0) {
+            saw_not_ready = true;
+            continue;
+        }
+        return .ready;
+    }
+    if (saw_stale) return .stale_generation;
+    if (saw_not_ready) return .not_ready;
+    return .not_found;
+}
+
+fn relationalTextSearchIndexMatchesRequest(
+    index: schema_mod.RelationalIndex,
+    primary_text_index_name: ?[]const u8,
+    query: types.TextQuery,
+) bool {
+    if (index.access_method != .text_search) return false;
+    if (primary_text_index_name) |name| {
+        if (!std.mem.eql(u8, index.name, name)) return false;
+    }
+    return textQueryFieldsCoveredByRelationalTextIndex(query, index);
+}
+
+fn textQueryFieldsCoveredByRelationalTextIndex(query: types.TextQuery, index: schema_mod.RelationalIndex) bool {
+    return switch (query) {
+        .match_none, .match_all, .doc_id => true,
+        .phrase => |value| relationalTextSearchIndexCoversField(index, value.field),
+        .multi_phrase => |value| relationalTextSearchIndexCoversField(index, value.field),
+        .term => |value| relationalTextSearchIndexCoversField(index, value.field),
+        .match => |value| relationalTextSearchIndexCoversField(index, value.field),
+        .match_phrase => |value| relationalTextSearchIndexCoversField(index, value.field),
+        .fuzzy => |value| relationalTextSearchIndexCoversField(index, value.field),
+        .numeric_range => |value| relationalTextSearchIndexCoversField(index, value.field),
+        .date_range => |value| relationalTextSearchIndexCoversField(index, value.field),
+        .bool_field => |value| relationalTextSearchIndexCoversField(index, value.field),
+        .geo_distance => |value| relationalTextSearchIndexCoversField(index, value.field),
+        .geo_bbox => |value| relationalTextSearchIndexCoversField(index, value.field),
+        .prefix => |value| relationalTextSearchIndexCoversField(index, value.field),
+        .wildcard => |value| relationalTextSearchIndexCoversField(index, value.field),
+        .regexp => |value| relationalTextSearchIndexCoversField(index, value.field),
+        .term_range => |value| relationalTextSearchIndexCoversField(index, value.field),
+        .ip_range => |value| relationalTextSearchIndexCoversField(index, value.field),
+        .geo_shape => |value| relationalTextSearchIndexCoversField(index, value.field),
+        .multi_match_bool_prefix => |value| {
+            if (value.fields.len == 0) return false;
+            for (value.fields) |field| {
+                if (!relationalTextSearchIndexCoversField(index, field.field)) return false;
+            }
+            return true;
+        },
+        .bool_query => |value| {
+            for (value.must) |child| if (!textQueryFieldsCoveredByRelationalTextIndex(child, index)) return false;
+            for (value.should) |child| if (!textQueryFieldsCoveredByRelationalTextIndex(child, index)) return false;
+            for (value.must_not) |child| if (!textQueryFieldsCoveredByRelationalTextIndex(child, index)) return false;
+            return true;
+        },
+    };
+}
+
+fn relationalTextSearchIndexCoversField(index: schema_mod.RelationalIndex, field: []const u8) bool {
+    for (index.columns) |column| {
+        if (std.mem.eql(u8, column, field)) return true;
+    }
+    if (index.owner_kind == .relational_column and std.mem.eql(u8, index.owner_name, field)) return true;
+    return false;
+}
+
+fn validateTextQueryFieldsAgainstSchema(
+    runtime_schema: schema_mod.TableSchema,
+    query: types.TextQuery,
+) anyerror!void {
+    switch (query) {
+        .match_none, .match_all, .doc_id => {},
+        .phrase => |value| try validateSchemaField(runtime_schema, value.field),
+        .multi_phrase => |value| try validateSchemaField(runtime_schema, value.field),
+        .term => |value| try validateSchemaField(runtime_schema, value.field),
+        .match => |value| try validateSchemaField(runtime_schema, value.field),
+        .match_phrase => |value| try validateSchemaField(runtime_schema, value.field),
+        .fuzzy => |value| try validateSchemaField(runtime_schema, value.field),
+        .numeric_range => |value| try validateSchemaField(runtime_schema, value.field),
+        .date_range => |value| try validateSchemaField(runtime_schema, value.field),
+        .bool_field => |value| try validateSchemaField(runtime_schema, value.field),
+        .geo_distance => |value| try validateSchemaField(runtime_schema, value.field),
+        .geo_bbox => |value| try validateSchemaField(runtime_schema, value.field),
+        .prefix => |value| try validateSchemaField(runtime_schema, value.field),
+        .wildcard => |value| try validateSchemaField(runtime_schema, value.field),
+        .regexp => |value| try validateSchemaField(runtime_schema, value.field),
+        .term_range => |value| try validateSchemaField(runtime_schema, value.field),
+        .ip_range => |value| try validateSchemaField(runtime_schema, value.field),
+        .geo_shape => |value| try validateSchemaField(runtime_schema, value.field),
+        .multi_match_bool_prefix => |value| {
+            if (value.fields.len == 0) return error.InvalidQueryRequest;
+            for (value.fields) |field| try validateSchemaField(runtime_schema, field.field);
+        },
+        .bool_query => |value| {
+            for (value.must) |child| try validateTextQueryFieldsAgainstSchema(runtime_schema, child);
+            for (value.should) |child| try validateTextQueryFieldsAgainstSchema(runtime_schema, child);
+            for (value.must_not) |child| try validateTextQueryFieldsAgainstSchema(runtime_schema, child);
+        },
+    }
 }
 
 fn validateAccessPredicateGroupAgainstSchema(
@@ -15190,12 +16066,26 @@ pub fn Impl(comptime DB: type) type {
             const order_by = try resolvedQueryOrdersWithSourceCollationsAlloc(alloc, req.order_by, runtime_schema.relational_columns);
             defer freeResolvedQueryOrdersWithSourceCollations(alloc, order_by);
             local_req.order_by = order_by;
+            const generated_expression_predicates = try appendGeneratedExpressionPredicateAliasesAlloc(alloc, runtime_schema, local_req);
+            defer if (generated_expression_predicates) |predicates| alloc.free(predicates);
+            if (generated_expression_predicates) |predicates| local_req.predicates = predicates;
+            const generated_expression_order = try generatedExpressionOrderAliasesAlloc(alloc, runtime_schema, local_req.order_by);
+            defer if (generated_expression_order) |orders| alloc.free(orders);
+            if (generated_expression_order) |orders| local_req.order_by = orders;
 
             self.core.lockApplyShared();
             var apply_shared_held = true;
             defer if (apply_shared_held) self.core.unlockApplyShared();
 
             const generation = self.core.nextDerivedSequence();
+            if (relationalRowsCanUseCountOnlyResult(local_req)) {
+                var result = try @This().buildCountOnlyRelationalRowsQueryResultAlloc(self, alloc, runtime_schema, local_req, generation);
+                result.include_profile = local_req.profile;
+                self.core.unlockApplyShared();
+                apply_shared_held = false;
+                return result;
+            }
+
             if (relationalRowsCanUseDirectUnorderedResult(local_req)) {
                 var result = try @This().buildDirectUnorderedRelationalRowsQueryResultAlloc(self, alloc, runtime_schema, local_req, generation);
                 result.include_profile = local_req.profile;
@@ -15204,8 +16094,47 @@ pub fn Impl(comptime DB: type) type {
                 return result;
             }
 
-            var profile = types.RelationalRowsQueryResult.Profile{};
+            var profile = types.RelationalRowsQueryResult.Profile{ .total_mode = local_req.total_mode };
             if (try @This().buildDirectOrderSatisfyingOrderedTupleRelationalRowsQueryResultAlloc(self, alloc, runtime_schema, local_req, generation, &profile)) |result| {
+                var owned_result = result;
+                owned_result.profile.refreshUnsupportedReason();
+                owned_result.profile.total_mode = local_req.total_mode;
+                owned_result.include_profile = local_req.profile;
+                self.core.unlockApplyShared();
+                apply_shared_held = false;
+                return owned_result;
+            }
+
+            if (relationalRowsCanUseBoundedSortedSkipLockedClaimResult(local_req)) {
+                var result = try @This().buildBoundedSortedSkipLockedClaimRelationalRowsQueryResultAlloc(
+                    self,
+                    alloc,
+                    runtime_schema,
+                    local_req,
+                    generation,
+                    &apply_shared_held,
+                );
+                result.include_profile = local_req.profile;
+                return result;
+            }
+
+            if (relationalRowsCanUseBoundedSortedClaimResult(local_req)) {
+                var acc = BoundedSortedRelationalRowsAccumulator{
+                    .req = local_req,
+                    .retained_limit = try boundedSortedRetainedLimit(local_req),
+                    .profile = profile,
+                };
+                errdefer acc.deinit(alloc);
+                try @This().appendBoundedSortedRelationalRowsForRequestAlloc(self, alloc, runtime_schema, local_req, generation, &acc);
+                self.core.unlockApplyShared();
+                apply_shared_held = false;
+
+                var result = try acc.toResult(self, alloc, runtime_schema);
+                result.include_profile = local_req.profile;
+                return result;
+            }
+
+            if (try @This().buildBoundedSortedRelationalRowsQueryResultAlloc(self, alloc, runtime_schema, local_req, generation, profile)) |result| {
                 var owned_result = result;
                 owned_result.include_profile = local_req.profile;
                 self.core.unlockApplyShared();
@@ -15226,6 +16155,7 @@ pub fn Impl(comptime DB: type) type {
 
             var result = try @This().buildRelationalRowsQueryResultFromCandidatesAlloc(self, alloc, runtime_schema, local_req, rows.items);
             profile.projected_rows += result.rows.len;
+            profile.refreshUnsupportedReason();
             result.profile = profile;
             result.include_profile = local_req.profile;
             return result;
@@ -15238,6 +16168,84 @@ pub fn Impl(comptime DB: type) type {
                 req.scalar_subqueries.len == 0;
         }
 
+        fn relationalRowsCanUseCountOnlyResult(req: types.RelationalRowsQueryRequest) bool {
+            return req.total_mode == .exact and
+                req.limit != null and
+                req.limit.? == 0 and
+                req.row_claim == null and
+                !queryHasDistinctOn(req);
+        }
+
+        fn buildCountOnlyRelationalRowsQueryResultAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            req: types.RelationalRowsQueryRequest,
+            generation: ?u64,
+        ) !types.RelationalRowsQueryResult {
+            var acc = CountOnlyRelationalRowsAccumulator{
+                .profile = .{
+                    .total_mode = req.total_mode,
+                    .count_only = true,
+                },
+            };
+            try @This().appendCountOnlyRelationalRowsForRequestAlloc(self, alloc, runtime_schema, req, generation, &acc);
+            return acc.toResult();
+        }
+
+        fn appendCountOnlyRelationalRowsForRequestAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            req: types.RelationalRowsQueryRequest,
+            generation: ?u64,
+            acc: *CountOnlyRelationalRowsAccumulator,
+        ) !void {
+            var candidate_set = try @This().resolveRelationalRowsQueryCandidateSetWithProfileAlloc(self, alloc, runtime_schema, req, generation, &acc.profile);
+            defer if (candidate_set) |*set| set.deinit(alloc);
+            if (candidate_set) |*set| {
+                var stream_stats = RelationalRowsCandidateStreamStats{};
+                var scan_ctx = CountOnlyDocSetCandidateStreamContext{
+                    .db = self,
+                    .alloc = alloc,
+                    .runtime_schema = runtime_schema,
+                    .req = req,
+                    .acc = acc,
+                };
+                if (try @This().scanResolvedDocSetAsCandidateStream(
+                    self,
+                    alloc,
+                    set,
+                    generation,
+                    relationalRowsCandidateStreamAccessMethodForProfile(acc.profile.access_method),
+                    &stream_stats,
+                    &scan_ctx,
+                    CountOnlyDocSetCandidateStreamContext.append,
+                )) {
+                    setRelationalRowsProfileAccessMethod(&acc.profile, .resolved_doc_set);
+                    if (acc.profile.access_method == .ordered_tuple_doc_set) {
+                        addRelationalRowsCandidateStreamEmissionStats(&acc.profile, stream_stats);
+                    } else {
+                        addRelationalRowsCandidateStreamStats(&acc.profile, stream_stats);
+                    }
+                    return;
+                }
+            }
+
+            const scanned = if (req.doc_key_range) |range|
+                try relational_store_mod.scanRowsSpanAlloc(alloc, self.core.store, range.start, range.end)
+            else
+                try relational_store_mod.scanRowsAlloc(alloc, self.core.store, "", "");
+            defer relational_store_mod.freeRows(alloc, scanned);
+            setRelationalRowsProfileAccessMethod(&acc.profile, .base_scan);
+            acc.profile.iterator_seeks += 1;
+            acc.profile.candidate_rows += scanned.len;
+            setRelationalRowsProfileBaseScanRows(&acc.profile, scanned.len);
+            for (scanned) |row| {
+                try @This().appendCountOnlyRelationalRowsResultFromRawAlloc(self, alloc, runtime_schema, req, acc, row.doc_key, row.row_value);
+            }
+        }
+
         fn buildDirectUnorderedRelationalRowsQueryResultAlloc(
             self: *DB,
             alloc: Allocator,
@@ -15245,33 +16253,51 @@ pub fn Impl(comptime DB: type) type {
             req: types.RelationalRowsQueryRequest,
             generation: ?u64,
         ) !types.RelationalRowsQueryResult {
-            var acc = DirectUnorderedRelationalRowsAccumulator{};
+            var acc = DirectUnorderedRelationalRowsAccumulator{
+                .profile = .{ .total_mode = req.total_mode },
+            };
             errdefer {
                 for (acc.rows.items) |row| alloc.free(@constCast(row));
                 acc.rows.deinit(alloc);
             }
 
             if (try @This().buildDirectUnorderedOrderedTupleRelationalRowsQueryResultAlloc(self, alloc, runtime_schema, req, generation)) |result| {
-                return result;
+                var owned_result = result;
+                owned_result.profile.total_mode = req.total_mode;
+                return owned_result;
             }
+
+            var text_scores = try @This().relationalRowsTextScoreLookupAlloc(self, alloc, req, generation);
+            defer text_scores.deinit(alloc);
+            const text_score_lookup: ?*const RelationalRowsTextScoreLookup = if (relationalRowsQuerySelectsTextScore(req)) &text_scores else null;
 
             var candidate_set = try @This().resolveRelationalRowsQueryCandidateSetWithProfileAlloc(self, alloc, runtime_schema, req, generation, &acc.profile);
             defer if (candidate_set) |*set| set.deinit(alloc);
             if (candidate_set) |*set| {
-                const maybe_doc_ids = try self.searchRuntimeResolveDocSetDocIds(alloc, set, generation);
-                if (maybe_doc_ids) |doc_ids| {
+                var stream_stats = RelationalRowsCandidateStreamStats{};
+                var scan_ctx = DirectUnorderedDocSetCandidateStreamContext{
+                    .db = self,
+                    .alloc = alloc,
+                    .runtime_schema = runtime_schema,
+                    .req = req,
+                    .acc = &acc,
+                    .text_scores = text_score_lookup,
+                };
+                if (try @This().scanResolvedDocSetAsCandidateStream(
+                    self,
+                    alloc,
+                    set,
+                    generation,
+                    relationalRowsCandidateStreamAccessMethodForProfile(acc.profile.access_method),
+                    &stream_stats,
+                    &scan_ctx,
+                    DirectUnorderedDocSetCandidateStreamContext.append,
+                )) {
                     setRelationalRowsProfileAccessMethod(&acc.profile, .resolved_doc_set);
-                    if (acc.profile.access_method != .ordered_tuple_doc_set) {
-                        acc.profile.candidate_rows += doc_ids.len;
-                        acc.profile.index_entries_scanned += doc_ids.len;
-                    }
-                    defer {
-                        for (doc_ids) |doc_id| alloc.free(@constCast(doc_id));
-                        alloc.free(doc_ids);
-                    }
-                    for (doc_ids) |doc_id| {
-                        try @This().appendDirectUnorderedRelationalRowsResultForDocKeyAlloc(self, alloc, runtime_schema, req, &acc, doc_id);
-                        if (acc.done(req)) break;
+                    if (acc.profile.access_method == .ordered_tuple_doc_set) {
+                        addRelationalRowsCandidateStreamEmissionStats(&acc.profile, stream_stats);
+                    } else {
+                        addRelationalRowsCandidateStreamStats(&acc.profile, stream_stats);
                     }
                     return try acc.toResult(alloc);
                 }
@@ -15285,11 +16311,490 @@ pub fn Impl(comptime DB: type) type {
             setRelationalRowsProfileAccessMethod(&acc.profile, .base_scan);
             acc.profile.iterator_seeks += 1;
             acc.profile.candidate_rows += scanned.len;
+            setRelationalRowsProfileBaseScanRows(&acc.profile, scanned.len);
             for (scanned) |row| {
-                try @This().appendDirectUnorderedRelationalRowsResultFromRawAlloc(self, alloc, runtime_schema, req, &acc, row.doc_key, row.row_value);
+                const text_score = if (text_score_lookup) |scores| scores.get(row.doc_key) else null;
+                try @This().appendDirectUnorderedRelationalRowsResultFromRawWithScoreAlloc(self, alloc, runtime_schema, req, &acc, row.doc_key, row.row_value, text_score);
                 if (acc.done(req)) break;
             }
             return try acc.toResult(alloc);
+        }
+
+        fn relationalRowsCanUseBoundedSortedResult(req: types.RelationalRowsQueryRequest) bool {
+            return req.order_by.len != 0 and
+                req.limit != null and
+                req.limit.? > 0 and
+                !queryHasDistinctOn(req) and
+                req.row_claim == null;
+        }
+
+        fn relationalRowsCanUseBoundedSortedClaimResult(req: types.RelationalRowsQueryRequest) bool {
+            return req.order_by.len != 0 and
+                req.limit != null and
+                req.limit.? > 0 and
+                !queryHasDistinctOn(req) and
+                req.row_claim != null and
+                !req.row_claim.?.effectiveSkipLocked();
+        }
+
+        fn relationalRowsCanUseBoundedSortedSkipLockedClaimResult(req: types.RelationalRowsQueryRequest) bool {
+            return req.order_by.len != 0 and
+                req.limit != null and
+                req.limit.? > 0 and
+                !queryHasDistinctOn(req) and
+                req.row_claim != null and
+                req.row_claim.?.effectiveSkipLocked();
+        }
+
+        fn boundedSortedRetainedLimit(req: types.RelationalRowsQueryRequest) !usize {
+            return std.math.add(usize, @as(usize, req.offset), @as(usize, req.limit orelse return error.UnsupportedQueryRequest)) catch error.UnsupportedQueryRequest;
+        }
+
+        fn buildBoundedSortedSkipLockedClaimRelationalRowsQueryResultAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            req: types.RelationalRowsQueryRequest,
+            generation: ?u64,
+            apply_shared_held: *bool,
+        ) !types.RelationalRowsQueryResult {
+            const claim = req.row_claim orelse return error.InvalidQueryRequest;
+            const limit = req.limit orelse return error.InvalidQueryRequest;
+            var retained_limit = try boundedSortedRetainedLimit(req);
+            var profile = types.RelationalRowsQueryResult.Profile{ .total_mode = req.total_mode };
+
+            var claimed_rows = std.ArrayListUnmanaged(QueryCandidate).empty;
+            defer {
+                for (claimed_rows.items) |*row| row.deinit(alloc);
+                claimed_rows.deinit(alloc);
+            }
+            var claimed_keys = std.StringHashMapUnmanaged(void).empty;
+            defer {
+                var keys = claimed_keys.keyIterator();
+                while (keys.next()) |key| alloc.free(@constCast(key.*));
+                claimed_keys.deinit(alloc);
+            }
+            var skipped_keys = std.StringHashMapUnmanaged(void).empty;
+            defer {
+                var keys = skipped_keys.keyIterator();
+                while (keys.next()) |key| alloc.free(@constCast(key.*));
+                skipped_keys.deinit(alloc);
+            }
+
+            while (true) {
+                var acc = BoundedSortedRelationalRowsAccumulator{
+                    .req = req,
+                    .retained_limit = retained_limit,
+                    .profile = profile,
+                };
+                defer acc.deinit(alloc);
+                try @This().appendBoundedSortedRelationalRowsForRequestAlloc(self, alloc, runtime_schema, req, generation, &acc);
+                profile = acc.profile;
+
+                self.core.unlockApplyShared();
+                apply_shared_held.* = false;
+
+                std.sort.pdq(QueryCandidate, acc.rows.items, QuerySortContext{ .order_by = req.order_by }, queryCandidateLessThan);
+                const start = @min(@as(usize, req.offset), acc.rows.items.len);
+                var scanned_for_claim: usize = start;
+                while (scanned_for_claim < acc.rows.items.len and claimed_rows.items.len < @as(usize, limit)) : (scanned_for_claim += 1) {
+                    const candidate = acc.rows.items[scanned_for_claim];
+                    if (claimed_keys.contains(candidate.doc_key) or skipped_keys.contains(candidate.doc_key)) continue;
+                    if (try @This().tryClaimRowForTransaction(self, claim.txn_id orelse return error.InvalidQueryRequest, candidate.doc_key, claim)) {
+                        var owned = try cloneQueryCandidateAlloc(alloc, candidate);
+                        var owned_transferred = false;
+                        errdefer if (!owned_transferred) owned.deinit(alloc);
+                        const key = try alloc.dupe(u8, candidate.doc_key);
+                        var key_transferred = false;
+                        errdefer if (!key_transferred) alloc.free(key);
+                        try claimed_rows.append(alloc, owned);
+                        owned_transferred = true;
+                        try claimed_keys.put(alloc, key, {});
+                        key_transferred = true;
+                    } else {
+                        const key = try alloc.dupe(u8, candidate.doc_key);
+                        var key_transferred = false;
+                        errdefer if (!key_transferred) alloc.free(key);
+                        try skipped_keys.put(alloc, key, {});
+                        key_transferred = true;
+                    }
+                }
+
+                const exhausted = retained_limit >= @as(usize, acc.total);
+                if (claimed_rows.items.len >= @as(usize, limit) or exhausted) break;
+
+                const previous_limit = retained_limit;
+                retained_limit = @min(@as(usize, acc.total), retained_limit + @as(usize, limit));
+                if (retained_limit <= previous_limit) break;
+
+                self.core.lockApplyShared();
+                apply_shared_held.* = true;
+            }
+
+            var out_rows = std.ArrayListUnmanaged([]const u8).empty;
+            errdefer {
+                for (out_rows.items) |row| alloc.free(@constCast(row));
+                out_rows.deinit(alloc);
+            }
+            for (claimed_rows.items) |row| {
+                const projected = try @This().projectRelationalRowsQueryCandidateWithMaterializedCtesAndScoreAlloc(self, alloc, runtime_schema, &.{}, row.doc_key, row.json, req, row.text_score);
+                var projected_transferred = false;
+                errdefer if (!projected_transferred) alloc.free(projected);
+                try out_rows.append(alloc, projected);
+                profile.projected_rows += 1;
+                projected_transferred = true;
+            }
+
+            const total: u32 = @intCast(claimed_rows.items.len);
+            const total_shape = relationalRowsQueryTotalShape(total, out_rows.items.len, req.offset, req.limit, req.total_mode);
+            profile.refreshUnsupportedReason();
+            return .{
+                .rows = try out_rows.toOwnedSlice(alloc),
+                .total = total_shape.total,
+                .total_exact = total_shape.total_exact,
+                .profile = profile,
+            };
+        }
+
+        fn buildBoundedSortedRelationalRowsQueryResultAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            req: types.RelationalRowsQueryRequest,
+            generation: ?u64,
+            initial_profile: types.RelationalRowsQueryResult.Profile,
+        ) !?types.RelationalRowsQueryResult {
+            if (!relationalRowsCanUseBoundedSortedResult(req)) return null;
+
+            var acc = BoundedSortedRelationalRowsAccumulator{
+                .req = req,
+                .retained_limit = try boundedSortedRetainedLimit(req),
+                .profile = initial_profile,
+            };
+            errdefer acc.deinit(alloc);
+            try @This().appendBoundedSortedRelationalRowsForRequestAlloc(self, alloc, runtime_schema, req, generation, &acc);
+            return try acc.toResult(self, alloc, runtime_schema);
+        }
+
+        fn appendBoundedSortedRelationalRowsForRequestAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            req: types.RelationalRowsQueryRequest,
+            generation: ?u64,
+            acc: *BoundedSortedRelationalRowsAccumulator,
+        ) !void {
+            if (try @This().appendBoundedSortedRelationalRowsFromOrderedTupleStreamAlloc(self, alloc, runtime_schema, req, generation, acc)) {
+                return;
+            }
+
+            var text_scores = try @This().relationalRowsTextScoreLookupAlloc(self, alloc, req, generation);
+            defer text_scores.deinit(alloc);
+            const text_score_lookup: ?*const RelationalRowsTextScoreLookup = if (relationalRowsQuerySelectsTextScore(req)) &text_scores else null;
+
+            var candidate_set = try @This().resolveRelationalRowsQueryCandidateSetWithProfileAlloc(self, alloc, runtime_schema, req, generation, &acc.profile);
+            defer if (candidate_set) |*set| set.deinit(alloc);
+            if (candidate_set) |*set| {
+                var stream_stats = RelationalRowsCandidateStreamStats{};
+                var scan_ctx = BoundedSortedDocSetCandidateStreamContext{
+                    .db = self,
+                    .alloc = alloc,
+                    .runtime_schema = runtime_schema,
+                    .req = req,
+                    .acc = acc,
+                    .text_scores = text_score_lookup,
+                };
+                if (try @This().scanResolvedDocSetAsCandidateStream(
+                    self,
+                    alloc,
+                    set,
+                    generation,
+                    relationalRowsCandidateStreamAccessMethodForProfile(acc.profile.access_method),
+                    &stream_stats,
+                    &scan_ctx,
+                    BoundedSortedDocSetCandidateStreamContext.append,
+                )) {
+                    setRelationalRowsProfileAccessMethod(&acc.profile, .resolved_doc_set);
+                    if (acc.profile.access_method == .ordered_tuple_doc_set) {
+                        addRelationalRowsCandidateStreamEmissionStats(&acc.profile, stream_stats);
+                    } else {
+                        addRelationalRowsCandidateStreamStats(&acc.profile, stream_stats);
+                    }
+                    return;
+                }
+            }
+
+            const scanned = if (req.doc_key_range) |range|
+                try relational_store_mod.scanRowsSpanAlloc(alloc, self.core.store, range.start, range.end)
+            else
+                try relational_store_mod.scanRowsAlloc(alloc, self.core.store, "", "");
+            defer relational_store_mod.freeRows(alloc, scanned);
+            setRelationalRowsProfileAccessMethod(&acc.profile, .base_scan);
+            acc.profile.iterator_seeks += 1;
+            acc.profile.candidate_rows += scanned.len;
+            setRelationalRowsProfileBaseScanRows(&acc.profile, scanned.len);
+            for (scanned) |row| {
+                const before_total = acc.total;
+                const text_score = if (text_score_lookup) |scores| scores.get(row.doc_key) else null;
+                try @This().appendBoundedSortedRelationalRowsCandidateFromRawWithScoreAlloc(self, alloc, runtime_schema, req, acc, row.doc_key, row.row_value, text_score);
+                if (acc.total != before_total) acc.profile.candidate_stream_emitted += 1;
+            }
+        }
+
+        fn appendBoundedSortedRelationalRowsFromOrderedTupleStreamAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            req: types.RelationalRowsQueryRequest,
+            generation: ?u64,
+            acc: *BoundedSortedRelationalRowsAccumulator,
+        ) !bool {
+            if (req.full_text != null) return false;
+            const implications = PredicateImplications{
+                .predicates = req.predicates,
+                .expressions = req.expression_predicates,
+            };
+            var rejection: ?OrderedTupleIndexCapabilityRejection = null;
+            var plan = (try @This().orderedTupleScanPlanForPredicatesAlloc(self, alloc, runtime_schema, req.predicates, implications, generation, null, &rejection)) orelse {
+                setRelationalRowsProfileOrderedTupleRejection(&acc.profile, rejection);
+                return false;
+            };
+            defer plan.deinit(alloc);
+
+            if (orderedTuplePlanOrderFallbackReason(runtime_schema, req, plan)) |reason| {
+                setRelationalRowsProfileFallback(&acc.profile, reason);
+                switch (reason) {
+                    .ordered_tuple_order_field_not_covered => {},
+                    else => return false,
+                }
+            }
+            setRelationalRowsProfileAccessMethod(&acc.profile, .ordered_tuple_stream);
+            setRelationalRowsProfileOrderedTuplePlan(&acc.profile, plan);
+
+            var stats = relational_store_mod.OrderedTupleDocKeyScanStats{};
+            var stream_stats = RelationalRowsCandidateStreamStats{};
+            var scan_ctx = BoundedSortedDocSetCandidateStreamContext{
+                .db = self,
+                .alloc = alloc,
+                .runtime_schema = runtime_schema,
+                .req = req,
+                .acc = acc,
+            };
+            try @This().scanOrderedTuplePlanAsCandidateStream(
+                self,
+                alloc,
+                plan,
+                req.doc_key_range,
+                &stats,
+                &stream_stats,
+                &scan_ctx,
+                BoundedSortedDocSetCandidateStreamContext.append,
+            );
+            addRelationalRowsOrderedTupleScanStats(&acc.profile, stats);
+            addRelationalRowsCandidateStreamStats(&acc.profile, stream_stats);
+            return true;
+        }
+
+        const BoundedSortedRelationalRowsAccumulator = struct {
+            req: types.RelationalRowsQueryRequest,
+            retained_limit: usize,
+            rows: std.ArrayListUnmanaged(QueryCandidate) = .empty,
+            total: u32 = 0,
+            next_ordinal: usize = 0,
+            profile: types.RelationalRowsQueryResult.Profile = .{},
+
+            fn deinit(self: *@This(), alloc: Allocator) void {
+                for (self.rows.items) |*row| row.deinit(alloc);
+                self.rows.deinit(alloc);
+                self.* = undefined;
+            }
+
+            fn append(self: *@This(), alloc: Allocator, candidate: QueryCandidate) !void {
+                const next_total = std.math.cast(u32, @as(usize, self.total) + 1) orelse return error.UnsupportedQueryRequest;
+                var owned_candidate = candidate;
+                errdefer owned_candidate.deinit(alloc);
+                try self.rows.append(alloc, owned_candidate);
+                owned_candidate = undefined;
+                self.total = next_total;
+                if (self.rows.items.len > self.retained_limit) {
+                    std.sort.pdq(QueryCandidate, self.rows.items, QuerySortContext{ .order_by = self.req.order_by }, queryCandidateLessThan);
+                    var dropped = self.rows.pop().?;
+                    dropped.deinit(alloc);
+                }
+                self.profile.retained_candidate_rows = @max(self.profile.retained_candidate_rows, @as(u64, @intCast(self.rows.items.len)));
+            }
+
+            fn toResult(
+                self: *@This(),
+                db: *DB,
+                alloc: Allocator,
+                runtime_schema: schema_mod.TableSchema,
+            ) !types.RelationalRowsQueryResult {
+                defer {
+                    for (self.rows.items) |*row| row.deinit(alloc);
+                    self.rows.deinit(alloc);
+                    self.rows = .empty;
+                }
+                std.sort.pdq(QueryCandidate, self.rows.items, QuerySortContext{ .order_by = self.req.order_by }, queryCandidateLessThan);
+                const start = @min(@as(usize, self.req.offset), self.rows.items.len);
+                const limited_len = if (self.req.limit) |limit|
+                    @min(@as(usize, limit), self.rows.items.len - start)
+                else
+                    self.rows.items.len - start;
+
+                var selected_indexes = std.ArrayListUnmanaged(usize).empty;
+                defer selected_indexes.deinit(alloc);
+                try selected_indexes.ensureUnusedCapacity(alloc, limited_len);
+                for (start..start + limited_len) |row_index| selected_indexes.appendAssumeCapacity(row_index);
+
+                var total = self.total;
+                if (self.req.row_claim) |claim| {
+                    total = try RelationalRowsImpl.applyRelationalRowsClaimToSelectedCandidatesAlloc(db, alloc, self.rows.items, &selected_indexes, claim, self.req.limit);
+                }
+
+                var out_rows = std.ArrayListUnmanaged([]const u8).empty;
+                errdefer {
+                    for (out_rows.items) |row| alloc.free(@constCast(row));
+                    out_rows.deinit(alloc);
+                }
+                for (selected_indexes.items) |row_index| {
+                    const row = self.rows.items[row_index];
+                    const projected = try RelationalRowsImpl.projectRelationalRowsQueryCandidateWithMaterializedCtesAndScoreAlloc(db, alloc, runtime_schema, &.{}, row.doc_key, row.json, self.req, row.text_score);
+                    var projected_transferred = false;
+                    errdefer if (!projected_transferred) alloc.free(projected);
+                    try out_rows.append(alloc, projected);
+                    self.profile.projected_rows += 1;
+                    projected_transferred = true;
+                }
+
+                const total_shape = relationalRowsQueryTotalShape(total, out_rows.items.len, self.req.offset, self.req.limit, self.req.total_mode);
+                self.profile.refreshUnsupportedReason();
+                const rows = try out_rows.toOwnedSlice(alloc);
+                return .{
+                    .rows = rows,
+                    .total = total_shape.total,
+                    .total_exact = total_shape.total_exact,
+                    .profile = self.profile,
+                };
+            }
+        };
+
+        const BoundedSortedDocSetCandidateStreamContext = struct {
+            db: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            req: types.RelationalRowsQueryRequest,
+            acc: *BoundedSortedRelationalRowsAccumulator,
+            text_scores: ?*const RelationalRowsTextScoreLookup = null,
+
+            fn append(ctx: ?*anyopaque, item: RelationalRowsCandidateStreamItem) anyerror!RelationalRowsCandidateStreamAction {
+                const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+                const text_score = if (self.text_scores) |scores| scores.get(item.doc_key) else null;
+                try RelationalRowsImpl.appendBoundedSortedRelationalRowsCandidateForDocKeyWithScoreAlloc(
+                    self.db,
+                    self.alloc,
+                    self.runtime_schema,
+                    self.req,
+                    self.acc,
+                    item.doc_key,
+                    text_score,
+                );
+                return .@"continue";
+            }
+        };
+
+        fn appendBoundedSortedRelationalRowsCandidateForDocKeyAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            req: types.RelationalRowsQueryRequest,
+            acc: *BoundedSortedRelationalRowsAccumulator,
+            doc_key: []const u8,
+        ) !void {
+            try @This().appendBoundedSortedRelationalRowsCandidateForDocKeyWithScoreAlloc(self, alloc, runtime_schema, req, acc, doc_key, null);
+        }
+
+        fn appendBoundedSortedRelationalRowsCandidateForDocKeyWithScoreAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            req: types.RelationalRowsQueryRequest,
+            acc: *BoundedSortedRelationalRowsAccumulator,
+            doc_key: []const u8,
+            text_score: ?f32,
+        ) !void {
+            if (!docKeyInQueryRange(req, doc_key)) return;
+            const raw_row = try relational_store_mod.getRawAlloc(alloc, self.core.store, doc_key) orelse return;
+            defer alloc.free(raw_row);
+            try @This().appendBoundedSortedRelationalRowsCandidateFromRawWithScoreAlloc(self, alloc, runtime_schema, req, acc, doc_key, raw_row, text_score);
+        }
+
+        fn appendBoundedSortedRelationalRowsCandidateFromRawAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            req: types.RelationalRowsQueryRequest,
+            acc: *BoundedSortedRelationalRowsAccumulator,
+            doc_key: []const u8,
+            raw_row: []const u8,
+        ) !void {
+            try @This().appendBoundedSortedRelationalRowsCandidateFromRawWithScoreAlloc(self, alloc, runtime_schema, req, acc, doc_key, raw_row, null);
+        }
+
+        fn appendBoundedSortedRelationalRowsCandidateFromRawWithScoreAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            req: types.RelationalRowsQueryRequest,
+            acc: *BoundedSortedRelationalRowsAccumulator,
+            doc_key: []const u8,
+            raw_row: []const u8,
+            text_score: ?f32,
+        ) !void {
+            if (!docKeyInQueryRange(req, doc_key)) return;
+            if (try @This().isExpiredDocumentKey(self, alloc, doc_key)) return;
+            const materialized = try mapper.materializeRelationalRowValueAlloc(alloc, raw_row);
+            defer alloc.free(materialized);
+            acc.profile.hydrated_rows += 1;
+            acc.profile.residual_rechecks += 1;
+            if (!(try @This().relationalRowsSubqueryPredicatesPassAlloc(self, alloc, runtime_schema, &.{}, materialized, req.subquery_predicates, currentTimeNs()))) return;
+            var local_req = req;
+            local_req.subquery_predicates = &.{};
+            if (!(try queryJsonMatchesRequestWithColumns(alloc, materialized, local_req, runtime_schema.relational_columns, currentTimeNs()))) return;
+
+            const needs_hidden_order_fields = queryOrdersReferenceHiddenScalarOutput(local_req.order_by, local_req.scalar_subqueries);
+            const order_row_json = if (needs_hidden_order_fields)
+                try @This().rowJsonWithHiddenScalarSubqueriesAlloc(self, alloc, runtime_schema, &.{}, materialized, local_req.scalar_subqueries)
+            else
+                materialized;
+            defer if (needs_hidden_order_fields) alloc.free(order_row_json);
+
+            var parsed = std.json.parseFromSlice(std.json.Value, alloc, order_row_json, .{}) catch return error.InvalidQueryRequest;
+            defer parsed.deinit();
+            if (parsed.value != .object) return error.InvalidQueryRequest;
+            const order_keys = try queryOrderKeysAlloc(alloc, parsed.value, local_req.order_by, currentTimeNs());
+            var order_keys_transferred = false;
+            errdefer if (!order_keys_transferred) freeQueryOrderKeySlice(alloc, order_keys);
+
+            const owned_doc_key = try alloc.dupe(u8, doc_key);
+            var doc_key_transferred = false;
+            errdefer if (!doc_key_transferred) alloc.free(owned_doc_key);
+            const materialized_owned = try alloc.dupe(u8, materialized);
+            var materialized_transferred = false;
+            errdefer if (!materialized_transferred) alloc.free(materialized_owned);
+
+            try acc.append(alloc, .{
+                .doc_key = owned_doc_key,
+                .json = materialized_owned,
+                .version = try self.getTimestamp(alloc, doc_key),
+                .order_keys = order_keys,
+                .text_score = text_score,
+                .ordinal = acc.next_ordinal,
+            });
+            acc.next_ordinal += 1;
+            doc_key_transferred = true;
+            materialized_transferred = true;
+            order_keys_transferred = true;
         }
 
         fn orderedTuplePayloadCanCoverQuery(
@@ -15338,8 +16843,9 @@ pub fn Impl(comptime DB: type) type {
             payload: []const u8,
             req: types.RelationalRowsQueryRequest,
         ) ![]u8 {
+            const payload_view = try relational_store_mod.orderedTuplePayloadView(payload);
             if (req.select.len == 0) {
-                try relational_row_codec.validate(payload);
+                try relational_row_codec.validate(payload_view.cells);
                 return try alloc.dupe(u8, "{}");
             }
 
@@ -15367,7 +16873,7 @@ pub fn Impl(comptime DB: type) type {
                         "",
                 };
             }
-            try relational_row_codec.collectCellsByLookup(payload, lookups, cells);
+            try relational_row_codec.collectCellsByLookup(payload_view.cells, lookups, cells);
 
             var out = std.ArrayListUnmanaged(u8).empty;
             errdefer out.deinit(alloc);
@@ -15385,6 +16891,36 @@ pub fn Impl(comptime DB: type) type {
             return try out.toOwnedSlice(alloc);
         }
 
+        fn orderedTuplePayloadCurrentCellsOrRecordFallback(
+            profile: *types.RelationalRowsQueryResult.Profile,
+            payload: []const u8,
+            index: schema_mod.RelationalIndex,
+            row_generation: u64,
+        ) !?[]const u8 {
+            const view = try relational_store_mod.orderedTuplePayloadView(payload);
+            if (!view.has_metadata) {
+                profile.covering_payload_fallback_metadata_missing_rows += 1;
+                return null;
+            }
+            if (row_generation == 0 or view.row_generation != row_generation) {
+                profile.covering_payload_fallback_row_generation_mismatch_rows += 1;
+                return null;
+            }
+            if (view.index_generation != index.generation) {
+                profile.covering_payload_fallback_index_generation_mismatch_rows += 1;
+                return null;
+            }
+            const schema_fingerprint = index.schema_fingerprint orelse {
+                profile.covering_payload_fallback_schema_fingerprint_mismatch_rows += 1;
+                return null;
+            };
+            if (!std.mem.eql(u8, view.schema_fingerprint, schema_fingerprint)) {
+                profile.covering_payload_fallback_schema_fingerprint_mismatch_rows += 1;
+                return null;
+            }
+            return view.cells;
+        }
+
         fn appendDirectUnorderedRelationalRowsResultFromOrderedTuplePayloadAlloc(
             self: *DB,
             alloc: Allocator,
@@ -15396,10 +16932,39 @@ pub fn Impl(comptime DB: type) type {
             doc_key: []const u8,
             payload: []const u8,
         ) !bool {
-            if (!orderedTuplePayloadCanCoverQuery(runtime_schema, req, plan)) return false;
             if (payload.len == 0) return false;
             if (!docKeyInQueryRange(req, doc_key)) return true;
             if (try @This().isExpiredDocumentKey(self, alloc, doc_key)) return true;
+            if (!orderedTuplePayloadCanCoverQuery(runtime_schema, req, plan)) {
+                if (plan.residual_predicate_count != 0) {
+                    acc.profile.covering_payload_fallback_residual_predicate_rows += 1;
+                } else {
+                    acc.profile.covering_payload_fallback_projection_shape_rows += 1;
+                }
+                return false;
+            }
+            if (plan.residual_predicate_count == 0) {
+                const current_row_generation = self.getTimestamp(alloc, doc_key) catch 0;
+                if (try orderedTuplePayloadCurrentCellsOrRecordFallback(&acc.profile, payload, plan.index, current_row_generation)) |payload_cells| {
+                    acc.profile.covering_payload_rechecked_rows += 1;
+                    acc.profile.covering_payload_hydration_avoided_rows += 1;
+                    const matched_index: usize = @intCast(acc.total);
+                    acc.total = std.math.cast(u32, @as(usize, acc.total) + 1) orelse return error.UnsupportedQueryRequest;
+                    if (matched_index < @as(usize, req.offset)) return true;
+                    if (req.limit) |limit| {
+                        if (acc.rows.items.len >= @as(usize, limit)) return true;
+                    }
+
+                    const projected = try projectOrderedTuplePayloadStaticAlloc(alloc, runtime_schema, payload_cells, req);
+                    var projected_transferred = false;
+                    errdefer if (!projected_transferred) alloc.free(projected);
+                    try acc.rows.append(alloc, projected);
+                    acc.profile.covering_payload_rows += 1;
+                    acc.profile.projected_rows += 1;
+                    projected_transferred = true;
+                    return true;
+                }
+            }
             const raw_row = try relational_store_mod.getRawAlloc(alloc, self.core.store, doc_key) orelse return true;
             defer alloc.free(raw_row);
             acc.profile.hydrated_rows += 1;
@@ -15411,6 +16976,10 @@ pub fn Impl(comptime DB: type) type {
                     return true;
                 },
                 .tuple_and_payload => {},
+            }
+            if (plan.residual_predicate_count != 0) {
+                try @This().appendDirectUnorderedRelationalRowsResultFromRawWithHydrationProfileAlloc(self, alloc, runtime_schema, req, acc, doc_key, raw_row, false);
+                return true;
             }
 
             const matched_index: usize = @intCast(acc.total);
@@ -15457,10 +17026,10 @@ pub fn Impl(comptime DB: type) type {
             ) anyerror!bool,
             plan: OrderedTupleScanPlan,
 
-            fn append(ctx: ?*anyopaque, entry_key: []const u8, doc_key: []const u8, payload: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+            fn append(ctx: ?*anyopaque, item: RelationalRowsCandidateStreamItem) anyerror!RelationalRowsCandidateStreamAction {
                 const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-                try @This().appendRow(self, entry_key, doc_key, payload);
-                return if (self.acc.done(self.req)) .stop else .@"continue";
+                try @This().appendRow(self, item.entry_key, item.doc_key, item.payload);
+                return if (self.acc.done(self.req)) .page_full else .@"continue";
             }
 
             fn appendRow(self: *@This(), entry_key: []const u8, doc_key: []const u8, payload: []const u8) !void {
@@ -15486,11 +17055,12 @@ pub fn Impl(comptime DB: type) type {
             req: types.RelationalRowsQueryRequest,
             generation: ?u64,
         ) !?types.RelationalRowsQueryResult {
+            if (req.full_text != null) return null;
             const implications = PredicateImplications{
                 .predicates = req.predicates,
                 .expressions = req.expression_predicates,
             };
-            var plan = (try @This().orderedTupleScanPlanForPredicatesAlloc(self, alloc, runtime_schema, req.predicates, implications, generation, null)) orelse return null;
+            var plan = (try @This().orderedTupleScanPlanForPredicatesAlloc(self, alloc, runtime_schema, req.predicates, implications, generation, null, null)) orelse return null;
             defer plan.deinit(alloc);
             return try @This().buildDirectOrderedTupleRelationalRowsQueryResultFromPlanAlloc(self, alloc, runtime_schema, req, plan);
         }
@@ -15503,14 +17073,20 @@ pub fn Impl(comptime DB: type) type {
             generation: ?u64,
             profile: ?*types.RelationalRowsQueryResult.Profile,
         ) !?types.RelationalRowsQueryResult {
+            if (req.full_text != null) return null;
             if (req.order_by.len == 0) return null;
             const implications = PredicateImplications{
                 .predicates = req.predicates,
                 .expressions = req.expression_predicates,
             };
             var rejection: ?OrderedTupleIndexCapabilityRejection = null;
-            var plan = (try @This().orderedTupleScanPlanForPredicatesAlloc(self, alloc, runtime_schema, req.predicates, implications, generation, &rejection)) orelse {
+            var plan = (try @This().orderedTupleScanPlanForPredicatesAlloc(self, alloc, runtime_schema, req.predicates, implications, generation, req, &rejection)) orelse {
                 setRelationalRowsProfileOrderedTupleRejection(profile, rejection);
+                if (rejection == null) {
+                    if (orderedTupleUnplannedExpressionOrderFallbackReason(runtime_schema, req)) |reason| {
+                        setRelationalRowsProfileFallback(profile, reason);
+                    }
+                }
                 return null;
             };
             defer plan.deinit(alloc);
@@ -15536,6 +17112,7 @@ pub fn Impl(comptime DB: type) type {
             setRelationalRowsProfileAccessMethod(&acc.profile, .ordered_tuple_stream);
             setRelationalRowsProfileOrderedTuplePlan(&acc.profile, plan);
             var stats = relational_store_mod.OrderedTupleDocKeyScanStats{};
+            var stream_stats = RelationalRowsCandidateStreamStats{};
             var scan_ctx = DirectUnorderedOrderedTupleScanContext{
                 .db = self,
                 .alloc = alloc,
@@ -15546,12 +17123,13 @@ pub fn Impl(comptime DB: type) type {
                 .append_payload = @This().appendDirectUnorderedRelationalRowsResultFromOrderedTuplePayloadAlloc,
                 .plan = plan,
             };
-            try @This().scanOrderedTuplePlanWithContext(
+            try @This().scanOrderedTuplePlanAsCandidateStream(
                 self,
                 alloc,
                 plan,
                 req.doc_key_range,
                 &stats,
+                &stream_stats,
                 &scan_ctx,
                 DirectUnorderedOrderedTupleScanContext.append,
             );
@@ -15559,6 +17137,7 @@ pub fn Impl(comptime DB: type) type {
             acc.profile.index_entries_scanned += stats.index_entries_scanned;
             acc.profile.candidate_rows += stats.candidate_rows;
             acc.profile.iterator_seeks += stats.iterator_seeks;
+            addRelationalRowsCandidateStreamStats(&acc.profile, stream_stats);
             return try acc.toResult(alloc);
         }
 
@@ -15601,6 +17180,68 @@ pub fn Impl(comptime DB: type) type {
             }
         };
 
+        const CountOnlyRelationalRowsAccumulator = struct {
+            total: u32 = 0,
+            profile: types.RelationalRowsQueryResult.Profile = .{},
+
+            fn increment(self: *@This()) !void {
+                self.total = std.math.cast(u32, @as(usize, self.total) + 1) orelse return error.UnsupportedQueryRequest;
+            }
+
+            fn toResult(self: *@This()) types.RelationalRowsQueryResult {
+                return .{
+                    .total = self.total,
+                    .total_exact = true,
+                    .profile = self.profile,
+                };
+            }
+        };
+
+        const CountOnlyDocSetCandidateStreamContext = struct {
+            db: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            req: types.RelationalRowsQueryRequest,
+            acc: *CountOnlyRelationalRowsAccumulator,
+
+            fn append(ctx: ?*anyopaque, item: RelationalRowsCandidateStreamItem) anyerror!RelationalRowsCandidateStreamAction {
+                const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+                try RelationalRowsImpl.appendCountOnlyRelationalRowsResultForDocKeyAlloc(
+                    self.db,
+                    self.alloc,
+                    self.runtime_schema,
+                    self.req,
+                    self.acc,
+                    item.doc_key,
+                );
+                return .@"continue";
+            }
+        };
+
+        const DirectUnorderedDocSetCandidateStreamContext = struct {
+            db: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            req: types.RelationalRowsQueryRequest,
+            acc: *DirectUnorderedRelationalRowsAccumulator,
+            text_scores: ?*const RelationalRowsTextScoreLookup = null,
+
+            fn append(ctx: ?*anyopaque, item: RelationalRowsCandidateStreamItem) anyerror!RelationalRowsCandidateStreamAction {
+                const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+                const text_score = if (self.text_scores) |scores| scores.get(item.doc_key) else null;
+                try RelationalRowsImpl.appendDirectUnorderedRelationalRowsResultForDocKeyWithScoreAlloc(
+                    self.db,
+                    self.alloc,
+                    self.runtime_schema,
+                    self.req,
+                    self.acc,
+                    item.doc_key,
+                    text_score,
+                );
+                return if (self.acc.done(self.req)) .page_full else .@"continue";
+            }
+        };
+
         fn appendDirectUnorderedRelationalRowsResultForDocKeyAlloc(
             self: *DB,
             alloc: Allocator,
@@ -15609,10 +17250,36 @@ pub fn Impl(comptime DB: type) type {
             acc: *DirectUnorderedRelationalRowsAccumulator,
             doc_key: []const u8,
         ) !void {
+            try @This().appendDirectUnorderedRelationalRowsResultForDocKeyWithScoreAlloc(self, alloc, runtime_schema, req, acc, doc_key, null);
+        }
+
+        fn appendDirectUnorderedRelationalRowsResultForDocKeyWithScoreAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            req: types.RelationalRowsQueryRequest,
+            acc: *DirectUnorderedRelationalRowsAccumulator,
+            doc_key: []const u8,
+            text_score: ?f32,
+        ) !void {
             if (!docKeyInQueryRange(req, doc_key)) return;
             const raw_row = try relational_store_mod.getRawAlloc(alloc, self.core.store, doc_key) orelse return;
             defer alloc.free(raw_row);
-            try @This().appendDirectUnorderedRelationalRowsResultFromRawAlloc(self, alloc, runtime_schema, req, acc, doc_key, raw_row);
+            try @This().appendDirectUnorderedRelationalRowsResultFromRawWithScoreAlloc(self, alloc, runtime_schema, req, acc, doc_key, raw_row, text_score);
+        }
+
+        fn appendCountOnlyRelationalRowsResultForDocKeyAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            req: types.RelationalRowsQueryRequest,
+            acc: *CountOnlyRelationalRowsAccumulator,
+            doc_key: []const u8,
+        ) !void {
+            if (!docKeyInQueryRange(req, doc_key)) return;
+            const raw_row = try relational_store_mod.getRawAlloc(alloc, self.core.store, doc_key) orelse return;
+            defer alloc.free(raw_row);
+            try @This().appendCountOnlyRelationalRowsResultFromRawAlloc(self, alloc, runtime_schema, req, acc, doc_key, raw_row);
         }
 
         fn appendDirectUnorderedRelationalRowsResultFromRawAlloc(
@@ -15624,7 +17291,42 @@ pub fn Impl(comptime DB: type) type {
             doc_key: []const u8,
             raw_row: []const u8,
         ) !void {
-            try @This().appendDirectUnorderedRelationalRowsResultFromRawWithHydrationProfileAlloc(self, alloc, runtime_schema, req, acc, doc_key, raw_row, true);
+            try @This().appendDirectUnorderedRelationalRowsResultFromRawWithScoreAlloc(self, alloc, runtime_schema, req, acc, doc_key, raw_row, null);
+        }
+
+        fn appendDirectUnorderedRelationalRowsResultFromRawWithScoreAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            req: types.RelationalRowsQueryRequest,
+            acc: *DirectUnorderedRelationalRowsAccumulator,
+            doc_key: []const u8,
+            raw_row: []const u8,
+            text_score: ?f32,
+        ) !void {
+            try @This().appendDirectUnorderedRelationalRowsResultFromRawWithHydrationProfileAndScoreAlloc(self, alloc, runtime_schema, req, acc, doc_key, raw_row, true, text_score);
+        }
+
+        fn appendCountOnlyRelationalRowsResultFromRawAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            req: types.RelationalRowsQueryRequest,
+            acc: *CountOnlyRelationalRowsAccumulator,
+            doc_key: []const u8,
+            raw_row: []const u8,
+        ) !void {
+            if (!docKeyInQueryRange(req, doc_key)) return;
+            if (try @This().isExpiredDocumentKey(self, alloc, doc_key)) return;
+            acc.profile.hydrated_rows += 1;
+            const materialized = try mapper.materializeRelationalRowValueAlloc(alloc, raw_row);
+            defer alloc.free(materialized);
+            acc.profile.residual_rechecks += 1;
+            if (!(try @This().relationalRowsSubqueryPredicatesPassAlloc(self, alloc, runtime_schema, &.{}, materialized, req.subquery_predicates, currentTimeNs()))) return;
+            var local_req = req;
+            local_req.subquery_predicates = &.{};
+            if (!(try queryJsonMatchesRequestWithColumns(alloc, materialized, local_req, runtime_schema.relational_columns, currentTimeNs()))) return;
+            try acc.increment();
         }
 
         fn appendDirectUnorderedRelationalRowsResultFromRawWithHydrationProfileAlloc(
@@ -15636,6 +17338,20 @@ pub fn Impl(comptime DB: type) type {
             doc_key: []const u8,
             raw_row: []const u8,
             count_hydration: bool,
+        ) !void {
+            try @This().appendDirectUnorderedRelationalRowsResultFromRawWithHydrationProfileAndScoreAlloc(self, alloc, runtime_schema, req, acc, doc_key, raw_row, count_hydration, null);
+        }
+
+        fn appendDirectUnorderedRelationalRowsResultFromRawWithHydrationProfileAndScoreAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            req: types.RelationalRowsQueryRequest,
+            acc: *DirectUnorderedRelationalRowsAccumulator,
+            doc_key: []const u8,
+            raw_row: []const u8,
+            count_hydration: bool,
+            text_score: ?f32,
         ) !void {
             if (!docKeyInQueryRange(req, doc_key)) return;
             if (try @This().isExpiredDocumentKey(self, alloc, doc_key)) return;
@@ -15655,7 +17371,7 @@ pub fn Impl(comptime DB: type) type {
                 if (acc.rows.items.len >= @as(usize, limit)) return;
             }
 
-            const projected = try @This().projectRelationalRowsQueryCandidateWithMaterializedCtesAlloc(self, alloc, runtime_schema, &.{}, doc_key, materialized, req);
+            const projected = try @This().projectRelationalRowsQueryCandidateWithMaterializedCtesAndScoreAlloc(self, alloc, runtime_schema, &.{}, doc_key, materialized, req, text_score);
             var projected_transferred = false;
             errdefer if (!projected_transferred) alloc.free(projected);
             try acc.rows.append(alloc, projected);
@@ -15732,6 +17448,10 @@ pub fn Impl(comptime DB: type) type {
             defer deinitPlannedCtes(alloc, planned_ctes);
             try validateQueryAgainstPlannedCteOutput(planned_ctes, plan.query);
 
+            if (try @This().queryRelationalRowsChainedCteCountOnlyAlloc(self, alloc, runtime_schema, plan)) |result| {
+                return result;
+            }
+
             var materialized_ctes = std.ArrayListUnmanaged(MaterializedCte).empty;
             defer {
                 @This().deinitRelationalRowsMaterializedCtes(self, alloc, materialized_ctes.items);
@@ -15740,6 +17460,256 @@ pub fn Impl(comptime DB: type) type {
 
             try @This().appendRelationalRowsMaterializedCtesAlloc(self, alloc, runtime_schema, plan.ranges, plan.ctes, &materialized_ctes);
             return try @This().queryRelationalRowsWithMaterializedCtesAndRangesAlloc(self, alloc, runtime_schema, materialized_ctes.items, plan.ranges, plan.query);
+        }
+
+        fn queryRelationalRowsChainedCteCountOnlyAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            plan: types.RelationalRowsQueryPlan,
+        ) !?types.RelationalRowsQueryResult {
+            if (!relationalRowsPlanCanUseChainedCteCountOnly(runtime_schema, plan)) return null;
+
+            var chain = std.ArrayListUnmanaged(types.RelationalRowsCte).empty;
+            defer chain.deinit(alloc);
+            var source_cte = plan.query.source_cte;
+            while (source_cte.len != 0) {
+                if (chain.items.len >= plan.ctes.len) return null;
+                const cte = findRelationalRowsCte(plan.ctes, source_cte) orelse return null;
+                try chain.append(alloc, cte);
+                source_cte = cte.query.source_cte;
+            }
+            if (chain.items.len == 0) return null;
+
+            var predicates = std.ArrayListUnmanaged(schema_mod.RelationalCheck).empty;
+            defer predicates.deinit(alloc);
+            var array_any = std.ArrayListUnmanaged(types.RelationalRowsArrayAnyPredicate).empty;
+            defer array_any.deinit(alloc);
+            var array_contains = std.ArrayListUnmanaged(types.RelationalRowsArrayContainsPredicate).empty;
+            defer array_contains.deinit(alloc);
+            var array_eq = std.ArrayListUnmanaged(types.RelationalRowsArrayEqPredicate).empty;
+            defer array_eq.deinit(alloc);
+            var in_predicates = std.ArrayListUnmanaged(types.RelationalRowsInPredicate).empty;
+            defer in_predicates.deinit(alloc);
+            var json_contains = std.ArrayListUnmanaged(types.RelationalRowsJsonContainsPredicate).empty;
+            defer json_contains.deinit(alloc);
+            var json_path_eq = std.ArrayListUnmanaged(types.RelationalRowsJsonPathEqPredicate).empty;
+            defer json_path_eq.deinit(alloc);
+            var json_path_exists = std.ArrayListUnmanaged(types.RelationalRowsJsonPathExistsPredicate).empty;
+            defer json_path_exists.deinit(alloc);
+            var text_patterns = std.ArrayListUnmanaged(types.RelationalRowsTextPatternPredicate).empty;
+            defer text_patterns.deinit(alloc);
+            var or_predicates = std.ArrayListUnmanaged(types.RelationalRowsPredicateGroup).empty;
+            defer or_predicates.deinit(alloc);
+            var not_predicates = std.ArrayListUnmanaged(types.RelationalRowsPredicateGroup).empty;
+            defer not_predicates.deinit(alloc);
+            var access_or_predicates = std.ArrayListUnmanaged(types.RelationalRowsAccessPredicateGroup).empty;
+            defer access_or_predicates.deinit(alloc);
+            var access_not_predicates = std.ArrayListUnmanaged(types.RelationalRowsAccessPredicateGroup).empty;
+            defer access_not_predicates.deinit(alloc);
+            var expression_predicates = std.ArrayListUnmanaged(types.RelationalRowsExpressionCondition).empty;
+            defer expression_predicates.deinit(alloc);
+            var expression_or_predicates = std.ArrayListUnmanaged(types.RelationalRowsExpressionPredicateGroup).empty;
+            defer expression_or_predicates.deinit(alloc);
+            var expression_not_predicates = std.ArrayListUnmanaged(types.RelationalRowsExpressionPredicateGroup).empty;
+            defer expression_not_predicates.deinit(alloc);
+            var expression_array_contains = std.ArrayListUnmanaged(types.RelationalRowsExpressionArrayContainsPredicate).empty;
+            defer expression_array_contains.deinit(alloc);
+
+            var reverse_index = chain.items.len;
+            while (reverse_index > 0) {
+                reverse_index -= 1;
+                const req = chain.items[reverse_index].query;
+                try predicates.appendSlice(alloc, req.predicates);
+                try array_any.appendSlice(alloc, req.array_any);
+                try array_contains.appendSlice(alloc, req.array_contains);
+                try array_eq.appendSlice(alloc, req.array_eq);
+                try in_predicates.appendSlice(alloc, req.in_predicates);
+                try json_contains.appendSlice(alloc, req.json_contains);
+                try json_path_eq.appendSlice(alloc, req.json_path_eq);
+                try json_path_exists.appendSlice(alloc, req.json_path_exists);
+                try text_patterns.appendSlice(alloc, req.text_patterns);
+                try or_predicates.appendSlice(alloc, req.or_predicates);
+                try not_predicates.appendSlice(alloc, req.not_predicates);
+                try access_or_predicates.appendSlice(alloc, req.access_or_predicates);
+                try access_not_predicates.appendSlice(alloc, req.access_not_predicates);
+                try expression_predicates.appendSlice(alloc, req.expression_predicates);
+                try expression_or_predicates.appendSlice(alloc, req.expression_or_predicates);
+                try expression_not_predicates.appendSlice(alloc, req.expression_not_predicates);
+                try expression_array_contains.appendSlice(alloc, req.expression_array_contains);
+            }
+            try predicates.appendSlice(alloc, plan.query.predicates);
+            try array_any.appendSlice(alloc, plan.query.array_any);
+            try array_contains.appendSlice(alloc, plan.query.array_contains);
+            try array_eq.appendSlice(alloc, plan.query.array_eq);
+            try in_predicates.appendSlice(alloc, plan.query.in_predicates);
+            try json_contains.appendSlice(alloc, plan.query.json_contains);
+            try json_path_eq.appendSlice(alloc, plan.query.json_path_eq);
+            try json_path_exists.appendSlice(alloc, plan.query.json_path_exists);
+            try text_patterns.appendSlice(alloc, plan.query.text_patterns);
+            try or_predicates.appendSlice(alloc, plan.query.or_predicates);
+            try not_predicates.appendSlice(alloc, plan.query.not_predicates);
+            try access_or_predicates.appendSlice(alloc, plan.query.access_or_predicates);
+            try access_not_predicates.appendSlice(alloc, plan.query.access_not_predicates);
+            try expression_predicates.appendSlice(alloc, plan.query.expression_predicates);
+            try expression_or_predicates.appendSlice(alloc, plan.query.expression_or_predicates);
+            try expression_not_predicates.appendSlice(alloc, plan.query.expression_not_predicates);
+            try expression_array_contains.appendSlice(alloc, plan.query.expression_array_contains);
+
+            const merged_req = types.RelationalRowsQueryRequest{
+                .predicates = predicates.items,
+                .array_any = array_any.items,
+                .array_contains = array_contains.items,
+                .array_eq = array_eq.items,
+                .in_predicates = in_predicates.items,
+                .json_contains = json_contains.items,
+                .json_path_eq = json_path_eq.items,
+                .json_path_exists = json_path_exists.items,
+                .text_patterns = text_patterns.items,
+                .or_predicates = or_predicates.items,
+                .not_predicates = not_predicates.items,
+                .access_or_predicates = access_or_predicates.items,
+                .access_not_predicates = access_not_predicates.items,
+                .expression_predicates = expression_predicates.items,
+                .expression_or_predicates = expression_or_predicates.items,
+                .expression_not_predicates = expression_not_predicates.items,
+                .expression_array_contains = expression_array_contains.items,
+                .limit = 0,
+                .total_mode = .exact,
+                .profile = plan.query.profile,
+            };
+            return try @This().queryRelationalRowsAcrossRanges(self, alloc, runtime_schema, merged_req, plan.ranges);
+        }
+
+        fn relationalRowsPlanCanUseChainedCteCountOnly(
+            runtime_schema: schema_mod.TableSchema,
+            plan: types.RelationalRowsQueryPlan,
+        ) bool {
+            if (plan.query.source_cte.len == 0 or plan.ctes.len == 0) return false;
+            if (!relationalRowsQueryCanUsePlanCountOnlyTail(plan.query)) return false;
+            if (!relationalRowsQueryFiltersUseSchemaFields(runtime_schema, plan.query)) return false;
+            var source_cte = plan.query.source_cte;
+            var depth: usize = 0;
+            while (source_cte.len != 0) {
+                if (depth >= plan.ctes.len) return false;
+                const cte = findRelationalRowsCte(plan.ctes, source_cte) orelse return false;
+                if (!relationalRowsCteCanStreamAsCountFilter(runtime_schema, cte)) return false;
+                source_cte = cte.query.source_cte;
+                depth += 1;
+            }
+            return depth > 0;
+        }
+
+        fn relationalRowsQueryCanUsePlanCountOnlyTail(req: types.RelationalRowsQueryRequest) bool {
+            return req.total_mode == .exact and
+                req.limit != null and
+                req.limit.? == 0 and
+                req.row_claim == null and
+                !queryHasDistinctOn(req);
+        }
+
+        fn relationalRowsCteCanStreamAsCountFilter(runtime_schema: schema_mod.TableSchema, cte: types.RelationalRowsCte) bool {
+            if (cte.name.len == 0) return false;
+            if (cte.join != null or cte.lateral != null or cte.table_function != null) return false;
+            if (cte.max_rows != null or cte.max_bytes != null or cte.spill_after_bytes != null) return false;
+            var local_query = cte.query;
+            local_query.source_cte = "";
+            if (!relationalRowsQueryRequestCanStreamAsRowPreservingFilter(local_query)) return false;
+            if (!relationalRowsSelectFieldsExist(runtime_schema, cte.query.select)) return false;
+            return relationalRowsQueryFiltersUseSchemaFields(runtime_schema, cte.query);
+        }
+
+        fn relationalRowsQueryRequestCanStreamAsRowPreservingFilter(req: types.RelationalRowsQueryRequest) bool {
+            return req.row_claim == null and
+                req.doc_key_range == null and
+                req.distinct_on.len == 0 and
+                req.distinct_on_expressions.len == 0 and
+                req.order_by.len == 0 and
+                req.limit == null and
+                req.offset == 0 and
+                req.json_extract.len == 0 and
+                req.array_length.len == 0 and
+                req.coalesce.len == 0 and
+                req.field_aliases.len == 0 and
+                req.expressions.len == 0 and
+                req.scalar_subqueries.len == 0 and
+                req.subquery_predicates.len == 0;
+        }
+
+        fn relationalRowsQueryRequestHasNoFilters(req: types.RelationalRowsQueryRequest) bool {
+            return req.predicates.len == 0 and
+                req.array_any.len == 0 and
+                req.array_contains.len == 0 and
+                req.array_eq.len == 0 and
+                req.in_predicates.len == 0 and
+                req.json_contains.len == 0 and
+                req.json_path_eq.len == 0 and
+                req.json_path_exists.len == 0 and
+                req.text_patterns.len == 0 and
+                req.full_text == null and
+                req.or_predicates.len == 0 and
+                req.not_predicates.len == 0 and
+                req.access_or_predicates.len == 0 and
+                req.access_not_predicates.len == 0 and
+                req.expression_predicates.len == 0 and
+                req.expression_or_predicates.len == 0 and
+                req.expression_not_predicates.len == 0 and
+                req.expression_array_contains.len == 0 and
+                req.subquery_predicates.len == 0;
+        }
+
+        fn relationalRowsQueryFiltersUseSchemaFields(runtime_schema: schema_mod.TableSchema, req: types.RelationalRowsQueryRequest) bool {
+            if (req.expression_predicates.len != 0 or
+                req.expression_or_predicates.len != 0 or
+                req.expression_not_predicates.len != 0 or
+                req.expression_array_contains.len != 0) return false;
+            for (req.predicates) |predicate| if (columnForField(runtime_schema, predicate.field) == null) return false;
+            for (req.array_any) |predicate| if (columnForField(runtime_schema, predicate.field) == null) return false;
+            for (req.array_contains) |predicate| if (columnForField(runtime_schema, predicate.field) == null) return false;
+            for (req.array_eq) |predicate| if (columnForField(runtime_schema, predicate.field) == null) return false;
+            for (req.in_predicates) |predicate| if (columnForField(runtime_schema, predicate.field) == null) return false;
+            for (req.json_contains) |predicate| if (columnForField(runtime_schema, predicate.field) == null) return false;
+            for (req.json_path_eq) |predicate| if (columnForField(runtime_schema, predicate.field) == null) return false;
+            for (req.json_path_exists) |predicate| if (columnForField(runtime_schema, predicate.field) == null) return false;
+            for (req.text_patterns) |predicate| if (columnForField(runtime_schema, predicate.field) == null) return false;
+            if (req.full_text != null) return false;
+            for (req.or_predicates) |group| if (!relationalRowsPredicateGroupUsesSchemaFields(runtime_schema, group)) return false;
+            for (req.not_predicates) |group| if (!relationalRowsPredicateGroupUsesSchemaFields(runtime_schema, group)) return false;
+            for (req.access_or_predicates) |group| if (!relationalRowsAccessPredicateGroupUsesSchemaFields(runtime_schema, group)) return false;
+            for (req.access_not_predicates) |group| if (!relationalRowsAccessPredicateGroupUsesSchemaFields(runtime_schema, group)) return false;
+            return true;
+        }
+
+        fn relationalRowsPredicateGroupUsesSchemaFields(runtime_schema: schema_mod.TableSchema, group: types.RelationalRowsPredicateGroup) bool {
+            for (group.predicates) |predicate| if (columnForField(runtime_schema, predicate.field) == null) return false;
+            return true;
+        }
+
+        fn relationalRowsAccessPredicateGroupUsesSchemaFields(runtime_schema: schema_mod.TableSchema, group: types.RelationalRowsAccessPredicateGroup) bool {
+            for (group.predicates) |predicate| if (columnForField(runtime_schema, predicate.field) == null) return false;
+            for (group.array_any) |predicate| if (columnForField(runtime_schema, predicate.field) == null) return false;
+            for (group.array_contains) |predicate| if (columnForField(runtime_schema, predicate.field) == null) return false;
+            for (group.array_eq) |predicate| if (columnForField(runtime_schema, predicate.field) == null) return false;
+            for (group.in_predicates) |predicate| if (columnForField(runtime_schema, predicate.field) == null) return false;
+            for (group.json_contains) |predicate| if (columnForField(runtime_schema, predicate.field) == null) return false;
+            for (group.json_path_eq) |predicate| if (columnForField(runtime_schema, predicate.field) == null) return false;
+            for (group.json_path_exists) |predicate| if (columnForField(runtime_schema, predicate.field) == null) return false;
+            for (group.text_patterns) |predicate| if (columnForField(runtime_schema, predicate.field) == null) return false;
+            return true;
+        }
+
+        fn relationalRowsSelectFieldsExist(runtime_schema: schema_mod.TableSchema, fields: []const []const u8) bool {
+            for (fields) |field| {
+                if (columnForField(runtime_schema, field) == null) return false;
+            }
+            return true;
+        }
+
+        fn findRelationalRowsCte(ctes: []const types.RelationalRowsCte, name: []const u8) ?types.RelationalRowsCte {
+            for (ctes) |cte| {
+                if (std.mem.eql(u8, cte.name, name)) return cte;
+            }
+            return null;
         }
 
         pub fn queryRelationalRowsAcrossRanges(
@@ -15764,11 +17734,34 @@ pub fn Impl(comptime DB: type) type {
             defer if (apply_shared_held) self.core.unlockApplyShared();
 
             const generation = self.core.nextDerivedSequence();
+            if (relationalRowsCanUseCountOnlyResult(local_req)) {
+                var acc = CountOnlyRelationalRowsAccumulator{
+                    .profile = .{
+                        .total_mode = local_req.total_mode,
+                        .count_only = true,
+                    },
+                };
+                for (ranges) |range| {
+                    var range_req = local_req;
+                    range_req.doc_key_range = range;
+                    range_req.offset = 0;
+                    range_req.limit = 0;
+                    range_req.row_claim = null;
+                    try @This().appendCountOnlyRelationalRowsForRequestAlloc(self, alloc, runtime_schema, range_req, generation, &acc);
+                }
+                var result = acc.toResult();
+                result.include_profile = local_req.profile;
+                self.core.unlockApplyShared();
+                apply_shared_held = false;
+                return result;
+            }
+
             var rows = std.ArrayListUnmanaged(QueryCandidate).empty;
             defer {
                 for (rows.items) |*row| row.deinit(alloc);
                 rows.deinit(alloc);
             }
+            var profile = types.RelationalRowsQueryResult.Profile{ .total_mode = local_req.total_mode };
 
             for (ranges) |range| {
                 var range_req = local_req;
@@ -15776,13 +17769,19 @@ pub fn Impl(comptime DB: type) type {
                 range_req.offset = 0;
                 range_req.limit = null;
                 range_req.row_claim = null;
-                try @This().appendRelationalRowsQueryCandidatesForRequestAlloc(self, alloc, runtime_schema, range_req, generation, &rows);
+                try @This().appendRelationalRowsQueryCandidatesForRequestWithMaterializedCtesAndProfileAlloc(self, alloc, runtime_schema, &.{}, range_req, generation, &rows, &profile);
             }
 
             self.core.unlockApplyShared();
             apply_shared_held = false;
 
-            return try @This().buildRelationalRowsQueryResultFromCandidatesAlloc(self, alloc, runtime_schema, local_req, rows.items);
+            var result = try @This().buildRelationalRowsQueryResultFromCandidatesAlloc(self, alloc, runtime_schema, local_req, rows.items);
+            profile.projected_rows += result.rows.len;
+            if (local_req.limit != null) profile.retained_candidate_rows = @min(profile.retained_candidate_rows, @as(u64, @intCast(result.rows.len)));
+            profile.refreshUnsupportedReason();
+            result.profile = profile;
+            result.include_profile = local_req.profile;
+            return result;
         }
 
         pub fn appendRelationalRowsQueryCandidatesForRequestAlloc(
@@ -15822,31 +17821,52 @@ pub fn Impl(comptime DB: type) type {
                 return;
             }
 
+            var text_scores = try @This().relationalRowsTextScoreLookupAlloc(self, alloc, req, generation);
+            defer text_scores.deinit(alloc);
+            const text_score_lookup: ?*const RelationalRowsTextScoreLookup = if (relationalRowsQuerySelectsTextScore(req)) &text_scores else null;
+
             var candidate_set = try @This().resolveRelationalRowsQueryCandidateSetWithProfileAlloc(self, alloc, runtime_schema, req, generation, profile);
             defer if (candidate_set) |*set| set.deinit(alloc);
 
             if (candidate_set) |*set| {
-                const maybe_doc_ids = try self.searchRuntimeResolveDocSetDocIds(alloc, set, generation);
-                if (maybe_doc_ids) |doc_ids| {
+                var stream_stats = RelationalRowsCandidateStreamStats{};
+                var scan_ctx = QueryCandidateDocSetStreamContext{
+                    .db = self,
+                    .alloc = alloc,
+                    .runtime_schema = runtime_schema,
+                    .materialized_ctes = materialized_ctes,
+                    .req = req,
+                    .rows = rows,
+                    .profile = profile,
+                    .text_scores = text_score_lookup,
+                };
+                const stream_access_method = if (profile) |out|
+                    relationalRowsCandidateStreamAccessMethodForProfile(out.access_method)
+                else
+                    .scalar;
+                if (try @This().scanResolvedDocSetAsCandidateStream(
+                    self,
+                    alloc,
+                    set,
+                    generation,
+                    stream_access_method,
+                    &stream_stats,
+                    &scan_ctx,
+                    QueryCandidateDocSetStreamContext.append,
+                )) {
                     if (profile) |out| {
                         setRelationalRowsProfileAccessMethod(profile, .resolved_doc_set);
-                        if (out.access_method != .ordered_tuple_doc_set) {
-                            out.index_entries_scanned += doc_ids.len;
-                            out.candidate_rows += doc_ids.len;
+                        if (out.access_method == .ordered_tuple_doc_set) {
+                            addRelationalRowsCandidateStreamEmissionStats(out, stream_stats);
+                        } else {
+                            addRelationalRowsCandidateStreamStats(out, stream_stats);
                         }
-                    }
-                    defer {
-                        for (doc_ids) |doc_id| alloc.free(@constCast(doc_id));
-                        alloc.free(doc_ids);
-                    }
-                    for (doc_ids) |doc_id| {
-                        try @This().appendRelationalRowsQueryCandidateWithMaterializedCtesAndProfileAlloc(self, alloc, runtime_schema, materialized_ctes, req, rows, doc_id, profile);
                     }
                     return;
                 }
             }
 
-            try @This().appendAllRelationalRowsQueryCandidatesWithMaterializedCtesAndProfileAlloc(self, alloc, runtime_schema, materialized_ctes, req, rows, profile);
+            try @This().appendAllRelationalRowsQueryCandidatesWithMaterializedCtesProfileAndScoresAlloc(self, alloc, runtime_schema, materialized_ctes, req, rows, profile, text_score_lookup);
         }
 
         fn relationalRowsCanStreamOrderedTupleCandidates(req: types.RelationalRowsQueryRequest) bool {
@@ -15871,7 +17891,7 @@ pub fn Impl(comptime DB: type) type {
                 return self.rows.items.len >= page_width;
             }
 
-            fn append(ctx: ?*anyopaque, _: []const u8, doc_key: []const u8, _: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+            fn append(ctx: ?*anyopaque, item: RelationalRowsCandidateStreamItem) anyerror!RelationalRowsCandidateStreamAction {
                 const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
                 try RelationalRowsImpl.appendRelationalRowsQueryCandidateWithMaterializedCtesAndProfileAlloc(
                     self.db,
@@ -15880,10 +17900,10 @@ pub fn Impl(comptime DB: type) type {
                     self.materialized_ctes,
                     self.req,
                     self.rows,
-                    doc_key,
+                    item.doc_key,
                     self.profile,
                 );
-                return if (self.done()) .stop else .@"continue";
+                return if (self.done()) .page_full else .@"continue";
             }
         };
 
@@ -15903,7 +17923,7 @@ pub fn Impl(comptime DB: type) type {
                 .expressions = req.expression_predicates,
             };
             var rejection: ?OrderedTupleIndexCapabilityRejection = null;
-            var plan = (try @This().orderedTupleScanPlanForPredicatesAlloc(self, alloc, runtime_schema, req.predicates, implications, generation, &rejection)) orelse {
+            var plan = (try @This().orderedTupleScanPlanForPredicatesAlloc(self, alloc, runtime_schema, req.predicates, implications, generation, null, &rejection)) orelse {
                 setRelationalRowsProfileOrderedTupleRejection(profile, rejection);
                 return false;
             };
@@ -15914,6 +17934,7 @@ pub fn Impl(comptime DB: type) type {
             setRelationalRowsProfileAccessMethod(profile, .ordered_tuple_stream);
             setRelationalRowsProfileOrderedTuplePlan(profile, plan);
             var stats = relational_store_mod.OrderedTupleDocKeyScanStats{};
+            var stream_stats = RelationalRowsCandidateStreamStats{};
             var scan_ctx = OrderedTupleCandidateAppendContext{
                 .db = self,
                 .alloc = alloc,
@@ -15923,18 +17944,48 @@ pub fn Impl(comptime DB: type) type {
                 .rows = rows,
                 .profile = profile,
             };
-            try @This().scanOrderedTuplePlanWithContext(
+            try @This().scanOrderedTuplePlanAsCandidateStream(
                 self,
                 alloc,
                 plan,
                 req.doc_key_range,
                 &stats,
+                &stream_stats,
                 &scan_ctx,
                 OrderedTupleCandidateAppendContext.append,
             );
             addRelationalRowsOrderedTupleScanStats(profile, stats);
+            if (profile) |out| addRelationalRowsCandidateStreamStats(out, stream_stats);
             return true;
         }
+
+        const QueryCandidateDocSetStreamContext = struct {
+            db: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            materialized_ctes: []MaterializedCte,
+            req: types.RelationalRowsQueryRequest,
+            rows: *std.ArrayListUnmanaged(QueryCandidate),
+            profile: ?*types.RelationalRowsQueryResult.Profile,
+            text_scores: ?*const RelationalRowsTextScoreLookup = null,
+
+            fn append(ctx: ?*anyopaque, item: RelationalRowsCandidateStreamItem) anyerror!RelationalRowsCandidateStreamAction {
+                const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+                const text_score = if (self.text_scores) |scores| scores.get(item.doc_key) else null;
+                try RelationalRowsImpl.appendRelationalRowsQueryCandidateWithMaterializedCtesProfileAndScoreAlloc(
+                    self.db,
+                    self.alloc,
+                    self.runtime_schema,
+                    self.materialized_ctes,
+                    self.req,
+                    self.rows,
+                    item.doc_key,
+                    self.profile,
+                    text_score,
+                );
+                return .@"continue";
+            }
+        };
 
         pub fn buildRelationalRowsQueryResultFromCandidatesAlloc(
             self: *DB,
@@ -15999,7 +18050,7 @@ pub fn Impl(comptime DB: type) type {
             }
             for (selected_indexes.items) |row_index| {
                 const row = rows[row_index];
-                const projected = try @This().projectRelationalRowsQueryCandidateWithMaterializedCtesAlloc(self, alloc, runtime_schema, materialized_ctes, row.doc_key, row.json, req);
+                const projected = try @This().projectRelationalRowsQueryCandidateWithMaterializedCtesAndScoreAlloc(self, alloc, runtime_schema, materialized_ctes, row.doc_key, row.json, req, row.text_score);
                 var projected_transferred = false;
                 errdefer if (!projected_transferred) alloc.free(projected);
                 try out_rows.append(alloc, projected);
@@ -16082,16 +18133,30 @@ pub fn Impl(comptime DB: type) type {
             row_json: []const u8,
             req: types.RelationalRowsQueryRequest,
         ) anyerror![]u8 {
-            if (req.json_extract.len == 0 and req.array_length.len == 0 and req.coalesce.len == 0 and req.field_aliases.len == 0 and req.expressions.len == 0 and req.scalar_subqueries.len == 0) {
+            return try @This().projectRelationalRowsQueryCandidateWithMaterializedCtesAndScoreAlloc(self, alloc, runtime_schema, materialized_ctes, doc_key, row_json, req, null);
+        }
+
+        fn projectRelationalRowsQueryCandidateWithMaterializedCtesAndScoreAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            materialized_ctes: []MaterializedCte,
+            doc_key: []const u8,
+            row_json: []const u8,
+            req: types.RelationalRowsQueryRequest,
+            text_score: ?f32,
+        ) anyerror![]u8 {
+            if (req.json_extract.len == 0 and req.array_length.len == 0 and req.coalesce.len == 0 and req.field_aliases.len == 0 and req.expressions.len == 0 and req.scalar_subqueries.len == 0 and !relationalRowsQuerySelectsReservedTextProjection(req)) {
                 return try self.searchRuntimeProjectLookupStoredBytes(alloc, doc_key, row_json, .{
                     .fields = req.select,
                     .include_all_fields = req.select_all,
                 });
             }
             if (req.scalar_subqueries.len != 0) {
+                if (relationalRowsQuerySelectsReservedTextProjection(req)) return error.UnsupportedQueryRequest;
                 return try @This().projectRelationalRowsQueryCandidateWithScalarSubqueriesAlloc(self, alloc, runtime_schema, materialized_ctes, doc_key, row_json, req);
             }
-            return try @This().projectRelationalRowsQueryCandidateStaticAlloc(alloc, doc_key, row_json, req);
+            return try @This().projectRelationalRowsQueryCandidateStaticWithScoreAlloc(alloc, doc_key, row_json, req, text_score);
         }
 
         fn projectRelationalRowsQueryCandidateWithScalarSubqueriesAlloc(
@@ -16247,7 +18312,17 @@ pub fn Impl(comptime DB: type) type {
             row_json: []const u8,
             req: types.RelationalRowsQueryRequest,
         ) ![]u8 {
-            return try projectQueryCandidateStaticAlloc(alloc, doc_key, row_json, req, currentTimeNs());
+            return try @This().projectRelationalRowsQueryCandidateStaticWithScoreAlloc(alloc, doc_key, row_json, req, null);
+        }
+
+        fn projectRelationalRowsQueryCandidateStaticWithScoreAlloc(
+            alloc: Allocator,
+            doc_key: []const u8,
+            row_json: []const u8,
+            req: types.RelationalRowsQueryRequest,
+            text_score: ?f32,
+        ) ![]u8 {
+            return try projectQueryCandidateStaticWithScoreAlloc(alloc, doc_key, row_json, req, currentTimeNs(), text_score);
         }
 
         pub fn resolveRelationalRowsQueryCandidateSetAlloc(
@@ -16258,6 +18333,15 @@ pub fn Impl(comptime DB: type) type {
             generation: ?u64,
         ) !?doc_set.ResolvedDocSet {
             return try @This().resolveRelationalRowsQueryCandidateSetWithProfileAlloc(self, alloc, runtime_schema, req, generation, null);
+        }
+
+        fn relationalRowsFastBaseRowEstimate(
+            self: *DB,
+            req: types.RelationalRowsQueryRequest,
+            generation: ?u64,
+        ) !?u64 {
+            if (req.doc_key_range != null) return null;
+            return try doc_identity.liveOrdinalCountFromSummaryFast(self.core.store, generation);
         }
 
         fn resolveRelationalRowsQueryCandidateSetWithProfileAlloc(
@@ -16283,34 +18367,39 @@ pub fn Impl(comptime DB: type) type {
             }
             var plan_ordinal: usize = 0;
             var ordered_tuple_predicates_planned = false;
+            const base_row_estimate = if (profile != null)
+                try @This().relationalRowsFastBaseRowEstimate(self, req, generation)
+            else
+                null;
+            setRelationalRowsProfileEstimatedBaseScanRows(profile, base_row_estimate);
 
             if (orderedTupleCanPlanForQueryShape(req)) {
                 var ordered_stats = relational_store_mod.OrderedTupleDocKeyScanStats{};
                 var exact_ordered_tuple_predicates = false;
-                if (try @This().resolveRelationalRowsOrderedTuplePredicateSetProbeAlloc(self, alloc, runtime_schema, req.predicates, implications, generation, req.doc_key_range, orderedTupleCandidateSetProbeLimit(req), &ordered_stats, profile, &exact_ordered_tuple_predicates)) |probe| {
+                if (try @This().resolveRelationalRowsOrderedTuplePredicateSetProbeAlloc(self, alloc, runtime_schema, req.predicates, implications, generation, req.doc_key_range, orderedTupleCandidateSetProbeLimit(req, base_row_estimate), &ordered_stats, profile, &exact_ordered_tuple_predicates)) |probe| {
                     switch (probe) {
                         .set => |ordered_set| {
                             var ordered = ordered_set;
                             errdefer ordered.deinit(alloc);
-                            if (orderedTupleCandidateSetUsableForQuery(req, &ordered)) {
+                            if (orderedTupleCandidateSetUsableForQuery(req, &ordered, base_row_estimate)) {
                                 setRelationalRowsProfileAccessMethod(profile, .ordered_tuple_doc_set);
                                 addRelationalRowsOrderedTupleScanStats(profile, ordered_stats);
-                                setRelationalRowsProfileOrderedTupleProbeGate(profile, req, relationalRowsSaturatingUsize(ordered_stats.candidate_rows), false);
+                                setRelationalRowsProfileOrderedTupleProbeGate(profile, req, base_row_estimate, relationalRowsSaturatingUsize(ordered_stats.candidate_rows), false);
                                 try appendPlannedCandidateSetAlloc(alloc, &planned_sets, &ordered, plan_ordinal, .ordered_tuple_doc_set);
                                 ordered = .none;
                                 plan_ordinal += 1;
                                 ordered_tuple_predicates_planned = exact_ordered_tuple_predicates;
                             } else {
                                 addRelationalRowsOrderedTupleScanStats(profile, ordered_stats);
-                                setRelationalRowsProfileOrderedTupleProbeGate(profile, req, relationalRowsSaturatingUsize(ordered_stats.candidate_rows), false);
+                                setRelationalRowsProfileOrderedTupleProbeGate(profile, req, base_row_estimate, relationalRowsSaturatingUsize(ordered_stats.candidate_rows), false);
                                 setRelationalRowsProfileFallback(profile, .ordered_tuple_candidate_gate);
                                 ordered.deinit(alloc);
                             }
                         },
                         .exceeded_gate => |observed_count| {
                             addRelationalRowsOrderedTupleScanStats(profile, ordered_stats);
-                            setRelationalRowsProfileOrderedTupleProbeGate(profile, req, observed_count, true);
-                            setRelationalRowsProfileFallback(profile, .ordered_tuple_materialization_cap);
+                            setRelationalRowsProfileOrderedTupleProbeGate(profile, req, base_row_estimate, observed_count, true);
+                            setRelationalRowsProfileFallback(profile, orderedTupleCandidateGateExceededFallbackReason(req, base_row_estimate));
                         },
                     }
                 }
@@ -16326,6 +18415,13 @@ pub fn Impl(comptime DB: type) type {
                     child = .none;
                     plan_ordinal += 1;
                 }
+            }
+            if (try @This().resolveRelationalRowsTextSearchCandidateSetAlloc(self, alloc, req, generation)) |text_set_value| {
+                var text_set = text_set_value;
+                errdefer text_set.deinit(alloc);
+                try appendPlannedCandidateSetAlloc(alloc, &planned_sets, &text_set, plan_ordinal, .text_search_doc_set);
+                text_set = .none;
+                plan_ordinal += 1;
             }
             for (req.array_any) |predicate| {
                 var child = (try @This().resolveRelationalRowsArrayAnyDocSetWithPredicatesAlloc(self, alloc, runtime_schema, predicate, implications, generation)) orelse continue;
@@ -16403,6 +18499,32 @@ pub fn Impl(comptime DB: type) type {
                 if (current != null and current.?.estimatedCardinality() != null and current.?.estimatedCardinality().? == 0) break;
             }
             return current;
+        }
+
+        fn resolveRelationalRowsTextSearchCandidateSetAlloc(
+            self: *DB,
+            alloc: Allocator,
+            req: types.RelationalRowsQueryRequest,
+            generation: ?u64,
+        ) !?doc_set.ResolvedDocSet {
+            const text_query = req.full_text orelse return null;
+
+            var search_result = try self.search(alloc, .{
+                .primary_text_index_name = req.primary_text_index_name,
+                .full_text = text_query,
+                .identity_read_generation = generation,
+                .limit = std.math.maxInt(u32),
+                .offset = 0,
+                .include_stored = false,
+                .include_all_fields = false,
+                .defer_stored_projection = true,
+            });
+            defer search_result.deinit();
+            return try self.searchRuntimeResolveSearchHitsToDocSet(alloc, .{
+                .primary_text_index_name = req.primary_text_index_name,
+                .full_text = text_query,
+                .identity_read_generation = generation,
+            }, search_result.hits);
         }
 
         pub fn resolveRelationalRowsOrPredicateGroupsCandidateSetAlloc(
@@ -16668,14 +18790,16 @@ pub fn Impl(comptime DB: type) type {
             profile: ?*types.RelationalRowsQueryResult.Profile,
         ) !?doc_set.ResolvedDocSet {
             const index = relational_store_mod.relationalIndexForUniqueConstraint(runtime_schema.relational_indexes, constraint, .ordered_tuple) orelse return null;
-            if (!orderedTupleUniqueConstraintOwnerLookupSupported(runtime_schema, constraint, index, predicates, expression_predicates, self.searchRuntimeRelationalFilterGenerationCanUseCurrentRows(generation))) return null;
+            const generation_usable = self.searchRuntimeRelationalFilterGenerationCanUseCurrentRows(generation);
+            if (!orderedTupleUniqueConstraintOwnerLookupSupported(runtime_schema, constraint, index, predicates, expression_predicates, generation_usable)) {
+                if (orderedTupleExpressionOwnerLookupFallbackReason(constraint, index, predicates, expression_predicates, generation_usable)) |reason| {
+                    setRelationalRowsProfileFallback(profile, reason);
+                }
+                return null;
+            }
             if (!(try relational_store_mod.predicatesImplyUniqueWhereWithColumns(alloc, implications.predicates, index.where, runtime_schema.relational_columns))) return null;
             if (!(try expressionPredicatesImplyWithColumns(alloc, implications, index.where_expressions, runtime_schema.relational_columns, currentTimeNs()))) return null;
 
-            const columns = try uniqueConstraintColumnsWithIndexAlloc(alloc, runtime_schema, constraint, index);
-            defer alloc.free(columns);
-            const row_value = mapper.buildRelationalRowValueAlloc(alloc, equality_json, columns) catch return null;
-            defer alloc.free(row_value);
             var expression_value_jsons: []?[]const u8 = &.{};
             if (constraint.expressions.len != 0) {
                 expression_value_jsons = try alloc.alloc(?[]const u8, constraint.expressions.len);
@@ -16685,6 +18809,13 @@ pub fn Impl(comptime DB: type) type {
                 }
             }
             defer if (expression_value_jsons.len > 0) alloc.free(expression_value_jsons);
+            const columns = if (constraint.expressions.len == 0)
+                try uniqueConstraintColumnsWithIndexAlloc(alloc, runtime_schema, constraint, index)
+            else
+                try uniqueConstraintColumnsWithIndexAndExpressionValuesAlloc(alloc, runtime_schema, constraint, index, expression_value_jsons);
+            defer alloc.free(columns);
+            const row_value = mapper.buildRelationalRowValueAlloc(alloc, equality_json, columns) catch return null;
+            defer alloc.free(row_value);
             const owner_tuple = if (constraint.expressions.len == 0)
                 (relational_store_mod.uniqueConstraintTupleValueWithColumnsAlloc(alloc, row_value, constraint, runtime_schema.relational_columns) catch return null) orelse return null
             else
@@ -16735,10 +18866,12 @@ pub fn Impl(comptime DB: type) type {
             predicates: []const schema_mod.RelationalCheck,
             implications: PredicateImplications,
             generation: ?u64,
+            order_req: ?types.RelationalRowsQueryRequest,
             rejection_out: ?*?OrderedTupleIndexCapabilityRejection,
         ) !?OrderedTupleScanPlan {
             const generation_usable = self.searchRuntimeRelationalFilterGenerationCanUseCurrentRows(generation);
             var best_candidate: ?OrderedTupleIndexCandidate = null;
+            var best_order_candidate: ?OrderedTupleIndexCandidate = null;
             for (runtime_schema.relational_indexes, 0..) |index, catalog_ordinal| {
                 if (index.owner_kind != .relational_column) continue;
                 const owner_column = relationalIndexOwnerColumn(runtime_schema, index) orelse {
@@ -16756,9 +18889,16 @@ pub fn Impl(comptime DB: type) type {
                 if (best_candidate == null or candidate.score() > best_candidate.?.score()) {
                     best_candidate = candidate;
                 }
+                if (order_req) |req| {
+                    if (orderedTupleCandidateOrderFallbackReason(runtime_schema, req, candidate) == null) {
+                        if (best_order_candidate == null or candidate.score() > best_order_candidate.?.score()) {
+                            best_order_candidate = candidate;
+                        }
+                    }
+                }
             }
 
-            const candidate = best_candidate orelse return null;
+            const candidate = best_order_candidate orelse best_candidate orelse return null;
             const proof_counts = orderedTuplePredicateProofCounts(candidate, predicates.len);
             const index = candidate.index;
             const prefix_keys = index.keys[0..candidate.equality_prefix_len];
@@ -16930,6 +19070,306 @@ pub fn Impl(comptime DB: type) type {
             };
         }
 
+        const RelationalRowsCandidateStreamAccessMethod = enum {
+            scalar,
+            ordered_tuple,
+            algebraic,
+            text_search,
+        };
+
+        const RelationalRowsCandidateStreamItem = struct {
+            access_method: RelationalRowsCandidateStreamAccessMethod,
+            entry_key: []const u8 = "",
+            doc_key: []const u8,
+            payload: []const u8 = "",
+            score: ?f64 = null,
+        };
+
+        const RelationalRowsTextScoreLookup = struct {
+            scores: std.StringHashMapUnmanaged(f32) = .empty,
+
+            fn deinit(self: *@This(), alloc: Allocator) void {
+                var keys = self.scores.keyIterator();
+                while (keys.next()) |key| alloc.free(@constCast(key.*));
+                self.scores.deinit(alloc);
+                self.* = undefined;
+            }
+
+            fn get(self: *const @This(), doc_key: []const u8) ?f32 {
+                return self.scores.get(doc_key);
+            }
+        };
+
+        fn relationalRowsTextScoreLookupAlloc(
+            self: *DB,
+            alloc: Allocator,
+            req: types.RelationalRowsQueryRequest,
+            generation: ?u64,
+        ) !RelationalRowsTextScoreLookup {
+            var lookup = RelationalRowsTextScoreLookup{};
+            errdefer lookup.deinit(alloc);
+            if (!relationalRowsQuerySelectsTextScore(req)) return lookup;
+            const text_query = req.full_text orelse return lookup;
+
+            var search_result = try self.search(alloc, .{
+                .primary_text_index_name = req.primary_text_index_name,
+                .full_text = text_query,
+                .identity_read_generation = generation,
+                .limit = std.math.maxInt(u32),
+                .offset = 0,
+                .include_stored = false,
+                .include_all_fields = false,
+                .defer_stored_projection = true,
+            });
+            defer search_result.deinit();
+
+            for (search_result.hits) |hit| {
+                const score = hit.score orelse 0;
+                const existing = lookup.scores.getPtr(hit.id);
+                if (existing) |value| {
+                    value.* = @max(value.*, score);
+                    continue;
+                }
+                const key = try alloc.dupe(u8, hit.id);
+                errdefer alloc.free(key);
+                try lookup.scores.put(alloc, key, score);
+            }
+            return lookup;
+        }
+
+        const RelationalRowsCandidateStreamStats = struct {
+            index_entries_scanned: u64 = 0,
+            candidate_rows: u64 = 0,
+            emitted_candidates: u64 = 0,
+            iterator_seeks: u64 = 0,
+            stop_reason: types.RelationalRowsQueryResult.CandidateStreamStopReason = .none,
+        };
+
+        const RelationalRowsCandidateStreamAction = enum {
+            @"continue",
+            stop,
+            page_full,
+        };
+
+        const RelationalRowsCandidateStreamSink = *const fn (
+            ctx: ?*anyopaque,
+            item: RelationalRowsCandidateStreamItem,
+        ) anyerror!RelationalRowsCandidateStreamAction;
+
+        fn relationalRowsCandidateStreamAccessMethodForProfile(
+            method: types.RelationalRowsQueryResult.AccessMethod,
+        ) RelationalRowsCandidateStreamAccessMethod {
+            return switch (method) {
+                .ordered_tuple_doc_set, .ordered_tuple_stream => .ordered_tuple,
+                else => .scalar,
+            };
+        }
+
+        fn addRelationalRowsCandidateStreamStats(
+            profile: *types.RelationalRowsQueryResult.Profile,
+            stats: RelationalRowsCandidateStreamStats,
+        ) void {
+            profile.index_entries_scanned += stats.index_entries_scanned;
+            profile.candidate_rows += stats.candidate_rows;
+            profile.candidate_stream_emitted += stats.emitted_candidates;
+            profile.iterator_seeks += stats.iterator_seeks;
+            if (profile.candidate_stream_stop_reason == .none) {
+                profile.candidate_stream_stop_reason = stats.stop_reason;
+            }
+        }
+
+        fn addRelationalRowsCandidateStreamEmissionStats(
+            profile: *types.RelationalRowsQueryResult.Profile,
+            stats: RelationalRowsCandidateStreamStats,
+        ) void {
+            profile.candidate_stream_emitted += stats.emitted_candidates;
+            if (profile.candidate_stream_stop_reason == .none) {
+                profile.candidate_stream_stop_reason = stats.stop_reason;
+            }
+        }
+
+        fn scanResolvedDocSetAsCandidateStream(
+            self: *DB,
+            alloc: Allocator,
+            set: *const doc_set.ResolvedDocSet,
+            generation: ?u64,
+            access_method: RelationalRowsCandidateStreamAccessMethod,
+            stats: ?*RelationalRowsCandidateStreamStats,
+            ctx: ?*anyopaque,
+            sink: RelationalRowsCandidateStreamSink,
+        ) !bool {
+            switch (set.*) {
+                .all => return false,
+                .none => {
+                    if (stats) |out| out.iterator_seeks += 1;
+                    return true;
+                },
+                .doc_keys => |doc_keys| {
+                    if (stats) |out| {
+                        out.iterator_seeks += 1;
+                        out.index_entries_scanned += doc_keys.len;
+                        out.candidate_rows += doc_keys.len;
+                    }
+                    for (doc_keys) |doc_key| {
+                        if (try emitResolvedDocSetCandidate(access_method, stats, ctx, sink, doc_key)) break;
+                    }
+                    return true;
+                },
+                .ordinals => |ordinals| {
+                    var txn = try self.core.store.beginProbeTxn();
+                    defer txn.abort();
+                    if (!try resolvedDocSetOrdinalsVisibleAtGeneration(&txn, ordinals, generation)) return false;
+                    if (stats) |out| {
+                        out.iterator_seeks += 1;
+                        out.index_entries_scanned += ordinals.len;
+                        out.candidate_rows += ordinals.len;
+                    }
+                    for (ordinals) |ordinal| {
+                        const doc_key = (try doc_identity.lookupDocIdTxn(alloc, &txn, ordinal)) orelse return error.InvalidDocIdentity;
+                        const stop = emitResolvedDocSetCandidate(access_method, stats, ctx, sink, doc_key) catch |err| {
+                            alloc.free(doc_key);
+                            return err;
+                        };
+                        alloc.free(doc_key);
+                        if (stop) break;
+                    }
+                    return true;
+                },
+                .ordinal_bitmap => |*bitmap| {
+                    var txn = try self.core.store.beginProbeTxn();
+                    defer txn.abort();
+                    var validation_iter = bitmap.iterator();
+                    while (validation_iter.next()) |ordinal| {
+                        if (!try resolvedDocSetOrdinalVisibleAtGeneration(&txn, ordinal, generation)) return false;
+                    }
+                    const cardinality = bitmap.cardinality();
+                    if (stats) |out| {
+                        out.iterator_seeks += 1;
+                        out.index_entries_scanned += cardinality;
+                        out.candidate_rows += cardinality;
+                    }
+                    var iter = bitmap.iterator();
+                    while (iter.next()) |ordinal| {
+                        const doc_key = (try doc_identity.lookupDocIdTxn(alloc, &txn, ordinal)) orelse return error.InvalidDocIdentity;
+                        const stop = emitResolvedDocSetCandidate(access_method, stats, ctx, sink, doc_key) catch |err| {
+                            alloc.free(doc_key);
+                            return err;
+                        };
+                        alloc.free(doc_key);
+                        if (stop) break;
+                    }
+                    return true;
+                },
+            }
+        }
+
+        fn resolvedDocSetOrdinalsVisibleAtGeneration(
+            txn: anytype,
+            ordinals: []const doc_set.DocOrdinal,
+            generation: ?u64,
+        ) !bool {
+            for (ordinals) |ordinal| {
+                if (!try resolvedDocSetOrdinalVisibleAtGeneration(txn, ordinal, generation)) return false;
+            }
+            return true;
+        }
+
+        fn resolvedDocSetOrdinalVisibleAtGeneration(
+            txn: anytype,
+            ordinal: doc_set.DocOrdinal,
+            generation: ?u64,
+        ) !bool {
+            const state = (try doc_identity.lookupStateTxn(txn, ordinal)) orelse return false;
+            return if (generation) |at| state.isVisibleAt(at) else state.isLive();
+        }
+
+        fn emitResolvedDocSetCandidate(
+            access_method: RelationalRowsCandidateStreamAccessMethod,
+            stats: ?*RelationalRowsCandidateStreamStats,
+            ctx: ?*anyopaque,
+            sink: RelationalRowsCandidateStreamSink,
+            doc_key: []const u8,
+        ) !bool {
+            const action = try sink(ctx, .{
+                .access_method = access_method,
+                .doc_key = doc_key,
+            });
+            if (stats) |out| out.emitted_candidates += 1;
+            switch (action) {
+                .@"continue" => return false,
+                .stop => {
+                    if (stats) |out| {
+                        if (out.stop_reason == .none) out.stop_reason = .sink_stop;
+                    }
+                    return true;
+                },
+                .page_full => {
+                    if (stats) |out| {
+                        if (out.stop_reason == .none) out.stop_reason = .page_full;
+                    }
+                    return true;
+                },
+            }
+        }
+
+        const OrderedTupleCandidateStreamAdapter = struct {
+            ctx: ?*anyopaque,
+            sink: RelationalRowsCandidateStreamSink,
+            stats: ?*RelationalRowsCandidateStreamStats = null,
+
+            fn append(ctx: ?*anyopaque, entry_key: []const u8, doc_key: []const u8, payload: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+                const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+                const action = try self.sink(self.ctx, .{
+                    .access_method = .ordered_tuple,
+                    .entry_key = entry_key,
+                    .doc_key = doc_key,
+                    .payload = payload,
+                });
+                if (self.stats) |out| out.emitted_candidates += 1;
+                switch (action) {
+                    .@"continue" => return .@"continue",
+                    .stop => {
+                        if (self.stats) |out| {
+                            if (out.stop_reason == .none) out.stop_reason = .sink_stop;
+                        }
+                        return .stop;
+                    },
+                    .page_full => {
+                        if (self.stats) |out| {
+                            if (out.stop_reason == .none) out.stop_reason = .page_full;
+                        }
+                        return .stop;
+                    },
+                }
+            }
+        };
+
+        fn scanOrderedTuplePlanAsCandidateStream(
+            self: *DB,
+            alloc: Allocator,
+            plan: OrderedTupleScanPlan,
+            doc_key_range: ?types.RelationalRowsDocKeyRange,
+            stats: ?*relational_store_mod.OrderedTupleDocKeyScanStats,
+            stream_stats: ?*RelationalRowsCandidateStreamStats,
+            ctx: ?*anyopaque,
+            sink: RelationalRowsCandidateStreamSink,
+        ) !void {
+            var adapter = OrderedTupleCandidateStreamAdapter{
+                .ctx = ctx,
+                .sink = sink,
+                .stats = stream_stats,
+            };
+            return try @This().scanOrderedTuplePlanWithContext(
+                self,
+                alloc,
+                plan,
+                doc_key_range,
+                stats,
+                &adapter,
+                OrderedTupleCandidateStreamAdapter.append,
+            );
+        }
+
         fn scanOrderedTuplePlanWithContext(
             self: *DB,
             alloc: Allocator,
@@ -16988,7 +19428,7 @@ pub fn Impl(comptime DB: type) type {
                 return .{ .doc_keys = doc_keys };
             }
 
-            fn append(ctx: ?*anyopaque, _: []const u8, doc_key: []const u8, _: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+            fn append(ctx: ?*anyopaque, item: RelationalRowsCandidateStreamItem) anyerror!RelationalRowsCandidateStreamAction {
                 const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
                 if (self.max_doc_keys) |max_doc_keys| {
                     if (self.out.items.len >= max_doc_keys) {
@@ -16997,7 +19437,7 @@ pub fn Impl(comptime DB: type) type {
                         return .stop;
                     }
                 }
-                const owned_doc_key = try self.alloc.dupe(u8, doc_key);
+                const owned_doc_key = try self.alloc.dupe(u8, item.doc_key);
                 errdefer self.alloc.free(owned_doc_key);
                 try self.out.append(self.alloc, owned_doc_key);
                 self.observed_count = self.out.items.len;
@@ -17019,7 +19459,7 @@ pub fn Impl(comptime DB: type) type {
             exact_predicates_out: ?*bool,
         ) !?OrderedTuplePredicateSetProbe {
             var rejection: ?OrderedTupleIndexCapabilityRejection = null;
-            var plan = (try @This().orderedTupleScanPlanForPredicatesAlloc(self, alloc, runtime_schema, predicates, implications, generation, &rejection)) orelse {
+            var plan = (try @This().orderedTupleScanPlanForPredicatesAlloc(self, alloc, runtime_schema, predicates, implications, generation, null, &rejection)) orelse {
                 setRelationalRowsProfileOrderedTupleRejection(profile, rejection);
                 return null;
             };
@@ -17032,12 +19472,13 @@ pub fn Impl(comptime DB: type) type {
                 .max_doc_keys = max_doc_keys,
             };
             defer collector.deinit();
-            try @This().scanOrderedTuplePlanWithContext(
+            try @This().scanOrderedTuplePlanAsCandidateStream(
                 self,
                 alloc,
                 plan,
                 doc_key_range,
                 stats,
+                null,
                 &collector,
                 OrderedTupleDocKeyProbeCollector.append,
             );
@@ -17486,6 +19927,19 @@ pub fn Impl(comptime DB: type) type {
             rows: *std.ArrayListUnmanaged(QueryCandidate),
             profile: ?*types.RelationalRowsQueryResult.Profile,
         ) !void {
+            try @This().appendAllRelationalRowsQueryCandidatesWithMaterializedCtesProfileAndScoresAlloc(self, alloc, runtime_schema, materialized_ctes, req, rows, profile, null);
+        }
+
+        fn appendAllRelationalRowsQueryCandidatesWithMaterializedCtesProfileAndScoresAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            materialized_ctes: []MaterializedCte,
+            req: types.RelationalRowsQueryRequest,
+            rows: *std.ArrayListUnmanaged(QueryCandidate),
+            profile: ?*types.RelationalRowsQueryResult.Profile,
+            text_scores: ?*const RelationalRowsTextScoreLookup,
+        ) !void {
             const scanned = if (req.doc_key_range) |range|
                 try relational_store_mod.scanRowsSpanAlloc(alloc, self.core.store, range.start, range.end)
             else
@@ -17495,9 +19949,11 @@ pub fn Impl(comptime DB: type) type {
                 setRelationalRowsProfileAccessMethod(profile, .base_scan);
                 out.iterator_seeks += 1;
                 out.candidate_rows += scanned.len;
+                setRelationalRowsProfileBaseScanRows(profile, scanned.len);
             }
             for (scanned) |row| {
-                try @This().appendRelationalRowsQueryCandidateFromRawWithMaterializedCtesAndProfileAlloc(self, alloc, runtime_schema, materialized_ctes, req, rows, row.doc_key, row.row_value, profile);
+                const text_score = if (text_scores) |scores| scores.get(row.doc_key) else null;
+                try @This().appendRelationalRowsQueryCandidateFromRawWithMaterializedCtesProfileAndScoreAlloc(self, alloc, runtime_schema, materialized_ctes, req, rows, row.doc_key, row.row_value, profile, text_score);
             }
         }
 
@@ -17849,10 +20305,24 @@ pub fn Impl(comptime DB: type) type {
             doc_key: []const u8,
             profile: ?*types.RelationalRowsQueryResult.Profile,
         ) !void {
+            try @This().appendRelationalRowsQueryCandidateWithMaterializedCtesProfileAndScoreAlloc(self, alloc, runtime_schema, materialized_ctes, req, rows, doc_key, profile, null);
+        }
+
+        fn appendRelationalRowsQueryCandidateWithMaterializedCtesProfileAndScoreAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            materialized_ctes: []MaterializedCte,
+            req: types.RelationalRowsQueryRequest,
+            rows: *std.ArrayListUnmanaged(QueryCandidate),
+            doc_key: []const u8,
+            profile: ?*types.RelationalRowsQueryResult.Profile,
+            text_score: ?f32,
+        ) !void {
             if (!docKeyInQueryRange(req, doc_key)) return;
             const raw_row = try relational_store_mod.getRawAlloc(alloc, self.core.store, doc_key) orelse return;
             defer alloc.free(raw_row);
-            try @This().appendRelationalRowsQueryCandidateFromRawWithMaterializedCtesAndProfileAlloc(self, alloc, runtime_schema, materialized_ctes, req, rows, doc_key, raw_row, profile);
+            try @This().appendRelationalRowsQueryCandidateFromRawWithMaterializedCtesProfileAndScoreAlloc(self, alloc, runtime_schema, materialized_ctes, req, rows, doc_key, raw_row, profile, text_score);
         }
 
         pub fn appendRelationalRowsQueryCandidateFromRawAlloc(
@@ -17890,6 +20360,21 @@ pub fn Impl(comptime DB: type) type {
             doc_key: []const u8,
             raw_row: []const u8,
             profile: ?*types.RelationalRowsQueryResult.Profile,
+        ) !void {
+            try @This().appendRelationalRowsQueryCandidateFromRawWithMaterializedCtesProfileAndScoreAlloc(self, alloc, runtime_schema, materialized_ctes, req, rows, doc_key, raw_row, profile, null);
+        }
+
+        fn appendRelationalRowsQueryCandidateFromRawWithMaterializedCtesProfileAndScoreAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            materialized_ctes: []MaterializedCte,
+            req: types.RelationalRowsQueryRequest,
+            rows: *std.ArrayListUnmanaged(QueryCandidate),
+            doc_key: []const u8,
+            raw_row: []const u8,
+            profile: ?*types.RelationalRowsQueryResult.Profile,
+            text_score: ?f32,
         ) !void {
             if (!docKeyInQueryRange(req, doc_key)) return;
             if (try @This().isExpiredDocumentKey(self, alloc, doc_key)) return;
@@ -17931,8 +20416,10 @@ pub fn Impl(comptime DB: type) type {
                 .json = materialized_owned,
                 .version = version,
                 .order_keys = order_keys,
+                .text_score = text_score,
                 .ordinal = rows.items.len,
             });
+            if (profile) |out| out.retained_candidate_rows += 1;
             doc_key_transferred = true;
             materialized_transferred = true;
             order_keys_transferred = true;
@@ -24365,7 +26852,7 @@ test "relational rows query uses indexed candidates and authoritative base rows"
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"}},"required":["id","status","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"}},"required":["id","status","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status","owner_kind":"relational_column","owner_name":"status","access_method":"scalar_column","columns":["status"]}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -24519,7 +27006,7 @@ test "relational rows indexed keyword predicates honor case-insensitive collatio
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","collation":"antfly.case_insensitive"},"amount":{"type":"numeric"}},"required":["id","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","collation":"antfly.case_insensitive"},"amount":{"type":"numeric"}},"required":["id","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status","owner_kind":"relational_column","owner_name":"status","access_method":"scalar_column","columns":["status"]}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -25115,21 +27602,25 @@ test "relational rows query planner orders candidate sets by estimated cardinali
             .set = .all,
             .estimated_cardinality = null,
             .ordinal = 0,
+            .access_method = .base_scan,
         },
         .{
             .set = medium,
             .estimated_cardinality = medium.estimatedCardinality(),
             .ordinal = 1,
+            .access_method = .mixed_doc_set,
         },
         .{
             .set = .none,
             .estimated_cardinality = 0,
             .ordinal = 2,
+            .access_method = .mixed_doc_set,
         },
         .{
             .set = small,
             .estimated_cardinality = small.estimatedCardinality(),
             .ordinal = 3,
+            .access_method = .mixed_doc_set,
         },
     };
     medium = .none;
@@ -25342,7 +27833,7 @@ test "relational rows cte materialization uses ordered tuple prefilters" {
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"rank":{"type":"numeric"},"status":{"type":"keyword"}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_rank_cte_idx","owner_kind":"relational_column","owner_name":"tenant","access_method":"ordered_tuple","columns":["tenant"],"keys":[{"column":"tenant"},{"column":"rank"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_rank_cte_idx"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"rank":{"type":"numeric"},"status":{"type":"keyword"}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_rank_cte_idx","owner_kind":"relational_column","owner_name":"tenant","access_method":"ordered_tuple","columns":["tenant"],"keys":[{"column":"tenant"},{"column":"rank"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_rank_cte_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -25580,8 +28071,87 @@ test "relational rows query plan composes non-recursive ctes" {
     defer result.deinit(alloc);
 
     try std.testing.expectEqual(@as(u32, 1), result.total);
+    try std.testing.expect(result.total_exact);
     try std.testing.expectEqual(@as(usize, 1), result.rows.len);
     try std.testing.expectEqualStrings("{\"id\":\"b\",\"amount\":20}", result.rows[0]);
+
+    var bounded_sorted = try db.queryRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = ctes[0..],
+        .query = .{
+            .source_cte = "expensive_open_orders",
+            .select = select[0..],
+            .select_all = false,
+            .order_by = order_by[0..],
+            .limit = 1,
+            .total_mode = .bounded,
+            .profile = true,
+        },
+    });
+    defer bounded_sorted.deinit(alloc);
+
+    try std.testing.expect(bounded_sorted.include_profile);
+    try std.testing.expect(!bounded_sorted.total_exact);
+    try std.testing.expectEqual(@as(u32, 1), bounded_sorted.total);
+    try std.testing.expectEqual(@as(usize, 1), bounded_sorted.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"d\",\"amount\":40}", bounded_sorted.rows[0]);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.base_scan, bounded_sorted.profile.access_method);
+    try std.testing.expectEqual(types.RelationalRowsQueryRequest.TotalMode.bounded, bounded_sorted.profile.total_mode);
+    try std.testing.expectEqual(@as(u64, 2), bounded_sorted.profile.base_scan_rows);
+    try std.testing.expectEqual(@as(u64, 2), bounded_sorted.profile.candidate_rows);
+    try std.testing.expectEqual(@as(u64, 2), bounded_sorted.profile.candidate_stream_emitted);
+    try std.testing.expectEqual(@as(u64, 1), bounded_sorted.profile.retained_candidate_rows);
+    try std.testing.expectEqual(@as(u64, 1), bounded_sorted.profile.projected_rows);
+
+    var none_total = try db.queryRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = ctes[0..],
+        .query = .{
+            .source_cte = "expensive_open_orders",
+            .select = select[0..],
+            .select_all = false,
+            .order_by = order_by[0..],
+            .limit = 1,
+            .total_mode = .none,
+            .profile = true,
+        },
+    });
+    defer none_total.deinit(alloc);
+
+    try std.testing.expect(none_total.include_profile);
+    try std.testing.expect(!none_total.total_exact);
+    try std.testing.expectEqual(@as(u32, 1), none_total.total);
+    try std.testing.expectEqual(@as(usize, 1), none_total.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"d\",\"amount\":40}", none_total.rows[0]);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.base_scan, none_total.profile.access_method);
+    try std.testing.expectEqual(types.RelationalRowsQueryRequest.TotalMode.none, none_total.profile.total_mode);
+    try std.testing.expectEqual(@as(u64, 2), none_total.profile.base_scan_rows);
+    try std.testing.expectEqual(@as(u64, 2), none_total.profile.candidate_rows);
+    try std.testing.expectEqual(@as(u64, 2), none_total.profile.candidate_stream_emitted);
+    try std.testing.expectEqual(@as(u64, 1), none_total.profile.retained_candidate_rows);
+    try std.testing.expectEqual(@as(u64, 1), none_total.profile.projected_rows);
+
+    var count_only = try db.queryRelationalRowsPlan(alloc, runtime_schema, .{
+        .ctes = ctes[0..],
+        .query = .{
+            .source_cte = "expensive_open_orders",
+            .predicates = final_predicates[0..],
+            .limit = 0,
+            .total_mode = .exact,
+            .profile = true,
+        },
+    });
+    defer count_only.deinit(alloc);
+
+    try std.testing.expect(count_only.include_profile);
+    try std.testing.expect(count_only.total_exact);
+    try std.testing.expectEqual(@as(u32, 1), count_only.total);
+    try std.testing.expectEqual(@as(usize, 0), count_only.rows.len);
+    try std.testing.expect(count_only.profile.count_only);
+    try std.testing.expectEqual(types.RelationalRowsQueryRequest.TotalMode.exact, count_only.profile.total_mode);
+    try std.testing.expectEqual(@as(u64, 0), count_only.profile.retained_candidate_rows);
+    try std.testing.expectEqual(@as(u64, 0), count_only.profile.projected_rows);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.base_scan, count_only.profile.access_method);
+    try std.testing.expectEqual(@as(u64, 4), count_only.profile.base_scan_rows);
+    try std.testing.expectEqual(@as(u64, 4), count_only.profile.candidate_rows);
 
     const spill_ctes = [_]types.RelationalRowsCte{.{
         .name = "open_orders",
@@ -26068,7 +28638,7 @@ test "relational rows query ignores building ordered tuple indexes and scans bas
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","email","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"email_rank_building_idx","owner_kind":"relational_column","owner_name":"email","access_method":"ordered_tuple","columns":["email"],"keys":[{"column":"email"},{"column":"rank"}],"lifecycle":"building","generation":7,"schema_fingerprint":"secondary-index-v1:email_rank_building_idx"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","email","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"email_rank_building_idx","owner_kind":"relational_column","owner_name":"email","access_method":"ordered_tuple","columns":["email"],"keys":[{"column":"email"},{"column":"rank"}],"lifecycle":"building","generation":7,"schema_fingerprint":"secondary-index-v1:email_rank_building_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"building","lag":0,"ready_watermark":0}}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -26133,7 +28703,7 @@ test "relational rows query does not maintain scalar entries for ordered seconda
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"username":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","email","username","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"email_rank_idx","owner_kind":"relational_column","owner_name":"email","access_method":"ordered_tuple","columns":["email"],"keys":[{"column":"email","direction":"desc","nulls":"last"},{"column":"rank","direction":"asc","nulls":"first"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:email_rank_idx"},{"name":"username_ordered_idx","owner_kind":"relational_column","owner_name":"username","access_method":"ordered_tuple","columns":["username"],"keys":[{"column":"username","direction":"desc","nulls":"last"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:username_ordered_idx"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"username":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","email","username","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"email_rank_idx","owner_kind":"relational_column","owner_name":"email","access_method":"ordered_tuple","columns":["email"],"keys":[{"column":"email","direction":"desc","nulls":"last"},{"column":"rank","direction":"asc","nulls":"first"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:email_rank_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}},{"name":"username_ordered_idx","owner_kind":"relational_column","owner_name":"username","access_method":"ordered_tuple","columns":["username"],"keys":[{"column":"username","direction":"desc","nulls":"last"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:username_ordered_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -26222,7 +28792,7 @@ test "relational rows query resolves compound ordered tuple equality prefixes" {
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"status":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","tenant","status","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_status_idx","owner_kind":"relational_column","owner_name":"tenant","access_method":"ordered_tuple","columns":["tenant"],"keys":[{"column":"tenant"},{"column":"status"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_status_idx"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"status":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","tenant","status","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_status_idx","owner_kind":"relational_column","owner_name":"tenant","access_method":"ordered_tuple","columns":["tenant"],"keys":[{"column":"tenant"},{"column":"status"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_status_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -26317,6 +28887,7 @@ test "relational ordered tuple capability matcher gates readiness and bounds" {
         .lifecycle = .ready,
         .generation = 7,
         .schema_fingerprint = "secondary-index-v1:tenant_rank_idx",
+        .generation_record = .{ .generation = 7, .lifecycle = .ready },
     }};
     const runtime_schema = schema_mod.TableSchema{
         .storage_mode = .relational,
@@ -26357,6 +28928,7 @@ test "relational ordered tuple capability matcher gates readiness and bounds" {
         .lifecycle = .ready,
         .generation = 7,
         .schema_fingerprint = "secondary-index-v1:tenant_rank_idx",
+        .generation_record = .{ .generation = 7, .lifecycle = .ready },
     }};
     const catalog_only_schema = schema_mod.TableSchema{
         .storage_mode = .relational,
@@ -26381,7 +28953,7 @@ test "relational ordered tuple capability matcher gates readiness and bounds" {
     var missing_generation_index = indexes[0];
     missing_generation_index.generation = 0;
     const missing_generation = try orderedTupleIndexCapabilityForQueryAlloc(alloc, runtime_schema, columns[0], missing_generation_index, 0, predicates[0..], implications, true);
-    try std.testing.expectEqual(OrderedTupleIndexCapability{ .rejected = .generation_not_current }, missing_generation);
+    try std.testing.expectEqual(OrderedTupleIndexCapability{ .rejected = .not_ready }, missing_generation);
 
     var missing_fingerprint_index = indexes[0];
     missing_fingerprint_index.schema_fingerprint = null;
@@ -26393,9 +28965,11 @@ test "relational ordered tuple capability matcher gates readiness and bounds" {
     const scalar_method = try orderedTupleIndexCapabilityForQueryAlloc(alloc, runtime_schema, columns[0], scalar_method_index, 0, predicates[0..], implications, true);
     try std.testing.expectEqual(OrderedTupleIndexCapability{ .rejected = .access_method_mismatch }, scalar_method);
     try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.ordered_tuple_access_method_mismatch, orderedTupleCapabilityFallbackReason(.access_method_mismatch));
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.UnsupportedReason.unsupported_access_method, types.RelationalRowsQueryResult.unsupportedReasonForFallback(.ordered_tuple_access_method_mismatch));
 
     var building_index = indexes[0];
     building_index.lifecycle = .building;
+    if (building_index.generation_record) |*record| record.lifecycle = .building;
     const building = try orderedTupleIndexCapabilityForQueryAlloc(alloc, runtime_schema, columns[0], building_index, 0, predicates[0..], implications, true);
     try std.testing.expectEqual(OrderedTupleIndexCapability{ .rejected = .not_ready }, building);
 
@@ -26432,6 +29006,7 @@ test "relational ordered tuple capability matcher gates readiness and bounds" {
         .lifecycle = .ready,
         .generation = 7,
         .schema_fingerprint = "secondary-index-v1:email_rank_ci_idx",
+        .generation_record = .{ .generation = 7, .lifecycle = .ready },
     }};
     const ci_schema = schema_mod.TableSchema{
         .storage_mode = .relational,
@@ -26446,7 +29021,7 @@ test "relational ordered tuple capability matcher gates readiness and bounds" {
     const ci_capability = try orderedTupleIndexCapabilityForQueryAlloc(alloc, ci_schema, ci_columns[0], ci_indexes[0], 0, ci_predicates[0..], ci_implications, true);
     switch (ci_capability) {
         .usable => |candidate| {
-            try std.testing.expectEqual(@as(usize, 1), candidate.equality_prefix_len);
+            try std.testing.expectEqual(@as(usize, 2), candidate.equality_prefix_len);
             try std.testing.expect(candidate.range_key_index == null);
         },
         .rejected => return error.TestExpectedEqual,
@@ -26471,6 +29046,7 @@ test "relational ordered tuple capability matcher gates readiness and bounds" {
         .lifecycle = .ready,
         .generation = 7,
         .schema_fingerprint = "secondary-index-v1:email_rank_unsupported_collation_idx",
+        .generation_record = .{ .generation = 7, .lifecycle = .ready },
     }};
     const unsupported_collation_schema = schema_mod.TableSchema{
         .storage_mode = .relational,
@@ -26498,7 +29074,7 @@ test "relational ordered tuple fallback profile names capability rejections" {
         defer db.close();
 
         const schema_json =
-            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"rank":{"type":"numeric"},"status":{"type":"keyword"}},"required":["id","tenant","rank","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_rank_active_idx","owner_kind":"relational_column","owner_name":"tenant","access_method":"ordered_tuple","columns":["tenant"],"keys":[{"column":"tenant"},{"column":"rank"}],"where":{"all":[{"field":"status","op":"eq","value":"active"}]},"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_rank_active_idx"}]}
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"rank":{"type":"numeric"},"status":{"type":"keyword"}},"required":["id","tenant","rank","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_rank_active_idx","owner_kind":"relational_column","owner_name":"tenant","access_method":"ordered_tuple","columns":["tenant"],"keys":[{"column":"tenant"},{"column":"rank"}],"where":{"all":[{"field":"status","op":"eq","value":"active"}]},"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_rank_active_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
         ;
         var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
         defer parsed_schema.deinit(alloc);
@@ -26529,6 +29105,8 @@ test "relational ordered tuple fallback profile names capability rejections" {
         try std.testing.expect(result.profile.access_method != .ordered_tuple_doc_set);
         try std.testing.expect(result.profile.access_method != .ordered_tuple_stream);
         try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.ordered_tuple_predicate_not_proven, result.profile.fallback_reason);
+        try std.testing.expectEqual(types.RelationalRowsQueryResult.UnsupportedReason.predicate_not_proven, result.profile.unsupported_reason);
+        try std.testing.expectEqual(types.RelationalRowsQueryResult.UnsupportedReason.predicate_not_proven, result.profile.unsupportedReason());
         try std.testing.expect(!result.profile.ordered_tuple_plan_selected);
         try std.testing.expectEqual(@as(u32, 2), result.total);
     }
@@ -26542,7 +29120,7 @@ test "relational ordered tuple fallback profile names capability rejections" {
         defer db.close();
 
         const schema_json =
-            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_rank_stale_idx","owner_kind":"relational_column","owner_name":"tenant","access_method":"ordered_tuple","columns":["tenant"],"keys":[{"column":"tenant"},{"column":"rank"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_rank_stale_idx"}]}
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_rank_stale_idx","owner_kind":"relational_column","owner_name":"tenant","access_method":"ordered_tuple","columns":["tenant"],"keys":[{"column":"tenant"},{"column":"rank"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_rank_stale_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
         ;
         var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
         defer parsed_schema.deinit(alloc);
@@ -26572,6 +29150,9 @@ test "relational ordered tuple fallback profile names capability rejections" {
         try std.testing.expect(profile.access_method != .ordered_tuple_doc_set);
         try std.testing.expect(profile.access_method != .ordered_tuple_stream);
         try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.ordered_tuple_stale_generation, profile.fallback_reason);
+        profile.refreshUnsupportedReason();
+        try std.testing.expectEqual(types.RelationalRowsQueryResult.UnsupportedReason.stale_generation, profile.unsupported_reason);
+        try std.testing.expectEqual(types.RelationalRowsQueryResult.UnsupportedReason.stale_generation, profile.unsupportedReason());
         try std.testing.expect(!profile.ordered_tuple_plan_selected);
     }
 
@@ -26584,7 +29165,7 @@ test "relational ordered tuple fallback profile names capability rejections" {
         defer db.close();
 
         const schema_json =
-            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword","collation":"und-x-icu"},"rank":{"type":"numeric"}},"required":["id","email","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"email_rank_unsupported_collation_idx","owner_kind":"relational_column","owner_name":"email","access_method":"ordered_tuple","columns":["email"],"keys":[{"column":"email"},{"column":"rank"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:email_rank_unsupported_collation_idx"}]}
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword","collation":"und-x-icu"},"rank":{"type":"numeric"}},"required":["id","email","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"email_rank_unsupported_collation_idx","owner_kind":"relational_column","owner_name":"email","access_method":"ordered_tuple","columns":["email"],"keys":[{"column":"email"},{"column":"rank"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:email_rank_unsupported_collation_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
         ;
         var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
         defer parsed_schema.deinit(alloc);
@@ -26615,6 +29196,7 @@ test "relational ordered tuple fallback profile names capability rejections" {
         try std.testing.expect(result.profile.access_method != .ordered_tuple_doc_set);
         try std.testing.expect(result.profile.access_method != .ordered_tuple_stream);
         try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.ordered_tuple_collation_not_supported, result.profile.fallback_reason);
+        try std.testing.expectEqual(types.RelationalRowsQueryResult.UnsupportedReason.access_method_capability_mismatch, result.profile.unsupportedReason());
         try std.testing.expect(!result.profile.ordered_tuple_plan_selected);
         try std.testing.expectEqual(@as(u32, 2), result.total);
     }
@@ -26628,7 +29210,7 @@ test "relational ordered tuple fallback profile names capability rejections" {
         defer db.close();
 
         const schema_json =
-            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_rank_idx","owner_kind":"relational_column","owner_name":"tenant","access_method":"ordered_tuple","columns":["tenant"],"keys":[{"column":"tenant"},{"column":"rank"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_rank_idx"}]}
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_rank_idx","owner_kind":"relational_column","owner_name":"tenant","access_method":"ordered_tuple","columns":["tenant"],"keys":[{"column":"tenant"},{"column":"rank"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_rank_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
         ;
         var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
         defer parsed_schema.deinit(alloc);
@@ -26661,6 +29243,7 @@ test "relational ordered tuple fallback profile names capability rejections" {
         try std.testing.expect(result.profile.access_method != .ordered_tuple_doc_set);
         try std.testing.expect(result.profile.access_method != .ordered_tuple_stream);
         try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.ordered_tuple_no_usable_bounds, result.profile.fallback_reason);
+        try std.testing.expectEqual(types.RelationalRowsQueryResult.UnsupportedReason.access_method_capability_mismatch, result.profile.unsupportedReason());
         try std.testing.expect(!result.profile.ordered_tuple_plan_selected);
         try std.testing.expectEqual(@as(u32, 2), result.total);
     }
@@ -26674,7 +29257,7 @@ test "relational ordered tuple fallback profile names capability rejections" {
         defer db.close();
 
         const schema_json =
-            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_rank_building_idx","owner_kind":"relational_column","owner_name":"tenant","access_method":"ordered_tuple","columns":["tenant"],"keys":[{"column":"tenant"},{"column":"rank"}],"lifecycle":"building","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_rank_building_idx"}]}
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_rank_building_idx","owner_kind":"relational_column","owner_name":"tenant","access_method":"ordered_tuple","columns":["tenant"],"keys":[{"column":"tenant"},{"column":"rank"}],"lifecycle":"building","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_rank_building_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"building","lag":0,"ready_watermark":0}}]}
         ;
         var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
         defer parsed_schema.deinit(alloc);
@@ -26705,15 +29288,19 @@ test "relational ordered tuple fallback profile names capability rejections" {
         try std.testing.expect(result.profile.access_method != .ordered_tuple_doc_set);
         try std.testing.expect(result.profile.access_method != .ordered_tuple_stream);
         try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.ordered_tuple_index_not_ready, result.profile.fallback_reason);
+        try std.testing.expectEqual(types.RelationalRowsQueryResult.UnsupportedReason.index_not_ready, result.profile.unsupportedReason());
         try std.testing.expect(!result.profile.ordered_tuple_plan_selected);
         try std.testing.expectEqual(@as(u32, 2), result.total);
     }
 }
 
-test "relational ordered tuple candidate gate is total-mode aware" {
-    const exact_page_gate = orderedTupleCandidateSetGate(.{ .limit = 1, .total_mode = .exact });
+test "relational ordered tuple candidate gate uses measured selectivity budget" {
+    const exact_page_gate = orderedTupleCandidateSetGate(.{ .limit = 1, .total_mode = .exact }, null);
     try std.testing.expectEqual(@as(usize, ordered_tuple_bounded_unordered_candidate_gate), exact_page_gate);
-    try std.testing.expectEqual(@as(usize, ordered_tuple_bounded_unordered_candidate_gate), orderedTupleCandidateSetGate(.{ .total_mode = .exact }));
+    try std.testing.expectEqual(@as(usize, ordered_tuple_bounded_unordered_candidate_gate), orderedTupleCandidateSetGate(.{ .total_mode = .exact }, null));
+    try std.testing.expectEqual(@as(usize, 25), orderedTupleCandidateSetGate(.{ .limit = 1, .total_mode = .exact }, 100));
+    try std.testing.expectEqual(@as(usize, 400), orderedTupleCandidateSetGate(.{ .limit = 100, .total_mode = .exact }, 1000));
+    try std.testing.expectEqual(@as(usize, ordered_tuple_bounded_unordered_candidate_gate), orderedTupleCandidateSetGate(.{ .limit = 1, .total_mode = .exact }, 1_000_000));
 
     var small_ordinals: [4]doc_set.DocOrdinal = undefined;
     for (&small_ordinals, 0..) |*ordinal, i| ordinal.* = @intCast(i);
@@ -26727,34 +29314,38 @@ test "relational ordered tuple candidate gate is total-mode aware" {
     for (&bounded_ordinals, 0..) |*ordinal, i| ordinal.* = @intCast(i);
     const bounded_set = doc_set.ResolvedDocSet{ .ordinals = bounded_ordinals[0..] };
 
-    try std.testing.expect(orderedTupleCandidateSetUsableForQuery(.{ .limit = 1, .total_mode = .exact }, &small_set));
-    try std.testing.expect(orderedTupleCandidateSetUsableForQuery(.{ .limit = 1, .total_mode = .exact }, &too_many_exact));
-    try std.testing.expect(orderedTupleCandidateSetUsableForQuery(.{ .limit = 100, .total_mode = .exact }, &too_many_exact));
-    try std.testing.expectEqual(@as(usize, ordered_tuple_bounded_unordered_candidate_gate), orderedTupleCandidateSetGate(.{ .limit = 100, .total_mode = .exact }));
-    try std.testing.expect(orderedTupleCandidateSetUsableForQuery(.{ .limit = 100, .total_mode = .none }, &bounded_set));
+    try std.testing.expect(orderedTupleCandidateSetUsableForQuery(.{ .limit = 1, .total_mode = .exact }, &small_set, null));
+    try std.testing.expect(orderedTupleCandidateSetUsableForQuery(.{ .limit = 1, .total_mode = .exact }, &too_many_exact, null));
+    try std.testing.expect(orderedTupleCandidateSetUsableForQuery(.{ .limit = 100, .total_mode = .exact }, &too_many_exact, null));
+    try std.testing.expectEqual(@as(usize, ordered_tuple_bounded_unordered_candidate_gate), orderedTupleCandidateSetGate(.{ .limit = 100, .total_mode = .exact }, null));
+    try std.testing.expect(orderedTupleCandidateSetUsableForQuery(.{ .limit = 100, .total_mode = .none }, &bounded_set, null));
+    try std.testing.expect(orderedTupleCandidateSetUsableForQuery(.{ .limit = 1, .total_mode = .exact }, &small_set, 100));
+    try std.testing.expect(orderedTupleCandidateSetUsableForQuery(.{ .limit = 1, .total_mode = .exact }, &too_many_exact, 20));
+    try std.testing.expect(!orderedTupleCandidateSetUsableForQuery(.{ .limit = 1, .total_mode = .exact }, &bounded_set, 100));
 
     const over_cap_ordinals = try std.testing.allocator.alloc(doc_set.DocOrdinal, ordered_tuple_bounded_unordered_candidate_gate + 1);
     defer std.testing.allocator.free(over_cap_ordinals);
     for (over_cap_ordinals, 0..) |*ordinal, i| ordinal.* = @intCast(i);
     const over_cap_set = doc_set.ResolvedDocSet{ .ordinals = over_cap_ordinals };
-    try std.testing.expect(!orderedTupleCandidateSetUsableForQuery(.{ .limit = 1, .total_mode = .exact }, &over_cap_set));
+    try std.testing.expect(!orderedTupleCandidateSetUsableForQuery(.{ .limit = 1, .total_mode = .exact }, &over_cap_set, null));
+    try std.testing.expect(!orderedTupleCandidateSetUsableForQuery(.{ .limit = 1, .total_mode = .exact }, &over_cap_set, 1_000_000));
 
     var finite_profile = types.RelationalRowsQueryResult.Profile{};
-    setRelationalRowsProfileOrderedTupleProbeGate(&finite_profile, .{ .limit = 1, .total_mode = .exact }, 5, false);
-    try std.testing.expectEqual(@as(u64, ordered_tuple_bounded_unordered_candidate_gate), finite_profile.candidate_gate_limit);
+    setRelationalRowsProfileOrderedTupleProbeGate(&finite_profile, .{ .limit = 1, .total_mode = .exact }, 100, 5, false);
+    try std.testing.expectEqual(@as(u64, 25), finite_profile.candidate_gate_limit);
     try std.testing.expectEqual(@as(u64, 5), finite_profile.candidate_gate_observed);
     try std.testing.expect(!finite_profile.candidate_gate_exceeded);
     try std.testing.expectEqual(@as(u64, 5), finite_profile.estimated_candidate_rows);
 
     var wider_profile = types.RelationalRowsQueryResult.Profile{};
-    setRelationalRowsProfileOrderedTupleProbeGate(&wider_profile, .{ .limit = 100, .total_mode = .exact }, 33, false);
-    try std.testing.expectEqual(@as(u64, ordered_tuple_bounded_unordered_candidate_gate), wider_profile.candidate_gate_limit);
+    setRelationalRowsProfileOrderedTupleProbeGate(&wider_profile, .{ .limit = 100, .total_mode = .exact }, 1000, 33, false);
+    try std.testing.expectEqual(@as(u64, 400), wider_profile.candidate_gate_limit);
     try std.testing.expectEqual(@as(u64, 33), wider_profile.candidate_gate_observed);
     try std.testing.expect(!wider_profile.candidate_gate_exceeded);
     try std.testing.expectEqual(@as(u64, 33), wider_profile.estimated_candidate_rows);
 
     var unpaged_profile = types.RelationalRowsQueryResult.Profile{};
-    setRelationalRowsProfileOrderedTupleProbeGate(&unpaged_profile, .{ .total_mode = .exact }, 33, false);
+    setRelationalRowsProfileOrderedTupleProbeGate(&unpaged_profile, .{ .total_mode = .exact }, null, 33, false);
     try std.testing.expectEqual(@as(u64, ordered_tuple_bounded_unordered_candidate_gate), unpaged_profile.candidate_gate_limit);
     try std.testing.expectEqual(@as(u64, 33), unpaged_profile.candidate_gate_observed);
     try std.testing.expect(!unpaged_profile.candidate_gate_exceeded);
@@ -26762,18 +29353,18 @@ test "relational ordered tuple candidate gate is total-mode aware" {
 
     const order_by = [_]types.RelationalRowsQueryOrder{.{ .field = "rank", .direction = .asc }};
     var ungated_profile = types.RelationalRowsQueryResult.Profile{};
-    setRelationalRowsProfileOrderedTupleProbeGate(&ungated_profile, .{ .order_by = order_by[0..], .limit = 100, .total_mode = .exact }, 33, true);
+    setRelationalRowsProfileOrderedTupleProbeGate(&ungated_profile, .{ .order_by = order_by[0..], .limit = 100, .total_mode = .exact }, 1000, 33, true);
     try std.testing.expectEqual(@as(u64, 0), ungated_profile.candidate_gate_limit);
     try std.testing.expectEqual(@as(u64, 0), ungated_profile.candidate_gate_observed);
     try std.testing.expect(!ungated_profile.candidate_gate_exceeded);
     try std.testing.expectEqual(@as(u64, 0), ungated_profile.estimated_candidate_rows);
 
     var exceeded_profile = types.RelationalRowsQueryResult.Profile{};
-    setRelationalRowsProfileOrderedTupleProbeGate(&exceeded_profile, .{ .limit = 1, .total_mode = .exact }, ordered_tuple_bounded_unordered_candidate_gate + 1, true);
-    try std.testing.expectEqual(@as(u64, ordered_tuple_bounded_unordered_candidate_gate), exceeded_profile.candidate_gate_limit);
-    try std.testing.expectEqual(@as(u64, ordered_tuple_bounded_unordered_candidate_gate + 1), exceeded_profile.candidate_gate_observed);
+    setRelationalRowsProfileOrderedTupleProbeGate(&exceeded_profile, .{ .limit = 1, .total_mode = .exact }, 100, 26, true);
+    try std.testing.expectEqual(@as(u64, 25), exceeded_profile.candidate_gate_limit);
+    try std.testing.expectEqual(@as(u64, 26), exceeded_profile.candidate_gate_observed);
     try std.testing.expect(exceeded_profile.candidate_gate_exceeded);
-    try std.testing.expectEqual(@as(u64, ordered_tuple_bounded_unordered_candidate_gate + 1), exceeded_profile.estimated_candidate_rows);
+    try std.testing.expectEqual(@as(u64, 26), exceeded_profile.estimated_candidate_rows);
 }
 
 test "relational ordered tuple candidate probe uses measured candidates past old page gate" {
@@ -26789,7 +29380,7 @@ test "relational ordered tuple candidate probe uses measured candidates past old
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_rank_gate_idx","owner_kind":"relational_column","owner_name":"tenant","access_method":"ordered_tuple","columns":["tenant"],"keys":[{"column":"tenant"},{"column":"rank"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_rank_gate_idx"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_rank_gate_idx","owner_kind":"relational_column","owner_name":"tenant","access_method":"ordered_tuple","columns":["tenant"],"keys":[{"column":"tenant"},{"column":"rank"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_rank_gate_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -26846,6 +29437,9 @@ test "relational ordered tuple candidate probe uses measured candidates past old
     try std.testing.expectEqual(@as(u64, 5), result.profile.estimated_candidate_rows);
     try std.testing.expectEqual(@as(u64, 5), result.profile.index_entries_scanned);
     try std.testing.expectEqual(@as(u64, 5), result.profile.candidate_rows);
+    try std.testing.expectEqual(@as(u64, 5), result.profile.candidate_stream_emitted);
+    try std.testing.expectEqual(@as(u64, 5), result.profile.retained_candidate_rows);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.CandidateStreamStopReason.none, result.profile.candidate_stream_stop_reason);
     try std.testing.expectEqual(@as(u64, 5), result.profile.hydrated_rows);
     try std.testing.expectEqual(@as(u64, 5), result.profile.residual_rechecks);
     try std.testing.expectEqual(@as(u32, 5), result.total);
@@ -26867,6 +29461,9 @@ test "relational ordered tuple candidate probe uses measured candidates past old
     try std.testing.expect(!bounded.total_exact);
     try std.testing.expectEqual(@as(usize, 1), bounded.rows.len);
     try std.testing.expectEqual(@as(u64, 1), bounded.profile.index_entries_scanned);
+    try std.testing.expectEqual(@as(u64, 1), bounded.profile.candidate_stream_emitted);
+    try std.testing.expectEqual(@as(u64, 1), bounded.profile.retained_candidate_rows);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.CandidateStreamStopReason.page_full, bounded.profile.candidate_stream_stop_reason);
     try std.testing.expectEqual(@as(u64, 1), bounded.profile.hydrated_rows);
 
     var no_total = try db.queryRelationalRows(alloc, runtime_schema, .{
@@ -26883,6 +29480,9 @@ test "relational ordered tuple candidate probe uses measured candidates past old
     try std.testing.expect(!no_total.total_exact);
     try std.testing.expectEqual(@as(usize, 1), no_total.rows.len);
     try std.testing.expectEqual(@as(u64, 1), no_total.profile.index_entries_scanned);
+    try std.testing.expectEqual(@as(u64, 1), no_total.profile.candidate_stream_emitted);
+    try std.testing.expectEqual(@as(u64, 1), no_total.profile.retained_candidate_rows);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.CandidateStreamStopReason.page_full, no_total.profile.candidate_stream_stop_reason);
     try std.testing.expectEqual(@as(u64, 1), no_total.profile.hydrated_rows);
 }
 
@@ -26899,7 +29499,7 @@ test "relational ordered tuple query planner uses catalog-only column index meta
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_rank_catalog_idx","owner_kind":"relational_column","owner_name":"tenant","access_method":"ordered_tuple","columns":["tenant"],"keys":[{"column":"tenant"},{"column":"rank"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_rank_catalog_idx"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_rank_catalog_idx","owner_kind":"relational_column","owner_name":"tenant","access_method":"ordered_tuple","columns":["tenant"],"keys":[{"column":"tenant"},{"column":"rank"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_rank_catalog_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -26956,7 +29556,7 @@ test "relational ordered tuple query planner uses catalog-only column index meta
     try std.testing.expectEqualStrings("{\"id\":\"a\"}", result.rows[1]);
 }
 
-test "relational ordered tuple candidate probe reports materialization cap fallback" {
+test "relational ordered tuple candidate probe reports selectivity budget fallback" {
     const DB = @import("mod.zig").DB;
     const table_schema_api = @import("../../schema/mod.zig");
 
@@ -26969,7 +29569,7 @@ test "relational ordered tuple candidate probe reports materialization cap fallb
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_rank_cap_idx","owner_kind":"relational_column","owner_name":"tenant","access_method":"ordered_tuple","columns":["tenant"],"keys":[{"column":"tenant"},{"column":"rank"}],"where":{"all":[{"field":"tenant","op":"is_not_null"}]},"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_rank_cap_idx"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_rank_cap_idx","owner_kind":"relational_column","owner_name":"tenant","access_method":"ordered_tuple","columns":["tenant"],"keys":[{"column":"tenant"},{"column":"rank"}],"where":{"all":[{"field":"tenant","op":"is_not_null"}]},"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_rank_cap_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -27027,14 +29627,211 @@ test "relational ordered tuple candidate probe reports materialization cap fallb
     });
     defer result.deinit(alloc);
 
-    try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.ordered_tuple_materialization_cap, result.profile.fallback_reason);
-    try std.testing.expectEqual(@as(u64, ordered_tuple_bounded_unordered_candidate_gate), result.profile.candidate_gate_limit);
-    try std.testing.expectEqual(@as(u64, ordered_tuple_bounded_unordered_candidate_gate + 1), result.profile.candidate_gate_observed);
+    const selectivity_budget = orderedTupleCandidateSelectivityBudget(row_count);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.ordered_tuple_candidate_gate, result.profile.fallback_reason);
+    try std.testing.expectEqual(@as(u64, @intCast(selectivity_budget)), result.profile.candidate_gate_limit);
+    try std.testing.expectEqual(@as(u64, @intCast(selectivity_budget + 1)), result.profile.candidate_gate_observed);
     try std.testing.expect(result.profile.candidate_gate_exceeded);
-    try std.testing.expectEqual(@as(u64, ordered_tuple_bounded_unordered_candidate_gate + 1), result.profile.estimated_candidate_rows);
+    try std.testing.expectEqual(@as(u64, @intCast(selectivity_budget + 1)), result.profile.estimated_candidate_rows);
+    try std.testing.expectEqual(@as(u64, @intCast(row_count)), result.profile.base_scan_rows);
+    try std.testing.expect(result.profile.ordered_tuple_probe_selectivity_ppm > ordered_tuple_candidate_selectivity_threshold_ppm);
     try std.testing.expect(result.profile.index_entries_scanned >= result.profile.candidate_gate_observed);
     try std.testing.expectEqual(@as(u32, @intCast(row_count)), result.total);
     try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+}
+
+test "relational ordered tuple candidate planner uses measured selectivity threshold" {
+    const DB = @import("mod.zig").DB;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    const alloc = std.testing.allocator;
+    const select_id = [_][]const u8{"id"};
+    const missing_rank = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "rank",
+        .op = .eq,
+        .value_json = "-2",
+    }};
+    const scalar_subqueries = [_]types.RelationalRowsScalarSubqueryProjection{.{
+        .output = "missing_id",
+        .query = .{
+            .predicates = missing_rank[0..],
+            .select = select_id[0..],
+            .select_all = false,
+        },
+        .output_field = "id",
+    }};
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_rank_selectivity_idx","owner_kind":"relational_column","owner_name":"tenant","access_method":"ordered_tuple","columns":["tenant"],"keys":[{"column":"tenant"},{"column":"rank"}],"where":{"all":[{"field":"tenant","op":"is_not_null"}]},"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_rank_selectivity_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
+    ;
+
+    {
+        var path_buf: [256]u8 = undefined;
+        const path = TestHelpers.tempPath(&path_buf);
+        defer TestHelpers.cleanupTempDir(path);
+
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+        var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+        defer parsed_schema.deinit(alloc);
+        const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+        defer schema_mod.freeSchema(alloc, runtime_schema);
+        try db.setSchema(runtime_schema);
+
+        const row_count: usize = 100;
+        const writes = try alloc.alloc(types.BatchWrite, row_count);
+        defer {
+            for (writes) |write| {
+                alloc.free(write.key);
+                alloc.free(write.value);
+            }
+            alloc.free(writes);
+        }
+        for (writes, 0..) |*write, i| {
+            const tenant = if (i < 10) "t1" else "t2";
+            write.* = .{
+                .key = try std.fmt.allocPrint(alloc, "row:{d:0>3}", .{i}),
+                .value = try std.fmt.allocPrint(alloc, "{{\"id\":\"{d:0>3}\",\"tenant\":\"{s}\",\"rank\":{d}}}", .{ i, tenant, i }),
+            };
+        }
+        try db.batch(.{ .writes = writes, .sync_level = .write });
+
+        const predicates = [_]schema_mod.RelationalCheck{
+            .{ .name = "", .field = "tenant", .op = .eq, .value_json = "\"t1\"" },
+            .{ .name = "", .field = "rank", .op = .gt, .value_json = "-1" },
+        };
+        var result = try db.queryRelationalRows(alloc, runtime_schema, .{
+            .predicates = predicates[0..],
+            .select = select_id[0..],
+            .select_all = false,
+            .scalar_subqueries = scalar_subqueries[0..],
+            .limit = 5,
+            .total_mode = .exact,
+        });
+        defer result.deinit(alloc);
+
+        try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.ordered_tuple_doc_set, result.profile.access_method);
+        try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.none, result.profile.fallback_reason);
+        try std.testing.expect(result.profile.ordered_tuple_plan_selected);
+        try std.testing.expectEqual(@as(u64, row_count), result.profile.base_scan_rows);
+        try std.testing.expectEqual(@as(u64, 10), result.profile.candidate_gate_observed);
+        try std.testing.expectEqual(@as(u64, 100_000), result.profile.ordered_tuple_probe_selectivity_ppm);
+        try std.testing.expectEqual(@as(u64, 100_000), result.profile.selected_candidate_selectivity_ppm);
+        try std.testing.expectEqual(@as(u32, 10), result.total);
+        try std.testing.expectEqual(@as(usize, 5), result.rows.len);
+    }
+
+    {
+        var path_buf: [256]u8 = undefined;
+        const path = TestHelpers.tempPath(&path_buf);
+        defer TestHelpers.cleanupTempDir(path);
+
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+        var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+        defer parsed_schema.deinit(alloc);
+        const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+        defer schema_mod.freeSchema(alloc, runtime_schema);
+        try db.setSchema(runtime_schema);
+
+        const row_count: usize = 100;
+        const writes = try alloc.alloc(types.BatchWrite, row_count);
+        defer {
+            for (writes) |write| {
+                alloc.free(write.key);
+                alloc.free(write.value);
+            }
+            alloc.free(writes);
+        }
+        for (writes, 0..) |*write, i| {
+            const tenant = if (i < 25) "t1" else "t2";
+            write.* = .{
+                .key = try std.fmt.allocPrint(alloc, "row:{d:0>3}", .{i}),
+                .value = try std.fmt.allocPrint(alloc, "{{\"id\":\"{d:0>3}\",\"tenant\":\"{s}\",\"rank\":{d}}}", .{ i, tenant, i }),
+            };
+        }
+        try db.batch(.{ .writes = writes, .sync_level = .write });
+
+        const predicates = [_]schema_mod.RelationalCheck{
+            .{ .name = "", .field = "tenant", .op = .eq, .value_json = "\"t1\"" },
+            .{ .name = "", .field = "rank", .op = .gt, .value_json = "-1" },
+        };
+        var result = try db.queryRelationalRows(alloc, runtime_schema, .{
+            .predicates = predicates[0..],
+            .select = select_id[0..],
+            .select_all = false,
+            .scalar_subqueries = scalar_subqueries[0..],
+            .limit = 5,
+            .total_mode = .exact,
+        });
+        defer result.deinit(alloc);
+
+        try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.ordered_tuple_doc_set, result.profile.access_method);
+        try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.none, result.profile.fallback_reason);
+        try std.testing.expectEqual(@as(u64, row_count), result.profile.base_scan_rows);
+        try std.testing.expectEqual(@as(u64, 25), result.profile.candidate_gate_limit);
+        try std.testing.expectEqual(@as(u64, 25), result.profile.candidate_gate_observed);
+        try std.testing.expectEqual(@as(u64, ordered_tuple_candidate_selectivity_threshold_ppm), result.profile.ordered_tuple_probe_selectivity_ppm);
+        try std.testing.expectEqual(@as(u64, ordered_tuple_candidate_selectivity_threshold_ppm), result.profile.selected_candidate_selectivity_ppm);
+        try std.testing.expectEqual(@as(u32, 25), result.total);
+        try std.testing.expectEqual(@as(usize, 5), result.rows.len);
+    }
+
+    {
+        var path_buf: [256]u8 = undefined;
+        const path = TestHelpers.tempPath(&path_buf);
+        defer TestHelpers.cleanupTempDir(path);
+
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+        var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+        defer parsed_schema.deinit(alloc);
+        const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+        defer schema_mod.freeSchema(alloc, runtime_schema);
+        try db.setSchema(runtime_schema);
+
+        const row_count: usize = 100;
+        const writes = try alloc.alloc(types.BatchWrite, row_count);
+        defer {
+            for (writes) |write| {
+                alloc.free(write.key);
+                alloc.free(write.value);
+            }
+            alloc.free(writes);
+        }
+        for (writes, 0..) |*write, i| {
+            const tenant = if (i < 90) "t1" else "t2";
+            write.* = .{
+                .key = try std.fmt.allocPrint(alloc, "row:{d:0>3}", .{i}),
+                .value = try std.fmt.allocPrint(alloc, "{{\"id\":\"{d:0>3}\",\"tenant\":\"{s}\",\"rank\":{d}}}", .{ i, tenant, i }),
+            };
+        }
+        try db.batch(.{ .writes = writes, .sync_level = .write });
+
+        const predicates = [_]schema_mod.RelationalCheck{
+            .{ .name = "", .field = "tenant", .op = .eq, .value_json = "\"t1\"" },
+            .{ .name = "", .field = "rank", .op = .gt, .value_json = "-1" },
+        };
+        var result = try db.queryRelationalRows(alloc, runtime_schema, .{
+            .predicates = predicates[0..],
+            .select = select_id[0..],
+            .select_all = false,
+            .scalar_subqueries = scalar_subqueries[0..],
+            .limit = 5,
+            .total_mode = .exact,
+        });
+        defer result.deinit(alloc);
+
+        try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.base_scan, result.profile.access_method);
+        try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.ordered_tuple_candidate_gate, result.profile.fallback_reason);
+        try std.testing.expectEqual(@as(u64, row_count), result.profile.base_scan_rows);
+        try std.testing.expectEqual(@as(u64, 25), result.profile.candidate_gate_limit);
+        try std.testing.expectEqual(@as(u64, 26), result.profile.candidate_gate_observed);
+        try std.testing.expectEqual(@as(u64, 260_000), result.profile.ordered_tuple_probe_selectivity_ppm);
+        try std.testing.expectEqual(@as(u32, 90), result.total);
+        try std.testing.expectEqual(@as(usize, 5), result.rows.len);
+    }
 }
 
 test "relational rows query resolves ordered tuple equality prefixes with desc and null ordering" {
@@ -27050,7 +29847,7 @@ test "relational rows query resolves ordered tuple equality prefixes with desc a
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","email","status","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"email_status_idx","owner_kind":"relational_column","owner_name":"email","access_method":"ordered_tuple","columns":["email"],"keys":[{"column":"email","direction":"desc","nulls":"last"},{"column":"status","direction":"asc","nulls":"first"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:email_status_idx"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","email","status","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"email_status_idx","owner_kind":"relational_column","owner_name":"email","access_method":"ordered_tuple","columns":["email"],"keys":[{"column":"email","direction":"desc","nulls":"last"},{"column":"status","direction":"asc","nulls":"first"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:email_status_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -27127,7 +29924,7 @@ test "relational rows query resolves ordered tuple folded collation equality pre
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword","collation":"antfly.case_insensitive"},"status":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","email","status","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"email_status_ci_idx","owner_kind":"relational_column","owner_name":"email","access_method":"ordered_tuple","columns":["email"],"keys":[{"column":"email"},{"column":"status"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:email_status_ci_idx"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword","collation":"antfly.case_insensitive"},"status":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","email","status","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"email_status_ci_idx","owner_kind":"relational_column","owner_name":"email","access_method":"ordered_tuple","columns":["email"],"keys":[{"column":"email"},{"column":"status"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:email_status_ci_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -27202,7 +29999,7 @@ test "relational rows query resolves compound ordered tuple equality prefix rang
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"rank":{"type":"numeric"},"status":{"type":"keyword"}},"required":["id","tenant","rank","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_rank_idx","owner_kind":"relational_column","owner_name":"tenant","access_method":"ordered_tuple","columns":["tenant"],"keys":[{"column":"tenant"},{"column":"rank"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_rank_idx"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"rank":{"type":"numeric"},"status":{"type":"keyword"}},"required":["id","tenant","rank","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_rank_idx","owner_kind":"relational_column","owner_name":"tenant","access_method":"ordered_tuple","columns":["tenant"],"keys":[{"column":"tenant"},{"column":"rank"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_rank_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -27269,7 +30066,7 @@ test "relational rows direct ordered tuple scan honors total modes" {
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"rank":{"type":"numeric"},"status":{"type":"keyword"}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_rank_page_idx","owner_kind":"relational_column","owner_name":"tenant","access_method":"ordered_tuple","columns":["tenant"],"keys":[{"column":"tenant"},{"column":"rank"}],"include_columns":["id"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_rank_page_idx"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"rank":{"type":"numeric"},"status":{"type":"keyword"}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_rank_page_idx","owner_kind":"relational_column","owner_name":"tenant","access_method":"ordered_tuple","columns":["tenant"],"keys":[{"column":"tenant"},{"column":"rank"}],"include_columns":["id"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_rank_page_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -27321,9 +30118,18 @@ test "relational rows direct ordered tuple scan honors total modes" {
     try std.testing.expectEqual(@as(u32, 2), bounded.total);
     try std.testing.expectEqual(@as(u64, 2), bounded.profile.estimated_candidate_rows);
     try std.testing.expectEqual(@as(u64, 2), bounded.profile.index_entries_scanned);
-    try std.testing.expectEqual(@as(u64, 2), bounded.profile.hydrated_rows);
+    try std.testing.expectEqual(@as(u64, 2), bounded.profile.candidate_stream_emitted);
+    try std.testing.expectEqual(@as(u64, 0), bounded.profile.retained_candidate_rows);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.CandidateStreamStopReason.page_full, bounded.profile.candidate_stream_stop_reason);
+    try std.testing.expectEqual(@as(u64, 0), bounded.profile.hydrated_rows);
     try std.testing.expectEqual(@as(u64, 0), bounded.profile.residual_rechecks);
     try std.testing.expectEqual(@as(u64, 2), bounded.profile.covering_payload_rows);
+    try std.testing.expectEqual(@as(u64, 2), bounded.profile.covering_payload_rechecked_rows);
+    try std.testing.expectEqual(@as(u64, 2), bounded.profile.covering_payload_hydration_avoided_rows);
+    try std.testing.expectEqual(@as(u64, 0), bounded.profile.covering_payload_fallback_metadata_missing_rows);
+    try std.testing.expectEqual(@as(u64, 0), bounded.profile.covering_payload_fallback_row_generation_mismatch_rows);
+    try std.testing.expectEqual(@as(u64, 0), bounded.profile.covering_payload_fallback_residual_predicate_rows);
+    try std.testing.expectEqual(@as(u64, 0), bounded.profile.covering_payload_fallback_projection_shape_rows);
     try std.testing.expectEqual(@as(u64, 2), bounded.profile.projected_rows);
 
     var exact = try db.queryRelationalRows(alloc, runtime_schema, .{
@@ -27349,9 +30155,11 @@ test "relational rows direct ordered tuple scan honors total modes" {
     try std.testing.expect(exact.total_exact);
     try std.testing.expectEqual(@as(u32, 4), exact.total);
     try std.testing.expectEqual(@as(u64, 4), exact.profile.index_entries_scanned);
-    try std.testing.expectEqual(@as(u64, 4), exact.profile.hydrated_rows);
+    try std.testing.expectEqual(@as(u64, 0), exact.profile.hydrated_rows);
     try std.testing.expectEqual(@as(u64, 0), exact.profile.residual_rechecks);
     try std.testing.expectEqual(@as(u64, 2), exact.profile.covering_payload_rows);
+    try std.testing.expectEqual(@as(u64, 4), exact.profile.covering_payload_rechecked_rows);
+    try std.testing.expectEqual(@as(u64, 4), exact.profile.covering_payload_hydration_avoided_rows);
     try std.testing.expectEqual(@as(u64, 2), exact.profile.projected_rows);
 
     const residual_predicates = [_]schema_mod.RelationalCheck{
@@ -27384,6 +30192,8 @@ test "relational rows direct ordered tuple scan honors total modes" {
     try std.testing.expectEqual(@as(u64, 2), residual.profile.hydrated_rows);
     try std.testing.expectEqual(@as(u64, 2), residual.profile.residual_rechecks);
     try std.testing.expectEqual(@as(u64, 0), residual.profile.covering_payload_rows);
+    try std.testing.expectEqual(@as(u64, 0), residual.profile.covering_payload_hydration_avoided_rows);
+    try std.testing.expectEqual(@as(u64, 2), residual.profile.covering_payload_fallback_residual_predicate_rows);
     try std.testing.expectEqual(@as(u64, 1), residual.profile.projected_rows);
 }
 
@@ -27400,7 +30210,7 @@ test "relational rows ordered tuple scan streams order-satisfying pagination" {
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id","status","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_amount_cover_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"amount"}],"include_columns":["id","amount"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:status_amount_cover_idx"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id","status","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_amount_cover_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"amount"}],"include_columns":["id","amount"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:status_amount_cover_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -27448,9 +30258,107 @@ test "relational rows ordered tuple scan streams order-satisfying pagination" {
     try std.testing.expectEqual(@as(u64, 2), result.profile.index_entries_scanned);
     try std.testing.expectEqual(@as(u64, 2), result.profile.candidate_rows);
     try std.testing.expectEqual(@as(u64, 1), result.profile.iterator_seeks);
-    try std.testing.expectEqual(@as(u64, 2), result.profile.hydrated_rows);
+    try std.testing.expectEqual(@as(u64, 0), result.profile.hydrated_rows);
     try std.testing.expectEqual(@as(u64, 0), result.profile.residual_rechecks);
     try std.testing.expectEqual(@as(u64, 2), result.profile.covering_payload_rows);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.covering_payload_rechecked_rows);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.covering_payload_hydration_avoided_rows);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.projected_rows);
+
+    const unsupported_select = [_][]const u8{"status"};
+    var unsupported_projection = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = predicates[0..],
+        .select = unsupported_select[0..],
+        .select_all = false,
+        .order_by = order_by[0..],
+        .limit = 1,
+        .total_mode = .none,
+        .profile = true,
+    });
+    defer unsupported_projection.deinit(alloc);
+
+    try std.testing.expect(unsupported_projection.include_profile);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.ordered_tuple_stream, unsupported_projection.profile.access_method);
+    try std.testing.expectEqual(@as(usize, 1), unsupported_projection.rows.len);
+    try std.testing.expectEqualStrings("{\"status\":\"open\"}", unsupported_projection.rows[0]);
+    try std.testing.expectEqual(@as(u64, 1), unsupported_projection.profile.hydrated_rows);
+    try std.testing.expectEqual(@as(u64, 0), unsupported_projection.profile.covering_payload_rows);
+    try std.testing.expectEqual(@as(u64, 0), unsupported_projection.profile.covering_payload_hydration_avoided_rows);
+    try std.testing.expectEqual(@as(u64, 1), unsupported_projection.profile.covering_payload_fallback_projection_shape_rows);
+}
+
+test "relational rows ordered tuple stream feeds bounded sorter when order is not covered" {
+    const DB = @import("mod.zig").DB;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id","status","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_amount_candidate_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"amount"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:status_amount_candidate_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"status\":\"open\",\"amount\":3}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"status\":\"open\",\"amount\":1}" },
+            .{ .key = "row:c", .value = "{\"id\":\"c\",\"status\":\"open\",\"amount\":2}" },
+            .{ .key = "row:d", .value = "{\"id\":\"d\",\"status\":\"closed\",\"amount\":0}" },
+        },
+        .sync_level = .write,
+    });
+
+    const predicates = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "status",
+        .op = .eq,
+        .value_json = "\"open\"",
+    }};
+    const select = [_][]const u8{ "id", "amount" };
+    const order_by = [_]types.RelationalRowsQueryOrder{.{
+        .field = "id",
+        .direction = .desc,
+    }};
+    var result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = predicates[0..],
+        .select = select[0..],
+        .select_all = false,
+        .order_by = order_by[0..],
+        .limit = 2,
+        .total_mode = .bounded,
+        .profile = true,
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expect(result.include_profile);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.ordered_tuple_stream, result.profile.access_method);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.ordered_tuple_order_field_not_covered, result.profile.fallback_reason);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.UnsupportedReason.ordering_not_covered, result.profile.unsupportedReason());
+    try std.testing.expect(result.profile.ordered_tuple_plan_selected);
+    try std.testing.expectEqual(@as(u32, 2), result.total);
+    try std.testing.expect(!result.total_exact);
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"c\",\"amount\":2}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"b\",\"amount\":1}", result.rows[1]);
+    try std.testing.expectEqual(@as(u64, 3), result.profile.estimated_candidate_rows);
+    try std.testing.expectEqual(@as(u64, 3), result.profile.index_entries_scanned);
+    try std.testing.expectEqual(@as(u64, 3), result.profile.candidate_rows);
+    try std.testing.expectEqual(@as(u64, 3), result.profile.candidate_stream_emitted);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.retained_candidate_rows);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.CandidateStreamStopReason.none, result.profile.candidate_stream_stop_reason);
+    try std.testing.expectEqual(@as(u64, 3), result.profile.hydrated_rows);
+    try std.testing.expectEqual(@as(u64, 3), result.profile.residual_rechecks);
+    try std.testing.expectEqual(@as(u64, 0), result.profile.covering_payload_rows);
     try std.testing.expectEqual(@as(u64, 2), result.profile.projected_rows);
 }
 
@@ -27467,7 +30375,7 @@ test "relational rows ordered tuple scan reports order direction mismatch" {
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id","status","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_amount_desc_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"amount","direction":"desc"}],"include_columns":["id","amount"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:status_amount_desc_idx"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id","status","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_amount_desc_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"amount","direction":"desc"}],"include_columns":["id","amount"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:status_amount_desc_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -27510,6 +30418,7 @@ test "relational rows ordered tuple scan reports order direction mismatch" {
     try std.testing.expect(result.include_profile);
     try std.testing.expect(result.profile.access_method != .ordered_tuple_stream);
     try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.ordered_tuple_order_direction_not_covered, result.profile.fallback_reason);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.UnsupportedReason.ordering_not_covered, result.profile.unsupportedReason());
     try std.testing.expectEqual(@as(u32, 2), result.total);
     try std.testing.expect(!result.total_exact);
     try std.testing.expectEqual(@as(usize, 2), result.rows.len);
@@ -27530,7 +30439,7 @@ test "relational rows ordered tuple scan streams descending order-satisfying pag
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id","status","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_amount_desc_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"amount","direction":"desc"}],"include_columns":["id","amount"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:status_amount_desc_idx"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id","status","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_amount_desc_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"amount","direction":"desc"}],"include_columns":["id","amount"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:status_amount_desc_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -27582,9 +30491,11 @@ test "relational rows ordered tuple scan streams descending order-satisfying pag
     try std.testing.expectEqual(@as(u64, 2), result.profile.index_entries_scanned);
     try std.testing.expectEqual(@as(u64, 2), result.profile.candidate_rows);
     try std.testing.expectEqual(@as(u64, 1), result.profile.iterator_seeks);
-    try std.testing.expectEqual(@as(u64, 2), result.profile.hydrated_rows);
+    try std.testing.expectEqual(@as(u64, 0), result.profile.hydrated_rows);
     try std.testing.expectEqual(@as(u64, 0), result.profile.residual_rechecks);
     try std.testing.expectEqual(@as(u64, 2), result.profile.covering_payload_rows);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.covering_payload_rechecked_rows);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.covering_payload_hydration_avoided_rows);
     try std.testing.expectEqual(@as(u64, 2), result.profile.projected_rows);
 }
 
@@ -27601,7 +30512,7 @@ test "relational rows ordered tuple scan streams explicit null order" {
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_amount_nulls_first_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"amount","direction":"asc","nulls":"first"}],"include_columns":["id","amount"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:status_amount_nulls_first_idx"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_amount_nulls_first_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"amount","direction":"asc","nulls":"first"}],"include_columns":["id","amount"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:status_amount_nulls_first_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -27659,10 +30570,200 @@ test "relational rows ordered tuple scan streams explicit null order" {
     try std.testing.expectEqual(@as(u64, 2), result.profile.index_entries_scanned);
     try std.testing.expectEqual(@as(u64, 2), result.profile.candidate_rows);
     try std.testing.expectEqual(@as(u64, 1), result.profile.iterator_seeks);
-    try std.testing.expectEqual(@as(u64, 2), result.profile.hydrated_rows);
+    try std.testing.expectEqual(@as(u64, 0), result.profile.hydrated_rows);
     try std.testing.expectEqual(@as(u64, 0), result.profile.residual_rechecks);
     try std.testing.expectEqual(@as(u64, 2), result.profile.covering_payload_rows);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.covering_payload_rechecked_rows);
+    try std.testing.expectEqual(@as(u64, 2), result.profile.covering_payload_hydration_avoided_rows);
     try std.testing.expectEqual(@as(u64, 2), result.profile.projected_rows);
+}
+
+test "relational rows ordered tuple scan uses generated expression key aliases" {
+    const DB = @import("mod.zig").DB;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"email":{"type":"keyword"},"email_lc":{"type":"keyword","generated":{"op":"expression","expression":{"op":"lower","args":[{"field":"email"}]}}},"nickname":{"type":"keyword"},"nickname_lc":{"type":"keyword","generated":{"op":"expression","expression":{"op":"lower","args":[{"field":"nickname"}]}}}},"required":["id","tenant","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_email_lc_idx","owner_kind":"relational_column","owner_name":"tenant","access_method":"ordered_tuple","columns":["tenant","email_lc"],"keys":[{"column":"tenant"},{"column":"email_lc"}],"include_columns":["id","email"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_email_lc_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}},{"name":"email_lc_id_idx","owner_kind":"relational_column","owner_name":"email_lc","access_method":"ordered_tuple","columns":["email_lc","id"],"keys":[{"column":"email_lc"},{"column":"id"}],"include_columns":["email"],"lifecycle":"ready","generation":8,"schema_fingerprint":"secondary-index-v1:email_lc_id_idx","generation_record":{"generation":8,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}},{"name":"tenant_email_lc_desc_idx","owner_kind":"relational_column","owner_name":"email","access_method":"ordered_tuple","columns":["tenant","email_lc","email"],"keys":[{"column":"tenant"},{"column":"email_lc","direction":"desc"}],"include_columns":["id"],"lifecycle":"ready","generation":9,"schema_fingerprint":"secondary-index-v1:tenant_email_lc_desc_idx","generation_record":{"generation":9,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}},{"name":"tenant_nickname_lc_nulls_first_idx","owner_kind":"relational_column","owner_name":"nickname","access_method":"ordered_tuple","columns":["tenant","nickname_lc","nickname"],"keys":[{"column":"tenant"},{"column":"nickname_lc","direction":"asc","nulls":"first"}],"include_columns":["id"],"lifecycle":"ready","generation":10,"schema_fingerprint":"secondary-index-v1:tenant_nickname_lc_nulls_first_idx","generation_record":{"generation":10,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"tenant\":\"t1\",\"email\":\"Zulu@Example.test\",\"email_lc\":\"zulu@example.test\",\"nickname\":\"Zed\",\"nickname_lc\":\"zed\"}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"tenant\":\"t1\",\"email\":\"Ada@Example.test\",\"email_lc\":\"ada@example.test\",\"nickname\":null,\"nickname_lc\":null}" },
+            .{ .key = "row:c", .value = "{\"id\":\"c\",\"tenant\":\"t1\",\"email\":\"Grace@Example.test\",\"email_lc\":\"grace@example.test\",\"nickname\":\"Grace\",\"nickname_lc\":\"grace\"}" },
+            .{ .key = "row:d", .value = "{\"id\":\"d\",\"tenant\":\"t2\",\"email\":\"Ada@Example.test\",\"email_lc\":\"ada@example.test\",\"nickname\":\"Ada\",\"nickname_lc\":\"ada\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    const lower_email_operands = [_]types.RelationalRowsExpression{.{
+        .kind = .field,
+        .field = "email",
+    }};
+    const lower_email = types.RelationalRowsExpression{
+        .kind = .lower,
+        .operands = lower_email_operands[0..],
+    };
+    const equality_rhs = [_]types.RelationalRowsExpression{.{ .kind = .value, .value_json = "\"ada@example.test\"" }};
+    const equality_expression = [_]types.RelationalRowsExpressionCondition{.{
+        .lhs = lower_email,
+        .op = .eq,
+        .rhs = equality_rhs[0..],
+    }};
+    const select = [_][]const u8{ "id", "email" };
+    var equality = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .expression_predicates = equality_expression[0..],
+        .select = select[0..],
+        .select_all = false,
+        .profile = true,
+    });
+    defer equality.deinit(alloc);
+    try std.testing.expect(equality.include_profile);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.ordered_tuple_stream, equality.profile.access_method);
+    try std.testing.expect(equality.profile.ordered_tuple_plan_selected);
+    try std.testing.expectEqual(@as(u32, 2), equality.total);
+    try std.testing.expectEqual(@as(usize, 2), equality.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"b\",\"email\":\"Ada@Example.test\"}", equality.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"d\",\"email\":\"Ada@Example.test\"}", equality.rows[1]);
+    try std.testing.expectEqual(@as(u32, 1), equality.profile.ordered_tuple_equality_prefix_len);
+    try std.testing.expectEqual(@as(u64, 2), equality.profile.index_entries_scanned);
+
+    const range_lower_rhs = [_]types.RelationalRowsExpression{.{ .kind = .value, .value_json = "\"b\"" }};
+    const range_upper_rhs = [_]types.RelationalRowsExpression{.{ .kind = .value, .value_json = "\"zz\"" }};
+    const range_expression = [_]types.RelationalRowsExpressionCondition{
+        .{ .lhs = lower_email, .op = .gte, .rhs = range_lower_rhs[0..] },
+        .{ .lhs = lower_email, .op = .lt, .rhs = range_upper_rhs[0..] },
+    };
+    var ranged = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .expression_predicates = range_expression[0..],
+        .select = select[0..],
+        .select_all = false,
+        .profile = true,
+    });
+    defer ranged.deinit(alloc);
+    try std.testing.expect(ranged.include_profile);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.ordered_tuple_stream, ranged.profile.access_method);
+    try std.testing.expect(ranged.profile.ordered_tuple_plan_selected);
+    try std.testing.expectEqual(@as(u32, 2), ranged.total);
+    try std.testing.expectEqual(@as(usize, 2), ranged.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"c\",\"email\":\"Grace@Example.test\"}", ranged.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"email\":\"Zulu@Example.test\"}", ranged.rows[1]);
+    try std.testing.expectEqual(@as(u32, 0), ranged.profile.ordered_tuple_equality_prefix_len);
+    try std.testing.expectEqual(@as(u32, 0), ranged.profile.ordered_tuple_range_key_index);
+    try std.testing.expectEqual(@as(u64, 2), ranged.profile.index_entries_scanned);
+
+    const tenant_predicates = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "tenant",
+        .op = .eq,
+        .value_json = "\"t1\"",
+    }};
+    const expression_order = [_]types.RelationalRowsQueryOrder{.{
+        .expression = lower_email,
+        .direction = .asc,
+    }};
+    var ordered = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = tenant_predicates[0..],
+        .select = select[0..],
+        .select_all = false,
+        .order_by = expression_order[0..],
+        .limit = 2,
+        .total_mode = .none,
+        .profile = true,
+    });
+    defer ordered.deinit(alloc);
+    try std.testing.expect(ordered.include_profile);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.ordered_tuple_stream, ordered.profile.access_method);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.none, ordered.profile.fallback_reason);
+    try std.testing.expect(ordered.profile.ordered_tuple_plan_selected);
+    try std.testing.expectEqual(@as(u32, 2), ordered.total);
+    try std.testing.expect(!ordered.total_exact);
+    try std.testing.expectEqual(@as(usize, 2), ordered.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"b\",\"email\":\"Ada@Example.test\"}", ordered.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\",\"email\":\"Grace@Example.test\"}", ordered.rows[1]);
+    try std.testing.expectEqual(@as(u32, 1), ordered.profile.ordered_tuple_equality_prefix_len);
+    try std.testing.expectEqual(@as(u64, 2), ordered.profile.index_entries_scanned);
+
+    const expression_order_desc = [_]types.RelationalRowsQueryOrder{.{
+        .expression = lower_email,
+        .direction = .desc,
+    }};
+    var desc_ordered = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = tenant_predicates[0..],
+        .select = select[0..],
+        .select_all = false,
+        .order_by = expression_order_desc[0..],
+        .limit = 2,
+        .total_mode = .none,
+        .profile = true,
+    });
+    defer desc_ordered.deinit(alloc);
+    try std.testing.expect(desc_ordered.include_profile);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.ordered_tuple_stream, desc_ordered.profile.access_method);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.none, desc_ordered.profile.fallback_reason);
+    try std.testing.expect(desc_ordered.profile.ordered_tuple_plan_selected);
+    try std.testing.expectEqual(@as(u32, 2), desc_ordered.total);
+    try std.testing.expect(!desc_ordered.total_exact);
+    try std.testing.expectEqual(@as(usize, 2), desc_ordered.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"email\":\"Zulu@Example.test\"}", desc_ordered.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\",\"email\":\"Grace@Example.test\"}", desc_ordered.rows[1]);
+    try std.testing.expectEqual(@as(u32, 1), desc_ordered.profile.ordered_tuple_equality_prefix_len);
+    try std.testing.expectEqual(@as(u64, 2), desc_ordered.profile.index_entries_scanned);
+
+    const lower_nickname_operands = [_]types.RelationalRowsExpression{.{
+        .kind = .field,
+        .field = "nickname",
+    }};
+    const lower_nickname = types.RelationalRowsExpression{
+        .kind = .lower,
+        .operands = lower_nickname_operands[0..],
+    };
+    const nickname_select = [_][]const u8{ "id", "nickname" };
+    const expression_null_order = [_]types.RelationalRowsQueryOrder{
+        .{
+            .expression = lower_nickname,
+            .direction = .desc,
+            .null_test = .is_null,
+        },
+        .{
+            .expression = lower_nickname,
+            .direction = .asc,
+        },
+    };
+    var null_ordered = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = tenant_predicates[0..],
+        .select = nickname_select[0..],
+        .select_all = false,
+        .order_by = expression_null_order[0..],
+        .limit = 2,
+        .total_mode = .none,
+        .profile = true,
+    });
+    defer null_ordered.deinit(alloc);
+    try std.testing.expect(null_ordered.include_profile);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.ordered_tuple_stream, null_ordered.profile.access_method);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.none, null_ordered.profile.fallback_reason);
+    try std.testing.expect(null_ordered.profile.ordered_tuple_plan_selected);
+    try std.testing.expectEqual(@as(u32, 2), null_ordered.total);
+    try std.testing.expect(!null_ordered.total_exact);
+    try std.testing.expectEqual(@as(usize, 2), null_ordered.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", null_ordered.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\",\"nickname\":\"Grace\"}", null_ordered.rows[1]);
+    try std.testing.expectEqual(@as(u32, 1), null_ordered.profile.ordered_tuple_equality_prefix_len);
+    try std.testing.expectEqual(@as(u64, 2), null_ordered.profile.index_entries_scanned);
 }
 
 test "relational rows ordered tuple scan does not stream non-default null order" {
@@ -27678,7 +30779,7 @@ test "relational rows ordered tuple scan does not stream non-default null order"
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_amount_nulls_first_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"amount","direction":"asc","nulls":"first"}],"include_columns":["id","amount"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:status_amount_nulls_first_idx"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_amount_nulls_first_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"amount","direction":"asc","nulls":"first"}],"include_columns":["id","amount"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:status_amount_nulls_first_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -27719,6 +30820,7 @@ test "relational rows ordered tuple scan does not stream non-default null order"
 
     try std.testing.expect(result.profile.access_method != .ordered_tuple_stream);
     try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.ordered_tuple_order_nulls_not_covered, result.profile.fallback_reason);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.UnsupportedReason.ordering_not_covered, result.profile.unsupportedReason());
     try std.testing.expectEqual(@as(usize, 2), result.rows.len);
     try std.testing.expectEqualStrings("{\"id\":\"b\",\"amount\":1}", result.rows[0]);
     try std.testing.expectEqualStrings("{\"id\":\"c\",\"amount\":2}", result.rows[1]);
@@ -27737,7 +30839,7 @@ test "relational rows ordered tuple scan reports order collation mismatch" {
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id","tenant","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_status_idx","owner_kind":"relational_column","owner_name":"tenant","access_method":"ordered_tuple","columns":["tenant"],"keys":[{"column":"tenant"},{"column":"status"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_status_idx"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id","tenant","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_status_idx","owner_kind":"relational_column","owner_name":"tenant","access_method":"ordered_tuple","columns":["tenant"],"keys":[{"column":"tenant"},{"column":"status"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_status_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -27780,6 +30882,7 @@ test "relational rows ordered tuple scan reports order collation mismatch" {
     try std.testing.expect(result.include_profile);
     try std.testing.expect(result.profile.access_method != .ordered_tuple_stream);
     try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.ordered_tuple_order_collation_not_covered, result.profile.fallback_reason);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.UnsupportedReason.ordering_not_covered, result.profile.unsupportedReason());
     try std.testing.expectEqual(@as(u32, 2), result.total);
     try std.testing.expect(!result.total_exact);
     try std.testing.expectEqual(@as(usize, 2), result.rows.len);
@@ -27800,7 +30903,7 @@ test "relational rows ordered tuple scan rejects unfixed trailing key tie breake
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"tenant":{"type":"keyword"}},"required":["id","status","amount","tenant"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_amount_tenant_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"amount"},{"column":"tenant"}],"include_columns":["id","amount","tenant"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:status_amount_tenant_idx"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"tenant":{"type":"keyword"}},"required":["id","status","amount","tenant"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_amount_tenant_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"amount"},{"column":"tenant"}],"include_columns":["id","amount","tenant"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:status_amount_tenant_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -27842,6 +30945,7 @@ test "relational rows ordered tuple scan rejects unfixed trailing key tie breake
     try std.testing.expect(result.include_profile);
     try std.testing.expect(result.profile.access_method != .ordered_tuple_stream);
     try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.ordered_tuple_order_tiebreaker_not_covered, result.profile.fallback_reason);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.UnsupportedReason.ordering_not_covered, result.profile.unsupportedReason());
     try std.testing.expectEqual(@as(usize, 2), result.rows.len);
     try std.testing.expectEqualStrings("{\"id\":\"a\",\"amount\":1,\"tenant\":\"z\"}", result.rows[0]);
     try std.testing.expectEqualStrings("{\"id\":\"b\",\"amount\":1,\"tenant\":\"a\"}", result.rows[1]);
@@ -27891,7 +30995,7 @@ test "relational rows ordered tuple covering payload rechecks packed row before 
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_rank_cover_idx","owner_kind":"relational_column","owner_name":"tenant","access_method":"ordered_tuple","columns":["tenant"],"keys":[{"column":"tenant"},{"column":"rank"}],"include_columns":["id"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_rank_cover_idx"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_rank_cover_idx","owner_kind":"relational_column","owner_name":"tenant","access_method":"ordered_tuple","columns":["tenant"],"keys":[{"column":"tenant"},{"column":"rank"}],"include_columns":["id"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_rank_cover_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -27939,10 +31043,12 @@ test "relational rows ordered tuple covering payload rechecks packed row before 
     try std.testing.expectEqual(@as(usize, 2), result.rows.len);
     try std.testing.expectEqualStrings("{\"id\":\"a\"}", result.rows[0]);
     try std.testing.expectEqualStrings("{\"id\":\"b\"}", result.rows[1]);
-    try std.testing.expectEqual(@as(u64, 2), result.profile.hydrated_rows);
+    try std.testing.expectEqual(@as(u64, 1), result.profile.hydrated_rows);
     try std.testing.expectEqual(@as(u64, 1), result.profile.residual_rechecks);
     try std.testing.expectEqual(@as(u64, 1), result.profile.covering_payload_rows);
     try std.testing.expectEqual(@as(u64, 2), result.profile.covering_payload_rechecked_rows);
+    try std.testing.expectEqual(@as(u64, 1), result.profile.covering_payload_hydration_avoided_rows);
+    try std.testing.expectEqual(@as(u64, 1), result.profile.covering_payload_fallback_metadata_missing_rows);
     try std.testing.expectEqual(@as(u64, 2), result.profile.projected_rows);
 }
 
@@ -27959,7 +31065,7 @@ test "relational rows ordered tuple stream skips stale tuple entries for moved r
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_rank_cover_idx","owner_kind":"relational_column","owner_name":"tenant","access_method":"ordered_tuple","columns":["tenant"],"keys":[{"column":"tenant"},{"column":"rank"}],"include_columns":["id"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_rank_cover_idx"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_rank_cover_idx","owner_kind":"relational_column","owner_name":"tenant","access_method":"ordered_tuple","columns":["tenant"],"keys":[{"column":"tenant"},{"column":"rank"}],"include_columns":["id"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_rank_cover_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -28006,10 +31112,12 @@ test "relational rows ordered tuple stream skips stale tuple entries for moved r
     try std.testing.expectEqual(@as(usize, 1), result.rows.len);
     try std.testing.expectEqualStrings("{\"id\":\"a\"}", result.rows[0]);
     try std.testing.expectEqual(@as(u64, 2), result.profile.index_entries_scanned);
-    try std.testing.expectEqual(@as(u64, 2), result.profile.hydrated_rows);
+    try std.testing.expectEqual(@as(u64, 1), result.profile.hydrated_rows);
     try std.testing.expectEqual(@as(u64, 0), result.profile.residual_rechecks);
     try std.testing.expectEqual(@as(u64, 1), result.profile.covering_payload_rows);
     try std.testing.expectEqual(@as(u64, 2), result.profile.covering_payload_rechecked_rows);
+    try std.testing.expectEqual(@as(u64, 1), result.profile.covering_payload_hydration_avoided_rows);
+    try std.testing.expectEqual(@as(u64, 1), result.profile.covering_payload_fallback_row_generation_mismatch_rows);
     try std.testing.expectEqual(@as(u64, 1), result.profile.projected_rows);
 }
 
@@ -28026,7 +31134,7 @@ test "relational rows query tightens compound ordered tuple range bounds" {
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_rank_tight_idx","owner_kind":"relational_column","owner_name":"tenant","access_method":"ordered_tuple","columns":["tenant"],"keys":[{"column":"tenant"},{"column":"rank"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_rank_tight_idx"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_rank_tight_idx","owner_kind":"relational_column","owner_name":"tenant","access_method":"ordered_tuple","columns":["tenant"],"keys":[{"column":"tenant"},{"column":"rank"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_rank_tight_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -28080,7 +31188,7 @@ test "relational rows query resolves ordered tuple first-key ranges" {
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"rank_tenant_range_idx","owner_kind":"relational_column","owner_name":"rank","access_method":"ordered_tuple","columns":["rank"],"keys":[{"column":"rank"},{"column":"tenant"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:rank_tenant_range_idx"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"rank_tenant_range_idx","owner_kind":"relational_column","owner_name":"rank","access_method":"ordered_tuple","columns":["rank"],"keys":[{"column":"rank"},{"column":"tenant"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:rank_tenant_range_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -28131,7 +31239,7 @@ test "relational rows query resolves explicit default-null ordered tuple ranges"
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","tenant"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"rank_nulls_last_range_idx","owner_kind":"relational_column","owner_name":"rank","access_method":"ordered_tuple","columns":["rank"],"keys":[{"column":"rank","direction":"asc","nulls":"last"},{"column":"tenant"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:rank_nulls_last_range_idx"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","tenant"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"rank_nulls_last_range_idx","owner_kind":"relational_column","owner_name":"rank","access_method":"ordered_tuple","columns":["rank"],"keys":[{"column":"rank","direction":"asc","nulls":"last"},{"column":"tenant"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:rank_nulls_last_range_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -28198,7 +31306,7 @@ test "relational rows query resolves non-default null ordered tuple ranges witho
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","tenant"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"rank_nulls_first_range_idx","owner_kind":"relational_column","owner_name":"rank","access_method":"ordered_tuple","columns":["rank"],"keys":[{"column":"rank","direction":"asc","nulls":"first"},{"column":"tenant"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:rank_nulls_first_range_idx"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","tenant"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"rank_nulls_first_range_idx","owner_kind":"relational_column","owner_name":"rank","access_method":"ordered_tuple","columns":["rank"],"keys":[{"column":"rank","direction":"asc","nulls":"first"},{"column":"tenant"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:rank_nulls_first_range_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -28263,7 +31371,7 @@ test "relational rows query resolves descending ordered tuple first-key ranges" 
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"rank_desc_tenant_range_idx","owner_kind":"relational_column","owner_name":"rank","access_method":"ordered_tuple","columns":["rank"],"keys":[{"column":"rank","direction":"desc"},{"column":"tenant"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:rank_desc_tenant_range_idx"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"rank_desc_tenant_range_idx","owner_kind":"relational_column","owner_name":"rank","access_method":"ordered_tuple","columns":["rank"],"keys":[{"column":"rank","direction":"desc"},{"column":"tenant"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:rank_desc_tenant_range_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -28331,7 +31439,7 @@ test "relational rows query resolves descending nulls-last ordered tuple ranges 
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","tenant"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"rank_desc_nulls_last_range_idx","owner_kind":"relational_column","owner_name":"rank","access_method":"ordered_tuple","columns":["rank"],"keys":[{"column":"rank","direction":"desc","nulls":"last"},{"column":"tenant"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:rank_desc_nulls_last_range_idx"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","tenant"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"rank_desc_nulls_last_range_idx","owner_kind":"relational_column","owner_name":"rank","access_method":"ordered_tuple","columns":["rank"],"keys":[{"column":"rank","direction":"desc","nulls":"last"},{"column":"tenant"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:rank_desc_nulls_last_range_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -28396,7 +31504,7 @@ test "relational rows across ranges uses ordered tuple candidate scans" {
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_rank_routed_idx","owner_kind":"relational_column","owner_name":"tenant","access_method":"ordered_tuple","columns":["tenant"],"keys":[{"column":"tenant"},{"column":"rank"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_rank_routed_idx"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_rank_routed_idx","owner_kind":"relational_column","owner_name":"tenant","access_method":"ordered_tuple","columns":["tenant"],"keys":[{"column":"tenant"},{"column":"rank"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_rank_routed_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -28442,6 +31550,10 @@ test "relational rows across ranges uses ordered tuple candidate scans" {
         .field = "id",
         .direction = .asc,
     }};
+    const order_by_desc = [_]types.RelationalRowsQueryOrder{.{
+        .field = "id",
+        .direction = .desc,
+    }};
     var result = try db.queryRelationalRowsAcrossRanges(alloc, runtime_schema, .{
         .predicates = predicates[0..],
         .select = select[0..],
@@ -28454,6 +31566,67 @@ test "relational rows across ranges uses ordered tuple candidate scans" {
     try std.testing.expectEqual(@as(usize, 2), result.rows.len);
     try std.testing.expectEqualStrings("{\"id\":\"b\"}", result.rows[0]);
     try std.testing.expectEqualStrings("{\"id\":\"c\"}", result.rows[1]);
+
+    var sorted_bounded = try db.queryRelationalRowsAcrossRanges(alloc, runtime_schema, .{
+        .predicates = predicates[0..],
+        .select = select[0..],
+        .select_all = false,
+        .order_by = order_by_desc[0..],
+        .limit = 1,
+        .total_mode = .bounded,
+        .profile = true,
+    }, ranges[0..]);
+    defer sorted_bounded.deinit(alloc);
+    try std.testing.expect(sorted_bounded.include_profile);
+    try std.testing.expectEqual(@as(u32, 1), sorted_bounded.total);
+    try std.testing.expect(!sorted_bounded.total_exact);
+    try std.testing.expectEqual(@as(usize, 1), sorted_bounded.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", sorted_bounded.rows[0]);
+    try std.testing.expectEqual(@as(u64, 1), sorted_bounded.profile.retained_candidate_rows);
+    try std.testing.expectEqual(@as(u64, 1), sorted_bounded.profile.projected_rows);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.CandidateStreamStopReason.none, sorted_bounded.profile.candidate_stream_stop_reason);
+
+    var count_only = try db.queryRelationalRowsAcrossRanges(alloc, runtime_schema, .{
+        .predicates = predicates[0..],
+        .select = select[0..],
+        .select_all = false,
+        .order_by = order_by[0..],
+        .limit = 0,
+        .total_mode = .exact,
+        .profile = true,
+    }, ranges[0..]);
+    defer count_only.deinit(alloc);
+    try std.testing.expect(count_only.include_profile);
+    try std.testing.expectEqual(@as(u32, 2), count_only.total);
+    try std.testing.expect(count_only.total_exact);
+    try std.testing.expectEqual(@as(usize, 0), count_only.rows.len);
+    try std.testing.expect(count_only.profile.count_only);
+    try std.testing.expectEqual(types.RelationalRowsQueryRequest.TotalMode.exact, count_only.profile.total_mode);
+    try std.testing.expectEqual(@as(u64, 0), count_only.profile.retained_candidate_rows);
+    try std.testing.expectEqual(@as(u64, 2), count_only.profile.hydrated_rows);
+    try std.testing.expectEqual(@as(u64, 0), count_only.profile.projected_rows);
+
+    var plan_count_only = try db.queryRelationalRowsPlan(alloc, runtime_schema, .{
+        .ranges = ranges[0..],
+        .query = .{
+            .predicates = predicates[0..],
+            .select = select[0..],
+            .select_all = false,
+            .order_by = order_by[0..],
+            .limit = 0,
+            .total_mode = .exact,
+            .profile = true,
+        },
+    });
+    defer plan_count_only.deinit(alloc);
+    try std.testing.expect(plan_count_only.include_profile);
+    try std.testing.expectEqual(@as(u32, 2), plan_count_only.total);
+    try std.testing.expect(plan_count_only.total_exact);
+    try std.testing.expectEqual(@as(usize, 0), plan_count_only.rows.len);
+    try std.testing.expect(plan_count_only.profile.count_only);
+    try std.testing.expectEqual(types.RelationalRowsQueryRequest.TotalMode.exact, plan_count_only.profile.total_mode);
+    try std.testing.expectEqual(@as(u64, 0), plan_count_only.profile.retained_candidate_rows);
+    try std.testing.expectEqual(@as(u64, 0), plan_count_only.profile.projected_rows);
 }
 
 test "relational rows ordered tuple doc set profiles residual predicate rechecks" {
@@ -28469,7 +31642,7 @@ test "relational rows ordered tuple doc set profiles residual predicate rechecks
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"rank":{"type":"numeric"},"category":{"type":"keyword"}},"required":["id","status","rank","category"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_rank_residual_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"rank"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:status_rank_residual_idx"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"rank":{"type":"numeric"},"category":{"type":"keyword"}},"required":["id","status","rank","category"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_rank_residual_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"rank"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:status_rank_residual_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -28544,7 +31717,7 @@ test "relational rows OR branches use compound ordered tuple candidate scans" {
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","status","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_rank_or_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"rank"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:status_rank_or_idx"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","status","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_rank_or_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"rank"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:status_rank_or_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -28636,7 +31809,7 @@ test "relational rows access OR branches use ranged compound ordered tuple candi
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","status","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_rank_access_or_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"rank"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:status_rank_access_or_idx"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","status","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_rank_access_or_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"rank"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:status_rank_access_or_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -28726,7 +31899,7 @@ test "relational aggregate and join sources use ordered tuple prefilters" {
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"kind":{"type":"keyword"},"tenant":{"type":"keyword"},"rank":{"type":"numeric"},"customer_id":{"type":"keyword"},"name":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id","kind","tenant"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_rank_prefilter_idx","owner_kind":"relational_column","owner_name":"tenant","access_method":"ordered_tuple","columns":["tenant"],"keys":[{"column":"tenant"},{"column":"rank"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_rank_prefilter_idx"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"kind":{"type":"keyword"},"tenant":{"type":"keyword"},"rank":{"type":"numeric"},"customer_id":{"type":"keyword"},"name":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id","kind","tenant"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_rank_prefilter_idx","owner_kind":"relational_column","owner_name":"tenant","access_method":"ordered_tuple","columns":["tenant"],"keys":[{"column":"tenant"},{"column":"rank"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_rank_prefilter_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -28959,7 +32132,7 @@ test "relational rows query resolves ordered unique tuple before column indexes"
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"},"name":{"type":"keyword"}},"required":["id","email","status","name"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_email_key","columns":["email"]}],"relational_indexes":[{"name":"users_email_key","owner_kind":"unique_constraint","owner_name":"users_email_key","access_method":"ordered_tuple","columns":["email"],"unique":true,"keys":[{"column":"email"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:users_email_key"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"},"name":{"type":"keyword"}},"required":["id","email","status","name"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_email_key","columns":["email"]}],"relational_indexes":[{"name":"users_email_key","owner_kind":"unique_constraint","owner_name":"users_email_key","access_method":"ordered_tuple","columns":["email"],"unique":true,"keys":[{"column":"email"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:users_email_key","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -29028,7 +32201,7 @@ test "relational rows query routes compound unique owner through ordered tuple m
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"},"name":{"type":"keyword"}},"required":["id","tenant","email","status","name"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_tenant_email_key","columns":["tenant","email"]}],"relational_indexes":[{"name":"users_tenant_email_key","owner_kind":"unique_constraint","owner_name":"users_tenant_email_key","access_method":"ordered_tuple","columns":["tenant","email"],"unique":true,"keys":[{"column":"tenant"},{"column":"email"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:users_tenant_email_key"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"},"name":{"type":"keyword"}},"required":["id","tenant","email","status","name"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_tenant_email_key","columns":["tenant","email"]}],"relational_indexes":[{"name":"users_tenant_email_key","owner_kind":"unique_constraint","owner_name":"users_tenant_email_key","access_method":"ordered_tuple","columns":["tenant","email"],"unique":true,"keys":[{"column":"tenant"},{"column":"email"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:users_tenant_email_key","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -29113,7 +32286,7 @@ test "relational rows query routes expression unique owner through ordered tuple
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"},"name":{"type":"keyword"}},"required":["id","tenant","email","status","name"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_tenant_lower_email_key","columns":["tenant"],"expressions":[{"op":"lower","field":"email"}]}],"relational_indexes":[{"name":"users_tenant_lower_email_key","owner_kind":"unique_constraint","owner_name":"users_tenant_lower_email_key","access_method":"ordered_tuple","columns":["tenant"],"expressions":[{"op":"lower","field":"email"}],"unique":true,"keys":[{"column":"tenant"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:users_tenant_lower_email_key"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"},"name":{"type":"keyword"}},"required":["id","tenant","email","status","name"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_tenant_lower_email_key","columns":["tenant"],"expressions":[{"op":"lower","field":"email"}]}],"relational_indexes":[{"name":"users_tenant_lower_email_key","owner_kind":"unique_constraint","owner_name":"users_tenant_lower_email_key","access_method":"ordered_tuple","columns":["tenant"],"expressions":[{"op":"lower","field":"email"}],"unique":true,"keys":[{"column":"tenant"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:users_tenant_lower_email_key","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -29216,7 +32389,7 @@ test "relational rows ordered unique lookup uses catalog-only index metadata" {
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"},"name":{"type":"keyword"}},"required":["id","tenant","email","status","name"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_tenant_email_key","columns":["tenant","email"]}],"relational_indexes":[{"name":"users_tenant_email_key","owner_kind":"unique_constraint","owner_name":"users_tenant_email_key","access_method":"ordered_tuple","columns":["tenant","email"],"unique":true,"keys":[{"column":"tenant"},{"column":"email"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:users_tenant_email_key"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"},"name":{"type":"keyword"}},"required":["id","tenant","email","status","name"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_tenant_email_key","columns":["tenant","email"]}],"relational_indexes":[{"name":"users_tenant_email_key","owner_kind":"unique_constraint","owner_name":"users_tenant_email_key","access_method":"ordered_tuple","columns":["tenant","email"],"unique":true,"keys":[{"column":"tenant"},{"column":"email"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:users_tenant_email_key","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -29289,7 +32462,7 @@ test "relational rows ordered unique lookup honors case-insensitive collation" {
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword","collation":"antfly.case_insensitive"},"status":{"type":"keyword"},"name":{"type":"keyword"}},"required":["id","email","status","name"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_email_key","columns":["email"]}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword","collation":"antfly.case_insensitive"},"status":{"type":"keyword"},"name":{"type":"keyword"}},"required":["id","email","status","name"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_email_key","columns":["email"]}],"relational_indexes":[{"name":"users_email_key","owner_kind":"unique_constraint","owner_name":"users_email_key","access_method":"ordered_tuple","columns":["email"],"unique":true,"keys":[{"column":"email"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:users_email_key","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -29599,6 +32772,82 @@ test "relational rows query row claim skip locked returns claimed subset" {
     }));
 }
 
+test "relational rows query row claim uses bounded ordered page" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const DB = @import("mod.zig").DB;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","status","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:first", .value = "{\"id\":\"first\",\"status\":\"ready\",\"rank\":1}" },
+            .{ .key = "row:second", .value = "{\"id\":\"second\",\"status\":\"ready\",\"rank\":2}" },
+            .{ .key = "row:third", .value = "{\"id\":\"third\",\"status\":\"ready\",\"rank\":3}" },
+        },
+        .timestamp_ns = 1_000,
+    });
+
+    const query_txn = try db.beginTransaction(2_000);
+    defer db.abortTransaction(query_txn, 2_100) catch {};
+    const predicates = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "status",
+        .op = .eq,
+        .value_json = "\"ready\"",
+    }};
+    const order_by = [_]types.RelationalRowsQueryOrder{.{
+        .field = "rank",
+        .direction = .asc,
+    }};
+    const select = [_][]const u8{"id"};
+    var claimed = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = predicates[0..],
+        .select = select[0..],
+        .select_all = false,
+        .order_by = order_by[0..],
+        .row_claim = .{
+            .mode = .for_update,
+            .owner_id = "session:bounded-query",
+            .txn_id = query_txn,
+        },
+        .limit = 1,
+        .profile = true,
+    });
+    defer claimed.deinit(alloc);
+
+    try std.testing.expect(claimed.include_profile);
+    try std.testing.expectEqual(@as(u32, 1), claimed.total);
+    try std.testing.expectEqual(@as(usize, 1), claimed.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"first\"}", claimed.rows[0]);
+    try std.testing.expectEqual(@as(u64, 3), claimed.profile.candidate_stream_emitted);
+    try std.testing.expectEqual(@as(u64, 1), claimed.profile.retained_candidate_rows);
+    try std.testing.expectEqual(@as(u64, 1), claimed.profile.projected_rows);
+
+    const blocked_txn = try db.beginTransaction(2_001);
+    defer db.abortTransaction(blocked_txn, 2_101) catch {};
+    try std.testing.expectError(transactions_mod.TxnError.IntentConflict, db.writeTransaction(blocked_txn, .{
+        .writes = &.{.{ .key = "row:first", .value = "{\"id\":\"first\",\"status\":\"blocked\",\"rank\":9}" }},
+    }));
+    try db.writeTransaction(blocked_txn, .{
+        .writes = &.{.{ .key = "row:second", .value = "{\"id\":\"second\",\"status\":\"free\",\"rank\":2}" }},
+    });
+}
+
 test "relational rows query row claim skip locked limit fills from later candidates" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
@@ -29657,13 +32906,21 @@ test "relational rows query row claim skip locked limit fills from later candida
             .txn_id = query_txn,
         },
         .limit = 2,
+        .profile = true,
     });
     defer claimed.deinit(alloc);
 
+    try std.testing.expect(claimed.include_profile);
     try std.testing.expectEqual(@as(u32, 2), claimed.total);
     try std.testing.expectEqual(@as(usize, 2), claimed.rows.len);
     try std.testing.expectEqualStrings("{\"id\":\"free1\"}", claimed.rows[0]);
     try std.testing.expectEqualStrings("{\"id\":\"free2\"}", claimed.rows[1]);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.base_scan, claimed.profile.access_method);
+    try std.testing.expectEqual(@as(u64, 3), claimed.profile.base_scan_rows);
+    try std.testing.expectEqual(@as(u64, 6), claimed.profile.candidate_stream_emitted);
+    try std.testing.expectEqual(@as(u64, 3), claimed.profile.retained_candidate_rows);
+    try std.testing.expectEqual(@as(u64, 2), claimed.profile.projected_rows);
+    try std.testing.expectEqual(@as(u64, 2), claimed.profile.iterator_seeks);
 }
 
 test "relational rows query applies typed array and json predicates through indexes" {
@@ -29774,6 +33031,119 @@ test "relational rows query profile records cross-method candidate selectivity" 
         .field = "rank",
         .direction = .asc,
     }};
+    const order_by_rank_desc = [_]types.RelationalRowsQueryOrder{.{
+        .field = "rank",
+        .direction = .desc,
+    }};
+
+    var scalar_bounded = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = active_predicate[0..],
+        .select = select[0..],
+        .select_all = false,
+        .limit = 1,
+        .total_mode = .bounded,
+        .profile = true,
+    });
+    defer scalar_bounded.deinit(alloc);
+    try std.testing.expect(scalar_bounded.include_profile);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.scalar_doc_set, scalar_bounded.profile.access_method);
+    try std.testing.expectEqual(@as(u32, 1), scalar_bounded.total);
+    try std.testing.expect(!scalar_bounded.total_exact);
+    try std.testing.expectEqual(@as(usize, 1), scalar_bounded.rows.len);
+    try std.testing.expect(!scalar_bounded.profile.count_only);
+    try std.testing.expectEqual(types.RelationalRowsQueryRequest.TotalMode.bounded, scalar_bounded.profile.total_mode);
+    try std.testing.expectEqual(@as(u64, 3), scalar_bounded.profile.candidate_rows);
+    try std.testing.expectEqual(@as(u64, 1), scalar_bounded.profile.candidate_stream_emitted);
+    try std.testing.expectEqual(@as(u64, 0), scalar_bounded.profile.retained_candidate_rows);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.CandidateStreamStopReason.page_full, scalar_bounded.profile.candidate_stream_stop_reason);
+
+    var scalar_count = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = active_predicate[0..],
+        .select = select[0..],
+        .select_all = false,
+        .order_by = order_by_rank[0..],
+        .limit = 0,
+        .total_mode = .exact,
+        .profile = true,
+    });
+    defer scalar_count.deinit(alloc);
+    try std.testing.expect(scalar_count.include_profile);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.scalar_doc_set, scalar_count.profile.access_method);
+    try std.testing.expectEqual(@as(u32, 3), scalar_count.total);
+    try std.testing.expect(scalar_count.total_exact);
+    try std.testing.expectEqual(@as(usize, 0), scalar_count.rows.len);
+    try std.testing.expect(scalar_count.profile.count_only);
+    try std.testing.expectEqual(types.RelationalRowsQueryRequest.TotalMode.exact, scalar_count.profile.total_mode);
+    try std.testing.expectEqual(@as(u64, 3), scalar_count.profile.candidate_rows);
+    try std.testing.expectEqual(@as(u64, 3), scalar_count.profile.candidate_stream_emitted);
+    try std.testing.expectEqual(@as(u64, 0), scalar_count.profile.retained_candidate_rows);
+    try std.testing.expectEqual(@as(u64, 3), scalar_count.profile.hydrated_rows);
+    try std.testing.expectEqual(@as(u64, 0), scalar_count.profile.projected_rows);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.CandidateStreamStopReason.none, scalar_count.profile.candidate_stream_stop_reason);
+
+    var scalar_sorted_bounded = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = active_predicate[0..],
+        .select = select[0..],
+        .select_all = false,
+        .order_by = order_by_rank_desc[0..],
+        .limit = 1,
+        .total_mode = .bounded,
+        .profile = true,
+    });
+    defer scalar_sorted_bounded.deinit(alloc);
+    try std.testing.expect(scalar_sorted_bounded.include_profile);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.scalar_doc_set, scalar_sorted_bounded.profile.access_method);
+    try std.testing.expectEqual(@as(u32, 1), scalar_sorted_bounded.total);
+    try std.testing.expect(!scalar_sorted_bounded.total_exact);
+    try std.testing.expectEqual(@as(usize, 1), scalar_sorted_bounded.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", scalar_sorted_bounded.rows[0]);
+    try std.testing.expectEqual(@as(u64, 3), scalar_sorted_bounded.profile.candidate_stream_emitted);
+    try std.testing.expectEqual(@as(u64, 1), scalar_sorted_bounded.profile.retained_candidate_rows);
+    try std.testing.expectEqual(@as(u64, 1), scalar_sorted_bounded.profile.projected_rows);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.CandidateStreamStopReason.none, scalar_sorted_bounded.profile.candidate_stream_stop_reason);
+
+    var array_bounded = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = active_predicate[0..],
+        .array_any = vip_tag[0..],
+        .select = select[0..],
+        .select_all = false,
+        .limit = 1,
+        .total_mode = .bounded,
+        .profile = true,
+    });
+    defer array_bounded.deinit(alloc);
+    try std.testing.expect(array_bounded.include_profile);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.array_doc_set, array_bounded.profile.access_method);
+    try std.testing.expectEqual(@as(u32, 1), array_bounded.total);
+    try std.testing.expect(!array_bounded.total_exact);
+    try std.testing.expectEqual(@as(usize, 1), array_bounded.rows.len);
+    try std.testing.expectEqual(@as(u64, 0), array_bounded.profile.retained_candidate_rows);
+    try std.testing.expectEqual(@as(u64, 1), array_bounded.profile.projected_rows);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.CandidateStreamStopReason.page_full, array_bounded.profile.candidate_stream_stop_reason);
+
+    const free_plan = [_]types.RelationalRowsJsonPathEqPredicate{.{
+        .field = "attrs",
+        .path = "billing.plan",
+        .value_json = "\"free\"",
+    }};
+    var json_bounded = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = active_predicate[0..],
+        .json_path_eq = free_plan[0..],
+        .select = select[0..],
+        .select_all = false,
+        .limit = 1,
+        .total_mode = .bounded,
+        .profile = true,
+    });
+    defer json_bounded.deinit(alloc);
+    try std.testing.expect(json_bounded.include_profile);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.json_doc_set, json_bounded.profile.access_method);
+    try std.testing.expectEqual(@as(u32, 1), json_bounded.total);
+    try std.testing.expect(!json_bounded.total_exact);
+    try std.testing.expectEqual(@as(usize, 1), json_bounded.rows.len);
+    try std.testing.expectEqual(@as(u64, 0), json_bounded.profile.retained_candidate_rows);
+    try std.testing.expectEqual(@as(u64, 1), json_bounded.profile.projected_rows);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.CandidateStreamStopReason.page_full, json_bounded.profile.candidate_stream_stop_reason);
 
     var array_selected = try db.queryRelationalRows(alloc, runtime_schema, .{
         .predicates = active_predicate[0..],
@@ -29790,14 +33160,13 @@ test "relational rows query profile records cross-method candidate selectivity" 
     try std.testing.expectEqual(@as(u32, 1), array_selected.profile.scalar_candidate_sets);
     try std.testing.expectEqual(@as(u32, 1), array_selected.profile.array_candidate_sets);
     try std.testing.expect(array_selected.profile.selected_candidate_estimated_rows <= array_selected.profile.estimated_candidate_rows);
+    try std.testing.expect(array_selected.profile.candidate_stream_emitted > 0);
+    try std.testing.expect(array_selected.profile.candidate_stream_emitted <= array_selected.profile.candidate_rows);
+    try std.testing.expectEqual(@as(u64, 1), array_selected.profile.retained_candidate_rows);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.CandidateStreamStopReason.none, array_selected.profile.candidate_stream_stop_reason);
     try std.testing.expectEqual(@as(u32, 1), array_selected.total);
     try std.testing.expectEqualStrings("{\"id\":\"a\"}", array_selected.rows[0]);
 
-    const free_plan = [_]types.RelationalRowsJsonPathEqPredicate{.{
-        .field = "attrs",
-        .path = "billing.plan",
-        .value_json = "\"free\"",
-    }};
     var json_selected = try db.queryRelationalRows(alloc, runtime_schema, .{
         .predicates = active_predicate[0..],
         .json_path_eq = free_plan[0..],
@@ -29813,8 +33182,472 @@ test "relational rows query profile records cross-method candidate selectivity" 
     try std.testing.expectEqual(@as(u32, 1), json_selected.profile.scalar_candidate_sets);
     try std.testing.expectEqual(@as(u32, 1), json_selected.profile.json_candidate_sets);
     try std.testing.expect(json_selected.profile.selected_candidate_estimated_rows <= json_selected.profile.estimated_candidate_rows);
+    try std.testing.expect(json_selected.profile.candidate_stream_emitted > 0);
+    try std.testing.expect(json_selected.profile.candidate_stream_emitted <= json_selected.profile.candidate_rows);
+    try std.testing.expectEqual(@as(u64, 1), json_selected.profile.retained_candidate_rows);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.CandidateStreamStopReason.none, json_selected.profile.candidate_stream_stop_reason);
     try std.testing.expectEqual(@as(u32, 1), json_selected.total);
     try std.testing.expectEqualStrings("{\"id\":\"b\"}", json_selected.rows[0]);
+}
+
+test "relational rows query plans full-text candidates with scalar residual recheck" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const DB = @import("mod.zig").DB;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"title":{"type":"text"},"status":{"type":"keyword"}},"required":["id","title","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status","owner_kind":"relational_column","owner_name":"status","access_method":"scalar_column","columns":["status"]},{"name":"ft_v1","owner_kind":"relational_column","owner_name":"title","access_method":"text_search","method_config":{"type":"full_text","field":"title","analyzer":"standard"},"columns":["title"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:ft_v1","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"title\":\"alpha launch notes\",\"status\":\"active\"}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"title\":\"beta launch notes\",\"status\":\"active\"}" },
+            .{ .key = "row:c", .value = "{\"id\":\"c\",\"title\":\"alpha archive notes\",\"status\":\"archived\"}" },
+            .{ .key = "row:d", .value = "{\"id\":\"d\",\"title\":\"gamma operations\",\"status\":\"active\"}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    const active_predicate = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "status",
+        .op = .eq,
+        .value_json = "\"active\"",
+    }};
+    const select = [_][]const u8{ "id", "status", "_score", "_snippet", "_highlight" };
+
+    var result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = active_predicate[0..],
+        .primary_text_index_name = "ft_v1",
+        .full_text = .{ .match = .{ .field = "title", .text = "alpha" } },
+        .select = select[0..],
+        .select_all = false,
+        .total_mode = .exact,
+        .profile = true,
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expect(result.include_profile);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.text_search_doc_set, result.profile.access_method);
+    try std.testing.expectEqual(@as(u32, 2), result.profile.planned_candidate_sets);
+    try std.testing.expectEqual(@as(u32, 1), result.profile.scalar_candidate_sets);
+    try std.testing.expectEqual(@as(u32, 1), result.profile.text_search_candidate_sets);
+    try std.testing.expectEqual(@as(u32, 1), result.total);
+    try std.testing.expect(result.total_exact);
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+    var parsed_row = try std.json.parseFromSlice(std.json.Value, alloc, result.rows[0], .{});
+    defer parsed_row.deinit();
+    try std.testing.expectEqualStrings("a", parsed_row.value.object.get("id").?.string);
+    try std.testing.expectEqualStrings("active", parsed_row.value.object.get("status").?.string);
+    const score = parsed_row.value.object.get("_score") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(score == .float or score == .integer);
+    const snippet = parsed_row.value.object.get("_snippet") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("alpha launch notes", snippet.string);
+    const highlight = parsed_row.value.object.get("_highlight") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("title", highlight.object.get("field").?.string);
+    try std.testing.expectEqualStrings("alpha", highlight.object.get("term").?.string);
+    try std.testing.expectEqual(@as(i64, 0), highlight.object.get("start").?.integer);
+    try std.testing.expectEqual(@as(i64, 5), highlight.object.get("end").?.integer);
+    try std.testing.expectEqual(@as(u64, 1), result.profile.candidate_rows);
+    try std.testing.expectEqual(@as(u64, 1), result.profile.candidate_stream_emitted);
+    try std.testing.expectEqual(@as(u64, 1), result.profile.hydrated_rows);
+    try std.testing.expectEqual(result.profile.hydrated_rows, result.profile.residual_rechecks);
+    try std.testing.expectEqual(@as(u64, 1), result.profile.projected_rows);
+}
+
+test "relational rows query gates full-text candidates on schema generation record" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const DB = @import("mod.zig").DB;
+
+    const RuntimeMutation = enum {
+        none,
+        stale_generation,
+        missing_generation_record,
+    };
+    const Case = struct {
+        name: []const u8,
+        index_json: []const u8,
+        runtime_mutation: RuntimeMutation = .none,
+        expected_error: ?anyerror = null,
+    };
+    const cases = [_]Case{
+        .{
+            .name = "ready",
+            .index_json = "{\"name\":\"ft_v1\",\"owner_kind\":\"relational_column\",\"owner_name\":\"title\",\"access_method\":\"text_search\",\"method_config\":{\"type\":\"full_text\",\"field\":\"title\",\"analyzer\":\"standard\"},\"columns\":[\"title\"],\"lifecycle\":\"ready\",\"generation\":7,\"schema_fingerprint\":\"secondary-index-v1:ft_v1\",\"generation_record\":{\"generation\":7,\"owner_ranges\":[],\"lifecycle\":\"ready\",\"lag\":0,\"ready_watermark\":0}}",
+        },
+        .{
+            .name = "catching-up",
+            .index_json = "{\"name\":\"ft_v1\",\"owner_kind\":\"relational_column\",\"owner_name\":\"title\",\"access_method\":\"text_search\",\"method_config\":{\"type\":\"full_text\",\"field\":\"title\",\"analyzer\":\"standard\"},\"columns\":[\"title\"],\"lifecycle\":\"catching_up\",\"generation\":7,\"schema_fingerprint\":\"secondary-index-v1:ft_v1\",\"generation_record\":{\"generation\":7,\"owner_ranges\":[],\"lifecycle\":\"catching_up\",\"lag\":3,\"ready_watermark\":4}}",
+            .expected_error = error.IndexUnavailable,
+        },
+        .{
+            .name = "stale-generation",
+            .index_json = "{\"name\":\"ft_v1\",\"owner_kind\":\"relational_column\",\"owner_name\":\"title\",\"access_method\":\"text_search\",\"method_config\":{\"type\":\"full_text\",\"field\":\"title\",\"analyzer\":\"standard\"},\"columns\":[\"title\"],\"lifecycle\":\"ready\",\"generation\":7,\"schema_fingerprint\":\"secondary-index-v1:ft_v1\",\"generation_record\":{\"generation\":7,\"owner_ranges\":[],\"lifecycle\":\"ready\",\"lag\":0,\"ready_watermark\":0}}",
+            .runtime_mutation = .stale_generation,
+            .expected_error = error.IndexUnavailable,
+        },
+        .{
+            .name = "missing-generation-record",
+            .index_json = "{\"name\":\"ft_v1\",\"owner_kind\":\"relational_column\",\"owner_name\":\"title\",\"access_method\":\"text_search\",\"method_config\":{\"type\":\"full_text\",\"field\":\"title\",\"analyzer\":\"standard\"},\"columns\":[\"title\"],\"lifecycle\":\"ready\",\"generation\":7,\"schema_fingerprint\":\"secondary-index-v1:ft_v1\",\"generation_record\":{\"generation\":7,\"owner_ranges\":[],\"lifecycle\":\"ready\",\"lag\":0,\"ready_watermark\":0}}",
+            .runtime_mutation = .missing_generation_record,
+            .expected_error = error.IndexUnavailable,
+        },
+    };
+
+    for (cases) |case| {
+        var path_buf: [256]u8 = undefined;
+        const path = TestHelpers.tempPath(&path_buf);
+        defer TestHelpers.cleanupTempDir(path);
+
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        const schema_json = try std.fmt.allocPrint(
+            alloc,
+            "{{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{{\"row\":{{\"schema\":{{\"type\":\"object\",\"properties\":{{\"id\":{{\"type\":\"keyword\"}},\"title\":{{\"type\":\"text\"}},\"status\":{{\"type\":\"keyword\"}}}},\"required\":[\"id\",\"title\",\"status\"],\"additionalProperties\":false}}}}}},\"primary_key\":{{\"columns\":[\"id\"]}},\"relational_indexes\":[{{\"name\":\"status\",\"owner_kind\":\"relational_column\",\"owner_name\":\"status\",\"access_method\":\"scalar_column\",\"columns\":[\"status\"]}},{s}]}}",
+            .{case.index_json},
+        );
+        defer alloc.free(schema_json);
+        var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+        defer parsed_schema.deinit(alloc);
+        const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+        defer schema_mod.freeSchema(alloc, runtime_schema);
+        try db.setSchema(runtime_schema);
+
+        const mutable_indexes = @constCast(runtime_schema.relational_indexes);
+        switch (case.runtime_mutation) {
+            .none => {},
+            .stale_generation => mutable_indexes[1].generation_record.?.generation = 6,
+            .missing_generation_record => mutable_indexes[1].generation_record = null,
+        }
+
+        try db.addIndex(.{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        });
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "row:a", .value = "{\"id\":\"a\",\"title\":\"alpha launch notes\",\"status\":\"active\"}" },
+                .{ .key = "row:b", .value = "{\"id\":\"b\",\"title\":\"beta launch notes\",\"status\":\"active\"}" },
+            },
+            .sync_level = .full_index,
+        });
+
+        const select = [_][]const u8{"id"};
+        const query = types.RelationalRowsQueryRequest{
+            .primary_text_index_name = "ft_v1",
+            .full_text = .{ .match = .{ .field = "title", .text = "alpha" } },
+            .select = select[0..],
+            .select_all = false,
+            .total_mode = .exact,
+            .profile = true,
+        };
+        if (case.expected_error) |expected| {
+            try std.testing.expectError(expected, db.queryRelationalRows(alloc, runtime_schema, query));
+            continue;
+        }
+
+        var result = try db.queryRelationalRows(alloc, runtime_schema, query);
+        defer result.deinit(alloc);
+        try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.text_search_doc_set, result.profile.access_method);
+        try std.testing.expectEqual(@as(u32, 1), result.total);
+        try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+        try std.testing.expectEqualStrings("{\"id\":\"a\"}", result.rows[0]);
+    }
+}
+
+fn expectProjectedRowsContainIdWithScore(
+    alloc: Allocator,
+    rows: []const []const u8,
+    id: []const u8,
+) !void {
+    for (rows) |row| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, row, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.TestUnexpectedResult;
+        const id_value = parsed.value.object.get("id") orelse continue;
+        if (id_value != .string or !std.mem.eql(u8, id_value.string, id)) continue;
+        const score = parsed.value.object.get("_score") orelse return error.TestUnexpectedResult;
+        try std.testing.expect(score == .float or score == .integer);
+        return;
+    }
+    return error.TestExpectedEqual;
+}
+
+fn expectProjectedRowsDoNotContainId(
+    alloc: Allocator,
+    rows: []const []const u8,
+    id: []const u8,
+) !void {
+    for (rows) |row| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, row, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.TestUnexpectedResult;
+        const id_value = parsed.value.object.get("id") orelse continue;
+        if (id_value == .string and std.mem.eql(u8, id_value.string, id)) return error.TestUnexpectedResult;
+    }
+}
+
+test "relational rows query intersects full-text candidates with scalar and ordered tuple sets" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const DB = @import("mod.zig").DB;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"title":{"type":"text"},"status":{"type":"keyword"},"tenant":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","title","status","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status","owner_kind":"relational_column","owner_name":"status","access_method":"scalar_column","columns":["status"]},{"name":"tenant_rank_idx","owner_kind":"relational_column","owner_name":"tenant","access_method":"ordered_tuple","columns":["tenant"],"keys":[{"column":"tenant"},{"column":"rank"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_rank_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}},{"name":"ft_v1","owner_kind":"relational_column","owner_name":"title","access_method":"text_search","method_config":{"type":"full_text","field":"title","analyzer":"standard"},"columns":["title"],"lifecycle":"ready","generation":8,"schema_fingerprint":"secondary-index-v1:ft_v1","generation_record":{"generation":8,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"title\":\"alpha launch notes\",\"status\":\"active\",\"tenant\":\"t1\",\"rank\":1}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"title\":\"beta launch notes\",\"status\":\"active\",\"tenant\":\"t1\",\"rank\":2}" },
+            .{ .key = "row:c", .value = "{\"id\":\"c\",\"title\":\"alpha archive notes\",\"status\":\"archived\",\"tenant\":\"t1\",\"rank\":3}" },
+            .{ .key = "row:d", .value = "{\"id\":\"d\",\"title\":\"alpha remote notes\",\"status\":\"active\",\"tenant\":\"t2\",\"rank\":4}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    const active_predicate = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "status",
+        .op = .eq,
+        .value_json = "\"active\"",
+    }};
+    const ordered_predicates = [_]schema_mod.RelationalCheck{
+        .{ .name = "", .field = "tenant", .op = .eq, .value_json = "\"t1\"" },
+        .{ .name = "", .field = "rank", .op = .gt, .value_json = "0" },
+    };
+    const select = [_][]const u8{ "id", "_score" };
+
+    const Case = struct {
+        name: []const u8,
+        predicates: []const schema_mod.RelationalCheck,
+        expected_scalar_sets: u32,
+        expected_ordered_sets: u32,
+        expected_ids: []const []const u8,
+        rejected_ids: []const []const u8,
+    };
+    const scalar_expected = [_][]const u8{ "a", "d" };
+    const scalar_rejected = [_][]const u8{ "b", "c" };
+    const ordered_expected = [_][]const u8{ "a", "c" };
+    const ordered_rejected = [_][]const u8{ "b", "d" };
+    const cases = [_]Case{
+        .{
+            .name = "scalar",
+            .predicates = active_predicate[0..],
+            .expected_scalar_sets = 1,
+            .expected_ordered_sets = 0,
+            .expected_ids = scalar_expected[0..],
+            .rejected_ids = scalar_rejected[0..],
+        },
+        .{
+            .name = "ordered-tuple",
+            .predicates = ordered_predicates[0..],
+            .expected_scalar_sets = 0,
+            .expected_ordered_sets = 1,
+            .expected_ids = ordered_expected[0..],
+            .rejected_ids = ordered_rejected[0..],
+        },
+    };
+
+    for (cases) |case| {
+        var result = try db.queryRelationalRows(alloc, runtime_schema, .{
+            .predicates = case.predicates,
+            .primary_text_index_name = "ft_v1",
+            .full_text = .{ .match = .{ .field = "title", .text = "alpha" } },
+            .select = select[0..],
+            .select_all = false,
+            .total_mode = .exact,
+            .profile = true,
+        });
+        defer result.deinit(alloc);
+
+        try std.testing.expect(result.include_profile);
+        try std.testing.expectEqual(@as(u32, 2), result.profile.planned_candidate_sets);
+        try std.testing.expectEqual(case.expected_scalar_sets, result.profile.scalar_candidate_sets);
+        try std.testing.expectEqual(case.expected_ordered_sets, result.profile.ordered_tuple_candidate_sets);
+        try std.testing.expectEqual(@as(u32, 1), result.profile.text_search_candidate_sets);
+        try std.testing.expectEqual(@as(u32, @intCast(case.expected_ids.len)), result.total);
+        try std.testing.expect(result.total_exact);
+        try std.testing.expectEqual(case.expected_ids.len, result.rows.len);
+        try std.testing.expect(result.profile.hydrated_rows >= case.expected_ids.len);
+        try std.testing.expectEqual(result.profile.hydrated_rows, result.profile.residual_rechecks);
+
+        for (case.expected_ids) |id| {
+            try expectProjectedRowsContainIdWithScore(alloc, result.rows, id);
+        }
+        for (case.rejected_ids) |id| {
+            try expectProjectedRowsDoNotContainId(alloc, result.rows, id);
+        }
+    }
+}
+
+test "relational rows query streams mixed ordered array and json candidates into bounded sink" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const DB = @import("mod.zig").DB;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"status":{"type":"keyword"},"tier":{"type":"keyword"},"tags":{"type":"array","items":{"type":"keyword"}},"attrs":{"type":"json"},"rank":{"type":"numeric"}},"required":["id","tenant","status","tier","tags","attrs","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_rank_idx","owner_kind":"relational_column","owner_name":"tenant","access_method":"ordered_tuple","columns":["tenant"],"keys":[{"column":"tenant"},{"column":"rank"}],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_rank_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}},{"name":"status","owner_kind":"relational_column","owner_name":"status","access_method":"scalar_column","columns":["status"]},{"name":"tags","owner_kind":"relational_column","owner_name":"tags","access_method":"scalar_column","columns":["tags"]},{"name":"attrs","owner_kind":"relational_column","owner_name":"attrs","access_method":"scalar_column","columns":["attrs"]}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"tenant\":\"t1\",\"status\":\"active\",\"tier\":\"gold\",\"tags\":[\"vip\"],\"attrs\":{\"billing\":{\"plan\":\"pro\"}},\"rank\":1}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"tenant\":\"t1\",\"status\":\"active\",\"tier\":\"gold\",\"tags\":[\"cold\"],\"attrs\":{\"billing\":{\"plan\":\"pro\"}},\"rank\":2}" },
+            .{ .key = "row:c", .value = "{\"id\":\"c\",\"tenant\":\"t1\",\"status\":\"active\",\"tier\":\"silver\",\"tags\":[\"vip\"],\"attrs\":{\"billing\":{\"plan\":\"pro\"}},\"rank\":3}" },
+            .{ .key = "row:d", .value = "{\"id\":\"d\",\"tenant\":\"t2\",\"status\":\"active\",\"tier\":\"gold\",\"tags\":[\"vip\"],\"attrs\":{\"billing\":{\"plan\":\"pro\"}},\"rank\":4}" },
+            .{ .key = "row:e", .value = "{\"id\":\"e\",\"tenant\":\"t1\",\"status\":\"active\",\"tier\":\"gold\",\"tags\":[\"vip\"],\"attrs\":{\"billing\":{\"plan\":\"pro\"}},\"rank\":5}" },
+        },
+        .sync_level = .write,
+    });
+
+    const predicates = [_]schema_mod.RelationalCheck{
+        .{ .name = "", .field = "tenant", .op = .eq, .value_json = "\"t1\"" },
+        .{ .name = "", .field = "rank", .op = .gt, .value_json = "0" },
+        .{ .name = "", .field = "tier", .op = .eq, .value_json = "\"gold\"" },
+    };
+    const vip_tag = [_]types.RelationalRowsArrayAnyPredicate{.{
+        .field = "tags",
+        .value_json = "\"vip\"",
+    }};
+    const pro_plan = [_]types.RelationalRowsJsonPathEqPredicate{.{
+        .field = "attrs",
+        .path = "billing.plan",
+        .value_json = "\"pro\"",
+    }};
+    const active_status = [_]types.RelationalRowsInPredicate{.{
+        .field = "status",
+        .values_json = "[\"active\"]",
+    }};
+    const order_by_rank_desc = [_]types.RelationalRowsQueryOrder{.{
+        .field = "rank",
+        .direction = .desc,
+    }};
+    const select = [_][]const u8{"id"};
+    var result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = predicates[0..],
+        .in_predicates = active_status[0..],
+        .array_any = vip_tag[0..],
+        .json_path_eq = pro_plan[0..],
+        .select = select[0..],
+        .select_all = false,
+        .order_by = order_by_rank_desc[0..],
+        .limit = 1,
+        .total_mode = .bounded,
+        .profile = true,
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expect(result.include_profile);
+    try std.testing.expectEqual(@as(u32, 1), result.total);
+    try std.testing.expect(!result.total_exact);
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"e\"}", result.rows[0]);
+    try std.testing.expectEqual(@as(u32, 4), result.profile.planned_candidate_sets);
+    try std.testing.expectEqual(@as(u32, 1), result.profile.ordered_tuple_candidate_sets);
+    try std.testing.expectEqual(@as(u32, 1), result.profile.scalar_candidate_sets);
+    try std.testing.expectEqual(@as(u32, 1), result.profile.array_candidate_sets);
+    try std.testing.expectEqual(@as(u32, 1), result.profile.json_candidate_sets);
+    try std.testing.expectEqual(@as(u32, 3), result.profile.ordered_tuple_filter_predicates);
+    try std.testing.expectEqual(@as(u32, 2), result.profile.ordered_tuple_proven_predicates);
+    try std.testing.expectEqual(@as(u32, 1), result.profile.ordered_tuple_residual_predicates);
+    try std.testing.expect(result.profile.ordered_tuple_residual_recheck_required);
+    try std.testing.expect(result.profile.index_entries_scanned > 0);
+    try std.testing.expect(result.profile.candidate_stream_emitted > 0);
+    try std.testing.expect(result.profile.candidate_stream_emitted <= result.profile.candidate_rows);
+    try std.testing.expect(result.profile.hydrated_rows >= 2);
+    try std.testing.expectEqual(result.profile.hydrated_rows, result.profile.residual_rechecks);
+    try std.testing.expectEqual(@as(u64, 1), result.profile.retained_candidate_rows);
+    try std.testing.expectEqual(@as(u64, 1), result.profile.projected_rows);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.CandidateStreamStopReason.none, result.profile.candidate_stream_stop_reason);
+
+    var second_page = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = predicates[0..],
+        .in_predicates = active_status[0..],
+        .array_any = vip_tag[0..],
+        .json_path_eq = pro_plan[0..],
+        .select = select[0..],
+        .select_all = false,
+        .order_by = order_by_rank_desc[0..],
+        .offset = 1,
+        .limit = 1,
+        .total_mode = .bounded,
+        .profile = true,
+    });
+    defer second_page.deinit(alloc);
+
+    try std.testing.expect(second_page.include_profile);
+    try std.testing.expectEqual(@as(u32, 2), second_page.total);
+    try std.testing.expect(!second_page.total_exact);
+    try std.testing.expectEqual(@as(usize, 1), second_page.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"a\"}", second_page.rows[0]);
+    try std.testing.expectEqual(@as(u32, 4), second_page.profile.planned_candidate_sets);
+    try std.testing.expectEqual(@as(u32, 1), second_page.profile.ordered_tuple_candidate_sets);
+    try std.testing.expectEqual(@as(u32, 1), second_page.profile.scalar_candidate_sets);
+    try std.testing.expectEqual(@as(u32, 1), second_page.profile.array_candidate_sets);
+    try std.testing.expectEqual(@as(u32, 1), second_page.profile.json_candidate_sets);
+    try std.testing.expectEqual(@as(u32, 3), second_page.profile.ordered_tuple_filter_predicates);
+    try std.testing.expectEqual(@as(u32, 2), second_page.profile.ordered_tuple_proven_predicates);
+    try std.testing.expectEqual(@as(u32, 1), second_page.profile.ordered_tuple_residual_predicates);
+    try std.testing.expect(second_page.profile.ordered_tuple_residual_recheck_required);
+    try std.testing.expect(second_page.profile.index_entries_scanned > 0);
+    try std.testing.expect(second_page.profile.candidate_stream_emitted > 0);
+    try std.testing.expect(second_page.profile.candidate_stream_emitted <= second_page.profile.candidate_rows);
+    try std.testing.expect(second_page.profile.hydrated_rows >= 3);
+    try std.testing.expectEqual(second_page.profile.hydrated_rows, second_page.profile.residual_rechecks);
+    try std.testing.expectEqual(@as(u64, 2), second_page.profile.retained_candidate_rows);
+    try std.testing.expectEqual(@as(u64, 1), second_page.profile.projected_rows);
+    try std.testing.expectEqual(types.RelationalRowsQueryResult.CandidateStreamStopReason.none, second_page.profile.candidate_stream_stop_reason);
 }
 
 test "relational rows query projects typed expression outputs" {
@@ -31048,8 +34881,14 @@ test "relational rows scalar subquery projections enforce scalar cardinality" {
         .scalar_subqueries = empty_projection[0..],
         .order_by = order_by_id[0..],
         .limit = 1,
+        .profile = true,
     });
     defer empty_result.deinit(alloc);
+    try std.testing.expect(empty_result.include_profile);
+    try std.testing.expectEqual(@as(u32, 3), empty_result.total);
+    try std.testing.expectEqual(@as(u64, 3), empty_result.profile.base_scan_rows);
+    try std.testing.expectEqual(@as(u64, 1), empty_result.profile.retained_candidate_rows);
+    try std.testing.expectEqual(@as(u64, 1), empty_result.profile.projected_rows);
     try std.testing.expectEqualStrings("{\"id\":\"a\",\"missing_status\":null}", empty_result.rows[0]);
 
     const rank_correlation = [_]types.RelationalRowsLateralCorrelation{.{
@@ -31116,9 +34955,14 @@ test "relational rows scalar subquery projections enforce scalar cardinality" {
         .scalar_subqueries = hidden_projection[0..],
         .order_by = hidden_id_order[0..],
         .limit = 1,
+        .profile = true,
     });
     defer hidden_order_result.deinit(alloc);
+    try std.testing.expect(hidden_order_result.include_profile);
     try std.testing.expectEqual(@as(u32, 3), hidden_order_result.total);
+    try std.testing.expectEqual(@as(u64, 3), hidden_order_result.profile.base_scan_rows);
+    try std.testing.expectEqual(@as(u64, 1), hidden_order_result.profile.retained_candidate_rows);
+    try std.testing.expectEqual(@as(u64, 1), hidden_order_result.profile.projected_rows);
     try std.testing.expectEqualStrings("{\"id\":\"c\"}", hidden_order_result.rows[0]);
 
     const multi_projection = [_]types.RelationalRowsScalarSubqueryProjection{.{
@@ -31281,7 +35125,7 @@ test "relational rows query array_contains uses element index with authoritative
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tags":{"type":"array","items":{"type":"keyword"}},"rank":{"type":"numeric"},"label":{"type":"keyword"},"email":{"type":"keyword"}},"required":["id","tags","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tags":{"type":"array","items":{"type":"keyword"}},"rank":{"type":"numeric"},"label":{"type":"keyword"},"email":{"type":"keyword"}},"required":["id","tags","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tags","owner_kind":"relational_column","owner_name":"tags","access_method":"scalar_column","columns":["tags"]}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -31442,7 +35286,7 @@ test "relational rows query uses generated expression columns as non-unique expr
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"email_lc":{"type":"keyword","generated":{"op":"expression","expression":{"op":"lower","args":[{"field":"email"}]}}}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"email_lc","owner_kind":"relational_column","owner_name":"email_lc","access_method":"scalar_column","columns":["email_lc"],"lifecycle":"ready","generation":1,"schema_fingerprint":"secondary-index-v1:email_lc"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"email_lc":{"type":"keyword","generated":{"op":"expression","expression":{"op":"lower","args":[{"field":"email"}]}}}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"email_lc","owner_kind":"relational_column","owner_name":"email_lc","access_method":"ordered_tuple","columns":["email_lc"],"keys":[{"column":"email_lc"}],"lifecycle":"ready","generation":1,"schema_fingerprint":"secondary-index-v1:email_lc","generation_record":{"generation":1,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -31459,10 +35303,15 @@ test "relational rows query uses generated expression columns as non-unique expr
         .sync_level = .write,
     });
 
-    const expression_index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "email_lc", "row:a");
-    defer alloc.free(expression_index_key);
-    const expression_index_value = try db.core.store.get(alloc, expression_index_key);
-    defer alloc.free(expression_index_value);
+    const raw_a = try relational_store_mod.getRawAlloc(alloc, db.core.store, "row:a") orelse return error.TestExpectedEqual;
+    defer alloc.free(raw_a);
+    const expression_tuple = try relational_store_mod.orderedTupleValueForIndexKeysAlloc(alloc, raw_a, runtime_schema.relational_indexes[0].keys, runtime_schema.relational_columns);
+    defer alloc.free(expression_tuple);
+    const expression_index_docs = try relational_store_mod.scanOrderedTupleDocKeysAlloc(alloc, db.core.store, "email_lc", expression_tuple, "", "");
+    defer relational_store_mod.freeDocKeys(alloc, expression_index_docs);
+    try std.testing.expectEqual(@as(usize, 2), expression_index_docs.len);
+    try std.testing.expectEqualStrings("row:a", expression_index_docs[0]);
+    try std.testing.expectEqualStrings("row:c", expression_index_docs[1]);
 
     const predicates = [_]schema_mod.RelationalCheck{
         .{ .name = "", .field = "email_lc", .op = .eq, .value_json = "\"ada@example.test\"" },
@@ -31528,7 +35377,7 @@ test "relational rows query json_path_eq uses json value index with authoritativ
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"attrs":{"type":"json"},"rank":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"attrs":{"type":"json"},"rank":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"attrs","owner_kind":"relational_column","owner_name":"attrs","access_method":"scalar_column","columns":["attrs"]}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);

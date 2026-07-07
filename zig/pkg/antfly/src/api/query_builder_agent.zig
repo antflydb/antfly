@@ -3670,7 +3670,7 @@ fn buildQueryBuilderQueryRequest(
     out.filter_prefix = queryBuilderConstraintString(request.constraints, "filter_prefix");
     out.exclusion_query = try buildQueryBuilderConstraintExclusionQueryValue(alloc, request.constraints, fields);
     out.graph_searches = try queryBuilderGraphSearches(alloc, request, built, graph_indexes);
-    out.expand_strategy = queryBuilderConstraintString(request.constraints, "expand_strategy");
+    out.expand_strategy = try queryBuilderConstraintExpandStrategy(request.constraints, "expand_strategy");
 
     switch (built.query_kind) {
         .status_only => {
@@ -4985,6 +4985,16 @@ fn queryBuilderConstraintString(constraints: ?std.json.Value, key: []const u8) ?
     const raw = value.object.get(key) orelse return null;
     const string = queryBuilderStringValue(raw) orelse return null;
     return if (string.len > 0) string else null;
+}
+
+fn queryBuilderConstraintExpandStrategy(
+    constraints: ?std.json.Value,
+    key: []const u8,
+) !?metadata_openapi.QueryRequestExpandStrategy {
+    const value = queryBuilderConstraintString(constraints, key) orelse return null;
+    if (std.mem.eql(u8, value, "union")) return .@"union";
+    if (std.mem.eql(u8, value, "intersection")) return .intersection;
+    return error.InvalidQueryBuilderRequest;
 }
 
 fn queryBuilderPreferredIndexSlice(
@@ -8286,7 +8296,7 @@ test "query builder maps graph searches from constraints" {
     }, null);
 
     const query_request = result.query_request.?;
-    try std.testing.expectEqualStrings("union", query_request.expand_strategy.?);
+    try std.testing.expectEqual(metadata_openapi.QueryRequestExpandStrategy.@"union", query_request.expand_strategy.?);
     try std.testing.expect(query_request.graph_searches != null);
     try std.testing.expectEqual(@as(usize, 1), query_request.graph_searches.?.map.count());
     const graph_query = query_request.graph_searches.?.map.get("related").?;

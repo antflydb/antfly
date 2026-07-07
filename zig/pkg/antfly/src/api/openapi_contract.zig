@@ -143,6 +143,7 @@ test "public index contract exposes runtime status metadata" {
     try std.testing.expect(@hasField(indexes_generated.AlgebraicIndexStats, "capability_lifecycle_status"));
     try std.testing.expect(@hasField(indexes_generated.AlgebraicIndexStats, "planner_last_decision"));
     try std.testing.expect(@hasField(indexes_generated.AlgebraicIndexStats, "planner_last_fallback_reason"));
+    try std.testing.expect(@hasField(indexes_generated.AlgebraicIndexStats, "planner_last_unsupported_reason"));
     try std.testing.expect(@hasField(indexes_generated.AlgebraicIndexStats, "planner_last_estimated_scan_rows"));
     try std.testing.expect(@hasField(indexes_generated.AlgebraicIndexStats, "planner_last_estimated_result_buckets"));
     try std.testing.expect(@hasField(indexes_generated.AlgebraicIndexStats, "planner_lifecycle_ready"));
@@ -155,6 +156,7 @@ test "public index contract exposes runtime status metadata" {
     try std.testing.expect(@hasField(indexes_generated.AlgebraicIndexStats, "adaptive_cleanup_recommended_count"));
     try std.testing.expect(@hasField(indexes_generated.AlgebraicIndexStats, "active_progress_lifecycle"));
     try std.testing.expect(@hasField(indexes_generated.AlgebraicIndexStats, "active_progress_rows_processed"));
+    try std.testing.expect(@hasField(client_generated.AlgebraicIndexStats, "planner_last_unsupported_reason"));
     try std.testing.expect(@hasDecl(indexes_generated, "RelationalIndexStats"));
     try std.testing.expect(@hasField(indexes_generated.RelationalIndexStats, "index_type"));
     try std.testing.expect(@hasField(indexes_generated.RelationalIndexStats, "rebuild"));
@@ -186,7 +188,7 @@ test "indexes openapi parses graph metric runtime summary" {
         .graph_index_stats => |stats| {
             const runtime = stats.graph_metric_runtime orelse return error.UnexpectedOpenApiVariant;
             try std.testing.expect(runtime.enabled.?);
-            try std.testing.expectEqualStrings("worker_pool", runtime.role.?);
+            try std.testing.expectEqual(indexes_generated.GraphMetricRuntimeStatsRole.worker_pool, runtime.role.?);
             try std.testing.expectEqual(@as(i64, 17), runtime.owner_id_hash.?);
             try std.testing.expectEqual(@as(i64, 23), runtime.worker_id_hash.?);
             try std.testing.expectEqual(@as(i64, 3), runtime.worker_count.?);
@@ -212,7 +214,7 @@ test "client openapi parses graph metric runtime summary" {
         .graph_index_stats => |stats| {
             const runtime = stats.graph_metric_runtime orelse return error.UnexpectedOpenApiVariant;
             try std.testing.expect(runtime.enabled.?);
-            try std.testing.expectEqualStrings("coordinator", runtime.role.?);
+            try std.testing.expectEqual(client_generated.GraphMetricRuntimeStatsRole.coordinator, runtime.role.?);
             try std.testing.expectEqual(@as(i64, 99), runtime.owner_id_hash.?);
             try std.testing.expectEqual(@as(i64, 1), runtime.worker_count.?);
             try std.testing.expectEqual(@as(i64, 2), runtime.takeover_count.?);
@@ -227,7 +229,7 @@ test "client openapi parses graph metric runtime summary" {
 test "indexes openapi parses algebraic status as algebraic stats" {
     const alloc = std.testing.allocator;
     var parsed = try std.json.parseFromSlice(indexes_generated.IndexStats, alloc,
-        \\{"index_type":"algebraic","total_indexed":3,"healthy":true,"parse_error_count":0,"planner_last_decision":"fallback","planner_last_fallback_reason":"no_materialization","planner_last_estimated_scan_rows":61,"planner_last_estimated_result_buckets":8,"planner_lifecycle_ready":false,"planner_lifecycle_blocking_reason":"capability_lifecycle_not_ready","capability_lifecycle_status":"stale","recommendation_count":4,"adaptive_backfilling_count":1,"adaptive_ready_count":2,"adaptive_stale_count":0,"adaptive_cleanup_recommended_count":1,"active_progress_lifecycle":"backfilling","active_progress_rows_processed":7,"active_progress_target_rows":14}
+        \\{"index_type":"algebraic","total_indexed":3,"healthy":true,"parse_error_count":0,"planner_last_decision":"fallback","planner_last_fallback_reason":"no_materialization","planner_last_unsupported_reason":"access-method-capability-mismatch","planner_last_estimated_scan_rows":61,"planner_last_estimated_result_buckets":8,"planner_lifecycle_ready":false,"planner_lifecycle_blocking_reason":"capability_lifecycle_not_ready","capability_lifecycle_status":"stale","recommendation_count":4,"adaptive_backfilling_count":1,"adaptive_ready_count":2,"adaptive_stale_count":0,"adaptive_cleanup_recommended_count":1,"active_progress_lifecycle":"backfilling","active_progress_rows_processed":7,"active_progress_target_rows":14}
     , .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
     defer parsed.deinit();
 
@@ -236,8 +238,9 @@ test "indexes openapi parses algebraic status as algebraic stats" {
             try std.testing.expectEqual(indexes_generated.AlgebraicIndexStatsIndexType.algebraic, stats.index_type);
             try std.testing.expectEqual(@as(i64, 3), stats.total_indexed.?);
             try std.testing.expect(stats.healthy.?);
-            try std.testing.expectEqualStrings("fallback", stats.planner_last_decision.?);
+            try std.testing.expectEqual(indexes_generated.AlgebraicIndexStatsPlannerLastDecision.fallback, stats.planner_last_decision.?);
             try std.testing.expectEqualStrings("no_materialization", stats.planner_last_fallback_reason.?);
+            try std.testing.expectEqual(indexes_generated.AlgebraicIndexStatsPlannerLastUnsupportedReason.access_method_capability_mismatch, stats.planner_last_unsupported_reason.?);
             try std.testing.expectEqual(@as(i64, 61), stats.planner_last_estimated_scan_rows.?);
             try std.testing.expectEqual(@as(i64, 8), stats.planner_last_estimated_result_buckets.?);
             try std.testing.expect(!stats.planner_lifecycle_ready.?);
@@ -252,6 +255,43 @@ test "indexes openapi parses algebraic status as algebraic stats" {
         },
         else => return error.UnexpectedOpenApiVariant,
     }
+
+    const BucketCase = struct {
+        wire_name: []const u8,
+        reason: indexes_generated.AlgebraicIndexStatsPlannerLastUnsupportedReason,
+    };
+    const unsupported_reason_buckets = [_]BucketCase{
+        .{ .wire_name = "unsupported-access-method", .reason = .unsupported_access_method },
+        .{ .wire_name = "index-not-ready", .reason = .index_not_ready },
+        .{ .wire_name = "stale-generation", .reason = .stale_generation },
+        .{ .wire_name = "predicate-not-proven", .reason = .predicate_not_proven },
+        .{ .wire_name = "ordering-not-covered", .reason = .ordering_not_covered },
+        .{ .wire_name = "access-method-capability-mismatch", .reason = .access_method_capability_mismatch },
+    };
+    for (unsupported_reason_buckets) |bucket| {
+        const body = try std.fmt.allocPrint(
+            alloc,
+            "{{\"index_type\":\"algebraic\",\"planner_last_decision\":\"fallback\",\"planner_last_fallback_reason\":\"fixture\",\"planner_last_unsupported_reason\":\"{s}\"}}",
+            .{bucket.wire_name},
+        );
+        defer alloc.free(body);
+        var bucket_parsed = try std.json.parseFromSlice(indexes_generated.IndexStats, alloc, body, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        });
+        defer bucket_parsed.deinit();
+        switch (bucket_parsed.value) {
+            .algebraic_index_stats => |stats| try std.testing.expectEqual(bucket.reason, stats.planner_last_unsupported_reason.?),
+            else => return error.UnexpectedOpenApiVariant,
+        }
+    }
+
+    try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSlice(
+        indexes_generated.IndexStats,
+        alloc,
+        "{\"index_type\":\"algebraic\",\"planner_last_unsupported_reason\":\"mystery-bucket\"}",
+        .{ .allocate = .alloc_always, .ignore_unknown_fields = true },
+    ));
 }
 
 test "indexes openapi parses relational status as relational stats" {
@@ -781,6 +821,28 @@ test "public openapi module resolves shared refs through owner modules" {
     try std.testing.expect(@FieldType(generated.RetrievalAgentRequest, "steps") == ?generated.RetrievalAgentSteps);
     try std.testing.expect(@FieldType(generated.RetrievalAgentSteps, "generation") == ?generating_api_generated.GenerationStepConfig);
     try std.testing.expect(@FieldType(generated.RetrievalAgentSteps, "eval") == ?eval_generated.EvalConfig);
+}
+
+test "public openapi row query contract includes total mode semantics" {
+    const PublicTotalMode = @typeInfo(@FieldType(generated.RowsQueryRequest, "total_mode")).optional.child;
+    const ClientTotalMode = @typeInfo(@FieldType(client_generated.RowsQueryRequest, "total_mode")).optional.child;
+    const MetadataTotalMode = @typeInfo(@FieldType(metadata_generated.RowsQueryRequest, "total_mode")).optional.child;
+    _ = MetadataTotalMode;
+    try std.testing.expect(@FieldType(generated.RowsQueryResultSet, "total_exact") == ?bool);
+    try std.testing.expect(@FieldType(client_generated.RowsQueryResultSet, "total_exact") == ?bool);
+    try std.testing.expect(@FieldType(metadata_generated.RowsQueryResultSet, "total_exact") == ?bool);
+
+    var public_request = try std.json.parseFromSlice(generated.RowsQueryRequest, std.testing.allocator, "{\"limit\":1,\"total_mode\":\"bounded\"}", .{});
+    defer public_request.deinit();
+    try std.testing.expectEqual(PublicTotalMode.bounded, public_request.value.total_mode.?);
+
+    var client_request = try std.json.parseFromSlice(client_generated.RowsQueryRequest, std.testing.allocator, "{\"limit\":1,\"total_mode\":\"none\"}", .{});
+    defer client_request.deinit();
+    try std.testing.expectEqual(ClientTotalMode.none, client_request.value.total_mode.?);
+
+    var metadata_result = try std.json.parseFromSlice(metadata_generated.RowsQueryResultSet, std.testing.allocator, "{\"total\":1,\"total_exact\":false,\"rows\":[]}", .{});
+    defer metadata_result.deinit();
+    try std.testing.expect(metadata_result.value.total_exact.? == false);
 }
 
 test "client openapi module resolves shared refs through owner modules" {

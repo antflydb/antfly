@@ -386,6 +386,9 @@ fn cloneRuntimeRelationalIndex(
         .lifecycle = index.lifecycle,
         .generation = index.generation,
         .schema_fingerprint = if (index.schema_fingerprint) |fingerprint| try alloc.dupe(u8, fingerprint) else null,
+        .owner_ranges = try cloneRelationalIndexOwnerRanges(alloc, index.owner_ranges),
+        .generation_record = if (index.generation_record) |record| try cloneRelationalIndexGenerationRecord(alloc, record) else null,
+        .planner_capabilities = index.planner_capabilities,
         .where = try cloneStorageUniquePredicates(alloc, index.where),
         .where_expressions = try cloneRelationalRowsExpressionConditionsAlloc(alloc, index.where_expressions),
     };
@@ -407,8 +410,72 @@ fn freeRuntimeRelationalIndex(alloc: std.mem.Allocator, index: storage_schema.Re
     if (index.include_columns.len > 0) alloc.free(index.include_columns);
     storage_schema.freeRelationalIndexKeySlice(alloc, index.keys);
     if (index.schema_fingerprint) |fingerprint| alloc.free(fingerprint);
+    freeRelationalIndexOwnerRanges(alloc, index.owner_ranges);
+    if (index.generation_record) |record| freeRelationalIndexGenerationRecord(alloc, record);
     freeStorageUniquePredicates(alloc, index.where);
     freeRelationalRowsExpressionConditions(alloc, index.where_expressions);
+}
+
+fn cloneRelationalIndexGenerationRecord(
+    alloc: std.mem.Allocator,
+    record: storage_schema.RelationalIndexGenerationRecord,
+) !storage_schema.RelationalIndexGenerationRecord {
+    return .{
+        .generation = record.generation,
+        .owner_ranges = try cloneRelationalIndexOwnerRanges(alloc, record.owner_ranges),
+        .lifecycle = record.lifecycle,
+        .lag = record.lag,
+        .failure_reason = if (record.failure_reason) |reason| try alloc.dupe(u8, reason) else null,
+        .ready_watermark = record.ready_watermark,
+    };
+}
+
+fn freeRelationalIndexGenerationRecord(
+    alloc: std.mem.Allocator,
+    record: storage_schema.RelationalIndexGenerationRecord,
+) void {
+    freeRelationalIndexOwnerRanges(alloc, record.owner_ranges);
+    if (record.failure_reason) |reason| alloc.free(reason);
+}
+
+fn cloneRelationalIndexOwnerRanges(
+    alloc: std.mem.Allocator,
+    ranges: []const storage_schema.RelationalIndexOwnerRange,
+) ![]const storage_schema.RelationalIndexOwnerRange {
+    if (ranges.len == 0) return &.{};
+    const out = try alloc.alloc(storage_schema.RelationalIndexOwnerRange, ranges.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |range| freeRelationalIndexOwnerRange(alloc, range);
+        alloc.free(out);
+    }
+    for (ranges) |range| {
+        out[initialized] = .{
+            .start = try alloc.dupe(u8, range.start),
+            .end = try alloc.dupe(u8, range.end),
+            .range_id = if (range.range_id) |range_id| try alloc.dupe(u8, range_id) else null,
+            .placement_generation = range.placement_generation,
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn freeRelationalIndexOwnerRanges(
+    alloc: std.mem.Allocator,
+    ranges: []const storage_schema.RelationalIndexOwnerRange,
+) void {
+    for (ranges) |range| freeRelationalIndexOwnerRange(alloc, range);
+    if (ranges.len > 0) alloc.free(ranges);
+}
+
+fn freeRelationalIndexOwnerRange(
+    alloc: std.mem.Allocator,
+    range: storage_schema.RelationalIndexOwnerRange,
+) void {
+    alloc.free(range.start);
+    alloc.free(range.end);
+    if (range.range_id) |range_id| alloc.free(range_id);
 }
 
 fn runtimeRelationalColumnSupportsCollation(field_type: storage_schema.AntflyType) bool {
@@ -530,12 +597,12 @@ fn cloneRelationalDefaultValue(
         .sequence_next => .sequence_next,
         .scalar_subquery => .scalar_subquery,
     };
+    if (kind == .scalar_subquery) {
+        try relational_rows.validateScalarSubqueryDefaultPayloadAlloc(alloc, value.value_json);
+    }
     return .{
         .kind = kind,
-        .value_json = if (kind == .scalar_subquery)
-            try relational_rows.normalizeScalarSubqueryDefaultValueJsonAlloc(alloc, value.value_json)
-        else
-            try alloc.dupe(u8, value.value_json),
+        .value_json = try alloc.dupe(u8, value.value_json),
     };
 }
 
@@ -1145,15 +1212,27 @@ fn cloneRelationalIndexKeys(alloc: std.mem.Allocator, values: []const storage_sc
     const out = try alloc.alloc(storage_schema.RelationalIndexKey, values.len);
     var initialized: usize = 0;
     errdefer {
-        for (out[0..initialized]) |value| alloc.free(value.column);
+        for (out[0..initialized]) |value| {
+            alloc.free(value.column);
+            if (value.collation) |collation| alloc.free(collation);
+        }
         alloc.free(out);
     }
     for (values) |value| {
+        const column = try alloc.dupe(u8, value.column);
+        var column_transferred = false;
+        errdefer if (!column_transferred) alloc.free(column);
+        const collation = if (value.collation) |source_collation| try alloc.dupe(u8, source_collation) else null;
+        var collation_transferred = false;
+        errdefer if (!collation_transferred) if (collation) |owned_collation| alloc.free(owned_collation);
         out[initialized] = .{
-            .column = try alloc.dupe(u8, value.column),
+            .column = column,
+            .collation = collation,
             .direction = value.direction,
             .nulls = value.nulls,
         };
+        column_transferred = true;
+        collation_transferred = true;
         initialized += 1;
     }
     return out;
@@ -1952,7 +2031,7 @@ test "deriveRuntimeTableSchema carries relational system-versioned marker" {
 test "deriveRuntimeTableSchema carries relational storage mode and column catalog" {
     const alloc = std.testing.allocator;
     var parsed = try parseValidatedTableSchema(alloc,
-        \\{"version":3,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword","collation":"C"},"tenant_id":{"type":"keyword"},"customer_id":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"datetime","x-antfly-on-update":{"op":"now_ns"}},"tags":{"type":"array","items":{"type":"keyword"}},"attrs":{"type":"object","properties":{"k":{"type":"keyword"}}},"payload":{"type":"json"}},"required":["id","tenant_id"],"additionalProperties":false}}},"primary_key":{"name":"orders_pkey","columns":["tenant_id","id"],"include_columns":["created_at","customer_id"]},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict","on_update":"no_action"}],"checks":[{"name":"tenant_case_match","field":"tenant_id","op":"eq","value":"TENANT","collation":"antfly.case_insensitive"}],"relational_indexes":[{"name":"customer_idx","owner_kind":"relational_column","owner_name":"customer_id","access_method":"ordered_tuple","columns":["customer_id"],"keys":[{"column":"customer_id","direction":"desc","nulls":"last"},{"column":"tenant_id","direction":"asc","nulls":"first"}],"lifecycle":"building","generation":99,"schema_fingerprint":"secondary-index-v1:customer","where":{"all":[{"field":"tenant_id","op":"is_not_null"}]}}]}
+        \\{"version":3,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword","collation":"C"},"tenant_id":{"type":"keyword"},"customer_id":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"datetime","x-antfly-on-update":{"op":"now_ns"}},"tags":{"type":"array","items":{"type":"keyword"}},"attrs":{"type":"object","properties":{"k":{"type":"keyword"}}},"payload":{"type":"json"}},"required":["id","tenant_id"],"additionalProperties":false}}},"primary_key":{"name":"orders_pkey","columns":["tenant_id","id"],"include_columns":["created_at","customer_id"]},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict","on_update":"no_action"}],"checks":[{"name":"tenant_case_match","field":"tenant_id","op":"eq","value":"TENANT","collation":"antfly.case_insensitive"}],"relational_indexes":[{"name":"customer_idx","owner_kind":"relational_column","owner_name":"customer_id","access_method":"ordered_tuple","columns":["customer_id"],"keys":[{"column":"customer_id","direction":"desc","nulls":"last"},{"column":"tenant_id","direction":"asc","nulls":"first"}],"lifecycle":"building","generation":99,"schema_fingerprint":"secondary-index-v1:customer","generation_record":{"generation":99,"owner_ranges":[{"start":"row:a","end":"row:z","range_id":"range-a","placement_generation":3}],"lifecycle":"building","lag":7,"failure_reason":"catching up","ready_watermark":42},"where":{"all":[{"field":"tenant_id","op":"is_not_null"}]}}]}
     );
     defer parsed.deinit(alloc);
 
@@ -1985,6 +2064,15 @@ test "deriveRuntimeTableSchema carries relational storage mode and column catalo
     try std.testing.expectEqual(@as(u64, 99), customer_idx.generation);
     try std.testing.expectEqual(storage_schema.RelationalIndexAccessMethod.ordered_tuple, customer_idx.access_method);
     try std.testing.expectEqualStrings("secondary-index-v1:customer", customer_idx.schema_fingerprint.?);
+    const customer_generation_record = customer_idx.generation_record orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 99), customer_generation_record.generation);
+    try std.testing.expectEqual(storage_schema.RelationalIndexLifecycle.building, customer_generation_record.lifecycle);
+    try std.testing.expectEqual(@as(u64, 7), customer_generation_record.lag);
+    try std.testing.expectEqualStrings("catching up", customer_generation_record.failure_reason.?);
+    try std.testing.expectEqual(@as(u64, 42), customer_generation_record.ready_watermark);
+    try std.testing.expectEqual(@as(usize, 1), customer_generation_record.owner_ranges.len);
+    try std.testing.expectEqualStrings("row:a", customer_generation_record.owner_ranges[0].start);
+    try std.testing.expectEqualStrings("row:z", customer_generation_record.owner_ranges[0].end);
     try std.testing.expectEqualStrings("tenant_id", customer_idx.where[0].field);
     try std.testing.expectEqual(storage_schema.UniquePredicateOp.is_not_null, customer_idx.where[0].op);
     try std.testing.expect(runtime.primary_key != null);
@@ -2028,6 +2116,8 @@ test "parseValidatedTableSchema rejects malformed relational index metadata refe
         ,
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_missing_generation_idx","owner_kind":"relational_column","owner_name":"status","access_method":"scalar_column","columns":["status"],"schema_fingerprint":"secondary-index-v1:missing_generation"}]}
         ,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_missing_record_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"}],"lifecycle":"ready","generation":1,"schema_fingerprint":"secondary-index-v1:missing_record"}]}
+        ,
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_status_half_declared_idx","owner_kind":"relational_column","owner_name":"tenant_id","access_method":"ordered_tuple","columns":["tenant_id"],"keys":[{"column":"tenant_id"},{"column":"status"}],"lifecycle":"ready","generation":1,"schema_fingerprint":"secondary-index-v1:tenant_status_half_declared"},{"name":"tenant_status_half_declared_idx","owner_kind":"relational_column","owner_name":"status","access_method":"scalar_column","columns":["status"]}]}
         ,
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_scalar_tuple_idx","owner_kind":"relational_column","owner_name":"status","access_method":"scalar_column","columns":["status"],"keys":[{"column":"status"}],"generation":1,"schema_fingerprint":"secondary-index-v1:scalar_tuple"}]}
@@ -2041,6 +2131,12 @@ test "parseValidatedTableSchema rejects malformed relational index metadata refe
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_missing_fingerprint_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"}],"lifecycle":"ready","generation":1}]}
         ,
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_missing_key_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"missing"}],"lifecycle":"ready","generation":1,"schema_fingerprint":"secondary-index-v1:missing_key"}]}
+        ,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_scalar_record_idx","owner_kind":"relational_column","owner_name":"status","access_method":"scalar_column","columns":["status"],"generation":1,"schema_fingerprint":"secondary-index-v1:status","generation_record":{"generation":1,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
+        ,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_stale_record_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"}],"lifecycle":"ready","generation":2,"schema_fingerprint":"secondary-index-v1:status","generation_record":{"generation":1,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
+        ,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_malformed_record_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"}],"lifecycle":"ready","generation":1,"schema_fingerprint":"secondary-index-v1:status","generation_record":{"generation":1,"owner_ranges":[],"lifecycle":"ready","lag":0}}]}
         ,
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_missing_include_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"}],"include_columns":["missing"],"lifecycle":"ready","generation":1,"schema_fingerprint":"secondary-index-v1:missing_include"}]}
         ,
@@ -2064,7 +2160,7 @@ test "parseValidatedTableSchema rejects malformed relational index metadata refe
 test "deriveRuntimeTableSchema carries admitted relational index access methods" {
     const alloc = std.testing.allocator;
     var parsed = try parseValidatedTableSchema(alloc,
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"tenant_id":{"type":"keyword"},"attrs":{"type":"json"},"body":{"type":"text"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_scalar_idx","owner_kind":"relational_column","owner_name":"status","access_method":"scalar_column","columns":["status"],"generation":3,"schema_fingerprint":"secondary-index-v1:status"},{"name":"tenant_status_idx","owner_kind":"relational_column","owner_name":"tenant_id","access_method":"ordered_tuple","columns":["tenant_id"],"keys":[{"column":"tenant_id"},{"column":"status"}],"include_columns":["id"],"generation":4,"schema_fingerprint":"secondary-index-v1:tenant_status"},{"name":"attrs_algebraic_idx","owner_kind":"relational_column","owner_name":"attrs","access_method":"algebraic_filter","columns":["attrs"],"generation":5,"schema_fingerprint":"secondary-index-v1:attrs"},{"name":"body_text_idx","owner_kind":"relational_column","owner_name":"body","access_method":"text_search","method_config":{"type":"full_text","field":"body","analyzer":"standard"},"columns":["body"],"generation":6,"schema_fingerprint":"secondary-index-v1:body"}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"tenant_id":{"type":"keyword"},"attrs":{"type":"json"},"body":{"type":"text"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_scalar_idx","owner_kind":"relational_column","owner_name":"status","access_method":"scalar_column","columns":["status"],"generation":3,"schema_fingerprint":"secondary-index-v1:status"},{"name":"tenant_status_idx","owner_kind":"relational_column","owner_name":"tenant_id","access_method":"ordered_tuple","columns":["tenant_id"],"keys":[{"column":"tenant_id"},{"column":"status"}],"include_columns":["id"],"generation":4,"schema_fingerprint":"secondary-index-v1:tenant_status","generation_record":{"generation":4,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}},{"name":"attrs_algebraic_idx","owner_kind":"relational_column","owner_name":"attrs","access_method":"algebraic_filter","columns":["attrs"],"generation":5,"schema_fingerprint":"secondary-index-v1:attrs","generation_record":{"generation":5,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}},{"name":"body_text_idx","owner_kind":"relational_column","owner_name":"body","access_method":"text_search","method_config":{"type":"full_text","field":"body","analyzer":"standard"},"columns":["body"],"generation":6,"schema_fingerprint":"secondary-index-v1:body","generation_record":{"generation":6,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
     );
     defer parsed.deinit(alloc);
 
@@ -2100,7 +2196,7 @@ test "deriveRuntimeTableSchema carries admitted relational index access methods"
 test "deriveRuntimeTableSchema accepts relational index metadata through aliased runtime columns" {
     const alloc = std.testing.allocator;
     var parsed = try parseValidatedTableSchema(alloc,
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword","x-antfly-column-name":"tenant_key"},"status":{"type":"keyword","x-antfly-column-name":"status_key"}},"required":["id","tenant_id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"tenant_status_key","columns":["tenant_id","status"],"include_columns":["id"],"where":{"all":[{"field":"tenant_id","op":"is_not_null"}]},"where_expressions":[{"lhs":{"field":"status"},"op":"is_not_null"}]}],"relational_indexes":[{"name":"status_tenant_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"tenant_id"}],"include_columns":["tenant_id"],"where":{"all":[{"field":"tenant_id","op":"is_not_null"}]},"where_expressions":[{"lhs":{"op":"lower","args":[{"field":"tenant_id"}]},"op":"is_not_null"}],"generation":1,"schema_fingerprint":"secondary-index-v1:status_tenant"},{"name":"tenant_status_key","owner_kind":"unique_constraint","owner_name":"tenant_status_key","access_method":"ordered_tuple","unique":true,"columns":["tenant_id","status"],"keys":[{"column":"tenant_id"},{"column":"status"}],"include_columns":["id"],"where":{"all":[{"field":"tenant_id","op":"is_not_null"}]},"where_expressions":[{"lhs":{"field":"status"},"op":"is_not_null"}]}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword","x-antfly-column-name":"tenant_key"},"status":{"type":"keyword","x-antfly-column-name":"status_key"}},"required":["id","tenant_id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"tenant_status_key","columns":["tenant_id","status"],"include_columns":["id"],"where":{"all":[{"field":"tenant_id","op":"is_not_null"}]},"where_expressions":[{"lhs":{"field":"status"},"op":"is_not_null"}]}],"relational_indexes":[{"name":"status_tenant_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"},{"column":"tenant_id"}],"include_columns":["tenant_id"],"where":{"all":[{"field":"tenant_id","op":"is_not_null"}]},"where_expressions":[{"lhs":{"op":"lower","args":[{"field":"tenant_id"}]},"op":"is_not_null"}],"generation":1,"schema_fingerprint":"secondary-index-v1:status_tenant","generation_record":{"generation":1,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}},{"name":"tenant_status_key","owner_kind":"unique_constraint","owner_name":"tenant_status_key","access_method":"ordered_tuple","unique":true,"columns":["tenant_id","status"],"keys":[{"column":"tenant_id"},{"column":"status"}],"include_columns":["id"],"where":{"all":[{"field":"tenant_id","op":"is_not_null"}]},"where_expressions":[{"lhs":{"field":"status"},"op":"is_not_null"}],"generation":1,"schema_fingerprint":"secondary-index-v1:tenant_status_key","generation_record":{"generation":1,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
     );
     defer parsed.deinit(alloc);
 
@@ -2217,6 +2313,20 @@ test "deriveRuntimeTableSchema carries scalar subquery relational defaults" {
     try std.testing.expect(status.default_value != null);
     try std.testing.expectEqual(storage_schema.RelationalDefaultKind.scalar_subquery, status.default_value.?.kind);
     try std.testing.expectEqualStrings("{\"query\":{\"table\":\"usage_records\",\"select\":[\"status\"],\"limit\":1}}", status.default_value.?.value_json);
+
+    var aliased = try parseValidatedTableSchema(alloc,
+        \\{"version":3,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-default":{"op":"scalar_subquery","query":{"table":"usage_records","alias":"u","select":["u.status"],"where":{"field":"u.id","op":"eq","value":"u2"},"order_by":[{"field":"u.id"}],"limit":1}}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    );
+    defer aliased.deinit(alloc);
+    const aliased_runtime = try deriveRuntimeTableSchema(alloc, aliased);
+    defer storage_schema.freeSchema(alloc, aliased_runtime);
+
+    const aliased_status = findRuntimeColumn(aliased_runtime, "status").?;
+    try std.testing.expect(aliased_status.default_value != null);
+    try std.testing.expectEqual(storage_schema.RelationalDefaultKind.scalar_subquery, aliased_status.default_value.?.kind);
+    try std.testing.expect(std.mem.indexOf(u8, aliased_status.default_value.?.value_json, "\"alias\":\"u\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aliased_status.default_value.?.value_json, "\"u.status\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aliased_status.default_value.?.value_json, "\"u.id\"") != null);
 
     try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseValidatedTableSchema(alloc,
         \\{"version":3,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","x-antfly-default":{"op":"scalar_subquery","query":"SELECT status FROM usage_records"}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}

@@ -36,3 +36,6 @@ pub const GeoShape = types.GeoShape;
 pub const GeoShapeGeometry = types.GeoShapeGeometry;
 pub const GeoShapeQuery = types.GeoShapeQuery;
 pub const Query = types.Query;
+pub const MultiMatchBodyType = types.MultiMatchBodyType;
+pub const MatchQueryOperator = types.MatchQueryOperator;
+pub const GeoShapeGeometryRelation = types.GeoShapeGeometryRelation;

@@ -3,7 +3,7 @@
   "entries": [
     {
       "id": "application-migration-equivalence-corpus",
-      "relational_slices_section": "SQL adapter and compatibility wrapper removal",
+      "relational_slices_section": "SQL adapter and cutover contract removal",
       "surface": "application_migration_equivalence_corpus",
       "status": "release_evidence",
       "current_evidence": "Application parity source and generated fixtures are freshness-checked, metadata-validated, and classified through SQL adapter integration tests. The fixture-backed corpus executes or classifies every entry as a golden typed plan, adapter-only no-op, invalid shape, or explicit unsupported native feature, and the SQL/API required plus resolved-native coverage manifests fail the release gate if any required catalog, row-state, DDL, DML, read, write, parser, binder, runtime, lowering, or native-parity bucket is missing.",
@@ -14,7 +14,7 @@
     },
     {
       "id": "catalog-snapshot-binding",
-      "relational_slices_section": "SQL adapter and compatibility wrapper removal",
+      "relational_slices_section": "SQL adapter and cutover contract removal",
       "surface": "catalog_snapshot_binding",
       "status": "release_evidence",
       "current_evidence": "Catalog-backed runtime reads execute across source schemas, fixture metadata validation binds entries against applied schema context, and required SQL/API coverage pins target/source read binding, insert-source and joined-source write binding, catalog object table-id and schema-generation binding, applied catalog rebuild/rewrite/validation, plus stale or ambiguous catalog fail-closed fixtures.",
@@ -24,19 +24,19 @@
       "release_gate": "relational-release-gate"
     },
     {
-      "id": "legacy-wrapper-deletion",
-      "relational_slices_section": "SQL adapter and compatibility wrapper removal",
-      "surface": "legacy_wrapper_deletion",
+      "id": "tokenized-wrapper-deletion",
+      "relational_slices_section": "SQL adapter and cutover contract removal",
+      "surface": "tokenized_wrapper_deletion",
       "status": "release_evidence",
-      "current_evidence": "Compatibility wrapper and production-ingress cutover inventories now leave no migration-blocker wrappers. The only remaining wrapper is document-query-bounded-scan-runtime, explicitly reclassified as a read-only compatibility contract outside generated grammar coverage; its parser, binder, typed plan, runtime diagnostics, parity evidence, and state-safety proof are recorded in sql_compatibility_wrappers.json, while document_sql_bounded_scan_inventory.json is empty.",
+      "current_evidence": "Compatibility wrapper and production-ingress cutover inventories now leave no migration-blocker wrappers and no parser-cutover cutover contracts. Runtime bounded-scan contracts are tracked outside parser fallback removal in document_sql_bounded_scan_inventory.json, which is currently empty.",
       "missing_evidence": "",
-      "evidence_file": "zig/pkg/antfly/src/sql/fixtures/sql_compatibility_wrappers.json",
-      "evidence_symbol": "sql_compatibility_wrappers",
+      "evidence_file": "zig/pkg/antfly/src/sql/fixtures/sql_production_ingress_cutover.json",
+      "evidence_symbol": "sql_production_ingress_cutover",
       "release_gate": "relational-release-gate"
     },
     {
       "id": "structural-sql-normalization",
-      "relational_slices_section": "SQL adapter and compatibility wrapper removal",
+      "relational_slices_section": "SQL adapter and cutover contract removal",
       "surface": "structural_sql_normalization",
       "status": "release_evidence",
       "current_evidence": "Generated DML lowering validates structural parser metadata before using SQL text: token ranges, list boundaries, aliases, target/source tables, CTE bodies, read-source bodies, conflict targets/actions, returning lists, merge arms, and nested expression surfaces are compared against the generated AST, with stale metadata tests proving fail-closed behavior for conflict ranges, conflict target payloads, targetless conflicts, joined updates, insert-source columns, mutation-source returning hooks, merge CTE prefixes, merge arm payloads, returning aliases, and returning expression children.",

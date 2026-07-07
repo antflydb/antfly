@@ -293,7 +293,7 @@ pub const Client = struct {
             .body = body,
         });
         errdefer result.deinit(self.alloc);
-        try validateReplicationSlotActionResponse(result.parsed.value, "create", slot_name);
+        try validateReplicationSlotActionResponse(result.parsed.value, .create, slot_name);
         return result;
     }
 
@@ -521,9 +521,9 @@ pub const Client = struct {
         });
         errdefer result.deinit(self.alloc);
         try validateReplicationSlotActionResponse(result.parsed.value, switch (action) {
-            .pause => "pause",
-            .@"resume" => "resume",
-            .drop => "drop",
+            .pause => .pause,
+            .@"resume" => .@"resume",
+            .drop => .drop,
         }, slot_name);
         return result;
     }
@@ -709,27 +709,29 @@ fn validateSchemaVersion(version: i64, err: anyerror) !void {
 
 fn validateActionReceipt(
     receipt: admin_api.HAActionReceipt,
-    expected_kind: []const u8,
+    expected_kind: admin_api.HAActionReceiptActionKind,
     expected_state: []const u8,
     expected_target: ?[]const u8,
     err: anyerror,
 ) !void {
+    const expected_kind_text = @tagName(expected_kind);
     if (receipt.action_id.len == 0) return err;
-    if (!std.mem.eql(u8, receipt.action_kind, expected_kind)) return err;
+    if (receipt.action_kind != expected_kind) return err;
     if (!receiptStateMatches(receipt.state, expected_state)) return err;
     if (receipt.target.len == 0 or !validation.isIdentifier(receipt.node_id)) return err;
     if (expected_target) |target| {
         if (!std.mem.eql(u8, receipt.target, target)) return err;
-        if (!std.mem.startsWith(u8, receipt.action_id, expected_kind)) return err;
-        if (receipt.action_id.len != expected_kind.len + 1 + target.len) return err;
-        if (receipt.action_id[expected_kind.len] != ':') return err;
-        if (!std.mem.eql(u8, receipt.action_id[expected_kind.len + 1 ..], target)) return err;
+        if (!std.mem.startsWith(u8, receipt.action_id, expected_kind_text)) return err;
+        if (receipt.action_id.len != expected_kind_text.len + 1 + target.len) return err;
+        if (receipt.action_id[expected_kind_text.len] != ':') return err;
+        if (!std.mem.eql(u8, receipt.action_id[expected_kind_text.len + 1 ..], target)) return err;
     }
 }
 
-fn receiptStateMatches(actual: []const u8, expected: []const u8) bool {
-    return std.mem.eql(u8, actual, expected) or
-        (std.mem.eql(u8, expected, "applied") and std.mem.eql(u8, actual, "already_applied"));
+fn receiptStateMatches(actual: admin_api.HAActionReceiptState, expected: []const u8) bool {
+    const actual_text = @tagName(actual);
+    return std.mem.eql(u8, actual_text, expected) or
+        (std.mem.eql(u8, expected, "applied") and actual == .already_applied);
 }
 
 fn validateIdentity(identity: admin_api.HAIdentity, err: anyerror) !void {
@@ -747,23 +749,19 @@ fn validateReplicationSlot(slot: admin_api.HAReplicationSlot) !void {
 
 fn validateReplicationSlotActionResponse(
     response: admin_api.HAReplicationSlotActionResponse,
-    expected_action: []const u8,
+    expected_action: admin_api.HAReplicationSlotActionResponseSlotAction,
     expected_slot: []const u8,
 ) !void {
     try validateSchemaVersion(response.schema_version, error.AdminReplicationSlotResponseMismatch);
-    if (!std.mem.eql(u8, response.slot_action, expected_action)) return error.AdminReplicationSlotResponseMismatch;
+    if (response.slot_action != expected_action) return error.AdminReplicationSlotResponseMismatch;
     try validateReplicationSlot(response.slot);
     if (!std.mem.eql(u8, response.slot.slot_name, expected_slot)) return error.AdminReplicationSlotResponseMismatch;
-    const expected_kind = if (std.mem.eql(u8, expected_action, "create"))
-        "replication_slot_create"
-    else if (std.mem.eql(u8, expected_action, "pause"))
-        "replication_slot_pause"
-    else if (std.mem.eql(u8, expected_action, "resume"))
-        "replication_slot_resume"
-    else if (std.mem.eql(u8, expected_action, "drop"))
-        "replication_slot_drop"
-    else
-        return error.AdminReplicationSlotResponseMismatch;
+    const expected_kind: admin_api.HAActionReceiptActionKind = switch (expected_action) {
+        .create => .replication_slot_create,
+        .pause => .replication_slot_pause,
+        .@"resume" => .replication_slot_resume,
+        .drop => .replication_slot_drop,
+    };
     try validateActionReceipt(response.action, expected_kind, "applied", expected_slot, error.AdminReplicationSlotResponseMismatch);
 }
 
@@ -774,7 +772,7 @@ fn validateReplicationSlotListResponse(response: admin_api.HAReplicationSlotList
 
 fn validateBaseBackupBeginResponse(response: admin_api.HABaseBackupBeginResponse, request: admin_api.BaseBackupStartRequest) !void {
     try validateSchemaVersion(response.schema_version, error.AdminSeedResponseMismatch);
-    try validateActionReceipt(response.action, "base_backup_begin", "applied", response.manifest_id, error.AdminSeedResponseMismatch);
+    try validateActionReceipt(response.action, .base_backup_begin, "applied", response.manifest_id, error.AdminSeedResponseMismatch);
     if (!std.mem.eql(u8, response.slot_name, request.slot_name)) return error.AdminSeedResponseMismatch;
     if (!std.mem.eql(u8, response.manifest_id, request.manifest_id)) return error.AdminSeedResponseMismatch;
     if (response.backup_lsn <= 0 or response.start_record_lsn <= 0) return error.AdminSeedResponseMismatch;
@@ -782,14 +780,14 @@ fn validateBaseBackupBeginResponse(response: admin_api.HABaseBackupBeginResponse
 
 fn validateBaseBackupFinishResponse(response: admin_api.HABaseBackupFinishResponse) !void {
     try validateSchemaVersion(response.schema_version, error.AdminSeedResponseMismatch);
-    try validateActionReceipt(response.action, "base_backup_finish", "applied", response.manifest_id, error.AdminSeedResponseMismatch);
+    try validateActionReceipt(response.action, .base_backup_finish, "applied", response.manifest_id, error.AdminSeedResponseMismatch);
     if (response.manifest_id.len == 0) return error.AdminSeedResponseMismatch;
     if (response.backup_lsn <= 0 or response.end_record_lsn <= 0) return error.AdminSeedResponseMismatch;
 }
 
 fn validateStandbyBootstrapResponse(response: admin_api.HAStandbyBootstrapResponse) !void {
     try validateSchemaVersion(response.schema_version, error.AdminSeedResponseMismatch);
-    try validateActionReceipt(response.action, "standby_bootstrap", "applied", response.manifest_id, error.AdminSeedResponseMismatch);
+    try validateActionReceipt(response.action, .standby_bootstrap, "applied", response.manifest_id, error.AdminSeedResponseMismatch);
     if (response.manifest_id.len == 0) return error.AdminSeedResponseMismatch;
     if (response.backup_lsn <= 0 or response.checkpoint_lsn <= 0) return error.AdminSeedResponseMismatch;
 }
@@ -807,7 +805,7 @@ fn validateFenceReceipt(receipt: admin_api.HAFenceReceipt) !void {
 
 fn validateFenceResponse(response: admin_api.HAFenceResponse, request: admin_api.FenceAcquireRequest) !void {
     try validateSchemaVersion(response.schema_version, error.AdminFenceResponseMismatch);
-    try validateActionReceipt(response.action, "fence_acquire", "applied", request.promoted_node_id, error.AdminFenceResponseMismatch);
+    try validateActionReceipt(response.action, .fence_acquire, "applied", request.promoted_node_id, error.AdminFenceResponseMismatch);
     try validateFenceReceipt(response.receipt);
     if (!std.mem.eql(u8, response.receipt.promoted_node_id, request.promoted_node_id)) return error.AdminFenceResponseMismatch;
     if (!std.mem.eql(u8, response.receipt.old_primary_id, request.old_primary_id)) return error.AdminFenceResponseMismatch;
@@ -884,7 +882,7 @@ fn validateOwnerJobCheckResponse(response: admin_api.HAOwnerJobCheckResponse) !v
 
 fn validatePromotionAssessResponse(response: admin_api.HAPromotionAssessResponse, request: admin_api.PromotionAssessRequest) !void {
     try validateSchemaVersion(response.schema_version, error.AdminPromotionResponseMismatch);
-    try validateActionReceipt(response.action, "promotion_assess", "assessed", null, error.AdminPromotionResponseMismatch);
+    try validateActionReceipt(response.action, .promotion_assess, "assessed", null, error.AdminPromotionResponseMismatch);
     if (!validation.isIdentifier(response.action.target) or !std.mem.eql(u8, response.action.target, response.action.node_id)) {
         return error.AdminPromotionResponseMismatch;
     }
@@ -904,76 +902,70 @@ fn validatePromotionHandoff(handoff: admin_api.HAPromotionHandoff) !void {
     if (handoff.switch_lsn < 0 or handoff.next_lsn < 0) return error.AdminGateResponseMismatch;
 }
 
-fn isCommitGateAction(value: []const u8) bool {
-    return std.mem.eql(u8, value, "acknowledge") or
-        std.mem.eql(u8, value, "wait_for_standby") or
-        std.mem.eql(u8, value, "reject") or
-        std.mem.eql(u8, value, "acknowledge_degraded");
+fn isCommitGateAction(value: admin_api.HACommitGateAction) bool {
+    return switch (value) {
+        .acknowledge, .wait_for_standby, .reject, .acknowledge_degraded => true,
+    };
 }
 
-fn isDurabilityStatus(value: []const u8) bool {
-    return std.mem.eql(u8, value, "satisfied") or
-        std.mem.eql(u8, value, "would_block") or
-        std.mem.eql(u8, value, "fail_closed") or
-        std.mem.eql(u8, value, "degraded_to_async");
+fn isDurabilityStatus(value: admin_api.HADurabilityDecisionStatus) bool {
+    return switch (value) {
+        .satisfied, .would_block, .fail_closed, .degraded_to_async => true,
+    };
 }
 
-fn isDurabilityMode(value: []const u8) bool {
-    return std.mem.eql(u8, value, "async") or
-        std.mem.eql(u8, value, "remote_write") or
-        std.mem.eql(u8, value, "remote_apply");
+fn isDurabilityMode(value: admin_api.HADurabilityDecisionMode) bool {
+    return switch (value) {
+        .async, .remote_write, .remote_apply => true,
+    };
 }
 
-fn isDurabilitySelection(value: []const u8) bool {
-    return std.mem.eql(u8, value, "any") or
-        std.mem.eql(u8, value, "first") or
-        std.mem.eql(u8, value, "all");
+fn isDurabilitySelection(value: admin_api.HADurabilityDecisionSelection) bool {
+    return switch (value) {
+        .any, .first, .all => true,
+    };
 }
 
-fn isReadDecisionAction(value: []const u8) bool {
-    return std.mem.eql(u8, value, "serve_standby") or
-        std.mem.eql(u8, value, "wait_for_apply") or
-        std.mem.eql(u8, value, "wait_for_metadata") or
-        std.mem.eql(u8, value, "route_to_primary");
+fn isReadDecisionAction(value: admin_api.HAReadDecisionAction) bool {
+    return switch (value) {
+        .serve_standby, .wait_for_apply, .wait_for_metadata, .route_to_primary => true,
+    };
 }
 
-fn isReadConsistency(value: []const u8) bool {
-    return std.mem.eql(u8, value, "stale_ok") or
-        std.mem.eql(u8, value, "at_least_lsn") or
-        std.mem.eql(u8, value, "primary");
+fn isReadConsistency(value: admin_api.HAReadDecisionConsistency) bool {
+    return switch (value) {
+        .stale_ok, .at_least_lsn, .primary => true,
+    };
 }
 
-fn isWriteRole(value: []const u8) bool {
-    return std.mem.eql(u8, value, "primary") or
-        std.mem.eql(u8, value, "standby") or
-        std.mem.eql(u8, value, "promoted_standby") or
-        std.mem.eql(u8, value, "fenced_primary");
+fn isWriteRole(value: admin_api.HAWriteDecisionRole) bool {
+    return switch (value) {
+        .primary, .standby, .promoted_standby, .fenced_primary => true,
+    };
 }
 
-fn isWriteAction(value: []const u8) bool {
-    return std.mem.eql(u8, value, "allow_write") or
-        std.mem.eql(u8, value, "reject_read_only_standby") or
-        std.mem.eql(u8, value, "open_promoted_primary") or
-        std.mem.eql(u8, value, "reject_fenced_primary");
+fn isWriteAction(value: admin_api.HAWriteDecisionAction) bool {
+    return switch (value) {
+        .allow_write, .reject_read_only_standby, .open_promoted_primary, .reject_fenced_primary => true,
+    };
 }
 
-fn isOwnerJobKind(value: []const u8) bool {
-    return std.mem.eql(u8, value, "compaction_publish") or
-        std.mem.eql(u8, value, "derived_effect_writer") or
-        std.mem.eql(u8, value, "enrichment_writer") or
-        std.mem.eql(u8, value, "retention_advance");
+fn isOwnerJobKind(value: admin_api.HAOwnerJobDecisionKind) bool {
+    return switch (value) {
+        .compaction_publish, .derived_effect_writer, .enrichment_writer, .retention_advance => true,
+    };
 }
 
-fn isOwnerJobRole(value: []const u8) bool {
-    return std.mem.eql(u8, value, "primary") or
-        std.mem.eql(u8, value, "standby") or
-        std.mem.eql(u8, value, "promoted_standby");
+fn isOwnerJobRole(value: admin_api.HAOwnerJobDecisionRole) bool {
+    return switch (value) {
+        .primary, .standby, .promoted_standby => true,
+    };
 }
 
-fn isOwnerJobAction(value: []const u8) bool {
-    return std.mem.eql(u8, value, "run") or
-        std.mem.eql(u8, value, "disable_on_standby") or
-        std.mem.eql(u8, value, "open_promoted_primary");
+fn isOwnerJobAction(value: admin_api.HAOwnerJobDecisionAction) bool {
+    return switch (value) {
+        .run, .disable_on_standby, .open_promoted_primary => true,
+    };
 }
 
 fn validatePromotionResponse(
@@ -982,7 +974,7 @@ fn validatePromotionResponse(
 ) !void {
     if (response.schema_version <= 0) return error.AdminPromotionResponseMismatch;
     if (!validation.isIdentifier(response.promotion.node_id)) return error.AdminPromotionResponseMismatch;
-    try validateActionReceipt(response.action, "promotion", "applied", response.promotion.node_id, error.AdminPromotionResponseMismatch);
+    try validateActionReceipt(response.action, .promotion, "applied", response.promotion.node_id, error.AdminPromotionResponseMismatch);
     if (!std.mem.eql(u8, response.action.target, response.promotion.node_id)) return error.AdminPromotionResponseMismatch;
     if (!std.mem.eql(u8, response.action.node_id, response.promotion.node_id)) return error.AdminPromotionResponseMismatch;
 
@@ -998,7 +990,7 @@ fn validatePromotionResponse(
     if (assessment.requires_fencing != (!assessment.fencing_confirmed and !assessment.force)) return error.AdminPromotionResponseMismatch;
     if (assessment.requires_force != (assessment.data_loss_possible and !assessment.force)) return error.AdminPromotionResponseMismatch;
     if (assessment.can_promote != (!assessment.requires_fencing and (!assessment.requires_force or assessment.force))) return error.AdminPromotionResponseMismatch;
-    if (!std.mem.eql(u8, assessment.mode, expectedPromotionMode(assessment))) return error.AdminPromotionResponseMismatch;
+    if (assessment.mode != expectedPromotionMode(assessment)) return error.AdminPromotionResponseMismatch;
     if (!response.assessment.fencing_confirmed) return error.AdminPromotionResponseMismatch;
     if (!response.assessment.can_promote) return error.AdminPromotionResponseMismatch;
     if (response.forced != promotion.forced) return error.AdminPromotionResponseMismatch;
@@ -1027,11 +1019,11 @@ fn validatePromotionResponse(
     }
 }
 
-fn expectedPromotionMode(assessment: admin_api.HAPromotionAssessment) []const u8 {
-    if (!assessment.can_promote) return "blocked";
-    if (assessment.data_loss_possible) return "lossy";
-    if (assessment.force) return "forced";
-    return "safe";
+fn expectedPromotionMode(assessment: admin_api.HAPromotionAssessment) admin_api.HAPromotionAssessmentMode {
+    if (!assessment.can_promote) return .blocked;
+    if (assessment.data_loss_possible) return .lossy;
+    if (assessment.force) return .forced;
+    return .safe;
 }
 
 const RejoinResponseKind = enum {
@@ -1047,10 +1039,10 @@ fn validateRejoinResponse(
 ) !void {
     if (response.schema_version <= 0) return error.AdminRejoinResponseMismatch;
 
-    const expected_action_kind = switch (expected) {
-        .assess => "rejoin_assess",
-        .rewind => "rejoin_rewind",
-        .reseed => "rejoin_reseed",
+    const expected_action_kind: admin_api.HAActionReceiptActionKind = switch (expected) {
+        .assess => .rejoin_assess,
+        .rewind => .rejoin_rewind,
+        .reseed => .rejoin_reseed,
     };
     const expected_state = switch (expected) {
         .assess => "assessed",
@@ -1076,8 +1068,8 @@ fn validateRejoinResponse(
 
     switch (expected) {
         .assess => {},
-        .rewind => if (!std.mem.eql(u8, assessment.action, "rewind")) return error.AdminRejoinResponseMismatch,
-        .reseed => if (!std.mem.eql(u8, assessment.action, "reseed")) return error.AdminRejoinResponseMismatch,
+        .rewind => if (assessment.action != .rewind) return error.AdminRejoinResponseMismatch,
+        .reseed => if (assessment.action != .reseed) return error.AdminRejoinResponseMismatch,
     }
 
     if (request.receipt) |receipt| {
@@ -1090,7 +1082,7 @@ fn validateRejoinResponse(
         if (assessment.parent_epoch != receipt.parent_epoch) return error.AdminRejoinResponseMismatch;
         if (assessment.fork_lsn != receipt.observed_lsn) return error.AdminRejoinResponseMismatch;
     } else {
-        if (!std.mem.eql(u8, assessment.action, "reject_unfenced")) return error.AdminRejoinResponseMismatch;
+        if (assessment.action != .reject_unfenced) return error.AdminRejoinResponseMismatch;
         if (assessment.target_timeline_id != request.identity.timeline_id) return error.AdminRejoinResponseMismatch;
         if (assessment.target_epoch != request.identity.epoch) return error.AdminRejoinResponseMismatch;
         if (assessment.parent_cluster_id != request.identity.cluster_id) return error.AdminRejoinResponseMismatch;
@@ -1352,12 +1344,12 @@ test "storage.ha http client round trips admin commands" {
     var typed_primary_status = try client.getPrimaryStatus("http://ha-admin.test", .{ .max_lag_lsn = 1 });
     defer typed_primary_status.deinit(alloc);
     try std.testing.expectEqual(@as(i64, 1), typed_primary_status.parsed.value.schema_version);
-    try std.testing.expectEqualStrings("primary", typed_primary_status.parsed.value.snapshot.role);
+    try std.testing.expectEqual(admin_api.HAPrimarySnapshotRole.primary, typed_primary_status.parsed.value.snapshot.role);
     try std.testing.expectEqual(@as(i64, 0), typed_primary_status.parsed.value.snapshot.current_lsn);
 
     var typed_created = try client.createReplicationSlot("http://ha-admin.test", "standby-typed", 0);
     defer typed_created.deinit(alloc);
-    try std.testing.expectEqualStrings("create", typed_created.parsed.value.slot_action);
+    try std.testing.expectEqual(admin_api.HAReplicationSlotActionResponseSlotAction.create, typed_created.parsed.value.slot_action);
     try std.testing.expectEqualStrings("standby-typed", typed_created.parsed.value.slot.slot_name);
     try std.testing.expect(typed_created.parsed.value.slot.active);
 
@@ -1369,39 +1361,39 @@ test "storage.ha http client round trips admin commands" {
 
     var typed_paused = try client.pauseReplicationSlot("http://ha-admin.test", "standby-typed");
     defer typed_paused.deinit(alloc);
-    try std.testing.expectEqualStrings("pause", typed_paused.parsed.value.slot_action);
+    try std.testing.expectEqual(admin_api.HAReplicationSlotActionResponseSlotAction.pause, typed_paused.parsed.value.slot_action);
     try std.testing.expect(!typed_paused.parsed.value.slot.active);
 
     var typed_resumed = try client.resumeReplicationSlot("http://ha-admin.test", "standby-typed");
     defer typed_resumed.deinit(alloc);
-    try std.testing.expectEqualStrings("resume", typed_resumed.parsed.value.slot_action);
+    try std.testing.expectEqual(admin_api.HAReplicationSlotActionResponseSlotAction.@"resume", typed_resumed.parsed.value.slot_action);
     try std.testing.expect(typed_resumed.parsed.value.slot.active);
 
     var typed_dropped = try client.dropReplicationSlot("http://ha-admin.test", "standby-typed");
     defer typed_dropped.deinit(alloc);
-    try std.testing.expectEqualStrings("drop", typed_dropped.parsed.value.slot_action);
+    try std.testing.expectEqual(admin_api.HAReplicationSlotActionResponseSlotAction.drop, typed_dropped.parsed.value.slot_action);
     try std.testing.expectEqual(@as(?bool, true), typed_dropped.parsed.value.slot.dropped);
 
     var encoded_created = try client.createReplicationSlot("http://ha-admin.test", "standby:a.b", 0);
     defer encoded_created.deinit(alloc);
-    try std.testing.expectEqualStrings("create", encoded_created.parsed.value.slot_action);
+    try std.testing.expectEqual(admin_api.HAReplicationSlotActionResponseSlotAction.create, encoded_created.parsed.value.slot_action);
     try std.testing.expectEqualStrings("standby:a.b", encoded_created.parsed.value.slot.slot_name);
 
     var encoded_paused = try client.pauseReplicationSlot("http://ha-admin.test", "standby:a.b");
     defer encoded_paused.deinit(alloc);
-    try std.testing.expectEqualStrings("pause", encoded_paused.parsed.value.slot_action);
+    try std.testing.expectEqual(admin_api.HAReplicationSlotActionResponseSlotAction.pause, encoded_paused.parsed.value.slot_action);
     try std.testing.expectEqualStrings("standby:a.b", encoded_paused.parsed.value.slot.slot_name);
     try std.testing.expect(!encoded_paused.parsed.value.slot.active);
 
     var encoded_resumed = try client.resumeReplicationSlot("http://ha-admin.test", "standby:a.b");
     defer encoded_resumed.deinit(alloc);
-    try std.testing.expectEqualStrings("resume", encoded_resumed.parsed.value.slot_action);
+    try std.testing.expectEqual(admin_api.HAReplicationSlotActionResponseSlotAction.@"resume", encoded_resumed.parsed.value.slot_action);
     try std.testing.expectEqualStrings("standby:a.b", encoded_resumed.parsed.value.slot.slot_name);
     try std.testing.expect(encoded_resumed.parsed.value.slot.active);
 
     var encoded_dropped = try client.dropReplicationSlot("http://ha-admin.test", "standby:a.b");
     defer encoded_dropped.deinit(alloc);
-    try std.testing.expectEqualStrings("drop", encoded_dropped.parsed.value.slot_action);
+    try std.testing.expectEqual(admin_api.HAReplicationSlotActionResponseSlotAction.drop, encoded_dropped.parsed.value.slot_action);
     try std.testing.expectEqualStrings("standby:a.b", encoded_dropped.parsed.value.slot.slot_name);
     try std.testing.expectEqual(@as(?bool, true), encoded_dropped.parsed.value.slot.dropped);
 
@@ -1413,11 +1405,11 @@ test "storage.ha http client round trips admin commands" {
         .payload = "one",
         .shard_id = @intCast(identity.shard_id),
         .table_id = @intCast(identity.table_id),
-        .sync_policy = .{ .mode = "async" },
+        .sync_policy = .{ .mode = .async },
     });
     defer appended.deinit(alloc);
     try std.testing.expectEqual(@as(i64, 1), appended.parsed.value.lsn);
-    try std.testing.expectEqualStrings("acknowledge", appended.parsed.value.gate.action);
+    try std.testing.expectEqual(admin_api.HACommitGateAction.acknowledge, appended.parsed.value.gate.action);
 
     var streamed = try client.executeCommand("http://ha-admin.test", &.{ "--table", "stream", "once", "--slot", "standby-a" });
     defer streamed.deinit(alloc);
@@ -1428,7 +1420,7 @@ test "storage.ha http client round trips admin commands" {
     var typed_standby_status = try client.getStandbyStatus("http://ha-admin.test", 2);
     defer typed_standby_status.deinit(alloc);
     try std.testing.expectEqual(@as(i64, 1), typed_standby_status.parsed.value.schema_version);
-    try std.testing.expectEqualStrings("standby", typed_standby_status.parsed.value.snapshot.role);
+    try std.testing.expectEqual(admin_api.HAStandbySnapshotRole.standby, typed_standby_status.parsed.value.snapshot.role);
     try std.testing.expectEqual(@as(i64, 1), typed_standby_status.parsed.value.snapshot.applied_lsn);
     try std.testing.expectEqual(@as(?i64, 2), typed_standby_status.parsed.value.snapshot.upstream_lsn);
     try std.testing.expectEqual(@as(?i64, 1), typed_standby_status.parsed.value.snapshot.write_lag_lsn);
@@ -1473,7 +1465,7 @@ test "storage.ha http client round trips admin commands" {
     };
     var fenced = try client.acquireFence("http://ha-admin.test", fence_request);
     defer fenced.deinit(alloc);
-    try std.testing.expectEqualStrings("fence_acquire", fenced.parsed.value.action.action_kind);
+    try std.testing.expectEqual(admin_api.HAActionReceiptActionKind.fence_acquire, fenced.parsed.value.action.action_kind);
     try std.testing.expectEqualStrings("standby-a", fenced.parsed.value.receipt.promoted_node_id);
 
     var current_fence = try client.currentFence("http://ha-admin.test");
@@ -1482,7 +1474,7 @@ test "storage.ha http client round trips admin commands" {
 
     var promoted = try client.promoteWithCurrentFence("http://ha-admin.test");
     defer promoted.deinit(alloc);
-    try std.testing.expectEqualStrings("promotion", promoted.parsed.value.action.action_kind);
+    try std.testing.expectEqual(admin_api.HAActionReceiptActionKind.promotion, promoted.parsed.value.action.action_kind);
     try std.testing.expectEqual(@as(i64, 2), promoted.parsed.value.promotion.new_identity.timeline_id);
 
     try std.testing.expectError(error.HaCommandConflict, client.executeCommand("http://ha-admin.test", &.{
@@ -1551,44 +1543,44 @@ test "storage.ha http client round trips typed commit operations" {
         .payload = "one",
         .shard_id = @intCast(identity.shard_id),
         .table_id = @intCast(identity.table_id),
-        .sync_policy = .{ .mode = "async" },
+        .sync_policy = .{ .mode = .async },
     });
     defer appended.deinit(alloc);
     try std.testing.expectEqual(@as(i64, 1), appended.parsed.value.lsn);
-    try std.testing.expectEqualStrings("acknowledge", appended.parsed.value.gate.action);
-    try std.testing.expectEqualStrings("async", appended.parsed.value.gate.durability.mode);
+    try std.testing.expectEqual(admin_api.HACommitGateAction.acknowledge, appended.parsed.value.gate.action);
+    try std.testing.expectEqual(admin_api.HADurabilityDecisionMode.async, appended.parsed.value.gate.durability.mode);
 
     const standby_names = [_][]const u8{"standby-a"};
     try primary.standbyStatusUpdate("standby-a", identity.timeline_id, 1, 0);
     var checked = try client.checkCommit("http://ha-admin.test", .{
         .target_lsn = 1,
         .sync_policy = .{
-            .mode = "remote_write",
+            .mode = .remote_write,
             .standby_names = &standby_names,
         },
     });
     defer checked.deinit(alloc);
     try std.testing.expectEqual(@as(i64, 1), checked.parsed.value.gate.target_lsn);
-    try std.testing.expectEqualStrings("acknowledge", checked.parsed.value.gate.action);
-    try std.testing.expectEqualStrings("remote_write", checked.parsed.value.gate.durability.mode);
+    try std.testing.expectEqual(admin_api.HACommitGateAction.acknowledge, checked.parsed.value.gate.action);
+    try std.testing.expectEqual(admin_api.HADurabilityDecisionMode.remote_write, checked.parsed.value.gate.durability.mode);
     try std.testing.expectEqual(@as(i64, 1), checked.parsed.value.gate.durability.progress_lsn);
 
     var degraded = try client.appendCommit("http://ha-admin.test", .{
         .payload = "two",
-        .kind = "metadata_mutation",
-        .payload_codec = "json",
+        .kind = .metadata_mutation,
+        .payload_codec = .json,
         .shard_id = 10,
         .table_id = 20,
         .sync_policy = .{
-            .mode = "remote_apply",
+            .mode = .remote_apply,
             .standby_names = &standby_names,
-            .failure_policy = "degrade_to_async",
+            .failure_policy = .degrade_to_async,
         },
     });
     defer degraded.deinit(alloc);
     try std.testing.expectEqual(@as(i64, 2), degraded.parsed.value.lsn);
-    try std.testing.expectEqualStrings("acknowledge_degraded", degraded.parsed.value.gate.action);
-    try std.testing.expectEqualStrings("degraded_to_async", degraded.parsed.value.gate.durability.status);
+    try std.testing.expectEqual(admin_api.HACommitGateAction.acknowledge_degraded, degraded.parsed.value.gate.action);
+    try std.testing.expectEqual(admin_api.HADurabilityDecisionStatus.degraded_to_async, degraded.parsed.value.gate.durability.status);
 }
 
 test "storage.ha http client round trips typed gate operations" {
@@ -1612,20 +1604,20 @@ test "storage.ha http client round trips typed gate operations" {
     var client = Client.init(alloc, server.executor());
 
     var primary_write = try client.checkWrite("http://ha-admin.test", .{
-        .role = "primary",
+        .role = .primary,
         .expected_identity = testAdminIdentity(),
     });
     defer primary_write.deinit(alloc);
-    try std.testing.expectEqualStrings("allow_write", primary_write.parsed.value.decision.action);
+    try std.testing.expectEqual(admin_api.HAWriteDecisionAction.allow_write, primary_write.parsed.value.decision.action);
     try std.testing.expectEqual(@as(i64, 1), primary_write.parsed.value.decision.next_lsn);
 
     var primary_owner_job = try client.checkOwnerJob("http://ha-admin.test", .{
-        .role = "primary",
-        .kind = "retention_advance",
+        .role = .primary,
+        .kind = .retention_advance,
         .expected_identity = testAdminIdentity(),
     });
     defer primary_owner_job.deinit(alloc);
-    try std.testing.expectEqualStrings("run", primary_owner_job.parsed.value.decision.action);
+    try std.testing.expectEqual(admin_api.HAOwnerJobDecisionAction.run, primary_owner_job.parsed.value.decision.action);
 
     var slot = try client.createReplicationSlot("http://ha-admin.test", "standby-a", 0);
     defer slot.deinit(alloc);
@@ -1633,7 +1625,7 @@ test "storage.ha http client round trips typed gate operations" {
         .payload = "one",
         .shard_id = @intCast(identity.shard_id),
         .table_id = @intCast(identity.table_id),
-        .sync_policy = .{ .mode = "async" },
+        .sync_policy = .{ .mode = .async },
     });
     defer appended.deinit(alloc);
     try std.testing.expectEqual(@as(i64, 1), appended.parsed.value.lsn);
@@ -1643,36 +1635,36 @@ test "storage.ha http client round trips typed gate operations" {
     try std.testing.expectEqual(@as(usize, 1), try standby.applyAvailable(&apply_ctx, noOpApply));
 
     var ready_read = try client.checkRead("http://ha-admin.test", .{
-        .consistency = "at_least_lsn",
+        .consistency = .at_least_lsn,
         .required_lsn = 1,
     });
     defer ready_read.deinit(alloc);
-    try std.testing.expectEqualStrings("serve_standby", ready_read.parsed.value.decision.action);
+    try std.testing.expectEqual(admin_api.HAReadDecisionAction.serve_standby, ready_read.parsed.value.decision.action);
     try std.testing.expectEqual(@as(?i64, 1), ready_read.parsed.value.decision.serve_lsn);
 
     var waiting_read = try client.checkRead("http://ha-admin.test", .{
-        .consistency = "at_least_lsn",
+        .consistency = .at_least_lsn,
         .required_lsn = 2,
     });
     defer waiting_read.deinit(alloc);
-    try std.testing.expectEqualStrings("wait_for_apply", waiting_read.parsed.value.decision.action);
+    try std.testing.expectEqual(admin_api.HAReadDecisionAction.wait_for_apply, waiting_read.parsed.value.decision.action);
     try std.testing.expectEqual(@as(i64, 1), waiting_read.parsed.value.decision.missing_lsn_count);
 
     var standby_write = try client.checkWrite("http://ha-admin.test", .{
-        .role = "standby",
+        .role = .standby,
         .expected_identity = testAdminIdentity(),
     });
     defer standby_write.deinit(alloc);
-    try std.testing.expectEqualStrings("reject_read_only_standby", standby_write.parsed.value.decision.action);
-    try std.testing.expectEqualStrings("standby", standby_write.parsed.value.decision.role);
+    try std.testing.expectEqual(admin_api.HAWriteDecisionAction.reject_read_only_standby, standby_write.parsed.value.decision.action);
+    try std.testing.expectEqual(admin_api.HAWriteDecisionRole.standby, standby_write.parsed.value.decision.role);
 
     var standby_owner_job = try client.checkOwnerJob("http://ha-admin.test", .{
-        .role = "standby",
-        .kind = "compaction_publish",
+        .role = .standby,
+        .kind = .compaction_publish,
         .expected_identity = testAdminIdentity(),
     });
     defer standby_owner_job.deinit(alloc);
-    try std.testing.expectEqualStrings("disable_on_standby", standby_owner_job.parsed.value.decision.action);
+    try std.testing.expectEqual(admin_api.HAOwnerJobDecisionAction.disable_on_standby, standby_owner_job.parsed.value.decision.action);
 }
 
 test "storage.ha http client round trips typed seed operations" {
@@ -1833,9 +1825,9 @@ test "storage.ha http client round trips typed safety operations" {
         .use_current_fence = true,
     });
     defer assessment.deinit(alloc);
-    try std.testing.expectEqualStrings("promotion_assess", assessment.parsed.value.action.action_kind);
+    try std.testing.expectEqual(admin_api.HAActionReceiptActionKind.promotion_assess, assessment.parsed.value.action.action_kind);
     try std.testing.expectEqualStrings("promotion_assess:standby-a", assessment.parsed.value.action.action_id);
-    try std.testing.expectEqualStrings("assessed", assessment.parsed.value.action.state);
+    try std.testing.expectEqual(admin_api.HAActionReceiptState.assessed, assessment.parsed.value.action.state);
     try std.testing.expectEqualStrings("standby-a", assessment.parsed.value.action.node_id);
     try std.testing.expect(assessment.parsed.value.assessment.can_promote);
     try std.testing.expect(assessment.parsed.value.assessment.fencing_confirmed);
@@ -1854,7 +1846,7 @@ test "storage.ha http client round trips typed safety operations" {
         .receipt = fence.parsed.value.receipt,
     });
     defer rejoin.deinit(alloc);
-    try std.testing.expectEqualStrings("rewind", rejoin.parsed.value.assessment.action);
+    try std.testing.expectEqual(admin_api.HARejoinAssessmentAction.rewind, rejoin.parsed.value.assessment.action);
     try std.testing.expectEqual(@as(i64, 2), rejoin.parsed.value.assessment.target_timeline_id);
     try std.testing.expectEqual(@as(i64, 100), rejoin.parsed.value.assessment.parent_cluster_id);
     try std.testing.expectEqual(@as(i64, 10), rejoin.parsed.value.assessment.parent_shard_id);
@@ -1871,7 +1863,7 @@ test "storage.ha http client round trips typed safety operations" {
         .receipt = fence.parsed.value.receipt,
     });
     defer rewind.deinit(alloc);
-    try std.testing.expectEqualStrings("rewind", rewind.parsed.value.assessment.action);
+    try std.testing.expectEqual(admin_api.HARejoinAssessmentAction.rewind, rewind.parsed.value.assessment.action);
     try std.testing.expectEqual(@as(i64, 1), rewind.parsed.value.assessment.parent_timeline_id);
     try std.testing.expect(rewind.parsed.value.rewind != null);
     try std.testing.expectEqual(@as(i64, 2), rewind.parsed.value.rewind.?.previous_last_lsn);
@@ -2004,7 +1996,7 @@ test "storage.ha http client accepts already applied idempotent admin receipts" 
         var client = Client.init(alloc, executor.executor());
         var response = try client.createReplicationSlot("http://ha-admin.test", "standby-a", 0);
         defer response.deinit(alloc);
-        try std.testing.expectEqualStrings("already_applied", response.parsed.value.action.state);
+        try std.testing.expectEqual(admin_api.HAActionReceiptState.already_applied, response.parsed.value.action.state);
     }
 
     {
@@ -2026,7 +2018,7 @@ test "storage.ha http client accepts already applied idempotent admin receipts" 
             .reason = "http-client-test",
         });
         defer response.deinit(alloc);
-        try std.testing.expectEqualStrings("already_applied", response.parsed.value.action.state);
+        try std.testing.expectEqual(admin_api.HAActionReceiptState.already_applied, response.parsed.value.action.state);
     }
 
     {
@@ -2045,7 +2037,7 @@ test "storage.ha http client accepts already applied idempotent admin receipts" 
             .receipt = testFenceReceipt(),
         });
         defer response.deinit(alloc);
-        try std.testing.expectEqualStrings("already_applied", response.parsed.value.action.state);
+        try std.testing.expectEqual(admin_api.HAActionReceiptState.already_applied, response.parsed.value.action.state);
     }
 
     {
@@ -2193,7 +2185,7 @@ test "storage.ha http client rejects invalid typed admin responses" {
         };
         var client = Client.init(alloc, executor.executor());
         try std.testing.expectError(error.AdminGateResponseMismatch, client.checkWrite("http://ha-admin.test", .{
-            .role = "primary",
+            .role = .primary,
             .expected_identity = testAdminIdentity(),
         }));
     }

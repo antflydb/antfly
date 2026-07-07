@@ -8121,6 +8121,13 @@ pub fn Impl(comptime DB: type) type {
                 if (profile) |active_profile| DB.WritePathCallbacks.record_profile_ns(profile, &active_profile.extract_graph_artifacts_ns, graph_artifacts_start_ns);
                 if (extracted[i].cleaned_value) |cleaned| {
                     try validateDocumentExtractionInlineSources(self, cleaned);
+                    const should_write_timestamp = DB.WritePathCallbacks.should_write_timestamp(write.key);
+                    const write_timestamp_ns = if (should_write_timestamp) blk: {
+                        const timestamp_start_ns = DB.WritePathCallbacks.monotonic_time_ns();
+                        const resolved = try DB.WritePathCallbacks.resolve_write_timestamp_ns(self, batch_timestamp_ns, write.value);
+                        if (profile) |active_profile| DB.WritePathCallbacks.record_profile_ns(profile, &active_profile.extract_timestamp_ns, timestamp_start_ns);
+                        break :blk resolved;
+                    } else @as(u64, 0);
                     const strip_store_value_start_ns = DB.WritePathCallbacks.monotonic_time_ns();
                     // Relational tables project the document once into a typed row
                     // and store that row as the table's only base document record.
@@ -8143,6 +8150,7 @@ pub fn Impl(comptime DB: type) type {
                         const row_write_index = store_writes.items.len;
                         const row_delete_index = delete_keys.items.len;
                         const prepare_upsert_start_ns = DB.WritePathCallbacks.monotonic_time_ns();
+                        relational_participant.configureNextRowGeneration(write_timestamp_ns);
                         relational_participant.prepareUpsert("", write.key, store_value, null) catch |err| {
                             if (err == error.ForeignKeyViolation) DB.WritePathCallbacks.record_foreign_key_child_write_reject(self);
                             return err;
@@ -8177,16 +8185,13 @@ pub fn Impl(comptime DB: type) type {
                     });
                     try identity_upsert_keys.append(self.alloc, write.key);
                     try identity_upsert_write_indexes.append(self.alloc, i);
-                    if (DB.WritePathCallbacks.should_write_timestamp(write.key)) {
-                        const timestamp_start_ns = DB.WritePathCallbacks.monotonic_time_ns();
-                        const write_timestamp_ns = try DB.WritePathCallbacks.resolve_write_timestamp_ns(self, batch_timestamp_ns, write.value);
+                    if (should_write_timestamp) {
                         const timestamp_key = try DB.WritePathCallbacks.make_timestamp_key(self.alloc, write.key);
                         const timestamp_value = try DB.WritePathCallbacks.encode_timestamp_value(self.alloc, write_timestamp_ns);
                         try timestamp_writes.append(self.alloc, .{
                             .key = timestamp_key,
                             .value = timestamp_value,
                         });
-                        if (profile) |active_profile| DB.WritePathCallbacks.record_profile_ns(profile, &active_profile.extract_timestamp_ns, timestamp_start_ns);
                     }
                 }
             }

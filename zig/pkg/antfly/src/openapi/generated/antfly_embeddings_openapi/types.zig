@@ -120,6 +120,67 @@ pub const BedrockEmbedderConfig = struct {
     batch_size: ?i64 = null,
 };
 
+/// Specifies the type of input for optimized embeddings.
+pub const CohereEmbedderConfigInputType = enum {
+    search_document,
+    search_query,
+    classification,
+    clustering,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .search_document => "search_document",
+            .search_query => "search_query",
+            .classification => "classification",
+            .clustering => "clustering",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "search_document", .search_document },
+            .{ "search_query", .search_query },
+            .{ "classification", .classification },
+            .{ "clustering", .clustering },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// How to handle inputs longer than the max token length.
+pub const CohereEmbedderConfigTruncate = enum {
+    none,
+    start,
+    end,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .none => "NONE",
+            .start => "START",
+            .end => "END",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "NONE", .none },
+            .{ "START", .start },
+            .{ "END", .end },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Configuration for the Cohere embedding provider. API key via `api_key` field or `COHERE_API_KEY` environment variable. **Example Models:** embed-english-v3.0 (default, 1024 dims), embed-multilingual-v3.0 **Docs:** https://docs.cohere.com/reference/embed
 pub const CohereEmbedderConfig = struct {
     /// The name of the Cohere embedding model to use.
@@ -127,9 +188,9 @@ pub const CohereEmbedderConfig = struct {
     /// The Cohere API key. Can also be set via COHERE_API_KEY environment variable.
     api_key: ?[]const u8 = null,
     /// Specifies the type of input for optimized embeddings.
-    input_type: ?[]const u8 = null,
+    input_type: ?CohereEmbedderConfigInputType = null,
     /// How to handle inputs longer than the max token length.
-    truncate: ?[]const u8 = null,
+    truncate: ?CohereEmbedderConfigTruncate = null,
 };
 
 /// Configuration for the OpenRouter embedding provider. OpenRouter provides a unified API for multiple embedding models from different providers. API key via `api_key` field or `OPENROUTER_API_KEY` environment variable. **Example Models:** openai/text-embedding-3-small (default), openai/text-embedding-3-large, google/gemini-embedding-001, qwen/qwen3-embedding-8b **Docs:** https://openrouter.ai/docs/api/reference/embeddings

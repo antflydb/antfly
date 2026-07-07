@@ -13,3 +13,5 @@ pub const CohereEmbedderConfig = types.CohereEmbedderConfig;
 pub const OpenRouterEmbedderConfig = types.OpenRouterEmbedderConfig;
 pub const AntflyEmbedderConfig = types.AntflyEmbedderConfig;
 pub const EmbedderConfig = types.EmbedderConfig;
+pub const CohereEmbedderConfigInputType = types.CohereEmbedderConfigInputType;
+pub const CohereEmbedderConfigTruncate = types.CohereEmbedderConfigTruncate;

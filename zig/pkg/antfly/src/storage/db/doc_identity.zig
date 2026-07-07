@@ -473,6 +473,17 @@ pub fn allVisibleFromSummaryFast(store: *docstore_mod.DocStore, generation: ?u64
     return allVisibleFromSummary(summary, generation);
 }
 
+pub fn liveOrdinalCountFromSummaryFast(store: *docstore_mod.DocStore, generation: ?u64) !?u64 {
+    var txn = try store.beginProbeTxn();
+    defer txn.abort();
+    const summary = (try readVisibilitySummaryTxn(&txn)) orelse return null;
+    if (generation) |at| {
+        if (summary.max_created_generation > at) return null;
+        if (summary.max_deleted_generation > at) return null;
+    }
+    return summary.live_ordinals;
+}
+
 pub fn allVisibleFromSummary(summary: VisibilitySummary, generation: ?u64) bool {
     if (summary.tombstone_ordinals != 0) return false;
     if (generation) |at| {

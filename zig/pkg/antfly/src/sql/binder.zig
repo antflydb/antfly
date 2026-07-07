@@ -1686,9 +1686,7 @@ fn requireParsedCatalogReadStatement(statement: tokenized.ParsedStatement) !void
 }
 
 fn requireParsedCatalogReadStatementIncludingGeneratedAst(parsed_sql: *const tokenized.ParsedSql) !void {
-    try requireParsedCatalogReadStatement(parsed_sql.statement);
     if (parsed_sql.generatedStatementKind() != .read) return error.UnsupportedSqlShape;
-    _ = parsed_sql.generatedReadStatementKind() orelse return error.UnsupportedSqlShape;
 }
 
 fn requireParsedCatalogWriteStatement(statement: tokenized.ParsedStatement) !void {
@@ -3233,7 +3231,6 @@ pub fn readSourceTableNamesFromParsedSqlAlloc(alloc: std.mem.Allocator, parsed_s
 
 fn generatedReadAstForParsedSql(parsed_sql: *const tokenized.ParsedSql) !?*const generated_parser.GeneratedSqlReadAst {
     if (parsed_sql.generatedStatementKind() != .read) return null;
-    _ = parsed_sql.generatedReadStatementKind() orelse return error.UnsupportedSqlShape;
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             return switch (generated_ast.*) {
@@ -4367,7 +4364,7 @@ test "sql adapter binder produces bound sql statements for catalog read and writ
     try std.testing.expectEqual(@as(usize, 0), (try bound_read.readCatalog()).bound_objects.len);
 
     const document_schema_json =
-        \\{"version":1,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"}},"additionalProperties":true}}}}
+        \\{"version":1,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"tags":{"type":"array","items":{"type":"keyword"}}},"additionalProperties":true}}}}
     ;
     const document_schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(document_schema_json);
     var document_catalog = MultiTableTestCatalog.init("docs", document_schema_json, "incoming_usage", incoming_schema_json);
@@ -4426,6 +4423,38 @@ test "sql adapter binder produces bound sql statements for catalog read and writ
         else => return error.TestUnexpectedResult,
     }
 
+    document_catalog.tables[0].indexes_json =
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"tag_list\",\"path\":\"tags\",\"type\":\"array\",\"item_type\":\"keyword\"}]}},\"tags_array\":{\"type\":\"array_element\",\"path\":\"tags\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}";
+    var parsed_document_view_unnest_read = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag = 'urgent' LIMIT 10;",
+    );
+    defer parsed_document_view_unnest_read.deinit(alloc);
+    var bound_document_view_unnest_read = try bindReadPlanCatalogStatementAlloc(alloc, &parsed_document_view_unnest_read, document_catalog.iface());
+    defer bound_document_view_unnest_read.deinit(alloc);
+    const document_view_unnest_read = try bound_document_view_unnest_read.readCatalog();
+    try std.testing.expect(document_view_unnest_read.target_binding != null);
+    try std.testing.expectEqual(@as(usize, 1), document_view_unnest_read.bound_objects.len);
+    switch (document_view_unnest_read.target_binding.?) {
+        .document => |binding| {
+            try std.testing.expectEqualStrings("docs", binding.target.table_name);
+            try std.testing.expectEqual(runtime_schema.StorageMode.document, binding.schema.storage_mode);
+            var saw_tag_list_view_field = false;
+            for (binding.virtual_schema.fields) |field| {
+                if (std.mem.eql(u8, field.name, "tag_list")) {
+                    saw_tag_list_view_field = true;
+                    try std.testing.expectEqualStrings("/tags", field.path);
+                    try std.testing.expectEqual(source_binding.DocumentSqlVirtualFieldSource.view_mapping, field.source);
+                }
+            }
+            try std.testing.expect(saw_tag_list_view_field);
+            try std.testing.expectEqual(source_binding.SqlSourceFamily.document, document_view_unnest_read.bound_objects[0].family);
+            try std.testing.expectEqualStrings("docs", document_view_unnest_read.bound_objects[0].target.table_name);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(document_view_unnest_read.source_schema == null);
+
     var parsed_document_unnest_read = try tokenized.ParsedSql.initAlloc(
         alloc,
         "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag = 'urgent' LIMIT 10;",
@@ -4465,6 +4494,8 @@ test "sql adapter binder produces bound sql statements for catalog read and writ
     }
     try std.testing.expect(document_lateral_unnest_read.source_schema == null);
 
+    document_catalog.tables[0].indexes_json =
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"}]}}}";
     var parsed_document_view_write = try tokenized.ParsedSql.initAlloc(
         alloc,
         "INSERT INTO support_view (_id, plan) VALUES ('doc:a', 'pro')",

@@ -27,9 +27,37 @@ pub const SqlStatementRequest = struct {
     read_only: ?bool = null,
 };
 
+pub const SqlStatementResponseKind = enum {
+    ddl,
+    read,
+    write,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .ddl => "ddl",
+            .read => "read",
+            .write => "write",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "ddl", .ddl },
+            .{ "read", .read },
+            .{ "write", .write },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Synchronous SQL statement result metadata. Catalog/session/control statements route through the typed DDL/session execution path. Read statements lower through the same typed row-plan executor used by the JSON relational rows APIs. Point write statements lower through the typed row-batch mutation path, and insert-from-source statements lower through the typed row-read plus row-batch mutation path.
 pub const SqlStatementResponse = struct {
-    kind: []const u8,
+    kind: SqlStatementResponseKind,
     session_id: i64,
     noop: ?bool = null,
     /// Applied DDL/session result record.
@@ -390,9 +418,32 @@ pub const TableArtifactEnrichmentList = struct {
     artifacts: []const antfly_indexes_openapi.EnrichmentConfig,
 };
 
+/// Indicates that reprocessing was accepted.
+pub const DocumentArtifactReprocessResponseReprocess = enum {
+    triggered,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .triggered => "triggered",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "triggered", .triggered },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const DocumentArtifactReprocessResponse = struct {
     /// Indicates that reprocessing was accepted.
-    reprocess: []const u8,
+    reprocess: DocumentArtifactReprocessResponseReprocess,
 };
 
 pub const DocumentArtifactReprocessFailure = struct {
@@ -624,9 +675,31 @@ pub const CreateTablespaceRequest = struct {
     placement_policy_json: ?[]const u8 = null,
 };
 
+pub const TableMigrationState = enum {
+    rebuilding,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .rebuilding => "rebuilding",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "rebuilding", .rebuilding },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Describes an in-progress schema migration. The table serves reads from read_schema while rebuilding full-text indexes for the new schema.
 pub const TableMigration = struct {
-    state: []const u8,
+    state: TableMigrationState,
     read_schema: antfly_schema_openapi.TableSchema,
 };
 
@@ -862,11 +935,43 @@ pub const SignificanceAlgorithm = enum {
     }
 };
 
+/// Temporal join mode for the algebraic materialization
+pub const AlgebraicAggregationJoinKind = enum {
+    none,
+    bucket,
+    window,
+    bucket_window,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .none => "none",
+            .bucket => "bucket",
+            .window => "window",
+            .bucket_window => "bucket_window",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "none", .none },
+            .{ "bucket", .bucket },
+            .{ "window", .window },
+            .{ "bucket_window", .bucket_window },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const AlgebraicAggregationJoin = struct {
     /// Algebraic join materialization or capability name
     name: []const u8,
     /// Temporal join mode for the algebraic materialization
-    kind: ?[]const u8 = null,
+    kind: ?AlgebraicAggregationJoinKind = null,
     /// Join side that supplies grouping bucket values
     group_side: []const u8,
     /// Join side that supplies metric values
@@ -1079,19 +1184,78 @@ pub const RowsFieldPatch = struct {};
 /// Numeric increment map keyed by declared numeric columns.
 pub const RowsNumericIncrement = struct {};
 
+pub const RowsArrayUpdateTransformOp = enum {
+    append,
+    remove,
+    add_to_set,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .append => "append",
+            .remove => "remove",
+            .add_to_set => "add_to_set",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "append", .append },
+            .{ "remove", .remove },
+            .{ "add_to_set", .add_to_set },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Array transform for a declared `array` column.
 pub const RowsArrayUpdateTransform = struct {
     /// Declared `array` column to update.
     field: []const u8,
-    op: []const u8,
+    op: RowsArrayUpdateTransformOp,
     /// JSON value to append, remove, or add if absent.
     value: std.json.Value,
+};
+
+pub const RowsUniquePredicateOp = enum {
+    is_null,
+    is_not_null,
+    eq,
+    ne,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .is_null => "is_null",
+            .is_not_null => "is_not_null",
+            .eq => "eq",
+            .ne => "ne",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "is_null", .is_null },
+            .{ "is_not_null", .is_not_null },
+            .{ "eq", .eq },
+            .{ "ne", .ne },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// Predicate atom that must match a partial unique constraint definition.
 pub const RowsUniquePredicate = struct {
     field: []const u8,
-    op: []const u8,
+    op: RowsUniquePredicateOp,
     /// Predicate comparison value. Omit for null-test operators.
     value: ?std.json.Value = null,
 };
@@ -1124,12 +1288,38 @@ pub const RowsTemporalPortion = struct {
     to: std.json.Value,
 };
 
+/// Join side that supplies the source field. Must be the non-target side.
+pub const RowsJoinedMutationSourceAssignmentSide = enum {
+    left,
+    right,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .left => "left",
+            .right => "right",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "left", .left },
+            .{ "right", .right },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Source-side assignment for joined mutation-source updates.
 pub const RowsJoinedMutationSourceAssignment = struct {
     /// Declared target-side relational field to assign.
     target_field: []const u8,
     /// Join side that supplies the source field. Must be the non-target side.
-    side: []const u8,
+    side: RowsJoinedMutationSourceAssignmentSide,
     /// Declared relational field to copy from the source side.
     field: []const u8,
 };
@@ -1143,17 +1333,120 @@ pub const RowsMutationSourceResultSet = struct {
     returning: ?[]const std.json.Value = null,
 };
 
+pub const RowsQueryOrderFieldNullTest = enum {
+    is_null,
+    is_not_null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .is_null => "is_null",
+            .is_not_null => "is_not_null",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "is_null", .is_null },
+            .{ "is_not_null", .is_not_null },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const RowsQueryOrderFieldDirection = enum {
+    asc,
+    desc,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .asc => "asc",
+            .desc => "desc",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "asc", .asc },
+            .{ "desc", .desc },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const RowsQueryOrderField = struct {
     /// Output/base field to order by. Mutually exclusive with `expr`.
     field: []const u8,
-    null_test: ?[]const u8 = null,
-    direction: ?[]const u8 = null,
+    null_test: ?RowsQueryOrderFieldNullTest = null,
+    direction: ?RowsQueryOrderFieldDirection = null,
+};
+
+pub const RowsRowClaimMode = enum {
+    for_update,
+    for_no_key_update,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .for_update => "for_update",
+            .for_no_key_update => "for_no_key_update",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "for_update", .for_update },
+            .{ "for_no_key_update", .for_no_key_update },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const RowsRowClaimWaitPolicy = enum {
+    wait,
+    nowait,
+    skip_locked,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .wait => "wait",
+            .nowait => "nowait",
+            .skip_locked => "skip_locked",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "wait", .wait },
+            .{ "nowait", .nowait },
+            .{ "skip_locked", .skip_locked },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// Lockable base-row claim metadata. Public row-plan endpoints reject this field; it is only accepted by `rows/mutation-source` lockable base-row sources and internal/coordinator execution paths. `transaction_id` is the canonical field name.
 pub const RowsRowClaim = struct {
-    mode: ?[]const u8 = null,
-    wait_policy: ?[]const u8 = null,
+    mode: ?RowsRowClaimMode = null,
+    wait_policy: ?RowsRowClaimWaitPolicy = null,
     skip_locked: ?bool = null,
     lease_ms: ?i64 = null,
     owner_id: ?[]const u8 = null,
@@ -1182,9 +1475,40 @@ pub const RowsDocKeyRange = struct {
     }
 };
 
+pub const RowsExpressionFieldSource = enum {
+    row,
+    existing,
+    proposed,
+    source,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .row => "row",
+            .existing => "existing",
+            .proposed => "proposed",
+            .source => "source",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "row", .row },
+            .{ "existing", .existing },
+            .{ "proposed", .proposed },
+            .{ "source", .source },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const RowsExpressionField = struct {
     field: []const u8,
-    source: ?[]const u8 = null,
+    source: ?RowsExpressionFieldSource = null,
 };
 
 pub const RowsExpressionValue = struct {
@@ -1230,11 +1554,87 @@ pub const RowsFieldAliasProjection = struct {
     field: []const u8,
 };
 
+pub const RowsWhereAtomOp = enum {
+    is_null,
+    is_not_null,
+    is_distinct,
+    is_not_distinct,
+    eq,
+    ne,
+    gt,
+    gte,
+    lt,
+    lte,
+    array_any,
+    array_contains,
+    array_eq,
+    in,
+    not_in,
+    json_contains,
+    json_path_eq,
+    json_path_exists,
+    text_pattern,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .is_null => "is_null",
+            .is_not_null => "is_not_null",
+            .is_distinct => "is_distinct",
+            .is_not_distinct => "is_not_distinct",
+            .eq => "eq",
+            .ne => "ne",
+            .gt => "gt",
+            .gte => "gte",
+            .lt => "lt",
+            .lte => "lte",
+            .array_any => "array_any",
+            .array_contains => "array_contains",
+            .array_eq => "array_eq",
+            .in => "in",
+            .not_in => "not_in",
+            .json_contains => "json_contains",
+            .json_path_eq => "json_path_eq",
+            .json_path_exists => "json_path_exists",
+            .text_pattern => "text_pattern",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "is_null", .is_null },
+            .{ "is_not_null", .is_not_null },
+            .{ "is_distinct", .is_distinct },
+            .{ "is_not_distinct", .is_not_distinct },
+            .{ "eq", .eq },
+            .{ "ne", .ne },
+            .{ "gt", .gt },
+            .{ "gte", .gte },
+            .{ "lt", .lt },
+            .{ "lte", .lte },
+            .{ "array_any", .array_any },
+            .{ "array_contains", .array_contains },
+            .{ "array_eq", .array_eq },
+            .{ "in", .in },
+            .{ "not_in", .not_in },
+            .{ "json_contains", .json_contains },
+            .{ "json_path_eq", .json_path_eq },
+            .{ "json_path_exists", .json_path_exists },
+            .{ "text_pattern", .text_pattern },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Typed scalar, array, JSON, or text-pattern row predicate atom over a declared relational column. Null-test operators omit `value`; value operators carry one JSON value; `in` and `not_in` carry an array value; JSON path operators carry `path`; text-pattern operators carry `pattern` and optional flags. The server validates column type and operator-specific fields against the table schema.
 pub const RowsWhereAtom = struct {
     /// Declared relational column.
     field: []const u8,
-    op: []const u8,
+    op: RowsWhereAtomOp,
     /// JSON comparison value or array operand for operators that require one.
     value: ?std.json.Value = null,
     /// Non-empty JSON path for `json_path_eq` and `json_path_exists`, encoded as a dot path string or array of path components.
@@ -1247,10 +1647,86 @@ pub const RowsWhereAtom = struct {
     negated: ?bool = null,
 };
 
+pub const RowsWhereBranchAtomOp = enum {
+    is_null,
+    is_not_null,
+    is_distinct,
+    is_not_distinct,
+    eq,
+    ne,
+    gt,
+    gte,
+    lt,
+    lte,
+    array_any,
+    array_contains,
+    array_eq,
+    in,
+    not_in,
+    json_contains,
+    json_path_eq,
+    json_path_exists,
+    text_pattern,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .is_null => "is_null",
+            .is_not_null => "is_not_null",
+            .is_distinct => "is_distinct",
+            .is_not_distinct => "is_not_distinct",
+            .eq => "eq",
+            .ne => "ne",
+            .gt => "gt",
+            .gte => "gte",
+            .lt => "lt",
+            .lte => "lte",
+            .array_any => "array_any",
+            .array_contains => "array_contains",
+            .array_eq => "array_eq",
+            .in => "in",
+            .not_in => "not_in",
+            .json_contains => "json_contains",
+            .json_path_eq => "json_path_eq",
+            .json_path_exists => "json_path_exists",
+            .text_pattern => "text_pattern",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "is_null", .is_null },
+            .{ "is_not_null", .is_not_null },
+            .{ "is_distinct", .is_distinct },
+            .{ "is_not_distinct", .is_not_distinct },
+            .{ "eq", .eq },
+            .{ "ne", .ne },
+            .{ "gt", .gt },
+            .{ "gte", .gte },
+            .{ "lt", .lt },
+            .{ "lte", .lte },
+            .{ "array_any", .array_any },
+            .{ "array_contains", .array_contains },
+            .{ "array_eq", .array_eq },
+            .{ "in", .in },
+            .{ "not_in", .not_in },
+            .{ "json_contains", .json_contains },
+            .{ "json_path_eq", .json_path_eq },
+            .{ "json_path_exists", .json_path_exists },
+            .{ "text_pattern", .text_pattern },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const RowsWhereBranchAtom = struct {
     /// Declared relational column for a single-atom branch.
     field: []const u8,
-    op: []const u8,
+    op: RowsWhereBranchAtomOp,
     /// JSON comparison value or array operand for operators that require one.
     value: ?std.json.Value = null,
     /// Non-empty JSON path for `json_path_eq` and `json_path_exists`, encoded as a dot path string or array of path components.
@@ -1261,22 +1737,158 @@ pub const RowsWhereBranchAtom = struct {
     case_insensitive: ?bool = null,
     /// Negates `text_pattern`.
     negated: ?bool = null,
+};
+
+pub const RowsAggregateHavingPredicateOp = enum {
+    is_null,
+    is_not_null,
+    is_distinct,
+    is_not_distinct,
+    eq,
+    ne,
+    gt,
+    gte,
+    lt,
+    lte,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .is_null => "is_null",
+            .is_not_null => "is_not_null",
+            .is_distinct => "is_distinct",
+            .is_not_distinct => "is_not_distinct",
+            .eq => "eq",
+            .ne => "ne",
+            .gt => "gt",
+            .gte => "gte",
+            .lt => "lt",
+            .lte => "lte",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "is_null", .is_null },
+            .{ "is_not_null", .is_not_null },
+            .{ "is_distinct", .is_distinct },
+            .{ "is_not_distinct", .is_not_distinct },
+            .{ "eq", .eq },
+            .{ "ne", .ne },
+            .{ "gt", .gt },
+            .{ "gte", .gte },
+            .{ "lt", .lt },
+            .{ "lte", .lte },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// Predicate over emitted aggregate output fields, evaluated after grouping.
 pub const RowsAggregateHavingPredicate = struct {
     /// Emitted aggregate output field name, usually an aggregation `name`, group key, or expression group alias.
     field: []const u8,
-    op: []const u8,
+    op: RowsAggregateHavingPredicateOp,
     /// Comparison value. Omit for `is_null` and `is_not_null`.
     value: ?std.json.Value = null,
 };
 
+pub const RowsWindowFrameUnit = enum {
+    rows,
+    range,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .rows => "rows",
+            .range => "range",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "rows", .rows },
+            .{ "range", .range },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const RowsWindowFrameStart = enum {
+    unbounded_preceding,
+    offset_preceding,
+    current_row,
+    offset_following,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .unbounded_preceding => "unbounded_preceding",
+            .offset_preceding => "offset_preceding",
+            .current_row => "current_row",
+            .offset_following => "offset_following",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "unbounded_preceding", .unbounded_preceding },
+            .{ "offset_preceding", .offset_preceding },
+            .{ "current_row", .current_row },
+            .{ "offset_following", .offset_following },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const RowsWindowFrameEnd = enum {
+    offset_preceding,
+    current_row,
+    offset_following,
+    unbounded_following,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .offset_preceding => "offset_preceding",
+            .current_row => "current_row",
+            .offset_following => "offset_following",
+            .unbounded_following => "unbounded_following",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "offset_preceding", .offset_preceding },
+            .{ "current_row", .current_row },
+            .{ "offset_following", .offset_following },
+            .{ "unbounded_following", .unbounded_following },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const RowsWindowFrame = struct {
-    unit: []const u8,
-    start: []const u8,
+    unit: RowsWindowFrameUnit,
+    start: RowsWindowFrameStart,
     start_offset: ?i64 = null,
-    end: []const u8,
+    end: RowsWindowFrameEnd,
     end_offset: ?i64 = null,
 };
 
@@ -1285,9 +1897,34 @@ pub const RowsJoinOn = struct {
     right_field: []const u8,
 };
 
+pub const RowsJoinProjectionSide = enum {
+    left,
+    right,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .left => "left",
+            .right => "right",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "left", .left },
+            .{ "right", .right },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const RowsJoinProjection = struct {
     as: []const u8,
-    side: []const u8,
+    side: RowsJoinProjectionSide,
     field: []const u8,
 };
 
@@ -1436,13 +2073,65 @@ pub const TransactionSessionCleanupResponse = struct {
     cutoff_ns: ?i64 = null,
 };
 
+/// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
+pub const BackupRequestFormat = enum {
+    native,
+    portable,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .native => "native",
+            .portable => "portable",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "native", .native },
+            .{ "portable", .portable },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const BackupRequest = struct {
     /// Unique identifier for this backup. Used to reference the backup for restore operations. Choose a meaningful name that includes date/version information.
     backup_id: []const u8,
     /// Storage location for the backup. Supports multiple backends: - Local filesystem: `file:///path/to/backup` - Amazon S3: `s3://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata for the specified table.
     location: []const u8,
     /// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
-    format: ?[]const u8 = null,
+    format: ?BackupRequestFormat = null,
+};
+
+/// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
+pub const ClusterBackupRequestFormat = enum {
+    native,
+    portable,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .native => "native",
+            .portable => "portable",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "native", .native },
+            .{ "portable", .portable },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 pub const ClusterBackupRequest = struct {
@@ -1451,18 +2140,76 @@ pub const ClusterBackupRequest = struct {
     /// Storage location for the backup. Supports multiple backends: - Local filesystem: `file:///path/to/backup` - Amazon S3: `s3://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata.
     location: []const u8,
     /// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
-    format: ?[]const u8 = null,
+    format: ?ClusterBackupRequestFormat = null,
     /// Optional list of tables to backup. If omitted, all tables are backed up.
     table_names: ?[]const []const u8 = null,
+};
+
+/// Backup status for this table
+pub const TableBackupStatusStatus = enum {
+    completed,
+    failed,
+    skipped,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .completed => "completed",
+            .failed => "failed",
+            .skipped => "skipped",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "completed", .completed },
+            .{ "failed", .failed },
+            .{ "skipped", .skipped },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 pub const TableBackupStatus = struct {
     /// Table name
     name: []const u8,
     /// Backup status for this table
-    status: []const u8,
+    status: TableBackupStatusStatus,
     /// Error message if backup failed
     @"error": ?[]const u8 = null,
+};
+
+/// How to handle existing tables: - `fail_if_exists`: Abort if any table already exists (default) - `skip_if_exists`: Skip existing tables, restore others - `overwrite`: Drop and recreate existing tables
+pub const ClusterRestoreRequestRestoreMode = enum {
+    fail_if_exists,
+    skip_if_exists,
+    overwrite,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .fail_if_exists => "fail_if_exists",
+            .skip_if_exists => "skip_if_exists",
+            .overwrite => "overwrite",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "fail_if_exists", .fail_if_exists },
+            .{ "skip_if_exists", .skip_if_exists },
+            .{ "overwrite", .overwrite },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 pub const ClusterRestoreRequest = struct {
@@ -1473,16 +2220,71 @@ pub const ClusterRestoreRequest = struct {
     /// Optional list of tables to restore. If omitted, all tables in the backup are restored.
     table_names: ?[]const []const u8 = null,
     /// How to handle existing tables: - `fail_if_exists`: Abort if any table already exists (default) - `skip_if_exists`: Skip existing tables, restore others - `overwrite`: Drop and recreate existing tables
-    restore_mode: ?[]const u8 = null,
+    restore_mode: ?ClusterRestoreRequestRestoreMode = null,
+};
+
+/// Restore status for this table
+pub const TableRestoreStatusStatus = enum {
+    triggered,
+    skipped,
+    failed,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .triggered => "triggered",
+            .skipped => "skipped",
+            .failed => "failed",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "triggered", .triggered },
+            .{ "skipped", .skipped },
+            .{ "failed", .failed },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 pub const TableRestoreStatus = struct {
     /// Table name
     name: []const u8,
     /// Restore status for this table
-    status: []const u8,
+    status: TableRestoreStatusStatus,
     /// Error message if restore failed
     @"error": ?[]const u8 = null,
+};
+
+/// Backup format used
+pub const BackupInfoFormat = enum {
+    native,
+    portable,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .native => "native",
+            .portable => "portable",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "native", .native },
+            .{ "portable", .portable },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 pub const BackupInfo = struct {
@@ -1497,13 +2299,45 @@ pub const BackupInfo = struct {
     /// Antfly version that created the backup
     antfly_version: ?[]const u8 = null,
     /// Backup format used
-    format: ?[]const u8 = null,
+    format: ?BackupInfoFormat = null,
+};
+
+/// Why the agent stopped: - max_internal_iterations: Hit the configured max_internal_iterations limit - max_tokens: LLM output was truncated - no_tools: No tools were available for agentic mode - clarification_required: The agent needs a user decision before it can continue
+pub const IncompleteDetailsReason = enum {
+    max_internal_iterations,
+    max_tokens,
+    no_tools,
+    clarification_required,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .max_internal_iterations => "max_internal_iterations",
+            .max_tokens => "max_tokens",
+            .no_tools => "no_tools",
+            .clarification_required => "clarification_required",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "max_internal_iterations", .max_internal_iterations },
+            .{ "max_tokens", .max_tokens },
+            .{ "no_tools", .no_tools },
+            .{ "clarification_required", .clarification_required },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// Explains why the agent stopped before completion. Present when status is "incomplete".
 pub const IncompleteDetails = struct {
     /// Why the agent stopped: - max_internal_iterations: Hit the configured max_internal_iterations limit - max_tokens: LLM output was truncated - no_tools: No tools were available for agentic mode - clarification_required: The agent needs a user decision before it can continue
-    reason: []const u8,
+    reason: IncompleteDetailsReason,
 };
 
 /// Strategy for document retrieval: - semantic: Vector similarity search using embeddings - bm25: Full-text search using BM25 scoring - metadata: Structured query on document fields - tree: Iterative tree navigation with summarization - graph: Relationship-based traversal - hybrid: Combine multiple strategies with RRF or rerank
@@ -1764,10 +2598,36 @@ pub const SSEStepProgress = struct {
     name: []const u8,
 };
 
+/// Tool calling mode selected
+pub const SSEToolModeMode = enum {
+    native,
+    structured_output,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .native => "native",
+            .structured_output => "structured_output",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "native", .native },
+            .{ "structured_output", .structured_output },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Emitted when the agent selects a tool-calling mode
 pub const SSEToolMode = struct {
     /// Tool calling mode selected
-    mode: []const u8,
+    mode: SSEToolModeMode,
     /// Number of tools available (present for native mode)
     tools_count: ?i64 = null,
 };
@@ -2039,9 +2899,34 @@ pub const LinearMergePageStatus = enum {
     }
 };
 
+pub const FailedOperationOperation = enum {
+    upsert,
+    delete,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .upsert => "upsert",
+            .delete => "delete",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "upsert", .upsert },
+            .{ "delete", .delete },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const FailedOperation = struct {
     id: ?[]const u8 = null,
-    operation: ?[]const u8 = null,
+    operation: ?FailedOperationOperation = null,
     @"error": ?[]const u8 = null,
 };
 
@@ -2200,11 +3085,43 @@ pub const RoleAssignment = struct {
     role: []const u8,
 };
 
+/// Conservative subject classification inferred from user records and subject prefixes.
+pub const AuthSubjectKind = enum {
+    user,
+    role,
+    group,
+    subject,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .user => "user",
+            .role => "role",
+            .group => "group",
+            .subject => "subject",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "user", .user },
+            .{ "role", .role },
+            .{ "group", .group },
+            .{ "subject", .subject },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const AuthSubject = struct {
     /// Casbin subject name.
     subject: []const u8,
     /// Conservative subject classification inferred from user records and subject prefixes.
-    kind: []const u8,
+    kind: AuthSubjectKind,
 };
 
 pub const UpdatePasswordRequest = struct {
@@ -2315,11 +3232,60 @@ pub const DocumentArtifactTableReprocessRequest = struct {
     shard_cursors: ?[]const DocumentArtifactReprocessShardCursor = null,
 };
 
+/// Indicates that reprocessing was accepted.
+pub const DocumentArtifactTableReprocessResponseReprocess = enum {
+    triggered,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .triggered => "triggered",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "triggered", .triggered },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Completion state for this bounded pass. `in_progress` means the caller should persist the returned cursor(s) and schedule another pass; `complete` means no continuation cursor remains.
+pub const DocumentArtifactTableReprocessResponseReprocessStatus = enum {
+    in_progress,
+    complete,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .in_progress => "in_progress",
+            .complete => "complete",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "in_progress", .in_progress },
+            .{ "complete", .complete },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const DocumentArtifactTableReprocessResponse = struct {
     /// Indicates that reprocessing was accepted.
-    reprocess: []const u8,
+    reprocess: DocumentArtifactTableReprocessResponseReprocess,
     /// Completion state for this bounded pass. `in_progress` means the caller should persist the returned cursor(s) and schedule another pass; `complete` means no continuation cursor remains.
-    reprocess_status: []const u8,
+    reprocess_status: DocumentArtifactTableReprocessResponseReprocessStatus,
     /// Name of the derived artifact that was reprocessed.
     artifact_name: []const u8,
     /// Number of source rows scanned by this bounded pass.
@@ -2341,6 +3307,70 @@ pub const DocumentArtifactTableReprocessResponse = struct {
     shard_cursors: []const DocumentArtifactReprocessShardCursor,
 };
 
+/// Lifecycle phase of the repair job.
+pub const DocumentArtifactReprocessJobPhase = enum {
+    queued,
+    running,
+    succeeded,
+    failed,
+    cancelled,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .queued => "queued",
+            .running => "running",
+            .succeeded => "succeeded",
+            .failed => "failed",
+            .cancelled => "cancelled",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "queued", .queued },
+            .{ "running", .running },
+            .{ "succeeded", .succeeded },
+            .{ "failed", .failed },
+            .{ "cancelled", .cancelled },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// User-facing completion status derived from the phase and remaining cursors.
+pub const DocumentArtifactReprocessJobReprocessStatus = enum {
+    in_progress,
+    complete,
+    stopped,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .in_progress => "in_progress",
+            .complete => "complete",
+            .stopped => "stopped",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "in_progress", .in_progress },
+            .{ "complete", .complete },
+            .{ "stopped", .stopped },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const DocumentArtifactReprocessJob = struct {
     /// Server-assigned durable repair job identifier.
     job_id: i64,
@@ -2349,9 +3379,9 @@ pub const DocumentArtifactReprocessJob = struct {
     /// Name of the derived artifact being repaired.
     artifact_name: []const u8,
     /// Lifecycle phase of the repair job.
-    phase: []const u8,
+    phase: DocumentArtifactReprocessJobPhase,
     /// User-facing completion status derived from the phase and remaining cursors.
-    reprocess_status: []const u8,
+    reprocess_status: DocumentArtifactReprocessJobReprocessStatus,
     /// Original exclusive lower bound for the job.
     from_key: []const u8,
     /// Original inclusive upper bound for the job, or empty for the end of the table/range.
@@ -2492,10 +3522,36 @@ pub const MultiBatchResponse = struct {
     tables: ?std.json.ArrayHashMap(BatchResponse) = null,
 };
 
+/// Whether the transaction was committed or aborted due to a conflict
+pub const TransactionCommitResponseStatus = enum {
+    committed,
+    aborted,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .committed => "committed",
+            .aborted => "aborted",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "committed", .committed },
+            .{ "aborted", .aborted },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Result of an OCC transaction commit attempt.
 pub const TransactionCommitResponse = struct {
     /// Whether the transaction was committed or aborted due to a conflict
-    status: []const u8,
+    status: TransactionCommitResponseStatus,
     /// Details about the conflict that caused an abort (only present when status is "aborted")
     conflict: ?std.json.Value = null,
     /// Per-table batch results (only present when status is "committed")
@@ -2570,8 +3626,17 @@ pub const RowsCoalesceOperand = union(enum) {
     rows_coalesce_field_operand: *RowsCoalesceFieldOperand,
     rows_coalesce_value_operand: *RowsCoalesceValueOperand,
 
+    fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
+        const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
+        defer allocator.free(encoded);
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.UnexpectedToken,
+        };
+    }
+
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+        const parsed = parseUnionVariantFromValue(T, allocator, source, options) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return null,
         };
@@ -2633,6 +3698,8 @@ pub const RowsJoinStrategySelection = struct {
 
 pub const RowsQueryResultSet = struct {
     total: ?i64 = null,
+    /// False when `total` is a bounded or no-total value rather than an exact match count.
+    total_exact: ?bool = null,
     result_schema: ?[]const RowsResultColumn = null,
     rows: ?[]const std.json.Value = null,
 };
@@ -2678,13 +3745,68 @@ pub const TransactionSessionDetailsResponse = struct {
     savepoint_ids: ?[]const i64 = null,
 };
 
+/// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
+pub const RestoreRequestFormat = enum {
+    native,
+    portable,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .native => "native",
+            .portable => "portable",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "native", .native },
+            .{ "portable", .portable },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const RestoreRequest = struct {
     /// Unique identifier for this backup. Used to reference the backup for restore operations. Choose a meaningful name that includes date/version information.
     backup_id: []const u8,
     /// Storage location for the backup. Supports multiple backends: - Local filesystem: `file:///path/to/backup` - Amazon S3: `s3://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata for the specified table.
     location: []const u8,
     /// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
-    format: ?[]const u8 = null,
+    format: ?RestoreRequestFormat = null,
+};
+
+/// Overall backup status
+pub const ClusterBackupResponseStatus = enum {
+    completed,
+    partial,
+    failed,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .completed => "completed",
+            .partial => "partial",
+            .failed => "failed",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "completed", .completed },
+            .{ "partial", .partial },
+            .{ "failed", .failed },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 pub const ClusterBackupResponse = struct {
@@ -2693,14 +3815,43 @@ pub const ClusterBackupResponse = struct {
     /// Status of each table backup
     tables: []const TableBackupStatus,
     /// Overall backup status
-    status: []const u8,
+    status: ClusterBackupResponseStatus,
+};
+
+/// Overall restore status
+pub const ClusterRestoreResponseStatus = enum {
+    triggered,
+    partial,
+    failed,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .triggered => "triggered",
+            .partial => "partial",
+            .failed => "failed",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "triggered", .triggered },
+            .{ "partial", .partial },
+            .{ "failed", .failed },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 pub const ClusterRestoreResponse = struct {
     /// Status of each table restore
     tables: []const TableRestoreStatus,
     /// Overall restore status
-    status: []const u8,
+    status: ClusterRestoreResponseStatus,
 };
 
 pub const BackupListResponse = struct {
@@ -2896,9 +4047,32 @@ pub const TraverseResponse = struct {
     count: ?i64 = null,
 };
 
+/// Type of the foreign data source. Currently only "postgres" is supported.
+pub const ForeignSourceType = enum {
+    postgres,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .postgres => "postgres",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "postgres", .postgres },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const ForeignSource = struct {
     /// Type of the foreign data source. Currently only "postgres" is supported.
-    type: []const u8,
+    type: ForeignSourceType,
     /// Data source name (connection string) for the foreign database. Supports `${secret:key_name}` references that resolve from the Antfly keystore or environment variables.
     dsn: []const u8,
     /// Name of the table or view in the foreign PostgreSQL database to query.
@@ -2983,9 +4157,35 @@ pub const Transform = struct {
     upsert: ?bool = null,
 };
 
+/// Whether the transaction was committed or aborted due to a conflict
+pub const TransactionSessionCommitResponseStatus = enum {
+    committed,
+    aborted,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .committed => "committed",
+            .aborted => "aborted",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "committed", .committed },
+            .{ "aborted", .aborted },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const TransactionSessionCommitResponse = struct {
     /// Whether the transaction was committed or aborted due to a conflict
-    status: []const u8,
+    status: TransactionSessionCommitResponseStatus,
     /// Details about the conflict that caused an abort (only present when status is "aborted")
     conflict: ?std.json.Value = null,
     /// Per-table batch results (only present when status is "committed")
@@ -3029,8 +4229,17 @@ pub const RowsWhereBranch = union(enum) {
     rows_where_branch_atom: *RowsWhereBranchAtom,
     rows_where_branch_all: *RowsWhereBranchAll,
 
+    fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
+        const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
+        defer allocator.free(encoded);
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.UnexpectedToken,
+        };
+    }
+
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+        const parsed = parseUnionVariantFromValue(T, allocator, source, options) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return null,
         };
@@ -3138,9 +4347,32 @@ pub const QueryHit = struct {
     _sort: ?[]const []const u8 = null,
 };
 
+/// Type of the replication source. Currently only "postgres" is supported.
+pub const ReplicationSourceType = enum {
+    postgres,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .postgres => "postgres",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "postgres", .postgres },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const ReplicationSource = struct {
     /// Type of the replication source. Currently only "postgres" is supported.
-    type: []const u8,
+    type: ReplicationSourceType,
     /// Data source name (connection string) for the PostgreSQL database. Supports `${secret:key_name}` references that resolve from the Antfly keystore or environment variables. Requires `wal_level=logical` on the source.
     dsn: []const u8,
     /// Name of the table in the PostgreSQL database to replicate from.
@@ -3226,8 +4458,17 @@ pub const RowsGetResultSet = struct {
 
 /// Canonical row predicate tree. A top-level `where` is one predicate atom, an `all` conjunction of atoms, `any` / `not` branch groups, or an `all` conjunction plus branch groups. Branches may contain scalar, membership, array, JSON, and text-pattern atoms; the server stores branches containing structured atoms in native mixed access predicate groups and keeps scalar-only branches in scalar predicate groups.
 pub const RowsWhere = union(enum) {
+    fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
+        const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
+        defer allocator.free(encoded);
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.UnexpectedToken,
+        };
+    }
+
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+        const parsed = parseUnionVariantFromValue(T, allocator, source, options) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return null,
         };
@@ -3254,6 +4495,32 @@ pub const RowsWhere = union(enum) {
     }
 
     pub fn jsonStringify(_: @This(), _: anytype) !void {}
+};
+
+/// Strategy for merging graph results with search results: - union: Include nodes from both search and graph results - intersection: Only include nodes appearing in both
+pub const QueryRequestExpandStrategy = enum {
+    @"union",
+    intersection,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .@"union" => "union",
+            .intersection => "intersection",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "union", .@"union" },
+            .{ "intersection", .intersection },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 pub const QueryRequest = struct {
@@ -3311,7 +4578,7 @@ pub const QueryRequest = struct {
     /// Declarative graph queries to execute after full-text/vector searches. Results can reference search results using node selectors like $full_text_results.
     graph_searches: ?std.json.ArrayHashMap(antfly_indexes_openapi.GraphQuery) = null,
     /// Strategy for merging graph results with search results: - union: Include nodes from both search and graph results - intersection: Only include nodes appearing in both
-    expand_strategy: ?[]const u8 = null,
+    expand_strategy: ?QueryRequestExpandStrategy = null,
     /// Optional Handlebars template string for rendering document content in RAG queries. Template has access to document fields via `{{this.fields.fieldName}}`. **Default**: Uses TOON (Token-Oriented Object Notation) format for 30-60% token reduction: ```handlebars {{encodeToon this.fields}} ``` **Available Helpers**: - `encodeToon` - Renders fields in compact TOON format with configurable options: - `lengthMarker` (bool): Add # prefix to array counts (default: true) - `indent` (int): Indentation spacing (default: 2) - `delimiter` (string): Field separator for tabular arrays - `scrubHtml` - Removes HTML tags and extracts text - `media` - Wraps data URIs for GenKit multimodal support - `eq` - Equality comparison for conditionals **Examples**: - Basic TOON: `{{encodeToon this.fields}}` - Compact TOON: `{{encodeToon this.fields lengthMarker=false indent=0}}` - Tabular data: `{{encodeToon this.fields delimiter="\t"}}` - Custom template: `Title: {{this.fields.title}}\nBody: {{this.fields.body}}` - Traditional format: `{{#each this.fields}}{{@key}}: {{this}}\n{{/each}}` TOON format produces compact, LLM-optimized output like: ``` title: Introduction to Vector Search author: Jane Doe tags[#3]: ai,search,ml ``` **References**: - TOON Specification: https://github.com/toon-format/toon - Go Implementation: https://github.com/alpkeskin/gotoon
     document_renderer: ?[]const u8 = null,
     /// Optional result pruning configuration to filter low-relevance results. Pruning helps detect "elbows" in score distributions and removes results that are significantly worse than top matches. **Common patterns:** - RAG queries: Use `max_score_gap_percent: 30` to stop at quality drop-offs - Strict matching: Use `min_score_ratio: 0.7` for high-quality results only - Combine both for best results Example: ```json { "min_score_ratio": 0.5, "max_score_gap_percent": 25.0, "min_absolute_score": 0.3 } ```
@@ -3453,6 +4720,32 @@ pub const TransactionCommitRequest = struct {
     sync_level: ?SyncLevel = null,
 };
 
+/// Strategy for merging graph results with search results: - union: Include nodes from both search and graph results - intersection: Only include nodes appearing in both
+pub const RetrievalQueryRequestExpandStrategy = enum {
+    @"union",
+    intersection,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .@"union" => "union",
+            .intersection => "intersection",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "union", .@"union" },
+            .{ "intersection", .intersection },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// A query in the retrieval pipeline. Extends QueryRequest with an optional tree search configuration. Each query specifies its own table. When both search fields (semantic_search, full_text_search) and tree_search are provided, the search results are used as start nodes for tree navigation.
 pub const RetrievalQueryRequest = struct {
     /// Name of the table to query. Optional for global queries.
@@ -3509,7 +4802,7 @@ pub const RetrievalQueryRequest = struct {
     /// Declarative graph queries to execute after full-text/vector searches. Results can reference search results using node selectors like $full_text_results.
     graph_searches: ?std.json.ArrayHashMap(antfly_indexes_openapi.GraphQuery) = null,
     /// Strategy for merging graph results with search results: - union: Include nodes from both search and graph results - intersection: Only include nodes appearing in both
-    expand_strategy: ?[]const u8 = null,
+    expand_strategy: ?RetrievalQueryRequestExpandStrategy = null,
     /// Optional Handlebars template string for rendering document content in RAG queries. Template has access to document fields via `{{this.fields.fieldName}}`. **Default**: Uses TOON (Token-Oriented Object Notation) format for 30-60% token reduction: ```handlebars {{encodeToon this.fields}} ``` **Available Helpers**: - `encodeToon` - Renders fields in compact TOON format with configurable options: - `lengthMarker` (bool): Add # prefix to array counts (default: true) - `indent` (int): Indentation spacing (default: 2) - `delimiter` (string): Field separator for tabular arrays - `scrubHtml` - Removes HTML tags and extracts text - `media` - Wraps data URIs for GenKit multimodal support - `eq` - Equality comparison for conditionals **Examples**: - Basic TOON: `{{encodeToon this.fields}}` - Compact TOON: `{{encodeToon this.fields lengthMarker=false indent=0}}` - Tabular data: `{{encodeToon this.fields delimiter="\t"}}` - Custom template: `Title: {{this.fields.title}}\nBody: {{this.fields.body}}` - Traditional format: `{{#each this.fields}}{{@key}}: {{this}}\n{{/each}}` TOON format produces compact, LLM-optimized output like: ``` title: Introduction to Vector Search author: Jane Doe tags[#3]: ai,search,ml ``` **References**: - TOON Specification: https://github.com/toon-format/toon - Go Implementation: https://github.com/alpkeskin/gotoon
     document_renderer: ?[]const u8 = null,
     /// Optional result pruning configuration to filter low-relevance results. Pruning helps detect "elbows" in score distributions and removes results that are significantly worse than top matches. **Common patterns:** - RAG queries: Use `max_score_gap_percent: 30` to stop at quality drop-offs - Strict matching: Use `min_score_ratio: 0.7` for high-quality results only - Combine both for best results Example: ```json { "min_score_ratio": 0.5, "max_score_gap_percent": 25.0, "min_absolute_score": 0.3 } ```
@@ -3737,10 +5030,35 @@ pub const RowsConflictTarget = struct {
     }
 };
 
+pub const RowsOnConflictAction = enum {
+    update,
+    nothing,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .update => "update",
+            .nothing => "nothing",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "update", .update },
+            .{ "nothing", .nothing },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Typed conflict action for insert operations. `nothing` skips the insert when the target already exists. `update` applies the same typed update operators as ordinary row updates, with expression sources allowed to reference `existing` and `proposed` row images.
 pub const RowsOnConflict = struct {
     target: RowsConflictTarget,
-    action: []const u8,
+    action: RowsOnConflictAction,
     patch: ?RowsFieldPatch = null,
     increment: ?RowsNumericIncrement = null,
     patch_expr: ?RowsExpressionAssignmentMap = null,
@@ -3750,9 +5068,40 @@ pub const RowsOnConflict = struct {
     where_expression: ?RowsExpressionCondition = null,
 };
 
+pub const RowOperationOp = enum {
+    insert,
+    upsert,
+    update,
+    delete,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .insert => "insert",
+            .upsert => "upsert",
+            .update => "update",
+            .delete => "delete",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "insert", .insert },
+            .{ "upsert", .upsert },
+            .{ "update", .update },
+            .{ "delete", .delete },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Structured relational row mutation. `insert` fails if the primary identity already exists, `upsert` overwrites or creates, `update` applies a non-upsert patch by primary or unique identity, and `delete` removes by primary or unique identity. `update.patch` cannot change primary-key components. Missing unique selectors fail the write request rather than falling back to scans. The operation envelope is exact and operation-specific: unsupported fields for the selected `op` fail validation instead of being ignored.
 pub const RowOperation = struct {
-    op: []const u8,
+    op: RowOperationOp,
     /// Full row document for insert/upsert. Must include primary-key columns.
     row: ?RowsRowDocument = null,
     where: ?RowSelector = null,
@@ -3777,9 +5126,34 @@ pub const RowsBatchRequest = struct {
     sync_level: ?SyncLevel = null,
 };
 
+pub const RowsMutationSourceRequestOp = enum {
+    update,
+    delete,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .update => "update",
+            .delete => "delete",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "update", .update },
+            .{ "delete", .delete },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Typed relational mutation-source plan. The `source` is a lockable base row-query request with `row_claim.transaction_id` and no `source_cte` or `doc_key_range`; update/delete intents are staged into that transaction using committed-version predicates from the selected preimages. Claims over physical ranges, CTEs, joins, aggregates, windows, and lateral outputs are rejected until those stages expose an explicit lockable base-row contract.
 pub const RowsMutationSourceRequest = struct {
-    op: []const u8,
+    op: RowsMutationSourceRequestOp,
     source: RowsQueryRequest,
     /// Top-level static field patch for update operations.
     patch: ?RowsFieldPatch = null,
@@ -3809,9 +5183,31 @@ pub const RowsInsertSourceAssignment = struct {
     expr: RowsExpression,
 };
 
+pub const RowsInsertSourceRequestOp = enum {
+    insert,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .insert => "insert",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "insert", .insert },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Typed relational insert-source plan. The `source` is a read-only row query over `source_table` or, when omitted, the target table named in the path. Each selected source row is projected through `assignments` into a target insert row, then optional conflict handling and `RETURNING` projection run through the same row-batch semantics as ordinary inserts. Execution is fail-closed until the storage/runtime layer implements source-to-target routing, duplicate-target detection, and owner-local insert staging for this native plan.
 pub const RowsInsertSourceRequest = struct {
-    op: []const u8,
+    op: RowsInsertSourceRequestOp,
     /// Optional source table name. Omit or set to the target table for same-table insert-source plans; cross-table execution requires routed source/target ownership support.
     source_table: ?[]const u8 = null,
     source: RowsQueryRequest,
@@ -3824,12 +5220,62 @@ pub const RowsInsertSourceRequest = struct {
     returning_expressions: ?[]const RowsExpressionProjection = null,
 };
 
+pub const RowsJoinedMutationSourceRequestOp = enum {
+    update,
+    delete,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .update => "update",
+            .delete => "delete",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "update", .update },
+            .{ "delete", .delete },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const RowsJoinedMutationSourceRequestTargetSide = enum {
+    left,
+    right,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .left => "left",
+            .right => "right",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "left", .left },
+            .{ "right", .right },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Typed relational joined mutation-source plan. The target side of the `join` must carry a lockable `row_claim.transaction_id`; the non-target side is read-only input. Update plans can copy same-typed values from the source side through `source_assignments` and can apply target-local patches or expression assignments. Delete plans reject update assignments. Execution must stage intents only for claimed target rows.
 pub const RowsJoinedMutationSourceRequest = struct {
-    op: []const u8,
+    op: RowsJoinedMutationSourceRequestOp,
     /// Optional source table name for cross-table joined mutation-source plans. Omit or set to the target table for same-table joined mutation sources. Catalog-routed execution reads source rows through the source table's owner ranges and stages only target-row intents through the target table's owner ranges.
     source_table: ?[]const u8 = null,
-    target_side: []const u8,
+    target_side: RowsJoinedMutationSourceRequestTargetSide,
     join: RowsJoinRequest,
     /// Post-match computed predicates over the target row and joined source row. Unqualified fields bind to the target row; fields with `source: source` bind to the source row.
     match_expression_where: ?[]const RowsExpressionCondition = null,
@@ -3860,8 +5306,17 @@ pub const RowsQueryOrder = union(enum) {
     rows_query_order_expression: *RowsQueryOrderExpression,
     rows_query_order_field: *RowsQueryOrderField,
 
+    fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
+        const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
+        defer allocator.free(encoded);
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.UnexpectedToken,
+        };
+    }
+
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+        const parsed = parseUnionVariantFromValue(T, allocator, source, options) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return null,
         };
@@ -3909,11 +5364,61 @@ pub const RowsQueryOrder = union(enum) {
     }
 };
 
+pub const RowsQueryOrderExpressionNullTest = enum {
+    is_null,
+    is_not_null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .is_null => "is_null",
+            .is_not_null => "is_not_null",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "is_null", .is_null },
+            .{ "is_not_null", .is_not_null },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const RowsQueryOrderExpressionDirection = enum {
+    asc,
+    desc,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .asc => "asc",
+            .desc => "desc",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "asc", .asc },
+            .{ "desc", .desc },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const RowsQueryOrderExpression = struct {
     /// Typed row-expression AST for computed ordering. Mutually exclusive with `field`.
     expr: RowsExpression,
-    null_test: ?[]const u8 = null,
-    direction: ?[]const u8 = null,
+    null_test: ?RowsQueryOrderExpressionNullTest = null,
+    direction: ?RowsQueryOrderExpressionDirection = null,
 };
 
 /// Shared typed row-expression AST. A node is exactly one of `{ "field": "name" }`, `{ "value": ... }`, or an operator node such as `{ "op": "lower", "args": [{ "field": "email" }] }`. Supported operators are the shared row-local expression surface used by schema predicates, mutation expressions, query projections, filters, grouping, ordering, and SQL lowering. Mutation expressions may set `source` to `existing` or `proposed`; query expressions use the default row source.
@@ -3922,8 +5427,17 @@ pub const RowsExpression = union(enum) {
     rows_expression_field: *RowsExpressionField,
     rows_expression_value: *RowsExpressionValue,
 
+    fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
+        const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
+        defer allocator.free(encoded);
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.UnexpectedToken,
+        };
+    }
+
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+        const parsed = parseUnionVariantFromValue(T, allocator, source, options) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return null,
         };
@@ -3980,12 +5494,342 @@ pub const RowsExpression = union(enum) {
     }
 };
 
+pub const RowsExpressionOperatorOp = enum {
+    now,
+    coalesce,
+    lower,
+    upper,
+    trim,
+    btrim,
+    ltrim,
+    rtrim,
+    replace,
+    translate,
+    substring,
+    substr,
+    overlay,
+    split_part,
+    strpos,
+    left,
+    right,
+    lpad,
+    rpad,
+    repeat,
+    reverse,
+    starts_with,
+    ends_with,
+    ascii,
+    chr,
+    md5,
+    like,
+    ilike,
+    bool_and,
+    @"and",
+    bool_or,
+    @"or",
+    bool_not,
+    not,
+    concat,
+    concat_ws,
+    length,
+    char_length,
+    character_length,
+    octet_length,
+    nullif,
+    greatest,
+    least,
+    abs,
+    round,
+    trunc,
+    floor,
+    ceil,
+    sqrt,
+    sign,
+    power,
+    add,
+    sub,
+    mul,
+    div,
+    mod,
+    interval_ns,
+    interval_months,
+    date_trunc,
+    date_bin,
+    date_part,
+    extract,
+    cast,
+    json_extract,
+    json_extract_path,
+    json_extract_path_text,
+    jsonb_extract_path,
+    jsonb_extract_path_text,
+    json_typeof,
+    jsonb_typeof,
+    json_array_length,
+    jsonb_array_length,
+    array_length,
+    cardinality,
+    array_position,
+    array_positions,
+    array_append,
+    array_prepend,
+    array_cat,
+    array_remove,
+    array_replace,
+    array_to_string,
+    string_to_array,
+    uuid_v4,
+    gen_random_uuid,
+    uuid_generate_v4,
+    json_build_object,
+    jsonb_build_object,
+    to_jsonb,
+    json_path_exists,
+    regexp_replace,
+    case,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .now => "now",
+            .coalesce => "coalesce",
+            .lower => "lower",
+            .upper => "upper",
+            .trim => "trim",
+            .btrim => "btrim",
+            .ltrim => "ltrim",
+            .rtrim => "rtrim",
+            .replace => "replace",
+            .translate => "translate",
+            .substring => "substring",
+            .substr => "substr",
+            .overlay => "overlay",
+            .split_part => "split_part",
+            .strpos => "strpos",
+            .left => "left",
+            .right => "right",
+            .lpad => "lpad",
+            .rpad => "rpad",
+            .repeat => "repeat",
+            .reverse => "reverse",
+            .starts_with => "starts_with",
+            .ends_with => "ends_with",
+            .ascii => "ascii",
+            .chr => "chr",
+            .md5 => "md5",
+            .like => "like",
+            .ilike => "ilike",
+            .bool_and => "bool_and",
+            .@"and" => "and",
+            .bool_or => "bool_or",
+            .@"or" => "or",
+            .bool_not => "bool_not",
+            .not => "not",
+            .concat => "concat",
+            .concat_ws => "concat_ws",
+            .length => "length",
+            .char_length => "char_length",
+            .character_length => "character_length",
+            .octet_length => "octet_length",
+            .nullif => "nullif",
+            .greatest => "greatest",
+            .least => "least",
+            .abs => "abs",
+            .round => "round",
+            .trunc => "trunc",
+            .floor => "floor",
+            .ceil => "ceil",
+            .sqrt => "sqrt",
+            .sign => "sign",
+            .power => "power",
+            .add => "add",
+            .sub => "sub",
+            .mul => "mul",
+            .div => "div",
+            .mod => "mod",
+            .interval_ns => "interval_ns",
+            .interval_months => "interval_months",
+            .date_trunc => "date_trunc",
+            .date_bin => "date_bin",
+            .date_part => "date_part",
+            .extract => "extract",
+            .cast => "cast",
+            .json_extract => "json_extract",
+            .json_extract_path => "json_extract_path",
+            .json_extract_path_text => "json_extract_path_text",
+            .jsonb_extract_path => "jsonb_extract_path",
+            .jsonb_extract_path_text => "jsonb_extract_path_text",
+            .json_typeof => "json_typeof",
+            .jsonb_typeof => "jsonb_typeof",
+            .json_array_length => "json_array_length",
+            .jsonb_array_length => "jsonb_array_length",
+            .array_length => "array_length",
+            .cardinality => "cardinality",
+            .array_position => "array_position",
+            .array_positions => "array_positions",
+            .array_append => "array_append",
+            .array_prepend => "array_prepend",
+            .array_cat => "array_cat",
+            .array_remove => "array_remove",
+            .array_replace => "array_replace",
+            .array_to_string => "array_to_string",
+            .string_to_array => "string_to_array",
+            .uuid_v4 => "uuid_v4",
+            .gen_random_uuid => "gen_random_uuid",
+            .uuid_generate_v4 => "uuid_generate_v4",
+            .json_build_object => "json_build_object",
+            .jsonb_build_object => "jsonb_build_object",
+            .to_jsonb => "to_jsonb",
+            .json_path_exists => "json_path_exists",
+            .regexp_replace => "regexp_replace",
+            .case => "case",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "now", .now },
+            .{ "coalesce", .coalesce },
+            .{ "lower", .lower },
+            .{ "upper", .upper },
+            .{ "trim", .trim },
+            .{ "btrim", .btrim },
+            .{ "ltrim", .ltrim },
+            .{ "rtrim", .rtrim },
+            .{ "replace", .replace },
+            .{ "translate", .translate },
+            .{ "substring", .substring },
+            .{ "substr", .substr },
+            .{ "overlay", .overlay },
+            .{ "split_part", .split_part },
+            .{ "strpos", .strpos },
+            .{ "left", .left },
+            .{ "right", .right },
+            .{ "lpad", .lpad },
+            .{ "rpad", .rpad },
+            .{ "repeat", .repeat },
+            .{ "reverse", .reverse },
+            .{ "starts_with", .starts_with },
+            .{ "ends_with", .ends_with },
+            .{ "ascii", .ascii },
+            .{ "chr", .chr },
+            .{ "md5", .md5 },
+            .{ "like", .like },
+            .{ "ilike", .ilike },
+            .{ "bool_and", .bool_and },
+            .{ "and", .@"and" },
+            .{ "bool_or", .bool_or },
+            .{ "or", .@"or" },
+            .{ "bool_not", .bool_not },
+            .{ "not", .not },
+            .{ "concat", .concat },
+            .{ "concat_ws", .concat_ws },
+            .{ "length", .length },
+            .{ "char_length", .char_length },
+            .{ "character_length", .character_length },
+            .{ "octet_length", .octet_length },
+            .{ "nullif", .nullif },
+            .{ "greatest", .greatest },
+            .{ "least", .least },
+            .{ "abs", .abs },
+            .{ "round", .round },
+            .{ "trunc", .trunc },
+            .{ "floor", .floor },
+            .{ "ceil", .ceil },
+            .{ "sqrt", .sqrt },
+            .{ "sign", .sign },
+            .{ "power", .power },
+            .{ "add", .add },
+            .{ "sub", .sub },
+            .{ "mul", .mul },
+            .{ "div", .div },
+            .{ "mod", .mod },
+            .{ "interval_ns", .interval_ns },
+            .{ "interval_months", .interval_months },
+            .{ "date_trunc", .date_trunc },
+            .{ "date_bin", .date_bin },
+            .{ "date_part", .date_part },
+            .{ "extract", .extract },
+            .{ "cast", .cast },
+            .{ "json_extract", .json_extract },
+            .{ "json_extract_path", .json_extract_path },
+            .{ "json_extract_path_text", .json_extract_path_text },
+            .{ "jsonb_extract_path", .jsonb_extract_path },
+            .{ "jsonb_extract_path_text", .jsonb_extract_path_text },
+            .{ "json_typeof", .json_typeof },
+            .{ "jsonb_typeof", .jsonb_typeof },
+            .{ "json_array_length", .json_array_length },
+            .{ "jsonb_array_length", .jsonb_array_length },
+            .{ "array_length", .array_length },
+            .{ "cardinality", .cardinality },
+            .{ "array_position", .array_position },
+            .{ "array_positions", .array_positions },
+            .{ "array_append", .array_append },
+            .{ "array_prepend", .array_prepend },
+            .{ "array_cat", .array_cat },
+            .{ "array_remove", .array_remove },
+            .{ "array_replace", .array_replace },
+            .{ "array_to_string", .array_to_string },
+            .{ "string_to_array", .string_to_array },
+            .{ "uuid_v4", .uuid_v4 },
+            .{ "gen_random_uuid", .gen_random_uuid },
+            .{ "uuid_generate_v4", .uuid_generate_v4 },
+            .{ "json_build_object", .json_build_object },
+            .{ "jsonb_build_object", .jsonb_build_object },
+            .{ "to_jsonb", .to_jsonb },
+            .{ "json_path_exists", .json_path_exists },
+            .{ "regexp_replace", .regexp_replace },
+            .{ "case", .case },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Cast target for `cast`.
+pub const RowsExpressionOperatorTo = enum {
+    text,
+    numeric,
+    bool,
+    boolean,
+    datetime,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .text => "text",
+            .numeric => "numeric",
+            .bool => "bool",
+            .boolean => "boolean",
+            .datetime => "datetime",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "text", .text },
+            .{ "numeric", .numeric },
+            .{ "bool", .bool },
+            .{ "boolean", .boolean },
+            .{ "datetime", .datetime },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const RowsExpressionOperator = struct {
-    op: []const u8,
+    op: RowsExpressionOperatorOp,
     /// Operand expressions for operator nodes.
     args: ?[]const RowsExpression = null,
     /// Cast target for `cast`.
-    to: ?[]const u8 = null,
+    to: ?RowsExpressionOperatorTo = null,
     /// Structured JSON path for `json_extract` and `json_path_exists`.
     path: ?std.json.Value = null,
     /// Return JSON path extraction as text.
@@ -4001,10 +5845,59 @@ pub const RowsExpressionCaseBranch = struct {
     then: RowsExpression,
 };
 
+pub const RowsExpressionConditionOp = enum {
+    is_null,
+    is_not_null,
+    is_distinct,
+    is_not_distinct,
+    eq,
+    ne,
+    gt,
+    gte,
+    lt,
+    lte,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .is_null => "is_null",
+            .is_not_null => "is_not_null",
+            .is_distinct => "is_distinct",
+            .is_not_distinct => "is_not_distinct",
+            .eq => "eq",
+            .ne => "ne",
+            .gt => "gt",
+            .gte => "gte",
+            .lt => "lt",
+            .lte => "lte",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "is_null", .is_null },
+            .{ "is_not_null", .is_not_null },
+            .{ "is_distinct", .is_distinct },
+            .{ "is_not_distinct", .is_not_distinct },
+            .{ "eq", .eq },
+            .{ "ne", .ne },
+            .{ "gt", .gt },
+            .{ "gte", .gte },
+            .{ "lt", .lt },
+            .{ "lte", .lte },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Computed expression predicate over the shared row-expression AST.
 pub const RowsExpressionCondition = struct {
     lhs: RowsExpression,
-    op: []const u8,
+    op: RowsExpressionConditionOp,
     rhs: ?RowsExpression = null,
 };
 
@@ -4020,6 +5913,35 @@ pub const RowsExpressionArrayContainsPredicate = struct {
 pub const RowsExpressionProjection = struct {
     as: []const u8,
     expr: RowsExpression,
+};
+
+/// Controls total counting for paged reads. `exact` scans all matches and returns an exact total. `bounded` may stop after the requested page and report a lower-bound total. `none` may omit work needed only for totals.
+pub const RowsQueryRequestTotalMode = enum {
+    exact,
+    bounded,
+    none,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .exact => "exact",
+            .bounded => "bounded",
+            .none => "none",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "exact", .exact },
+            .{ "bounded", .bounded },
+            .{ "none", .none },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// Typed relational row-query plan. Predicate and expression arrays carry Antfly row-expression AST nodes; SQL syntax is adapter sugar over this native request shape.
@@ -4050,6 +5972,8 @@ pub const RowsQueryRequest = struct {
     order_by: ?[]const RowsQueryOrder = null,
     limit: ?i64 = null,
     offset: ?i64 = null,
+    /// Controls total counting for paged reads. `exact` scans all matches and returns an exact total. `bounded` may stop after the requested page and report a lower-bound total. `none` may omit work needed only for totals.
+    total_mode: ?RowsQueryRequestTotalMode = null,
     row_claim: ?RowsRowClaim = null,
     doc_key_range: ?RowsDocKeyRange = null,
 };
@@ -4062,9 +5986,90 @@ pub const RowsCte = struct {
     query: RowsQueryRequest,
 };
 
+pub const RowsAggregateSpecOp = enum {
+    count,
+    sum,
+    min,
+    max,
+    avg,
+    array_agg,
+    string_agg,
+    percentile_cont,
+    percentile_disc,
+    mode,
+    bool_or,
+    bool_and,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .count => "count",
+            .sum => "sum",
+            .min => "min",
+            .max => "max",
+            .avg => "avg",
+            .array_agg => "array_agg",
+            .string_agg => "string_agg",
+            .percentile_cont => "percentile_cont",
+            .percentile_disc => "percentile_disc",
+            .mode => "mode",
+            .bool_or => "bool_or",
+            .bool_and => "bool_and",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "count", .count },
+            .{ "sum", .sum },
+            .{ "min", .min },
+            .{ "max", .max },
+            .{ "avg", .avg },
+            .{ "array_agg", .array_agg },
+            .{ "string_agg", .string_agg },
+            .{ "percentile_cont", .percentile_cont },
+            .{ "percentile_disc", .percentile_disc },
+            .{ "mode", .mode },
+            .{ "bool_or", .bool_or },
+            .{ "bool_and", .bool_and },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Ordered-set sample direction for percentile_cont and percentile_disc; deterministic tie-break direction for mode.
+pub const RowsAggregateSpecPercentileOrder = enum {
+    asc,
+    desc,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .asc => "asc",
+            .desc => "desc",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "asc", .asc },
+            .{ "desc", .desc },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const RowsAggregateSpec = struct {
     name: []const u8,
-    op: []const u8,
+    op: RowsAggregateSpecOp,
     field: ?[]const u8 = null,
     expr: ?RowsExpression = null,
     distinct: ?bool = null,
@@ -4076,7 +6081,7 @@ pub const RowsAggregateSpec = struct {
     /// Maximum bounded per-group sample count for percentile_cont and percentile_disc.
     percentile_max_items: ?i64 = null,
     /// Ordered-set sample direction for percentile_cont and percentile_disc; deterministic tie-break direction for mode.
-    percentile_order: ?[]const u8 = null,
+    percentile_order: ?RowsAggregateSpecPercentileOrder = null,
     array_max_items: ?i64 = null,
     array_order_by: ?[]const RowsQueryOrder = null,
     /// Delimiter for string_agg aggregate specs.
@@ -4147,6 +6152,31 @@ pub const RowsWindowRequest = struct {
     offset: ?i64 = null,
 };
 
+pub const RowsJoinRequestJoinType = enum {
+    inner,
+    left,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .inner => "inner",
+            .left => "left",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "inner", .inner },
+            .{ "left", .left },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Typed equality join plan. Each side is a full row-query request and can read an ordered CTE through `source_cte`.
 pub const RowsJoinRequest = struct {
     left: RowsQueryRequest,
@@ -4160,7 +6190,7 @@ pub const RowsJoinRequest = struct {
     match_expression_not: ?[]const RowsExpressionConditionGroup = null,
     /// Post-match computed array-containment predicates over the joined rows.
     match_expression_array_contains: ?[]const RowsExpressionArrayContainsPredicate = null,
-    join_type: ?[]const u8 = null,
+    join_type: ?RowsJoinRequestJoinType = null,
     strategy: ?RowsJoinStrategy = null,
     select: ?[]const RowsJoinProjection = null,
     order_by: ?[]const RowsQueryOrder = null,
@@ -4195,8 +6225,17 @@ pub const RowsPlanRequest = union(enum) {
     rows_query_plan_request: *RowsQueryPlanRequest,
     rows_window_plan_request: *RowsWindowPlanRequest,
 
+    fn parseUnionVariantFromValue(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !T {
+        const encoded = try std.json.Stringify.valueAlloc(allocator, source, .{});
+        defer allocator.free(encoded);
+        return std.json.parseFromSliceLeaky(T, allocator, encoded, options) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.UnexpectedToken,
+        };
+    }
+
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+        const parsed = parseUnionVariantFromValue(T, allocator, source, options) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return null,
         };

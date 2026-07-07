@@ -43,6 +43,7 @@ pub const DocumentSqlReadPlanExpectationJson = struct {
     having: ?usize = null,
     order_by: ?[]const u8 = null,
     limit: ?u32 = null,
+    filter_query_json: ?[]const u8 = null,
     native_query_json: ?[]const u8 = null,
     residual_filter_json: ?[]const u8 = null,
     filter_query_contains: []const []const u8 = &.{},
@@ -124,9 +125,11 @@ pub fn parseDocumentSqlCorpusAlloc(alloc: std.mem.Allocator) !std.json.Parsed(Do
 pub const ExpectedError = enum {
     DocumentSqlBoundedScanUnsupportedResidual,
     DocumentSqlBoundedScanPolicyRequired,
+    DocumentSqlBoundedScanIncompleteTopK,
     DocumentSqlIndexUnavailable,
     DocumentSqlNativeSearchRequiresTableFunction,
     DocumentSqlLateralRequiresNativeProducer,
+    DocumentSqlUnsupportedJoin,
     DocumentSqlUnnestUnsupported,
     DocumentSqlUnnestRequiresArray,
     UnsupportedSqlShape,
@@ -153,9 +156,11 @@ pub const ExpectedError = enum {
 pub fn errorFromName(name: []const u8) !ExpectedError {
     if (std.mem.eql(u8, name, "DocumentSqlBoundedScanUnsupportedResidual")) return .DocumentSqlBoundedScanUnsupportedResidual;
     if (std.mem.eql(u8, name, "DocumentSqlBoundedScanPolicyRequired")) return .DocumentSqlBoundedScanPolicyRequired;
+    if (std.mem.eql(u8, name, "DocumentSqlBoundedScanIncompleteTopK")) return .DocumentSqlBoundedScanIncompleteTopK;
     if (std.mem.eql(u8, name, "DocumentSqlIndexUnavailable")) return .DocumentSqlIndexUnavailable;
     if (std.mem.eql(u8, name, "DocumentSqlNativeSearchRequiresTableFunction")) return .DocumentSqlNativeSearchRequiresTableFunction;
     if (std.mem.eql(u8, name, "DocumentSqlLateralRequiresNativeProducer")) return .DocumentSqlLateralRequiresNativeProducer;
+    if (std.mem.eql(u8, name, "DocumentSqlUnsupportedJoin")) return .DocumentSqlUnsupportedJoin;
     if (std.mem.eql(u8, name, "DocumentSqlUnnestUnsupported")) return .DocumentSqlUnnestUnsupported;
     if (std.mem.eql(u8, name, "DocumentSqlUnnestRequiresArray")) return .DocumentSqlUnnestRequiresArray;
     if (std.mem.eql(u8, name, "UnsupportedSqlShape")) return .UnsupportedSqlShape;
@@ -184,9 +189,11 @@ pub fn errorValue(expected: ExpectedError) anyerror {
     return switch (expected) {
         .DocumentSqlBoundedScanUnsupportedResidual => error.DocumentSqlBoundedScanUnsupportedResidual,
         .DocumentSqlBoundedScanPolicyRequired => error.DocumentSqlBoundedScanPolicyRequired,
+        .DocumentSqlBoundedScanIncompleteTopK => error.DocumentSqlBoundedScanIncompleteTopK,
         .DocumentSqlIndexUnavailable => error.DocumentSqlIndexUnavailable,
         .DocumentSqlNativeSearchRequiresTableFunction => error.DocumentSqlNativeSearchRequiresTableFunction,
         .DocumentSqlLateralRequiresNativeProducer => error.DocumentSqlLateralRequiresNativeProducer,
+        .DocumentSqlUnsupportedJoin => error.DocumentSqlUnsupportedJoin,
         .DocumentSqlUnnestUnsupported => error.DocumentSqlUnnestUnsupported,
         .DocumentSqlUnnestRequiresArray => error.DocumentSqlUnnestRequiresArray,
         .UnsupportedSqlShape => error.UnsupportedSqlShape,

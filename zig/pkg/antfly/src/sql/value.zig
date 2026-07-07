@@ -355,7 +355,7 @@ pub fn parseSqlColumnValueAlloc(
     return error.UnsupportedSqlShape;
 }
 
-fn boundSqlColumnValueJsonAlloc(
+pub fn boundSqlColumnValueJsonAlloc(
     alloc: std.mem.Allocator,
     value: SqlValue,
     column: runtime_schema.RelationalColumn,

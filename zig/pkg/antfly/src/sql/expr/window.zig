@@ -1284,8 +1284,7 @@ fn validateGeneratedWindowFunctionArgumentPayloads(
     if (expression.argument_items.count < bounds.min or expression.argument_items.count > bounds.max) return error.UnsupportedSqlShape;
     if (expression.argument_items.count == 0) return error.UnsupportedSqlShape;
     if (expression.argument_items.items.len != expression.argument_items.count or expression.argument_items.expressions.len != expression.argument_items.count) return error.UnsupportedSqlShape;
-    if (!expr_generated.generatedTokenRangeEqual(expression.argument_items.first_tokens orelse return error.UnsupportedSqlShape, expression.argument_items.items[0])) return error.UnsupportedSqlShape;
-    if (!expr_generated.generatedTokenRangeEqual(expression.argument_items.last_tokens orelse return error.UnsupportedSqlShape, expression.argument_items.items[expression.argument_items.count - 1])) return error.UnsupportedSqlShape;
+    try validateGeneratedExpressionListForClause(tokens, value_tokens, expression.argument_items);
 }
 
 fn validateGeneratedCountStarArgumentList(
@@ -1825,6 +1824,7 @@ pub fn parseWindowSpecAlloc(
     } else parsed_function;
     try parser.expectToken(tokens, pos, .lparen);
     const argument_start = pos.*;
+    const value_expression_start = pos.*;
     const value_expression: ?db_mod.types.RelationalRowsExpression = switch (function) {
         .row_number, .rank, .dense_rank, .percent_rank, .cume_dist, .ntile => null,
         .lag, .lead, .first_value, .last_value, .nth_value => try expr_row_parse.parseRowExpressionAlloc(alloc, tokens, pos, type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks),
@@ -1835,6 +1835,16 @@ pub fn parseWindowSpecAlloc(
     var value_expression_transferred = false;
     errdefer if (!value_expression_transferred) if (value_expression) |expression| freeExpression(alloc, expression);
     if (value_expression) |expression| {
+        if (options.generated_expression_ast) |generated_expression| {
+            if (generated_expression.argument_items.expressions.len == 0) return error.UnsupportedSqlShape;
+            try expr_generated_validate.validateGeneratedRowExpressionIdentityStrict(
+                tokens,
+                value_expression_start,
+                pos.*,
+                expression,
+                &generated_expression.argument_items.expressions[0],
+            );
+        }
         switch (function) {
             .sum, .avg => try type_context.validateNumericRowExpression(expression),
             .min, .max => try expr_type.validateAggregateMinMaxRowExpression(type_context, expression),
