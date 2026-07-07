@@ -7215,6 +7215,24 @@ fn sortedSegmentDocMembershipDocNumsAlloc(
     return try out.toOwnedSlice(alloc);
 }
 
+fn sortedSegmentConstraintsAreEmpty(constraints: *const NativeDocIdConstraints) bool {
+    return !constraints.positive_filter and
+        constraints.filter_doc_ids.len == 0 and
+        constraints.filter_doc_nums.len == 0 and
+        constraints.exclude_doc_ids.len == 0 and
+        constraints.exclude_doc_nums.len == 0;
+}
+
+fn sortedSegmentConstraintsAreKnownEmpty(constraints: *const NativeDocIdConstraints) bool {
+    return constraints.positive_filter and constraints.filter_doc_ids.len == 0 and constraints.filter_doc_nums.len == 0;
+}
+
+fn sortedSegmentLiveDocCount(snapshot: *const index_mod.IndexSnapshot) usize {
+    var count: usize = 0;
+    for (snapshot.segments) |*segment| count +|= segment.liveDocCount();
+    return count;
+}
+
 fn decorateSortedSegmentDocAlloc(
     alloc: Allocator,
     req: types.SearchRequest,
@@ -7490,6 +7508,86 @@ fn nextSortedSegmentHeadAlloc(
     return null;
 }
 
+fn countSortedSegmentVisibleCandidatesAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: MatchAllExecutor,
+    constraints: *const NativeDocIdConstraints,
+    text_entry: *index_manager_mod.IndexManager.TextIndex,
+    plan: SortExecutionPlan,
+    native_loader: NativeSortValueLoader,
+    membership: ?*const SortedSegmentDocMembership,
+    profile: ?*SortCollectorProfile,
+) !usize {
+    if (sortedSegmentConstraintsAreKnownEmpty(constraints)) return 0;
+
+    const snapshot = text_entry.persistent.snapshot();
+    const cursor = activeSortCursor(req);
+    if (cursor.len == 0 and
+        membership == null and
+        executor.is_expired_key == null and
+        sortedSegmentConstraintsAreEmpty(constraints))
+    {
+        return sortedSegmentLiveDocCount(snapshot);
+    }
+
+    const reverse = req.search_before.len > 0;
+    const scan_budget = sortedSegmentScanBudget();
+    var scanned_count: u64 = 0;
+    if (profile) |p| p.sorted_segment_scan_budget = scan_budget;
+
+    var iterators = std.ArrayListUnmanaged(SortedSegmentIterator).empty;
+    defer iterators.deinit(alloc);
+    var doc_base: u32 = 0;
+    for (snapshot.segments, 0..) |*segment, segment_index| {
+        defer doc_base += segment.reader.doc_count;
+        if (segment.liveDocCount() == 0) continue;
+        var iterator = SortedSegmentIterator{
+            .segment_index = segment_index,
+            .doc_base = doc_base,
+            .next_doc = 0,
+        };
+        iterator.next_doc = try sortedSegmentSeekStartDocAlloc(
+            alloc,
+            req,
+            plan,
+            snapshot,
+            iterator,
+            native_loader,
+            executor.ctx,
+            executor.load_stored,
+            reverse,
+        );
+        if (sortedSegmentIteratorDone(snapshot, iterator, reverse)) continue;
+        try iterators.append(alloc, iterator);
+    }
+
+    var count: usize = 0;
+    for (iterators.items, 0..) |_, iterator_index| {
+        while (try nextSortedSegmentHeadAlloc(
+            alloc,
+            req,
+            plan,
+            snapshot,
+            iterator_index,
+            iterators.items,
+            constraints,
+            membership,
+            executor,
+            native_loader,
+            profile,
+            reverse,
+            &scanned_count,
+            scan_budget,
+        )) |head_value| {
+            var head = head_value;
+            count +|= 1;
+            head.decorated.deinit(alloc);
+        }
+    }
+    return count;
+}
+
 fn appendSortedSegmentSelectedHit(
     alloc: Allocator,
     out: *std.ArrayListUnmanaged(types.SearchHit),
@@ -7537,6 +7635,7 @@ fn sortAndPageMatchAllSortedSegmentsAlloc(
     try validateSortExecutionPlanForRuntime(effective_req, plan, native_loader);
     try checkSearchRequestDeadline(effective_req);
 
+    const snapshot = text_entry.persistent.snapshot();
     const bench_query_profile = shouldLogBenchQueryProfile();
     const collect_sort_profile = bench_query_profile or effective_req.profile;
     if (effective_req.limit == 0) {
@@ -7544,6 +7643,20 @@ fn sortAndPageMatchAllSortedSegmentsAlloc(
         var zero_profile = SortCollectorProfile{};
         zero_profile.window_capacity = 0;
         zero_profile.sorted_segment_scan_budget = sortedSegmentScanBudget();
+        const visible_total = try countSortedSegmentVisibleCandidatesAlloc(
+            alloc,
+            effective_req,
+            executor,
+            constraints,
+            text_entry,
+            plan,
+            native_loader,
+            membership,
+            if (collect_sort_profile) &zero_profile else null,
+        );
+        if (collect_sort_profile) {
+            zero_profile.candidate_count = @intCast(@min(visible_total, @as(usize, std.math.maxInt(u64))));
+        }
         zero_profile.total_ns = if (collect_sort_profile) platform_time.monotonicNs() - zero_start_ns else 0;
         if (bench_query_profile) {
             logBenchSortCollectorProfile(effective_req, plan, true, zero_profile);
@@ -7551,14 +7664,13 @@ fn sortAndPageMatchAllSortedSegmentsAlloc(
         return .{
             .alloc = alloc,
             .hits = &.{},
-            .total_hits = 0,
-            .total_hits_relation = .gte,
+            .total_hits = boundedU32(visible_total),
+            .total_hits_relation = if (visible_total > std.math.maxInt(u32)) .gte else .exact,
             .sort_profile = if (collect_sort_profile) sortResultProfile(effective_req, plan, true, zero_profile) else null,
             .graph_results = &.{},
         };
     }
 
-    const snapshot = text_entry.persistent.snapshot();
     const reverse = effective_req.search_before.len > 0;
     const sort_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
     var profile = SortCollectorProfile{};
@@ -18968,6 +19080,21 @@ test "match_all sorted segment seek merges sorted segments and applies cursors" 
     try std.testing.expectEqualStrings("doc:c", after_page.hits[0].id);
     try std.testing.expectEqualStrings("doc:d", after_page.hits[1].id);
 
+    var after_zero = try sortAndPageMatchAllSortedSegmentsAlloc(alloc, .{
+        .order_by = &order_by,
+        .search_after = &after_cursor,
+        .include_stored = false,
+        .profile = true,
+        .limit = 0,
+    }, executor, &constraints, &text_entry, sorted_plan, native_loader, null);
+    defer after_zero.deinit();
+    try std.testing.expectEqual(@as(usize, 0), after_zero.hits.len);
+    try std.testing.expectEqual(@as(u32, 2), after_zero.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, after_zero.total_hits_relation);
+    const after_zero_profile = after_zero.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("sorted_segment_seek", after_zero_profile.plan);
+    try std.testing.expect(after_zero_profile.sorted_segment_scanned_count > 0);
+
     const before_cursor = [_]std.json.Value{
         .{ .float = 3.0 },
         .{ .string = "doc:c" },
@@ -19010,6 +19137,16 @@ test "match_all sorted segment seek merges sorted segments and applies cursors" 
     try std.testing.expectEqualStrings("doc:b", membership_page.hits[0].id);
     try std.testing.expectEqualStrings("doc:c", membership_page.hits[1].id);
 
+    var membership_zero = try sortAndPageMatchAllSortedSegmentsAlloc(alloc, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 0,
+    }, executor, &constraints, &text_entry, sorted_plan, native_loader, &membership);
+    defer membership_zero.deinit();
+    try std.testing.expectEqual(@as(usize, 0), membership_zero.hits.len);
+    try std.testing.expectEqual(@as(u32, 2), membership_zero.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, membership_zero.total_hits_relation);
+
     const ExpiryHarness = struct {
         expired_checks: usize = 0,
 
@@ -19038,6 +19175,18 @@ test "match_all sorted segment seek merges sorted segments and applies cursors" 
     try std.testing.expectEqualStrings("doc:a", expiring_page.hits[0].id);
     try std.testing.expectEqualStrings("doc:c", expiring_page.hits[1].id);
     try std.testing.expectEqualStrings("doc:d", expiring_page.hits[2].id);
+    try std.testing.expect(expiry_harness.expired_checks >= 4);
+
+    expiry_harness.expired_checks = 0;
+    var expiring_zero = try sortAndPageMatchAllSortedSegmentsAlloc(alloc, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 0,
+    }, expiring_executor, &constraints, &text_entry, sorted_plan, native_loader, null);
+    defer expiring_zero.deinit();
+    try std.testing.expectEqual(@as(usize, 0), expiring_zero.hits.len);
+    try std.testing.expectEqual(@as(u32, 3), expiring_zero.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, expiring_zero.total_hits_relation);
     try std.testing.expect(expiry_harness.expired_checks >= 4);
 
     var filter = doc_set.ResolvedDocFilter{
@@ -20866,9 +21015,11 @@ test "match_all sorted segment seek zero limit returns profile without scanning"
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), result.hits.len);
-    try std.testing.expectEqual(types.TotalHitsRelation.gte, result.total_hits_relation);
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, result.total_hits_relation);
     const profile = result.sort_profile orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("sorted_segment_seek", profile.plan);
+    try std.testing.expectEqual(@as(u64, 1), profile.candidate_count);
     try std.testing.expectEqual(@as(u64, 0), profile.sorted_segment_scanned_count);
     try std.testing.expect(profile.sorted_segment_scan_budget > 0);
 }
