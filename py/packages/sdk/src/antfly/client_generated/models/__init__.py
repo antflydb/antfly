@@ -18,8 +18,13 @@ from .algebraic_aggregation_join import AlgebraicAggregationJoin
 from .algebraic_aggregation_join_kind import AlgebraicAggregationJoinKind
 from .algebraic_index_config import AlgebraicIndexConfig
 from .algebraic_index_stats import AlgebraicIndexStats
+from .algebraic_index_stats_async_indexing import AlgebraicIndexStatsAsyncIndexing
 from .algebraic_index_stats_index_type import AlgebraicIndexStatsIndexType
 from .algebraic_index_stats_planner_last_decision import AlgebraicIndexStatsPlannerLastDecision
+from .algebraic_index_stats_promotion import AlgebraicIndexStatsPromotion
+from .algebraic_index_stats_resolution import AlgebraicIndexStatsResolution
+from .algebraic_index_stats_resolver_replay import AlgebraicIndexStatsResolverReplay
+from .algebraic_index_stats_source_artifact import AlgebraicIndexStatsSourceArtifact
 from .analyses import Analyses
 from .analyses_result import AnalysesResult
 from .answer_agent_result import AnswerAgentResult
@@ -34,12 +39,8 @@ from .anthropic_generator_config import AnthropicGeneratorConfig
 from .api_key import ApiKey
 from .api_key_row_filter_type_0 import ApiKeyRowFilterType0
 from .api_key_with_secret import ApiKeyWithSecret
-from .artifact_repair_issue import ArtifactRepairIssue
-from .artifact_repair_issue_list import ArtifactRepairIssueList
 from .artifact_repair_kind import ArtifactRepairKind
 from .artifact_repair_reason import ArtifactRepairReason
-from .artifact_repair_run_response import ArtifactRepairRunResponse
-from .artifact_repair_run_result import ArtifactRepairRunResult
 from .audio_chunk_options import AudioChunkOptions
 from .auth_subject import AuthSubject
 from .auth_subject_kind import AuthSubjectKind
@@ -154,7 +155,13 @@ from .embedding_type_1 import EmbeddingType1
 from .embedding_type_3 import EmbeddingType3
 from .embeddings_index_config import EmbeddingsIndexConfig
 from .embeddings_index_stats import EmbeddingsIndexStats
+from .embeddings_index_stats_async_indexing import EmbeddingsIndexStatsAsyncIndexing
+from .embeddings_index_stats_enrichment_runtime import EmbeddingsIndexStatsEnrichmentRuntime
+from .embeddings_index_stats_hbc_cache import EmbeddingsIndexStatsHbcCache
+from .embeddings_index_stats_hbc_posting import EmbeddingsIndexStatsHbcPosting
 from .embeddings_index_stats_index_type import EmbeddingsIndexStatsIndexType
+from .embeddings_index_stats_promotion import EmbeddingsIndexStatsPromotion
+from .embeddings_index_stats_resolution import EmbeddingsIndexStatsResolution
 from .enrichment_config import EnrichmentConfig
 from .enrichment_kind import EnrichmentKind
 from .error import Error
@@ -214,7 +221,11 @@ from .foreign_source import ForeignSource
 from .foreign_source_type import ForeignSourceType
 from .full_text_index_config import FullTextIndexConfig
 from .full_text_index_stats import FullTextIndexStats
+from .full_text_index_stats_async_indexing import FullTextIndexStatsAsyncIndexing
 from .full_text_index_stats_index_type import FullTextIndexStatsIndexType
+from .full_text_index_stats_promotion import FullTextIndexStatsPromotion
+from .full_text_index_stats_resolution import FullTextIndexStatsResolution
+from .full_text_index_stats_text_merge import FullTextIndexStatsTextMerge
 from .fuzziness_type_1 import FuzzinessType1
 from .fuzzy_query import FuzzyQuery
 from .generation_step_config import GenerationStepConfig
@@ -234,8 +245,11 @@ from .graph_index_config import GraphIndexConfig
 from .graph_index_stats import GraphIndexStats
 from .graph_index_stats_algebraic_graph import GraphIndexStatsAlgebraicGraph
 from .graph_index_stats_algebraic_graph_traversal import GraphIndexStatsAlgebraicGraphTraversal
+from .graph_index_stats_async_indexing import GraphIndexStatsAsyncIndexing
 from .graph_index_stats_edge_types import GraphIndexStatsEdgeTypes
 from .graph_index_stats_index_type import GraphIndexStatsIndexType
+from .graph_index_stats_promotion import GraphIndexStatsPromotion
+from .graph_index_stats_resolution import GraphIndexStatsResolution
 from .graph_node_selector import GraphNodeSelector
 from .graph_query import GraphQuery
 from .graph_query_params import GraphQueryParams
@@ -531,6 +545,14 @@ from .table_backup_status import TableBackupStatus
 from .table_backup_status_status import TableBackupStatusStatus
 from .table_migration import TableMigration
 from .table_migration_state import TableMigrationState
+from .table_repair_issue import TableRepairIssue
+from .table_repair_issue_list import TableRepairIssueList
+from .table_repair_job import TableRepairJob
+from .table_repair_job_phase import TableRepairJobPhase
+from .table_repair_job_repair_status import TableRepairJobRepairStatus
+from .table_repair_job_start_request import TableRepairJobStartRequest
+from .table_repair_run_response import TableRepairRunResponse
+from .table_repair_run_result import TableRepairRunResult
 from .table_restore_status import TableRestoreStatus
 from .table_restore_status_status import TableRestoreStatusStatus
 from .table_schema import TableSchema
@@ -615,8 +637,13 @@ __all__ = (
     "AlgebraicAggregationJoinKind",
     "AlgebraicIndexConfig",
     "AlgebraicIndexStats",
+    "AlgebraicIndexStatsAsyncIndexing",
     "AlgebraicIndexStatsIndexType",
     "AlgebraicIndexStatsPlannerLastDecision",
+    "AlgebraicIndexStatsPromotion",
+    "AlgebraicIndexStatsResolution",
+    "AlgebraicIndexStatsResolverReplay",
+    "AlgebraicIndexStatsSourceArtifact",
     "Analyses",
     "AnalysesResult",
     "AnswerAgentResult",
@@ -631,12 +658,8 @@ __all__ = (
     "ApiKey",
     "ApiKeyRowFilterType0",
     "ApiKeyWithSecret",
-    "ArtifactRepairIssue",
-    "ArtifactRepairIssueList",
     "ArtifactRepairKind",
     "ArtifactRepairReason",
-    "ArtifactRepairRunResponse",
-    "ArtifactRepairRunResult",
     "AudioChunkOptions",
     "AuthSubject",
     "AuthSubjectKind",
@@ -747,7 +770,13 @@ __all__ = (
     "EmbedderProvider",
     "EmbeddingsIndexConfig",
     "EmbeddingsIndexStats",
+    "EmbeddingsIndexStatsAsyncIndexing",
+    "EmbeddingsIndexStatsEnrichmentRuntime",
+    "EmbeddingsIndexStatsHbcCache",
+    "EmbeddingsIndexStatsHbcPosting",
     "EmbeddingsIndexStatsIndexType",
+    "EmbeddingsIndexStatsPromotion",
+    "EmbeddingsIndexStatsResolution",
     "EmbeddingType1",
     "EmbeddingType3",
     "EnrichmentConfig",
@@ -809,7 +838,11 @@ __all__ = (
     "ForeignSourceType",
     "FullTextIndexConfig",
     "FullTextIndexStats",
+    "FullTextIndexStatsAsyncIndexing",
     "FullTextIndexStatsIndexType",
+    "FullTextIndexStatsPromotion",
+    "FullTextIndexStatsResolution",
+    "FullTextIndexStatsTextMerge",
     "FuzzinessType1",
     "FuzzyQuery",
     "GenerationStepConfig",
@@ -829,8 +862,11 @@ __all__ = (
     "GraphIndexStats",
     "GraphIndexStatsAlgebraicGraph",
     "GraphIndexStatsAlgebraicGraphTraversal",
+    "GraphIndexStatsAsyncIndexing",
     "GraphIndexStatsEdgeTypes",
     "GraphIndexStatsIndexType",
+    "GraphIndexStatsPromotion",
+    "GraphIndexStatsResolution",
     "GraphNodeSelector",
     "GraphQuery",
     "GraphQueryParams",
@@ -1126,6 +1162,14 @@ __all__ = (
     "TableBackupStatusStatus",
     "TableMigration",
     "TableMigrationState",
+    "TableRepairIssue",
+    "TableRepairIssueList",
+    "TableRepairJob",
+    "TableRepairJobPhase",
+    "TableRepairJobRepairStatus",
+    "TableRepairJobStartRequest",
+    "TableRepairRunResponse",
+    "TableRepairRunResult",
     "TableRestoreStatus",
     "TableRestoreStatusStatus",
     "TableSchema",

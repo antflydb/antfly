@@ -600,11 +600,11 @@ pub const Reconciler = struct {
                 if (!groupStatusReadyForAutomaticPlanning(status)) continue;
                 if (!docIdentityNamespaceReadyForAutomaticSplit(status)) continue;
                 if (status.disk_bytes <= self.config.max_shard_size_bytes) continue;
-                if (status.doc_count < 2) continue;
                 const lookup = self.config.median_key_lookup orelse continue;
                 const owned_split_key = (lookup.fetchMedianKey(self.alloc, range.group_id) catch continue) orelse continue;
                 var split_key_consumed = false;
                 defer if (!split_key_consumed) self.alloc.free(owned_split_key);
+                if (status.doc_count > 0 and status.doc_count < 2) continue;
                 if (owned_split_key.len == 0) continue;
                 if (!keyStrictlyInsideRange(owned_split_key, range.start_key, range.end_key)) continue;
 
@@ -3278,6 +3278,64 @@ test "metadata reconciler plans an automatic split from fresh group status" {
 
     try std.testing.expectEqual(@as(usize, 1), plan.split_upserts.len);
     try std.testing.expectEqual(@as(u64, 4001), plan.split_upserts[0].source_group_id);
+    try std.testing.expect(plan.split_upserts[0].destination_group_id != 0);
+    try std.testing.expectEqualStrings("doc:m", plan.split_upserts[0].split_key.?);
+}
+
+test "metadata reconciler plans an automatic split from disk size when doc count is stale" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 410, .name = "docs" });
+    try manager.upsertRange(.{
+        .group_id = 4101,
+        .table_id = 410,
+        .start_key = "doc:a",
+        .end_key = "doc:z",
+    });
+
+    const tables = try manager.listTables(std.testing.allocator);
+    defer manager.freeTables(std.testing.allocator, tables);
+    const ranges = try manager.listRanges(std.testing.allocator);
+    defer manager.freeRanges(std.testing.allocator, ranges);
+
+    const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+    const stores = [_]table_manager.StoreRecord{
+        .{
+            .store_id = 1,
+            .node_id = 1,
+            .role = "data",
+            .health_class = "healthy",
+            .failure_domain = "rack-a",
+            .live = true,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{
+                .{
+                    .group_id = 4101,
+                    .doc_count = 0,
+                    .disk_bytes = 200,
+                    .empty = false,
+                    .updated_at_millis = now_ms,
+                    .local_leader = true,
+                },
+            })[0..]),
+        },
+    };
+
+    var lookup = TestMedianKeyLookup{ .median_key = "doc:m" };
+    var reconciler = Reconciler.initWithConfig(std.testing.allocator, .{
+        .max_shard_size_bytes = 100,
+        .max_shards_per_table = 8,
+        .median_key_lookup = lookup.iface(),
+    });
+    var plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+        .tables = tables,
+        .ranges = ranges,
+        .stores = &stores,
+    });
+    defer plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), plan.split_upserts.len);
+    try std.testing.expectEqual(@as(u64, 4101), plan.split_upserts[0].source_group_id);
     try std.testing.expect(plan.split_upserts[0].destination_group_id != 0);
     try std.testing.expectEqualStrings("doc:m", plan.split_upserts[0].split_key.?);
 }

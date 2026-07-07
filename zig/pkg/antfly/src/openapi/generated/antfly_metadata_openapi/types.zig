@@ -369,6 +369,7 @@ pub const ArtifactRepairKind = enum {
     chunk,
     graph,
     full_text,
+    algebraic,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -377,6 +378,7 @@ pub const ArtifactRepairKind = enum {
             .chunk => "chunk",
             .graph => "graph",
             .full_text => "full_text",
+            .algebraic => "algebraic",
         };
         try jw.write(s);
     }
@@ -392,6 +394,7 @@ pub const ArtifactRepairKind = enum {
             .{ "chunk", .chunk },
             .{ "graph", .graph },
             .{ "full_text", .full_text },
+            .{ "algebraic", .algebraic },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -452,8 +455,8 @@ pub const RepairTarget = enum {
     }
 };
 
-/// Result of one bounded artifact repair pass.
-pub const ArtifactRepairRunResult = struct {
+/// Result of one bounded table repair pass.
+pub const TableRepairRunResult = struct {
     /// Number of repair records attempted by this pass.
     scanned: i64,
     /// Number of table groups touched by this bounded repair pass.
@@ -466,10 +469,12 @@ pub const ArtifactRepairRunResult = struct {
     missing_source_docs: i64,
     /// Number of supported repair attempts that failed.
     failed: i64,
-    /// Number of repair records skipped because no reprocessor exists for the artifact kind.
+    /// Number of repair records skipped because no automated repair exists for the selected target.
     unsupported: i64,
     /// Number of attempted repair records that remained queued after this pass.
     unresolved: i64,
+    /// Number of selected repair records or indexes skipped because another repair pass already owns them.
+    in_progress: i64,
     /// Number of indexes rebuilt by this pass when target is index.
     indexes_rebuilt: i64,
     /// Number of selected indexes that were already degraded or quarantined before repair.
@@ -478,7 +483,7 @@ pub const ArtifactRepairRunResult = struct {
     limit: i64,
     /// Opaque cursor for the next artifact repair pass when has_more is true. Index repair currently repairs one named index per request and does not return a continuation cursor.
     next_cursor: ?[]const u8 = null,
-    /// Whether another artifact scan page is available via next_cursor.
+    /// Whether another repair scan page is available via next_cursor.
     has_more: bool,
     /// Whether repair debt remains after this bounded pass. If true and next_cursor is absent, rerun repair from the beginning after addressing failed or unsupported records.
     debt_remaining: bool,
@@ -1900,8 +1905,8 @@ pub const DocumentArtifactManifest = struct {
     state_json: ?[]const u8 = null,
 };
 
-/// Durable repair debt for a derived artifact. This is an operator-facing record and includes exact source and artifact identifiers.
-pub const ArtifactRepairIssue = struct {
+/// Durable table repair debt. Artifact targets include exact source and artifact identifiers; index targets include the affected index and repair status.
+pub const TableRepairIssue = struct {
     artifact_kind: ArtifactRepairKind,
     /// Index whose replay or derived state observed the artifact problem.
     index_name: []const u8,
@@ -1963,14 +1968,65 @@ pub const RepairRunRequest = struct {
     limit: ?i64 = null,
 };
 
+/// Starts a durable table repair job. The job advances in bounded passes using the same repair request shape as runTableRepair.
+pub const TableRepairJobStartRequest = struct {
+    target: ?RepairTarget = null,
+    kind: ?ArtifactRepairKind = null,
+    /// Restrict repair attempts to one index name.
+    index: ?[]const u8 = null,
+    /// Opaque cursor returned by a prior repair response.
+    cursor: ?[]const u8 = null,
+    /// Force a named index rebuild even when no repair debt is currently recorded. Only applies to target=index.
+    force: ?bool = null,
+    /// Maximum artifact repair records to attempt per pass. For target=index, any positive value permits one named index repair.
+    limit: ?i64 = null,
+    /// When true, the server immediately attempts the first bounded repair pass before returning the job.
+    advance: ?bool = null,
+};
+
 /// Response for a bounded table repair pass.
-pub const ArtifactRepairRunResponse = struct {
+pub const TableRepairRunResponse = struct {
     /// Table whose repair queue was processed.
     table: []const u8,
     target: RepairTarget,
     /// Effective repair limit.
     limit: i64,
-    result: ArtifactRepairRunResult,
+    result: TableRepairRunResult,
+};
+
+/// Durable table repair job state.
+pub const TableRepairJob = struct {
+    /// Server-assigned durable repair job identifier.
+    job_id: i64,
+    /// Monotonic execution attempt token for the current running pass.
+    attempt_id: i64,
+    /// Table being repaired.
+    table_name: []const u8,
+    /// Lifecycle phase of the repair job.
+    phase: []const u8,
+    /// User-facing repair progress state. `debt_remaining` means the bounded job stopped because unsupported or failed debt still requires operator action.
+    repair_status: []const u8,
+    target: RepairTarget,
+    kind: ?ArtifactRepairKind = null,
+    /// Index name when the job is restricted to one index.
+    index: ?[]const u8 = null,
+    /// Opaque continuation cursor for the next bounded repair pass.
+    cursor: ?[]const u8 = null,
+    /// Effective per-pass repair limit.
+    limit: i64,
+    /// Whether the job forces a named index rebuild.
+    force: bool,
+    result: TableRepairRunResult,
+    /// Last stable job-level error code.
+    last_error: ?[]const u8 = null,
+    /// Whether cancellation has been requested for a running pass. Running passes finish at a bounded repair boundary before the job transitions to cancelled.
+    cancel_requested: bool,
+    /// Unix epoch milliseconds when the job was created.
+    created_at_millis: i64,
+    /// Unix epoch milliseconds when the job state was last updated.
+    last_updated_at_millis: i64,
+    /// Unix epoch milliseconds when the job is eligible for cleanup.
+    expires_at_millis: i64,
 };
 
 /// Bounded request for reprocessing a derived artifact across source rows in key order.
@@ -2014,6 +2070,8 @@ pub const DocumentArtifactTableReprocessResponse = struct {
 pub const DocumentArtifactReprocessJob = struct {
     /// Server-assigned durable repair job identifier.
     job_id: i64,
+    /// Monotonic execution attempt token for the current running pass.
+    attempt_id: i64,
     /// Table containing the source documents being repaired.
     table_name: []const u8,
     /// Name of the derived artifact being repaired.
@@ -2046,11 +2104,13 @@ pub const DocumentArtifactReprocessJob = struct {
     shard_cursors: []const DocumentArtifactReprocessShardCursor,
     /// Last terminal or transient job error, when available.
     last_error: ?[]const u8 = null,
-    /// Monotonic server timestamp when the job was created.
+    /// Whether cancellation has been requested for a running pass. Running passes finish at a bounded reprocess boundary before the job transitions to cancelled.
+    cancel_requested: bool,
+    /// Unix epoch milliseconds when the job was created.
     created_at_millis: i64,
-    /// Monotonic server timestamp when the job was last updated.
+    /// Unix epoch milliseconds when the job was last updated.
     last_updated_at_millis: i64,
-    /// Monotonic server timestamp after which the retained job status may be removed.
+    /// Unix epoch milliseconds after which the retained job status may be removed.
     expires_at_millis: i64,
 };
 
@@ -2481,7 +2541,7 @@ pub const DocumentArtifactManifestList = struct {
 };
 
 /// Bounded page of table repair issues.
-pub const ArtifactRepairIssueList = struct {
+pub const TableRepairIssueList = struct {
     /// Table whose repair queue was listed.
     table: []const u8,
     target: RepairTarget,
@@ -2495,7 +2555,7 @@ pub const ArtifactRepairIssueList = struct {
     has_more: bool,
     /// Opaque cursor for the next page when has_more is true.
     next_cursor: ?[]const u8 = null,
-    issues: []const ArtifactRepairIssue,
+    issues: []const TableRepairIssue,
 };
 
 pub const ClusterTopology = struct {

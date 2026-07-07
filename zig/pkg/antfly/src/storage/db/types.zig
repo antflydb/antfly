@@ -1630,6 +1630,7 @@ pub const ArtifactRepairKind = enum {
     chunk,
     graph,
     full_text,
+    algebraic,
 };
 
 pub const RepairTarget = enum {
@@ -1711,6 +1712,27 @@ pub const ArtifactRepairRunRequest = struct {
     limit: u32 = 100,
     cursor: ?[]const u8 = null,
     force: bool = false,
+    repair_job_id: ?u64 = null,
+    repair_attempt_id: ?u64 = null,
+    repair_cancel_base_uri: ?[]const u8 = null,
+};
+
+pub const RepairCancelCheck = struct {
+    ptr: *anyopaque,
+    is_requested: *const fn (ptr: *anyopaque) bool,
+
+    pub fn requested(self: RepairCancelCheck) bool {
+        return self.is_requested(self.ptr);
+    }
+};
+
+pub const ArtifactRepairRunOptions = struct {
+    cancel_check: ?RepairCancelCheck = null,
+
+    pub fn cancelled(self: ArtifactRepairRunOptions) bool {
+        if (self.cancel_check) |check| return check.requested();
+        return false;
+    }
 };
 
 pub const ArtifactRepairResult = struct {
@@ -1722,6 +1744,7 @@ pub const ArtifactRepairResult = struct {
     failed: u64 = 0,
     unsupported: u64 = 0,
     unresolved: u64 = 0,
+    in_progress: u64 = 0,
     indexes_rebuilt: u64 = 0,
     indexes_degraded: u64 = 0,
     limit: u32 = 0,

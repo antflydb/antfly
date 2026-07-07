@@ -2,6 +2,7 @@ from enum import Enum
 
 
 class ArtifactRepairKind(str, Enum):
+    ALGEBRAIC = "algebraic"
     ASSET = "asset"
     CHUNK = "chunk"
     EMBEDDING = "embedding"

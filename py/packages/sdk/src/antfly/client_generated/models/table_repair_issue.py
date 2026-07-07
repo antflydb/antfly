@@ -10,13 +10,13 @@ from ..models.artifact_repair_kind import ArtifactRepairKind
 from ..models.artifact_repair_reason import ArtifactRepairReason
 from ..types import UNSET, Unset
 
-T = TypeVar("T", bound="ArtifactRepairIssue")
+T = TypeVar("T", bound="TableRepairIssue")
 
 
 @_attrs_define
-class ArtifactRepairIssue:
-    """Durable repair debt for a derived artifact. This is an operator-facing record and includes exact source and artifact
-    identifiers.
+class TableRepairIssue:
+    """Durable table repair debt. Artifact targets include exact source and artifact identifiers; index targets include the
+    affected index and repair status.
 
         Attributes:
             artifact_kind (ArtifactRepairKind): Kind of stored artifact tracked by the repair queue.
@@ -173,7 +173,7 @@ class ArtifactRepairIssue:
 
         last_error = d.pop("last_error", UNSET)
 
-        artifact_repair_issue = cls(
+        table_repair_issue = cls(
             artifact_kind=artifact_kind,
             index_name=index_name,
             doc_key=doc_key,
@@ -193,8 +193,8 @@ class ArtifactRepairIssue:
             last_error=last_error,
         )
 
-        artifact_repair_issue.additional_properties = d
-        return artifact_repair_issue
+        table_repair_issue.additional_properties = d
+        return table_repair_issue
 
     @property
     def additional_keys(self) -> list[str]:

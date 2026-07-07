@@ -6030,6 +6030,7 @@ test "typed index status response rejects extended variant fields but raw json p
         \\{
         \\  "config": { "name": "graph_idx", "type": "graph" },
         \\  "status": {
+        \\    "index_type": "graph",
         \\    "rebuilding": false,
         \\    "backfill_active": false,
         \\    "doc_count": 0,

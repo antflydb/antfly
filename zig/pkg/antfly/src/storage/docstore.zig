@@ -1092,6 +1092,16 @@ pub const DocStore = struct {
         return if (next <= 1) 0 else next - 1;
     }
 
+    pub fn lastReplaySequenceFromTxn(_: *DocStore, txn: *Txn, fallback_last: u64) !u64 {
+        const raw = txn.get(internal_keys.replay_meta_next_sequence_key[0..]) catch |err| switch (err) {
+            error.NotFound => return fallback_last,
+            else => return err,
+        };
+        if (raw.len != 8) return error.CorruptReplayMetadata;
+        const next = std.mem.readInt(u64, raw[0..8], .little);
+        return if (next <= 1) 0 else next - 1;
+    }
+
     pub fn latestReplaySequenceForHint(self: *DocStore, hint: change_journal_mod.TargetHint, fallback_last: u64) !u64 {
         return try self.latestReplaySequenceForOrdinal(replayHintOrdinal(hint), fallback_last);
     }
@@ -1502,6 +1512,52 @@ pub const DocStore = struct {
         return owned;
     }
 
+    /// Scan up to `limit` keys with the given prefix after `after_key`.
+    /// Caller owns returned slices.
+    pub fn scanPrefixPage(
+        self: *DocStore,
+        alloc: Allocator,
+        prefix: []const u8,
+        after_key: ?[]const u8,
+        limit: usize,
+    ) ![]OwnedKVPair {
+        if (limit == 0) return try alloc.dupe(OwnedKVPair, &.{});
+
+        var txn = try self.beginReadTxn();
+        defer txn.abort();
+
+        var cur = try txn.openCursor();
+        defer cur.close();
+
+        var results = std.ArrayListUnmanaged(OwnedKVPair).empty;
+        errdefer {
+            for (results.items) |item| {
+                alloc.free(item.key);
+                alloc.free(item.value);
+            }
+            results.deinit(alloc);
+        }
+
+        const bounded_after_key = if (after_key) |key| if (std.mem.startsWith(u8, key, prefix)) key else null else null;
+        const seek_key = bounded_after_key orelse prefix;
+        var entry = (try cur.seekAtOrAfter(seek_key)) orelse return try alloc.dupe(OwnedKVPair, results.items);
+        while (true) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            if (bounded_after_key == null or std.mem.order(u8, entry.key, bounded_after_key.?) == .gt) {
+                try results.append(alloc, .{
+                    .key = try alloc.dupe(u8, entry.key),
+                    .value = try alloc.dupe(u8, entry.value),
+                });
+                if (results.items.len >= limit) break;
+            }
+            entry = (try cur.next()) orelse break;
+        }
+
+        const owned = try alloc.dupe(OwnedKVPair, results.items);
+        results.deinit(alloc);
+        return owned;
+    }
+
     /// Scan keys in [lower, upper). Caller owns returned slices.
     pub fn scanRange(self: *DocStore, alloc: Allocator, lower: []const u8, upper: []const u8) ![]OwnedKVPair {
         var txn = try self.beginReadTxn();
@@ -1610,7 +1666,19 @@ pub const DocStore = struct {
     ) !void {
         var txn = try self.beginReadTxn();
         defer txn.abort();
+        try self.scanReadTxnWithContext(&txn, lower, upper, options, ctx, callback);
+    }
 
+    pub fn scanReadTxnWithContext(
+        self: *DocStore,
+        txn: *Txn,
+        lower: []const u8,
+        upper: []const u8,
+        options: ScanOptions,
+        ctx: ?*anyopaque,
+        callback: ScanWithContextCallback,
+    ) !void {
+        _ = self;
         var cur = try txn.openCursor();
         defer cur.close();
         cur.setUpperBound(if (upper.len > 0) upper else null);

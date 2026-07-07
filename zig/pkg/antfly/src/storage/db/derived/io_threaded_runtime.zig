@@ -24,6 +24,8 @@ const resource_manager_mod = @import("../../resource_manager.zig");
 const index_manager_mod = @import("../catalog/index_manager.zig");
 const types = @import("../types.zig");
 const async_runtime_mod = @import("async_runtime.zig");
+const change_journal_mod = @import("change_journal.zig");
+const derived_types = @import("derived_types.zig");
 
 pub const RuntimeError = async_runtime_mod.RuntimeError;
 pub const ApplyFn = async_runtime_mod.ApplyFn;
@@ -779,6 +781,11 @@ fn workerMain(worker: *Worker) void {
             runtime.cond.broadcast(io);
             runtime.mutex.unlock(io);
             if (isRecoverableCatchUpError(worker, err)) {
+                closeWorkerCatchUpState(runtime, worker, false) catch |close_err| {
+                    close_success = false;
+                    runtime.recordError(io, worker.name, "recoverable_catch_up_close", close_err);
+                    return;
+                };
                 io.sleep(Io.Duration.zero, .awake) catch {};
                 continue;
             }
@@ -823,6 +830,11 @@ fn workerMain(worker: *Worker) void {
                     runtime.cond.broadcast(io);
                     runtime.mutex.unlock(io);
                     if (isRecoverableCatchUpError(worker, err)) {
+                        closeWorkerCatchUpState(runtime, worker, false) catch |close_err| {
+                            close_success = false;
+                            runtime.recordError(io, worker.name, "recoverable_refreshed_catch_up_close", close_err);
+                            return;
+                        };
                         io.sleep(Io.Duration.zero, .awake) catch {};
                         continue;
                     }
@@ -1129,4 +1141,167 @@ fn stopAndJoinWorker(runtime: *DerivedRuntime, worker: *Worker, io: Io) void {
     runtime.cond.broadcast(io);
     runtime.mutex.unlock(io);
     if (worker.future) |*future| _ = future.await(io);
+}
+
+const TestThreadedRuntimeCapture = struct {
+    apply_calls: std.atomic.Value(u64) = .init(0),
+    begin_calls: std.atomic.Value(u64) = .init(0),
+    finish_calls: std.atomic.Value(u64) = .init(0),
+    publish_failures: std.atomic.Value(u64) = .init(0),
+    apply_not_found_failures: std.atomic.Value(u64) = .init(0),
+    persisted_sequence: std.atomic.Value(u64) = .init(0),
+    fail_next_dense_apply_not_found: std.atomic.Value(bool) = .init(false),
+    fail_next_publish: std.atomic.Value(bool) = .init(false),
+};
+
+fn testThreadedRuntimeApply(ctx: *anyopaque, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef) !bool {
+    _ = batch;
+    const capture: *TestThreadedRuntimeCapture = @ptrCast(@alignCast(ctx));
+    _ = capture.apply_calls.fetchAdd(1, .monotonic);
+    if (index_ref.kind == .dense_vector and capture.fail_next_dense_apply_not_found.swap(false, .monotonic)) {
+        _ = capture.apply_not_found_failures.fetchAdd(1, .monotonic);
+        return error.NotFound;
+    }
+    return true;
+}
+
+fn testThreadedRuntimePersist(ctx: *anyopaque, index_name: []const u8, sequence: u64, force: bool) !bool {
+    _ = index_name;
+    _ = force;
+    const capture: *TestThreadedRuntimeCapture = @ptrCast(@alignCast(ctx));
+    capture.persisted_sequence.store(sequence, .monotonic);
+    return true;
+}
+
+fn testThreadedRuntimeTruncate(ctx: *anyopaque, sequence: u64) !void {
+    _ = ctx;
+    _ = sequence;
+}
+
+fn testThreadedRuntimeBeginCatchUp(ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef) !void {
+    _ = index_ref;
+    const capture: *TestThreadedRuntimeCapture = @ptrCast(@alignCast(ctx));
+    _ = capture.begin_calls.fetchAdd(1, .monotonic);
+}
+
+fn testThreadedRuntimeFinishCatchUp(ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, success: bool) !void {
+    _ = index_ref;
+    const capture: *TestThreadedRuntimeCapture = @ptrCast(@alignCast(ctx));
+    _ = capture.finish_calls.fetchAdd(1, .monotonic);
+    if (success and capture.fail_next_publish.swap(false, .monotonic)) {
+        _ = capture.publish_failures.fetchAdd(1, .monotonic);
+        return error.NotFound;
+    }
+}
+
+fn testThreadedRuntimeJournalOpenOptions() change_journal_mod.OpenOptions {
+    return .{
+        .backend = .lsm_memory,
+        .lsm_options = .{
+            .flush_threshold = 512,
+            .compact_threshold_runs = 256,
+            .wal_enabled = false,
+            .obsolete_retention_ns = 0,
+        },
+    };
+}
+
+fn appendTestThreadedRuntimeRecord(log: *change_journal_mod.Journal, alloc: Allocator, record: change_journal_mod.Record) !void {
+    const payload = try change_journal_mod.encodeRecord(alloc, record);
+    defer alloc.free(payload);
+    _ = try log.appendOpaque(payload);
+}
+
+test "io threaded dense catch-up NotFound closes session before retry" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/io-threaded-dense-catch-up-retry-journal", .{tmp.sub_path});
+    defer alloc.free(journal_path);
+    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    defer alloc.free(journal_path_z);
+
+    var journal = try change_journal_mod.Journal.open(journal_path_z, testThreadedRuntimeJournalOpenOptions());
+    defer journal.close();
+    try appendTestThreadedRuntimeRecord(&journal, alloc, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{"doc:a"},
+        .target_hints = &.{.dense_vector},
+    });
+
+    var capture = TestThreadedRuntimeCapture{};
+    capture.fail_next_dense_apply_not_found.store(true, .monotonic);
+    var runtime = try DerivedRuntime.init(
+        alloc,
+        replay_source_mod.Source.fromJournal(&journal),
+        &capture,
+        testThreadedRuntimeApply,
+        testThreadedRuntimePersist,
+        testThreadedRuntimeTruncate,
+        testThreadedRuntimeBeginCatchUp,
+        testThreadedRuntimeFinishCatchUp,
+        null,
+        null,
+    );
+    defer runtime.deinit();
+
+    try runtime.addWorker("dense_idx", .{ .name = "dense_idx", .kind = .dense_vector }, 0);
+    runtime.notifySequence(1);
+    try runtime.waitForAll(1);
+    try runtime.failIfUnhealthy();
+
+    try std.testing.expectEqual(@as(u64, 1), capture.apply_not_found_failures.load(.monotonic));
+    try std.testing.expect(capture.apply_calls.load(.monotonic) >= 2);
+    try std.testing.expect(capture.begin_calls.load(.monotonic) >= 2);
+    try std.testing.expect(capture.finish_calls.load(.monotonic) >= 2);
+    try std.testing.expectEqual(@as(u64, 1), runtime.appliedSequence("dense_idx").?);
+    try std.testing.expectEqual(@as(u64, 1), capture.persisted_sequence.load(.monotonic));
+}
+
+test "io threaded dense publish NotFound retries with a fresh session" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/io-threaded-dense-publish-retry-journal", .{tmp.sub_path});
+    defer alloc.free(journal_path);
+    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    defer alloc.free(journal_path_z);
+
+    var journal = try change_journal_mod.Journal.open(journal_path_z, testThreadedRuntimeJournalOpenOptions());
+    defer journal.close();
+    try appendTestThreadedRuntimeRecord(&journal, alloc, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{"doc:a"},
+        .target_hints = &.{.dense_vector},
+    });
+
+    var capture = TestThreadedRuntimeCapture{};
+    capture.fail_next_publish.store(true, .monotonic);
+    var runtime = try DerivedRuntime.init(
+        alloc,
+        replay_source_mod.Source.fromJournal(&journal),
+        &capture,
+        testThreadedRuntimeApply,
+        testThreadedRuntimePersist,
+        testThreadedRuntimeTruncate,
+        testThreadedRuntimeBeginCatchUp,
+        testThreadedRuntimeFinishCatchUp,
+        null,
+        null,
+    );
+    defer runtime.deinit();
+
+    try runtime.addWorker("dense_idx", .{ .name = "dense_idx", .kind = .dense_vector }, 0);
+    runtime.notifySequence(1);
+    try runtime.waitForAll(1);
+    try runtime.failIfUnhealthy();
+
+    try std.testing.expectEqual(@as(u64, 1), capture.publish_failures.load(.monotonic));
+    try std.testing.expect(capture.apply_calls.load(.monotonic) >= 2);
+    try std.testing.expect(capture.begin_calls.load(.monotonic) >= 2);
+    try std.testing.expect(capture.finish_calls.load(.monotonic) >= 2);
+    try std.testing.expectEqual(@as(u64, 1), runtime.appliedSequence("dense_idx").?);
+    try std.testing.expectEqual(@as(u64, 1), capture.persisted_sequence.load(.monotonic));
 }

@@ -715,9 +715,9 @@ pub const Client = struct {
         return ApiResponse(types.TableArtifactEnrichmentList).fromResponse(self.allocator, &resp);
     }
 
-    /// List artifact repair issues
+    /// List table repair issues
     /// POST /db/v1/tables/{tableName}/repair/issues
-    pub fn listArtifactRepairIssues(self: *@This(), table_name: []const u8, body: types.RepairIssueListRequest) !ApiResponse(types.ArtifactRepairIssueList) {
+    pub fn listTableRepairIssues(self: *@This(), table_name: []const u8, body: types.RepairIssueListRequest) !ApiResponse(types.TableRepairIssueList) {
         const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
         defer self.allocator.free(encoded_table_name);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/repair/issues", .{ self.base_url, encoded_table_name });
@@ -725,12 +725,12 @@ pub const Client = struct {
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(types.ArtifactRepairIssueList).fromResponse(self.allocator, &resp);
+        return ApiResponse(types.TableRepairIssueList).fromResponse(self.allocator, &resp);
     }
 
     /// Run a bounded table repair pass
     /// POST /db/v1/tables/{tableName}/repair/run
-    pub fn runTableRepair(self: *@This(), table_name: []const u8, body: types.RepairRunRequest) !ApiResponse(types.ArtifactRepairRunResponse) {
+    pub fn runTableRepair(self: *@This(), table_name: []const u8, body: types.RepairRunRequest) !ApiResponse(types.TableRepairRunResponse) {
         const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
         defer self.allocator.free(encoded_table_name);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/repair/run", .{ self.base_url, encoded_table_name });
@@ -738,7 +738,59 @@ pub const Client = struct {
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(types.ArtifactRepairRunResponse).fromResponse(self.allocator, &resp);
+        return ApiResponse(types.TableRepairRunResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Start a durable table repair job
+    /// POST /db/v1/tables/{tableName}/repair/jobs
+    pub fn startTableRepairJob(self: *@This(), table_name: []const u8, body: types.TableRepairJobStartRequest) !ApiResponse(types.TableRepairJob) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/repair/jobs", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.TableRepairJob).fromResponse(self.allocator, &resp);
+    }
+
+    /// Get a table repair job
+    /// GET /db/v1/tables/{tableName}/repair/jobs/{jobId}
+    pub fn getTableRepairJob(self: *@This(), table_name: []const u8, job_id: []const u8) !ApiResponse(types.TableRepairJob) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/repair/jobs/{s}", .{ self.base_url, encoded_table_name, encoded_job_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.TableRepairJob).fromResponse(self.allocator, &resp);
+    }
+
+    /// Advance a table repair job
+    /// POST /db/v1/tables/{tableName}/repair/jobs/{jobId}/advance
+    pub fn advanceTableRepairJob(self: *@This(), table_name: []const u8, job_id: []const u8) !ApiResponse(types.TableRepairJob) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/repair/jobs/{s}/advance", .{ self.base_url, encoded_table_name, encoded_job_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.TableRepairJob).fromResponse(self.allocator, &resp);
+    }
+
+    /// Cancel a table repair job
+    /// POST /db/v1/tables/{tableName}/repair/jobs/{jobId}/cancel
+    pub fn cancelTableRepairJob(self: *@This(), table_name: []const u8, job_id: []const u8) !ApiResponse(types.TableRepairJob) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/repair/jobs/{s}/cancel", .{ self.base_url, encoded_table_name, encoded_job_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.TableRepairJob).fromResponse(self.allocator, &resp);
     }
 
     /// Reprocess a derived document artifact across a table range

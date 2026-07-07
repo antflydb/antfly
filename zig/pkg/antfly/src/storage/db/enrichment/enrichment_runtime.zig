@@ -1745,7 +1745,7 @@ fn processAsset(
         const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
         defer runtime.alloc.free(state_key);
         if (producer_cfg.type == .document_extraction) {
-            try deleteDocumentExtractionForRuntime(runtime, key, state_key, window);
+            try deleteDocumentExtractionForRuntime(runtime, request.doc_key, artifact_name, key, state_key, window);
         } else {
             try storePutBatchWithRetry(runtime, &.{}, &.{ key, state_key });
             try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);
@@ -1759,7 +1759,7 @@ fn processAsset(
         const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
         defer runtime.alloc.free(state_key);
         if (producer_cfg.type == .document_extraction) {
-            try deleteDocumentExtractionForRuntime(runtime, key, state_key, window);
+            try deleteDocumentExtractionForRuntime(runtime, request.doc_key, artifact_name, key, state_key, window);
         } else {
             try storePutBatchWithRetry(runtime, &.{}, &.{ key, state_key });
             try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);
@@ -2033,26 +2033,20 @@ fn processDocumentExtractionAsset(
         deletes.deinit(runtime.alloc);
     }
 
-    var previous_unit_keys: []const []const u8 = &.{};
-    defer freeOwnedConstKeySlice(runtime.alloc, previous_unit_keys);
-    var previous_unit_descriptors: []DocumentExtractionUnitDescriptor = &.{};
-    defer freeDocumentExtractionUnitDescriptors(runtime.alloc, previous_unit_descriptors);
-    var previous_chunk_keys: []const []const u8 = &.{};
-    defer freeOwnedConstKeySlice(runtime.alloc, previous_chunk_keys);
+    var previous_state = RuntimeDocumentExtractionPreviousState{};
+    defer previous_state.deinit(runtime.alloc);
     if (existing_state) |state| {
-        previous_unit_keys = try documentExtractionStateUnitKeysAlloc(runtime.alloc, state);
-        previous_unit_descriptors = try documentExtractionStateUnitDescriptorsAlloc(runtime.alloc, state);
-        previous_chunk_keys = try documentExtractionStateChunkKeysAlloc(runtime.alloc, state);
+        previous_state = try loadRuntimeDocumentExtractionPreviousState(runtime, request.doc_key, artifact_name, state);
     }
 
     if (existing_state != null) {
-        for (previous_unit_keys) |previous_key| {
+        for (previous_state.unit_keys) |previous_key| {
             if (runtimeContainsConstKey(desired_unit_keys.items, previous_key)) continue;
             try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
             try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
             try appendUniqueDupeKey(runtime.alloc, &window.deleted_keys, previous_key);
         }
-        for (previous_chunk_keys) |previous_key| {
+        for (previous_state.chunk_keys) |previous_key| {
             if (runtimeContainsConstKey(desired_chunk_keys.items, previous_key)) continue;
             try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
             try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
@@ -2080,9 +2074,9 @@ fn processDocumentExtractionAsset(
         desired_unit_descriptors,
         desired_chunk_keys.items,
         previous_child_ranges,
-        previous_unit_keys,
-        previous_unit_descriptors,
-        previous_chunk_keys,
+        previous_state.unit_keys,
+        previous_state.unit_descriptors,
+        previous_state.chunk_keys,
         &.{},
         from_generation,
         from_generation,
@@ -2158,9 +2152,9 @@ fn processDocumentExtractionAsset(
         desired_unit_descriptors,
         desired_chunk_keys.items,
         previous_child_ranges,
-        previous_unit_keys,
-        previous_unit_descriptors,
-        previous_chunk_keys,
+        previous_state.unit_keys,
+        previous_state.unit_descriptors,
+        previous_state.chunk_keys,
         &.{},
         to_generation,
         from_generation,
@@ -2227,16 +2221,10 @@ fn writeDocumentExtractionFailureManifest(
     from_generation: u64,
     window: *GeneratedReplayWindow,
 ) !void {
-    var previous_unit_keys: []const []const u8 = &.{};
-    defer freeOwnedConstKeySlice(runtime.alloc, previous_unit_keys);
-    var previous_unit_descriptors: []DocumentExtractionUnitDescriptor = &.{};
-    defer freeDocumentExtractionUnitDescriptors(runtime.alloc, previous_unit_descriptors);
-    var previous_chunk_keys: []const []const u8 = &.{};
-    defer freeOwnedConstKeySlice(runtime.alloc, previous_chunk_keys);
+    var previous_state = RuntimeDocumentExtractionPreviousState{};
+    defer previous_state.deinit(runtime.alloc);
     if (existing_state) |state| {
-        previous_unit_keys = try documentExtractionStateUnitKeysAlloc(runtime.alloc, state);
-        previous_unit_descriptors = try documentExtractionStateUnitDescriptorsAlloc(runtime.alloc, state);
-        previous_chunk_keys = try documentExtractionStateChunkKeysAlloc(runtime.alloc, state);
+        previous_state = try loadRuntimeDocumentExtractionPreviousState(runtime, doc_key, artifact_name, state);
     }
 
     const empty_units: [0]document_extraction_mod.Unit = .{};
@@ -2258,9 +2246,9 @@ fn writeDocumentExtractionFailureManifest(
         &.{},
         &.{},
         previous_child_ranges,
-        previous_unit_keys,
-        previous_unit_descriptors,
-        previous_chunk_keys,
+        previous_state.unit_keys,
+        previous_state.unit_descriptors,
+        previous_state.chunk_keys,
         previous_child_ranges,
         to_generation,
         from_generation,
@@ -2291,12 +2279,12 @@ fn writeDocumentExtractionFailureManifest(
     try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, manifest_key);
 
     try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, state_key));
-    for (previous_unit_keys) |previous_key| {
+    for (previous_state.unit_keys) |previous_key| {
         try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
         try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
         try appendUniqueDupeKey(runtime.alloc, &window.deleted_keys, previous_key);
     }
-    for (previous_chunk_keys) |previous_key| {
+    for (previous_state.chunk_keys) |previous_key| {
         try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
         try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
         try appendUniqueDupeKey(runtime.alloc, &window.deleted_keys, previous_key);
@@ -2308,6 +2296,8 @@ fn writeDocumentExtractionFailureManifest(
 
 fn deleteDocumentExtractionForRuntime(
     runtime: *EnrichmentRuntime,
+    doc_key: []const u8,
+    artifact_name: []const u8,
     manifest_key: []const u8,
     state_key: []const u8,
     window: *GeneratedReplayWindow,
@@ -2321,6 +2311,7 @@ fn deleteDocumentExtractionForRuntime(
     try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, manifest_key));
     try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, state_key));
     try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, manifest_key);
+    try appendUniqueDupeKey(runtime.alloc, &window.artifact_delete_keys, manifest_key);
 
     const existing_state = storeGetAlloc(runtime, state_key) catch |err| switch (err) {
         std.mem.Allocator.Error.OutOfMemory => return err,
@@ -2328,17 +2319,17 @@ fn deleteDocumentExtractionForRuntime(
     };
     defer if (existing_state) |value| runtime.alloc.free(value);
     if (existing_state) |state| {
-        const previous_keys = try documentExtractionStateUnitKeysAlloc(runtime.alloc, state);
-        defer freeOwnedConstKeySlice(runtime.alloc, previous_keys);
-        for (previous_keys) |previous_key| {
+        var previous_state = try loadRuntimeDocumentExtractionPreviousState(runtime, doc_key, artifact_name, state);
+        defer previous_state.deinit(runtime.alloc);
+        for (previous_state.unit_keys) |previous_key| {
             try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
             try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
+            try appendUniqueDupeKey(runtime.alloc, &window.artifact_delete_keys, previous_key);
         }
-        const previous_chunk_keys = try documentExtractionStateChunkKeysAlloc(runtime.alloc, state);
-        defer freeOwnedConstKeySlice(runtime.alloc, previous_chunk_keys);
-        for (previous_chunk_keys) |previous_key| {
+        for (previous_state.chunk_keys) |previous_key| {
             try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
             try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
+            try appendUniqueDupeKey(runtime.alloc, &window.artifact_delete_keys, previous_key);
         }
     }
 
@@ -5612,6 +5603,102 @@ const DocumentExtractionRangeRoute = struct {
     owner_group_id: u64 = 0,
 };
 
+const RuntimeDocumentExtractionPreviousState = struct {
+    unit_keys: []const []const u8 = &.{},
+    unit_descriptors: []DocumentExtractionUnitDescriptor = &.{},
+    chunk_keys: []const []const u8 = &.{},
+    recovered_from_store_scan: bool = false,
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        freeOwnedConstKeySlice(alloc, self.unit_keys);
+        freeDocumentExtractionUnitDescriptors(alloc, self.unit_descriptors);
+        freeOwnedConstKeySlice(alloc, self.chunk_keys);
+        self.* = undefined;
+    }
+};
+
+fn loadRuntimeDocumentExtractionPreviousState(
+    runtime: *EnrichmentRuntime,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    state: []const u8,
+) !RuntimeDocumentExtractionPreviousState {
+    if (loadRuntimeDocumentExtractionPreviousStateFromJson(runtime.alloc, state)) |parsed| {
+        return parsed;
+    } else |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {},
+    }
+    var recovered = try scanRuntimeDocumentExtractionPreviousStateFromStore(runtime, doc_key, artifact_name);
+    recovered.recovered_from_store_scan = true;
+    return recovered;
+}
+
+fn loadRuntimeDocumentExtractionPreviousStateFromJson(alloc: Allocator, state: []const u8) !RuntimeDocumentExtractionPreviousState {
+    var out = RuntimeDocumentExtractionPreviousState{};
+    errdefer out.deinit(alloc);
+    out.unit_keys = try documentExtractionStateUnitKeysAlloc(alloc, state);
+    out.unit_descriptors = try documentExtractionStateUnitDescriptorsAlloc(alloc, state);
+    out.chunk_keys = try documentExtractionStateChunkKeysAlloc(alloc, state);
+    return out;
+}
+
+fn scanRuntimeDocumentExtractionPreviousStateFromStore(
+    runtime: *EnrichmentRuntime,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+) !RuntimeDocumentExtractionPreviousState {
+    var out = RuntimeDocumentExtractionPreviousState{};
+    errdefer out.deinit(runtime.alloc);
+
+    var unit_keys = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (unit_keys.items) |key| runtime.alloc.free(@constCast(key));
+        unit_keys.deinit(runtime.alloc);
+    }
+    const unit_prefix = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, doc_key, "asset", artifact_name);
+    defer runtime.alloc.free(unit_prefix);
+    const unit_rows = try backend_scan.scanPrefix(runtime.alloc, &runtime.store, unit_prefix);
+    defer backend_scan.freeResults(runtime.alloc, unit_rows);
+    for (unit_rows) |entry| {
+        if (std.mem.eql(u8, entry.key, unit_prefix)) continue;
+        if (internal_keys.isDerivedEmbeddingArtifactKey(entry.key)) continue;
+        try unit_keys.append(runtime.alloc, try runtime.alloc.dupe(u8, entry.key));
+    }
+
+    var chunk_keys = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (chunk_keys.items) |key| runtime.alloc.free(@constCast(key));
+        chunk_keys.deinit(runtime.alloc);
+    }
+    for (runtime.index_manager.enrichments.items) |entry| {
+        if (entry.kind != .chunk) continue;
+        if (!std.mem.eql(u8, entry.source_artifact_name, artifact_name)) continue;
+        const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, doc_key, "chunk", entry.name);
+        defer runtime.alloc.free(chunk_prefix);
+        const chunk_rows = try backend_scan.scanPrefix(runtime.alloc, &runtime.store, chunk_prefix);
+        defer backend_scan.freeResults(runtime.alloc, chunk_rows);
+        for (chunk_rows) |row| {
+            if (!internal_keys.isChunkArtifactRecordKey(row.key)) continue;
+            try chunk_keys.append(runtime.alloc, try runtime.alloc.dupe(u8, row.key));
+        }
+    }
+
+    out.unit_keys = try unit_keys.toOwnedSlice(runtime.alloc);
+    out.chunk_keys = try chunk_keys.toOwnedSlice(runtime.alloc);
+    out.unit_descriptors = try runtime.alloc.alloc(DocumentExtractionUnitDescriptor, out.unit_keys.len);
+    for (out.unit_descriptors) |*descriptor| {
+        descriptor.* = .{ .key = "", .fingerprint = "" };
+    }
+    for (out.unit_descriptors, out.unit_keys) |*descriptor, key| {
+        descriptor.* = .{
+            .key = try runtime.alloc.dupe(u8, key),
+            .fingerprint = "",
+        };
+    }
+    return out;
+}
+
 fn documentExtractionUnitFingerprintAlloc(alloc: Allocator, unit: document_extraction_mod.Unit) ![]u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update(unit.unit_id);
@@ -5761,10 +5848,14 @@ fn documentExtractionStateUnitDescriptorsAlloc(alloc: Allocator, state: []const 
         if (item != .object) return error.InvalidDocumentExtractionState;
         const key_value = item.object.get("key") orelse return error.InvalidDocumentExtractionState;
         const fingerprint_value = item.object.get("fingerprint") orelse return error.InvalidDocumentExtractionState;
-        if (key_value != .string or fingerprint_value != .string) return error.InvalidDocumentExtractionState;
+        if (fingerprint_value != .string) return error.InvalidDocumentExtractionState;
+        const key = try documentExtractionStateByteSliceAlloc(alloc, key_value);
+        errdefer alloc.free(@constCast(key));
+        const fingerprint = try alloc.dupe(u8, fingerprint_value.string);
+        errdefer alloc.free(fingerprint);
         out[i] = .{
-            .key = try alloc.dupe(u8, key_value.string),
-            .fingerprint = try alloc.dupe(u8, fingerprint_value.string),
+            .key = key,
+            .fingerprint = fingerprint,
         };
         initialized += 1;
     }
@@ -5784,9 +5875,8 @@ fn documentExtractionStateUnitDescriptorFallbackAlloc(alloc: Allocator, object: 
         alloc.free(out);
     }
     for (keys_value.array.items, 0..) |item, i| {
-        if (item != .string) return error.InvalidDocumentExtractionState;
         out[i] = .{
-            .key = try alloc.dupe(u8, item.string),
+            .key = try documentExtractionStateByteSliceAlloc(alloc, item),
             .fingerprint = "",
         };
         initialized += 1;
@@ -5807,11 +5897,26 @@ fn documentExtractionStateKeysAlloc(alloc: Allocator, state: []const u8, field_n
         alloc.free(out);
     }
     for (keys_value.array.items, 0..) |item, i| {
-        if (item != .string) return error.InvalidDocumentExtractionState;
-        out[i] = try alloc.dupe(u8, item.string);
+        out[i] = try documentExtractionStateByteSliceAlloc(alloc, item);
         initialized += 1;
     }
     return out;
+}
+
+fn documentExtractionStateByteSliceAlloc(alloc: Allocator, value: std.json.Value) ![]const u8 {
+    switch (value) {
+        .string => |string| return try alloc.dupe(u8, string),
+        .array => |array| {
+            const out = try alloc.alloc(u8, array.items.len);
+            errdefer alloc.free(out);
+            for (array.items, 0..) |item, i| {
+                if (item != .integer) return error.InvalidDocumentExtractionState;
+                out[i] = std.math.cast(u8, item.integer) orelse return error.InvalidDocumentExtractionState;
+            }
+            return out;
+        },
+        else => return error.InvalidDocumentExtractionState,
+    }
 }
 
 fn documentExtractionUnitKeyStillPresent(
@@ -7539,6 +7644,24 @@ fn freeJsonValue(alloc: Allocator, value: *std.json.Value) void {
 // ============================================================================
 // Tests
 // ============================================================================
+
+test "enrichment runtime document extraction state parses byte-array keys" {
+    const alloc = std.testing.allocator;
+    const state = "{\"kind\":\"document_extraction_state_v1\",\"fingerprint\":\"source\",\"unit_keys\":[[65,0,255]],\"unit_descriptors\":[{\"key\":[65,0,255],\"fingerprint\":\"fp\"}],\"chunk_keys\":[[66,1,254]]}";
+
+    var parsed = try loadRuntimeDocumentExtractionPreviousStateFromJson(alloc, state);
+    defer parsed.deinit(alloc);
+
+    const expected_unit_key = [_]u8{ 65, 0, 255 };
+    const expected_chunk_key = [_]u8{ 66, 1, 254 };
+    try std.testing.expectEqual(@as(usize, 1), parsed.unit_keys.len);
+    try std.testing.expectEqualSlices(u8, &expected_unit_key, parsed.unit_keys[0]);
+    try std.testing.expectEqual(@as(usize, 1), parsed.unit_descriptors.len);
+    try std.testing.expectEqualSlices(u8, &expected_unit_key, parsed.unit_descriptors[0].key);
+    try std.testing.expectEqualStrings("fp", parsed.unit_descriptors[0].fingerprint);
+    try std.testing.expectEqual(@as(usize, 1), parsed.chunk_keys.len);
+    try std.testing.expectEqualSlices(u8, &expected_chunk_key, parsed.chunk_keys[0]);
+}
 
 test "enrichment runtime document extraction manifest uses v2 range and merge shape" {
     const alloc = std.testing.allocator;

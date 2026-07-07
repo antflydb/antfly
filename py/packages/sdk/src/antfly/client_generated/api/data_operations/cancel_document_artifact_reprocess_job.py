@@ -37,6 +37,11 @@ def _parse_response(
 
         return response_200
 
+    if response.status_code == 202:
+        response_202 = DocumentArtifactReprocessJob.from_dict(response.json())
+
+        return response_202
+
     if response.status_code == 400:
         response_400 = Error.from_dict(response.json())
 
@@ -78,6 +83,11 @@ def sync_detailed(
 ) -> Response[DocumentArtifactReprocessJob | Error]:
     """Cancel a derived document artifact reprocess job
 
+     Cancels a queued document artifact reprocess job. If a reprocess pass is
+    already running, the response returns the current running state;
+    cancellation is applied only at pass boundaries so the API never reports
+    a committed in-flight pass as cancelled.
+
     Args:
         table_name (str):
         artifact_name (str):
@@ -113,6 +123,11 @@ def sync(
 ) -> DocumentArtifactReprocessJob | Error | None:
     """Cancel a derived document artifact reprocess job
 
+     Cancels a queued document artifact reprocess job. If a reprocess pass is
+    already running, the response returns the current running state;
+    cancellation is applied only at pass boundaries so the API never reports
+    a committed in-flight pass as cancelled.
+
     Args:
         table_name (str):
         artifact_name (str):
@@ -142,6 +157,11 @@ async def asyncio_detailed(
     client: AuthenticatedClient,
 ) -> Response[DocumentArtifactReprocessJob | Error]:
     """Cancel a derived document artifact reprocess job
+
+     Cancels a queued document artifact reprocess job. If a reprocess pass is
+    already running, the response returns the current running state;
+    cancellation is applied only at pass boundaries so the API never reports
+    a committed in-flight pass as cancelled.
 
     Args:
         table_name (str):
@@ -175,6 +195,11 @@ async def asyncio(
     client: AuthenticatedClient,
 ) -> DocumentArtifactReprocessJob | Error | None:
     """Cancel a derived document artifact reprocess job
+
+     Cancels a queued document artifact reprocess job. If a reprocess pass is
+    already running, the response returns the current running state;
+    cancellation is applied only at pass boundaries so the API never reports
+    a committed in-flight pass as cancelled.
 
     Args:
         table_name (str):

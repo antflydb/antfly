@@ -139,6 +139,43 @@ pub const FullTextIndexStats = struct {
     checkpoint_replay_tail_sequence_count: ?i64 = null,
     /// Repair issues found by explicit repair-scan accounting for this projection.
     repair_scan_issue_count: ?i64 = null,
+    /// Whether this index currently has derived indexing work in progress.
+    backfill_active: ?bool = null,
+    /// Compact lifecycle state for derived indexing work.
+    backfill_state: ?[]const u8 = null,
+    doc_count: ?i64 = null,
+    term_count: ?i64 = null,
+    edge_count: ?i64 = null,
+    node_count: ?i64 = null,
+    replay_applied_sequence: ?i64 = null,
+    replay_target_sequence: ?i64 = null,
+    replay_catch_up_required: ?bool = null,
+    repair_degraded: ?bool = null,
+    repair_issue_count: ?i64 = null,
+    repair_summary_ready: ?bool = null,
+    repair_issue_count_estimated: ?bool = null,
+    runtime_present: ?bool = null,
+    runtime_fresh: ?bool = null,
+    runtime_source: ?[]const u8 = null,
+    runtime_freshness: ?[]const u8 = null,
+    catch_up_active: ?bool = null,
+    catch_up_phase: ?[]const u8 = null,
+    catch_up_applied_sequence: ?i64 = null,
+    catch_up_target_sequence: ?i64 = null,
+    expected_groups: ?i64 = null,
+    reported_groups: ?i64 = null,
+    fresh_groups: ?i64 = null,
+    stale_groups: ?i64 = null,
+    missing_groups: ?i64 = null,
+    unknown_remote_groups: ?i64 = null,
+    /// Full-text merge runtime diagnostics.
+    text_merge: ?std.json.Value = null,
+    /// Artifact resolution replay diagnostics.
+    resolution: ?std.json.Value = null,
+    /// Artifact promotion replay diagnostics.
+    promotion: ?std.json.Value = null,
+    /// Derived-index background indexing diagnostics.
+    async_indexing: ?std.json.Value = null,
 };
 
 /// Discriminator for the index stats variant.
@@ -198,6 +235,55 @@ pub const EmbeddingsIndexStats = struct {
     checkpoint_replay_tail_sequence_count: ?i64 = null,
     /// Repair issues found by explicit repair-scan accounting for this projection.
     repair_scan_issue_count: ?i64 = null,
+    /// Whether this index currently has derived indexing work in progress.
+    backfill_active: ?bool = null,
+    /// Compact lifecycle state for derived indexing work.
+    backfill_state: ?[]const u8 = null,
+    doc_count: ?i64 = null,
+    term_count: ?i64 = null,
+    edge_count: ?i64 = null,
+    node_count: ?i64 = null,
+    query_visible_doc_count: ?i64 = null,
+    published_doc_count: ?i64 = null,
+    published_node_count: ?i64 = null,
+    root_node: ?i64 = null,
+    published_root_node: ?i64 = null,
+    dense_replay_applied_sequence: ?i64 = null,
+    dense_replay_target_sequence: ?i64 = null,
+    dense_publish_pending: ?bool = null,
+    replay_applied_sequence: ?i64 = null,
+    replay_target_sequence: ?i64 = null,
+    replay_catch_up_required: ?bool = null,
+    repair_degraded: ?bool = null,
+    repair_issue_count: ?i64 = null,
+    repair_summary_ready: ?bool = null,
+    repair_issue_count_estimated: ?bool = null,
+    runtime_present: ?bool = null,
+    runtime_fresh: ?bool = null,
+    runtime_source: ?[]const u8 = null,
+    runtime_freshness: ?[]const u8 = null,
+    catch_up_active: ?bool = null,
+    catch_up_phase: ?[]const u8 = null,
+    catch_up_applied_sequence: ?i64 = null,
+    catch_up_target_sequence: ?i64 = null,
+    expected_groups: ?i64 = null,
+    reported_groups: ?i64 = null,
+    fresh_groups: ?i64 = null,
+    stale_groups: ?i64 = null,
+    missing_groups: ?i64 = null,
+    unknown_remote_groups: ?i64 = null,
+    /// Artifact resolution replay diagnostics.
+    resolution: ?std.json.Value = null,
+    /// Artifact promotion replay diagnostics.
+    promotion: ?std.json.Value = null,
+    /// Dense-vector cache diagnostics.
+    hbc_cache: ?std.json.Value = null,
+    /// Dense-vector posting diagnostics.
+    hbc_posting: ?std.json.Value = null,
+    /// Managed enrichment runtime diagnostics.
+    enrichment_runtime: ?std.json.Value = null,
+    /// Derived-index background indexing diagnostics.
+    async_indexing: ?std.json.Value = null,
 };
 
 /// Discriminator for the index stats variant.
@@ -277,6 +363,45 @@ pub const AlgebraicIndexStats = struct {
     checkpoint_replay_tail_sequence_count: ?i64 = null,
     /// Repair issues found by explicit repair-scan accounting for this projection.
     repair_scan_issue_count: ?i64 = null,
+    /// Whether this index currently has derived indexing work in progress.
+    backfill_active: ?bool = null,
+    /// Compact lifecycle state for derived indexing work.
+    backfill_state: ?[]const u8 = null,
+    doc_count: ?i64 = null,
+    term_count: ?i64 = null,
+    edge_count: ?i64 = null,
+    node_count: ?i64 = null,
+    replay_applied_sequence: ?i64 = null,
+    replay_target_sequence: ?i64 = null,
+    replay_catch_up_required: ?bool = null,
+    repair_degraded: ?bool = null,
+    repair_issue_count: ?i64 = null,
+    repair_summary_ready: ?bool = null,
+    repair_issue_count_estimated: ?bool = null,
+    runtime_present: ?bool = null,
+    runtime_fresh: ?bool = null,
+    runtime_source: ?[]const u8 = null,
+    runtime_freshness: ?[]const u8 = null,
+    catch_up_active: ?bool = null,
+    catch_up_phase: ?[]const u8 = null,
+    catch_up_applied_sequence: ?i64 = null,
+    catch_up_target_sequence: ?i64 = null,
+    expected_groups: ?i64 = null,
+    reported_groups: ?i64 = null,
+    fresh_groups: ?i64 = null,
+    stale_groups: ?i64 = null,
+    missing_groups: ?i64 = null,
+    unknown_remote_groups: ?i64 = null,
+    /// Source artifact stream used to materialize graph edges.
+    source_artifact: ?std.json.Value = null,
+    /// Graph resolver replay diagnostics.
+    resolver_replay: ?std.json.Value = null,
+    /// Artifact resolution replay diagnostics.
+    resolution: ?std.json.Value = null,
+    /// Artifact promotion replay diagnostics.
+    promotion: ?std.json.Value = null,
+    /// Derived-index background indexing diagnostics.
+    async_indexing: ?std.json.Value = null,
 };
 
 /// Merge strategy for combining results from the semantic_search and full_text_search. rrf: Reciprocal Rank Fusion - combines scores using reciprocal rank formula rsf: Relative Score Fusion - normalizes scores by min/max within a window and combines weighted scores failover: Use full_text_search if embedding generation fails
@@ -475,6 +600,41 @@ pub const GraphIndexStats = struct {
     checkpoint_replay_tail_sequence_count: ?i64 = null,
     /// Repair issues found by explicit repair-scan accounting for this projection.
     repair_scan_issue_count: ?i64 = null,
+    /// Whether this index currently has derived indexing work in progress.
+    backfill_active: ?bool = null,
+    /// Compact lifecycle state for derived indexing work.
+    backfill_state: ?[]const u8 = null,
+    doc_count: ?i64 = null,
+    term_count: ?i64 = null,
+    edge_count: ?i64 = null,
+    node_count: ?i64 = null,
+    replay_applied_sequence: ?i64 = null,
+    replay_target_sequence: ?i64 = null,
+    replay_catch_up_required: ?bool = null,
+    repair_degraded: ?bool = null,
+    repair_issue_count: ?i64 = null,
+    repair_summary_ready: ?bool = null,
+    repair_issue_count_estimated: ?bool = null,
+    runtime_present: ?bool = null,
+    runtime_fresh: ?bool = null,
+    runtime_source: ?[]const u8 = null,
+    runtime_freshness: ?[]const u8 = null,
+    catch_up_active: ?bool = null,
+    catch_up_phase: ?[]const u8 = null,
+    catch_up_applied_sequence: ?i64 = null,
+    catch_up_target_sequence: ?i64 = null,
+    expected_groups: ?i64 = null,
+    reported_groups: ?i64 = null,
+    fresh_groups: ?i64 = null,
+    stale_groups: ?i64 = null,
+    missing_groups: ?i64 = null,
+    unknown_remote_groups: ?i64 = null,
+    /// Artifact resolution replay diagnostics.
+    resolution: ?std.json.Value = null,
+    /// Artifact promotion replay diagnostics.
+    promotion: ?std.json.Value = null,
+    /// Derived-index background indexing diagnostics.
+    async_indexing: ?std.json.Value = null,
     /// Algebraic graph execution health for bounded semiring traversal.
     algebraic_graph: ?std.json.Value = null,
 };
@@ -725,6 +885,11 @@ pub const IndexStats = union(enum) {
     graph_index_stats: GraphIndexStats,
     algebraic_index_stats: AlgebraicIndexStats,
 
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
         const disc_val = source.object.get("index_type") orelse return error.MissingField;
@@ -733,16 +898,16 @@ pub const IndexStats = union(enum) {
             else => return error.UnexpectedToken,
         };
         if (std.mem.eql(u8, disc_str, "full_text")) {
-            return .{ .full_text_index_stats = try std.json.parseFromValue(FullTextIndexStats, allocator, source, options) };
+            return .{ .full_text_index_stats = try std.json.parseFromValueLeaky(FullTextIndexStats, allocator, source, options) };
         }
         if (std.mem.eql(u8, disc_str, "embeddings")) {
-            return .{ .embeddings_index_stats = try std.json.parseFromValue(EmbeddingsIndexStats, allocator, source, options) };
+            return .{ .embeddings_index_stats = try std.json.parseFromValueLeaky(EmbeddingsIndexStats, allocator, source, options) };
         }
         if (std.mem.eql(u8, disc_str, "graph")) {
-            return .{ .graph_index_stats = try std.json.parseFromValue(GraphIndexStats, allocator, source, options) };
+            return .{ .graph_index_stats = try std.json.parseFromValueLeaky(GraphIndexStats, allocator, source, options) };
         }
         if (std.mem.eql(u8, disc_str, "algebraic")) {
-            return .{ .algebraic_index_stats = try std.json.parseFromValue(AlgebraicIndexStats, allocator, source, options) };
+            return .{ .algebraic_index_stats = try std.json.parseFromValueLeaky(AlgebraicIndexStats, allocator, source, options) };
         }
         return error.UnexpectedToken;
     }
