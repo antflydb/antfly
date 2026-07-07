@@ -1546,7 +1546,6 @@ pub const ApiHttpClient = struct {
             200, 202 => return .{ .body = try self.alloc.dupe(u8, resp.body) },
             404 => return error.NotFound,
             409 => return remoteGroupConflictError(resp.body),
-            503 => if (std.mem.eql(u8, resp.body, "repair cancel unavailable")) return error.RepairCancelUnavailable else return error.UnexpectedHttpStatus,
             else => return error.UnexpectedHttpStatus,
         }
     }
@@ -1651,6 +1650,7 @@ pub const ApiHttpClient = struct {
             200, 202 => return .{ .body = try self.alloc.dupe(u8, resp.body) },
             404 => return error.NotFound,
             409 => return remoteGroupConflictError(resp.body),
+            503 => if (std.mem.eql(u8, resp.body, "repair cancel unavailable")) return error.RepairCancelUnavailable else return error.UnexpectedHttpStatus,
             else => return error.UnexpectedHttpStatus,
         }
     }
@@ -2463,6 +2463,41 @@ fn remoteGroupTxnResolveConflictError(body: []const u8) anyerror {
     if (isDocIdentityNamespaceMismatchConflictMessage(body)) return error.DocIdentityNamespaceMismatch;
     if (std.mem.eql(u8, body, "decision conflict")) return error.DecisionConflict;
     return error.UnexpectedHttpStatus;
+}
+
+pub fn expectGroupArtifactRepairRunMapsCancelUnavailableForTest() !void {
+    const RepairExecutor = struct {
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .execute = execute,
+                },
+            };
+        }
+
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, "/internal/v1/groups/7/tables/docs/repair/run"));
+            try std.testing.expectEqualStrings("application/json", req.content_type.?);
+            try std.testing.expectEqualStrings("{\"target\":\"index\"}", req.body);
+            return .{
+                .status = 503,
+                .body = try alloc.dupe(u8, "repair cancel unavailable"),
+            };
+        }
+    };
+
+    var executor = RepairExecutor{};
+    var client = ApiHttpClient.init(std.testing.allocator, executor.executor());
+    try std.testing.expectError(
+        error.RepairCancelUnavailable,
+        client.fetchGroupArtifactRepairRun("http://127.0.0.1:1", 7, "docs", "{\"target\":\"index\"}"),
+    );
+}
+
+test "api http client maps remote repair cancel unavailable" {
+    try expectGroupArtifactRepairRunMapsCancelUnavailableForTest();
 }
 
 test "api http client preserves group doc identity conflicts" {
