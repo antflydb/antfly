@@ -77,6 +77,8 @@ pub const QueryBuilderFieldCapability = struct {
     doc_value_coverage: []const u8 = "",
     queryability_state: []const u8 = "",
     provenance: []const u8 = "",
+    index_sort_position: ?usize = null,
+    index_sort_order: ?[]const u8 = null,
 };
 
 pub const QueryBuilderCollectedContext = struct {

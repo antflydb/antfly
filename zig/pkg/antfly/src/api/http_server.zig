@@ -4860,6 +4860,8 @@ pub const ApiHttpServer = struct {
                     .doc_value_coverage = capability.doc_value_coverage,
                     .queryability_state = capability.queryability_state,
                     .provenance = capability.provenance,
+                    .index_sort_position = if (capability.index_sort) |membership| membership.position else null,
+                    .index_sort_order = if (capability.index_sort) |membership| if (membership.desc) "desc" else "asc" else null,
                 });
             }
         }
@@ -4874,6 +4876,8 @@ pub const ApiHttpServer = struct {
                     .doc_value_coverage = capability.doc_value_coverage,
                     .queryability_state = capability.queryability_state,
                     .provenance = capability.provenance,
+                    .index_sort_position = if (capability.index_sort) |membership| membership.position else null,
+                    .index_sort_order = if (capability.index_sort) |membership| if (membership.desc) "desc" else "asc" else null,
                 });
             }
         }
@@ -8175,6 +8179,7 @@ fn freeQueryBuilderFieldCapability(
     alloc.free(@constCast(capability.doc_value_coverage));
     alloc.free(@constCast(capability.queryability_state));
     alloc.free(@constCast(capability.provenance));
+    if (capability.index_sort_order) |value| alloc.free(@constCast(value));
 }
 
 fn appendQueryBuilderFieldCapability(
@@ -8190,6 +8195,8 @@ fn appendQueryBuilderFieldCapability(
     errdefer alloc.free(owned_queryability);
     const owned_provenance = try alloc.dupe(u8, capability.provenance);
     errdefer alloc.free(owned_provenance);
+    const owned_index_sort_order = if (capability.index_sort_order) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (owned_index_sort_order) |value| alloc.free(value);
     const item = query_builder_agent.QueryBuilderFieldCapability{
         .field = owned_field,
         .field_type = capability.field_type,
@@ -8198,6 +8205,8 @@ fn appendQueryBuilderFieldCapability(
         .doc_value_coverage = owned_coverage,
         .queryability_state = owned_queryability,
         .provenance = owned_provenance,
+        .index_sort_position = capability.index_sort_position,
+        .index_sort_order = owned_index_sort_order,
     };
     errdefer freeQueryBuilderFieldCapability(alloc, item);
     try out.append(alloc, item);
@@ -16222,7 +16231,7 @@ test "api http server query builder loads structured table index metadata" {
                 .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
                     .table_id = 1,
                     .name = "docs",
-                    .schema_json = "{\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"body\":{\"type\":\"text\"}}}}}}",
+                    .schema_json = "{\"default_type\":\"doc\",\"dynamic_templates\":[{\"name\":\"created\",\"path_match\":\"created_at\",\"mapping\":{\"type\":\"datetime\",\"sortable\":true}}],\"index_sort\":[{\"field\":\"created_at\",\"order\":\"desc\"},{\"field\":\"_id\",\"order\":\"asc\"}],\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"body\":{\"type\":\"text\"},\"created_at\":{\"type\":\"string\",\"format\":\"date-time\"}}}}}}",
                     .indexes_json = "{\"search_idx\":{\"type\":\"full_text\",\"fields\":[\"title\",\"body\"]},\"semantic_idx\":{\"type\":\"dense_vector\",\"dimension\":384,\"embedder\":{\"model\":\"e5-small\"}},\"sparse_idx\":{\"type\":\"sparse_vector\",\"model\":\"splade\"},\"doc_graph\":{\"type\":\"graph\",\"edge_types\":[{\"name\":\"references\",\"topology\":\"graph\"},{\"name\":\"parent\",\"topology\":\"tree\"}]}}",
                     .placement_role = "data",
                 }})[0..]),
@@ -16245,6 +16254,21 @@ test "api http server query builder loads structured table index metadata" {
     try std.testing.expectEqualStrings("search_idx", context.full_text_index_metadata[0].name);
     try std.testing.expectEqualStrings("title", context.full_text_index_metadata[0].fields[0]);
     try std.testing.expectEqualStrings("body", context.full_text_index_metadata[0].fields[1]);
+
+    var created_capability: ?query_builder_agent.QueryBuilderFieldCapability = null;
+    var id_capability: ?query_builder_agent.QueryBuilderFieldCapability = null;
+    for (context.field_capabilities) |capability| {
+        if (std.mem.eql(u8, capability.field, "created_at")) created_capability = capability;
+        if (std.mem.eql(u8, capability.field, "_id")) id_capability = capability;
+    }
+    const created = created_capability orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(storage_schema.AntflyType.datetime, created.field_type.?);
+    try std.testing.expect(created.sortable);
+    try std.testing.expectEqual(@as(?usize, 0), created.index_sort_position);
+    try std.testing.expectEqualStrings("desc", created.index_sort_order.?);
+    const id = id_capability orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(?usize, 1), id.index_sort_position);
+    try std.testing.expectEqualStrings("asc", id.index_sort_order.?);
 
     try std.testing.expectEqual(@as(usize, 2), context.embedding_index_metadata.len);
     try std.testing.expectEqualStrings("semantic_idx", context.embedding_index_metadata[0].name);
