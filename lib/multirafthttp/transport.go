@@ -372,8 +372,10 @@ func (t *Transport) Stop(shardID types.ID) {
 		t.peerAdds[peer]--
 		if t.peerAdds[peer] == 0 {
 			delete(t.peerAdds, peer)
-			t.peers[peer].stop()
-			delete(t.peers, peer)
+			if p, ok := t.peers[peer]; ok {
+				p.stop()
+				delete(t.peers, peer)
+			}
 		}
 	}
 	delete(t.shardPeers, shardID)

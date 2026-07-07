@@ -166,6 +166,34 @@ func TestTransportAdd(t *testing.T) {
 	tr.Stop(shardID)
 }
 
+func TestTransportStopIgnoresPeerMissingDuringRestart(t *testing.T) {
+	tr := &Transport{
+		LeaderStats:      stats.NewLeaderStats(""),
+		StreamRt:         &roundTripperRecorder{},
+		peers:            make(map[types.ID]Peer),
+		shardPeers:       make(map[types.ID]map[types.ID]struct{}),
+		peerAdds:         make(map[types.ID]int),
+		remotes:          make(map[types.ID]map[types.ID]*remote),
+		PipelineProber:   probing.NewProber(nil),
+		StreamProber:     probing.NewProber(nil),
+		SnapStoreFactory: mockSnapStoreFactory,
+	}
+	shardID := types.ID(1)
+	peerID := types.ID(2)
+	tr.remotes[shardID] = make(map[types.ID]*remote)
+	tr.shardPeers[shardID] = map[types.ID]struct{}{peerID: {}}
+	tr.peerAdds[peerID] = 1
+
+	tr.Stop(shardID)
+
+	if _, ok := tr.peerAdds[peerID]; ok {
+		t.Fatalf("peer refcount was not removed")
+	}
+	if _, ok := tr.shardPeers[shardID]; ok {
+		t.Fatalf("shard peer membership was not removed")
+	}
+}
+
 func TestTransportRemove(t *testing.T) {
 	defer goleak.VerifyNone(t,
 		// Ants starts a goroutine even on import
