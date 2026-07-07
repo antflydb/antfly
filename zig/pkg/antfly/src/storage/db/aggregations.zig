@@ -27,6 +27,7 @@ const geo_mod = @import("../../search/geo.zig");
 const regex_mod = @import("../../search/regex.zig");
 const doc_identity = @import("doc_identity.zig");
 const doc_set = @import("doc_set.zig");
+const schema_mod = @import("../schema.zig");
 
 pub const NumericRangeRequest = struct {
     name: []const u8 = "",
@@ -188,6 +189,7 @@ pub const Context = struct {
     algebraic_index_name: ?[]const u8 = null,
     algebraic_scope: AlgebraicScope = .disabled,
     algebraic_available: bool = false,
+    runtime_schema: ?schema_mod.TableSchema = null,
     algebraic_constraints: []const FixedConstraint = &.{},
     identity_read_generation: ?u64 = null,
     distributed_text_stats: []const distributed_stats_mod.TextFieldStats = &.{},
@@ -370,6 +372,10 @@ fn computeAlgebraicAggregation(
     }
     if (!index.plannerLifecycleReady()) {
         index.recordPlannerFallback("schema_lifecycle_not_ready", null, null);
+        return null;
+    }
+    if (!schema_mod.relationalAccessMethodQueryReady(ctx.runtime_schema, .algebraic_filter, entry.config.name)) {
+        index.recordPlannerFallback("relational_generation_not_ready", null, null);
         return null;
     }
     if (std.mem.eql(u8, request.type, "stats")) {
@@ -14727,6 +14733,67 @@ test "cardinality_mode approximate errors when no sketch applies" {
 
     const requests = [_]SearchAggregationRequest{.{ .name = "unique_customers", .type = "cardinality", .field = "customer", .cardinality_mode = .approximate }};
     try std.testing.expectError(error.UnsupportedAggregation, computeSearchAggregations(alloc, &requests, result, ctx));
+}
+
+test "algebraic aggregations fail closed when relational generation record is stale" {
+    const alloc = std.testing.allocator;
+    var backend = @import("../mem_backend.zig").Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "orders",
+        \\  "group_fields": [{"name":"customer","path":"customer","type":"string"}],
+        \\  "hll_cardinalities": [{"name":"customer_ndv","field":"customer"}]
+        \\}
+    ;
+    var manager = try index_manager_mod.IndexManager.init(alloc, ".");
+    defer manager.deinit();
+    const mutex = try alloc.create(std.atomic.Mutex);
+    mutex.* = .unlocked;
+    const config = try types.IndexConfig.clone(alloc, .{ .name = "alg", .kind = .algebraic, .config_json = cfg });
+    const alg_index = try algebraic_mod.index.Index.open(alloc, "alg", cfg);
+    try manager.algebraic_indexes.append(alloc, .{ .apply_mutex = mutex, .config = config, .rebuild_root_path = try alloc.dupe(u8, "."), .index = alg_index });
+
+    const stale_algebraic_index = schema_mod.RelationalIndex{
+        .name = "alg",
+        .owner_kind = .table,
+        .owner_name = schema_mod.relational_table_index_owner_name,
+        .access_method = .algebraic_filter,
+        .lifecycle = .stale,
+        .generation = 3,
+        .generation_record = .{
+            .generation = 3,
+            .lifecycle = .stale,
+            .lag = 1,
+            .ready_watermark = 2,
+        },
+    };
+
+    const hits = try alloc.alloc(types.SearchHit, 0);
+    defer alloc.free(hits);
+    const result = types.SearchResult{ .alloc = alloc, .hits = hits, .total_hits = 0 };
+    const ctx = Context{
+        .index_manager = &manager,
+        .doc_store = &store,
+        .algebraic_scope = .root,
+        .algebraic_available = true,
+        .runtime_schema = .{
+            .version = 1,
+            .relational_indexes = &[_]schema_mod.RelationalIndex{stale_algebraic_index},
+        },
+    };
+
+    const requests = [_]SearchAggregationRequest{.{ .name = "unique_customers", .type = "cardinality", .field = "customer", .cardinality_mode = .approximate }};
+    try std.testing.expectError(error.UnsupportedAggregation, computeSearchAggregations(alloc, &requests, result, ctx));
+
+    const status_value = manager.algebraic_indexes.items[0].index.status();
+    try std.testing.expectEqual(@as(u64, 1), status_value.planner_fallback_count);
+    try std.testing.expectEqualStrings("relational_generation_not_ready", status_value.planner_last_fallback_reason.?);
 }
 
 // Asserts a cardinality result was served approximately (from a sketch): it

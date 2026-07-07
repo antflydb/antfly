@@ -587,6 +587,47 @@ pub fn relationalIndexLifecycle(index: RelationalIndex) ?RelationalIndexLifecycl
     };
 }
 
+pub fn relationalIndexQueryReady(index: RelationalIndex) bool {
+    if (!relationalIndexGenerationRecordValid(index)) return false;
+    const lifecycle = relationalIndexLifecycle(index) orelse return false;
+    if (lifecycle != .ready) return false;
+    if (index.generation_record) |record| return record.lag == 0;
+    return true;
+}
+
+pub fn relationalIndexWriteMaintenanceAllowed(index: RelationalIndex) bool {
+    if (!relationalIndexGenerationRecordValid(index)) return false;
+    const lifecycle = relationalIndexLifecycle(index) orelse return false;
+    return switch (lifecycle) {
+        .ready, .building, .catching_up => true,
+        .invalid, .dropping, .stale, .rebuild_required, .failed => false,
+    };
+}
+
+pub fn relationalAccessMethodQueryReady(schema: ?TableSchema, access_method: RelationalIndexAccessMethod, index_name: []const u8) bool {
+    const active_schema = schema orelse return true;
+    var matched = false;
+    for (active_schema.relational_indexes) |index| {
+        if (index.access_method != access_method) continue;
+        if (!std.mem.eql(u8, index.name, index_name)) continue;
+        matched = true;
+        if (relationalIndexQueryReady(index)) return true;
+    }
+    return !matched;
+}
+
+pub fn relationalAccessMethodWriteMaintenanceAllowed(schema: ?TableSchema, access_method: RelationalIndexAccessMethod, index_name: []const u8) bool {
+    const active_schema = schema orelse return true;
+    var matched = false;
+    for (active_schema.relational_indexes) |index| {
+        if (index.access_method != access_method) continue;
+        if (!std.mem.eql(u8, index.name, index_name)) continue;
+        matched = true;
+        if (relationalIndexWriteMaintenanceAllowed(index)) return true;
+    }
+    return !matched;
+}
+
 pub fn relationalIndexOwnerRangeSlicesEqual(
     lhs: []const RelationalIndexOwnerRange,
     rhs: []const RelationalIndexOwnerRange,

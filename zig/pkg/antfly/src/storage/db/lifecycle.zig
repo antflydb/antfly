@@ -1888,7 +1888,7 @@ pub fn Impl(comptime DB: type) type {
                 .all_indexes = try all_indexes.toOwnedSlice(self.alloc),
             };
             errdefer targets.deinit(self.alloc);
-            try derived_async_mod.filterManagedSyncTargetsForRelationalTextSearchMaintenance(self.alloc, self.core.schema, &targets);
+            try derived_async_mod.filterManagedSyncTargetsForRelationalDerivedMaintenance(self.alloc, self.core.schema, &targets);
             return targets;
         }
 

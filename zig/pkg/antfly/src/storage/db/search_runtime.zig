@@ -527,9 +527,7 @@ test "relational table full-text backfill indexes committed base rows" {
         .sync_level = .write,
     });
 
-    const row_key = try relational_store_mod.rowKeyAlloc(alloc, "row:committed");
-    defer alloc.free(row_key);
-    const packed_row = try relational_store_mod.getRawAlloc(alloc, db.core.store, row_key) orelse return error.TestUnexpectedResult;
+    const packed_row = try relational_store_mod.getRawAlloc(alloc, db.core.store, "row:committed") orelse return error.TestUnexpectedResult;
     defer alloc.free(packed_row);
     try std.testing.expect(packed_row.len > 0);
 
@@ -667,7 +665,7 @@ test "relational indexed array_any filters use array element indexes" {
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"tags":{"type":"array","items":{"type":"keyword"}}},"required":["title"],"additionalProperties":false}}}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"tags":{"type":"array","items":{"type":"keyword"}}},"required":["title"],"additionalProperties":false}}},"relational_indexes":[{"name":"tags_idx","owner_kind":"relational_column","owner_name":"tags","access_method":"scalar_column","columns":["tags"],"lifecycle":"ready","generation":1,"schema_fingerprint":"secondary-index-v1:tags"}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -755,7 +753,7 @@ test "relational indexed json_contains filters use json value indexes" {
     defer db.close();
 
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"attrs":{"type":"json"}},"required":["title"],"additionalProperties":false}}}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"attrs":{"type":"json"}},"required":["title"],"additionalProperties":false}}},"relational_indexes":[{"name":"attrs_idx","owner_kind":"relational_column","owner_name":"attrs","access_method":"scalar_column","columns":["attrs"],"lifecycle":"ready","generation":1,"schema_fingerprint":"secondary-index-v1:attrs"}]}
     ;
     var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -1841,6 +1839,13 @@ pub fn Impl(comptime DB: type) type {
                 return .{ .req = req };
             };
             entry.index.recordVectorFilterAttempt();
+            if (!schema_mod.relationalAccessMethodQueryReady(self.core.schema, .algebraic_filter, entry.config.name)) {
+                entry.index.recordPlannerFallback("relational_generation_not_ready", null, null);
+                entry.index.recordVectorFilterUnsupported(req.require_algebraic_filter_resolution);
+                Self.recordUnsupportedDocSetFilterShape(self);
+                if (req.require_algebraic_filter_resolution) return error.UnsupportedQueryRequest;
+                return .{ .req = req };
+            }
             if (entry.index.hasErrors() or !entry.index.plannerLifecycleReady()) {
                 entry.index.recordVectorFilterUnsupported(req.require_algebraic_filter_resolution);
                 Self.recordUnsupportedDocSetFilterShape(self);
@@ -8146,6 +8151,81 @@ test "db search runtime identity vector symbolic filters fail closed when algebr
         try std.testing.expectEqual(@as(u64, 2), status_value.vector_filter_unsupported_count);
         try std.testing.expectEqual(@as(u64, 2), status_value.vector_filter_fail_closed_count);
     }
+}
+
+test "db search runtime relational algebraic filters fail closed when generation record is stale" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const stale_algebraic_index = schema_mod.RelationalIndex{
+        .name = "alg",
+        .owner_kind = .table,
+        .owner_name = schema_mod.relational_table_index_owner_name,
+        .access_method = .algebraic_filter,
+        .lifecycle = .stale,
+        .generation = 7,
+        .generation_record = .{
+            .generation = 7,
+            .lifecycle = .stale,
+            .lag = 3,
+            .ready_watermark = 11,
+        },
+    };
+    try db.setSchema(.{
+        .version = 1,
+        .relational_indexes = &[_]schema_mod.RelationalIndex{stale_algebraic_index},
+    });
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    });
+    try db.addIndex(.{
+        .name = "alg",
+        .kind = .algebraic,
+        .config_json =
+        \\{
+        \\  "version": 1,
+        \\  "table": "docs",
+        \\  "group_fields": [{"name":"category","path":"category","type":"string"}],
+        \\  "materializations": [{"name":"count_by_category","op":"count","group_by":["category"]}]
+        \\}
+        ,
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"category\":\"reject\",\"embedding\":[0,0]}" },
+            .{ .key = "doc:b", .value = "{\"category\":\"keep\",\"embedding\":[10,0]}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    const alg_entry = db.core.index_manager.algebraicIndex("alg") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(alg_entry.index.plannerLifecycleReady());
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"term\":{\"category\":\"keep\"}}",
+        .require_algebraic_filter_resolution = true,
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 }));
+
+    const status_value = alg_entry.index.status();
+    try std.testing.expectEqual(@as(u64, 1), status_value.vector_filter_attempt_count);
+    try std.testing.expectEqual(@as(u64, 0), status_value.vector_filter_resolved_count);
+    try std.testing.expectEqual(@as(u64, 1), status_value.vector_filter_unsupported_count);
+    try std.testing.expectEqual(@as(u64, 1), status_value.vector_filter_fail_closed_count);
+    try std.testing.expectEqualStrings("relational_generation_not_ready", status_value.planner_last_fallback_reason.?);
 }
 
 test "db search runtime identity algebraic doc facts feed native dense and sparse symbolic filters" {

@@ -6703,7 +6703,7 @@ pub fn Impl(comptime DB: type) type {
             if (ctx.relational_base_rows) {
                 const loaded_schema = try schema_mod.loadSchema(ctx.store, ctx.alloc);
                 defer if (loaded_schema) |schema| schema_mod.freeSchema(ctx.alloc, schema);
-                try DB.WritePathCallbacks.filter_managed_sync_targets_for_relational_text_search_maintenance(ctx.alloc, loaded_schema, &sync_targets);
+                try DB.WritePathCallbacks.filter_managed_sync_targets_for_relational_derived_maintenance(ctx.alloc, loaded_schema, &sync_targets);
             }
             ctx.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
             try DB.WritePathCallbacks.mark_precomputed_enrichment_applied_for_sync_context(ctx, sync_level, sequence);

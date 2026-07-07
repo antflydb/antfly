@@ -1359,11 +1359,113 @@ test "db derived async filters relational text-search sync targets by generation
     }
 }
 
+test "db derived async filters relational algebraic sync targets by generation record" {
+    const alloc = std.testing.allocator;
+    const Case = struct {
+        name: []const u8,
+        schema: ?schema_mod.TableSchema,
+        expected_all: []const []const u8,
+    };
+
+    const ready_index = relationalAlgebraicIndexForTest(.ready, .{ .generation = 7, .lifecycle = .ready });
+    const building_index = relationalAlgebraicIndexForTest(.building, .{ .generation = 7, .lifecycle = .building });
+    const catching_up_index = relationalAlgebraicIndexForTest(.catching_up, .{ .generation = 7, .lifecycle = .catching_up, .lag = 9 });
+    const invalid_index = relationalAlgebraicIndexForTest(.invalid, .{ .generation = 7, .lifecycle = .invalid });
+    const missing_record_index = schema_mod.RelationalIndex{
+        .name = "alg_rel",
+        .owner_kind = .table,
+        .owner_name = schema_mod.relational_table_index_owner_name,
+        .access_method = .algebraic_filter,
+        .lifecycle = .ready,
+        .generation = 7,
+    };
+    const mismatched_generation_index = relationalAlgebraicIndexForTest(.ready, .{ .generation = 6, .lifecycle = .ready });
+    const unrelated_indexes = [_]schema_mod.RelationalIndex{
+        relationalTextSearchIndexNamedForTest("fts_doc", .ready, .{ .generation = 7, .lifecycle = .ready }),
+    };
+
+    const keep_all = [_][]const u8{ "alg_rel", "fts_doc", "dense_v1" };
+    const filtered_all = [_][]const u8{ "fts_doc", "dense_v1" };
+    const cases = [_]Case{
+        .{
+            .name = "no relational schema keeps document algebraic target",
+            .schema = null,
+            .expected_all = &keep_all,
+        },
+        .{
+            .name = "no matching relational algebraic index keeps target",
+            .schema = .{ .relational_indexes = &unrelated_indexes },
+            .expected_all = &keep_all,
+        },
+        .{
+            .name = "ready generation keeps algebraic target",
+            .schema = .{ .relational_indexes = &[_]schema_mod.RelationalIndex{ready_index} },
+            .expected_all = &keep_all,
+        },
+        .{
+            .name = "building generation keeps algebraic target for write maintenance",
+            .schema = .{ .relational_indexes = &[_]schema_mod.RelationalIndex{building_index} },
+            .expected_all = &keep_all,
+        },
+        .{
+            .name = "catching-up generation keeps algebraic target for write maintenance",
+            .schema = .{ .relational_indexes = &[_]schema_mod.RelationalIndex{catching_up_index} },
+            .expected_all = &keep_all,
+        },
+        .{
+            .name = "invalid generation filters algebraic target",
+            .schema = .{ .relational_indexes = &[_]schema_mod.RelationalIndex{invalid_index} },
+            .expected_all = &filtered_all,
+        },
+        .{
+            .name = "missing generation record filters algebraic target",
+            .schema = .{ .relational_indexes = &[_]schema_mod.RelationalIndex{missing_record_index} },
+            .expected_all = &filtered_all,
+        },
+        .{
+            .name = "mismatched generation record filters algebraic target",
+            .schema = .{ .relational_indexes = &[_]schema_mod.RelationalIndex{mismatched_generation_index} },
+            .expected_all = &filtered_all,
+        },
+    };
+
+    for (cases) |case| {
+        var targets = try managedAlgebraicSyncTargetsForFilterTest(alloc);
+        defer targets.deinit(alloc);
+
+        try filterManagedSyncTargetsForRelationalDerivedMaintenance(alloc, case.schema, &targets);
+
+        expectManagedSyncTargetNames(case.name, &[_][]const u8{"fts_doc"}, targets.full_text_indexes) catch |err| {
+            std.debug.print("case failed: {s}\n", .{case.name});
+            return err;
+        };
+        expectManagedSyncTargetNames(case.name, case.expected_all, targets.all_indexes) catch |err| {
+            std.debug.print("case failed: {s}\n", .{case.name});
+            return err;
+        };
+    }
+}
+
 fn relationalTextSearchIndexForTest(
     lifecycle: schema_mod.RelationalIndexLifecycle,
     record: schema_mod.RelationalIndexGenerationRecord,
 ) schema_mod.RelationalIndex {
     return relationalTextSearchIndexNamedForTest("fts_rel", lifecycle, record);
+}
+
+fn relationalAlgebraicIndexForTest(
+    lifecycle: schema_mod.RelationalIndexLifecycle,
+    record: schema_mod.RelationalIndexGenerationRecord,
+) schema_mod.RelationalIndex {
+    return .{
+        .name = "alg_rel",
+        .owner_kind = .table,
+        .owner_name = schema_mod.relational_table_index_owner_name,
+        .access_method = .algebraic_filter,
+        .lifecycle = lifecycle,
+        .generation = 7,
+        .generation_record = record,
+    };
 }
 
 fn relationalTextSearchIndexNamedForTest(
@@ -1379,6 +1481,31 @@ fn relationalTextSearchIndexNamedForTest(
         .lifecycle = lifecycle,
         .generation = 7,
         .generation_record = record,
+    };
+}
+
+fn managedAlgebraicSyncTargetsForFilterTest(alloc: Allocator) !db_internal.ManagedSyncTargets {
+    var full_text_indexes = try alloc.alloc([]const u8, 1);
+    errdefer alloc.free(full_text_indexes);
+    full_text_indexes[0] = try alloc.dupe(u8, "fts_doc");
+    errdefer alloc.free(@constCast(full_text_indexes[0]));
+
+    var all_indexes = try alloc.alloc([]const u8, 3);
+    var initialized_all: usize = 0;
+    errdefer {
+        for (all_indexes[0..initialized_all]) |name| alloc.free(@constCast(name));
+        alloc.free(all_indexes);
+    }
+    all_indexes[0] = try alloc.dupe(u8, "alg_rel");
+    initialized_all += 1;
+    all_indexes[1] = try alloc.dupe(u8, "fts_doc");
+    initialized_all += 1;
+    all_indexes[2] = try alloc.dupe(u8, "dense_v1");
+    initialized_all += 1;
+
+    return .{
+        .full_text_indexes = full_text_indexes,
+        .all_indexes = all_indexes,
     };
 }
 
@@ -1428,23 +1555,32 @@ pub fn filterManagedSyncTargetsForRelationalTextSearchMaintenance(
     schema: ?schema_mod.TableSchema,
     targets: *db_internal.ManagedSyncTargets,
 ) !void {
-    targets.full_text_indexes = try filterRelationalTextSearchMaintenanceTargets(alloc, schema, targets.full_text_indexes);
-    targets.all_indexes = try filterRelationalTextSearchMaintenanceTargets(alloc, schema, targets.all_indexes);
+    return try filterManagedSyncTargetsForRelationalDerivedMaintenance(alloc, schema, targets);
 }
 
-fn filterRelationalTextSearchMaintenanceTargets(
+pub fn filterManagedSyncTargetsForRelationalDerivedMaintenance(
+    alloc: Allocator,
+    schema: ?schema_mod.TableSchema,
+    targets: *db_internal.ManagedSyncTargets,
+) !void {
+    targets.full_text_indexes = try filterRelationalDerivedMaintenanceTargets(alloc, schema, targets.full_text_indexes, &.{.text_search});
+    targets.all_indexes = try filterRelationalDerivedMaintenanceTargets(alloc, schema, targets.all_indexes, &.{ .text_search, .algebraic_filter });
+}
+
+fn filterRelationalDerivedMaintenanceTargets(
     alloc: Allocator,
     schema: ?schema_mod.TableSchema,
     source: []const []const u8,
+    access_methods: []const schema_mod.RelationalIndexAccessMethod,
 ) ![]const []const u8 {
     var kept_len: usize = 0;
     for (source) |name| {
-        if (relationalTextSearchWriteMaintenanceAllowed(schema, name)) kept_len += 1;
+        if (relationalDerivedWriteMaintenanceAllowed(schema, name, access_methods)) kept_len += 1;
     }
     var kept: [][]const u8 = if (kept_len == 0) &.{} else try alloc.alloc([]const u8, kept_len);
     var kept_index: usize = 0;
     for (source) |name| {
-        if (relationalTextSearchWriteMaintenanceAllowed(schema, name)) {
+        if (relationalDerivedWriteMaintenanceAllowed(schema, name, access_methods)) {
             kept[kept_index] = name;
             kept_index += 1;
         } else {
@@ -1455,26 +1591,15 @@ fn filterRelationalTextSearchMaintenanceTargets(
     return kept;
 }
 
-fn relationalTextSearchWriteMaintenanceAllowed(schema: ?schema_mod.TableSchema, index_name: []const u8) bool {
-    const active_schema = schema orelse return true;
-    var matched_relational_text_search = false;
-    var allowed = false;
-    for (active_schema.relational_indexes) |index| {
-        if (index.access_method != .text_search) continue;
-        if (!std.mem.eql(u8, index.name, index_name)) continue;
-        matched_relational_text_search = true;
-        if (relationalTextSearchIndexWriteMaintenanceAllowed(index)) allowed = true;
+fn relationalDerivedWriteMaintenanceAllowed(
+    schema: ?schema_mod.TableSchema,
+    index_name: []const u8,
+    access_methods: []const schema_mod.RelationalIndexAccessMethod,
+) bool {
+    for (access_methods) |access_method| {
+        if (!schema_mod.relationalAccessMethodWriteMaintenanceAllowed(schema, access_method, index_name)) return false;
     }
-    return !matched_relational_text_search or allowed;
-}
-
-fn relationalTextSearchIndexWriteMaintenanceAllowed(index: schema_mod.RelationalIndex) bool {
-    if (!schema_mod.relationalIndexGenerationRecordValid(index)) return false;
-    const lifecycle = schema_mod.relationalIndexLifecycle(index) orelse return false;
-    return switch (lifecycle) {
-        .ready, .building, .catching_up => true,
-        .invalid, .dropping, .stale, .rebuild_required, .failed => false,
-    };
+    return true;
 }
 
 pub fn denseCatchUpStartupMaxRecords() usize {
@@ -1804,7 +1929,7 @@ pub fn Impl(comptime DB: type) type {
         pub fn collectManagedSyncTargetsForDB(self: *DB, alloc: Allocator, batch: derived_types.DerivedBatch) !ManagedSyncTargets {
             var targets = try collectManagedSyncTargets(alloc, self.core.index_manager, batch);
             errdefer targets.deinit(alloc);
-            try filterManagedSyncTargetsForRelationalTextSearchMaintenance(alloc, self.core.schema, &targets);
+            try filterManagedSyncTargetsForRelationalDerivedMaintenance(alloc, self.core.schema, &targets);
             return targets;
         }
 

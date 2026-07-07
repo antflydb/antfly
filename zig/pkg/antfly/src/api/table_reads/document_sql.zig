@@ -193,6 +193,7 @@ pub fn aggregationContextForDb(
         .full_text_index_name = req.index_name,
         .algebraic_index_name = req.index_name,
         .algebraic_available = try algebraicIndexFreshEnoughForRequest(alloc, req, db),
+        .runtime_schema = db.core.schema,
         .identity_read_generation = identity_read_generation,
     };
 }
