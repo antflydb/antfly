@@ -6639,6 +6639,7 @@ pub fn build(b: *std.Build) void {
         "exact-sort-cursor",
         "exact-sort-before-cursor",
         "exact-sort-keyword",
+        "exact-sort-datetime",
         "exact-sort-full-text",
         "exact-sort-filter",
     };
