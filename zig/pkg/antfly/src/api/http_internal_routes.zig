@@ -15,9 +15,12 @@
 const std = @import("std");
 const distributed_join = @import("distributed_join.zig");
 const http_common = @import("../raft/transport/http_common.zig");
+const http_route_helpers = @import("http_route_helpers.zig");
 const http_internal_group_join_routes = @import("http_internal_group_join_routes.zig");
 const http_internal_group_read_routes = @import("http_internal_group_read_routes.zig");
 const http_internal_group_write_routes = @import("http_internal_group_write_routes.zig");
+const repair_jobs = @import("repair_jobs.zig");
+const routes = @import("http_routes.zig");
 
 pub const RetrievalExecutor = struct {
     ptr: *anyopaque,
@@ -39,7 +42,29 @@ pub const Context = struct {
     retrieval_executor: RetrievalExecutor,
 };
 
+fn handleRepairCancelState(ctx: Context, route: routes.Routes.InternalTableRepairCancelState) !http_common.HttpResponse {
+    const store = ctx.write_ctx.repair_job_store orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+    const job_id = std.fmt.parseUnsigned(u64, route.job_id, 10) catch return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid repair job id");
+    const attempt_id = std.fmt.parseUnsigned(u64, route.attempt_id, 10) catch return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid repair attempt id");
+    const table_name = http_route_helpers.decodePercentEncodedPathComponentAlloc(ctx.alloc, route.table_name) catch {
+        return try http_route_helpers.textResponse(ctx.alloc, 400, "invalid path parameter");
+    };
+    defer ctx.alloc.free(table_name);
+    const encoded = (try store.loadJobAlloc(ctx.alloc, job_id)) orelse return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+    defer ctx.alloc.free(encoded);
+    var parsed = std.json.parseFromSlice(repair_jobs.JobState, ctx.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
+        return try http_route_helpers.textResponse(ctx.alloc, 500, "invalid repair job state");
+    };
+    defer parsed.deinit();
+    if (!std.mem.eql(u8, parsed.value.table_name, table_name)) return try http_route_helpers.textResponse(ctx.alloc, 404, "not found");
+    const cancel_requested = parsed.value.cancel_requested or
+        repair_jobs.isTerminalPhase(parsed.value.phase) or
+        parsed.value.attempt_id != attempt_id;
+    return try http_route_helpers.jsonResponseWithStatus(ctx.alloc, 200, .{ .cancel_requested = cancel_requested });
+}
+
 pub fn handle(ctx: Context, req: http_common.HttpRequest) !?http_common.HttpResponse {
+    if (routes.Routes.matchInternalTableRepairCancelState(ctx.path)) |route| return try handleRepairCancelState(ctx, route);
     if (try ctx.retrieval_executor.run(req, ctx.path)) |resp| return resp;
     if (try http_internal_group_read_routes.handle(ctx.read_ctx, req, ctx.path, ctx.query)) |resp| return resp;
     if (try http_internal_group_join_routes.handle(.{

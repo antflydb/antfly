@@ -3998,7 +3998,7 @@ paths:
         schema:
           type: string
     post:
-      summary: List artifact repair issues
+      summary: List table repair issues
       description: >
         Lists durable repair debt for a table. This operator-facing endpoint
 
@@ -4013,7 +4013,7 @@ paths:
         `target=index` for index repair candidates.
       tags:
         - data_operations
-      operationId: listArtifactRepairIssues
+      operationId: listTableRepairIssues
       requestBody:
         required: false
         content:
@@ -4022,11 +4022,11 @@ paths:
               $ref: '#/components/schemas/RepairIssueListRequest'
       responses:
         '200':
-          description: Artifact repair issue page
+          description: Table repair issue page
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ArtifactRepairIssueList'
+                $ref: '#/components/schemas/TableRepairIssueList'
         '400':
           $ref: '#/components/responses/BadRequest'
         '404':
@@ -4050,23 +4050,25 @@ paths:
     post:
       summary: Run a bounded table repair pass
       description: >
-        Attempts to repair queued table issues. `target=artifact` reprocesses
+        Synchronously attempts to repair queued table issues. `target=artifact` reprocesses
 
         supported artifact kinds and replays derived state; it is bounded by
 
         `limit` and returns an opaque continuation cursor when another artifact
 
-        repair page is available. `target=index` repairs one named index after
+        repair page is available. `target=index` repairs one named index by
 
-        resetting its derived index storage; healthy indexes are skipped unless
+        building a shadow replacement, catching it up to the current derived
 
-        `force=true` is supplied, and any positive `limit` permits that single
+        replay sequence, and atomically swapping it into service; healthy
 
-        named index repair. The response reports unresolved debt separately, and
+        indexes are skipped unless `force=true` is supplied, and any positive
 
-        the endpoint requires table admin permission when authentication is
+        `limit` permits that single named index repair. The response reports
 
-        enabled.
+        unresolved debt separately, and the endpoint requires table admin
+
+        permission when authentication is enabled.
       tags:
         - data_operations
       operationId: runTableRepair
@@ -4077,18 +4079,203 @@ paths:
             schema:
               $ref: '#/components/schemas/RepairRunRequest'
       responses:
-        '202':
-          description: Bounded table repair pass was accepted
+        '200':
+          description: Bounded table repair pass completed
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ArtifactRepairRunResponse'
+                $ref: '#/components/schemas/TableRepairRunResponse'
         '400':
           $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
         '405':
           $ref: '#/components/responses/MethodNotAllowed'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/repair/jobs:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+    post:
+      summary: Start a durable table repair job
+      description: >
+        Creates a durable table repair job for large or long-running repair work.
+
+        The job stores progress and accumulated counters across bounded advance
+
+        calls. Use this endpoint instead of synchronous `runTableRepair` when
+
+        repairing large indexes or when clients need retryable progress.
+      tags:
+        - data_operations
+      operationId: startTableRepairJob
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TableRepairJobStartRequest'
+      responses:
+        '200':
+          description: Job completed during the initial advance.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TableRepairJob'
+        '202':
+          description: Repair job accepted or advanced but not terminal.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TableRepairJob'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/repair/jobs/{jobId}:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+      - name: jobId
+        in: path
+        required: true
+        description: Repair job identifier.
+        schema:
+          type: string
+    get:
+      summary: Get a table repair job
+      tags:
+        - data_operations
+      operationId: getTableRepairJob
+      responses:
+        '200':
+          description: Repair job state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TableRepairJob'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/repair/jobs/{jobId}/advance:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+      - name: jobId
+        in: path
+        required: true
+        description: Repair job identifier.
+        schema:
+          type: string
+    post:
+      summary: Advance a table repair job
+      description: Runs at most one bounded repair pass for the job. Concurrent advances use the job lease
+        and return the current running state.
+      tags:
+        - data_operations
+      operationId: advanceTableRepairJob
+      responses:
+        '200':
+          description: Repair job reached a terminal phase.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TableRepairJob'
+        '202':
+          description: Repair job remains queued or running.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TableRepairJob'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/repair/jobs/{jobId}/cancel:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+      - name: jobId
+        in: path
+        required: true
+        description: Repair job identifier.
+        schema:
+          type: string
+    post:
+      summary: Cancel a table repair job
+      description: >
+        Cancels a queued table repair job. If a repair pass is already running,
+
+        the response returns the current running state; cancellation is applied
+
+        only at pass boundaries so the API never reports a committed in-flight
+
+        pass as cancelled.
+      tags:
+        - data_operations
+      operationId: cancelTableRepairJob
+      responses:
+        '200':
+          description: Repair job cancelled or already terminal.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TableRepairJob'
+        '202':
+          description: Cancellation requested; the current running pass has not yet reached a cancellation
+            boundary.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TableRepairJob'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
         '500':
           $ref: '#/components/responses/InternalServerError'
       security:
@@ -4412,12 +4599,27 @@ paths:
           type: string
     post:
       summary: Cancel a derived document artifact reprocess job
+      description: >
+        Cancels a queued document artifact reprocess job. If a reprocess pass is
+
+        already running, the response returns the current running state;
+
+        cancellation is applied only at pass boundaries so the API never reports
+
+        a committed in-flight pass as cancelled.
       tags:
         - data_operations
       operationId: cancelDocumentArtifactReprocessJob
       responses:
         '200':
-          description: Reprocess job was cancelled or already terminal
+          description: Reprocess job cancelled or already terminal.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentArtifactReprocessJob'
+        '202':
+          description: Cancellation requested; the current running pass has not yet reached a cancellation
+            boundary.
           content:
             application/json:
               schema:
@@ -7493,6 +7695,7 @@ components:
         - chunk
         - graph
         - full_text
+        - algebraic
     ArtifactRepairReason:
       type: string
       description: Reason an artifact was added to the repair queue.
@@ -7506,10 +7709,10 @@ components:
       enum:
         - artifact
         - index
-    ArtifactRepairIssue:
+    TableRepairIssue:
       type: object
-      description: Durable repair debt for a derived artifact. This is an operator-facing record and includes
-        exact source and artifact identifiers.
+      description: Durable table repair debt. Artifact targets include exact source and artifact identifiers;
+        index targets include the affected index and repair status.
       required:
         - artifact_kind
         - index_name
@@ -7577,7 +7780,7 @@ components:
         last_error:
           type: string
           description: Last stable repair error code, when a repair attempt failed.
-    ArtifactRepairIssueList:
+    TableRepairIssueList:
       type: object
       description: Bounded page of table repair issues.
       required:
@@ -7616,7 +7819,7 @@ components:
         issues:
           type: array
           items:
-            $ref: '#/components/schemas/ArtifactRepairIssue'
+            $ref: '#/components/schemas/TableRepairIssue'
     RepairIssueListRequest:
       type: object
       description: Bounded request to list table repair issues.
@@ -7668,9 +7871,9 @@ components:
           default: 100
           description: Maximum artifact repair records to attempt. For target=index, any positive value
             permits one named index repair.
-    ArtifactRepairRunResult:
+    TableRepairRunResult:
       type: object
-      description: Result of one bounded artifact repair pass.
+      description: Result of one bounded table repair pass.
       required:
         - scanned
         - groups_scanned
@@ -7680,6 +7883,7 @@ components:
         - failed
         - unsupported
         - unresolved
+        - in_progress
         - indexes_rebuilt
         - indexes_degraded
         - limit
@@ -7713,12 +7917,17 @@ components:
         unsupported:
           type: integer
           format: uint64
-          description: Number of repair records skipped because no reprocessor exists for the artifact
-            kind.
+          description: Number of repair records skipped because no automated repair exists for the selected
+            target.
         unresolved:
           type: integer
           format: uint64
           description: Number of attempted repair records that remained queued after this pass.
+        in_progress:
+          type: integer
+          format: uint64
+          description: Number of selected repair records or indexes skipped because another repair pass
+            already owns them.
         indexes_rebuilt:
           type: integer
           format: uint64
@@ -7738,12 +7947,12 @@ components:
             currently repairs one named index per request and does not return a continuation cursor.
         has_more:
           type: boolean
-          description: Whether another artifact scan page is available via next_cursor.
+          description: Whether another repair scan page is available via next_cursor.
         debt_remaining:
           type: boolean
           description: Whether repair debt remains after this bounded pass. If true and next_cursor is
             absent, rerun repair from the beginning after addressing failed or unsupported records.
-    ArtifactRepairRunResponse:
+    TableRepairRunResponse:
       type: object
       description: Response for a bounded table repair pass.
       required:
@@ -7762,7 +7971,128 @@ components:
           format: uint32
           description: Effective repair limit.
         result:
-          $ref: '#/components/schemas/ArtifactRepairRunResult'
+          $ref: '#/components/schemas/TableRepairRunResult'
+    TableRepairJobStartRequest:
+      type: object
+      description: Starts a durable table repair job. The job advances in bounded passes using the same
+        repair request shape as runTableRepair.
+      properties:
+        target:
+          $ref: '#/components/schemas/RepairTarget'
+          default: artifact
+        kind:
+          $ref: '#/components/schemas/ArtifactRepairKind'
+        index:
+          type: string
+          description: Restrict repair attempts to one index name.
+        cursor:
+          type: string
+          description: Opaque cursor returned by a prior repair response.
+        force:
+          type: boolean
+          default: false
+          description: Force a named index rebuild even when no repair debt is currently recorded. Only
+            applies to target=index.
+        limit:
+          type: integer
+          format: uint32
+          minimum: 1
+          maximum: 1000
+          default: 100
+          description: Maximum artifact repair records to attempt per pass. For target=index, any positive
+            value permits one named index repair.
+        advance:
+          type: boolean
+          default: true
+          description: When true, the server immediately attempts the first bounded repair pass before
+            returning the job.
+    TableRepairJob:
+      type: object
+      description: Durable table repair job state.
+      required:
+        - job_id
+        - attempt_id
+        - table_name
+        - phase
+        - repair_status
+        - target
+        - limit
+        - force
+        - result
+        - cancel_requested
+        - created_at_millis
+        - last_updated_at_millis
+        - expires_at_millis
+      properties:
+        job_id:
+          type: integer
+          format: uint64
+          description: Server-assigned durable repair job identifier.
+        attempt_id:
+          type: integer
+          format: uint64
+          description: Monotonic execution attempt token for the current running pass.
+        table_name:
+          type: string
+          description: Table being repaired.
+        phase:
+          type: string
+          enum:
+            - queued
+            - running
+            - succeeded
+            - failed
+            - cancelled
+          description: Lifecycle phase of the repair job.
+        repair_status:
+          type: string
+          enum:
+            - in_progress
+            - complete
+            - debt_remaining
+            - stopped
+          description: User-facing repair progress state. `debt_remaining` means the bounded job stopped
+            because unsupported or failed debt still requires operator action.
+        target:
+          $ref: '#/components/schemas/RepairTarget'
+        kind:
+          $ref: '#/components/schemas/ArtifactRepairKind'
+        index:
+          type: string
+          description: Index name when the job is restricted to one index.
+        cursor:
+          type: string
+          nullable: true
+          description: Opaque continuation cursor for the next bounded repair pass.
+        limit:
+          type: integer
+          format: uint32
+          description: Effective per-pass repair limit.
+        force:
+          type: boolean
+          description: Whether the job forces a named index rebuild.
+        result:
+          $ref: '#/components/schemas/TableRepairRunResult'
+        last_error:
+          type: string
+          nullable: true
+          description: Last stable job-level error code.
+        cancel_requested:
+          type: boolean
+          description: Whether cancellation has been requested for a running pass. Running passes finish
+            at a bounded repair boundary before the job transitions to cancelled.
+        created_at_millis:
+          type: integer
+          format: uint64
+          description: Unix epoch milliseconds when the job was created.
+        last_updated_at_millis:
+          type: integer
+          format: uint64
+          description: Unix epoch milliseconds when the job state was last updated.
+        expires_at_millis:
+          type: integer
+          format: uint64
+          description: Unix epoch milliseconds when the job is eligible for cleanup.
     DocumentArtifactReprocessResponse:
       type: object
       required:
@@ -7934,6 +8264,7 @@ components:
       type: object
       required:
         - job_id
+        - attempt_id
         - table_name
         - artifact_name
         - phase
@@ -7948,6 +8279,7 @@ components:
         - pending_shards
         - failures
         - shard_cursors
+        - cancel_requested
         - created_at_millis
         - last_updated_at_millis
         - expires_at_millis
@@ -7956,6 +8288,10 @@ components:
           type: integer
           format: uint64
           description: Server-assigned durable repair job identifier.
+        attempt_id:
+          type: integer
+          format: uint64
+          description: Monotonic execution attempt token for the current running pass.
         table_name:
           type: string
           description: Table containing the source documents being repaired.
@@ -8021,18 +8357,22 @@ components:
           type: string
           nullable: true
           description: Last terminal or transient job error, when available.
+        cancel_requested:
+          type: boolean
+          description: Whether cancellation has been requested for a running pass. Running passes finish
+            at a bounded reprocess boundary before the job transitions to cancelled.
         created_at_millis:
           type: integer
           format: uint64
-          description: Monotonic server timestamp when the job was created.
+          description: Unix epoch milliseconds when the job was created.
         last_updated_at_millis:
           type: integer
           format: uint64
-          description: Monotonic server timestamp when the job was last updated.
+          description: Unix epoch milliseconds when the job was last updated.
         expires_at_millis:
           type: integer
           format: uint64
-          description: Monotonic server timestamp after which the retained job status may be removed.
+          description: Unix epoch milliseconds after which the retained job status may be removed.
     ClusterDataNodeStatus:
       type: object
       required:
@@ -15907,6 +16247,11 @@ components:
           type: integer
           format: uint64
           description: Number of documents in the index
+        disk_usage:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Size of the index in bytes
         rebuilding:
           x-go-type-skip-optional-pointer: true
           type: boolean
@@ -15920,6 +16265,11 @@ components:
           type: number
           format: double
           description: Progress of ongoing rebuild as fraction [0.0, 1.0]
+        backfill_items_processed:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Number of documents indexed during current rebuild
         backfill_state:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -16013,6 +16363,61 @@ components:
           type: integer
           format: uint64
           description: Repair issues found by explicit repair-scan accounting for this projection.
+        edge_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        node_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        repair_degraded:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_issue_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        repair_summary_ready:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_issue_count_estimated:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        expected_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        reported_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        fresh_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        stale_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        missing_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        unknown_remote_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        resolution:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Artifact resolution replay diagnostics.
+        promotion:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Artifact promotion replay diagnostics.
     EmbeddingsIndexStats:
       type: object
       description: Statistics for an embeddings index (dense or sparse)
@@ -16034,6 +16439,11 @@ components:
           type: integer
           format: uint64
           description: Number of vectors/documents in the index
+        disk_usage:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Size of the index in bytes
         total_nodes:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -16048,6 +16458,11 @@ components:
           x-go-type-skip-optional-pointer: true
           type: boolean
           description: Whether the index enricher is currently backfilling
+        wal_backlog:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Number of documents pending enrichment in the WAL
         backfill_active:
           x-go-type-skip-optional-pointer: true
           type: boolean
@@ -16057,6 +16472,11 @@ components:
           type: number
           format: double
           description: Backfill progress as a ratio from 0.0 to 1.0
+        backfill_items_processed:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Total items processed during backfill
         backfill_state:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -16187,6 +16607,65 @@ components:
           type: integer
           format: uint64
           description: Repair issues found by explicit repair-scan accounting for this projection.
+        term_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        edge_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        node_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        repair_degraded:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_issue_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        repair_summary_ready:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_issue_count_estimated:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        expected_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        reported_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        fresh_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        stale_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        missing_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        unknown_remote_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        resolution:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Artifact resolution replay diagnostics.
+        promotion:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Artifact promotion replay diagnostics.
     GraphIndexStats:
       type: object
       description: Statistics for graph index
@@ -16227,6 +16706,11 @@ components:
           type: number
           format: double
           description: Rebuild progress as a ratio from 0.0 to 1.0
+        backfill_items_processed:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Number of edges indexed during current rebuild
         backfill_state:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -16326,6 +16810,57 @@ components:
           type: integer
           format: uint64
           description: Repair issues found by explicit repair-scan accounting for this projection.
+        term_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        repair_degraded:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_issue_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        repair_summary_ready:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_issue_count_estimated:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        expected_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        reported_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        fresh_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        stale_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        missing_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        unknown_remote_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        resolution:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Artifact resolution replay diagnostics.
+        promotion:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Artifact promotion replay diagnostics.
         algebraic_graph:
           x-go-type-skip-optional-pointer: true
           type: object
@@ -16371,6 +16906,11 @@ components:
           type: integer
           format: uint64
           description: Number of documents reflected in the algebraic sidecar
+        disk_usage:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Size of the index in bytes
         rebuilding:
           x-go-type-skip-optional-pointer: true
           type: boolean
@@ -16384,6 +16924,11 @@ components:
           type: number
           format: double
           description: Backfill progress as a ratio from 0.0 to 1.0
+        backfill_items_processed:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: Number of documents processed during current backfill
         backfill_state:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -16555,6 +17100,71 @@ components:
           type: integer
           format: uint64
           description: Repair issues found by explicit repair-scan accounting for this projection.
+        edge_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        node_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        repair_degraded:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_issue_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        repair_summary_ready:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_issue_count_estimated:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        expected_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        reported_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        fresh_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        stale_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        missing_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        unknown_remote_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        source_artifact:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Source artifact stream used to materialize graph edges.
+        resolver_replay:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Graph resolver replay diagnostics.
+        resolution:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Artifact resolution replay diagnostics.
+        promotion:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: Artifact promotion replay diagnostics.
     IndexStats:
       type: object
       description: Statistics for an index

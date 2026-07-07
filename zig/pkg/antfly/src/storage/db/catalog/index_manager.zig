@@ -79,6 +79,17 @@ const index_catalog_key = "\x00\x00__metadata__:indexes";
 const enrichment_catalog_key = "\x00\x00__metadata__:enrichments";
 const resolver_catalog_key = "\x00\x00__metadata__:resolvers";
 const text_field_analyzers_prefix = "\x00\x00__metadata__:text_field_analyzers:";
+const active_index_root_pointer_file = ".antfly-active-index-root";
+const active_index_root_pointer_magic = "antfly-active-index-root-v1\n";
+
+fn checkRepairCancelled(cancel_check: ?types.RepairCancelCheck) !void {
+    if (cancel_check) |check| {
+        if (check.requested()) return error.Canceled;
+    }
+}
+const repair_shadow_root_prefix = ".repair-shadow-";
+const repair_shadow_in_progress_file = ".antfly-repair-shadow-in-progress";
+const repair_shadow_in_progress_magic = "antfly-repair-shadow-in-progress-v1\n";
 var bench_hbc_tree_counter: platform.atomic.Value(u64) = .init(0);
 var hbc_coalesce_bulk_writes_cache: std.atomic.Value(u8) = .init(0);
 var hbc_bulk_ingest_bulk_build_min_items_cache: std.atomic.Value(usize) = .init(0);
@@ -1557,7 +1568,7 @@ pub const IndexManager = struct {
 
     pub fn resetDenseIndexForArtifactRebuild(self: *IndexManager, index_name: []const u8) !void {
         const entry = self.denseIndex(index_name) orelse return error.IndexNotFound;
-        const path = try self.indexPath(index_name);
+        const path = try self.activeIndexPath(index_name);
         defer self.alloc.free(path);
 
         entry.index.close();
@@ -1574,7 +1585,7 @@ pub const IndexManager = struct {
 
     pub fn resetSparseIndexForArtifactRebuild(self: *IndexManager, index_name: []const u8) !void {
         const entry = self.sparseIndex(index_name) orelse return error.IndexNotFound;
-        const path = try self.indexPath(index_name);
+        const path = try self.activeIndexPath(index_name);
         defer self.alloc.free(path);
 
         entry.index.close();
@@ -1595,7 +1606,7 @@ pub const IndexManager = struct {
 
     pub fn resetGraphIndexForArtifactRebuild(self: *IndexManager, index_name: []const u8) !void {
         const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
-        const path = try self.indexPath(index_name);
+        const path = try self.activeIndexPath(index_name);
         defer self.alloc.free(path);
 
         var graph_cfg = try parseGraphConfig(self.alloc, entry.config.config_json);
@@ -1660,6 +1671,26 @@ pub const IndexManager = struct {
             TextMergeScheduler.noteComplete(entry);
         }
         return rebuilt;
+    }
+
+    pub fn resetFullTextIndexForArtifactRebuildFromReadTxn(
+        self: *IndexManager,
+        store: *docstore_mod.DocStore,
+        read_txn: *docstore_mod.DocStore.Txn,
+        index_name: []const u8,
+        cancel_check: ?types.RepairCancelCheck,
+    ) !u64 {
+        const entry = self.textIndexEntry(index_name) orelse return error.IndexNotFound;
+        const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
+
+        try checkRepairCancelled(cancel_check);
+        try entry.persistent.resetAllForRebuild();
+        try rebuild_state.update("");
+        try self.backfillTextIndexFromReadTxn(store, read_txn, entry, null, cancel_check);
+        try checkRepairCancelled(cancel_check);
+        try entry.persistent.sync(true);
+
+        return entry.persistent.snapshot().global_doc_count;
     }
 
     pub fn clearDenseHbcCaches(self: *IndexManager) void {
@@ -1849,44 +1880,106 @@ pub const IndexManager = struct {
     /// (30s..10min). `remaining` is the quarantine count after this pass,
     /// read under the catalog lock so callers can stop polling at zero.
     pub fn retryFailedIndexLoads(self: *IndexManager, store: anytype, now_ns: u64, force: bool) !QuarantineRetryResult {
-        self.catalog_mutex.lockExclusive();
-        defer self.catalog_mutex.unlockExclusive();
-        if (self.failed_index_loads.count() == 0) return .{};
+        const RetryTask = struct {
+            name: []u8,
+            cfg: types.IndexConfig,
 
-        var due_names = std.ArrayListUnmanaged([]const u8).empty;
-        defer due_names.deinit(self.alloc);
-        var it = self.failed_index_loads.iterator();
-        while (it.next()) |entry| {
-            if (!force and now_ns < entry.value_ptr.next_retry_ns) continue;
-            // Keys are owned by the map and stable across the value updates
-            // below (no inserts/removes until the success path).
-            try due_names.append(self.alloc, entry.key_ptr.*);
+            fn deinit(task: *@This(), alloc: Allocator) void {
+                alloc.free(task.name);
+                task.cfg.deinit(alloc);
+                task.* = undefined;
+            }
+        };
+
+        var tasks = std.ArrayListUnmanaged(RetryTask).empty;
+        defer {
+            for (tasks.items) |*task| task.deinit(self.alloc);
+            tasks.deinit(self.alloc);
+        }
+        var stale_failed_names = std.ArrayListUnmanaged([]const u8).empty;
+        defer stale_failed_names.deinit(self.alloc);
+
+        {
+            self.catalog_mutex.lockExclusive();
+            defer self.catalog_mutex.unlockExclusive();
+            if (self.failed_index_loads.count() == 0) return .{};
+
+            var it = self.failed_index_loads.iterator();
+            while (it.next()) |entry| {
+                if (!force and now_ns < entry.value_ptr.next_retry_ns) continue;
+                const cfg = blk: {
+                    for (self.status_only_index_configs) |*candidate| {
+                        if (std.mem.eql(u8, candidate.name, entry.key_ptr.*)) break :blk candidate.*;
+                    }
+                    try stale_failed_names.append(self.alloc, entry.key_ptr.*);
+                    continue;
+                };
+                var task = RetryTask{
+                    .name = try self.alloc.dupe(u8, entry.key_ptr.*),
+                    .cfg = undefined,
+                };
+                var task_name_owned = true;
+                errdefer if (task_name_owned) self.alloc.free(task.name);
+                task.cfg = try types.IndexConfig.clone(self.alloc, cfg);
+                var task_cfg_owned = true;
+                errdefer if (task_cfg_owned) task.cfg.deinit(self.alloc);
+                try tasks.append(self.alloc, task);
+                task_name_owned = false;
+                task_cfg_owned = false;
+            }
+            for (stale_failed_names.items) |name| self.dropFailedIndexLoad(name);
         }
 
         var recovered: usize = 0;
-        for (due_names.items) |name| {
-            const cfg = blk: {
-                for (self.status_only_index_configs) |*candidate| {
-                    if (std.mem.eql(u8, candidate.name, name)) break :blk candidate.*;
-                }
-                // Config vanished (concurrent drop); clear the stale record.
-                self.dropFailedIndexLoad(name);
+        for (tasks.items) |*task| {
+            self.catalog_mutex.lockExclusive();
+            if (self.failed_index_loads.get(task.name) == null) {
+                self.catalog_mutex.unlockExclusive();
                 continue;
+            }
+            self.beginIndexLoadNoLock(task.name) catch |err| {
+                self.catalog_mutex.unlockExclusive();
+                return err;
             };
-            try self.beginIndexLoadNoLock(name);
-            var opened = self.openConfiguredIndexDetached(store, cfg, true, false) catch |err| {
-                self.completeIndexLoadNoLock(name);
-                const record = self.failed_index_loads.getPtr(name) orelse continue;
+            self.catalog_mutex.unlockExclusive();
+
+            var opened = self.openConfiguredIndexDetached(store, task.cfg, true, false) catch |err| {
+                self.catalog_mutex.lockExclusive();
+                defer self.catalog_mutex.unlockExclusive();
+                self.completeIndexLoadNoLock(task.name);
+                const record = self.failed_index_loads.getPtr(task.name) orelse continue;
                 record.err_name = @errorName(err);
                 record.retry_attempts +|= 1;
                 record.next_retry_ns = now_ns + quarantineRetryBackoffNs(record.retry_attempts);
                 std.log.warn("quarantined index retry failed name={s} attempt={d} err={s}", .{
-                    name,
+                    task.name,
                     record.retry_attempts,
                     @errorName(err),
                 });
                 continue;
             };
+
+            self.catalog_mutex.lockExclusive();
+            if (self.failed_index_loads.get(task.name) == null) {
+                self.completeIndexLoadNoLock(task.name);
+                self.catalog_mutex.unlockExclusive();
+                opened.deinit(self);
+                continue;
+            }
+            var remove_idx: ?usize = null;
+            for (self.status_only_index_configs, 0..) |old_cfg, i| {
+                if (std.mem.eql(u8, old_cfg.name, task.name)) {
+                    remove_idx = i;
+                    break;
+                }
+            }
+            if (remove_idx == null) {
+                self.completeIndexLoadNoLock(task.name);
+                self.dropFailedIndexLoad(task.name);
+                self.catalog_mutex.unlockExclusive();
+                opened.deinit(self);
+                continue;
+            }
             // Pre-allocate the shrunken status-only list so registration and
             // de-quarantine commit together once the open has succeeded.
             const old = self.status_only_index_configs;
@@ -1894,20 +1987,22 @@ pub const IndexManager = struct {
                 &.{}
             else
                 self.alloc.alloc(types.IndexConfig, old.len - 1) catch |err| {
-                    self.completeIndexLoadNoLock(name);
+                    self.completeIndexLoadNoLock(task.name);
+                    self.catalog_mutex.unlockExclusive();
                     opened.deinit(self);
                     return err;
                 };
             self.appendOpenedIndex(opened) catch |err| {
                 if (replacement.len > 0) self.alloc.free(replacement);
-                self.completeIndexLoadNoLock(name);
+                self.completeIndexLoadNoLock(task.name);
+                self.catalog_mutex.unlockExclusive();
                 opened.deinit(self);
                 return err;
             };
-            self.completeIndexLoadNoLock(name);
+            self.completeIndexLoadNoLock(task.name);
             var wi: usize = 0;
-            for (old) |old_cfg| {
-                if (std.mem.eql(u8, old_cfg.name, name)) {
+            for (old, 0..) |old_cfg, i| {
+                if (i == remove_idx.?) {
                     var removed = old_cfg;
                     removed.deinit(self.alloc);
                     continue;
@@ -1918,10 +2013,14 @@ pub const IndexManager = struct {
             if (old.len > 0) self.alloc.free(old);
             self.status_only_index_configs = replacement;
             // Log before dropFailedIndexLoad frees the `name` key buffer.
-            std.log.info("quarantined index recovered name={s} kind={s}", .{ name, @tagName(cfg.kind) });
-            self.dropFailedIndexLoad(name);
+            std.log.info("quarantined index recovered name={s} kind={s}", .{ task.name, @tagName(task.cfg.kind) });
+            self.dropFailedIndexLoad(task.name);
+            self.catalog_mutex.unlockExclusive();
             recovered += 1;
         }
+
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
         return .{ .recovered = recovered, .remaining = self.failed_index_loads.count() };
     }
 
@@ -3004,6 +3103,16 @@ pub const IndexManager = struct {
         try self.refreshGeneratedEnrichmentTargetCache();
     }
 
+    pub fn registerReplacementIndex(self: *IndexManager, store: anytype, cfg: types.IndexConfig) !void {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        self.bindPrimaryStore(store);
+        if (self.has(cfg.name)) return error.IndexAlreadyExists;
+        try self.openConfiguredIndex(store, cfg, false, false);
+        errdefer self.removeInMemory(cfg.name);
+        try self.refreshGeneratedEnrichmentTargetCache();
+    }
+
     pub fn addEnrichment(self: *IndexManager, store: anytype, cfg: types.EnrichmentConfig) !void {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
@@ -3234,7 +3343,7 @@ pub const IndexManager = struct {
                 try self.persistCatalog(store);
                 self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
                 try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, name);
-                deleteIndexDirIfPresent(index_path);
+                self.deleteIndexRootForName(name, index_path);
                 return true;
             }
         }
@@ -3261,7 +3370,7 @@ pub const IndexManager = struct {
                 try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, name);
                 try self.deleteDenseIndexMetadata(store, name);
                 try self.deleteOwnedGeneratedArtifacts(store, owned_chunk_name, owned_embedding_name);
-                deleteIndexDirIfPresent(index_path);
+                self.deleteIndexRootForName(name, index_path);
                 return true;
             }
         }
@@ -3287,7 +3396,7 @@ pub const IndexManager = struct {
                 self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
                 try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, name);
                 try self.deleteOwnedGeneratedArtifacts(store, owned_chunk_name, owned_embedding_name);
-                deleteIndexDirIfPresent(index_path);
+                self.deleteIndexRootForName(name, index_path);
                 return true;
             }
         }
@@ -3302,7 +3411,7 @@ pub const IndexManager = struct {
                 try self.persistCatalog(store);
                 self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
                 try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, name);
-                deleteIndexDirIfPresent(index_path);
+                self.deleteIndexRootForName(name, index_path);
                 return true;
             }
         }
@@ -3317,11 +3426,133 @@ pub const IndexManager = struct {
                 try self.persistCatalog(store);
                 self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
                 try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, name);
-                deleteIndexDirIfPresent(index_path);
+                self.deleteIndexRootForName(name, index_path);
                 return true;
             }
         }
         return false;
+    }
+
+    pub fn reopenQuarantinedIndexForArtifactRebuild(self: *IndexManager, store: anytype, name: []const u8) !types.IndexKind {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+
+        for (self.status_only_index_configs, 0..) |cfg, i| {
+            if (!std.mem.eql(u8, cfg.name, name)) continue;
+
+            var rebuild_cfg = try types.IndexConfig.clone(self.alloc, cfg);
+            errdefer rebuild_cfg.deinit(self.alloc);
+            const index_path = try self.indexPath(name);
+            defer self.alloc.free(index_path);
+
+            self.deleteIndexRootForName(name, index_path);
+            try self.openConfiguredIndex(store, rebuild_cfg, false, false);
+            errdefer self.removeInMemory(name);
+
+            const replacement: []types.IndexConfig = if (self.status_only_index_configs.len > 1)
+                try self.alloc.alloc(types.IndexConfig, self.status_only_index_configs.len - 1)
+            else
+                &.{};
+            errdefer if (replacement.len > 0) self.alloc.free(replacement);
+
+            var out: usize = 0;
+            var removed = cfg;
+            for (self.status_only_index_configs, 0..) |existing, existing_i| {
+                if (existing_i == i) continue;
+                replacement[out] = existing;
+                out += 1;
+            }
+            self.alloc.free(self.status_only_index_configs);
+            self.status_only_index_configs = replacement;
+
+            self.dropFailedIndexLoad(name);
+            self.dropIndexLoadStateNoLock(name);
+            try self.refreshGeneratedEnrichmentTargetCache();
+
+            const kind = rebuild_cfg.kind;
+            removed.deinit(self.alloc);
+            rebuild_cfg.deinit(self.alloc);
+            return kind;
+        }
+
+        return error.IndexNotFound;
+    }
+
+    pub fn installBuiltReplacementIndex(
+        self: *IndexManager,
+        store: anytype,
+        cfg: types.IndexConfig,
+        replacement_index_path: []const u8,
+    ) !void {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        self.bindPrimaryStore(store);
+
+        const target_path = try self.indexPath(cfg.name);
+        defer self.alloc.free(target_path);
+        const previous_active_path = try self.activeIndexPath(cfg.name);
+        defer self.alloc.free(previous_active_path);
+        const previous_pointer = try self.readActiveIndexRootPointer(target_path, cfg.name);
+        defer if (previous_pointer) |value| self.alloc.free(value);
+        const replacement_relative_path = try self.relativeRepairIndexRootForActivePath(cfg.name, replacement_index_path);
+        defer self.alloc.free(replacement_relative_path);
+
+        self.removeInMemory(cfg.name);
+
+        self.writeActiveIndexRootPointer(target_path, replacement_relative_path) catch |err| {
+            self.recordFailedIndexLoad(cfg, err) catch {};
+            return err;
+        };
+
+        self.openConfiguredIndex(store, cfg, false, false) catch |err| {
+            self.removeInMemory(cfg.name);
+            if (previous_pointer) |value| {
+                self.writeActiveIndexRootPointer(target_path, value) catch {};
+            } else {
+                self.clearActiveIndexRootPointer(target_path) catch {};
+            }
+            self.openConfiguredIndex(store, cfg, false, false) catch {};
+            self.recordFailedIndexLoad(cfg, err) catch {};
+            return err;
+        };
+        self.dropFailedIndexLoad(cfg.name);
+        if (std.mem.eql(u8, previous_active_path, target_path)) {
+            pruneCanonicalIndexRootAfterPointerInstall(target_path) catch |err| {
+                std.log.warn("failed to prune previous canonical index root name={s} err={s}", .{ cfg.name, @errorName(err) });
+            };
+        } else if (!std.mem.eql(u8, previous_active_path, replacement_index_path)) {
+            deleteIndexDirIfPresent(previous_active_path);
+        }
+        try self.refreshGeneratedEnrichmentTargetCache();
+    }
+
+    pub fn cleanupInactiveRepairShadowRoots(self: *IndexManager) void {
+        if (builtin.os.tag == .freestanding) return;
+
+        var active_roots = std.StringHashMapUnmanaged(void).empty;
+        defer {
+            var it = active_roots.iterator();
+            while (it.next()) |entry| self.alloc.free(entry.key_ptr.*);
+            active_roots.deinit(self.alloc);
+        }
+        self.collectActiveRepairShadowRoots(&active_roots) catch return;
+
+        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        var dir = std.Io.Dir.cwd().openDir(io, self.base_path, .{ .iterate = true }) catch return;
+        defer dir.close(io);
+
+        var iter = dir.iterate();
+        while (iter.next(io) catch null) |entry| {
+            if (entry.kind != .directory) continue;
+            if (!std.mem.startsWith(u8, entry.name, repair_shadow_root_prefix)) continue;
+            if (active_roots.contains(entry.name)) continue;
+            const path = std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ self.base_path, entry.name }) catch continue;
+            defer self.alloc.free(path);
+            if (repairShadowRootInProgress(path)) continue;
+            deleteIndexDirIfPresent(path);
+        }
     }
 
     fn removeStatusOnlyConfig(self: *IndexManager, store: anytype, name: []const u8) !bool {
@@ -3366,7 +3597,7 @@ pub const IndexManager = struct {
             try apply_state.clearAppliedSequenceWithCheckpoint(self.alloc, store, self.applied_sequence_checkpoint_path, name);
             if (removed.kind == .dense_vector) try self.deleteDenseIndexMetadata(store, name);
             try self.deleteOwnedGeneratedArtifacts(store, owned_chunk_name, owned_embedding_name);
-            deleteIndexDirIfPresent(index_path);
+            self.deleteIndexRootForName(name, index_path);
             removed.deinit(self.alloc);
             return true;
         }
@@ -6303,9 +6534,6 @@ pub const IndexManager = struct {
         const upper = try internal_keys.documentRangeUpperAlloc(self.alloc, if (self.byte_range.end.len > 0) self.byte_range.end else "");
         defer if (upper) |buf| self.alloc.free(buf);
 
-        var identity_txn = try runtime_store.store.beginProbe();
-        defer identity_txn.abort();
-
         var mapped_docs = std.ArrayListUnmanaged(mapper.MapperDoc).empty;
         defer {
             for (mapped_docs.items) |doc| {
@@ -6317,8 +6545,8 @@ pub const IndexManager = struct {
 
         var flushed_batches: usize = 0;
         var saw_visible_doc = false;
-        var max_flushed_key: ?[]const u8 = null;
-        defer if (max_flushed_key) |buf| self.alloc.free(buf);
+        var batch_last_doc_key: ?[]const u8 = null;
+        defer if (batch_last_doc_key) |buf| self.alloc.free(buf);
 
         const flush_batch = struct {
             fn run(
@@ -6357,83 +6585,280 @@ pub const IndexManager = struct {
             }
         }.run;
 
-        const ScanState = struct {
-            manager: *IndexManager,
-            store: *docstore_mod.DocStore,
-            text_entry: *TextIndex,
-            rebuild_state: backfill_state_mod.RebuildState,
-            identity_txn: *@TypeOf(identity_txn),
-            resume_from: ?[]const u8,
-            mapped_docs: *std.ArrayListUnmanaged(mapper.MapperDoc),
-            max_flushed_key: *?[]const u8,
-            flushed_batches: *usize,
-            saw_visible_doc: *bool,
+        var scan_lower_buf: ?[]u8 = if (resume_from) |buf| try self.alloc.dupe(u8, buf) else null;
+        defer if (scan_lower_buf) |buf| self.alloc.free(buf);
+        const scan_budget_per_page = @max(text_backfill_batch_size * 32, 256);
+        var reached_end = false;
 
-            fn scanEntry(scan_ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!backend_scan.ScanAction {
-                const state: *@This() = @ptrCast(@alignCast(scan_ctx orelse return error.InvalidArgument));
-                if (isMetadataKey(key)) return .@"continue";
-                if (!state.manager.keyInRange(key)) return .@"continue";
-                if (!try textIndexShouldConsumeDoc(state.manager, state.text_entry, key)) return .@"continue";
-                if (state.resume_from) |resume_key| {
-                    if (resume_key.len > 0 and std.mem.order(u8, key, resume_key) != .gt) return .@"continue";
+        while (!reached_end) {
+            var identity_txn = try runtime_store.store.beginProbe();
+            var identity_txn_open = true;
+            errdefer if (identity_txn_open) identity_txn.abort();
+            var page_last_seen_key: ?[]u8 = null;
+            defer if (page_last_seen_key) |buf| self.alloc.free(buf);
+
+            const ScanState = struct {
+                manager: *IndexManager,
+                text_entry: *TextIndex,
+                identity_txn: *@TypeOf(identity_txn),
+                lower_exclusive: ?[]const u8,
+                mapped_docs: *std.ArrayListUnmanaged(mapper.MapperDoc),
+                batch_last_doc_key: *?[]const u8,
+                page_last_seen_key: *?[]u8,
+                saw_visible_doc: *bool,
+                scan_budget: usize,
+                scanned: usize = 0,
+                stopped_early: bool = false,
+
+                fn rememberKey(state: *@This(), key: []const u8) !void {
+                    if (state.page_last_seen_key.*) |old| state.manager.alloc.free(old);
+                    state.page_last_seen_key.* = try state.manager.alloc.dupe(u8, key);
                 }
 
-                state.saw_visible_doc.* = true;
-                const doc_id = if (internal_keys.isPrimaryDocumentKey(key))
-                    (try internal_keys.decodePrimaryDocumentKeyAlloc(state.manager.alloc, key)) orelse return .@"continue"
-                else
-                    try state.manager.alloc.dupe(u8, key);
-                var doc_id_owned = true;
-                errdefer if (doc_id_owned) state.manager.alloc.free(doc_id);
-                const doc_value = try state.manager.alloc.dupe(u8, value);
-                var doc_value_owned = true;
-                errdefer if (doc_value_owned) state.manager.alloc.free(doc_value);
+                fn scanEntry(scan_ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!backend_scan.ScanAction {
+                    const state: *@This() = @ptrCast(@alignCast(scan_ctx orelse return error.InvalidArgument));
+                    if (state.lower_exclusive) |exclusive| {
+                        if (std.mem.order(u8, key, exclusive) != .gt) return .@"continue";
+                    }
+                    try state.rememberKey(key);
+                    state.scanned += 1;
+                    if (isMetadataKey(key) or !state.manager.keyInRange(key) or !try textIndexShouldConsumeDoc(state.manager, state.text_entry, key)) {
+                        if (state.scanned >= state.scan_budget) {
+                            state.stopped_early = true;
+                            return .stop;
+                        }
+                        return .@"continue";
+                    }
 
-                try state.mapped_docs.append(state.manager.alloc, .{
-                    .key = doc_id,
-                    .value = doc_value,
-                    .doc_ordinal = try doc_identity.lookupOrdinalTxn(state.manager.alloc, state.identity_txn, doc_id),
-                });
-                doc_id_owned = false;
-                doc_value_owned = false;
+                    state.saw_visible_doc.* = true;
+                    const doc_id = if (internal_keys.isPrimaryDocumentKey(key))
+                        (try internal_keys.decodePrimaryDocumentKeyAlloc(state.manager.alloc, key)) orelse return .@"continue"
+                    else
+                        try state.manager.alloc.dupe(u8, key);
+                    var doc_id_owned = true;
+                    errdefer if (doc_id_owned) state.manager.alloc.free(doc_id);
+                    const doc_value = try state.manager.alloc.dupe(u8, value);
+                    var doc_value_owned = true;
+                    errdefer if (doc_value_owned) state.manager.alloc.free(doc_value);
 
-                if (state.max_flushed_key.* == null or std.mem.order(u8, key, state.max_flushed_key.*.?) == .gt) {
-                    if (state.max_flushed_key.*) |old| state.manager.alloc.free(old);
-                    state.max_flushed_key.* = try state.manager.alloc.dupe(u8, key);
+                    try state.mapped_docs.append(state.manager.alloc, .{
+                        .key = doc_id,
+                        .value = doc_value,
+                        .doc_ordinal = try doc_identity.lookupOrdinalTxn(state.manager.alloc, state.identity_txn, doc_id),
+                    });
+                    doc_id_owned = false;
+                    doc_value_owned = false;
+
+                    if (state.batch_last_doc_key.*) |old| state.manager.alloc.free(old);
+                    state.batch_last_doc_key.* = try state.manager.alloc.dupe(u8, key);
+
+                    const backfill_batch_size = if (@import("builtin").is_test) test_text_backfill_batch_size orelse text_backfill_batch_size else text_backfill_batch_size;
+                    if (state.mapped_docs.items.len >= backfill_batch_size or state.scanned >= state.scan_budget) {
+                        state.stopped_early = true;
+                        return .stop;
+                    }
+                    return .@"continue";
                 }
+            };
 
-                const backfill_batch_size = if (@import("builtin").is_test) test_text_backfill_batch_size orelse text_backfill_batch_size else text_backfill_batch_size;
-                if (state.mapped_docs.items.len >= backfill_batch_size) {
-                    try flush_batch(
-                        state.manager,
-                        state.store,
-                        state.text_entry,
-                        state.rebuild_state,
-                        state.mapped_docs,
-                        state.max_flushed_key.*.?,
-                        state.flushed_batches,
-                    );
-                }
-                return .@"continue";
+            var scan_state = ScanState{
+                .manager = self,
+                .text_entry = entry,
+                .identity_txn = &identity_txn,
+                .lower_exclusive = scan_lower_buf,
+                .mapped_docs = &mapped_docs,
+                .batch_last_doc_key = &batch_last_doc_key,
+                .page_last_seen_key = &page_last_seen_key,
+                .saw_visible_doc = &saw_visible_doc,
+                .scan_budget = scan_budget_per_page,
+            };
+            try backend_scan.scanWithContext(&runtime_store.store, if (scan_lower_buf) |buf| buf else lower, if (upper) |buf| buf else "", .{}, &scan_state, ScanState.scanEntry);
+            identity_txn.abort();
+            identity_txn_open = false;
+            reached_end = !scan_state.stopped_early or page_last_seen_key == null;
+
+            if (page_last_seen_key) |seen| {
+                if (scan_lower_buf) |old| self.alloc.free(old);
+                scan_lower_buf = try self.alloc.dupe(u8, seen);
             }
-        };
 
-        var scan_state = ScanState{
-            .manager = self,
-            .store = store,
-            .text_entry = entry,
-            .rebuild_state = rebuild_state,
-            .identity_txn = &identity_txn,
-            .resume_from = resume_from,
-            .mapped_docs = &mapped_docs,
-            .max_flushed_key = &max_flushed_key,
-            .flushed_batches = &flushed_batches,
-            .saw_visible_doc = &saw_visible_doc,
-        };
-        try backend_scan.scanWithContext(&runtime_store.store, lower, if (upper) |buf| buf else "", .{}, &scan_state, ScanState.scanEntry);
+            if (mapped_docs.items.len > 0) {
+                try flush_batch(self, store, entry, rebuild_state, &mapped_docs, batch_last_doc_key.?, &flushed_batches);
+                if (batch_last_doc_key) |old| self.alloc.free(old);
+                batch_last_doc_key = null;
+            }
+        }
 
-        if (mapped_docs.items.len > 0) {
-            try flush_batch(self, store, entry, rebuild_state, &mapped_docs, max_flushed_key.?, &flushed_batches);
+        if (!saw_visible_doc or flushed_batches > 0) try rebuild_state.clear();
+        if (flushed_batches > 0) try entry.persistent.checkpointLsmWalAfterDurableBoundary();
+    }
+
+    fn backfillTextIndexFromReadTxn(
+        self: *IndexManager,
+        store: *docstore_mod.DocStore,
+        read_txn: *docstore_mod.DocStore.Txn,
+        entry: *TextIndex,
+        resume_from: ?[]const u8,
+        cancel_check: ?types.RepairCancelCheck,
+    ) !void {
+        const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
+
+        const lower = try internal_keys.documentRangeLowerAlloc(self.alloc, self.byte_range.start);
+        defer self.alloc.free(lower);
+        const upper = try internal_keys.documentRangeUpperAlloc(self.alloc, if (self.byte_range.end.len > 0) self.byte_range.end else "");
+        defer if (upper) |buf| self.alloc.free(buf);
+
+        var mapped_docs = std.ArrayListUnmanaged(mapper.MapperDoc).empty;
+        defer {
+            for (mapped_docs.items) |doc| {
+                self.alloc.free(@constCast(doc.key));
+                self.alloc.free(@constCast(doc.value));
+            }
+            mapped_docs.deinit(self.alloc);
+        }
+
+        var flushed_batches: usize = 0;
+        var saw_visible_doc = false;
+        var batch_last_doc_key: ?[]const u8 = null;
+        defer if (batch_last_doc_key) |buf| self.alloc.free(buf);
+
+        const flush_batch = struct {
+            fn run(
+                manager: *IndexManager,
+                doc_store: *docstore_mod.DocStore,
+                text_entry: *TextIndex,
+                rebuild: backfill_state_mod.RebuildState,
+                docs_buf: *std.ArrayListUnmanaged(mapper.MapperDoc),
+                last_doc_key: []const u8,
+                flush_count: *usize,
+                check: ?types.RepairCancelCheck,
+            ) !void {
+                try checkRepairCancelled(check);
+                var built = try mapper.buildTextSegmentsFromDocumentsWithMetadata(manager.alloc, docs_buf.items, text_entry.text_analysis, text_entry.runtime_schema, .{
+                    .target_segment_bytes = default_text_segment_build_target_bytes,
+                });
+                defer built.deinit(manager.alloc);
+                if (built.observed_field_analyzers.len > 0) {
+                    try mergeObservedTextFieldAnalyzers(manager, doc_store, text_entry, built.observed_field_analyzers);
+                }
+                for (built.segments) |*seg| {
+                    const owned = seg.*;
+                    seg.* = &.{};
+                    try text_entry.persistent.indexSegmentOwned(owned);
+                }
+                try rebuild.update(last_doc_key);
+                for (docs_buf.items) |doc| {
+                    manager.alloc.free(@constCast(doc.key));
+                    manager.alloc.free(@constCast(doc.value));
+                }
+                docs_buf.clearRetainingCapacity();
+                flush_count.* += 1;
+                if (@import("builtin").is_test) {
+                    if (test_abort_text_backfill_after_batches) |limit| {
+                        if (flush_count.* >= limit) return error.TestInjectedBackfillFailure;
+                    }
+                }
+            }
+        }.run;
+
+        var scan_lower_buf: ?[]u8 = if (resume_from) |buf| try self.alloc.dupe(u8, buf) else null;
+        defer if (scan_lower_buf) |buf| self.alloc.free(buf);
+        const scan_budget_per_page = @max(text_backfill_batch_size * 32, 256);
+        var reached_end = false;
+
+        while (!reached_end) {
+            try checkRepairCancelled(cancel_check);
+            var page_last_seen_key: ?[]u8 = null;
+            defer if (page_last_seen_key) |buf| self.alloc.free(buf);
+
+            const ScanState = struct {
+                manager: *IndexManager,
+                text_entry: *TextIndex,
+                identity_txn: *docstore_mod.DocStore.Txn,
+                lower_exclusive: ?[]const u8,
+                mapped_docs: *std.ArrayListUnmanaged(mapper.MapperDoc),
+                batch_last_doc_key: *?[]const u8,
+                page_last_seen_key: *?[]u8,
+                saw_visible_doc: *bool,
+                scan_budget: usize,
+                scanned: usize = 0,
+                stopped_early: bool = false,
+
+                fn rememberKey(state: *@This(), key: []const u8) !void {
+                    if (state.page_last_seen_key.*) |old| state.manager.alloc.free(old);
+                    state.page_last_seen_key.* = try state.manager.alloc.dupe(u8, key);
+                }
+
+                fn scanEntry(scan_ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+                    const state: *@This() = @ptrCast(@alignCast(scan_ctx orelse return error.InvalidArgument));
+                    if (state.lower_exclusive) |exclusive| {
+                        if (std.mem.order(u8, key, exclusive) != .gt) return .@"continue";
+                    }
+                    try state.rememberKey(key);
+                    state.scanned += 1;
+                    if (isMetadataKey(key) or !state.manager.keyInRange(key) or !try textIndexShouldConsumeDoc(state.manager, state.text_entry, key)) {
+                        if (state.scanned >= state.scan_budget) {
+                            state.stopped_early = true;
+                            return .stop;
+                        }
+                        return .@"continue";
+                    }
+
+                    state.saw_visible_doc.* = true;
+                    const doc_id = if (internal_keys.isPrimaryDocumentKey(key))
+                        (try internal_keys.decodePrimaryDocumentKeyAlloc(state.manager.alloc, key)) orelse return .@"continue"
+                    else
+                        try state.manager.alloc.dupe(u8, key);
+                    var doc_id_owned = true;
+                    errdefer if (doc_id_owned) state.manager.alloc.free(doc_id);
+                    const doc_value = try state.manager.alloc.dupe(u8, value);
+                    var doc_value_owned = true;
+                    errdefer if (doc_value_owned) state.manager.alloc.free(doc_value);
+
+                    try state.mapped_docs.append(state.manager.alloc, .{
+                        .key = doc_id,
+                        .value = doc_value,
+                        .doc_ordinal = try doc_identity.lookupOrdinalTxn(state.manager.alloc, state.identity_txn, doc_id),
+                    });
+                    doc_id_owned = false;
+                    doc_value_owned = false;
+
+                    if (state.batch_last_doc_key.*) |old| state.manager.alloc.free(old);
+                    state.batch_last_doc_key.* = try state.manager.alloc.dupe(u8, key);
+
+                    const backfill_batch_size = if (@import("builtin").is_test) test_text_backfill_batch_size orelse text_backfill_batch_size else text_backfill_batch_size;
+                    if (state.mapped_docs.items.len >= backfill_batch_size or state.scanned >= state.scan_budget) {
+                        state.stopped_early = true;
+                        return .stop;
+                    }
+                    return .@"continue";
+                }
+            };
+
+            var scan_state = ScanState{
+                .manager = self,
+                .text_entry = entry,
+                .identity_txn = read_txn,
+                .lower_exclusive = scan_lower_buf,
+                .mapped_docs = &mapped_docs,
+                .batch_last_doc_key = &batch_last_doc_key,
+                .page_last_seen_key = &page_last_seen_key,
+                .saw_visible_doc = &saw_visible_doc,
+                .scan_budget = scan_budget_per_page,
+            };
+            try store.scanReadTxnWithContext(read_txn, if (scan_lower_buf) |buf| buf else lower, if (upper) |buf| buf else "", .{}, &scan_state, ScanState.scanEntry);
+            reached_end = !scan_state.stopped_early or page_last_seen_key == null;
+
+            if (page_last_seen_key) |seen| {
+                if (scan_lower_buf) |old| self.alloc.free(old);
+                scan_lower_buf = try self.alloc.dupe(u8, seen);
+            }
+
+            if (mapped_docs.items.len > 0) {
+                try flush_batch(self, store, entry, rebuild_state, &mapped_docs, batch_last_doc_key.?, &flushed_batches, cancel_check);
+                if (batch_last_doc_key) |old| self.alloc.free(old);
+                batch_last_doc_key = null;
+            }
         }
 
         if (!saw_visible_doc or flushed_batches > 0) try rebuild_state.clear();
@@ -6442,6 +6867,164 @@ pub const IndexManager = struct {
 
     fn indexPath(self: *const IndexManager, name: []const u8) ![]u8 {
         return std.fmt.allocPrint(self.alloc, "{s}/indexes/{s}", .{ self.base_path, name });
+    }
+
+    fn activeIndexRootPointerPath(self: *const IndexManager, canonical_path: []const u8) ![]u8 {
+        return std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ canonical_path, active_index_root_pointer_file });
+    }
+
+    pub fn writeRepairShadowInProgressMarker(alloc: Allocator, shadow_root_path: []const u8) !void {
+        if (builtin.os.tag == .freestanding) return;
+        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        try fs_paths.createDirPathPortable(io, shadow_root_path);
+        const marker_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ shadow_root_path, repair_shadow_in_progress_file });
+        defer alloc.free(marker_path);
+        const payload = if (platform.process.currentId()) |pid|
+            try std.fmt.allocPrint(alloc, "{s}pid={d}\n", .{ repair_shadow_in_progress_magic, pid })
+        else
+            try std.fmt.allocPrint(alloc, "{s}pid=unknown\n", .{repair_shadow_in_progress_magic});
+        defer alloc.free(payload);
+        try writeFileAtomicallyDurable(alloc, io, marker_path, payload);
+    }
+
+    pub fn clearRepairShadowInProgressMarker(alloc: Allocator, shadow_root_path: []const u8) !void {
+        if (builtin.os.tag == .freestanding) return;
+        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        const marker_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ shadow_root_path, repair_shadow_in_progress_file });
+        defer alloc.free(marker_path);
+        std.Io.Dir.cwd().deleteFile(io, marker_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+        try fs_paths.syncDirPortable(io, shadow_root_path);
+    }
+
+    fn readActiveIndexRootPointer(self: *const IndexManager, canonical_path: []const u8, name: []const u8) !?[]u8 {
+        if (builtin.os.tag == .freestanding) return null;
+        const marker_path = try self.activeIndexRootPointerPath(canonical_path);
+        defer self.alloc.free(marker_path);
+
+        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer io_impl.deinit();
+        const raw = std.Io.Dir.cwd().readFileAlloc(io_impl.io(), marker_path, self.alloc, .limited(4096)) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer self.alloc.free(raw);
+        if (!std.mem.startsWith(u8, raw, active_index_root_pointer_magic)) return error.InvalidIndexRootPointer;
+        const trimmed = std.mem.trim(u8, raw[active_index_root_pointer_magic.len..], "\r\n");
+        if (trimmed.len == 0) return error.InvalidIndexRootPointer;
+        if (!validRelativeRepairIndexRoot(name, trimmed)) return error.InvalidIndexRootPointer;
+        return try self.alloc.dupe(u8, trimmed);
+    }
+
+    fn writeActiveIndexRootPointer(self: *const IndexManager, canonical_path: []const u8, relative_active_path: []const u8) !void {
+        if (builtin.os.tag == .freestanding) return;
+        if (!validRelativeRepairIndexRoot(std.fs.path.basename(canonical_path), relative_active_path)) return error.InvalidIndexRootPointer;
+        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        try fs_paths.createDirPathPortable(io, canonical_path);
+        const marker_path = try self.activeIndexRootPointerPath(canonical_path);
+        defer self.alloc.free(marker_path);
+        const payload = try std.fmt.allocPrint(self.alloc, "{s}{s}\n", .{ active_index_root_pointer_magic, relative_active_path });
+        defer self.alloc.free(payload);
+        try writeFileAtomicallyDurable(self.alloc, io, marker_path, payload);
+    }
+
+    fn clearActiveIndexRootPointer(self: *const IndexManager, canonical_path: []const u8) !void {
+        if (builtin.os.tag == .freestanding) return;
+        const marker_path = try self.activeIndexRootPointerPath(canonical_path);
+        defer self.alloc.free(marker_path);
+
+        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        std.Io.Dir.cwd().deleteFile(io, marker_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+        const parent = std.fs.path.dirname(marker_path) orelse ".";
+        try fs_paths.syncDirPortable(io, parent);
+    }
+
+    fn activeIndexPath(self: *const IndexManager, name: []const u8) ![]u8 {
+        const canonical_path = try self.indexPath(name);
+        errdefer self.alloc.free(canonical_path);
+        if (try self.readActiveIndexRootPointer(canonical_path, name)) |relative_active_path| {
+            defer self.alloc.free(relative_active_path);
+            const active_path = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ self.base_path, relative_active_path });
+            self.alloc.free(canonical_path);
+            return active_path;
+        }
+        return canonical_path;
+    }
+
+    fn relativeRepairIndexRootForActivePath(self: *const IndexManager, name: []const u8, active_path: []const u8) ![]u8 {
+        if (!std.mem.startsWith(u8, active_path, self.base_path)) return error.InvalidIndexRootPointer;
+        if (active_path.len <= self.base_path.len or active_path[self.base_path.len] != '/') return error.InvalidIndexRootPointer;
+        const relative = active_path[self.base_path.len + 1 ..];
+        if (!validRelativeRepairIndexRoot(name, relative)) return error.InvalidIndexRootPointer;
+        return try self.alloc.dupe(u8, relative);
+    }
+
+    fn collectActiveRepairShadowRoots(self: *IndexManager, active_roots: *std.StringHashMapUnmanaged(void)) !void {
+        for (self.text_indexes.items) |entry| try self.collectActiveRepairShadowRoot(active_roots, entry.config.name);
+        for (self.dense_indexes.items) |entry| try self.collectActiveRepairShadowRoot(active_roots, entry.config.name);
+        for (self.sparse_indexes.items) |entry| try self.collectActiveRepairShadowRoot(active_roots, entry.config.name);
+        for (self.graph_indexes.items) |entry| try self.collectActiveRepairShadowRoot(active_roots, entry.config.name);
+        for (self.algebraic_indexes.items) |entry| try self.collectActiveRepairShadowRoot(active_roots, entry.config.name);
+        for (self.status_only_index_configs) |cfg| try self.collectActiveRepairShadowRoot(active_roots, cfg.name);
+    }
+
+    fn collectActiveRepairShadowRoot(
+        self: *IndexManager,
+        active_roots: *std.StringHashMapUnmanaged(void),
+        index_name: []const u8,
+    ) !void {
+        const canonical_path = try self.indexPath(index_name);
+        defer self.alloc.free(canonical_path);
+        const relative = (try self.readActiveIndexRootPointer(canonical_path, index_name)) orelse return;
+        defer self.alloc.free(relative);
+        var iter = std.mem.splitScalar(u8, relative, '/');
+        const root = iter.next() orelse return;
+        if (active_roots.contains(root)) return;
+        try active_roots.put(self.alloc, try self.alloc.dupe(u8, root), {});
+    }
+
+    fn deleteIndexRootForName(self: *const IndexManager, name: []const u8, canonical_path: []const u8) void {
+        const active_path = self.activeIndexPath(name) catch null;
+        defer if (active_path) |path| self.alloc.free(path);
+        if (active_path) |path| {
+            if (!std.mem.eql(u8, path, canonical_path)) deleteIndexDirIfPresent(path);
+        }
+        deleteIndexDirIfPresent(canonical_path);
+    }
+
+    fn pruneCanonicalIndexRootAfterPointerInstall(canonical_path: []const u8) !void {
+        if (builtin.os.tag == .freestanding) return;
+        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        var dir = std.Io.Dir.cwd().openDir(io, canonical_path, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer dir.close(io);
+
+        var iter = dir.iterate();
+        while (try iter.next(io)) |entry| {
+            if (std.mem.eql(u8, entry.name, active_index_root_pointer_file)) continue;
+            switch (entry.kind) {
+                .directory => try dir.deleteTree(io, entry.name),
+                else => try dir.deleteFile(io, entry.name),
+            }
+        }
+        try fs_paths.syncDirPortable(io, canonical_path);
     }
 
     fn configRequiresEnrichmentReplay(self: *const IndexManager, cfg: types.IndexConfig) !bool {
@@ -6626,7 +7209,7 @@ pub const IndexManager = struct {
                 const text_cfg = try parseTextConfig(self.alloc, cfg.config_json);
                 defer text_cfg.deinit(self.alloc);
 
-                const path = try self.indexPath(cfg.name);
+                const path = try self.activeIndexPath(cfg.name);
                 defer self.alloc.free(path);
 
                 const zpath = try self.alloc.dupeZ(u8, path);
@@ -6778,7 +7361,7 @@ pub const IndexManager = struct {
                     }
                 }
 
-                const path = try self.indexPath(cfg.name);
+                const path = try self.activeIndexPath(cfg.name);
                 defer self.alloc.free(path);
 
                 const zpath = try self.alloc.dupeZ(u8, path);
@@ -6898,7 +7481,7 @@ pub const IndexManager = struct {
                 else
                     null;
 
-                const path = try self.indexPath(cfg.name);
+                const path = try self.activeIndexPath(cfg.name);
                 defer self.alloc.free(path);
 
                 const zpath = try self.alloc.dupeZ(u8, path);
@@ -6983,7 +7566,7 @@ pub const IndexManager = struct {
                     graph_cfg.shorthand_asset = null;
                 }
 
-                const path = try self.indexPath(cfg.name);
+                const path = try self.activeIndexPath(cfg.name);
                 defer self.alloc.free(path);
 
                 const forward_path = try std.fmt.allocPrint(self.alloc, "{s}/forward", .{path});
@@ -13958,6 +14541,82 @@ fn deleteIndexDirIfPresent(path: []const u8) void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+}
+
+fn repairShadowRootInProgress(path: []const u8) bool {
+    if (builtin.os.tag == .freestanding) return false;
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const marker_path = std.fmt.allocPrint(std.heap.page_allocator, "{s}/{s}", .{ path, repair_shadow_in_progress_file }) catch return true;
+    defer std.heap.page_allocator.free(marker_path);
+    const raw = std.Io.Dir.cwd().readFileAlloc(io, marker_path, std.heap.page_allocator, .limited(4096)) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return true,
+    };
+    defer std.heap.page_allocator.free(raw);
+    if (!std.mem.startsWith(u8, raw, repair_shadow_in_progress_magic)) return true;
+    const body = raw[repair_shadow_in_progress_magic.len..];
+    if (!std.mem.startsWith(u8, body, "pid=")) return true;
+    const end = std.mem.indexOfAny(u8, body["pid=".len..], "\r\n") orelse body["pid=".len..].len;
+    const pid_text = body["pid=".len..][0..end];
+    const pid = std.fmt.parseUnsigned(u32, pid_text, 10) catch return true;
+    if (platform.process.alive(pid)) return true;
+    std.log.warn("discarding stale repair shadow root for dead owner path={s} pid={d}", .{ path, pid });
+    return false;
+}
+
+fn writeFileAtomicallyDurable(alloc: Allocator, io: std.Io, path: []const u8, contents: []const u8) !void {
+    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-{d}", .{ path, platform_time.monotonicNs() });
+    defer alloc.free(tmp_path);
+
+    if (std.fs.path.dirname(path)) |parent| try fs_paths.createDirPathPortable(io, parent);
+
+    {
+        var file = try fs_paths.createFilePortable(io, tmp_path, .{ .truncate = true });
+        defer file.close(io);
+        var buf: [1024]u8 = undefined;
+        var writer = file.writer(io, &buf);
+        try writer.interface.writeAll(contents);
+        try writer.end();
+        try file.sync(io);
+    }
+
+    std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io) catch |err| {
+        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+        return err;
+    };
+    if (std.fs.path.dirname(path)) |parent| try fs_paths.syncDirPortable(io, parent);
+}
+
+fn validRelativeRepairIndexRoot(index_name: []const u8, relative_path: []const u8) bool {
+    if (relative_path.len == 0) return false;
+    if (std.fs.path.isAbsolute(relative_path)) return false;
+
+    var iter = std.mem.splitScalar(u8, relative_path, '/');
+    const root = iter.next() orelse return false;
+    if (root.len == 0 or !std.mem.startsWith(u8, root, repair_shadow_root_prefix)) return false;
+    if (std.mem.eql(u8, root, repair_shadow_root_prefix)) return false;
+    if (iter.next()) |component| {
+        if (!std.mem.eql(u8, component, "indexes")) return false;
+    } else return false;
+    if (iter.next()) |component| {
+        if (!std.mem.eql(u8, component, index_name)) return false;
+        if (std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) return false;
+    } else return false;
+    return iter.next() == null;
+}
+
+test "active repair shadow root validation rejects escapes" {
+    try std.testing.expect(validRelativeRepairIndexRoot("ft_v1", ".repair-shadow-1/indexes/ft_v1"));
+    try std.testing.expect(!validRelativeRepairIndexRoot("ft_v1", ""));
+    try std.testing.expect(!validRelativeRepairIndexRoot("ft_v1", "."));
+    try std.testing.expect(!validRelativeRepairIndexRoot("ft_v1", ".."));
+    try std.testing.expect(!validRelativeRepairIndexRoot("ft_v1", "/tmp/table/.repair-shadow-1/indexes/ft_v1"));
+    try std.testing.expect(!validRelativeRepairIndexRoot("ft_v1", ".repair-shadow-1/../indexes/ft_v1"));
+    try std.testing.expect(!validRelativeRepairIndexRoot("ft_v1", ".repair-shadow-1/indexes/other"));
+    try std.testing.expect(!validRelativeRepairIndexRoot("ft_v1", ".shadow-1/indexes/ft_v1"));
 }
 
 fn denseDocMappingKey(alloc: Allocator, index_name: []const u8, doc_key: []const u8) ![]u8 {

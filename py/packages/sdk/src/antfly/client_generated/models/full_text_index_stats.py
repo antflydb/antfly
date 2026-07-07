@@ -11,6 +11,8 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.full_text_index_stats_async_indexing import FullTextIndexStatsAsyncIndexing
+    from ..models.full_text_index_stats_promotion import FullTextIndexStatsPromotion
+    from ..models.full_text_index_stats_resolution import FullTextIndexStatsResolution
     from ..models.full_text_index_stats_text_merge import FullTextIndexStatsTextMerge
 
 
@@ -24,9 +26,11 @@ class FullTextIndexStats:
         index_type (FullTextIndexStatsIndexType): Discriminator for the index stats variant.
         error (str | Unset): Error message if stats could not be retrieved
         total_indexed (int | Unset): Number of documents in the index
+        disk_usage (int | Unset): Size of the index in bytes
         rebuilding (bool | Unset): Whether the index is currently rebuilding
         backfill_active (bool | Unset): Whether the index is actively rebuilding, replaying, or catching up.
         backfill_progress (float | Unset): Progress of ongoing rebuild as fraction [0.0, 1.0]
+        backfill_items_processed (int | Unset): Number of documents indexed during current rebuild
         backfill_state (str | Unset): Operational readiness state such as ready, running, retrying, or failed.
         doc_count (int | Unset): Number of documents visible to the index.
         term_count (int | Unset): Number of indexed terms when available.
@@ -54,14 +58,30 @@ class FullTextIndexStats:
             checkpoint that still need replay.
         repair_scan_issue_count (int | Unset): Repair issues found by explicit repair-scan accounting for this
             projection.
+        edge_count (int | Unset):
+        node_count (int | Unset):
+        repair_degraded (bool | Unset):
+        repair_issue_count (int | Unset):
+        repair_summary_ready (bool | Unset):
+        repair_issue_count_estimated (bool | Unset):
+        expected_groups (int | Unset):
+        reported_groups (int | Unset):
+        fresh_groups (int | Unset):
+        stale_groups (int | Unset):
+        missing_groups (int | Unset):
+        unknown_remote_groups (int | Unset):
+        resolution (FullTextIndexStatsResolution | Unset): Artifact resolution replay diagnostics.
+        promotion (FullTextIndexStatsPromotion | Unset): Artifact promotion replay diagnostics.
     """
 
     index_type: FullTextIndexStatsIndexType
     error: str | Unset = UNSET
     total_indexed: int | Unset = UNSET
+    disk_usage: int | Unset = UNSET
     rebuilding: bool | Unset = UNSET
     backfill_active: bool | Unset = UNSET
     backfill_progress: float | Unset = UNSET
+    backfill_items_processed: int | Unset = UNSET
     backfill_state: str | Unset = UNSET
     doc_count: int | Unset = UNSET
     term_count: int | Unset = UNSET
@@ -84,6 +104,20 @@ class FullTextIndexStats:
     projection_checkpoint_config_hash: int | Unset = UNSET
     checkpoint_replay_tail_sequence_count: int | Unset = UNSET
     repair_scan_issue_count: int | Unset = UNSET
+    edge_count: int | Unset = UNSET
+    node_count: int | Unset = UNSET
+    repair_degraded: bool | Unset = UNSET
+    repair_issue_count: int | Unset = UNSET
+    repair_summary_ready: bool | Unset = UNSET
+    repair_issue_count_estimated: bool | Unset = UNSET
+    expected_groups: int | Unset = UNSET
+    reported_groups: int | Unset = UNSET
+    fresh_groups: int | Unset = UNSET
+    stale_groups: int | Unset = UNSET
+    missing_groups: int | Unset = UNSET
+    unknown_remote_groups: int | Unset = UNSET
+    resolution: FullTextIndexStatsResolution | Unset = UNSET
+    promotion: FullTextIndexStatsPromotion | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -93,11 +127,15 @@ class FullTextIndexStats:
 
         total_indexed = self.total_indexed
 
+        disk_usage = self.disk_usage
+
         rebuilding = self.rebuilding
 
         backfill_active = self.backfill_active
 
         backfill_progress = self.backfill_progress
+
+        backfill_items_processed = self.backfill_items_processed
 
         backfill_state = self.backfill_state
 
@@ -147,6 +185,38 @@ class FullTextIndexStats:
 
         repair_scan_issue_count = self.repair_scan_issue_count
 
+        edge_count = self.edge_count
+
+        node_count = self.node_count
+
+        repair_degraded = self.repair_degraded
+
+        repair_issue_count = self.repair_issue_count
+
+        repair_summary_ready = self.repair_summary_ready
+
+        repair_issue_count_estimated = self.repair_issue_count_estimated
+
+        expected_groups = self.expected_groups
+
+        reported_groups = self.reported_groups
+
+        fresh_groups = self.fresh_groups
+
+        stale_groups = self.stale_groups
+
+        missing_groups = self.missing_groups
+
+        unknown_remote_groups = self.unknown_remote_groups
+
+        resolution: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.resolution, Unset):
+            resolution = self.resolution.to_dict()
+
+        promotion: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.promotion, Unset):
+            promotion = self.promotion.to_dict()
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -158,12 +228,16 @@ class FullTextIndexStats:
             field_dict["error"] = error
         if total_indexed is not UNSET:
             field_dict["total_indexed"] = total_indexed
+        if disk_usage is not UNSET:
+            field_dict["disk_usage"] = disk_usage
         if rebuilding is not UNSET:
             field_dict["rebuilding"] = rebuilding
         if backfill_active is not UNSET:
             field_dict["backfill_active"] = backfill_active
         if backfill_progress is not UNSET:
             field_dict["backfill_progress"] = backfill_progress
+        if backfill_items_processed is not UNSET:
+            field_dict["backfill_items_processed"] = backfill_items_processed
         if backfill_state is not UNSET:
             field_dict["backfill_state"] = backfill_state
         if doc_count is not UNSET:
@@ -208,12 +282,42 @@ class FullTextIndexStats:
             field_dict["checkpoint_replay_tail_sequence_count"] = checkpoint_replay_tail_sequence_count
         if repair_scan_issue_count is not UNSET:
             field_dict["repair_scan_issue_count"] = repair_scan_issue_count
+        if edge_count is not UNSET:
+            field_dict["edge_count"] = edge_count
+        if node_count is not UNSET:
+            field_dict["node_count"] = node_count
+        if repair_degraded is not UNSET:
+            field_dict["repair_degraded"] = repair_degraded
+        if repair_issue_count is not UNSET:
+            field_dict["repair_issue_count"] = repair_issue_count
+        if repair_summary_ready is not UNSET:
+            field_dict["repair_summary_ready"] = repair_summary_ready
+        if repair_issue_count_estimated is not UNSET:
+            field_dict["repair_issue_count_estimated"] = repair_issue_count_estimated
+        if expected_groups is not UNSET:
+            field_dict["expected_groups"] = expected_groups
+        if reported_groups is not UNSET:
+            field_dict["reported_groups"] = reported_groups
+        if fresh_groups is not UNSET:
+            field_dict["fresh_groups"] = fresh_groups
+        if stale_groups is not UNSET:
+            field_dict["stale_groups"] = stale_groups
+        if missing_groups is not UNSET:
+            field_dict["missing_groups"] = missing_groups
+        if unknown_remote_groups is not UNSET:
+            field_dict["unknown_remote_groups"] = unknown_remote_groups
+        if resolution is not UNSET:
+            field_dict["resolution"] = resolution
+        if promotion is not UNSET:
+            field_dict["promotion"] = promotion
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.full_text_index_stats_async_indexing import FullTextIndexStatsAsyncIndexing
+        from ..models.full_text_index_stats_promotion import FullTextIndexStatsPromotion
+        from ..models.full_text_index_stats_resolution import FullTextIndexStatsResolution
         from ..models.full_text_index_stats_text_merge import FullTextIndexStatsTextMerge
 
         d = dict(src_dict)
@@ -223,11 +327,15 @@ class FullTextIndexStats:
 
         total_indexed = d.pop("total_indexed", UNSET)
 
+        disk_usage = d.pop("disk_usage", UNSET)
+
         rebuilding = d.pop("rebuilding", UNSET)
 
         backfill_active = d.pop("backfill_active", UNSET)
 
         backfill_progress = d.pop("backfill_progress", UNSET)
+
+        backfill_items_processed = d.pop("backfill_items_processed", UNSET)
 
         backfill_state = d.pop("backfill_state", UNSET)
 
@@ -283,13 +391,53 @@ class FullTextIndexStats:
 
         repair_scan_issue_count = d.pop("repair_scan_issue_count", UNSET)
 
+        edge_count = d.pop("edge_count", UNSET)
+
+        node_count = d.pop("node_count", UNSET)
+
+        repair_degraded = d.pop("repair_degraded", UNSET)
+
+        repair_issue_count = d.pop("repair_issue_count", UNSET)
+
+        repair_summary_ready = d.pop("repair_summary_ready", UNSET)
+
+        repair_issue_count_estimated = d.pop("repair_issue_count_estimated", UNSET)
+
+        expected_groups = d.pop("expected_groups", UNSET)
+
+        reported_groups = d.pop("reported_groups", UNSET)
+
+        fresh_groups = d.pop("fresh_groups", UNSET)
+
+        stale_groups = d.pop("stale_groups", UNSET)
+
+        missing_groups = d.pop("missing_groups", UNSET)
+
+        unknown_remote_groups = d.pop("unknown_remote_groups", UNSET)
+
+        _resolution = d.pop("resolution", UNSET)
+        resolution: FullTextIndexStatsResolution | Unset
+        if isinstance(_resolution, Unset):
+            resolution = UNSET
+        else:
+            resolution = FullTextIndexStatsResolution.from_dict(_resolution)
+
+        _promotion = d.pop("promotion", UNSET)
+        promotion: FullTextIndexStatsPromotion | Unset
+        if isinstance(_promotion, Unset):
+            promotion = UNSET
+        else:
+            promotion = FullTextIndexStatsPromotion.from_dict(_promotion)
+
         full_text_index_stats = cls(
             index_type=index_type,
             error=error,
             total_indexed=total_indexed,
+            disk_usage=disk_usage,
             rebuilding=rebuilding,
             backfill_active=backfill_active,
             backfill_progress=backfill_progress,
+            backfill_items_processed=backfill_items_processed,
             backfill_state=backfill_state,
             doc_count=doc_count,
             term_count=term_count,
@@ -312,6 +460,20 @@ class FullTextIndexStats:
             projection_checkpoint_config_hash=projection_checkpoint_config_hash,
             checkpoint_replay_tail_sequence_count=checkpoint_replay_tail_sequence_count,
             repair_scan_issue_count=repair_scan_issue_count,
+            edge_count=edge_count,
+            node_count=node_count,
+            repair_degraded=repair_degraded,
+            repair_issue_count=repair_issue_count,
+            repair_summary_ready=repair_summary_ready,
+            repair_issue_count_estimated=repair_issue_count_estimated,
+            expected_groups=expected_groups,
+            reported_groups=reported_groups,
+            fresh_groups=fresh_groups,
+            stale_groups=stale_groups,
+            missing_groups=missing_groups,
+            unknown_remote_groups=unknown_remote_groups,
+            resolution=resolution,
+            promotion=promotion,
         )
 
         full_text_index_stats.additional_properties = d

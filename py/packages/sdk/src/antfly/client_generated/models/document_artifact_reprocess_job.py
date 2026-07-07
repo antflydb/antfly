@@ -23,6 +23,7 @@ class DocumentArtifactReprocessJob:
     """
     Attributes:
         job_id (int): Server-assigned durable repair job identifier.
+        attempt_id (int): Monotonic execution attempt token for the current running pass.
         table_name (str): Table containing the source documents being repaired.
         artifact_name (str): Name of the derived artifact being repaired.
         phase (DocumentArtifactReprocessJobPhase): Lifecycle phase of the repair job.
@@ -39,14 +40,17 @@ class DocumentArtifactReprocessJob:
         failures (list[DocumentArtifactReprocessFailure]): Failures from the most recent completed pass.
         shard_cursors (list[DocumentArtifactReprocessShardCursor]): Per-shard continuation cursors to resume on the next
             advance operation.
-        created_at_millis (int): Monotonic server timestamp when the job was created.
-        last_updated_at_millis (int): Monotonic server timestamp when the job was last updated.
-        expires_at_millis (int): Monotonic server timestamp after which the retained job status may be removed.
+        cancel_requested (bool): Whether cancellation has been requested for a running pass. Running passes finish at a
+            bounded reprocess boundary before the job transitions to cancelled.
+        created_at_millis (int): Unix epoch milliseconds when the job was created.
+        last_updated_at_millis (int): Unix epoch milliseconds when the job was last updated.
+        expires_at_millis (int): Unix epoch milliseconds after which the retained job status may be removed.
         next_key (None | str | Unset): Single-shard continuation key when no shard cursors are present.
         last_error (None | str | Unset): Last terminal or transient job error, when available.
     """
 
     job_id: int
+    attempt_id: int
     table_name: str
     artifact_name: str
     phase: DocumentArtifactReprocessJobPhase
@@ -61,6 +65,7 @@ class DocumentArtifactReprocessJob:
     pending_shards: int
     failures: list[DocumentArtifactReprocessFailure]
     shard_cursors: list[DocumentArtifactReprocessShardCursor]
+    cancel_requested: bool
     created_at_millis: int
     last_updated_at_millis: int
     expires_at_millis: int
@@ -70,6 +75,8 @@ class DocumentArtifactReprocessJob:
 
     def to_dict(self) -> dict[str, Any]:
         job_id = self.job_id
+
+        attempt_id = self.attempt_id
 
         table_name = self.table_name
 
@@ -105,6 +112,8 @@ class DocumentArtifactReprocessJob:
             shard_cursors_item = shard_cursors_item_data.to_dict()
             shard_cursors.append(shard_cursors_item)
 
+        cancel_requested = self.cancel_requested
+
         created_at_millis = self.created_at_millis
 
         last_updated_at_millis = self.last_updated_at_millis
@@ -128,6 +137,7 @@ class DocumentArtifactReprocessJob:
         field_dict.update(
             {
                 "job_id": job_id,
+                "attempt_id": attempt_id,
                 "table_name": table_name,
                 "artifact_name": artifact_name,
                 "phase": phase,
@@ -142,6 +152,7 @@ class DocumentArtifactReprocessJob:
                 "pending_shards": pending_shards,
                 "failures": failures,
                 "shard_cursors": shard_cursors,
+                "cancel_requested": cancel_requested,
                 "created_at_millis": created_at_millis,
                 "last_updated_at_millis": last_updated_at_millis,
                 "expires_at_millis": expires_at_millis,
@@ -161,6 +172,8 @@ class DocumentArtifactReprocessJob:
 
         d = dict(src_dict)
         job_id = d.pop("job_id")
+
+        attempt_id = d.pop("attempt_id")
 
         table_name = d.pop("table_name")
 
@@ -200,6 +213,8 @@ class DocumentArtifactReprocessJob:
 
             shard_cursors.append(shard_cursors_item)
 
+        cancel_requested = d.pop("cancel_requested")
+
         created_at_millis = d.pop("created_at_millis")
 
         last_updated_at_millis = d.pop("last_updated_at_millis")
@@ -226,6 +241,7 @@ class DocumentArtifactReprocessJob:
 
         document_artifact_reprocess_job = cls(
             job_id=job_id,
+            attempt_id=attempt_id,
             table_name=table_name,
             artifact_name=artifact_name,
             phase=phase,
@@ -240,6 +256,7 @@ class DocumentArtifactReprocessJob:
             pending_shards=pending_shards,
             failures=failures,
             shard_cursors=shard_cursors,
+            cancel_requested=cancel_requested,
             created_at_millis=created_at_millis,
             last_updated_at_millis=last_updated_at_millis,
             expires_at_millis=expires_at_millis,

@@ -14,6 +14,8 @@ if TYPE_CHECKING:
     from ..models.embeddings_index_stats_enrichment_runtime import EmbeddingsIndexStatsEnrichmentRuntime
     from ..models.embeddings_index_stats_hbc_cache import EmbeddingsIndexStatsHbcCache
     from ..models.embeddings_index_stats_hbc_posting import EmbeddingsIndexStatsHbcPosting
+    from ..models.embeddings_index_stats_promotion import EmbeddingsIndexStatsPromotion
+    from ..models.embeddings_index_stats_resolution import EmbeddingsIndexStatsResolution
 
 
 T = TypeVar("T", bound="EmbeddingsIndexStats")
@@ -27,11 +29,14 @@ class EmbeddingsIndexStats:
         index_type (EmbeddingsIndexStatsIndexType): Discriminator for the index stats variant.
         error (str | Unset): Error message if stats could not be retrieved
         total_indexed (int | Unset): Number of vectors/documents in the index
+        disk_usage (int | Unset): Size of the index in bytes
         total_nodes (int | Unset): Total number of nodes in the index (dense only)
         total_terms (int | Unset): Number of unique terms in the inverted index (sparse only)
         rebuilding (bool | Unset): Whether the index enricher is currently backfilling
+        wal_backlog (int | Unset): Number of documents pending enrichment in the WAL
         backfill_active (bool | Unset): Whether the index is actively rebuilding, replaying, enriching, or catching up.
         backfill_progress (float | Unset): Backfill progress as a ratio from 0.0 to 1.0
+        backfill_items_processed (int | Unset): Total items processed during backfill
         backfill_state (str | Unset): Operational readiness state such as ready, running, retrying, or failed.
         doc_count (int | Unset): Number of documents visible to the index.
         query_visible_doc_count (int | Unset): Documents currently visible to queries.
@@ -70,16 +75,34 @@ class EmbeddingsIndexStats:
             checkpoint that still need replay.
         repair_scan_issue_count (int | Unset): Repair issues found by explicit repair-scan accounting for this
             projection.
+        term_count (int | Unset):
+        edge_count (int | Unset):
+        node_count (int | Unset):
+        repair_degraded (bool | Unset):
+        repair_issue_count (int | Unset):
+        repair_summary_ready (bool | Unset):
+        repair_issue_count_estimated (bool | Unset):
+        expected_groups (int | Unset):
+        reported_groups (int | Unset):
+        fresh_groups (int | Unset):
+        stale_groups (int | Unset):
+        missing_groups (int | Unset):
+        unknown_remote_groups (int | Unset):
+        resolution (EmbeddingsIndexStatsResolution | Unset): Artifact resolution replay diagnostics.
+        promotion (EmbeddingsIndexStatsPromotion | Unset): Artifact promotion replay diagnostics.
     """
 
     index_type: EmbeddingsIndexStatsIndexType
     error: str | Unset = UNSET
     total_indexed: int | Unset = UNSET
+    disk_usage: int | Unset = UNSET
     total_nodes: int | Unset = UNSET
     total_terms: int | Unset = UNSET
     rebuilding: bool | Unset = UNSET
+    wal_backlog: int | Unset = UNSET
     backfill_active: bool | Unset = UNSET
     backfill_progress: float | Unset = UNSET
+    backfill_items_processed: int | Unset = UNSET
     backfill_state: str | Unset = UNSET
     doc_count: int | Unset = UNSET
     query_visible_doc_count: int | Unset = UNSET
@@ -111,6 +134,21 @@ class EmbeddingsIndexStats:
     projection_checkpoint_config_hash: int | Unset = UNSET
     checkpoint_replay_tail_sequence_count: int | Unset = UNSET
     repair_scan_issue_count: int | Unset = UNSET
+    term_count: int | Unset = UNSET
+    edge_count: int | Unset = UNSET
+    node_count: int | Unset = UNSET
+    repair_degraded: bool | Unset = UNSET
+    repair_issue_count: int | Unset = UNSET
+    repair_summary_ready: bool | Unset = UNSET
+    repair_issue_count_estimated: bool | Unset = UNSET
+    expected_groups: int | Unset = UNSET
+    reported_groups: int | Unset = UNSET
+    fresh_groups: int | Unset = UNSET
+    stale_groups: int | Unset = UNSET
+    missing_groups: int | Unset = UNSET
+    unknown_remote_groups: int | Unset = UNSET
+    resolution: EmbeddingsIndexStatsResolution | Unset = UNSET
+    promotion: EmbeddingsIndexStatsPromotion | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -120,15 +158,21 @@ class EmbeddingsIndexStats:
 
         total_indexed = self.total_indexed
 
+        disk_usage = self.disk_usage
+
         total_nodes = self.total_nodes
 
         total_terms = self.total_terms
 
         rebuilding = self.rebuilding
 
+        wal_backlog = self.wal_backlog
+
         backfill_active = self.backfill_active
 
         backfill_progress = self.backfill_progress
+
+        backfill_items_processed = self.backfill_items_processed
 
         backfill_state = self.backfill_state
 
@@ -200,6 +244,40 @@ class EmbeddingsIndexStats:
 
         repair_scan_issue_count = self.repair_scan_issue_count
 
+        term_count = self.term_count
+
+        edge_count = self.edge_count
+
+        node_count = self.node_count
+
+        repair_degraded = self.repair_degraded
+
+        repair_issue_count = self.repair_issue_count
+
+        repair_summary_ready = self.repair_summary_ready
+
+        repair_issue_count_estimated = self.repair_issue_count_estimated
+
+        expected_groups = self.expected_groups
+
+        reported_groups = self.reported_groups
+
+        fresh_groups = self.fresh_groups
+
+        stale_groups = self.stale_groups
+
+        missing_groups = self.missing_groups
+
+        unknown_remote_groups = self.unknown_remote_groups
+
+        resolution: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.resolution, Unset):
+            resolution = self.resolution.to_dict()
+
+        promotion: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.promotion, Unset):
+            promotion = self.promotion.to_dict()
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -211,16 +289,22 @@ class EmbeddingsIndexStats:
             field_dict["error"] = error
         if total_indexed is not UNSET:
             field_dict["total_indexed"] = total_indexed
+        if disk_usage is not UNSET:
+            field_dict["disk_usage"] = disk_usage
         if total_nodes is not UNSET:
             field_dict["total_nodes"] = total_nodes
         if total_terms is not UNSET:
             field_dict["total_terms"] = total_terms
         if rebuilding is not UNSET:
             field_dict["rebuilding"] = rebuilding
+        if wal_backlog is not UNSET:
+            field_dict["wal_backlog"] = wal_backlog
         if backfill_active is not UNSET:
             field_dict["backfill_active"] = backfill_active
         if backfill_progress is not UNSET:
             field_dict["backfill_progress"] = backfill_progress
+        if backfill_items_processed is not UNSET:
+            field_dict["backfill_items_processed"] = backfill_items_processed
         if backfill_state is not UNSET:
             field_dict["backfill_state"] = backfill_state
         if doc_count is not UNSET:
@@ -283,6 +367,36 @@ class EmbeddingsIndexStats:
             field_dict["checkpoint_replay_tail_sequence_count"] = checkpoint_replay_tail_sequence_count
         if repair_scan_issue_count is not UNSET:
             field_dict["repair_scan_issue_count"] = repair_scan_issue_count
+        if term_count is not UNSET:
+            field_dict["term_count"] = term_count
+        if edge_count is not UNSET:
+            field_dict["edge_count"] = edge_count
+        if node_count is not UNSET:
+            field_dict["node_count"] = node_count
+        if repair_degraded is not UNSET:
+            field_dict["repair_degraded"] = repair_degraded
+        if repair_issue_count is not UNSET:
+            field_dict["repair_issue_count"] = repair_issue_count
+        if repair_summary_ready is not UNSET:
+            field_dict["repair_summary_ready"] = repair_summary_ready
+        if repair_issue_count_estimated is not UNSET:
+            field_dict["repair_issue_count_estimated"] = repair_issue_count_estimated
+        if expected_groups is not UNSET:
+            field_dict["expected_groups"] = expected_groups
+        if reported_groups is not UNSET:
+            field_dict["reported_groups"] = reported_groups
+        if fresh_groups is not UNSET:
+            field_dict["fresh_groups"] = fresh_groups
+        if stale_groups is not UNSET:
+            field_dict["stale_groups"] = stale_groups
+        if missing_groups is not UNSET:
+            field_dict["missing_groups"] = missing_groups
+        if unknown_remote_groups is not UNSET:
+            field_dict["unknown_remote_groups"] = unknown_remote_groups
+        if resolution is not UNSET:
+            field_dict["resolution"] = resolution
+        if promotion is not UNSET:
+            field_dict["promotion"] = promotion
 
         return field_dict
 
@@ -292,6 +406,8 @@ class EmbeddingsIndexStats:
         from ..models.embeddings_index_stats_enrichment_runtime import EmbeddingsIndexStatsEnrichmentRuntime
         from ..models.embeddings_index_stats_hbc_cache import EmbeddingsIndexStatsHbcCache
         from ..models.embeddings_index_stats_hbc_posting import EmbeddingsIndexStatsHbcPosting
+        from ..models.embeddings_index_stats_promotion import EmbeddingsIndexStatsPromotion
+        from ..models.embeddings_index_stats_resolution import EmbeddingsIndexStatsResolution
 
         d = dict(src_dict)
         index_type = EmbeddingsIndexStatsIndexType(d.pop("index_type"))
@@ -300,15 +416,21 @@ class EmbeddingsIndexStats:
 
         total_indexed = d.pop("total_indexed", UNSET)
 
+        disk_usage = d.pop("disk_usage", UNSET)
+
         total_nodes = d.pop("total_nodes", UNSET)
 
         total_terms = d.pop("total_terms", UNSET)
 
         rebuilding = d.pop("rebuilding", UNSET)
 
+        wal_backlog = d.pop("wal_backlog", UNSET)
+
         backfill_active = d.pop("backfill_active", UNSET)
 
         backfill_progress = d.pop("backfill_progress", UNSET)
+
+        backfill_items_processed = d.pop("backfill_items_processed", UNSET)
 
         backfill_state = d.pop("backfill_state", UNSET)
 
@@ -392,15 +514,58 @@ class EmbeddingsIndexStats:
 
         repair_scan_issue_count = d.pop("repair_scan_issue_count", UNSET)
 
+        term_count = d.pop("term_count", UNSET)
+
+        edge_count = d.pop("edge_count", UNSET)
+
+        node_count = d.pop("node_count", UNSET)
+
+        repair_degraded = d.pop("repair_degraded", UNSET)
+
+        repair_issue_count = d.pop("repair_issue_count", UNSET)
+
+        repair_summary_ready = d.pop("repair_summary_ready", UNSET)
+
+        repair_issue_count_estimated = d.pop("repair_issue_count_estimated", UNSET)
+
+        expected_groups = d.pop("expected_groups", UNSET)
+
+        reported_groups = d.pop("reported_groups", UNSET)
+
+        fresh_groups = d.pop("fresh_groups", UNSET)
+
+        stale_groups = d.pop("stale_groups", UNSET)
+
+        missing_groups = d.pop("missing_groups", UNSET)
+
+        unknown_remote_groups = d.pop("unknown_remote_groups", UNSET)
+
+        _resolution = d.pop("resolution", UNSET)
+        resolution: EmbeddingsIndexStatsResolution | Unset
+        if isinstance(_resolution, Unset):
+            resolution = UNSET
+        else:
+            resolution = EmbeddingsIndexStatsResolution.from_dict(_resolution)
+
+        _promotion = d.pop("promotion", UNSET)
+        promotion: EmbeddingsIndexStatsPromotion | Unset
+        if isinstance(_promotion, Unset):
+            promotion = UNSET
+        else:
+            promotion = EmbeddingsIndexStatsPromotion.from_dict(_promotion)
+
         embeddings_index_stats = cls(
             index_type=index_type,
             error=error,
             total_indexed=total_indexed,
+            disk_usage=disk_usage,
             total_nodes=total_nodes,
             total_terms=total_terms,
             rebuilding=rebuilding,
+            wal_backlog=wal_backlog,
             backfill_active=backfill_active,
             backfill_progress=backfill_progress,
+            backfill_items_processed=backfill_items_processed,
             backfill_state=backfill_state,
             doc_count=doc_count,
             query_visible_doc_count=query_visible_doc_count,
@@ -432,6 +597,21 @@ class EmbeddingsIndexStats:
             projection_checkpoint_config_hash=projection_checkpoint_config_hash,
             checkpoint_replay_tail_sequence_count=checkpoint_replay_tail_sequence_count,
             repair_scan_issue_count=repair_scan_issue_count,
+            term_count=term_count,
+            edge_count=edge_count,
+            node_count=node_count,
+            repair_degraded=repair_degraded,
+            repair_issue_count=repair_issue_count,
+            repair_summary_ready=repair_summary_ready,
+            repair_issue_count_estimated=repair_issue_count_estimated,
+            expected_groups=expected_groups,
+            reported_groups=reported_groups,
+            fresh_groups=fresh_groups,
+            stale_groups=stale_groups,
+            missing_groups=missing_groups,
+            unknown_remote_groups=unknown_remote_groups,
+            resolution=resolution,
+            promotion=promotion,
         )
 
         embeddings_index_stats.additional_properties = d

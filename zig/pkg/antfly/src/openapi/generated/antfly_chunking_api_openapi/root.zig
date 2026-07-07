@@ -3,9 +3,9 @@
 
 pub const types = @import("types.zig");
 
-pub const AudioChunkOptions = types.AudioChunkOptions;
+pub const TextContent = types.TextContent;
 pub const BinaryContent = types.BinaryContent;
 pub const Chunk = types.Chunk;
-pub const ChunkOptions = types.ChunkOptions;
 pub const TextChunkOptions = types.TextChunkOptions;
-pub const TextContent = types.TextContent;
+pub const AudioChunkOptions = types.AudioChunkOptions;
+pub const ChunkOptions = types.ChunkOptions;

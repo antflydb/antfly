@@ -175,6 +175,11 @@ components:
           type: integer
           format: uint64
           description: "Number of documents in the index"
+        disk_usage:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Size of the index in bytes"
         rebuilding:
           x-go-type-skip-optional-pointer: true
           type: boolean
@@ -188,6 +193,11 @@ components:
           type: number
           format: double
           description: "Progress of ongoing rebuild as fraction [0.0, 1.0]"
+        backfill_items_processed:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Number of documents indexed during current rebuild"
         backfill_state:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -281,6 +291,61 @@ components:
           type: integer
           format: uint64
           description: "Repair issues found by explicit repair-scan accounting for this projection."
+        edge_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        node_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        repair_degraded:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_issue_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        repair_summary_ready:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_issue_count_estimated:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        expected_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        reported_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        fresh_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        stale_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        missing_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        unknown_remote_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        resolution:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: "Artifact resolution replay diagnostics."
+        promotion:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: "Artifact promotion replay diagnostics."
     EmbeddingsIndexConfig:
       type: object
       description: >-
@@ -377,6 +442,11 @@ components:
           type: integer
           format: uint64
           description: "Number of vectors/documents in the index"
+        disk_usage:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Size of the index in bytes"
         total_nodes:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -391,6 +461,11 @@ components:
           x-go-type-skip-optional-pointer: true
           type: boolean
           description: "Whether the index enricher is currently backfilling"
+        wal_backlog:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Number of documents pending enrichment in the WAL"
         backfill_active:
           x-go-type-skip-optional-pointer: true
           type: boolean
@@ -400,6 +475,11 @@ components:
           type: number
           format: double
           description: "Backfill progress as a ratio from 0.0 to 1.0"
+        backfill_items_processed:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Total items processed during backfill"
         backfill_state:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -529,6 +609,65 @@ components:
           type: integer
           format: uint64
           description: "Repair issues found by explicit repair-scan accounting for this projection."
+        term_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        edge_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        node_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        repair_degraded:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_issue_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        repair_summary_ready:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_issue_count_estimated:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        expected_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        reported_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        fresh_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        stale_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        missing_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        unknown_remote_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        resolution:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: "Artifact resolution replay diagnostics."
+        promotion:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: "Artifact promotion replay diagnostics."
     IndexStats:
       type: object
       description: "Statistics for an index"
@@ -565,6 +704,11 @@ components:
           type: integer
           format: uint64
           description: "Number of documents reflected in the algebraic sidecar"
+        disk_usage:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Size of the index in bytes"
         rebuilding:
           x-go-type-skip-optional-pointer: true
           type: boolean
@@ -578,6 +722,11 @@ components:
           type: number
           format: double
           description: "Backfill progress as a ratio from 0.0 to 1.0"
+        backfill_items_processed:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Number of documents processed during current backfill"
         backfill_state:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -748,6 +897,71 @@ components:
           type: integer
           format: uint64
           description: "Repair issues found by explicit repair-scan accounting for this projection."
+        edge_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        node_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        repair_degraded:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_issue_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        repair_summary_ready:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_issue_count_estimated:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        expected_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        reported_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        fresh_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        stale_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        missing_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        unknown_remote_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        source_artifact:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: "Source artifact stream used to materialize graph edges."
+        resolver_replay:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: "Graph resolver replay diagnostics."
+        resolution:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: "Artifact resolution replay diagnostics."
+        promotion:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: "Artifact promotion replay diagnostics."
     MergeStrategy:
       type: string
       enum:
@@ -977,6 +1191,11 @@ components:
           type: number
           format: double
           description: "Rebuild progress as a ratio from 0.0 to 1.0"
+        backfill_items_processed:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+          description: "Number of edges indexed during current rebuild"
         backfill_state:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -1076,6 +1295,57 @@ components:
           type: integer
           format: uint64
           description: "Repair issues found by explicit repair-scan accounting for this projection."
+        term_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        repair_degraded:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_issue_count:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        repair_summary_ready:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        repair_issue_count_estimated:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+        expected_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        reported_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        fresh_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        stale_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        missing_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        unknown_remote_groups:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          format: uint64
+        resolution:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: "Artifact resolution replay diagnostics."
+        promotion:
+          x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: "Artifact promotion replay diagnostics."
         algebraic_graph:
           x-go-type-skip-optional-pointer: true
           type: object

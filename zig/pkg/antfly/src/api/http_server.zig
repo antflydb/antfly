@@ -58,6 +58,7 @@ const distributed_graph = @import("distributed_graph.zig");
 const distributed_join = @import("distributed_join.zig");
 const distributed_txn = @import("distributed_txn.zig");
 const artifact_reprocess_jobs = @import("artifact_reprocess_jobs.zig");
+const repair_jobs = @import("repair_jobs.zig");
 const admin_routes = @import("../admin/routes.zig");
 const internal_api_routes = @import("../internal/routes.zig");
 const http_internal_routes = @import("http_internal_routes.zig");
@@ -283,6 +284,8 @@ pub const ApiHttpServerConfig = struct {
     join_job_retention_ms: ?u64 = null,
     artifact_reprocess_job_store_path: ?[]const u8 = null,
     artifact_reprocess_job_retention_ms: ?u64 = null,
+    repair_job_store_path: ?[]const u8 = null,
+    repair_job_retention_ms: ?u64 = null,
     session_ttl_ns: ?u64 = null,
     session_cleanup_interval_ns: ?u64 = null,
     session_owner_lease_ttl_ns: ?u64 = null,
@@ -1053,6 +1056,8 @@ pub const ApiHttpServer = struct {
     opened_session_store: ?*transactions_api.OpenedSessionStore = null,
     join_job_store: distributed_join.JoinJobStore = .{ .alloc = undefined, .cfg = .{} },
     artifact_reprocess_job_store: artifact_reprocess_jobs.Store = .{ .alloc = undefined, .cfg = .{} },
+    repair_job_store: repair_jobs.Store = .{ .alloc = undefined, .cfg = .{} },
+    repair_job_owner_id: u64 = 0,
     mcp_sessions: mcp.InMemorySessionStore = .{},
     a2a_tasks: a2a.InMemoryTaskStore = .{},
     connections_cache: connections_api.Cache = .{ .alloc = undefined },
@@ -1096,6 +1101,11 @@ pub const ApiHttpServer = struct {
                 .artifact_reprocess_job_store_path = cfg.artifact_reprocess_job_store_path,
                 .artifact_reprocess_job_retention_ms = cfg.artifact_reprocess_job_retention_ms,
             }),
+            .repair_job_store = repair_jobs.Store.init(alloc, .{
+                .repair_job_store_path = cfg.repair_job_store_path,
+                .repair_job_retention_ms = cfg.repair_job_retention_ms,
+            }),
+            .repair_job_owner_id = if (cfg.backend_runtime) |runtime| runtime.allocOwnerId() else 0,
             .connections_cache = connections_api.Cache.init(alloc),
             .mcp_sessions = mcp.InMemorySessionStore.init(alloc),
             .a2a_tasks = a2a.InMemoryTaskStore.init(alloc),
@@ -1167,6 +1177,18 @@ pub const ApiHttpServer = struct {
             errdefer opened.deinit();
             try server.artifact_reprocess_job_store.attachOpenedStore(opened);
         }
+        if (cfg.repair_job_store_path orelse cfg.session_store_path) |base_path| {
+            const job_path = if (cfg.repair_job_store_path != null)
+                try alloc.dupe(u8, base_path)
+            else
+                try std.fmt.allocPrint(alloc, "{s}.repair_jobs", .{base_path});
+            defer alloc.free(job_path);
+            const opened = try alloc.create(repair_jobs.OpenedStore);
+            errdefer alloc.destroy(opened);
+            opened.* = try repair_jobs.OpenedStore.open(alloc, job_path);
+            errdefer opened.deinit();
+            try server.repair_job_store.attachOpenedStore(opened);
+        }
         return server;
     }
 
@@ -1189,6 +1211,9 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn deinit(self: *ApiHttpServer) void {
+        if (self.cfg.backend_runtime) |runtime| {
+            if (self.repair_job_owner_id != 0) runtime.durable_jobs.closeOwner(self.repair_job_owner_id);
+        }
         self.mcp_sessions.deinit(self.alloc);
         self.a2a_tasks.deinit(self.alloc);
         self.txn_sessions.deinit(self.alloc);
@@ -1198,6 +1223,7 @@ pub const ApiHttpServer = struct {
         }
         self.join_job_store.deinit();
         self.artifact_reprocess_job_store.deinit();
+        self.repair_job_store.deinit();
         if (self.owned_foreign_registry) |registry| {
             registry.deinit(self.alloc);
             self.alloc.destroy(registry);
@@ -1326,6 +1352,12 @@ pub const ApiHttpServer = struct {
         try self.maybeRenewOwnedSessionLeases();
         self.join_job_store.cleanupExpiredJoinJobs();
         self.artifact_reprocess_job_store.cleanupExpiredJobs();
+        self.repair_job_store.cleanupExpiredJobs();
+        if (self.cfg.backend_runtime) |runtime| {
+            _ = runtime.durable_jobs.poll(32) catch |err| {
+                std.log.warn("failed to reap table repair background jobs err={s}", .{@errorName(err)});
+            };
+        }
     }
 
     fn localTableRuntimeStatuses(
@@ -1957,7 +1989,8 @@ pub const ApiHttpServer = struct {
     pub fn handleInternalRoute(self: *ApiHttpServer, req: http_common.HttpRequest) !?http_common.HttpResponse {
         const uri_parts = splitTarget(req.uri);
         if (!std.mem.startsWith(u8, uri_parts.path, routes.Routes.internal_groups_prefix) and
-            routes.Routes.matchInternalTableCorruptEmbeddingArtifact(uri_parts.path) == null)
+            routes.Routes.matchInternalTableCorruptEmbeddingArtifact(uri_parts.path) == null and
+            routes.Routes.matchInternalTableRepairCancelState(uri_parts.path) == null)
         {
             return null;
         }
@@ -3566,6 +3599,8 @@ pub const ApiHttpServer = struct {
                 .shard_ops = self.cfg.shard_ops,
                 .shard_db_adapter = self.cfg.shard_db_adapter,
                 .writes = self.table_writes,
+                .repair_job_store = &self.repair_job_store,
+                .repair_cancel_executor = self.cfg.session_executor,
                 .batch_validator = .{
                     .ptr = self,
                     .validate = validateInternalGroupBatchWrites,
@@ -4011,6 +4046,22 @@ pub const ApiHttpServer = struct {
                 defer self.alloc.free(table_name);
                 return try self.handlePublicRunTableRepair(table_name, req.body);
             }
+            if (routes.Routes.matchTableRepairJobs(uri_parts.path)) |job_route| {
+                if (uri_parts.query.len != 0) return try textResponse(self.alloc, 400, "repair job requests use json body");
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicStartTableRepairJob(table_name, req.body);
+            }
+            if (routes.Routes.matchTableRepairJobAdvance(uri_parts.path)) |job_route| {
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicAdvanceTableRepairJob(table_name, job_route.job_id);
+            }
+            if (routes.Routes.matchTableRepairJobCancel(uri_parts.path)) |job_route| {
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicCancelTableRepairJob(table_name, job_route.job_id);
+            }
             if (routes.Routes.matchTableArtifactReprocessJobs(uri_parts.path)) |job_route| {
                 const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
                 defer self.alloc.free(table_name);
@@ -4302,6 +4353,11 @@ pub const ApiHttpServer = struct {
             }
         }
         if (req.method == .GET) {
+            if (routes.Routes.matchTableRepairJob(uri_parts.path)) |job_route| {
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicTableRepairJob(table_name, job_route.job_id);
+            }
             if (routes.Routes.matchTableArtifactReprocessJob(uri_parts.path)) |job_route| {
                 const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
                 defer self.alloc.free(table_name);
@@ -7531,7 +7587,312 @@ pub const ApiHttpServer = struct {
             .result = result,
         }, .{ .emit_null_optional_fields = false });
         defer self.alloc.free(response_body);
-        return try jsonBodyResponseWithStatus(self.alloc, 202, response_body);
+        return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
+    }
+
+    pub fn handlePublicStartTableRepairJob(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !http_common.HttpResponse {
+        if (self.table_writes == null) return try textResponse(self.alloc, 405, "method not allowed");
+        var parsed = std.json.parseFromSlice(repair_jobs.StartRequest, self.alloc, if (body.len > 0) body else "{}", .{ .ignore_unknown_fields = true }) catch {
+            return try textResponse(self.alloc, 400, "invalid repair job request");
+        };
+        defer parsed.deinit();
+        if (std.meta.stringToEnum(db_mod.types.RepairTarget, parsed.value.target) == null) return try textResponse(self.alloc, 400, "invalid repair target");
+        if (parsed.value.limit == 0) return try textResponse(self.alloc, 400, "invalid limit");
+
+        const encoded = try self.repair_job_store.startJob(self.alloc, table_name, .{
+            .target = parsed.value.target,
+            .kind = parsed.value.kind,
+            .index = parsed.value.index,
+            .cursor = parsed.value.cursor,
+            .limit = @min(parsed.value.limit, 1000),
+            .force = parsed.value.force,
+            .advance = parsed.value.advance,
+        });
+        defer self.alloc.free(encoded);
+        if (parsed.value.advance) {
+            var parsed_state = std.json.parseFromSlice(repair_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
+                return try textResponse(self.alloc, 500, "repair job failed");
+            };
+            defer parsed_state.deinit();
+            return try self.advanceTableRepairJobState(table_name, parsed_state.value);
+        }
+        return try jsonBodyResponseWithStatus(self.alloc, 202, encoded);
+    }
+
+    pub fn handlePublicTableRepairJob(self: *ApiHttpServer, table_name: []const u8, encoded_job_id: []const u8) !http_common.HttpResponse {
+        const job_id = parseArtifactReprocessJobId(encoded_job_id) catch return try textResponse(self.alloc, 400, "invalid job id");
+        const encoded = (try self.repair_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try textResponse(self.alloc, 404, "not found");
+        defer self.alloc.free(encoded);
+        var parsed = std.json.parseFromSlice(repair_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
+            return try textResponse(self.alloc, 500, "repair job failed");
+        };
+        defer parsed.deinit();
+        if (!std.mem.eql(u8, parsed.value.table_name, table_name)) return try textResponse(self.alloc, 404, "not found");
+        return try jsonBodyResponseWithStatus(self.alloc, 200, encoded);
+    }
+
+    pub fn handlePublicAdvanceTableRepairJob(self: *ApiHttpServer, table_name: []const u8, encoded_job_id: []const u8) !http_common.HttpResponse {
+        const job_id = parseArtifactReprocessJobId(encoded_job_id) catch return try textResponse(self.alloc, 400, "invalid job id");
+        const encoded = (try self.repair_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try textResponse(self.alloc, 404, "not found");
+        defer self.alloc.free(encoded);
+        var parsed = std.json.parseFromSlice(repair_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
+            return try textResponse(self.alloc, 500, "repair job failed");
+        };
+        defer parsed.deinit();
+        if (!std.mem.eql(u8, parsed.value.table_name, table_name)) return try textResponse(self.alloc, 404, "not found");
+        return try self.advanceTableRepairJobState(table_name, parsed.value);
+    }
+
+    pub fn handlePublicCancelTableRepairJob(self: *ApiHttpServer, table_name: []const u8, encoded_job_id: []const u8) !http_common.HttpResponse {
+        const job_id = parseArtifactReprocessJobId(encoded_job_id) catch return try textResponse(self.alloc, 400, "invalid job id");
+        const encoded = (try self.repair_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try textResponse(self.alloc, 404, "not found");
+        defer self.alloc.free(encoded);
+        var parsed = std.json.parseFromSlice(repair_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
+            return try textResponse(self.alloc, 500, "repair job failed");
+        };
+        defer parsed.deinit();
+        if (!std.mem.eql(u8, parsed.value.table_name, table_name)) return try textResponse(self.alloc, 404, "not found");
+        const cancelled = try self.repair_job_store.requestCancel(self.alloc, parsed.value);
+        defer self.alloc.free(cancelled);
+        var parsed_cancelled = std.json.parseFromSlice(repair_jobs.JobState, self.alloc, cancelled, .{ .ignore_unknown_fields = true }) catch {
+            return try textResponse(self.alloc, 500, "invalid repair job state");
+        };
+        defer parsed_cancelled.deinit();
+        return try jsonBodyResponseWithStatus(self.alloc, if (repair_jobs.isTerminalPhase(parsed_cancelled.value.phase)) 200 else 202, cancelled);
+    }
+
+    fn advanceTableRepairJobState(self: *ApiHttpServer, table_name: []const u8, state: repair_jobs.JobState) !http_common.HttpResponse {
+        if (repair_jobs.isTerminalPhase(state.phase)) {
+            const encoded = try repair_jobs.encodeState(self.alloc, state);
+            defer self.alloc.free(encoded);
+            return try jsonBodyResponseWithStatus(self.alloc, 200, encoded);
+        }
+
+        const begin = try self.repair_job_store.beginAdvance(self.alloc, state);
+        defer self.alloc.free(begin.encoded);
+        var parsed_running = std.json.parseFromSlice(repair_jobs.JobState, self.alloc, begin.encoded, .{ .ignore_unknown_fields = true }) catch {
+            return try textResponse(self.alloc, 500, "invalid repair job state");
+        };
+        defer parsed_running.deinit();
+        const running_state = parsed_running.value;
+        if (!begin.started) {
+            return try jsonBodyResponseWithStatus(self.alloc, if (repair_jobs.isTerminalPhase(running_state.phase)) 200 else 202, begin.encoded);
+        }
+
+        const updated = if (try self.submitTableRepairJobPass(table_name, begin.encoded, running_state.job_id)) |submitted|
+            submitted
+        else
+            try self.runTableRepairJobPass(table_name, running_state);
+        defer self.alloc.free(updated);
+        var parsed_updated = std.json.parseFromSlice(repair_jobs.JobState, self.alloc, updated, .{ .ignore_unknown_fields = true }) catch {
+            return try textResponse(self.alloc, 500, "invalid repair job state");
+        };
+        defer parsed_updated.deinit();
+        return try jsonBodyResponseWithStatus(self.alloc, if (repair_jobs.isTerminalPhase(parsed_updated.value.phase)) 200 else 202, updated);
+    }
+
+    const TableRepairJobPassWork = struct {
+        server: *ApiHttpServer,
+        table_name: []u8,
+        running_encoded: []u8,
+
+        fn run(ptr: *anyopaque) !void {
+            const work: *TableRepairJobPassWork = @ptrCast(@alignCast(ptr));
+            var parsed = try std.json.parseFromSlice(repair_jobs.JobState, work.server.alloc, work.running_encoded, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+            const heartbeat = work.server.submitTableRepairJobHeartbeat(parsed.value.job_id, parsed.value.attempt_id) catch null;
+            defer if (heartbeat) |hb| hb.stop.store(true, .release);
+            const updated = try work.server.runTableRepairJobPass(work.table_name, parsed.value);
+            work.server.alloc.free(updated);
+        }
+
+        fn deinit(ptr: *anyopaque) void {
+            const work: *TableRepairJobPassWork = @ptrCast(@alignCast(ptr));
+            work.server.alloc.free(work.running_encoded);
+            work.server.alloc.free(work.table_name);
+            work.server.alloc.destroy(work);
+        }
+    };
+
+    const TableRepairJobHeartbeatWork = struct {
+        server: *ApiHttpServer,
+        job_id: u64,
+        attempt_id: u64,
+        stop: std.atomic.Value(bool) = .init(false),
+
+        const interval_ns: u64 = 30 * std.time.ns_per_s;
+        const poll_ns: u64 = 100 * std.time.ns_per_ms;
+
+        fn run(ptr: *anyopaque) !void {
+            const self: *TableRepairJobHeartbeatWork = @ptrCast(@alignCast(ptr));
+            const runtime = self.server.cfg.backend_runtime orelse return;
+            const io_impl = runtime.apiIoImpl() orelse runtime.io_impl orelse return;
+            var elapsed_ns: u64 = 0;
+            while (!self.stop.load(.acquire)) {
+                io_impl.io().sleep(std.Io.Duration.fromNanoseconds(@intCast(poll_ns)), .awake) catch {};
+                if (self.stop.load(.acquire)) break;
+                elapsed_ns +|= poll_ns;
+                if (elapsed_ns < interval_ns) continue;
+                elapsed_ns = 0;
+                self.server.repair_job_store.heartbeatRunning(self.server.alloc, self.job_id, self.attempt_id) catch |err| {
+                    std.log.warn("failed to heartbeat table repair job job_id={d} attempt_id={d} err={s}", .{
+                        self.job_id,
+                        self.attempt_id,
+                        @errorName(err),
+                    });
+                };
+            }
+        }
+
+        fn deinit(ptr: *anyopaque) void {
+            const self: *TableRepairJobHeartbeatWork = @ptrCast(@alignCast(ptr));
+            self.server.alloc.destroy(self);
+        }
+    };
+
+    const TableRepairCancelProbe = struct {
+        server: *ApiHttpServer,
+        job_id: u64,
+        attempt_id: u64,
+        cached_requested: std.atomic.Value(bool) = .init(false),
+        last_check_ns: std.atomic.Value(u64) = .init(0),
+
+        const check_interval_ns: u64 = 100 * std.time.ns_per_ms;
+
+        fn check(ptr: *anyopaque) bool {
+            const self: *TableRepairCancelProbe = @ptrCast(@alignCast(ptr));
+            if (self.cached_requested.load(.acquire)) return true;
+            const now_ns = platform_time.monotonicNs();
+            const last_ns = self.last_check_ns.load(.acquire);
+            if (last_ns != 0 and now_ns -| last_ns < check_interval_ns) return false;
+            self.last_check_ns.store(now_ns, .release);
+
+            const encoded = self.server.repair_job_store.loadJobAlloc(self.server.alloc, self.job_id) catch return false;
+            defer if (encoded) |buf| self.server.alloc.free(buf);
+            const body = encoded orelse {
+                self.cached_requested.store(true, .release);
+                return true;
+            };
+            var parsed = std.json.parseFromSlice(repair_jobs.JobState, self.server.alloc, body, .{ .ignore_unknown_fields = true }) catch return false;
+            defer parsed.deinit();
+            const state = parsed.value;
+            const requested = state.cancel_requested or
+                repair_jobs.isTerminalPhase(state.phase) or
+                state.attempt_id != self.attempt_id;
+            if (requested) self.cached_requested.store(true, .release);
+            return requested;
+        }
+    };
+
+    fn submitTableRepairJobHeartbeat(self: *ApiHttpServer, job_id: u64, attempt_id: u64) !?*TableRepairJobHeartbeatWork {
+        const runtime = self.cfg.backend_runtime orelse return null;
+        if (runtime.threaded_jobs == null) return null;
+        if (runtime.apiIoImpl() == null and runtime.io_impl == null) return null;
+        if (self.repair_job_owner_id == 0) return null;
+
+        const heartbeat = try self.alloc.create(TableRepairJobHeartbeatWork);
+        heartbeat.* = .{
+            .server = self,
+            .job_id = job_id,
+            .attempt_id = attempt_id,
+        };
+        runtime.durable_jobs.submit(.{
+            .owner_id = self.repair_job_owner_id,
+            .class = .maintenance,
+            .ptr = heartbeat,
+            .run = TableRepairJobHeartbeatWork.run,
+            .deinit = TableRepairJobHeartbeatWork.deinit,
+        }) catch |err| {
+            self.alloc.destroy(heartbeat);
+            return err;
+        };
+        return heartbeat;
+    }
+
+    fn submitTableRepairJobPass(self: *ApiHttpServer, table_name: []const u8, running_encoded: []const u8, job_id: u64) !?[]u8 {
+        const runtime = self.cfg.backend_runtime orelse return null;
+        if (runtime.threaded_jobs == null) return null;
+        if (self.repair_job_owner_id == 0) return null;
+
+        var work_consumed = false;
+        const owned_table_name = try self.alloc.dupe(u8, table_name);
+        errdefer if (!work_consumed) self.alloc.free(owned_table_name);
+        const owned_running_encoded = try self.alloc.dupe(u8, running_encoded);
+        errdefer if (!work_consumed) self.alloc.free(owned_running_encoded);
+        const work = try self.alloc.create(TableRepairJobPassWork);
+        errdefer if (!work_consumed) self.alloc.destroy(work);
+        work.* = .{
+            .server = self,
+            .table_name = owned_table_name,
+            .running_encoded = owned_running_encoded,
+        };
+
+        runtime.durable_jobs.submit(.{
+            .owner_id = self.repair_job_owner_id,
+            .class = .maintenance,
+            .ptr = work,
+            .run = TableRepairJobPassWork.run,
+            .deinit = TableRepairJobPassWork.deinit,
+        }) catch |err| {
+            TableRepairJobPassWork.deinit(work);
+            work_consumed = true;
+            var parsed = try std.json.parseFromSlice(repair_jobs.JobState, self.alloc, running_encoded, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+            const failed = try self.repair_job_store.markPhase(self.alloc, parsed.value, .failed, @errorName(err));
+            defer self.alloc.free(failed);
+            std.log.err("failed to submit table repair job table={s} job_id={d} err={}", .{ table_name, job_id, err });
+            return try self.repair_job_store.loadJobAlloc(self.alloc, job_id) orelse try self.alloc.dupe(u8, failed);
+        };
+        work_consumed = true;
+
+        return try self.repair_job_store.loadJobAlloc(self.alloc, job_id) orelse try self.alloc.dupe(u8, running_encoded);
+    }
+
+    fn runTableRepairJobPass(self: *ApiHttpServer, table_name: []const u8, running_state: repair_jobs.JobState) ![]u8 {
+        const source = self.table_writes orelse {
+            return try self.repair_job_store.markPhase(self.alloc, running_state, .failed, "method not allowed");
+        };
+        const target = std.meta.stringToEnum(db_mod.types.RepairTarget, running_state.target) orelse {
+            return try self.repair_job_store.markPhase(self.alloc, running_state, .failed, "invalid repair target");
+        };
+        var cancel_probe = TableRepairCancelProbe{
+            .server = self,
+            .job_id = running_state.job_id,
+            .attempt_id = running_state.attempt_id,
+        };
+        var result = (source.repairArtifactIssuesControlled(self.alloc, table_name, .{
+            .target = target,
+            .artifact_kind = running_state.kind,
+            .index_name = running_state.index,
+            .limit = running_state.limit,
+            .cursor = running_state.cursor,
+            .force = running_state.force,
+            .repair_job_id = running_state.job_id,
+            .repair_attempt_id = running_state.attempt_id,
+        }, .{
+            .cancel_check = .{
+                .ptr = &cancel_probe,
+                .is_requested = TableRepairCancelProbe.check,
+            },
+        }) catch |err| switch (err) {
+            error.Canceled => {
+                return try self.repair_job_store.markPhase(self.alloc, running_state, .cancelled, "cancel_requested");
+            },
+            error.InvalidArgument => {
+                return try self.repair_job_store.markPhase(self.alloc, running_state, .failed, @errorName(err));
+            },
+            error.NotFound => {
+                return try self.repair_job_store.markPhase(self.alloc, running_state, .failed, @errorName(err));
+            },
+            else => {
+                std.log.err("public table repair job failed table={s} job_id={d} err={}", .{ table_name, running_state.job_id, err });
+                return try self.repair_job_store.markPhase(self.alloc, running_state, .failed, @errorName(err));
+            },
+        }) orelse {
+            return try self.repair_job_store.markPhase(self.alloc, running_state, .failed, "method not allowed");
+        };
+        defer result.deinit(self.alloc);
+        return try self.repair_job_store.recordPass(self.alloc, running_state, result);
     }
 
     pub fn handlePublicStartDocumentArtifactReprocessJob(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, body: []const u8) !http_common.HttpResponse {
@@ -7603,9 +7964,13 @@ pub const ApiHttpServer = struct {
         if (artifact_reprocess_jobs.isTerminalPhase(parsed.value.phase)) {
             return try jsonBodyResponseWithStatus(self.alloc, 200, encoded);
         }
-        const cancelled = try self.artifact_reprocess_job_store.markPhase(self.alloc, parsed.value, .cancelled, null);
+        const cancelled = try self.artifact_reprocess_job_store.requestCancel(self.alloc, parsed.value);
         defer self.alloc.free(cancelled);
-        return try jsonBodyResponseWithStatus(self.alloc, 200, cancelled);
+        var parsed_cancelled = std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, cancelled, .{ .ignore_unknown_fields = true }) catch {
+            return try textResponse(self.alloc, 500, "invalid artifact reprocess job state");
+        };
+        defer parsed_cancelled.deinit();
+        return try jsonBodyResponseWithStatus(self.alloc, if (artifact_reprocess_jobs.isTerminalPhase(parsed_cancelled.value.phase)) 200 else 202, cancelled);
     }
 
     fn advanceDocumentArtifactReprocessJobState(self: *ApiHttpServer, table_name: []const u8, artifact_name: []const u8, state: artifact_reprocess_jobs.JobState) !http_common.HttpResponse {
@@ -8984,6 +9349,22 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_commo
         .POST => .admin,
         .GET, .PUT, .DELETE => return null,
     });
+    if (routes.Routes.matchTableRepairJobs(path)) |repair_job| return try tablePermission(alloc, repair_job.table_name, switch (method) {
+        .POST => .admin,
+        .GET, .PUT, .DELETE => return null,
+    });
+    if (routes.Routes.matchTableRepairJob(path)) |repair_job| return try tablePermission(alloc, repair_job.table_name, switch (method) {
+        .GET => .read,
+        .POST, .PUT, .DELETE => return null,
+    });
+    if (routes.Routes.matchTableRepairJobAdvance(path)) |repair_job| return try tablePermission(alloc, repair_job.table_name, switch (method) {
+        .POST => .admin,
+        .GET, .PUT, .DELETE => return null,
+    });
+    if (routes.Routes.matchTableRepairJobCancel(path)) |repair_job| return try tablePermission(alloc, repair_job.table_name, switch (method) {
+        .POST => .admin,
+        .GET, .PUT, .DELETE => return null,
+    });
     if (routes.Routes.matchTableArtifacts(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
         .GET => .read,
         .POST, .PUT, .DELETE => return null,
@@ -9094,6 +9475,34 @@ test "document artifact routes declare read and admin permissions" {
         try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
     }
     {
+        const required = (try requiredPermissionForRequest(std.testing.allocator, .POST, "/tables/docs/repair/jobs")).?;
+        defer required.deinit(std.testing.allocator);
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqualStrings("docs", required.resource);
+        try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
+    }
+    {
+        const required = (try requiredPermissionForRequest(std.testing.allocator, .GET, "/tables/docs/repair/jobs/42")).?;
+        defer required.deinit(std.testing.allocator);
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqualStrings("docs", required.resource);
+        try std.testing.expectEqual(usermgr.PermissionType.read, required.permission_type);
+    }
+    {
+        const required = (try requiredPermissionForRequest(std.testing.allocator, .POST, "/tables/docs/repair/jobs/42/advance")).?;
+        defer required.deinit(std.testing.allocator);
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqualStrings("docs", required.resource);
+        try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
+    }
+    {
+        const required = (try requiredPermissionForRequest(std.testing.allocator, .POST, "/tables/docs/repair/jobs/42/cancel")).?;
+        defer required.deinit(std.testing.allocator);
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqualStrings("docs", required.resource);
+        try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
+    }
+    {
         const required = (try requiredPermissionForRequest(std.testing.allocator, .POST, "/tables/docs/artifacts/document_units_v1/reprocess")).?;
         defer required.deinit(std.testing.allocator);
         try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
@@ -9146,6 +9555,51 @@ test "required permissions decode table path resources" {
         try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
     }
     try std.testing.expectError(error.InvalidArgument, requiredPermissionForRequest(std.testing.allocator, .GET, "/tables/docs%ZZ/artifacts"));
+}
+
+test "api http server marks table repair job failed when background submit is closing" {
+    if (@import("builtin").os.tag == .freestanding) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer runtime.deinit();
+
+    const DummyStatus = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+
+    var server = ApiHttpServer.init(alloc, .{
+        .backend_runtime = runtime.ptr(),
+    }, .{
+        .ptr = undefined,
+        .vtable = &.{ .status = DummyStatus.status },
+    }, null, null);
+    defer server.deinit();
+
+    const started = try server.repair_job_store.startJob(alloc, "docs", .{
+        .target = "artifact",
+        .limit = 1,
+    });
+    defer alloc.free(started);
+    var parsed_started = try std.json.parseFromSlice(repair_jobs.JobState, alloc, started, .{ .ignore_unknown_fields = true });
+    defer parsed_started.deinit();
+
+    const begin = try server.repair_job_store.beginAdvance(alloc, parsed_started.value);
+    defer alloc.free(begin.encoded);
+    try std.testing.expect(begin.started);
+    var parsed_running = try std.json.parseFromSlice(repair_jobs.JobState, alloc, begin.encoded, .{ .ignore_unknown_fields = true });
+    defer parsed_running.deinit();
+
+    runtime.ptr().durable_jobs.closeOwner(server.repair_job_owner_id);
+    const updated = (try server.submitTableRepairJobPass("docs", begin.encoded, parsed_running.value.job_id)).?;
+    defer alloc.free(updated);
+
+    var parsed_updated = try std.json.parseFromSlice(repair_jobs.JobState, alloc, updated, .{ .ignore_unknown_fields = true });
+    defer parsed_updated.deinit();
+    try std.testing.expectEqualStrings("failed", parsed_updated.value.phase);
+    try std.testing.expectEqualStrings("BackgroundOwnerClosing", parsed_updated.value.last_error.?);
 }
 
 fn base64UrlDecodeAlloc(alloc: std.mem.Allocator, value: []const u8) ![]u8 {

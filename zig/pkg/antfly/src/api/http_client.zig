@@ -74,6 +74,10 @@ pub const ScanResponse = struct {
     }
 };
 
+pub const RepairCancelStateResponse = struct {
+    cancel_requested: bool = false,
+};
+
 pub const QueryResponse = struct {
     content_type: ?[]u8 = null,
     body: []u8,
@@ -1646,6 +1650,45 @@ pub const ApiHttpClient = struct {
             200, 202 => return .{ .body = try self.alloc.dupe(u8, resp.body) },
             404 => return error.NotFound,
             409 => return remoteGroupConflictError(resp.body),
+            503 => if (std.mem.eql(u8, resp.body, "repair cancel unavailable")) return error.RepairCancelUnavailable else return error.UnexpectedHttpStatus,
+            else => return error.UnexpectedHttpStatus,
+        }
+    }
+
+    pub fn fetchTableRepairCancelRequested(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        table_name: []const u8,
+        job_id: u64,
+        attempt_id: u64,
+    ) !bool {
+        const escaped_table_name = try percentEncodePathComponent(self.alloc, table_name);
+        defer self.alloc.free(escaped_table_name);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}{d}{s}{d}{s}", .{
+            routes.Routes.internal_tables_prefix,
+            escaped_table_name,
+            routes.Routes.repair_jobs_marker,
+            job_id,
+            routes.Routes.repair_attempts_marker,
+            attempt_id,
+            routes.Routes.repair_cancel_state_suffix,
+        });
+        defer self.alloc.free(path);
+        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        defer self.alloc.free(uri);
+
+        var resp = try self.executor.execute(self.alloc, .{
+            .method = .GET,
+            .uri = uri,
+        });
+        defer resp.deinit(self.alloc);
+        switch (resp.status) {
+            200 => {
+                var parsed = try parseJsonBody(RepairCancelStateResponse, self.alloc, resp.body);
+                defer parsed.deinit();
+                return parsed.value.cancel_requested;
+            },
+            404 => return true,
             else => return error.UnexpectedHttpStatus,
         }
     }
@@ -2408,6 +2451,7 @@ fn remoteGroupConflictError(body: []const u8) anyerror {
     if (transactions_api.isTopologyChangedConflictMessage(body)) return error.TopologyChanged;
     if (std.mem.eql(u8, body, "TopologyChanged")) return error.TopologyChanged;
     if (isDocIdentityNamespaceMismatchConflictMessage(body)) return error.DocIdentityNamespaceMismatch;
+    if (std.mem.eql(u8, body, "repair cancelled")) return error.Canceled;
     return error.UnexpectedHttpStatus;
 }
 
@@ -2423,6 +2467,67 @@ fn remoteGroupTxnResolveConflictError(body: []const u8) anyerror {
     if (isDocIdentityNamespaceMismatchConflictMessage(body)) return error.DocIdentityNamespaceMismatch;
     if (std.mem.eql(u8, body, "decision conflict")) return error.DecisionConflict;
     return error.UnexpectedHttpStatus;
+}
+
+pub fn expectGroupArtifactRepairRunMapsCancelUnavailableForTest() !void {
+    const RepairExecutor = struct {
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .execute = execute,
+                },
+            };
+        }
+
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, "/internal/v1/groups/7/tables/docs/repair/run"));
+            try std.testing.expectEqualStrings("application/json", req.content_type.?);
+            try std.testing.expectEqualStrings("{\"target\":\"index\"}", req.body);
+            return .{
+                .status = 503,
+                .body = try alloc.dupe(u8, "repair cancel unavailable"),
+            };
+        }
+    };
+
+    var executor = RepairExecutor{};
+    var client = ApiHttpClient.init(std.testing.allocator, executor.executor());
+    try std.testing.expectError(
+        error.RepairCancelUnavailable,
+        client.fetchGroupArtifactRepairRun("http://127.0.0.1:1", 7, "docs", "{\"target\":\"index\"}"),
+    );
+}
+
+test "api http client maps remote repair cancel unavailable" {
+    try expectGroupArtifactRepairRunMapsCancelUnavailableForTest();
+}
+
+test "api http client encodes table name for repair cancel callback" {
+    const CancelExecutor = struct {
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .execute = execute,
+                },
+            };
+        }
+
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            try std.testing.expectEqual(http_common.Method.GET, req.method);
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, "/internal/v1/tables/docs%20table%2Ftenant/repair/jobs/42/attempts/3/cancel-state"));
+            return .{
+                .status = 200,
+                .body = try alloc.dupe(u8, "{\"cancel_requested\":false}"),
+            };
+        }
+    };
+
+    var executor = CancelExecutor{};
+    var client = ApiHttpClient.init(std.testing.allocator, executor.executor());
+    try std.testing.expect(!try client.fetchTableRepairCancelRequested("http://127.0.0.1:1", "docs table/tenant", 42, 3));
 }
 
 test "api http client preserves group doc identity conflicts" {
@@ -2699,7 +2804,7 @@ test "api http client round-trips public table management routes" {
                 .description = "docs table",
                 .schema_json = "{\"kind\":\"demo\"}",
                 .indexes_json = self.indexes_json,
-                .replication_sources_json = "[\"seed\"]",
+                .replication_sources_json = "[]",
                 .placement_role = "data",
             };
             self.owns_created_table = false;
@@ -2795,8 +2900,11 @@ test "api http client round-trips public table management routes" {
     defer indexes.deinit(std.heap.page_allocator);
     var parsed_indexes = try parseJsonBody([]metadata_openapi.IndexStatus, std.testing.allocator, indexes.body);
     defer parsed_indexes.deinit();
-    try std.testing.expectEqual(@as(usize, 1), parsed_indexes.value.len);
+    try std.testing.expectEqual(@as(usize, 2), parsed_indexes.value.len);
+    try std.testing.expectEqualStrings("full_text_index_v0", parsed_indexes.value[0].config.name);
     try std.testing.expectEqual(.full_text, parsed_indexes.value[0].config.type);
+    try std.testing.expectEqualStrings("full_text_index_v1", parsed_indexes.value[1].config.name);
+    try std.testing.expectEqual(.full_text, parsed_indexes.value[1].config.type);
 
     var index = try client.fetchTableIndex(base_uri, "docs", "full_text_index_v0");
     defer index.deinit(std.heap.page_allocator);

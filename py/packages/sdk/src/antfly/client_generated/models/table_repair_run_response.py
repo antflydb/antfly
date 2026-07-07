@@ -9,27 +9,27 @@ from attrs import field as _attrs_field
 from ..models.repair_target import RepairTarget
 
 if TYPE_CHECKING:
-    from ..models.artifact_repair_run_result import ArtifactRepairRunResult
+    from ..models.table_repair_run_result import TableRepairRunResult
 
 
-T = TypeVar("T", bound="ArtifactRepairRunResponse")
+T = TypeVar("T", bound="TableRepairRunResponse")
 
 
 @_attrs_define
-class ArtifactRepairRunResponse:
+class TableRepairRunResponse:
     """Response for a bounded table repair pass.
 
     Attributes:
         table (str): Table whose repair queue was processed.
         target (RepairTarget): Repair subsystem to inspect or run.
         limit (int): Effective repair limit.
-        result (ArtifactRepairRunResult): Result of one bounded artifact repair pass.
+        result (TableRepairRunResult): Result of one bounded table repair pass.
     """
 
     table: str
     target: RepairTarget
     limit: int
-    result: ArtifactRepairRunResult
+    result: TableRepairRunResult
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -56,7 +56,7 @@ class ArtifactRepairRunResponse:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.artifact_repair_run_result import ArtifactRepairRunResult
+        from ..models.table_repair_run_result import TableRepairRunResult
 
         d = dict(src_dict)
         table = d.pop("table")
@@ -65,17 +65,17 @@ class ArtifactRepairRunResponse:
 
         limit = d.pop("limit")
 
-        result = ArtifactRepairRunResult.from_dict(d.pop("result"))
+        result = TableRepairRunResult.from_dict(d.pop("result"))
 
-        artifact_repair_run_response = cls(
+        table_repair_run_response = cls(
             table=table,
             target=target,
             limit=limit,
             result=result,
         )
 
-        artifact_repair_run_response.additional_properties = d
-        return artifact_repair_run_response
+        table_repair_run_response.additional_properties = d
+        return table_repair_run_response
 
     @property
     def additional_keys(self) -> list[str]:

@@ -13,6 +13,8 @@ if TYPE_CHECKING:
     from ..models.graph_index_stats_algebraic_graph import GraphIndexStatsAlgebraicGraph
     from ..models.graph_index_stats_async_indexing import GraphIndexStatsAsyncIndexing
     from ..models.graph_index_stats_edge_types import GraphIndexStatsEdgeTypes
+    from ..models.graph_index_stats_promotion import GraphIndexStatsPromotion
+    from ..models.graph_index_stats_resolution import GraphIndexStatsResolution
     from ..models.graph_index_stats_resolver_replay import GraphIndexStatsResolverReplay
     from ..models.graph_index_stats_source_artifact import GraphIndexStatsSourceArtifact
 
@@ -32,6 +34,7 @@ class GraphIndexStats:
         rebuilding (bool | Unset): Whether the index is currently rebuilding
         backfill_active (bool | Unset): Whether the index is actively rebuilding, materializing, or catching up.
         backfill_progress (float | Unset): Rebuild progress as a ratio from 0.0 to 1.0
+        backfill_items_processed (int | Unset): Number of edges indexed during current rebuild
         backfill_state (str | Unset): Operational readiness state such as ready, running, retrying, or failed.
         doc_count (int | Unset): Number of documents covered by the graph index.
         edge_count (int | Unset): Number of graph edges currently indexed.
@@ -61,6 +64,19 @@ class GraphIndexStats:
             checkpoint that still need replay.
         repair_scan_issue_count (int | Unset): Repair issues found by explicit repair-scan accounting for this
             projection.
+        term_count (int | Unset):
+        repair_degraded (bool | Unset):
+        repair_issue_count (int | Unset):
+        repair_summary_ready (bool | Unset):
+        repair_issue_count_estimated (bool | Unset):
+        expected_groups (int | Unset):
+        reported_groups (int | Unset):
+        fresh_groups (int | Unset):
+        stale_groups (int | Unset):
+        missing_groups (int | Unset):
+        unknown_remote_groups (int | Unset):
+        resolution (GraphIndexStatsResolution | Unset): Artifact resolution replay diagnostics.
+        promotion (GraphIndexStatsPromotion | Unset): Artifact promotion replay diagnostics.
         algebraic_graph (GraphIndexStatsAlgebraicGraph | Unset): Algebraic graph execution health for bounded semiring
             traversal.
     """
@@ -72,6 +88,7 @@ class GraphIndexStats:
     rebuilding: bool | Unset = UNSET
     backfill_active: bool | Unset = UNSET
     backfill_progress: float | Unset = UNSET
+    backfill_items_processed: int | Unset = UNSET
     backfill_state: str | Unset = UNSET
     doc_count: int | Unset = UNSET
     edge_count: int | Unset = UNSET
@@ -96,6 +113,19 @@ class GraphIndexStats:
     projection_checkpoint_config_hash: int | Unset = UNSET
     checkpoint_replay_tail_sequence_count: int | Unset = UNSET
     repair_scan_issue_count: int | Unset = UNSET
+    term_count: int | Unset = UNSET
+    repair_degraded: bool | Unset = UNSET
+    repair_issue_count: int | Unset = UNSET
+    repair_summary_ready: bool | Unset = UNSET
+    repair_issue_count_estimated: bool | Unset = UNSET
+    expected_groups: int | Unset = UNSET
+    reported_groups: int | Unset = UNSET
+    fresh_groups: int | Unset = UNSET
+    stale_groups: int | Unset = UNSET
+    missing_groups: int | Unset = UNSET
+    unknown_remote_groups: int | Unset = UNSET
+    resolution: GraphIndexStatsResolution | Unset = UNSET
+    promotion: GraphIndexStatsPromotion | Unset = UNSET
     algebraic_graph: GraphIndexStatsAlgebraicGraph | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -115,6 +145,8 @@ class GraphIndexStats:
         backfill_active = self.backfill_active
 
         backfill_progress = self.backfill_progress
+
+        backfill_items_processed = self.backfill_items_processed
 
         backfill_state = self.backfill_state
 
@@ -170,6 +202,36 @@ class GraphIndexStats:
 
         repair_scan_issue_count = self.repair_scan_issue_count
 
+        term_count = self.term_count
+
+        repair_degraded = self.repair_degraded
+
+        repair_issue_count = self.repair_issue_count
+
+        repair_summary_ready = self.repair_summary_ready
+
+        repair_issue_count_estimated = self.repair_issue_count_estimated
+
+        expected_groups = self.expected_groups
+
+        reported_groups = self.reported_groups
+
+        fresh_groups = self.fresh_groups
+
+        stale_groups = self.stale_groups
+
+        missing_groups = self.missing_groups
+
+        unknown_remote_groups = self.unknown_remote_groups
+
+        resolution: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.resolution, Unset):
+            resolution = self.resolution.to_dict()
+
+        promotion: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.promotion, Unset):
+            promotion = self.promotion.to_dict()
+
         algebraic_graph: dict[str, Any] | Unset = UNSET
         if not isinstance(self.algebraic_graph, Unset):
             algebraic_graph = self.algebraic_graph.to_dict()
@@ -193,6 +255,8 @@ class GraphIndexStats:
             field_dict["backfill_active"] = backfill_active
         if backfill_progress is not UNSET:
             field_dict["backfill_progress"] = backfill_progress
+        if backfill_items_processed is not UNSET:
+            field_dict["backfill_items_processed"] = backfill_items_processed
         if backfill_state is not UNSET:
             field_dict["backfill_state"] = backfill_state
         if doc_count is not UNSET:
@@ -241,6 +305,32 @@ class GraphIndexStats:
             field_dict["checkpoint_replay_tail_sequence_count"] = checkpoint_replay_tail_sequence_count
         if repair_scan_issue_count is not UNSET:
             field_dict["repair_scan_issue_count"] = repair_scan_issue_count
+        if term_count is not UNSET:
+            field_dict["term_count"] = term_count
+        if repair_degraded is not UNSET:
+            field_dict["repair_degraded"] = repair_degraded
+        if repair_issue_count is not UNSET:
+            field_dict["repair_issue_count"] = repair_issue_count
+        if repair_summary_ready is not UNSET:
+            field_dict["repair_summary_ready"] = repair_summary_ready
+        if repair_issue_count_estimated is not UNSET:
+            field_dict["repair_issue_count_estimated"] = repair_issue_count_estimated
+        if expected_groups is not UNSET:
+            field_dict["expected_groups"] = expected_groups
+        if reported_groups is not UNSET:
+            field_dict["reported_groups"] = reported_groups
+        if fresh_groups is not UNSET:
+            field_dict["fresh_groups"] = fresh_groups
+        if stale_groups is not UNSET:
+            field_dict["stale_groups"] = stale_groups
+        if missing_groups is not UNSET:
+            field_dict["missing_groups"] = missing_groups
+        if unknown_remote_groups is not UNSET:
+            field_dict["unknown_remote_groups"] = unknown_remote_groups
+        if resolution is not UNSET:
+            field_dict["resolution"] = resolution
+        if promotion is not UNSET:
+            field_dict["promotion"] = promotion
         if algebraic_graph is not UNSET:
             field_dict["algebraic_graph"] = algebraic_graph
 
@@ -251,6 +341,8 @@ class GraphIndexStats:
         from ..models.graph_index_stats_algebraic_graph import GraphIndexStatsAlgebraicGraph
         from ..models.graph_index_stats_async_indexing import GraphIndexStatsAsyncIndexing
         from ..models.graph_index_stats_edge_types import GraphIndexStatsEdgeTypes
+        from ..models.graph_index_stats_promotion import GraphIndexStatsPromotion
+        from ..models.graph_index_stats_resolution import GraphIndexStatsResolution
         from ..models.graph_index_stats_resolver_replay import GraphIndexStatsResolverReplay
         from ..models.graph_index_stats_source_artifact import GraphIndexStatsSourceArtifact
 
@@ -273,6 +365,8 @@ class GraphIndexStats:
         backfill_active = d.pop("backfill_active", UNSET)
 
         backfill_progress = d.pop("backfill_progress", UNSET)
+
+        backfill_items_processed = d.pop("backfill_items_processed", UNSET)
 
         backfill_state = d.pop("backfill_state", UNSET)
 
@@ -337,6 +431,42 @@ class GraphIndexStats:
 
         repair_scan_issue_count = d.pop("repair_scan_issue_count", UNSET)
 
+        term_count = d.pop("term_count", UNSET)
+
+        repair_degraded = d.pop("repair_degraded", UNSET)
+
+        repair_issue_count = d.pop("repair_issue_count", UNSET)
+
+        repair_summary_ready = d.pop("repair_summary_ready", UNSET)
+
+        repair_issue_count_estimated = d.pop("repair_issue_count_estimated", UNSET)
+
+        expected_groups = d.pop("expected_groups", UNSET)
+
+        reported_groups = d.pop("reported_groups", UNSET)
+
+        fresh_groups = d.pop("fresh_groups", UNSET)
+
+        stale_groups = d.pop("stale_groups", UNSET)
+
+        missing_groups = d.pop("missing_groups", UNSET)
+
+        unknown_remote_groups = d.pop("unknown_remote_groups", UNSET)
+
+        _resolution = d.pop("resolution", UNSET)
+        resolution: GraphIndexStatsResolution | Unset
+        if isinstance(_resolution, Unset):
+            resolution = UNSET
+        else:
+            resolution = GraphIndexStatsResolution.from_dict(_resolution)
+
+        _promotion = d.pop("promotion", UNSET)
+        promotion: GraphIndexStatsPromotion | Unset
+        if isinstance(_promotion, Unset):
+            promotion = UNSET
+        else:
+            promotion = GraphIndexStatsPromotion.from_dict(_promotion)
+
         _algebraic_graph = d.pop("algebraic_graph", UNSET)
         algebraic_graph: GraphIndexStatsAlgebraicGraph | Unset
         if isinstance(_algebraic_graph, Unset):
@@ -352,6 +482,7 @@ class GraphIndexStats:
             rebuilding=rebuilding,
             backfill_active=backfill_active,
             backfill_progress=backfill_progress,
+            backfill_items_processed=backfill_items_processed,
             backfill_state=backfill_state,
             doc_count=doc_count,
             edge_count=edge_count,
@@ -376,6 +507,19 @@ class GraphIndexStats:
             projection_checkpoint_config_hash=projection_checkpoint_config_hash,
             checkpoint_replay_tail_sequence_count=checkpoint_replay_tail_sequence_count,
             repair_scan_issue_count=repair_scan_issue_count,
+            term_count=term_count,
+            repair_degraded=repair_degraded,
+            repair_issue_count=repair_issue_count,
+            repair_summary_ready=repair_summary_ready,
+            repair_issue_count_estimated=repair_issue_count_estimated,
+            expected_groups=expected_groups,
+            reported_groups=reported_groups,
+            fresh_groups=fresh_groups,
+            stale_groups=stale_groups,
+            missing_groups=missing_groups,
+            unknown_remote_groups=unknown_remote_groups,
+            resolution=resolution,
+            promotion=promotion,
             algebraic_graph=algebraic_graph,
         )
 
