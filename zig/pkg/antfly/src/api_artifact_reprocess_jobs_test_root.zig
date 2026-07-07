@@ -17,6 +17,7 @@ const std = @import("std");
 const artifact_reprocess_jobs = @import("api/artifact_reprocess_jobs.zig");
 const http_client = @import("api/http_client.zig");
 const http_internal_group_write_routes = @import("api/http_internal_group_write_routes.zig");
+const http_routes = @import("api/http_routes.zig");
 const repair_jobs = @import("api/repair_jobs.zig");
 const db_mod = @import("storage/db/mod.zig");
 
@@ -24,6 +25,7 @@ test {
     std.testing.refAllDecls(artifact_reprocess_jobs);
     std.testing.refAllDecls(http_client);
     std.testing.refAllDecls(http_internal_group_write_routes);
+    std.testing.refAllDecls(http_routes);
     std.testing.refAllDecls(repair_jobs);
 }
 
