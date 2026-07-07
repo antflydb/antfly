@@ -6275,23 +6275,38 @@ components:
           description: Cursor mode for this request.
         exactness:
           type: string
-          description: Exactness class for the selected plan.
+          description: |
+            Exactness class for the selected plan. Known values include
+            `none`, `exact`, `bounded_exact`, `approximate`, and
+            `unsupported`.
         source:
           type: string
-          description: Sort execution primitive used by the selected plan.
+          description: |
+            Sort execution primitive used by the selected plan. Known values
+            include `none`, `candidate_collector`, `primary_key_scan`,
+            `sorted_segment_scan`, `score_top_k`, `doc_values_collector`,
+            `distributed_merge`, `stored_json_debug`, and `unsupported`.
         candidate_source:
           type: string
           enum: [none, existing_hits, match_all, primary_key, native_filter, sorted_segment_membership, text_postings, distributed_shards, vector_top_k, composed]
           description: Exact candidate source consumed by the selected sort primitive.
         cursor_support:
           type: string
-          description: Cursor support level for the selected plan.
+          description: |
+            Cursor support level for the selected plan. Known values include
+            `none`, `comparator`, `segment_seek`, `distributed_seek`, and
+            `unsupported`.
         source_load:
           type: string
-          description: Stored source load strategy.
+          description: |
+            Stored source load strategy. Known values include `none`,
+            `source_free`, `projected_source_after_page`,
+            `stored_source_required`, and `unsupported`.
         distributed_behavior:
           type: string
-          description: Distributed sort behavior.
+          description: |
+            Distributed sort behavior. Known values include `none`,
+            `shard_local_only`, `coordinator_merge`, and `unsupported`.
         selection_reason:
           type: string
           description: |

@@ -2444,17 +2444,17 @@ pub const SortProfile = struct {
     order_by: ?[]const SortField = null,
     /// Cursor mode for this request.
     cursor: ?[]const u8 = null,
-    /// Exactness class for the selected plan.
+    /// Exactness class for the selected plan. Known values include `none`, `exact`, `bounded_exact`, `approximate`, and `unsupported`.
     exactness: ?[]const u8 = null,
-    /// Sort execution primitive used by the selected plan.
+    /// Sort execution primitive used by the selected plan. Known values include `none`, `candidate_collector`, `primary_key_scan`, `sorted_segment_scan`, `score_top_k`, `doc_values_collector`, `distributed_merge`, `stored_json_debug`, and `unsupported`.
     source: ?[]const u8 = null,
     /// Exact candidate source consumed by the selected sort primitive.
     candidate_source: ?[]const u8 = null,
-    /// Cursor support level for the selected plan.
+    /// Cursor support level for the selected plan. Known values include `none`, `comparator`, `segment_seek`, `distributed_seek`, and `unsupported`.
     cursor_support: ?[]const u8 = null,
-    /// Stored source load strategy.
+    /// Stored source load strategy. Known values include `none`, `source_free`, `projected_source_after_page`, `stored_source_required`, and `unsupported`.
     source_load: ?[]const u8 = null,
-    /// Distributed sort behavior.
+    /// Distributed sort behavior. Known values include `none`, `shard_local_only`, `coordinator_merge`, and `unsupported`.
     distributed_behavior: ?[]const u8 = null,
     /// Stable reason the planner selected this sort plan. Known values include `none`, `unsupported_exact_sort`, `distributed_k_way_merge`, `stored_json_debug`, `id_candidate_order`, `id_primary_key_seek`, `score_top_k`, `index_sort_sorted_segment_seek`, `sorted_segment_seek`, `doc_values_collector`, `index_sort_unavailable_doc_values_collector`, `caller_selected_doc_values_collector`, and `selective_filter_doc_values_collector`.
     selection_reason: ?[]const u8 = null,

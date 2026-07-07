@@ -170,6 +170,49 @@ pub fn expectPublicOpenApiDocumentsStableExactSortDiagnostics() !void {
     };
     for (plan_names) |plan| try expectOpenApiDocumentsToken(plan);
 
+    const exactness_values = [_][]const u8{
+        "`none`",
+        "`exact`",
+        "`bounded_exact`",
+        "`approximate`",
+        "`unsupported`",
+    };
+    for (exactness_values) |value| try expectOpenApiDocumentsToken(value);
+
+    const source_values = [_][]const u8{
+        "`candidate_collector`",
+        "`primary_key_scan`",
+        "`sorted_segment_scan`",
+        "`doc_values_collector`",
+        "`distributed_merge`",
+        "`stored_json_debug`",
+        "`unsupported`",
+    };
+    for (source_values) |value| try expectOpenApiDocumentsToken(value);
+
+    const cursor_support_values = [_][]const u8{
+        "`comparator`",
+        "`segment_seek`",
+        "`distributed_seek`",
+        "`unsupported`",
+    };
+    for (cursor_support_values) |value| try expectOpenApiDocumentsToken(value);
+
+    const source_load_values = [_][]const u8{
+        "`source_free`",
+        "`projected_source_after_page`",
+        "`stored_source_required`",
+        "`unsupported`",
+    };
+    for (source_load_values) |value| try expectOpenApiDocumentsToken(value);
+
+    const distributed_behavior_values = [_][]const u8{
+        "`shard_local_only`",
+        "`coordinator_merge`",
+        "`unsupported`",
+    };
+    for (distributed_behavior_values) |value| try expectOpenApiDocumentsToken(value);
+
     const rejection_reasons = [_][]const u8{
         "`unmapped_sort_field`",
         "`non_sortable_sort_field`",
