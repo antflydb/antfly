@@ -4080,21 +4080,13 @@ fn buildQueryBuilderQueryRequest(
         },
     }
 
-    if (out.full_text_search != null) {
-        out.order_by = try queryBuilderConstraintSortFields(alloc, request.constraints, fields);
-        if (out.order_by != null) {
-            const search_after = try queryBuilderConstraintJsonValueSlice(alloc, request.constraints, "search_after");
-            const search_before = try queryBuilderConstraintJsonValueSlice(alloc, request.constraints, "search_before");
-            if (search_after.len > 0) {
-                out.search_after = search_after;
-            } else if (search_before.len > 0) {
-                out.search_before = search_before;
-            } else {
-                out.offset = queryBuilderConstraintInteger(request.constraints, "offset");
-            }
-        } else {
-            out.offset = queryBuilderConstraintInteger(request.constraints, "offset");
-        }
+    out.order_by = try queryBuilderConstraintSortFields(alloc, request.constraints, fields);
+    const search_after = try queryBuilderConstraintJsonValueSlice(alloc, request.constraints, "search_after");
+    const search_before = try queryBuilderConstraintJsonValueSlice(alloc, request.constraints, "search_before");
+    if (search_after.len > 0) out.search_after = search_after;
+    if (search_before.len > 0) out.search_before = search_before;
+    if (search_after.len == 0 and search_before.len == 0) {
+        out.offset = queryBuilderConstraintInteger(request.constraints, "offset");
     }
 
     return out;
@@ -9029,6 +9021,52 @@ test "query builder applies projection sort and pagination constraints" {
     try std.testing.expectEqual(true, query_request.order_by.?[0].desc.?);
     try std.testing.expectEqualStrings("title", query_request.order_by.?[1].field);
     try std.testing.expectEqual(false, query_request.order_by.?[1].desc.?);
+}
+
+test "query builder applies sort constraints outside full text requests" {
+    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"prefer_indexes":["body_embedding"],"order_by":["published_at desc"],"limit":4}
+    , .{});
+    defer constraints_tree.deinit();
+
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const result = try buildQueryBuilderResponse(arena_impl.allocator(), .{
+        .intent = "find raft architecture",
+        .schema_fields = &.{ "body", "published_at" },
+        .mode = "semantic",
+        .constraints = constraints_tree.value,
+    }, null);
+
+    const query_request = result.query_request.?;
+    try std.testing.expect(query_request.full_text_search == null);
+    try std.testing.expect(query_request.semantic_search != null);
+    try std.testing.expectEqual(@as(usize, 1), query_request.order_by.?.len);
+    try std.testing.expectEqualStrings("published_at", query_request.order_by.?[0].field);
+    try std.testing.expectEqual(true, query_request.order_by.?[0].desc.?);
+}
+
+test "query builder preserves cursor-only pagination for implicit id sort" {
+    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"prefer_indexes":["body_embedding"],"search_after":["doc-9"],"offset":5}
+    , .{});
+    defer constraints_tree.deinit();
+
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const result = try buildQueryBuilderResponse(arena_impl.allocator(), .{
+        .intent = "find raft architecture",
+        .schema_fields = &.{ "body", "published_at" },
+        .mode = "semantic",
+        .constraints = constraints_tree.value,
+    }, null);
+
+    const query_request = result.query_request.?;
+    try std.testing.expect(query_request.full_text_search == null);
+    try std.testing.expect(query_request.order_by == null);
+    try std.testing.expect(query_request.offset == null);
+    try std.testing.expectEqual(@as(usize, 1), query_request.search_after.?.len);
+    try std.testing.expectEqualStrings("doc-9", query_request.search_after.?[0].string);
 }
 
 test "query builder require executable rejects sort outside full text index metadata" {
