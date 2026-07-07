@@ -1356,8 +1356,13 @@ def _wait_node_drained_for_groups(
                 if not isinstance(intent, dict) or not isinstance(intent.get("record"), dict):
                     continue
                 record = intent["record"]
-                if int(record.get("group_id", 0)) in group_ids and int(record.get("local_node_id", 0)) == node_id:
-                    return None
+                if int(record.get("group_id", 0)) not in group_ids:
+                    continue
+                if int(record.get("local_node_id", 0)) != node_id:
+                    continue
+                if intent.get("serving_state") == "draining":
+                    continue
+                return None
         return snapshots[0]
 
     return wait_until(drained_and_replaced, timeout_s=timeout_s, interval_s=0.5)

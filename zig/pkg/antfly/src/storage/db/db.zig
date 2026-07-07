@@ -29471,6 +29471,11 @@ fn waitForRawDelete(alloc: Allocator, db: *DB, key: []const u8, max_attempts: us
     return error.Timeout;
 }
 
+fn initStoppedTtlRuntimeForTest(db: *DB, cfg: ttl_runtime_mod.Config) !void {
+    try std.testing.expect(db.ttl_runtime == null);
+    try db.initOptionalTtlRuntime(cfg);
+}
+
 fn expectedChunkArtifactKeyAlloc(alloc: Allocator, doc_key: []const u8, artifact_name: []const u8, chunk_id: u32) ![]u8 {
     return try internal_keys.chunkArtifactKeyAlloc(alloc, doc_key, artifact_name, chunk_id);
 }
@@ -57473,15 +57478,18 @@ test "db ttl cleanup reclaims expired documents through normal delete semantics"
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
 
+    const ttl_cfg: ttl_runtime_mod.Config = .{
+        .enabled = true,
+        .interval_ms = 10,
+        .batch_size = 8,
+        .grace_period_ns = 0,
+    };
     var db = try DB.open(alloc, std.mem.span(path), .{
-        .ttl_cleanup = .{
-            .enabled = true,
-            .interval_ms = 10,
-            .batch_size = 8,
-            .grace_period_ns = 0,
-        },
+        .start_optional_runtimes = false,
+        .ttl_cleanup = ttl_cfg,
     });
     defer db.close();
+    try initStoppedTtlRuntimeForTest(&db, ttl_cfg);
 
     try db.setSchema(.{
         .version = 1,
@@ -57500,7 +57508,7 @@ test "db ttl cleanup reclaims expired documents through normal delete semantics"
         .timestamp_ns = now_ns - 2_000_000_000,
     });
 
-    try waitForRawDelete(alloc, &db, "doc:expired", 200);
+    try db.ttl_runtime.?.runOnce();
     try db.runUntilIdle();
     try std.testing.expectEqual(@as(u64, 0), try db.getTimestamp(alloc, "doc:expired"));
     {
@@ -57536,15 +57544,18 @@ test "db stats expose ttl cleanup activity" {
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
 
+    const ttl_cfg: ttl_runtime_mod.Config = .{
+        .enabled = true,
+        .interval_ms = 10,
+        .batch_size = 8,
+        .grace_period_ns = 0,
+    };
     var db = try DB.open(alloc, std.mem.span(path), .{
-        .ttl_cleanup = .{
-            .enabled = true,
-            .interval_ms = 10,
-            .batch_size = 8,
-            .grace_period_ns = 0,
-        },
+        .start_optional_runtimes = false,
+        .ttl_cleanup = ttl_cfg,
     });
     defer db.close();
+    try initStoppedTtlRuntimeForTest(&db, ttl_cfg);
 
     try db.setSchema(.{
         .version = 1,
@@ -57558,15 +57569,9 @@ test "db stats expose ttl cleanup activity" {
         .timestamp_ns = now_ns - 2_000_000_000,
     });
 
-    try waitForRawDelete(alloc, &db, "doc:expired", 200);
-    var stats = try db.stats(alloc);
+    try db.ttl_runtime.?.runOnce();
+    const stats = try db.stats(alloc);
     defer types.freeDBStats(alloc, stats);
-    var attempts: usize = 0;
-    while ((stats.ttl_cleanup.deleted_docs == 0 or stats.ttl_cleanup.scanned_timestamps == 0) and attempts < 200) : (attempts += 1) {
-        sleepPollInterval();
-        types.freeDBStats(alloc, stats);
-        stats = try db.stats(alloc);
-    }
     try std.testing.expect(stats.ttl_cleanup.enabled);
     try std.testing.expect(stats.ttl_cleanup.runs > 0);
     try std.testing.expect(stats.ttl_cleanup.scanned_timestamps > 0);
@@ -57581,18 +57586,21 @@ test "db ttl cleanup can run under lease ownership" {
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
 
+    const ttl_cfg: ttl_runtime_mod.Config = .{
+        .enabled = true,
+        .lease_owned = true,
+        .owner_id = "ttl-owner-a",
+        .lease_ttl_ms = 250,
+        .interval_ms = 10,
+        .batch_size = 8,
+        .grace_period_ns = 0,
+    };
     var db = try DB.open(alloc, std.mem.span(path), .{
-        .ttl_cleanup = .{
-            .enabled = true,
-            .lease_owned = true,
-            .owner_id = "ttl-owner-a",
-            .lease_ttl_ms = 250,
-            .interval_ms = 10,
-            .batch_size = 8,
-            .grace_period_ns = 0,
-        },
+        .start_optional_runtimes = false,
+        .ttl_cleanup = ttl_cfg,
     });
     defer db.close();
+    try initStoppedTtlRuntimeForTest(&db, ttl_cfg);
 
     try db.setSchema(.{
         .version = 1,
@@ -57606,15 +57614,9 @@ test "db ttl cleanup can run under lease ownership" {
         .timestamp_ns = now_ns - 2_000_000_000,
     });
 
-    try waitForRawDelete(alloc, &db, "doc:expired", 200);
-    var stats = try db.stats(alloc);
+    try db.ttl_runtime.?.runOnce();
+    const stats = try db.stats(alloc);
     defer types.freeDBStats(alloc, stats);
-    var attempts: usize = 0;
-    while ((!stats.ttl_cleanup.has_lease or stats.ttl_cleanup.deleted_docs == 0) and attempts < 200) : (attempts += 1) {
-        sleepPollInterval();
-        types.freeDBStats(alloc, stats);
-        stats = try db.stats(alloc);
-    }
 
     try std.testing.expect(stats.ttl_cleanup.enabled);
     try std.testing.expect(stats.ttl_cleanup.lease_owned);
@@ -57631,19 +57633,22 @@ test "db ttl cleanup can run under lease ownership with durable lsm primary back
 
     const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
 
+    const ttl_cfg: ttl_runtime_mod.Config = .{
+        .enabled = true,
+        .lease_owned = true,
+        .owner_id = "ttl-owner-a",
+        .lease_ttl_ms = 250,
+        .interval_ms = 10,
+        .batch_size = 8,
+        .grace_period_ns = 0,
+    };
     var db = try DB.open(alloc, std.mem.span(path), .{
         .primary_backend = primary_backend,
-        .ttl_cleanup = .{
-            .enabled = true,
-            .lease_owned = true,
-            .owner_id = "ttl-owner-a",
-            .lease_ttl_ms = 250,
-            .interval_ms = 10,
-            .batch_size = 8,
-            .grace_period_ns = 0,
-        },
+        .start_optional_runtimes = false,
+        .ttl_cleanup = ttl_cfg,
     });
     defer db.close();
+    try initStoppedTtlRuntimeForTest(&db, ttl_cfg);
 
     try db.setSchema(.{
         .version = 1,
@@ -57657,15 +57662,9 @@ test "db ttl cleanup can run under lease ownership with durable lsm primary back
         .timestamp_ns = now_ns - 2_000_000_000,
     });
 
-    try waitForRawDelete(alloc, &db, "doc:expired", 200);
-    var stats = try db.stats(alloc);
+    try db.ttl_runtime.?.runOnce();
+    const stats = try db.stats(alloc);
     defer types.freeDBStats(alloc, stats);
-    var attempts: usize = 0;
-    while ((!stats.ttl_cleanup.has_lease or stats.ttl_cleanup.deleted_docs == 0) and attempts < 200) : (attempts += 1) {
-        sleepPollInterval();
-        types.freeDBStats(alloc, stats);
-        stats = try db.stats(alloc);
-    }
 
     try std.testing.expect(stats.ttl_cleanup.enabled);
     try std.testing.expect(stats.ttl_cleanup.lease_owned);
@@ -57684,16 +57683,19 @@ test "db ttl cleanup can run with manual clock" {
         .now_realtime_ns = 10 * std.time.ns_per_s,
     };
 
+    const ttl_cfg: ttl_runtime_mod.Config = .{
+        .enabled = true,
+        .interval_ms = 10,
+        .batch_size = 8,
+        .grace_period_ns = 0,
+        .clock = clock.clock(),
+    };
     var db = try DB.open(alloc, std.mem.span(path), .{
-        .ttl_cleanup = .{
-            .enabled = true,
-            .interval_ms = 10,
-            .batch_size = 8,
-            .grace_period_ns = 0,
-            .clock = clock.clock(),
-        },
+        .start_optional_runtimes = false,
+        .ttl_cleanup = ttl_cfg,
     });
     defer db.close();
+    try initStoppedTtlRuntimeForTest(&db, ttl_cfg);
 
     try db.setSchema(.{
         .version = 1,
@@ -57707,28 +57709,63 @@ test "db ttl cleanup can run with manual clock" {
         .timestamp_ns = now_ns - 2 * std.time.ns_per_s,
     });
 
-    var deleted = false;
-    var attempts: usize = 0;
-    while (attempts < 32) : (attempts += 1) {
-        const raw = try db.get(alloc, "doc:expired_manual");
-        if (raw) |bytes| alloc.free(bytes) else {
-            deleted = true;
-            break;
-        }
-        clock.advanceMs(10);
-        yieldToBackground();
-    }
-    try std.testing.expect(deleted);
+    try db.ttl_runtime.?.runOnce();
+    try std.testing.expectEqual(@as(u64, 0), try db.getTimestamp(alloc, "doc:expired_manual"));
+
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expect(stats.ttl_cleanup.runs > 0);
+    try std.testing.expect(stats.ttl_cleanup.deleted_docs > 0);
+}
+
+test "db ttl cleanup background worker starts and deletes with manual clock" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var clock = platform_clock.ManualClock{
+        .now_realtime_ns = 10 * std.time.ns_per_s,
+    };
+
+    const ttl_cfg: ttl_runtime_mod.Config = .{
+        .enabled = true,
+        .interval_ms = 1_000,
+        .batch_size = 8,
+        .grace_period_ns = 0,
+        .clock = clock.clock(),
+    };
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .ttl_cleanup = ttl_cfg,
+    });
+    defer db.close();
+    try std.testing.expect(db.ttl_runtime != null);
+
+    try db.setSchema(.{
+        .version = 1,
+        .default_type = "_default",
+        .ttl_duration_ns = std.time.ns_per_s,
+    });
+
+    const now_ns = clock.clock().nowRealtimeNs();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:expired_worker", .value = "{\"title\":\"gone\"}" }},
+        .timestamp_ns = now_ns - 2 * std.time.ns_per_s,
+    });
+
+    try waitForRawDelete(alloc, &db, "doc:expired_worker", 200);
 
     var stats = try db.stats(alloc);
     defer types.freeDBStats(alloc, stats);
-    attempts = 0;
-    while ((stats.ttl_cleanup.runs == 0 or stats.ttl_cleanup.deleted_docs == 0) and attempts < 32) : (attempts += 1) {
-        clock.advanceMs(10);
-        yieldToBackground();
+    var attempts: usize = 0;
+    while (stats.ttl_cleanup.deleted_docs == 0 and attempts < 200) : (attempts += 1) {
+        sleepPollInterval();
         types.freeDBStats(alloc, stats);
         stats = try db.stats(alloc);
     }
+
+    try std.testing.expect(stats.ttl_cleanup.enabled);
     try std.testing.expect(stats.ttl_cleanup.runs > 0);
     try std.testing.expect(stats.ttl_cleanup.deleted_docs > 0);
 }

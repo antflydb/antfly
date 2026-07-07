@@ -2402,7 +2402,10 @@ pub fn build(b: *std.Build) void {
             "repair job store records cancel requested across stale queued token",
             "repair job store does not expire future live running heartbeat",
             "table repair job store persists monotonic next id across stale durable writes",
+            "table repair job cleanup pages durable expired jobs",
             "api http client maps remote repair cancel unavailable",
+            "api http client encodes table name for repair cancel callback",
+            "public api routes compile",
             "internal group artifact repair rejects callback token without cancel executor",
             "table repair job records bounded pass and continuation",
         },
@@ -5124,6 +5127,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_db_unit_tests = b.addRunArtifact(db_unit_tests);
+    if (b.args) |args| run_db_unit_tests.addArgs(args);
     const db_test_step = b.step("db-test", "Run storage/db unit tests");
     db_test_step.dependOn(&run_db_unit_tests.step);
 

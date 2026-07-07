@@ -55,6 +55,8 @@ work-log/
 
 # Specs, datasets, and build cache
 specs/
+!specs/openapi/
+!specs/openapi/**
 datasets/
 .turbo/
 

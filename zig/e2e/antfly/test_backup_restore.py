@@ -636,7 +636,13 @@ def test_table_backup_restore_round_trip_managed_chunked_semantic(backup_api, op
         assert restored_doc is not None
         assert restored_doc["title"] == "Alpha backup"
 
-        backup_api.wait_index_ready(table_name, "semantic_chunked_idx", timeout_s=180.0, interval_s=1.0)
+        backup_api.wait_index_ready(
+            table_name,
+            "semantic_chunked_idx",
+            timeout_s=180.0,
+            interval_s=1.0,
+            require_query_fresh=True,
+        )
 
         semantic_after = wait_until(
             lambda: _semantic_top_hit(backup_api, table_name, "alpha concept", "semantic_chunked_idx", "doc:a"),

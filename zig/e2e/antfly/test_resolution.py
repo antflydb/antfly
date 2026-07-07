@@ -144,8 +144,19 @@ class _Api:
         payload: dict = {"num_shards": num_shards}
         if indexes is not None:
             payload["indexes"] = indexes
-        timeout = deadline.request_timeout(30.0) if deadline is not None else 30.0
-        return self._check(self.s.post(f"{self.url}/tables/{name}", json=payload, timeout=timeout))
+        max_timeout = 90.0 if indexes is not None or num_shards > 1 else 30.0
+        timeout = deadline.request_timeout(max_timeout) if deadline is not None else max_timeout
+        try:
+            response = self.s.post(f"{self.url}/tables/{name}", json=payload, timeout=timeout)
+        except requests.RequestException as exc:
+            stacks = self._server.native_stack_dumps()
+            index_names = sorted(indexes.keys()) if indexes is not None else []
+            raise AssertionError(
+                f"create table timed out/failed table={name!r} shards={num_shards} "
+                f"indexes={index_names!r}: {exc!r}\n[native stacks]\n{stacks}"
+                f"\n[logs]\n{self._server.debug_logs()}"
+            ) from exc
+        return self._check(response)
 
     def insert(
         self,
