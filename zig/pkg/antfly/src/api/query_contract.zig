@@ -2117,9 +2117,13 @@ fn parseQueryTimeoutMs(alloc: std.mem.Allocator, body: []const u8) !?u64 {
     };
 }
 
+pub fn queryExecutionDeadlineNsFromBody(alloc: std.mem.Allocator, body: []const u8) !?u64 {
+    const timeout_ms = (try parseQueryTimeoutMs(alloc, body)) orelse return null;
+    return platform_time.monotonicNs() +| timeout_ms *| std.time.ns_per_ms;
+}
+
 fn applyQueryExecutionDeadline(alloc: std.mem.Allocator, body: []const u8, req: *db_mod.types.SearchRequest) !void {
-    const timeout_ms = (try parseQueryTimeoutMs(alloc, body)) orelse return;
-    req.execution_deadline_ns = platform_time.monotonicNs() +| timeout_ms *| std.time.ns_per_ms;
+    req.execution_deadline_ns = (try queryExecutionDeadlineNsFromBody(alloc, body)) orelse return;
 }
 
 pub fn parseQueryRequest(

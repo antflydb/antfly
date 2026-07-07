@@ -5962,7 +5962,9 @@ pub const ApiHttpServer = struct {
         const retry_timeout_ns: u64 = if (self.table_writes != null) 5 * std.time.ns_per_s else 0;
         const retry_poll_ns = 50 * std.time.ns_per_ms;
         const start_ns = platform_time.monotonicNs();
+        const request_deadline_ns = query_contract.queryExecutionDeadlineNsFromBody(alloc, body) catch return error.InvalidQueryRequest;
         while (true) {
+            if (retryDeadlineExpired(request_deadline_ns, platform_time.monotonicNs())) return error.Timeout;
             return self.executePublicTableQueryDispatchWithIdentity(
                 alloc,
                 source,
@@ -5972,10 +5974,18 @@ pub const ApiHttpServer = struct {
                 authenticated_identity,
             ) catch |err| switch (err) {
                 error.DocIdentityNamespaceMismatch => {
-                    if (retry_timeout_ns > 0 and platform_time.monotonicNs() -| start_ns < retry_timeout_ns) {
-                        sleepNs(retry_poll_ns);
-                        continue;
-                    }
+                    const now_ns = platform_time.monotonicNs();
+                    if (retryDeadlineExpired(request_deadline_ns, now_ns)) return error.Timeout;
+                    if (retry_timeout_ns == 0) return err;
+                    const sleep_ns = boundedRetrySleepNs(request_deadline_ns, now_ns, start_ns, retry_timeout_ns, retry_poll_ns) orelse return err;
+                    if (sleep_ns == 0) return error.Timeout;
+                    sleepNs(sleep_ns);
+                    continue;
+                },
+                error.Timeout => {
+                    return error.Timeout;
+                },
+                error.InvalidQueryRequest => {
                     return err;
                 },
                 else => return err,
@@ -6449,6 +6459,7 @@ pub const ApiHttpServer = struct {
         const start_ns = platform_time.monotonicNs();
         var attempts: u32 = 0;
         while (true) : (attempts += 1) {
+            if (retryDeadlineExpired(req.execution_deadline_ns, platform_time.monotonicNs())) return error.Timeout;
             return source.query(alloc, table_name, req, consistency) catch |err| switch (err) {
                 // FileNotFound surfaces when a read-only replica open races
                 // with the writer reclaiming obsolete LSM runs; reopening
@@ -6457,10 +6468,14 @@ pub const ApiHttpServer = struct {
                 // than an open completes.
                 error.EndOfStream, error.FileNotFound, error.TableReadChurn => {
                     std.log.warn("public table query read failed table={s} err={} attempt={d}", .{ table_name, err, attempts + 1 });
-                    if (platform_time.monotonicNs() -| start_ns >= retry_timeout_ns) return err;
-                    sleepNs(retry_poll_ns);
+                    const now_ns = platform_time.monotonicNs();
+                    if (retryDeadlineExpired(req.execution_deadline_ns, now_ns)) return error.Timeout;
+                    const sleep_ns = boundedRetrySleepNs(req.execution_deadline_ns, now_ns, start_ns, retry_timeout_ns, retry_poll_ns) orelse return err;
+                    if (sleep_ns == 0) return error.Timeout;
+                    sleepNs(sleep_ns);
                     continue;
                 },
+                error.Timeout => return error.Timeout,
                 else => {
                     std.log.warn("public table query read failed table={s} err={}", .{ table_name, err });
                     return err;
@@ -8145,6 +8160,30 @@ fn sleepNs(duration_ns: u64) void {
         .INTR => continue,
         else => return,
     };
+}
+
+fn retryDeadlineExpired(deadline_ns: ?u64, now_ns: u64) bool {
+    const deadline = deadline_ns orelse return false;
+    return now_ns >= deadline;
+}
+
+fn boundedRetrySleepNs(
+    deadline_ns: ?u64,
+    now_ns: u64,
+    retry_start_ns: u64,
+    retry_timeout_ns: u64,
+    retry_poll_ns: u64,
+) ?u64 {
+    if (retry_timeout_ns == 0) return null;
+    const retry_elapsed_ns = now_ns -| retry_start_ns;
+    if (retry_elapsed_ns >= retry_timeout_ns) return null;
+
+    var sleep_ns = @min(retry_poll_ns, retry_timeout_ns - retry_elapsed_ns);
+    if (deadline_ns) |deadline| {
+        if (now_ns >= deadline) return 0;
+        sleep_ns = @min(sleep_ns, deadline - now_ns);
+    }
+    return sleep_ns;
 }
 
 fn testMetadataServiceSourceWithoutLifecycle(svc: *metadata_service.MetadataService) StatusSource {
@@ -11415,6 +11454,84 @@ test "api http unsupported unsorted query response remains generic" {
     try std.testing.expectEqual(@as(u16, 422), resp.status);
     try std.testing.expectEqualStrings("text/plain", resp.content_type.?);
     try std.testing.expectEqualStrings("unsupported query request", resp.body);
+}
+
+test "api http retry sleep is bounded by request deadline" {
+    const now_ns: u64 = 1_000;
+    try std.testing.expectEqual(
+        @as(?u64, 10),
+        boundedRetrySleepNs(now_ns + 10, now_ns, now_ns - 100, std.time.ns_per_s, 25 * std.time.ns_per_ms),
+    );
+    try std.testing.expectEqual(
+        @as(?u64, 0),
+        boundedRetrySleepNs(now_ns, now_ns, now_ns - 100, std.time.ns_per_s, 25 * std.time.ns_per_ms),
+    );
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        boundedRetrySleepNs(null, now_ns, now_ns - 100, 50, 25 * std.time.ns_per_ms),
+    );
+}
+
+test "api http transient read retry honors expired request deadline before source query" {
+    const FakeReads = struct {
+        attempts: u32 = 0,
+
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+            };
+        }
+
+        fn lookup(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?table_reads.LookupResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn scan(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.ScanOptions,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?table_reads.ScanResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn query(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.SearchRequest,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.attempts += 1;
+            return error.FileNotFound;
+        }
+    };
+
+    var reads = FakeReads{};
+    try std.testing.expectError(error.Timeout, ApiHttpServer.queryWithTransientReadRetry(
+        std.testing.allocator,
+        reads.source(),
+        "docs",
+        .{ .execution_deadline_ns = 0 },
+        .read_index,
+    ));
+    try std.testing.expectEqual(@as(u32, 0), reads.attempts);
 }
 
 test "api http public table dispatch preserves unsupported sorted query as exact sort" {
