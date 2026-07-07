@@ -139,7 +139,9 @@ jobs:
     needs: changes
     if: (github.event_name != 'schedule' && needs.changes.outputs.zig_tests == 'true') || needs.changes.outputs.model_check == 'true' || needs.changes.outputs.trace_validate == 'true'
     runs-on: arc-antfly-heavy
-    timeout-minutes: 45
+    # Keep the outer job timeout above the in-step hard watchdog so true hangs
+    # produce the watchdog stack dump instead of an opaque GitHub cancellation.
+    timeout-minutes: 75
     env:
       ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
