@@ -7844,6 +7844,130 @@ fn nextSortedSegmentHeadAlloc(
     return null;
 }
 
+fn countSortedSegmentVisibleCandidatesWithoutSortValuesAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: MatchAllExecutor,
+    constraints: *const NativeDocIdConstraints,
+    snapshot: *const index_mod.IndexSnapshot,
+    plan: SortExecutionPlan,
+    membership: ?*const SortedSegmentDocMembership,
+    profile: ?*SortCollectorProfile,
+) !usize {
+    const scan_budget = sortedSegmentScanBudget();
+    var scanned_count: u64 = 0;
+    if (profile) |p| p.sorted_segment_scan_budget = scan_budget;
+    var constraint_membership = try NativeDocIdConstraintMembership.initAlloc(alloc, constraints);
+    defer constraint_membership.deinit(alloc);
+
+    var count: usize = 0;
+    for (snapshot.segments, 0..) |*segment, segment_index| {
+        if (segment.liveDocCount() == 0) continue;
+        for (0..segment.reader.doc_count) |local_doc_id_usize| {
+            const local_doc_id: u32 = @intCast(local_doc_id_usize);
+            scanned_count +|= 1;
+            if (scanned_count == 1 or scanned_count % sorted_segment_deadline_check_interval == 0) {
+                try checkSearchRequestDeadline(req);
+            }
+            if (profile) |p| {
+                p.sorted_segment_scanned_count = scanned_count;
+                p.sorted_segment_scan_budget = scan_budget;
+            }
+            if (scanned_count > scan_budget) {
+                logExactSortBudgetRejection(
+                    "sorted_segment",
+                    .sorted_segment_scan_window,
+                    req.index_name,
+                    boundedU32(scanned_count),
+                    boundedU32(scan_budget),
+                    plan,
+                );
+                if (profile) |p| p.budget_rejection_reason = exactSortBudgetRejectionReasonName(.sorted_segment_scan_window);
+                return error.QueryCandidateBudgetExceeded;
+            }
+            if (sortedSegmentLocalDocDeleted(segment, local_doc_id)) continue;
+            if (membership) |m| {
+                if (!m.contains(segment_index, local_doc_id)) continue;
+            }
+            const stored = segment.reader.storedDoc(local_doc_id) orelse return error.InvalidSegment;
+            if (executor.is_expired_key) |is_expired| {
+                if (try is_expired(executor.ctx, alloc, stored.id)) continue;
+            }
+            const candidate = MatchAllCandidate{
+                .id = @constCast(stored.id),
+                .ordinal = try segment.reader.docOrdinal(local_doc_id),
+            };
+            if (!matchAllCandidateAllowedWithMembership(candidate, constraints, &constraint_membership)) continue;
+            count +|= 1;
+        }
+    }
+    return count;
+}
+
+fn countSortedSegmentVisibleCandidatesFromSeekAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: MatchAllExecutor,
+    constraints: *const NativeDocIdConstraints,
+    snapshot: *const index_mod.IndexSnapshot,
+    plan: SortExecutionPlan,
+    iterators: []SortedSegmentIterator,
+    membership: ?*const SortedSegmentDocMembership,
+    reverse: bool,
+    profile: ?*SortCollectorProfile,
+) !usize {
+    const scan_budget = sortedSegmentScanBudget();
+    var scanned_count: u64 = 0;
+    if (profile) |p| p.sorted_segment_scan_budget = scan_budget;
+    var constraint_membership = try NativeDocIdConstraintMembership.initAlloc(alloc, constraints);
+    defer constraint_membership.deinit(alloc);
+
+    var count: usize = 0;
+    for (iterators) |*iterator| {
+        const segment = &snapshot.segments[iterator.segment_index];
+        while (!sortedSegmentIteratorDone(snapshot, iterator.*, reverse)) {
+            const local_doc_id: u32 = @intCast(iterator.next_doc);
+            sortedSegmentIteratorAdvance(iterator, reverse);
+            scanned_count +|= 1;
+            if (scanned_count == 1 or scanned_count % sorted_segment_deadline_check_interval == 0) {
+                try checkSearchRequestDeadline(req);
+            }
+            if (profile) |p| {
+                p.sorted_segment_scanned_count = scanned_count;
+                p.sorted_segment_scan_budget = scan_budget;
+            }
+            if (scanned_count > scan_budget) {
+                logExactSortBudgetRejection(
+                    "sorted_segment",
+                    .sorted_segment_scan_window,
+                    req.index_name,
+                    boundedU32(scanned_count),
+                    boundedU32(scan_budget),
+                    plan,
+                );
+                if (profile) |p| p.budget_rejection_reason = exactSortBudgetRejectionReasonName(.sorted_segment_scan_window);
+                return error.QueryCandidateBudgetExceeded;
+            }
+            if (local_doc_id >= segment.reader.doc_count) continue;
+            if (sortedSegmentLocalDocDeleted(segment, local_doc_id)) continue;
+            if (membership) |m| {
+                if (!m.contains(iterator.segment_index, local_doc_id)) continue;
+            }
+            const stored = segment.reader.storedDoc(local_doc_id) orelse return error.InvalidSegment;
+            if (executor.is_expired_key) |is_expired| {
+                if (try is_expired(executor.ctx, alloc, stored.id)) continue;
+            }
+            const candidate = MatchAllCandidate{
+                .id = @constCast(stored.id),
+                .ordinal = try segment.reader.docOrdinal(local_doc_id),
+            };
+            if (!matchAllCandidateAllowedWithMembership(candidate, constraints, &constraint_membership)) continue;
+            count +|= 1;
+        }
+    }
+    return count;
+}
+
 fn countSortedSegmentVisibleCandidatesAlloc(
     alloc: Allocator,
     req: types.SearchRequest,
@@ -7866,13 +7990,20 @@ fn countSortedSegmentVisibleCandidatesAlloc(
     {
         return sortedSegmentLiveDocCount(snapshot);
     }
+    if (cursor.len == 0) {
+        return try countSortedSegmentVisibleCandidatesWithoutSortValuesAlloc(
+            alloc,
+            req,
+            executor,
+            constraints,
+            snapshot,
+            plan,
+            membership,
+            profile,
+        );
+    }
 
     const reverse = req.search_before.len > 0;
-    const scan_budget = sortedSegmentScanBudget();
-    var scanned_count: u64 = 0;
-    if (profile) |p| p.sorted_segment_scan_budget = scan_budget;
-    var constraint_membership = try NativeDocIdConstraintMembership.initAlloc(alloc, constraints);
-    defer constraint_membership.deinit(alloc);
 
     var iterators = std.ArrayListUnmanaged(SortedSegmentIterator).empty;
     defer iterators.deinit(alloc);
@@ -7900,31 +8031,18 @@ fn countSortedSegmentVisibleCandidatesAlloc(
         try iterators.append(alloc, iterator);
     }
 
-    var count: usize = 0;
-    for (iterators.items, 0..) |_, iterator_index| {
-        while (try nextSortedSegmentHeadAlloc(
-            alloc,
-            req,
-            plan,
-            snapshot,
-            iterator_index,
-            iterators.items,
-            constraints,
-            &constraint_membership,
-            membership,
-            executor,
-            native_loader,
-            profile,
-            reverse,
-            &scanned_count,
-            scan_budget,
-        )) |head_value| {
-            var head = head_value;
-            count +|= 1;
-            head.decorated.deinit(alloc);
-        }
-    }
-    return count;
+    return try countSortedSegmentVisibleCandidatesFromSeekAlloc(
+        alloc,
+        req,
+        executor,
+        constraints,
+        snapshot,
+        plan,
+        iterators.items,
+        membership,
+        reverse,
+        profile,
+    );
 }
 
 fn appendSortedSegmentSelectedHit(
@@ -10290,11 +10408,24 @@ fn sortAndPageTextDocValueDocNumsAlloc(
     const collect_sort_profile = bench_query_profile or effective_req.profile;
     if (effective_req.limit == 0) {
         const zero_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
-        const visible_total = try visibleTextDocNumCount(alloc, effective_req, snapshot, doc_nums, executor);
         var profile = SortCollectorProfile{};
         observeSortCandidateSource(if (collect_sort_profile) &profile else null, "text_postings");
-        if (collect_sort_profile) {
+        const visible_total = if (activeSortCursor(effective_req).len > 0)
+            try visibleTextDocNumCountAfterCursorAlloc(
+                alloc,
+                effective_req,
+                snapshot,
+                doc_nums,
+                executor,
+                plan,
+                if (collect_sort_profile) &profile else null,
+            )
+        else
+            try visibleTextDocNumCount(alloc, effective_req, snapshot, doc_nums, executor);
+        if (collect_sort_profile and activeSortCursor(effective_req).len == 0) {
             profile.candidate_count = @intCast(@min(visible_total, @as(usize, std.math.maxInt(u64))));
+        }
+        if (collect_sort_profile) {
             profile.window_capacity = 0;
             profile.window_len = 0;
             profile.total_ns = platform_time.monotonicNs() - zero_start_ns;
@@ -10451,6 +10582,60 @@ fn sortAndPageTextDocValueDocNumsAlloc(
         logBenchProjectedSourceLoadProfile(effective_req, plan, "text", source_profile);
     }
     return out;
+}
+
+fn visibleTextDocNumCountAfterCursorAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    snapshot: *const index_mod.IndexSnapshot,
+    doc_nums: []const u32,
+    executor: SearchTextQueryExecutor,
+    plan: SortExecutionPlan,
+    profile: ?*SortCollectorProfile,
+) !usize {
+    var native_sort_ctx = TextDocValueSortContext{ .snapshot = snapshot };
+    const native_loader = NativeSortValueLoader{
+        .ctx = &native_sort_ctx,
+        .require_native = plan.require_native,
+        .load = loadTextDocValueSortValue,
+    };
+
+    var visible_count: usize = 0;
+    for (doc_nums, 0..) |doc_num, i| {
+        if (i % 1024 == 0) try checkSearchRequestDeadline(req);
+        const stored = snapshot.storedDoc(doc_num) orelse return error.StoredDocMissing;
+        if (executor.is_expired_key) |is_expired| {
+            if (try is_expired(executor.ctx, alloc, stored.id)) continue;
+        }
+        if (profile) |p| p.candidate_count += 1;
+        const raw_hit = types.SearchHit{
+            .id = try alloc.dupe(u8, stored.id),
+            .doc_ordinal = try snapshot.docOrdinal(doc_num),
+            .native_text_doc_id = doc_num,
+            .score = 1.0,
+            .stored_data = null,
+        };
+        const decorate_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
+        var decorated = try decorateSortHitAlloc(
+            alloc,
+            req,
+            plan,
+            raw_hit,
+            executor.ctx,
+            executor.load_stored,
+            native_loader,
+            profile,
+        );
+        defer decorated.deinit(alloc);
+        if (profile) |p| p.decorate_ns += platform_time.monotonicNs() - decorate_start_ns;
+
+        if (try decoratedHitAllowedByCursor(req, plan, decorated)) {
+            visible_count += 1;
+        } else if (profile) |p| {
+            p.cursor_rejected_count += 1;
+        }
+    }
+    return visible_count;
 }
 
 fn visibleTextDocNumCount(
@@ -13736,19 +13921,33 @@ fn sortAndPageMatchAllOrdinalDocValueCandidatesAlloc(
     const collect_sort_profile = bench_query_profile or effective_req.profile;
     if (effective_req.limit == 0) {
         const zero_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
-        const visible_total = try visibleMatchAllOrdinalDocValueCandidateCount(
-            alloc,
-            effective_req,
-            executor,
-            snapshot,
-            constraints,
-            ordinal_to_text_doc_id,
-        );
         var profile = SortCollectorProfile{};
         observeSortCandidateSource(if (collect_sort_profile) &profile else null, "native_filter");
         observeNativeFilterConstraints(if (collect_sort_profile) &profile else null, constraints);
-        if (collect_sort_profile) {
+        const visible_total = if (activeSortCursor(effective_req).len > 0)
+            try visibleMatchAllOrdinalDocValueCandidateCountAfterCursorAlloc(
+                alloc,
+                effective_req,
+                executor,
+                snapshot,
+                constraints,
+                plan,
+                ordinal_to_text_doc_id,
+                if (collect_sort_profile) &profile else null,
+            )
+        else
+            try visibleMatchAllOrdinalDocValueCandidateCount(
+                alloc,
+                effective_req,
+                executor,
+                snapshot,
+                constraints,
+                ordinal_to_text_doc_id,
+            );
+        if (collect_sort_profile and activeSortCursor(effective_req).len == 0) {
             profile.candidate_count = @intCast(@min(visible_total, @as(usize, std.math.maxInt(u64))));
+        }
+        if (collect_sort_profile) {
             profile.window_capacity = 0;
             profile.window_len = 0;
             profile.total_ns = platform_time.monotonicNs() - zero_start_ns;
@@ -13925,6 +14124,79 @@ fn sortAndPageMatchAllOrdinalDocValueCandidatesAlloc(
         logBenchProjectedSourceLoadProfile(effective_req, plan, "match_all", source_profile);
     }
     return out;
+}
+
+fn visibleMatchAllOrdinalDocValueCandidateCountAfterCursorAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: MatchAllExecutor,
+    snapshot: *const index_mod.IndexSnapshot,
+    constraints: *const NativeDocIdConstraints,
+    plan: SortExecutionPlan,
+    ordinal_to_text_doc_id: *const std.AutoHashMapUnmanaged(doc_set.DocOrdinal, u32),
+    profile: ?*SortCollectorProfile,
+) !usize {
+    var native_sort_ctx = TextDocValueSortContext{
+        .snapshot = snapshot,
+        .ordinal_to_text_doc_id = ordinal_to_text_doc_id,
+    };
+    const native_loader = NativeSortValueLoader{
+        .ctx = &native_sort_ctx,
+        .require_native = plan.require_native,
+        .load = loadTextDocValueSortValue,
+    };
+    var constraint_membership = try NativeDocIdConstraintMembership.initAlloc(alloc, constraints);
+    defer constraint_membership.deinit(alloc);
+
+    var visible_count: usize = 0;
+    for (constraints.filter_doc_nums, 0..) |ordinal, i| {
+        if (i % 1024 == 0) try checkSearchRequestDeadline(req);
+        const doc_num = ordinal_to_text_doc_id.get(ordinal) orelse {
+            logNativeSortPlanRejection(
+                "*",
+                nativeSortPlanRejectionReasonName(.missing_doc_values_capability),
+                "doc_ordinal_projection_unavailable",
+            );
+            return error.UnsupportedQueryRequest;
+        };
+        const stored = snapshot.storedDoc(doc_num) orelse return error.StoredDocMissing;
+        const candidate = MatchAllCandidate{
+            .id = @constCast(stored.id),
+            .ordinal = ordinal,
+        };
+        if (!matchAllCandidateAllowedWithMembership(candidate, constraints, &constraint_membership)) continue;
+        if (executor.is_expired_key) |is_expired| {
+            if (try is_expired(executor.ctx, alloc, stored.id)) continue;
+        }
+        if (profile) |p| p.candidate_count += 1;
+        const raw_hit = types.SearchHit{
+            .id = try alloc.dupe(u8, stored.id),
+            .doc_ordinal = ordinal,
+            .native_text_doc_id = doc_num,
+            .score = 1.0,
+            .stored_data = null,
+        };
+        const decorate_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
+        var decorated = try decorateSortHitAlloc(
+            alloc,
+            req,
+            plan,
+            raw_hit,
+            executor.ctx,
+            executor.load_stored,
+            native_loader,
+            profile,
+        );
+        defer decorated.deinit(alloc);
+        if (profile) |p| p.decorate_ns += platform_time.monotonicNs() - decorate_start_ns;
+
+        if (try decoratedHitAllowedByCursor(req, plan, decorated)) {
+            visible_count += 1;
+        } else if (profile) |p| {
+            p.cursor_rejected_count += 1;
+        }
+    }
+    return visible_count;
 }
 
 fn visibleMatchAllOrdinalDocValueCandidateCount(
@@ -21482,6 +21754,8 @@ test "text field sort uses sorted segment membership path when index sort matche
     try std.testing.expectEqual(@as(u64, 3), zero_limit_profile.candidate_count);
     try std.testing.expectEqual(@as(u64, 0), zero_limit_profile.window_capacity);
     try std.testing.expectEqual(@as(u64, 0), zero_limit_profile.window_len);
+    try std.testing.expectEqual(@as(u64, 0), zero_limit_profile.native_doc_value_hit_count);
+    try std.testing.expectEqual(@as(u64, 0), zero_limit_profile.native_doc_value_miss_count);
     try std.testing.expectEqual(@as(u64, 0), zero_limit_profile.stored_json_load_count);
     try std.testing.expectEqual(@as(usize, 0), harness.postprocess_count);
 
@@ -21908,6 +22182,27 @@ test "match_all sorted segment seek uses cursor seek within each segment" {
 
     try std.testing.expectEqual(@as(usize, 0), empty_page.hits.len);
     try std.testing.expectEqual(@as(usize, 0), counter.count);
+
+    counter.count = 0;
+    var zero_after_page = try sortAndPageMatchAllSortedSegmentsAlloc(alloc, .{
+        .order_by = &order_by,
+        .search_after = &cursor,
+        .include_stored = false,
+        .profile = true,
+        .limit = 0,
+    }, executor, &constraints, &text_entry, sorted_plan, native_loader, null);
+    defer zero_after_page.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), zero_after_page.hits.len);
+    try std.testing.expectEqual(@as(u32, 13), zero_after_page.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, zero_after_page.total_hits_relation);
+    try std.testing.expect(counter.count < 10);
+    const zero_after_profile = zero_after_page.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("sorted_segment_seek", zero_after_profile.plan);
+    try std.testing.expectEqual(@as(u64, 13), zero_after_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 13), zero_after_profile.sorted_segment_scanned_count);
+    try std.testing.expectEqual(@as(u64, 0), zero_after_profile.native_doc_value_hit_count);
+    try std.testing.expectEqual(@as(u64, 0), zero_after_profile.native_doc_value_miss_count);
 }
 
 test "match_all sorted segment seek enforces scan budget" {
@@ -22480,6 +22775,64 @@ test "text doc values sort zero limit avoids budget and decoration" {
     try std.testing.expectEqual(@as(u64, 3), profile.candidate_count);
     try std.testing.expectEqual(@as(u64, 0), profile.native_doc_value_hit_count);
     try std.testing.expectEqual(@as(u64, 0), profile.native_doc_value_miss_count);
+
+    const cursor = [_]std.json.Value{
+        .{ .float = 2.0 },
+        .{ .string = "doc:b" },
+    };
+    var cursor_result = try sortAndPageTextDocValueDocNumsAlloc(
+        alloc,
+        .{
+            .index_name = "ft",
+            .order_by = &order_by,
+            .search_after = &cursor,
+            .include_stored = false,
+            .profile = true,
+            .limit = 0,
+        },
+        text_entry.persistent.snapshot(),
+        &doc_nums,
+        executor,
+        plan,
+    );
+    defer cursor_result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), cursor_result.hits.len);
+    try std.testing.expectEqual(@as(u32, 1), cursor_result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, cursor_result.total_hits_relation);
+    const cursor_profile = cursor_result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", cursor_profile.plan);
+    try std.testing.expectEqual(@as(u64, 3), cursor_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 2), cursor_profile.cursor_rejected_count);
+    try std.testing.expectEqual(@as(u64, 3), cursor_profile.native_doc_value_hit_count);
+    try std.testing.expectEqual(@as(u64, 0), cursor_profile.native_doc_value_miss_count);
+
+    var before_result = try sortAndPageTextDocValueDocNumsAlloc(
+        alloc,
+        .{
+            .index_name = "ft",
+            .order_by = &order_by,
+            .search_before = &cursor,
+            .include_stored = false,
+            .profile = true,
+            .limit = 0,
+        },
+        text_entry.persistent.snapshot(),
+        &doc_nums,
+        executor,
+        plan,
+    );
+    defer before_result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), before_result.hits.len);
+    try std.testing.expectEqual(@as(u32, 1), before_result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, before_result.total_hits_relation);
+    const before_profile = before_result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", before_profile.plan);
+    try std.testing.expectEqual(@as(u64, 3), before_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 2), before_profile.cursor_rejected_count);
+    try std.testing.expectEqual(@as(u64, 3), before_profile.native_doc_value_hit_count);
+    try std.testing.expectEqual(@as(u64, 0), before_profile.native_doc_value_miss_count);
 }
 
 test "match_all native ordinal doc values zero limit avoids budget and decoration" {
@@ -22578,6 +22931,66 @@ test "match_all native ordinal doc values zero limit avoids budget and decoratio
     try std.testing.expectEqual(@as(u64, 3), profile.candidate_count);
     try std.testing.expectEqual(@as(u64, 0), profile.native_doc_value_hit_count);
     try std.testing.expectEqual(@as(u64, 0), profile.native_doc_value_miss_count);
+
+    const cursor = [_]std.json.Value{
+        .{ .float = 2.0 },
+        .{ .string = "doc:b" },
+    };
+    var cursor_result = try sortAndPageMatchAllOrdinalDocValueCandidatesAlloc(
+        alloc,
+        .{
+            .index_name = "ft",
+            .order_by = &order_by,
+            .search_after = &cursor,
+            .include_stored = false,
+            .profile = true,
+            .limit = 0,
+        },
+        executor,
+        text_entry.persistent.snapshot(),
+        &constraints,
+        plan,
+        &ordinal_to_text_doc_id,
+    );
+    defer cursor_result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), cursor_result.hits.len);
+    try std.testing.expectEqual(@as(u32, 1), cursor_result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, cursor_result.total_hits_relation);
+    const cursor_profile = cursor_result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", cursor_profile.plan);
+    try std.testing.expectEqual(@as(u64, 3), cursor_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 2), cursor_profile.cursor_rejected_count);
+    try std.testing.expectEqual(@as(u64, 3), cursor_profile.native_doc_value_hit_count);
+    try std.testing.expectEqual(@as(u64, 0), cursor_profile.native_doc_value_miss_count);
+
+    var before_result = try sortAndPageMatchAllOrdinalDocValueCandidatesAlloc(
+        alloc,
+        .{
+            .index_name = "ft",
+            .order_by = &order_by,
+            .search_before = &cursor,
+            .include_stored = false,
+            .profile = true,
+            .limit = 0,
+        },
+        executor,
+        text_entry.persistent.snapshot(),
+        &constraints,
+        plan,
+        &ordinal_to_text_doc_id,
+    );
+    defer before_result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), before_result.hits.len);
+    try std.testing.expectEqual(@as(u32, 1), before_result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, before_result.total_hits_relation);
+    const before_profile = before_result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", before_profile.plan);
+    try std.testing.expectEqual(@as(u64, 3), before_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 2), before_profile.cursor_rejected_count);
+    try std.testing.expectEqual(@as(u64, 3), before_profile.native_doc_value_hit_count);
+    try std.testing.expectEqual(@as(u64, 0), before_profile.native_doc_value_miss_count);
 }
 
 test "native doc values sort plan requires runtime schema" {
