@@ -4184,6 +4184,7 @@ pub fn build(b: *std.Build) void {
             "managed startup catch-up finishes restore repair before terminal index load degradation",
             "table runtime snapshot cache clones stored status",
             "provisioned runtime status overlays live writer replay target without republishing stats",
+            "provisioned runtime status live replay overlay preserves cold dense visibility refresh",
             "provisioned runtime status live replay overlay clears ambiguous replay-only backfill",
             "provisioned runtime status live replay overlay preserves non-replay backfill",
             "managed source status-only open drains stale pending close before retry",
