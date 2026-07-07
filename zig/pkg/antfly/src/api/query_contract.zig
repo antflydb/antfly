@@ -1910,7 +1910,7 @@ fn applyCommonSearchRequestOptions(
 
     const has_semantic = request.semantic_search != null or request.embeddings != null;
     if (has_semantic and req.offset > 0) return error.UnsupportedQueryRequest;
-    if (has_semantic and req.order_by.len > 0 and !db_mod.requestHasVectorScoreOrderOnly(req.*)) {
+    if (has_semantic and req.order_by.len > 0) {
         return unsupportedExactSort(approximateSemanticSortField(req.order_by), "approximate_candidate_source", "approximate_candidate_source");
     }
     if (req.order_by.len > 0 and req.offset > 0 and (req.search_after.len > 0 or req.search_before.len > 0)) {
@@ -7558,6 +7558,25 @@ test "api query contract preflight rejects search_before pagination over approxi
     try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.detail);
 }
 
+test "api query contract preflight rejects score sort over approximate vector source" {
+    var parsed = try std.json.parseFromSlice(metadata_openapi.QueryRequest, std.testing.allocator,
+        \\{
+        \\  "embeddings": {"dense_idx":"AACAPwAAAEAAAEBA"},
+        \\  "indexes": ["dense_idx"],
+        \\  "order_by": [{"field":"_score","desc":true}],
+        \\  "limit": 10
+        \\}
+    , .{});
+    defer parsed.deinit();
+
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, preflightQueryRequestAlloc(std.testing.allocator, parsed.value));
+    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("_score", diagnostic.field);
+    try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.reason);
+    try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.detail);
+}
+
 test "api query contract preflight rejects score sort without score-bearing source" {
     var parsed_match_all = try std.json.parseFromSlice(metadata_openapi.QueryRequest, std.testing.allocator,
         \\{
@@ -7601,19 +7620,6 @@ test "api query contract preflight rejects score sort without score-bearing sour
     defer summary.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u32, 1), summary.base_result_set_count);
 
-    var parsed_vector_score = try std.json.parseFromSlice(metadata_openapi.QueryRequest, std.testing.allocator,
-        \\{
-        \\  "embeddings": {"dense_idx":"AACAPwAAAEAAAEBA"},
-        \\  "indexes": ["dense_idx"],
-        \\  "order_by": [{"field":"_score","desc":true}],
-        \\  "limit": 10
-        \\}
-    , .{});
-    defer parsed_vector_score.deinit();
-
-    var vector_summary = try preflightQueryRequestAlloc(std.testing.allocator, parsed_vector_score.value);
-    defer vector_summary.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u32, 1), vector_summary.base_result_set_count);
 }
 
 test "api query contract appends stable id sort tiebreaker for cursors" {

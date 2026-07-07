@@ -853,7 +853,7 @@ fn preflightQueryRequestAgainstContext(
     var runtime_preflight: ?db_mod.RuntimePreflightSummary = null;
     defer if (runtime_preflight) |*summary| summary.deinit(alloc);
     var contract_preflight = query_contract.preflightQueryRequestAlloc(alloc, query_request) catch |err| blk: {
-        if (!metadataSortCursorShapeInvalid(query_request)) {
+        if (!metadataSortOrderShapeInvalid(query_request) and !metadataSortCursorShapeInvalid(query_request)) {
             const feedback = if (query_request.graph_searches != null)
                 try std.fmt.allocPrint(alloc, "query_request.graph_searches failed executor preflight: {s}", .{@errorName(err)})
             else
@@ -930,6 +930,10 @@ fn preflightQueryRequestAgainstContext(
                 try appendQueryPreflightDiagnostic(alloc, &diagnostics, .@"error", "invalid_sort_field", "query_request.order_by", feedback);
             }
         }
+    }
+    if (try metadataSortOrderFeedback(alloc, query_request)) |feedback| {
+        defer alloc.free(feedback.message);
+        try appendQueryPreflightDiagnostic(alloc, &diagnostics, .@"error", "invalid_sort_field", feedback.path, feedback.message);
     }
     if (try metadataSortCursorFeedback(alloc, context, query_request)) |feedback| {
         defer alloc.free(feedback.message);
@@ -1755,6 +1759,68 @@ const SortCursorFeedback = struct {
     path: []const u8,
     message: []const u8,
 };
+
+fn metadataSortOrderFeedback(
+    alloc: std.mem.Allocator,
+    query_request: metadata_openapi.QueryRequest,
+) !?SortCursorFeedback {
+    const order_by = query_request.order_by orelse return null;
+    if (order_by.len == 0) {
+        return .{
+            .path = "query_request.order_by",
+            .message = try alloc.dupe(u8, "query_request.order_by must include at least one sort field"),
+        };
+    }
+
+    for (order_by, 0..) |field, i| {
+        if (field.field.len == 0) {
+            return .{
+                .path = "query_request.order_by",
+                .message = try alloc.dupe(u8, "query_request.order_by contains an empty sort field"),
+            };
+        }
+        for (order_by[0..i]) |prior| {
+            if (!std.mem.eql(u8, prior.field, field.field)) continue;
+            return .{
+                .path = "query_request.order_by",
+                .message = try std.fmt.allocPrint(
+                    alloc,
+                    "query_request.order_by repeats sort field '{s}'; each field can appear once in the effective sort tuple",
+                    .{field.field},
+                ),
+            };
+        }
+        if (!std.mem.eql(u8, field.field, "_id")) continue;
+        if (i + 1 != order_by.len) {
+            return .{
+                .path = "query_request.order_by",
+                .message = try alloc.dupe(u8, "query_request.order_by can include _id only as the final stable tie-breaker"),
+            };
+        }
+        if (field.desc orelse false) {
+            return .{
+                .path = "query_request.order_by",
+                .message = try alloc.dupe(u8, "query_request.order_by _id tie-breaker must be ascending"),
+            };
+        }
+    }
+    return null;
+}
+
+fn metadataSortOrderShapeInvalid(query_request: metadata_openapi.QueryRequest) bool {
+    const order_by = query_request.order_by orelse return false;
+    if (order_by.len == 0) return true;
+    for (order_by, 0..) |field, i| {
+        if (field.field.len == 0) return true;
+        for (order_by[0..i]) |prior| {
+            if (std.mem.eql(u8, prior.field, field.field)) return true;
+        }
+        if (!std.mem.eql(u8, field.field, "_id")) continue;
+        if (i + 1 != order_by.len) return true;
+        if (field.desc orelse false) return true;
+    }
+    return false;
+}
 
 fn metadataSortCursorFeedback(
     alloc: std.mem.Allocator,
@@ -7125,6 +7191,67 @@ test "query builder preflight reports cursor shape diagnostics directly" {
     try std.testing.expectEqualStrings("invalid_sort_cursor", both_preflight.diagnostics[0].code);
     try std.testing.expectEqualStrings("query_request", both_preflight.diagnostics[0].path);
     try std.testing.expect(std.mem.indexOf(u8, both_preflight.diagnostics[0].message, "both search_after and search_before") != null);
+}
+
+test "query builder preflight reports sort tuple shape diagnostics directly" {
+    const capabilities = [_]QueryBuilderFieldCapability{.{
+        .field = "created_at",
+        .field_type = .datetime,
+        .sortable = true,
+        .sort_lifecycle_state = "queryable",
+    }};
+    var collected = collectQueryBuilderContext(.{
+        .schema_fields = &.{"created_at"},
+        .field_capabilities = &capabilities,
+    });
+
+    const duplicate_order = [_]metadata_openapi.SortField{
+        .{ .field = "created_at", .desc = true },
+        .{ .field = "created_at", .desc = false },
+    };
+    var duplicate_preflight = try preflightQueryRequest(std.testing.allocator, &collected, .{
+        .intent = "newest docs with duplicate sort",
+    }, .{
+        .order_by = &duplicate_order,
+    }, null, "query_builder", .{});
+    defer duplicate_preflight.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), duplicate_preflight.diagnostics.len);
+    try std.testing.expectEqualStrings("invalid_sort_field", duplicate_preflight.diagnostics[0].code);
+    try std.testing.expectEqualStrings("query_request.order_by", duplicate_preflight.diagnostics[0].path);
+    try std.testing.expect(std.mem.indexOf(u8, duplicate_preflight.diagnostics[0].message, "repeats sort field 'created_at'") != null);
+
+    const misplaced_id_order = [_]metadata_openapi.SortField{
+        .{ .field = "_id", .desc = false },
+        .{ .field = "created_at", .desc = true },
+    };
+    var misplaced_id_preflight = try preflightQueryRequest(std.testing.allocator, &collected, .{
+        .intent = "newest docs with explicit id first",
+    }, .{
+        .order_by = &misplaced_id_order,
+    }, null, "query_builder", .{});
+    defer misplaced_id_preflight.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), misplaced_id_preflight.diagnostics.len);
+    try std.testing.expectEqualStrings("invalid_sort_field", misplaced_id_preflight.diagnostics[0].code);
+    try std.testing.expectEqualStrings("query_request.order_by", misplaced_id_preflight.diagnostics[0].path);
+    try std.testing.expect(std.mem.indexOf(u8, misplaced_id_preflight.diagnostics[0].message, "final stable tie-breaker") != null);
+
+    const descending_id_order = [_]metadata_openapi.SortField{.{
+        .field = "_id",
+        .desc = true,
+    }};
+    var descending_id_preflight = try preflightQueryRequest(std.testing.allocator, &collected, .{
+        .intent = "docs with descending id",
+    }, .{
+        .order_by = &descending_id_order,
+    }, null, "query_builder", .{});
+    defer descending_id_preflight.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), descending_id_preflight.diagnostics.len);
+    try std.testing.expectEqualStrings("invalid_sort_field", descending_id_preflight.diagnostics[0].code);
+    try std.testing.expectEqualStrings("query_request.order_by", descending_id_preflight.diagnostics[0].path);
+    try std.testing.expect(std.mem.indexOf(u8, descending_id_preflight.diagnostics[0].message, "_id tie-breaker must be ascending") != null);
 }
 
 test "query builder preflight rejects declared sort field before sortable runtime coverage" {

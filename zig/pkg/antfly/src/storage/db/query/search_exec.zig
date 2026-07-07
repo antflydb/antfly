@@ -1558,7 +1558,6 @@ fn effectiveSortRequestAlloc(alloc: Allocator, req: types.SearchRequest) !Effect
 
 fn rejectApproximateSortPageOptions(req: types.SearchRequest) !void {
     if (requestHasSortPageOptions(req)) {
-        if (requestHasVectorScoreOrderOnly(req)) return;
         logNativeSortPlanRejection(
             approximateSortPageDiagnosticField(req),
             nativeSortPlanRejectionReasonName(.approximate_candidate_source),
@@ -13104,7 +13103,7 @@ test "score sort source detection rejects non-scoring text queries" {
     });
 }
 
-test "score sort source detection treats vector sources as score-bearing for public validation" {
+test "vector score order helper is limited to internal score tuple decoration" {
     const score_order = [_]types.SortField{.{ .field = "_score", .desc = true }};
     const effective_score_order = [_]types.SortField{
         .{ .field = "_score", .desc = true },
@@ -15851,6 +15850,21 @@ test "dense and sparse search reject unsupported exact sort page options" {
     try std.testing.expectEqualStrings("created_at", dense_diagnostic.field);
     try std.testing.expectEqualStrings("approximate_candidate_source", dense_diagnostic.reason);
     try std.testing.expectEqualStrings("approximate_candidate_source", dense_diagnostic.detail);
+
+    const score_order = [_]types.SortField{.{ .field = "_score", .desc = true }};
+    recordSortRejectionDiagnostic("stale_field", "stale_reason", "stale_detail");
+    try std.testing.expectError(error.UnsupportedQueryRequest, searchDense(alloc, .{
+        .order_by = &score_order,
+        .include_stored = false,
+        .limit = 10,
+    }, .{
+        .vector = &dense_vector,
+        .k = 10,
+    }, testDenseConstraintExecutor()));
+    const score_diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("_score", score_diagnostic.field);
+    try std.testing.expectEqualStrings("approximate_candidate_source", score_diagnostic.reason);
+    try std.testing.expectEqualStrings("approximate_candidate_source", score_diagnostic.detail);
 
     recordSortRejectionDiagnostic("stale_field", "stale_reason", "stale_detail");
     try std.testing.expectError(error.UnsupportedQueryRequest, searchSparse(alloc, .{
