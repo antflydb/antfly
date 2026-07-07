@@ -3621,6 +3621,7 @@ pub fn build(b: *std.Build) void {
             "api http server serves api key and row filter routes",
             "api http server returns json user auth errors",
             "document artifact routes declare read and admin permissions",
+            "api http server marks table repair job failed when background submit is closing",
             "api http server serves mcp and a2a protocol surfaces",
             "api http server serves ARD catalogs with public bootstrap and authenticated tenant entries",
             "api http server requires auth for ARD tenant catalog when auth is enabled",

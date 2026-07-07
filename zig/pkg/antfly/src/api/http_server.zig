@@ -7665,11 +7665,9 @@ pub const ApiHttpServer = struct {
         }) catch |err| {
             TableRepairJobPassWork.deinit(work);
             work_consumed = true;
-            const failed = try self.repair_job_store.markPhase(self.alloc, blk: {
-                var parsed = try std.json.parseFromSlice(repair_jobs.JobState, self.alloc, running_encoded, .{ .ignore_unknown_fields = true });
-                defer parsed.deinit();
-                break :blk parsed.value;
-            }, .failed, @errorName(err));
+            var parsed = try std.json.parseFromSlice(repair_jobs.JobState, self.alloc, running_encoded, .{ .ignore_unknown_fields = true });
+            defer parsed.deinit();
+            const failed = try self.repair_job_store.markPhase(self.alloc, parsed.value, .failed, @errorName(err));
             defer self.alloc.free(failed);
             std.log.err("failed to submit table repair job table={s} job_id={d} err={}", .{ table_name, job_id, err });
             return try self.repair_job_store.loadJobAlloc(self.alloc, job_id) orelse try self.alloc.dupe(u8, failed);
@@ -9027,6 +9025,51 @@ test "required permissions decode table path resources" {
         try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
     }
     try std.testing.expectError(error.InvalidArgument, requiredPermissionForRequest(std.testing.allocator, .GET, "/tables/docs%ZZ/artifacts"));
+}
+
+test "api http server marks table repair job failed when background submit is closing" {
+    if (@import("builtin").os.tag == .freestanding) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer runtime.deinit();
+
+    const DummyStatus = struct {
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+    };
+
+    var server = ApiHttpServer.init(alloc, .{
+        .backend_runtime = runtime.ptr(),
+    }, .{
+        .ptr = undefined,
+        .vtable = &.{ .status = DummyStatus.status },
+    }, null, null);
+    defer server.deinit();
+
+    const started = try server.repair_job_store.startJob(alloc, "docs", .{
+        .target = "artifact",
+        .limit = 1,
+    });
+    defer alloc.free(started);
+    var parsed_started = try std.json.parseFromSlice(repair_jobs.JobState, alloc, started, .{ .ignore_unknown_fields = true });
+    defer parsed_started.deinit();
+
+    const begin = try server.repair_job_store.beginAdvance(alloc, parsed_started.value);
+    defer alloc.free(begin.encoded);
+    try std.testing.expect(begin.started);
+    var parsed_running = try std.json.parseFromSlice(repair_jobs.JobState, alloc, begin.encoded, .{ .ignore_unknown_fields = true });
+    defer parsed_running.deinit();
+
+    runtime.ptr().durable_jobs.closeOwner(server.repair_job_owner_id);
+    const updated = (try server.submitTableRepairJobPass("docs", begin.encoded, parsed_running.value.job_id)).?;
+    defer alloc.free(updated);
+
+    var parsed_updated = try std.json.parseFromSlice(repair_jobs.JobState, alloc, updated, .{ .ignore_unknown_fields = true });
+    defer parsed_updated.deinit();
+    try std.testing.expectEqualStrings("failed", parsed_updated.value.phase);
+    try std.testing.expectEqualStrings("BackgroundOwnerClosing", parsed_updated.value.last_error.?);
 }
 
 fn base64UrlDecodeAlloc(alloc: std.mem.Allocator, value: []const u8) ![]u8 {
