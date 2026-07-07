@@ -4,11 +4,11 @@
 pub const types = @import("types.zig");
 
 pub const EvalConfig = types.EvalConfig;
-pub const EvaluatorName = types.EvaluatorName;
-pub const GroundTruth = types.GroundTruth;
 pub const EvalOptions = types.EvalOptions;
+pub const EvalRequest = types.EvalRequest;
 pub const EvalResult = types.EvalResult;
 pub const EvalScores = types.EvalScores;
-pub const EvaluatorScore = types.EvaluatorScore;
 pub const EvalSummary = types.EvalSummary;
-pub const EvalRequest = types.EvalRequest;
+pub const EvaluatorName = types.EvaluatorName;
+pub const EvaluatorScore = types.EvaluatorScore;
+pub const GroundTruth = types.GroundTruth;

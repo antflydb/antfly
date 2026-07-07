@@ -38,7 +38,7 @@ require (
 	github.com/antchfx/htmlquery v1.3.6 // indirect
 	github.com/antchfx/xmlquery v1.5.0 // indirect
 	github.com/antchfx/xpath v1.3.6 // indirect
-	github.com/antflydb/antfly/go/pkg/generating v0.0.0-20260707135339-05a2b0b8ac61 // indirect
+	github.com/antflydb/antfly/go/pkg/generating v0.0.0 // indirect
 	github.com/apapsch/go-jsonmerge/v2 v2.0.0 // indirect
 	github.com/bahlo/generic-list-go v0.2.0 // indirect
 	github.com/bits-and-blooms/bitset v1.24.4 // indirect

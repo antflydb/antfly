@@ -3,13 +3,13 @@
 
 pub const types = @import("types.zig");
 
-pub const TextContent = types.TextContent;
+pub const AudioChunkOptions = types.AudioChunkOptions;
 pub const BinaryContent = types.BinaryContent;
 pub const Chunk = types.Chunk;
-pub const TextChunkOptions = types.TextChunkOptions;
-pub const AudioChunkOptions = types.AudioChunkOptions;
 pub const ChunkOptions = types.ChunkOptions;
-pub const VADOptions = types.VADOptions;
 pub const InferenceAudioChunkConfig = types.InferenceAudioChunkConfig;
 pub const InferenceChunkConfig = types.InferenceChunkConfig;
 pub const InferenceChunkRequest = types.InferenceChunkRequest;
+pub const TextChunkOptions = types.TextChunkOptions;
+pub const TextContent = types.TextContent;
+pub const VADOptions = types.VADOptions;

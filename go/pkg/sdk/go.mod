@@ -27,7 +27,7 @@ require (
 )
 
 require (
-	github.com/antflydb/antfly/go/pkg/generating v0.0.0-20260707135339-05a2b0b8ac61 // indirect
+	github.com/antflydb/antfly/go/pkg/generating v0.0.0 // indirect
 	github.com/apapsch/go-jsonmerge/v2 v2.0.0 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/dprotaso/go-yit v0.0.0-20250909171706-0a81c39169bc // indirect

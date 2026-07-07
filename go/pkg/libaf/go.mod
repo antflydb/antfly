@@ -15,7 +15,7 @@ replace (
 )
 
 require (
-	github.com/antflydb/antfly/go/pkg/generating v0.0.0-20260707135339-05a2b0b8ac61
+	github.com/antflydb/antfly/go/pkg/generating v0.0.0
 	github.com/minio/minio-go/v7 v7.0.99
 	github.com/oapi-codegen/runtime v1.3.0
 	github.com/prometheus/client_golang v1.23.2
