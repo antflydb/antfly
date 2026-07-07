@@ -6719,6 +6719,21 @@ const MatchAllSortStreamContext = struct {
     total_hits: u32 = 0,
 };
 
+const MatchAllCountStreamContext = struct {
+    alloc: Allocator,
+    req: types.SearchRequest,
+    accepted_count: usize = 0,
+};
+
+fn countMatchAllSortCandidate(ctx: ?*anyopaque, candidate: MatchAllCandidate) !void {
+    const count_ctx: *MatchAllCountStreamContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+    var owned_candidate = candidate;
+    defer owned_candidate.deinit(count_ctx.alloc);
+
+    count_ctx.accepted_count += 1;
+    if (count_ctx.accepted_count % 1024 == 0) try checkSearchRequestDeadline(count_ctx.req);
+}
+
 fn consumeMatchAllSortCandidate(ctx: ?*anyopaque, candidate: MatchAllCandidate) !void {
     const stream_ctx: *MatchAllSortStreamContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
     const alloc = stream_ctx.alloc;
@@ -6796,6 +6811,37 @@ fn sortAndPageMatchAllCandidateStreamAlloc(
     const collect_stream = executor.collect_candidates_stream orelse return rejectSortCandidateStreamUnavailable(plan);
     const bench_query_profile = shouldLogBenchQueryProfile();
     const collect_sort_profile = bench_query_profile or effective_req.profile;
+    if (effective_req.limit == 0) {
+        var count_ctx = MatchAllCountStreamContext{
+            .alloc = alloc,
+            .req = effective_req,
+        };
+        var count_options = options;
+        count_options.candidate_limit = null;
+        count_options.stop_after_accepted = null;
+        const stream_stats = try collect_stream(executor.ctx, alloc, effective_req, count_options, &count_ctx, countMatchAllSortCandidate);
+        try checkSearchRequestDeadline(effective_req);
+        const total_hits = boundedU32(count_ctx.accepted_count);
+        var profile = SortCollectorProfile{};
+        if (collect_sort_profile) {
+            profile.candidate_count = @intCast(@min(count_ctx.accepted_count, @as(usize, std.math.maxInt(u64))));
+            profile.window_capacity = 0;
+            profile.window_len = 0;
+            profile.total_ns = 0;
+        }
+        if (bench_query_profile) {
+            logBenchSortCollectorProfile(effective_req, plan, native_loader != null, profile);
+        }
+        return .{
+            .alloc = alloc,
+            .hits = &.{},
+            .total_hits = total_hits,
+            .total_hits_relation = if (stream_stats.stopped_early or count_options.primary_key_stop_before != null or count_ctx.accepted_count > std.math.maxInt(u32)) .gte else .exact,
+            .sort_profile = if (collect_sort_profile) sortResultProfile(effective_req, plan, native_loader != null, profile) else null,
+            .graph_results = &.{},
+        };
+    }
+
     const sort_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
     var profile = SortCollectorProfile{};
     const window_capacity = sortWindowCapacity(effective_req);
@@ -9493,6 +9539,20 @@ fn sortAndPageTextDocValueDocNumsAlloc(
     });
     try checkSearchRequestDeadline(effective_req);
 
+    const bench_query_profile = shouldLogBenchQueryProfile();
+    const collect_sort_profile = bench_query_profile or effective_req.profile;
+    if (effective_req.limit == 0) {
+        const visible_total = try visibleTextDocNumCount(alloc, effective_req, snapshot, doc_nums, executor);
+        return .{
+            .alloc = alloc,
+            .hits = &.{},
+            .total_hits = boundedU32(visible_total),
+            .total_hits_relation = if (visible_total > std.math.maxInt(u32)) .gte else .exact,
+            .sort_profile = if (collect_sort_profile) sortResultProfile(effective_req, plan, true, .{ .window_capacity = 0 }) else null,
+            .graph_results = &.{},
+        };
+    }
+
     const exact_candidate_budget = lateVisibilityExactCandidateBudget();
     const candidate_count = boundedU32(doc_nums.len);
     enforceLateVisibilityExactCandidateBudget(candidate_count, exact_candidate_budget) catch |err| {
@@ -9507,8 +9567,6 @@ fn sortAndPageTextDocValueDocNumsAlloc(
         return err;
     };
 
-    const bench_query_profile = shouldLogBenchQueryProfile();
-    const collect_sort_profile = bench_query_profile or effective_req.profile;
     const sort_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
     var profile = SortCollectorProfile{};
     const window_capacity = sortWindowCapacity(effective_req);
@@ -9633,6 +9691,25 @@ fn sortAndPageTextDocValueDocNumsAlloc(
         logBenchProjectedSourceLoadProfile(effective_req, plan, "text", source_profile);
     }
     return out;
+}
+
+fn visibleTextDocNumCount(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    snapshot: *const index_mod.IndexSnapshot,
+    doc_nums: []const u32,
+    executor: SearchTextQueryExecutor,
+) !usize {
+    if (executor.is_expired_key == null) return doc_nums.len;
+
+    var visible_count: usize = 0;
+    for (doc_nums, 0..) |doc_num, i| {
+        if (i % 1024 == 0) try checkSearchRequestDeadline(req);
+        const stored = snapshot.storedDoc(doc_num) orelse return error.StoredDocMissing;
+        if (try executor.is_expired_key.?(executor.ctx, alloc, stored.id)) continue;
+        visible_count += 1;
+    }
+    return visible_count;
 }
 
 pub fn searchTextQuery(
@@ -12756,6 +12833,27 @@ fn sortAndPageMatchAllOrdinalDocValueCandidatesAlloc(
         .load = loadTextDocValueSortValue,
     });
     try checkSearchRequestDeadline(effective_req);
+    const bench_query_profile = shouldLogBenchQueryProfile();
+    const collect_sort_profile = bench_query_profile or effective_req.profile;
+    if (effective_req.limit == 0) {
+        const visible_total = try visibleMatchAllOrdinalDocValueCandidateCount(
+            alloc,
+            effective_req,
+            executor,
+            snapshot,
+            constraints,
+            ordinal_to_text_doc_id,
+        );
+        return .{
+            .alloc = alloc,
+            .hits = &.{},
+            .total_hits = boundedU32(visible_total),
+            .total_hits_relation = if (visible_total > std.math.maxInt(u32)) .gte else .exact,
+            .sort_profile = if (collect_sort_profile) sortResultProfile(effective_req, plan, true, .{ .window_capacity = 0 }) else null,
+            .graph_results = &.{},
+        };
+    }
+
     const exact_candidate_budget = lateVisibilityExactCandidateBudget();
     const candidate_count = boundedU32(constraints.filter_doc_nums.len);
     enforceLateVisibilityExactCandidateBudget(candidate_count, exact_candidate_budget) catch |err| {
@@ -12770,8 +12868,6 @@ fn sortAndPageMatchAllOrdinalDocValueCandidatesAlloc(
         return err;
     };
 
-    const bench_query_profile = shouldLogBenchQueryProfile();
-    const collect_sort_profile = bench_query_profile or effective_req.profile;
     const sort_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
     var profile = SortCollectorProfile{};
     const window_capacity = sortWindowCapacity(effective_req);
@@ -12908,6 +13004,35 @@ fn sortAndPageMatchAllOrdinalDocValueCandidatesAlloc(
         logBenchProjectedSourceLoadProfile(effective_req, plan, "match_all", source_profile);
     }
     return out;
+}
+
+fn visibleMatchAllOrdinalDocValueCandidateCount(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: MatchAllExecutor,
+    snapshot: *const index_mod.IndexSnapshot,
+    constraints: *const NativeDocIdConstraints,
+    ordinal_to_text_doc_id: *const std.AutoHashMapUnmanaged(doc_set.DocOrdinal, u32),
+) !usize {
+    var visible_count: usize = 0;
+    for (constraints.filter_doc_nums, 0..) |ordinal, i| {
+        if (i % 1024 == 0) try checkSearchRequestDeadline(req);
+        if (containsDocNum(constraints.exclude_doc_nums, ordinal)) continue;
+        const doc_num = ordinal_to_text_doc_id.get(ordinal) orelse {
+            logNativeSortPlanRejection(
+                "*",
+                nativeSortPlanRejectionReasonName(.missing_doc_values_capability),
+                "doc_ordinal_projection_unavailable",
+            );
+            return error.UnsupportedQueryRequest;
+        };
+        const stored = snapshot.storedDoc(doc_num) orelse return error.StoredDocMissing;
+        if (executor.is_expired_key) |is_expired| {
+            if (try is_expired(executor.ctx, alloc, stored.id)) continue;
+        }
+        visible_count += 1;
+    }
+    return visible_count;
 }
 
 fn planMatchAllSortBeforeCandidatesAlloc(
@@ -20879,6 +21004,195 @@ test "match_all native ordinal doc values path enforces exact candidate budget" 
     try std.testing.expectEqualStrings("ft", diagnostic.field);
     try std.testing.expectEqualStrings("candidate_budget_exceeded", diagnostic.reason);
     try std.testing.expectEqualStrings("match_all_exact_candidate_window", diagnostic.detail);
+}
+
+test "text doc values sort zero limit avoids budget and decoration" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/text-doc-values-zero-limit", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    const docs = [_]TestSortedPriceDoc{
+        .{ .id = "doc:a", .price = 1.0, .ordinal = 1001 },
+        .{ .id = "doc:b", .price = 2.0, .ordinal = 1002 },
+        .{ .id = "doc:c", .price = 3.0, .ordinal = 1003 },
+    };
+
+    var persistent = try persistent_mod.PersistentIndex.open(alloc, .{
+        .path = path_z.ptr,
+        .main_backend = .lsm_memory,
+    });
+    var persistent_owned = true;
+    errdefer if (persistent_owned) persistent.close();
+
+    const segment = try buildTestSortedPriceSegmentAlloc(alloc, &docs);
+    defer alloc.free(segment);
+    try persistent.writer.addSegment(segment);
+
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
+        .chunk_name = null,
+        .text_analysis = .{},
+        .runtime_schema = testSortedPriceSchema(),
+        .rebuild_root_path = "",
+        .persistent = persistent,
+    };
+    persistent_owned = false;
+    defer text_entry.persistent.close();
+
+    const doc_nums = [_]u32{ 0, 1, 2 };
+    const order_by = [_]types.SortField{.{ .field = "price" }};
+    const plan = SortExecutionPlan{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .runtime_schema = text_entry.runtime_schema,
+    };
+    const executor = SearchTextQueryExecutor{
+        .ctx = null,
+        .text_index_entry = undefined,
+        .text_index_is_chunk_backed = undefined,
+        .search_match_all = undefined,
+        .project_stored_search = undefined,
+        .load_stored = testUnexpectedLoadStoredCallback,
+        .postprocess = undefined,
+    };
+
+    const c = struct {
+        extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    const budget_env = "ANTFLY_TEXT_LATE_VISIBILITY_EXACT_CANDIDATE_BUDGET";
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(budget_env, "1", 1));
+    defer _ = c.unsetenv(budget_env);
+
+    var result = try sortAndPageTextDocValueDocNumsAlloc(
+        alloc,
+        .{
+            .index_name = "ft",
+            .order_by = &order_by,
+            .include_stored = false,
+            .profile = true,
+            .limit = 0,
+        },
+        text_entry.persistent.snapshot(),
+        &doc_nums,
+        executor,
+        plan,
+    );
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), result.hits.len);
+    try std.testing.expectEqual(@as(u32, 3), result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, result.total_hits_relation);
+    const profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", profile.plan);
+    try std.testing.expectEqual(@as(u64, 0), profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 0), profile.native_doc_value_hit_count);
+    try std.testing.expectEqual(@as(u64, 0), profile.native_doc_value_miss_count);
+}
+
+test "match_all native ordinal doc values zero limit avoids budget and decoration" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/match-all-ordinal-doc-values-zero-limit", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    const docs = [_]TestSortedPriceDoc{
+        .{ .id = "doc:a", .price = 1.0, .ordinal = 1001 },
+        .{ .id = "doc:b", .price = 2.0, .ordinal = 1002 },
+        .{ .id = "doc:c", .price = 3.0, .ordinal = 1003 },
+    };
+
+    var persistent = try persistent_mod.PersistentIndex.open(alloc, .{
+        .path = path_z.ptr,
+        .main_backend = .lsm_memory,
+    });
+    var persistent_owned = true;
+    errdefer if (persistent_owned) persistent.close();
+
+    const segment = try buildTestSortedPriceSegmentAlloc(alloc, &docs);
+    defer alloc.free(segment);
+    try persistent.writer.addSegment(segment);
+
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
+        .chunk_name = null,
+        .text_analysis = .{},
+        .runtime_schema = testSortedPriceSchema(),
+        .rebuild_root_path = "",
+        .persistent = persistent,
+    };
+    persistent_owned = false;
+    defer text_entry.persistent.close();
+
+    var ordinal_to_text_doc_id = std.AutoHashMapUnmanaged(doc_set.DocOrdinal, u32).empty;
+    defer ordinal_to_text_doc_id.deinit(alloc);
+    try std.testing.expect(try buildAllOrdinalTextDocIdMapAlloc(alloc, text_entry.persistent.snapshot(), &ordinal_to_text_doc_id));
+
+    const filter_doc_nums = [_]u32{ 1001, 1002, 1003 };
+    const constraints = NativeDocIdConstraints{
+        .positive_filter = true,
+        .filter_doc_nums = &filter_doc_nums,
+    };
+    const order_by = [_]types.SortField{.{ .field = "price" }};
+    const plan = SortExecutionPlan{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .runtime_schema = text_entry.runtime_schema,
+    };
+    const executor = MatchAllExecutor{
+        .ctx = null,
+        .collect_candidates = undefined,
+        .text_index_entry = undefined,
+        .load_projected_document = undefined,
+        .load_stored = testUnexpectedLoadStoredCallback,
+    };
+
+    const c = struct {
+        extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    const budget_env = "ANTFLY_TEXT_LATE_VISIBILITY_EXACT_CANDIDATE_BUDGET";
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(budget_env, "1", 1));
+    defer _ = c.unsetenv(budget_env);
+
+    var result = try sortAndPageMatchAllOrdinalDocValueCandidatesAlloc(
+        alloc,
+        .{
+            .index_name = "ft",
+            .order_by = &order_by,
+            .include_stored = false,
+            .profile = true,
+            .limit = 0,
+        },
+        executor,
+        text_entry.persistent.snapshot(),
+        &constraints,
+        plan,
+        &ordinal_to_text_doc_id,
+    );
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), result.hits.len);
+    try std.testing.expectEqual(@as(u32, 3), result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, result.total_hits_relation);
+    const profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", profile.plan);
+    try std.testing.expectEqual(@as(u64, 0), profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 0), profile.native_doc_value_hit_count);
+    try std.testing.expectEqual(@as(u64, 0), profile.native_doc_value_miss_count);
 }
 
 test "native doc values sort plan requires runtime schema" {

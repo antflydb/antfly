@@ -8445,13 +8445,30 @@ export interface components {
             field?: string;
             boost?: components["schemas"]["Boost"];
         };
-        /** @description Geographic bounding box filter. Longitude ranges may cross the antimeridian by specifying a western/min longitude that is greater than the eastern/max longitude; for example, 179.5 to -179.5 matches points near +/-180 degrees longitude. */
+        /** @description Geographic bounding box filter. The public query shape uses scalar latitude and longitude bounds to match structured filter_query.geo_bbox. Longitude ranges may cross the antimeridian by specifying a western/min longitude that is greater than the eastern/max longitude; for example, min_lon 179.5 and max_lon -179.5 matches points near +/-180 degrees longitude. Latitude bounds must be ordered with min_lat <= max_lat. */
         GeoBoundingBoxQuery: {
-            /** @description [lon, lat] */
-            top_left: number[];
-            /** @description [lon, lat] */
-            bottom_right: number[];
-            field?: string;
+            /** @description Field or path containing geo_point values. */
+            field: string;
+            /**
+             * Format: double
+             * @description Southern latitude bound.
+             */
+            min_lat: number;
+            /**
+             * Format: double
+             * @description Western longitude bound. If greater than max_lon, the box crosses the antimeridian.
+             */
+            min_lon: number;
+            /**
+             * Format: double
+             * @description Northern latitude bound. Must be greater than or equal to min_lat.
+             */
+            max_lat: number;
+            /**
+             * Format: double
+             * @description Eastern longitude bound. May be less than min_lon for antimeridian-wrapped boxes.
+             */
+            max_lon: number;
             boost?: components["schemas"]["Boost"];
         };
         GeoDistanceQuery: {

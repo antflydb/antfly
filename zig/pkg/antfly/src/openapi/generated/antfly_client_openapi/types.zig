@@ -5268,13 +5268,18 @@ pub const IPRangeQuery = struct {
     boost: ?Boost = null,
 };
 
-/// Geographic bounding box filter. Longitude ranges may cross the antimeridian by specifying a western/min longitude that is greater than the eastern/max longitude; for example, 179.5 to -179.5 matches points near +/-180 degrees longitude.
+/// Geographic bounding box filter. The public query shape uses scalar latitude and longitude bounds to match structured filter_query.geo_bbox. Longitude ranges may cross the antimeridian by specifying a western/min longitude that is greater than the eastern/max longitude; for example, min_lon 179.5 and max_lon -179.5 matches points near +/-180 degrees longitude. Latitude bounds must be ordered with min_lat <= max_lat.
 pub const GeoBoundingBoxQuery = struct {
-    /// [lon, lat]
-    top_left: []const f64,
-    /// [lon, lat]
-    bottom_right: []const f64,
-    field: ?[]const u8 = null,
+    /// Field or path containing geo_point values.
+    field: []const u8,
+    /// Southern latitude bound.
+    min_lat: f64,
+    /// Western longitude bound. If greater than max_lon, the box crosses the antimeridian.
+    min_lon: f64,
+    /// Northern latitude bound. Must be greater than or equal to min_lat.
+    max_lat: f64,
+    /// Eastern longitude bound. May be less than min_lon for antimeridian-wrapped boxes.
+    max_lon: f64,
     boost: ?Boost = null,
 };
 
@@ -7832,12 +7837,12 @@ pub const Query = union(enum) {
     date_range_string_query: *DateRangeStringQuery,
     match_query: *MatchQuery,
     boolean_query: *BooleanQuery,
+    geo_bounding_box_query: *GeoBoundingBoxQuery,
     numeric_range_query: *NumericRangeQuery,
     term_range_query: *TermRangeQuery,
     fuzzy_query: *FuzzyQuery,
     match_phrase_query: *MatchPhraseQuery,
     disjunction_query: *DisjunctionQuery,
-    geo_bounding_box_query: *GeoBoundingBoxQuery,
     geo_distance_query: *GeoDistanceQuery,
     multi_phrase_query: *MultiPhraseQuery,
     phrase_query: *PhraseQuery,
@@ -7902,6 +7907,14 @@ pub const Query = union(enum) {
             if (try parseStructuralVariant(BooleanQuery, allocator, source, options)) |parsed| return .{ .boolean_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
+            "min_lat",
+            "min_lon",
+            "max_lat",
+            "max_lon",
+        })) {
+            if (try parseStructuralVariant(GeoBoundingBoxQuery, allocator, source, options)) |parsed| return .{ .geo_bounding_box_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
             "min",
             "max",
             "inclusive_min",
@@ -7936,12 +7949,6 @@ pub const Query = union(enum) {
             "min",
         })) {
             if (try parseStructuralVariant(DisjunctionQuery, allocator, source, options)) |parsed| return .{ .disjunction_query = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
-            "top_left",
-            "bottom_right",
-        })) {
-            if (try parseStructuralVariant(GeoBoundingBoxQuery, allocator, source, options)) |parsed| return .{ .geo_bounding_box_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
             "location",
@@ -8039,12 +8046,12 @@ pub const Query = union(enum) {
             .date_range_string_query => |v| try jw.write(v.*),
             .match_query => |v| try jw.write(v.*),
             .boolean_query => |v| try jw.write(v.*),
+            .geo_bounding_box_query => |v| try jw.write(v.*),
             .numeric_range_query => |v| try jw.write(v.*),
             .term_range_query => |v| try jw.write(v.*),
             .fuzzy_query => |v| try jw.write(v.*),
             .match_phrase_query => |v| try jw.write(v.*),
             .disjunction_query => |v| try jw.write(v.*),
-            .geo_bounding_box_query => |v| try jw.write(v.*),
             .geo_distance_query => |v| try jw.write(v.*),
             .multi_phrase_query => |v| try jw.write(v.*),
             .phrase_query => |v| try jw.write(v.*),

@@ -347,22 +347,28 @@ export function geoDistance(
  *
  * @example
  * geoBoundingBox("location", {
- *   top_left: { lon: -122.5, lat: 37.9 },
- *   bottom_right: { lon: -122.3, lat: 37.7 }
+ *   min_lat: 37.7,
+ *   min_lon: -122.5,
+ *   max_lat: 37.9,
+ *   max_lon: -122.3
  * })
  */
 export function geoBoundingBox(
   field: string,
   bounds: {
-    top_left: { lon: number; lat: number };
-    bottom_right: { lon: number; lat: number };
+    min_lat: number;
+    min_lon: number;
+    max_lat: number;
+    max_lon: number;
   },
   boost?: number
 ): Query {
   return {
     field,
-    top_left: bounds.top_left,
-    bottom_right: bounds.bottom_right,
+    min_lat: bounds.min_lat,
+    min_lon: bounds.min_lon,
+    max_lat: bounds.max_lat,
+    max_lon: bounds.max_lon,
     boost: boost ?? undefined,
   } as Query;
 }
