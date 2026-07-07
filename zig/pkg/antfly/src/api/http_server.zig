@@ -4859,6 +4859,7 @@ pub const ApiHttpServer = struct {
                     .sortable = capability.sortable,
                     .doc_value_coverage = capability.doc_value_coverage,
                     .queryability_state = capability.queryability_state,
+                    .sort_lifecycle_state = capability.sort_lifecycle_state,
                     .provenance = capability.provenance,
                     .index_sort_position = if (capability.index_sort) |membership| membership.position else null,
                     .index_sort_order = if (capability.index_sort) |membership| if (membership.desc) "desc" else "asc" else null,
@@ -4875,6 +4876,7 @@ pub const ApiHttpServer = struct {
                     .sortable = capability.sortable,
                     .doc_value_coverage = capability.doc_value_coverage,
                     .queryability_state = capability.queryability_state,
+                    .sort_lifecycle_state = capability.sort_lifecycle_state,
                     .provenance = capability.provenance,
                     .index_sort_position = if (capability.index_sort) |membership| membership.position else null,
                     .index_sort_order = if (capability.index_sort) |membership| if (membership.desc) "desc" else "asc" else null,
@@ -8178,6 +8180,7 @@ fn freeQueryBuilderFieldCapability(
     alloc.free(@constCast(capability.field));
     alloc.free(@constCast(capability.doc_value_coverage));
     alloc.free(@constCast(capability.queryability_state));
+    alloc.free(@constCast(capability.sort_lifecycle_state));
     alloc.free(@constCast(capability.provenance));
     if (capability.index_sort_order) |value| alloc.free(@constCast(value));
 }
@@ -8193,6 +8196,8 @@ fn appendQueryBuilderFieldCapability(
     errdefer alloc.free(owned_coverage);
     const owned_queryability = try alloc.dupe(u8, capability.queryability_state);
     errdefer alloc.free(owned_queryability);
+    const owned_lifecycle = try alloc.dupe(u8, capability.sort_lifecycle_state);
+    errdefer alloc.free(owned_lifecycle);
     const owned_provenance = try alloc.dupe(u8, capability.provenance);
     errdefer alloc.free(owned_provenance);
     const owned_index_sort_order = if (capability.index_sort_order) |value| try alloc.dupe(u8, value) else null;
@@ -8204,6 +8209,7 @@ fn appendQueryBuilderFieldCapability(
         .sortable = capability.sortable,
         .doc_value_coverage = owned_coverage,
         .queryability_state = owned_queryability,
+        .sort_lifecycle_state = owned_lifecycle,
         .provenance = owned_provenance,
         .index_sort_position = capability.index_sort_position,
         .index_sort_order = owned_index_sort_order,
@@ -10943,6 +10949,7 @@ test "api http public sort capability gate validates mapped sortable fields" {
     });
     covered_created.doc_value_coverage = "covered";
     covered_created.queryability_state = "queryable";
+    storage_schema.refreshSortLifecycleState(&covered_created);
     const covered_created_set = table_reads.ObservedDynamicFieldCapabilitySet{
         .index_name = @constCast("full_text_index_v0"),
         .field_capabilities = @constCast((&[_]storage_schema.FieldCapability{covered_created})[0..]),
@@ -11206,6 +11213,7 @@ test "api http public sort capability gate fails closed for uncovered observed d
     });
     covered.doc_value_coverage = "covered";
     covered.queryability_state = "queryable";
+    storage_schema.refreshSortLifecycleState(&covered);
     const covered_set = table_reads.ObservedDynamicFieldCapabilitySet{
         .index_name = @constCast("full_text_index_v0"),
         .field_capabilities = @constCast((&[_]storage_schema.FieldCapability{covered})[0..]),

@@ -813,6 +813,37 @@ fn queryabilityStateRank(value: []const u8) u8 {
     return 0;
 }
 
+pub fn sortLifecycleStateName(capability: FieldCapability) []const u8 {
+    if (!capability.sortable) return "unsupported";
+    if (std.mem.eql(u8, capability.queryability_state, "queryable")) {
+        return if (capability.index_sort != null) "accelerated" else "queryable";
+    }
+    if (std.mem.eql(u8, capability.doc_value_coverage, "covered") or
+        std.mem.eql(u8, capability.doc_value_coverage, "identity_metadata"))
+    {
+        return "covered";
+    }
+    if (capability.doc_values and std.mem.eql(u8, capability.doc_value_coverage, "observed_declared")) return "indexed";
+    return "declared";
+}
+
+pub fn refreshSortLifecycleState(capability: *FieldCapability) void {
+    capability.sort_lifecycle_state = sortLifecycleStateName(capability.*);
+}
+
+pub fn conservativeSortLifecycleState(left: []const u8, right: []const u8) []const u8 {
+    return if (sortLifecycleStateRank(left) <= sortLifecycleStateRank(right)) left else right;
+}
+
+fn sortLifecycleStateRank(value: []const u8) u8 {
+    if (std.mem.eql(u8, value, "accelerated")) return 5;
+    if (std.mem.eql(u8, value, "queryable")) return 4;
+    if (std.mem.eql(u8, value, "covered")) return 3;
+    if (std.mem.eql(u8, value, "indexed")) return 2;
+    if (std.mem.eql(u8, value, "declared")) return 1;
+    return 0;
+}
+
 pub const IndexSortMembership = struct {
     position: usize,
     desc: bool,
@@ -836,6 +867,7 @@ pub const FieldCapability = struct {
     provenance: []const u8,
     missing_null_policy: []const u8,
     queryability_state: []const u8,
+    sort_lifecycle_state: []const u8,
     analyzer: ?[]const u8 = null,
     index_sort: ?IndexSortMembership = null,
 };
@@ -850,6 +882,7 @@ pub fn indexSortMembership(schema: TableSchema, field: []const u8) ?IndexSortMem
 }
 
 pub fn reservedIdFieldCapability(schema: TableSchema) FieldCapability {
+    const index_sort = indexSortMembership(schema, "_id");
     return .{
         .field = "_id",
         .field_type = .keyword,
@@ -862,13 +895,18 @@ pub fn reservedIdFieldCapability(schema: TableSchema) FieldCapability {
         .provenance = "reserved",
         .missing_null_policy = "not_null",
         .queryability_state = "queryable",
-        .index_sort = indexSortMembership(schema, "_id"),
+        .sort_lifecycle_state = lifecycleStateFromParts(true, false, "identity_metadata", "queryable", index_sort),
+        .index_sort = index_sort,
     };
 }
 
 pub fn dynamicTemplateFieldCapability(schema: TableSchema, tmpl: DynamicTemplate) FieldCapability {
     const mapping = tmpl.mapping;
     const exact_path = exactDynamicTemplatePath(tmpl);
+    const index_sort = if (exact_path) |field| indexSortMembership(schema, field) else null;
+    const sortable = mappingIsSortable(mapping);
+    const queryability_state = mappingQueryabilityStateName(mapping);
+    const doc_value_coverage = if (mapping.doc_values) "schema_declared" else "not_declared";
     return .{
         .name = tmpl.name,
         .field = exact_path,
@@ -880,13 +918,14 @@ pub fn dynamicTemplateFieldCapability(schema: TableSchema, tmpl: DynamicTemplate
         .filterable = mappingIsFilterable(mapping),
         .aggregatable = mappingIsAggregatable(mapping),
         .doc_values = mapping.doc_values,
-        .sortable = mappingIsSortable(mapping),
-        .doc_value_coverage = if (mapping.doc_values) "schema_declared" else "not_declared",
+        .sortable = sortable,
+        .doc_value_coverage = doc_value_coverage,
         .provenance = "dynamic_template",
         .missing_null_policy = missingNullPolicyName(mapping.missing_null_policy),
-        .queryability_state = mappingQueryabilityStateName(mapping),
+        .queryability_state = queryability_state,
+        .sort_lifecycle_state = lifecycleStateFromParts(sortable, mapping.doc_values, doc_value_coverage, queryability_state, index_sort),
         .analyzer = mapping.analyzer,
-        .index_sort = if (exact_path) |field| indexSortMembership(schema, field) else null,
+        .index_sort = index_sort,
     };
 }
 
@@ -907,12 +946,17 @@ pub fn fullTextFieldCapability(schema: TableSchema, document_name: []const u8, f
         .provenance = "document_schema",
         .missing_null_policy = "not_applicable",
         .queryability_state = if (exact_keyword) "missing_doc_values" else "text_search_only",
+        .sort_lifecycle_state = "unsupported",
         .analyzer = field.analyzer,
         .index_sort = indexSortMembership(schema, capability_field),
     };
 }
 
 pub fn observedDynamicFieldCapability(schema: ?TableSchema, field: []const u8, mapping: FieldMapping) FieldCapability {
+    const index_sort = if (schema) |runtime_schema| indexSortMembership(runtime_schema, field) else null;
+    const sortable = mappingIsSortable(mapping);
+    const queryability_state = mappingQueryabilityStateName(mapping);
+    const doc_value_coverage = if (mapping.doc_values) "observed_declared" else "not_declared";
     return .{
         .field = field,
         .field_type = mapping.field_type,
@@ -920,14 +964,35 @@ pub fn observedDynamicFieldCapability(schema: ?TableSchema, field: []const u8, m
         .filterable = mappingIsFilterable(mapping),
         .aggregatable = mappingIsAggregatable(mapping),
         .doc_values = mapping.doc_values,
-        .sortable = mappingIsSortable(mapping),
-        .doc_value_coverage = if (mapping.doc_values) "observed_declared" else "not_declared",
+        .sortable = sortable,
+        .doc_value_coverage = doc_value_coverage,
         .provenance = "observed_dynamic",
         .missing_null_policy = missingNullPolicyName(mapping.missing_null_policy),
-        .queryability_state = mappingQueryabilityStateName(mapping),
+        .queryability_state = queryability_state,
+        .sort_lifecycle_state = lifecycleStateFromParts(sortable, mapping.doc_values, doc_value_coverage, queryability_state, index_sort),
         .analyzer = mapping.analyzer,
-        .index_sort = if (schema) |runtime_schema| indexSortMembership(runtime_schema, field) else null,
+        .index_sort = index_sort,
     };
+}
+
+fn lifecycleStateFromParts(
+    sortable: bool,
+    doc_values: bool,
+    doc_value_coverage: []const u8,
+    queryability_state: []const u8,
+    index_sort: ?IndexSortMembership,
+) []const u8 {
+    if (!sortable) return "unsupported";
+    if (std.mem.eql(u8, queryability_state, "queryable")) {
+        return if (index_sort != null) "accelerated" else "queryable";
+    }
+    if (std.mem.eql(u8, doc_value_coverage, "covered") or
+        std.mem.eql(u8, doc_value_coverage, "identity_metadata"))
+    {
+        return "covered";
+    }
+    if (doc_values and std.mem.eql(u8, doc_value_coverage, "observed_declared")) return "indexed";
+    return "declared";
 }
 
 pub fn fieldCapabilitiesAlloc(alloc: Allocator, schema: TableSchema) ![]FieldCapability {
@@ -993,6 +1058,8 @@ pub fn cloneFieldCapabilityAlloc(alloc: Allocator, capability: FieldCapability) 
     errdefer alloc.free(cloned.missing_null_policy);
     cloned.queryability_state = try alloc.dupe(u8, capability.queryability_state);
     errdefer alloc.free(cloned.queryability_state);
+    cloned.sort_lifecycle_state = try alloc.dupe(u8, capability.sort_lifecycle_state);
+    errdefer alloc.free(cloned.sort_lifecycle_state);
     cloned.analyzer = if (capability.analyzer) |value| try alloc.dupe(u8, value) else null;
     return cloned;
 }
@@ -1024,6 +1091,7 @@ pub fn freeOwnedFieldCapability(alloc: Allocator, capability: FieldCapability) v
     alloc.free(capability.provenance);
     alloc.free(capability.missing_null_policy);
     alloc.free(capability.queryability_state);
+    alloc.free(capability.sort_lifecycle_state);
     if (capability.analyzer) |value| alloc.free(value);
 }
 
@@ -1734,6 +1802,7 @@ test "runtime schema field capability model carries provenance and index sort me
     try std.testing.expectEqual(AntflyType.keyword, id_capability.field_type);
     try std.testing.expect(id_capability.sortable);
     try std.testing.expectEqualStrings("identity_metadata", id_capability.doc_value_coverage);
+    try std.testing.expectEqualStrings("accelerated", id_capability.sort_lifecycle_state);
     try std.testing.expectEqual(@as(usize, 1), id_capability.index_sort.?.position);
     try std.testing.expect(!id_capability.index_sort.?.desc);
 
@@ -1746,6 +1815,7 @@ test "runtime schema field capability model carries provenance and index sort me
     try std.testing.expect(dynamic_capability.sortable);
     try std.testing.expectEqualStrings("dynamic_template", dynamic_capability.provenance);
     try std.testing.expectEqualStrings("declared", dynamic_capability.queryability_state);
+    try std.testing.expectEqualStrings("declared", dynamic_capability.sort_lifecycle_state);
     try std.testing.expectEqual(@as(usize, 0), dynamic_capability.index_sort.?.position);
     try std.testing.expect(dynamic_capability.index_sort.?.desc);
 
@@ -1757,6 +1827,7 @@ test "runtime schema field capability model carries provenance and index sort me
     try std.testing.expect(!text_capability.sortable);
     try std.testing.expectEqualStrings("document_schema", text_capability.provenance);
     try std.testing.expectEqualStrings("text_search_only", text_capability.queryability_state);
+    try std.testing.expectEqualStrings("unsupported", text_capability.sort_lifecycle_state);
     try std.testing.expect(text_capability.index_sort == null);
 
     const observed_capability = observedDynamicFieldCapability(schema, "meta.created_at", tmpl.mapping);
@@ -1768,6 +1839,7 @@ test "runtime schema field capability model carries provenance and index sort me
     try std.testing.expectEqualStrings("observed_declared", observed_capability.doc_value_coverage);
     try std.testing.expectEqualStrings("observed_dynamic", observed_capability.provenance);
     try std.testing.expectEqualStrings("declared", observed_capability.queryability_state);
+    try std.testing.expectEqualStrings("indexed", observed_capability.sort_lifecycle_state);
     try std.testing.expectEqual(@as(usize, 0), observed_capability.index_sort.?.position);
     try std.testing.expect(observed_capability.index_sort.?.desc);
 }
@@ -1805,18 +1877,21 @@ test "runtime schema field capability matrix enumerates shared capabilities" {
     try std.testing.expectEqual(@as(usize, 4), capabilities.len);
     try std.testing.expectEqualStrings("_id", capabilities[0].field.?);
     try std.testing.expectEqualStrings("reserved", capabilities[0].provenance);
+    try std.testing.expectEqualStrings("accelerated", capabilities[0].sort_lifecycle_state);
     try std.testing.expectEqual(@as(usize, 1), capabilities[0].index_sort.?.position);
 
     try std.testing.expectEqualStrings("created", capabilities[1].name.?);
     try std.testing.expectEqualStrings("created_at", capabilities[1].field.?);
     try std.testing.expectEqualStrings("dynamic_template", capabilities[1].provenance);
     try std.testing.expect(capabilities[1].sortable);
+    try std.testing.expectEqualStrings("declared", capabilities[1].sort_lifecycle_state);
     try std.testing.expectEqual(@as(usize, 0), capabilities[1].index_sort.?.position);
 
     try std.testing.expectEqualStrings("title", capabilities[2].field.?);
     try std.testing.expectEqualStrings("document_schema", capabilities[2].provenance);
     try std.testing.expectEqual(AntflyType.text, capabilities[2].field_type);
     try std.testing.expectEqualStrings("text_search_only", capabilities[2].queryability_state);
+    try std.testing.expectEqualStrings("unsupported", capabilities[2].sort_lifecycle_state);
     try std.testing.expect(capabilities[2].index_sort == null);
 
     try std.testing.expectEqualStrings("title.keyword", capabilities[3].field.?);
@@ -1827,6 +1902,7 @@ test "runtime schema field capability matrix enumerates shared capabilities" {
     try std.testing.expect(!capabilities[3].doc_values);
     try std.testing.expect(!capabilities[3].sortable);
     try std.testing.expectEqualStrings("missing_doc_values", capabilities[3].queryability_state);
+    try std.testing.expectEqualStrings("unsupported", capabilities[3].sort_lifecycle_state);
 }
 
 test "dynamic template field resolution" {

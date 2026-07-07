@@ -8434,6 +8434,7 @@ components:
         - provenance
         - missing_null_policy
         - queryability_state
+        - sort_lifecycle_state
       properties:
         name:
           type: string
@@ -8482,6 +8483,18 @@ components:
         queryability_state:
           type: string
           description: Whether the field is currently usable by public query planning.
+        sort_lifecycle_state:
+          type: string
+          enum:
+            - unsupported
+            - declared
+            - indexed
+            - covered
+            - queryable
+            - accelerated
+          description: Operational lifecycle state for exact sort/filter use. Queryable fields are accepted
+            by public exact sort; accelerated fields are queryable and participate in the configured index_sort
+            tuple.
         analyzer:
           type: string
           description: Analyzer name for text/searchable fields, when applicable.

@@ -1030,6 +1030,7 @@ fn appendRuntimeGeneratedFieldCapability(
         if (runtimeCapabilityCanPromoteSchemaDeclaration(existing.*, owned)) {
             try replaceOwnedStringIfDifferent(alloc, &existing.doc_value_coverage, owned.doc_value_coverage);
             try replaceOwnedStringIfDifferent(alloc, &existing.queryability_state, owned.queryability_state);
+            try replaceOwnedStringIfDifferent(alloc, &existing.sort_lifecycle_state, owned.sort_lifecycle_state);
             freeGeneratedFieldCapability(alloc, owned);
             return;
         }
@@ -1094,6 +1095,7 @@ fn mergeGeneratedFieldCapability(
     existing.sortable = existing.sortable and incoming.sortable;
     try replaceOwnedStringIfDifferent(alloc, &existing.doc_value_coverage, runtime_schema_mod.conservativeDocValueCoverage(existing.doc_value_coverage, incoming.doc_value_coverage));
     try replaceOwnedStringIfDifferent(alloc, &existing.queryability_state, runtime_schema_mod.conservativeQueryabilityState(existing.queryability_state, incoming.queryability_state));
+    try replaceOwnedStringIfDifferent(alloc, &existing.sort_lifecycle_state, runtime_schema_mod.conservativeSortLifecycleState(existing.sort_lifecycle_state, incoming.sort_lifecycle_state));
     if (!std.mem.eql(u8, existing.missing_null_policy, incoming.missing_null_policy)) {
         try replaceOwnedStringIfDifferent(alloc, &existing.missing_null_policy, "mixed");
     }
@@ -1123,6 +1125,7 @@ fn generatedFieldCapabilityAlloc(alloc: std.mem.Allocator, capability: runtime_s
         .provenance = "",
         .missing_null_policy = "",
         .queryability_state = "",
+        .sort_lifecycle_state = "",
         .index_sort_position = if (capability.index_sort) |membership| @intCast(membership.position) else null,
     };
     errdefer freeGeneratedFieldCapability(alloc, owned);
@@ -1138,6 +1141,7 @@ fn generatedFieldCapabilityAlloc(alloc: std.mem.Allocator, capability: runtime_s
     owned.provenance = try alloc.dupe(u8, capability.provenance);
     owned.missing_null_policy = try alloc.dupe(u8, capability.missing_null_policy);
     owned.queryability_state = try alloc.dupe(u8, capability.queryability_state);
+    owned.sort_lifecycle_state = try alloc.dupe(u8, capability.sort_lifecycle_state);
     owned.analyzer = try dupeOptionalString(alloc, capability.analyzer);
     owned.index_sort_order = if (capability.index_sort) |membership| try alloc.dupe(u8, if (membership.desc) "desc" else "asc") else null;
     return owned;
@@ -1182,6 +1186,7 @@ fn freeGeneratedFieldCapability(alloc: std.mem.Allocator, capability: metadata_o
     if (capability.provenance.len > 0) alloc.free(@constCast(capability.provenance));
     if (capability.missing_null_policy.len > 0) alloc.free(@constCast(capability.missing_null_policy));
     if (capability.queryability_state.len > 0) alloc.free(@constCast(capability.queryability_state));
+    if (capability.sort_lifecycle_state.len > 0) alloc.free(@constCast(capability.sort_lifecycle_state));
     if (capability.analyzer) |value| alloc.free(@constCast(value));
     if (capability.index_sort_order) |value| alloc.free(@constCast(value));
 }
@@ -2248,6 +2253,8 @@ fn appendRuntimeFieldCapability(
     try appendJsonString(alloc, out, capability.missing_null_policy);
     try out.appendSlice(alloc, ",\"queryability_state\":");
     try appendJsonString(alloc, out, capability.queryability_state);
+    try out.appendSlice(alloc, ",\"sort_lifecycle_state\":");
+    try appendJsonString(alloc, out, capability.sort_lifecycle_state);
     if (capability.analyzer) |analyzer| {
         try out.appendSlice(alloc, ",\"analyzer\":");
         try appendJsonString(alloc, out, analyzer);
@@ -2950,6 +2957,7 @@ test "metadata.table status promotes schema capability when runtime coverage is 
     var covered = runtime_schema_mod.dynamicTemplateFieldCapability(runtime_schema, template);
     covered.doc_value_coverage = "covered";
     covered.queryability_state = "queryable";
+    runtime_schema_mod.refreshSortLifecycleState(&covered);
     var runtime_capabilities = [_]runtime_schema_mod.FieldCapability{covered};
     var observed_sets = [_]table_reads.ObservedDynamicFieldCapabilitySet{.{
         .index_name = @constCast("full_text_index_v0"),
@@ -2970,6 +2978,7 @@ test "metadata.table status promotes schema capability when runtime coverage is 
     try std.testing.expectEqualStrings("covered", created.object.get("doc_value_coverage").?.string);
     try std.testing.expectEqualStrings("dynamic_template", created.object.get("provenance").?.string);
     try std.testing.expectEqualStrings("queryable", created.object.get("queryability_state").?.string);
+    try std.testing.expectEqualStrings("queryable", created.object.get("sort_lifecycle_state").?.string);
 }
 
 test "metadata.table status promotes schema geo capability when runtime coverage is complete" {
@@ -3001,6 +3010,7 @@ test "metadata.table status promotes schema geo capability when runtime coverage
     var covered = runtime_schema_mod.dynamicTemplateFieldCapability(runtime_schema, template);
     covered.doc_value_coverage = "covered";
     covered.queryability_state = "queryable";
+    runtime_schema_mod.refreshSortLifecycleState(&covered);
     var runtime_capabilities = [_]runtime_schema_mod.FieldCapability{covered};
     var observed_sets = [_]table_reads.ObservedDynamicFieldCapabilitySet{.{
         .index_name = @constCast("full_text_index_v0"),
@@ -3026,6 +3036,7 @@ test "metadata.table status promotes schema geo capability when runtime coverage
     try std.testing.expectEqualStrings("covered", location.object.get("doc_value_coverage").?.string);
     try std.testing.expectEqualStrings("dynamic_template", location.object.get("provenance").?.string);
     try std.testing.expectEqualStrings("queryable", location.object.get("queryability_state").?.string);
+    try std.testing.expectEqualStrings("unsupported", location.object.get("sort_lifecycle_state").?.string);
 }
 
 test "metadata.table status does not promote mismatched index sort runtime capability" {
@@ -3056,6 +3067,7 @@ test "metadata.table status does not promote mismatched index sort runtime capab
     var covered_without_index_sort = runtime_schema_mod.dynamicTemplateFieldCapability(runtime_schema_without_index_sort, template);
     covered_without_index_sort.doc_value_coverage = "covered";
     covered_without_index_sort.queryability_state = "queryable";
+    runtime_schema_mod.refreshSortLifecycleState(&covered_without_index_sort);
     var runtime_capabilities = [_]runtime_schema_mod.FieldCapability{covered_without_index_sort};
     var observed_sets = [_]table_reads.ObservedDynamicFieldCapabilitySet{.{
         .index_name = @constCast("full_text_index_v0"),
@@ -3075,6 +3087,7 @@ test "metadata.table status does not promote mismatched index sort runtime capab
     try std.testing.expectEqualStrings("datetime", created.object.get("type").?.string);
     try std.testing.expectEqualStrings("schema_declared", created.object.get("doc_value_coverage").?.string);
     try std.testing.expectEqualStrings("declared", created.object.get("queryability_state").?.string);
+    try std.testing.expectEqualStrings("declared", created.object.get("sort_lifecycle_state").?.string);
     try std.testing.expect(created.object.get("index_sort_position") == null);
     try std.testing.expect(created.object.get("index_sort_order") == null);
 }
@@ -3098,6 +3111,7 @@ test "metadata.table status merges observed capabilities conservatively" {
     });
     covered.doc_value_coverage = "covered";
     covered.queryability_state = "queryable";
+    runtime_schema_mod.refreshSortLifecycleState(&covered);
     const declared = runtime_schema_mod.observedDynamicFieldCapability(null, "price", .{
         .field_type = .numeric,
         .do_index = true,
@@ -3122,6 +3136,7 @@ test "metadata.table status merges observed capabilities conservatively" {
     const price = testFieldCapabilityByIdentifier(parsed.value, "price") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("numeric", price.object.get("type").?.string);
     try std.testing.expectEqualStrings("observed_declared", price.object.get("doc_value_coverage").?.string);
+    try std.testing.expectEqualStrings("indexed", price.object.get("sort_lifecycle_state").?.string);
     try std.testing.expectEqualStrings("observed_dynamic", price.object.get("provenance").?.string);
     try std.testing.expectEqualStrings("declared", price.object.get("queryability_state").?.string);
 }

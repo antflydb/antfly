@@ -4018,6 +4018,7 @@ pub const IndexManager = struct {
                 capability.doc_value_coverage = typed_dv_coverage.statusName(coverage);
                 capability.queryability_state = "missing_doc_values";
             }
+            schema_mod.refreshSortLifecycleState(&capability);
             capabilities[initialized] = try schema_mod.cloneFieldCapabilityAlloc(
                 alloc,
                 capability,
@@ -4037,6 +4038,7 @@ pub const IndexManager = struct {
                     capability.doc_value_coverage = typed_dv_coverage.statusName(coverage);
                     capability.queryability_state = "missing_doc_values";
                 }
+                schema_mod.refreshSortLifecycleState(&capability);
                 capabilities[initialized] = try schema_mod.cloneFieldCapabilityAlloc(alloc, capability);
                 initialized += 1;
             }
@@ -16511,6 +16513,7 @@ test "observed full text analyzers publish shared dictionary ownership" {
     try std.testing.expectEqualStrings("not_declared", capabilities[0].doc_value_coverage);
     try std.testing.expectEqualStrings("observed_dynamic", capabilities[0].provenance);
     try std.testing.expectEqualStrings("non_scalar", capabilities[0].queryability_state);
+    try std.testing.expectEqualStrings("unsupported", capabilities[0].sort_lifecycle_state);
 
     const identity = algebraic_mod.lexical.DictionaryIdentity.analyzedText("ft_v1", "meta.body", "french");
     const registry_key = try identity.registryKeyAlloc(alloc);
@@ -16604,6 +16607,7 @@ test "observed dynamic sortable field capability reports covered queryable state
     try std.testing.expect(capabilities[0].sortable);
     try std.testing.expectEqualStrings("covered", capabilities[0].doc_value_coverage);
     try std.testing.expectEqualStrings("queryable", capabilities[0].queryability_state);
+    try std.testing.expectEqualStrings("queryable", capabilities[0].sort_lifecycle_state);
 }
 
 test "declared runtime sortable field capability reports covered queryable state" {

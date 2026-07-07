@@ -2046,6 +2046,8 @@ pub const FieldCapability = struct {
     missing_null_policy: []const u8,
     /// Whether the field is currently usable by public query planning.
     queryability_state: []const u8,
+    /// Operational lifecycle state for exact sort/filter use. Queryable fields are accepted by public exact sort; accelerated fields are queryable and participate in the configured index_sort tuple.
+    sort_lifecycle_state: []const u8,
     /// Analyzer name for text/searchable fields, when applicable.
     analyzer: ?[]const u8 = null,
     /// Zero-based position in the table index_sort tuple when this field participates.

@@ -76,6 +76,7 @@ pub const QueryBuilderFieldCapability = struct {
     sortable: bool = false,
     doc_value_coverage: []const u8 = "",
     queryability_state: []const u8 = "",
+    sort_lifecycle_state: []const u8 = "",
     provenance: []const u8 = "",
     index_sort_position: ?usize = null,
     index_sort_order: ?[]const u8 = null,
@@ -2930,6 +2931,7 @@ fn appendNativeSortCapabilityPromptSection(
         try out.appendSlice(alloc, "- ");
         try out.appendSlice(alloc, capability.field);
         if (capability.field_type) |field_type| try out.print(alloc, " type: {s}", .{@tagName(field_type)});
+        if (capability.sort_lifecycle_state.len > 0) try out.print(alloc, " lifecycle: {s}", .{capability.sort_lifecycle_state});
         if (capability.index_sort_position) |position| {
             try out.print(alloc, " index_sort[{d}]", .{position});
             if (capability.index_sort_order) |order| try out.print(alloc, " {s}", .{order});
@@ -6204,8 +6206,8 @@ pub fn testQueryBuilderUsesGeneratedFullTextSpecialistWhenRunnerProvided() !void
             try std.testing.expect(std.mem.indexOf(u8, system_prompt, "Full-text indexes:") != null);
             try std.testing.expect(std.mem.indexOf(u8, system_prompt, "search_idx fields: title, body") != null);
             try std.testing.expect(std.mem.indexOf(u8, system_prompt, "Native sortable fields:") != null);
-            try std.testing.expect(std.mem.indexOf(u8, system_prompt, "published_at type: datetime index_sort[0] desc") != null);
-            try std.testing.expect(std.mem.indexOf(u8, system_prompt, "_id type: keyword index_sort[1] asc") != null);
+            try std.testing.expect(std.mem.indexOf(u8, system_prompt, "published_at type: datetime lifecycle: accelerated index_sort[0] desc") != null);
+            try std.testing.expect(std.mem.indexOf(u8, system_prompt, "_id type: keyword lifecycle: accelerated index_sort[1] asc") != null);
             try std.testing.expect(std.mem.indexOf(u8, system_prompt, "Dominant index_sort:") != null);
             try std.testing.expect(std.mem.indexOf(u8, system_prompt, "published_at desc, _id asc") != null);
             try std.testing.expect(std.mem.indexOf(u8, user_prompt, "raft snapshots") != null);
@@ -6242,6 +6244,7 @@ pub fn testQueryBuilderUsesGeneratedFullTextSpecialistWhenRunnerProvided() !void
             .sortable = true,
             .doc_value_coverage = "covered",
             .queryability_state = "queryable",
+            .sort_lifecycle_state = "accelerated",
             .index_sort_position = 0,
             .index_sort_order = "desc",
         },
@@ -6251,6 +6254,7 @@ pub fn testQueryBuilderUsesGeneratedFullTextSpecialistWhenRunnerProvided() !void
             .sortable = true,
             .doc_value_coverage = "identity_metadata",
             .queryability_state = "queryable",
+            .sort_lifecycle_state = "accelerated",
             .index_sort_position = 1,
             .index_sort_order = "asc",
         },

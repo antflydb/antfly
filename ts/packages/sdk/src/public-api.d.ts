@@ -3467,6 +3467,11 @@ export interface components {
             missing_null_policy: string;
             /** @description Whether the field is currently usable by public query planning. */
             queryability_state: string;
+            /**
+             * @description Operational lifecycle state for exact sort/filter use. Queryable fields are accepted by public exact sort; accelerated fields are queryable and participate in the configured index_sort tuple.
+             * @enum {string}
+             */
+            sort_lifecycle_state: "unsupported" | "declared" | "indexed" | "covered" | "queryable" | "accelerated";
             /** @description Analyzer name for text/searchable fields, when applicable. */
             analyzer?: string;
             /**

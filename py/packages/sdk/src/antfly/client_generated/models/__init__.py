@@ -213,6 +213,7 @@ from .failed_operation_operation import FailedOperationOperation
 from .fetch_config import FetchConfig
 from .field_capability import FieldCapability
 from .field_capability_index_sort_order import FieldCapabilityIndexSortOrder
+from .field_capability_sort_lifecycle_state import FieldCapabilitySortLifecycleState
 from .field_statistics import FieldStatistics
 from .filter_spec import FilterSpec
 from .filter_spec_operator import FilterSpecOperator
@@ -825,6 +826,7 @@ __all__ = (
     "FetchConfig",
     "FieldCapability",
     "FieldCapabilityIndexSortOrder",
+    "FieldCapabilitySortLifecycleState",
     "FieldStatistics",
     "FilterSpec",
     "FilterSpecOperator",

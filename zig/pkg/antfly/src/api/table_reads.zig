@@ -3122,6 +3122,7 @@ fn mergeObservedFieldCapability(
     existing.sortable = existing.sortable and incoming.sortable;
     existing.doc_value_coverage = storage_schema.conservativeDocValueCoverage(existing.doc_value_coverage, incoming.doc_value_coverage);
     existing.queryability_state = storage_schema.conservativeQueryabilityState(existing.queryability_state, incoming.queryability_state);
+    existing.sort_lifecycle_state = storage_schema.conservativeSortLifecycleState(existing.sort_lifecycle_state, incoming.sort_lifecycle_state);
     if (!std.mem.eql(u8, existing.missing_null_policy, incoming.missing_null_policy)) {
         existing.missing_null_policy = "mixed";
     }
@@ -3151,6 +3152,7 @@ test "provisioned observed dynamic capability merge is conservative across group
     });
     covered.doc_value_coverage = "covered";
     covered.queryability_state = "queryable";
+    storage_schema.refreshSortLifecycleState(&covered);
 
     const declared = storage_schema.observedDynamicFieldCapability(null, "price", .{
         .field_type = .numeric,

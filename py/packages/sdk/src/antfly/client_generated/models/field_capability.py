@@ -8,6 +8,7 @@ from attrs import field as _attrs_field
 
 from ..models.antfly_type import AntflyType
 from ..models.field_capability_index_sort_order import FieldCapabilityIndexSortOrder
+from ..models.field_capability_sort_lifecycle_state import FieldCapabilitySortLifecycleState
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="FieldCapability")
@@ -29,6 +30,9 @@ class FieldCapability:
         provenance (str): Capability source, such as reserved, document_schema, dynamic_template, or observed_dynamic.
         missing_null_policy (str): Current missing/null handling policy for this field.
         queryability_state (str): Whether the field is currently usable by public query planning.
+        sort_lifecycle_state (FieldCapabilitySortLifecycleState): Operational lifecycle state for exact sort/filter use.
+            Queryable fields are accepted by public exact sort; accelerated fields are queryable and participate in the
+            configured index_sort tuple.
         name (str | Unset): Mapping or dynamic-template name, when applicable.
         field (str | Unset): Concrete query field path when known. Pattern-only dynamic templates may omit this.
         path_pattern (str | Unset): Dynamic-template path_match pattern, when applicable.
@@ -54,6 +58,7 @@ class FieldCapability:
     provenance: str
     missing_null_policy: str
     queryability_state: str
+    sort_lifecycle_state: FieldCapabilitySortLifecycleState
     name: str | Unset = UNSET
     field: str | Unset = UNSET
     path_pattern: str | Unset = UNSET
@@ -86,6 +91,8 @@ class FieldCapability:
         missing_null_policy = self.missing_null_policy
 
         queryability_state = self.queryability_state
+
+        sort_lifecycle_state = self.sort_lifecycle_state.value
 
         name = self.name
 
@@ -123,6 +130,7 @@ class FieldCapability:
                 "provenance": provenance,
                 "missing_null_policy": missing_null_policy,
                 "queryability_state": queryability_state,
+                "sort_lifecycle_state": sort_lifecycle_state,
             }
         )
         if name is not UNSET:
@@ -171,6 +179,8 @@ class FieldCapability:
 
         queryability_state = d.pop("queryability_state")
 
+        sort_lifecycle_state = FieldCapabilitySortLifecycleState(d.pop("sort_lifecycle_state"))
+
         name = d.pop("name", UNSET)
 
         field = d.pop("field", UNSET)
@@ -207,6 +217,7 @@ class FieldCapability:
             provenance=provenance,
             missing_null_policy=missing_null_policy,
             queryability_state=queryability_state,
+            sort_lifecycle_state=sort_lifecycle_state,
             name=name,
             field=field,
             path_pattern=path_pattern,
