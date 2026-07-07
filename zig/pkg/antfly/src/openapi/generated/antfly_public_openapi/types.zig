@@ -2538,7 +2538,7 @@ pub const AggregationRequest = struct {
     sub_aggregations: ?std.json.ArrayHashMap(AggregationRequest) = null,
 };
 
-/// Sort execution profile. The fields below are the stable public diagnostic surface; profiling responses may include additional implementation counters.
+/// Sort execution profile. The fields below are the stable public diagnostic surface; profiling responses may include additional implementation counters. Additional properties may include low-level implementation details such as doc-value load timings, stored-source loads, collector/window internals, cost-model inputs, native-filter modes, and index-sort availability flags; treat those properties as diagnostic and not as a frozen SDK contract.
 pub const SortProfile = struct {
     /// Stable physical sort plan name. Known values include `none`, `id_only`, `id_seek`, `sorted_segment_seek`, `native_doc_values_top_n`, `score_top_k`, `distributed_k_way_merge`, `stored_json_debug`, and `unsupported_exact_sort`. Public exact sort requests must not silently move from native plans to `stored_json_debug`; missing native coverage is reported through the rejection fields instead.
     plan: ?[]const u8 = null,
@@ -2562,80 +2562,22 @@ pub const SortProfile = struct {
     selection_reason: ?[]const u8 = null,
     /// Whether exact execution required native typed sort values.
     require_native: ?bool = null,
-    /// Whether a native typed sort value loader was active.
-    native_loader: ?bool = null,
     /// Conservative lifecycle state for the requested sort path. Queryable fields are accepted by public exact sort; accelerated fields are queryable and have an index_sort-compatible physical path.
     sort_lifecycle_state: ?[]const u8 = null,
-    /// Native filter constraint shape available to sort planning for this request.
-    native_filter_mode: ?[]const u8 = null,
-    /// Number of resolved native positive-filter candidates available to the sort executor.
-    native_filter_candidate_count: ?i64 = null,
-    /// Number of resolved native exclusion candidates available to the sort executor.
-    native_filter_exclusion_count: ?i64 = null,
-    /// Whether the planner preferred candidate-first doc-values collection over sorted-segment scanning because a native filter was selective.
-    selective_filter_doc_values_preferred: ?bool = null,
-    /// Live document count used by the sort planner cost model for the selected execution decision.
-    cost_model_live_docs: ?i64 = null,
-    /// Candidate count used by the sort planner cost model for the selected execution decision.
-    cost_model_candidate_count: ?i64 = null,
-    /// Candidate-count threshold under which the sort planner considers a filter selective.
-    cost_model_selective_limit: ?i64 = null,
     /// Native typed doc-values coverage status for mapped sort fields. Known values include `covered`, `identity_metadata`, `schema_declared`, `observed_declared`, and `not_declared`.
     native_doc_values_coverage: ?[]const u8 = null,
     /// Physical index_sort coverage status for the requested order. Known values include `request_mismatch`, `no_live_segments`, `missing_segment_index_sort`, `covered_without_bounds`, and `covered_with_bounds`.
     index_sort_coverage: ?[]const u8 = null,
-    /// Whether the requested order matched the configured physical index_sort prefix.
-    index_sort_match: ?bool = null,
-    /// Whether sorted-segment execution was available for this request.
-    sorted_segment_executor_available: ?bool = null,
-    /// Whether sorted-segment bounds were available for cursor seeks.
-    sorted_segment_bounds_available: ?bool = null,
-    /// Physical sorted-segment documents scanned before deleted-doc, cursor, membership, and filter checks.
-    sorted_segment_scanned_count: ?i64 = null,
-    /// Maximum physical sorted-segment documents allowed before the sorted_segment_scan_window budget rejection.
-    sorted_segment_scan_budget: ?i64 = null,
     /// Candidate documents considered by sort execution.
     candidate_count: ?i64 = null,
     /// Candidates rejected by cursor comparison.
     cursor_rejected_count: ?i64 = null,
-    /// Candidate hits admitted to the sort window.
-    admitted_count: ?i64 = null,
-    /// Candidate hits replaced in the bounded sort window.
-    replaced_count: ?i64 = null,
-    /// Candidate hits discarded by the bounded sort window.
-    discarded_count: ?i64 = null,
     /// Hits selected for the returned page.
     selected_count: ?i64 = null,
-    /// Time spent decorating hits with sort values, in microseconds.
-    decorate_us: ?i64 = null,
-    /// Time spent loading native typed doc values, in microseconds.
-    native_doc_value_load_us: ?i64 = null,
-    /// Native typed doc-value loads that returned a value.
-    native_doc_value_hit_count: ?i64 = null,
-    /// Native typed doc-value loads that missed and had to fail or fall back.
-    native_doc_value_miss_count: ?i64 = null,
-    /// Time spent loading stored JSON for debug sort paths, in microseconds.
-    stored_json_load_us: ?i64 = null,
-    /// Stored JSON loads performed by sort execution.
-    stored_json_load_count: ?i64 = null,
-    /// Time spent loading projected source after page selection, in microseconds.
-    projected_source_load_us: ?i64 = null,
-    /// Projected source documents loaded after page selection.
-    projected_source_load_count: ?i64 = null,
-    /// Time spent in the final in-memory page/window sort, in microseconds.
-    final_sort_us: ?i64 = null,
     /// Total sort execution time in microseconds.
     total_us: ?i64 = null,
-    /// Capacity of the bounded sort window.
-    window_capacity: ?i64 = null,
-    /// Number of hits retained in the bounded sort window.
-    window_len: ?i64 = null,
-    /// Peak collector heap size observed during sort execution.
-    collector_heap_peak: ?i64 = null,
     /// Shards participating in distributed sort execution.
     distributed_shard_count: ?i64 = null,
-    /// Largest shard-local sorted window merged by the coordinator.
-    distributed_shard_window: ?i64 = null,
     /// Stable budget rejection reason. Known values include `text_exact_late_visibility_totals`, `text_field_sort_candidate_window`, `match_all_candidate_collect_limit`, `match_all_exact_candidate_window`, `sorted_segment_scan_window`, and `distributed_merge_shard_window`.
     budget_rejection_reason: ?[]const u8 = null,
     /// Stable exact-sort rejection reason. Known values include `unmapped_sort_field`, `non_sortable_sort_field`, `missing_doc_values_coverage`, `missing_native_filter_coverage`, `invalid_cursor_arity`, `invalid_cursor_type`, `invalid_sort_tuple`, `approximate_candidate_source`, `candidate_budget_exceeded`, `missing_runtime_mapping`, `invalid_doc_value_type`, `missing_null_policy`, `non_score_bearing_source`, `invalid_score_value`, `count_only_ordered_page`, `stored_json_sort_disabled`, `unsupported_exact_sort`, and `distributed_merge_unsupported`.

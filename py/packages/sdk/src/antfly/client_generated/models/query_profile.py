@@ -31,7 +31,11 @@ class QueryProfile:
             merge (MergeProfile | Unset): Result merge statistics for hybrid search.
             sort (SortProfile | Unset): Sort execution profile. The fields below are the stable public
                 diagnostic surface; profiling responses may include additional
-                implementation counters.
+                implementation counters. Additional properties may include low-level
+                implementation details such as doc-value load timings, stored-source
+                loads, collector/window internals, cost-model inputs, native-filter
+                modes, and index-sort availability flags; treat those properties as
+                diagnostic and not as a frozen SDK contract.
     """
 
     shards: ShardsProfile | Unset = UNSET

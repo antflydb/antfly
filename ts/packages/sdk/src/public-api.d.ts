@@ -5921,7 +5921,11 @@ export interface components {
         /**
          * @description Sort execution profile. The fields below are the stable public
          *     diagnostic surface; profiling responses may include additional
-         *     implementation counters.
+         *     implementation counters. Additional properties may include low-level
+         *     implementation details such as doc-value load timings, stored-source
+         *     loads, collector/window internals, cost-model inputs, native-filter
+         *     modes, and index-sort availability flags; treat those properties as
+         *     diagnostic and not as a frozen SDK contract.
          */
         SortProfile: {
             /**
@@ -5938,84 +5942,72 @@ export interface components {
             order_by?: components["schemas"]["SortField"][];
             /** @description Cursor mode for this request. */
             cursor?: string;
-            /** @description Exactness class for the selected plan. */
+            /**
+             * @description Exactness class for the selected plan. Known values include
+             *     `none`, `exact`, `bounded_exact`, `approximate`, and
+             *     `unsupported`.
+             */
             exactness?: string;
-            /** @description Sort execution primitive used by the selected plan. */
+            /**
+             * @description Sort execution primitive used by the selected plan. Known values
+             *     include `none`, `candidate_collector`, `primary_key_scan`,
+             *     `sorted_segment_scan`, `score_top_k`, `doc_values_collector`,
+             *     `distributed_merge`, `stored_json_debug`, and `unsupported`.
+             */
             source?: string;
             /**
              * @description Exact candidate source consumed by the selected sort primitive.
              * @enum {string}
              */
             candidate_source?: "none" | "existing_hits" | "match_all" | "primary_key" | "native_filter" | "sorted_segment_membership" | "text_postings" | "distributed_shards" | "vector_top_k" | "composed";
-            /** @description Cursor support level for the selected plan. */
+            /**
+             * @description Cursor support level for the selected plan. Known values include
+             *     `none`, `comparator`, `segment_seek`, `distributed_seek`, and
+             *     `unsupported`.
+             */
             cursor_support?: string;
-            /** @description Stored source load strategy. */
+            /**
+             * @description Stored source load strategy. Known values include `none`,
+             *     `source_free`, `projected_source_after_page`,
+             *     `stored_source_required`, and `unsupported`.
+             */
             source_load?: string;
-            /** @description Distributed sort behavior. */
+            /**
+             * @description Distributed sort behavior. Known values include `none`,
+             *     `shard_local_only`, `coordinator_merge`, and `unsupported`.
+             */
             distributed_behavior?: string;
-            /** @description Stable reason the planner selected this sort plan. */
+            /**
+             * @description Stable reason the planner selected this sort plan. Known values
+             *     include `none`, `unsupported_exact_sort`,
+             *     `distributed_k_way_merge`, `stored_json_debug`,
+             *     `id_candidate_order`, `id_primary_key_seek`, `score_top_k`,
+             *     `index_sort_sorted_segment_seek`, `sorted_segment_seek`,
+             *     `doc_values_collector`, `index_sort_unavailable_doc_values_collector`,
+             *     `caller_selected_doc_values_collector`, and
+             *     `selective_filter_doc_values_collector`.
+             */
             selection_reason?: string;
             /** @description Whether exact execution required native typed sort values. */
             require_native?: boolean;
-            /** @description Whether a native typed sort value loader was active. */
-            native_loader?: boolean;
             /**
              * @description Conservative lifecycle state for the requested sort path. Queryable fields are accepted by public exact sort; accelerated fields are queryable and have an index_sort-compatible physical path.
              * @enum {string}
              */
             sort_lifecycle_state?: "unsupported" | "declared" | "indexed" | "covered" | "queryable" | "accelerated";
             /**
-             * @description Native filter constraint shape available to sort planning for this request.
-             * @enum {string}
+             * @description Native typed doc-values coverage status for mapped sort fields.
+             *     Known values include `covered`, `identity_metadata`,
+             *     `schema_declared`, `observed_declared`, and `not_declared`.
              */
-            native_filter_mode?: "none" | "empty" | "doc_nums" | "doc_ids" | "mixed" | "exclusion_only";
-            /**
-             * Format: int64
-             * @description Number of resolved native positive-filter candidates available to the sort executor.
-             */
-            native_filter_candidate_count?: number;
-            /**
-             * Format: int64
-             * @description Number of resolved native exclusion candidates available to the sort executor.
-             */
-            native_filter_exclusion_count?: number;
-            /** @description Whether the planner preferred candidate-first doc-values collection over sorted-segment scanning because a native filter was selective. */
-            selective_filter_doc_values_preferred?: boolean;
-            /**
-             * Format: int64
-             * @description Live document count used by the sort planner cost model for the selected execution decision.
-             */
-            cost_model_live_docs?: number;
-            /**
-             * Format: int64
-             * @description Candidate count used by the sort planner cost model for the selected execution decision.
-             */
-            cost_model_candidate_count?: number;
-            /**
-             * Format: int64
-             * @description Candidate-count threshold under which the sort planner considers a filter selective.
-             */
-            cost_model_selective_limit?: number;
-            /** @description Native typed doc-values coverage status for mapped sort fields. */
             native_doc_values_coverage?: string;
-            /** @description Physical index_sort coverage status for the requested order. */
+            /**
+             * @description Physical index_sort coverage status for the requested order. Known
+             *     values include `request_mismatch`, `no_live_segments`,
+             *     `missing_segment_index_sort`, `covered_without_bounds`, and
+             *     `covered_with_bounds`.
+             */
             index_sort_coverage?: string;
-            /** @description Whether the requested order matched the configured physical index_sort prefix. */
-            index_sort_match?: boolean;
-            /** @description Whether sorted-segment execution was available for this request. */
-            sorted_segment_executor_available?: boolean;
-            /** @description Whether sorted-segment bounds were available for cursor seeks. */
-            sorted_segment_bounds_available?: boolean;
-            /**
-             * Format: int64
-             * @description Physical sorted-segment documents scanned before deleted-doc, cursor, membership, and filter checks.
-             */
-            sorted_segment_scanned_count?: number;
-            /**
-             * Format: int64
-             * @description Maximum physical sorted-segment documents allowed before the sorted_segment_scan_window budget rejection.
-             */
-            sorted_segment_scan_budget?: number;
             /**
              * Format: int64
              * @description Candidate documents considered by sort execution.
@@ -6028,69 +6020,9 @@ export interface components {
             cursor_rejected_count?: number;
             /**
              * Format: int64
-             * @description Candidate hits admitted to the sort window.
-             */
-            admitted_count?: number;
-            /**
-             * Format: int64
-             * @description Candidate hits replaced in the bounded sort window.
-             */
-            replaced_count?: number;
-            /**
-             * Format: int64
-             * @description Candidate hits discarded by the bounded sort window.
-             */
-            discarded_count?: number;
-            /**
-             * Format: int64
              * @description Hits selected for the returned page.
              */
             selected_count?: number;
-            /**
-             * Format: int64
-             * @description Time spent decorating hits with sort values, in microseconds.
-             */
-            decorate_us?: number;
-            /**
-             * Format: int64
-             * @description Time spent loading native typed doc values, in microseconds.
-             */
-            native_doc_value_load_us?: number;
-            /**
-             * Format: int64
-             * @description Native typed doc-value loads that returned a value.
-             */
-            native_doc_value_hit_count?: number;
-            /**
-             * Format: int64
-             * @description Native typed doc-value loads that missed and had to fail or fall back.
-             */
-            native_doc_value_miss_count?: number;
-            /**
-             * Format: int64
-             * @description Time spent loading stored JSON for debug sort paths, in microseconds.
-             */
-            stored_json_load_us?: number;
-            /**
-             * Format: int64
-             * @description Stored JSON loads performed by sort execution.
-             */
-            stored_json_load_count?: number;
-            /**
-             * Format: int64
-             * @description Time spent loading projected source after page selection, in microseconds.
-             */
-            projected_source_load_us?: number;
-            /**
-             * Format: int64
-             * @description Projected source documents loaded after page selection.
-             */
-            projected_source_load_count?: number;
-            /**
-             * Format: int64
-             * @description Time spent in the final in-memory page/window sort, in microseconds.
-             */
-            final_sort_us?: number;
             /**
              * Format: int64
              * @description Total sort execution time in microseconds.
@@ -6098,29 +6030,9 @@ export interface components {
             total_us?: number;
             /**
              * Format: int64
-             * @description Capacity of the bounded sort window.
-             */
-            window_capacity?: number;
-            /**
-             * Format: int64
-             * @description Number of hits retained in the bounded sort window.
-             */
-            window_len?: number;
-            /**
-             * Format: int64
-             * @description Peak collector heap size observed during sort execution.
-             */
-            collector_heap_peak?: number;
-            /**
-             * Format: int64
              * @description Shards participating in distributed sort execution.
              */
             distributed_shard_count?: number;
-            /**
-             * Format: int64
-             * @description Largest shard-local sorted window merged by the coordinator.
-             */
-            distributed_shard_window?: number;
             /**
              * @description Stable budget rejection reason. Known values include
              *     `text_exact_late_visibility_totals`,

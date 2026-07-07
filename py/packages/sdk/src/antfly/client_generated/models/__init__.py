@@ -533,7 +533,6 @@ from .significance_algorithm import SignificanceAlgorithm
 from .sort_field import SortField
 from .sort_profile import SortProfile
 from .sort_profile_candidate_source import SortProfileCandidateSource
-from .sort_profile_native_filter_mode import SortProfileNativeFilterMode
 from .sort_profile_sort_lifecycle_state import SortProfileSortLifecycleState
 from .sse_error import SSEError
 from .sse_event import SSEEvent
@@ -1149,7 +1148,6 @@ __all__ = (
     "SortField",
     "SortProfile",
     "SortProfileCandidateSource",
-    "SortProfileNativeFilterMode",
     "SortProfileSortLifecycleState",
     "SSEError",
     "SSEEvent",

@@ -12141,7 +12141,15 @@ components:
 
         diagnostic surface; profiling responses may include additional
 
-        implementation counters.
+        implementation counters. Additional properties may include low-level
+
+        implementation details such as doc-value load timings, stored-source
+
+        loads, collector/window internals, cost-model inputs, native-filter
+
+        modes, and index-sort availability flags; treat those properties as
+
+        diagnostic and not as a frozen SDK contract.
       properties:
         plan:
           type: string
@@ -12242,9 +12250,6 @@ components:
         require_native:
           type: boolean
           description: Whether exact execution required native typed sort values.
-        native_loader:
-          type: boolean
-          description: Whether a native typed sort value loader was active.
         sort_lifecycle_state:
           type: string
           enum:
@@ -12257,42 +12262,6 @@ components:
           description: Conservative lifecycle state for the requested sort path. Queryable fields are
             accepted by public exact sort; accelerated fields are queryable and have an index_sort-compatible
             physical path.
-        native_filter_mode:
-          type: string
-          enum:
-            - none
-            - empty
-            - doc_nums
-            - doc_ids
-            - mixed
-            - exclusion_only
-          description: Native filter constraint shape available to sort planning for this request.
-        native_filter_candidate_count:
-          type: integer
-          format: int64
-          description: Number of resolved native positive-filter candidates available to the sort executor.
-        native_filter_exclusion_count:
-          type: integer
-          format: int64
-          description: Number of resolved native exclusion candidates available to the sort executor.
-        selective_filter_doc_values_preferred:
-          type: boolean
-          description: Whether the planner preferred candidate-first doc-values collection over sorted-segment
-            scanning because a native filter was selective.
-        cost_model_live_docs:
-          type: integer
-          format: int64
-          description: Live document count used by the sort planner cost model for the selected execution
-            decision.
-        cost_model_candidate_count:
-          type: integer
-          format: int64
-          description: Candidate count used by the sort planner cost model for the selected execution
-            decision.
-        cost_model_selective_limit:
-          type: integer
-          format: int64
-          description: Candidate-count threshold under which the sort planner considers a filter selective.
         native_doc_values_coverage:
           type: string
           description: >
@@ -12311,25 +12280,6 @@ components:
             `missing_segment_index_sort`, `covered_without_bounds`, and
 
             `covered_with_bounds`.
-        index_sort_match:
-          type: boolean
-          description: Whether the requested order matched the configured physical index_sort prefix.
-        sorted_segment_executor_available:
-          type: boolean
-          description: Whether sorted-segment execution was available for this request.
-        sorted_segment_bounds_available:
-          type: boolean
-          description: Whether sorted-segment bounds were available for cursor seeks.
-        sorted_segment_scanned_count:
-          type: integer
-          format: int64
-          description: Physical sorted-segment documents scanned before deleted-doc, cursor, membership,
-            and filter checks.
-        sorted_segment_scan_budget:
-          type: integer
-          format: int64
-          description: Maximum physical sorted-segment documents allowed before the sorted_segment_scan_window
-            budget rejection.
         candidate_count:
           type: integer
           format: int64
@@ -12338,82 +12288,18 @@ components:
           type: integer
           format: int64
           description: Candidates rejected by cursor comparison.
-        admitted_count:
-          type: integer
-          format: int64
-          description: Candidate hits admitted to the sort window.
-        replaced_count:
-          type: integer
-          format: int64
-          description: Candidate hits replaced in the bounded sort window.
-        discarded_count:
-          type: integer
-          format: int64
-          description: Candidate hits discarded by the bounded sort window.
         selected_count:
           type: integer
           format: int64
           description: Hits selected for the returned page.
-        decorate_us:
-          type: integer
-          format: int64
-          description: Time spent decorating hits with sort values, in microseconds.
-        native_doc_value_load_us:
-          type: integer
-          format: int64
-          description: Time spent loading native typed doc values, in microseconds.
-        native_doc_value_hit_count:
-          type: integer
-          format: int64
-          description: Native typed doc-value loads that returned a value.
-        native_doc_value_miss_count:
-          type: integer
-          format: int64
-          description: Native typed doc-value loads that missed and had to fail or fall back.
-        stored_json_load_us:
-          type: integer
-          format: int64
-          description: Time spent loading stored JSON for debug sort paths, in microseconds.
-        stored_json_load_count:
-          type: integer
-          format: int64
-          description: Stored JSON loads performed by sort execution.
-        projected_source_load_us:
-          type: integer
-          format: int64
-          description: Time spent loading projected source after page selection, in microseconds.
-        projected_source_load_count:
-          type: integer
-          format: int64
-          description: Projected source documents loaded after page selection.
-        final_sort_us:
-          type: integer
-          format: int64
-          description: Time spent in the final in-memory page/window sort, in microseconds.
         total_us:
           type: integer
           format: int64
           description: Total sort execution time in microseconds.
-        window_capacity:
-          type: integer
-          format: int64
-          description: Capacity of the bounded sort window.
-        window_len:
-          type: integer
-          format: int64
-          description: Number of hits retained in the bounded sort window.
-        collector_heap_peak:
-          type: integer
-          format: int64
-          description: Peak collector heap size observed during sort execution.
         distributed_shard_count:
           type: integer
           format: int64
           description: Shards participating in distributed sort execution.
-        distributed_shard_window:
-          type: integer
-          format: int64
-          description: Largest shard-local sorted window merged by the coordinator.
         budget_rejection_reason:
           type: string
           description: >
