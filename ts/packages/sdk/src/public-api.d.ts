@@ -3641,7 +3641,7 @@ export interface components {
              */
             replication_sources?: components["schemas"]["ReplicationSource"][];
         };
-        /** @description Runtime field capability exposed for planning, sortable field discovery, and operator diagnostics. */
+        /** @description Public field capability derived from Antfly schema mappings and observed dynamic field metadata. */
         FieldCapability: {
             /** @description Mapping or dynamic-template name, when applicable. */
             name?: string;
@@ -3658,21 +3658,19 @@ export interface components {
             /** @description Document schema that produced this capability, when applicable. */
             document_schema?: string;
             type: components["schemas"]["AntflyType"];
-            searchable: boolean;
-            filterable: boolean;
-            aggregatable: boolean;
-            doc_values: boolean;
+            /**
+             * @description Query modes supported by this concrete field variant. These modes are derived from
+             *     Antfly field types such as `text`, `keyword`, `datetime`, `geopoint`, and
+             *     `search_as_you_type`; they are not separate schema toggles.
+             */
+            query_modes: ("full_text" | "exact" | "range" | "geo" | "autocomplete")[];
             sortable: boolean;
-            /** @description Coverage state for native doc values, such as identity_metadata, schema_declared, observed_declared, or not_declared. */
-            doc_value_coverage: string;
             /** @description Capability source, such as reserved, document_schema, dynamic_template, or observed_dynamic. */
             provenance: string;
             /** @description Current missing/null handling policy for this field. */
             missing_null_policy: string;
-            /** @description Whether the field is currently usable by public query planning. */
-            queryability_state: string;
             /**
-             * @description Operational lifecycle state for exact sort/filter use. Queryable fields are accepted by public exact sort; accelerated fields are queryable and participate in the configured index_sort tuple.
+             * @description Operational lifecycle state for exact sort use. Queryable fields are accepted by public exact sort; accelerated fields are queryable and participate in the configured index_sort tuple.
              * @enum {string}
              */
             sort_lifecycle_state: "unsupported" | "declared" | "indexed" | "covered" | "queryable" | "accelerated";
@@ -3711,9 +3709,9 @@ export interface components {
             replication_sources?: components["schemas"]["ReplicationSource"][];
             /**
              * @description Effective runtime field capabilities for this table. Clients can use this to discover
-             *     concrete searchable, filterable, aggregatable, and sortable fields. Public exact
-             *     field sort is supported only for `_id` or scalar fields marked sortable with native
-             *     doc-value coverage and queryable state.
+             *     concrete field variants and their supported query modes, such as full_text, exact,
+             *     range, geo, and autocomplete. Public exact field sort is supported only for `_id`
+             *     or scalar fields marked sortable whose sort lifecycle is queryable or accelerated.
              */
             field_capabilities?: components["schemas"]["FieldCapability"][];
         };

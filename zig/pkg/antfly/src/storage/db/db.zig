@@ -13638,19 +13638,16 @@ pub const DB = struct {
             AlgebraicDocFilterRequest{ .req = req };
         defer algebraic_filter.deinit();
         var execution_req = algebraic_filter.req;
-        var resolved_text_filter = if (text_query == .match_all)
-            null
-        else
-            try db_query_search.resolveStructuredTextDocNumFilterForComposedAlloc(alloc, execution_req, .{
-                .ctx = self,
-                .text_index_entry = textIndexEntryCallback,
-                .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
-                .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
-                .live_filter_doc_set = liveFilterDocSetCallback,
-                .all_docs_visible = allDocsVisibleCallback,
-                .project_ordinals_to_doc_ids = false,
-                .identity_read_generation = execution_req.identity_read_generation,
-            });
+        var resolved_text_filter = try db_query_search.resolveStructuredTextDocNumFilterForComposedAlloc(alloc, execution_req, .{
+            .ctx = self,
+            .text_index_entry = textIndexEntryCallback,
+            .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
+            .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .live_filter_doc_set = liveFilterDocSetCallback,
+            .all_docs_visible = allDocsVisibleCallback,
+            .project_ordinals_to_doc_ids = false,
+            .identity_read_generation = execution_req.identity_read_generation,
+        });
         defer if (resolved_text_filter) |*filter| filter.deinit(alloc);
         if (resolved_text_filter) |*filter| {
             execution_req.resolved_text_doc_filter = filter;

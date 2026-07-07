@@ -59,6 +59,17 @@ pub const testing = if (builtin.is_test) struct {
     pub fn expectSortProfileDiagnosticsSerialization() !void {
         return expectSortProfileDiagnosticsSerializationForTest();
     }
+
+    pub fn expectFilterOnlyQueryStringFilterPreserved() !void {
+        var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
+            \\{"filter_query":{"query":"status:active"},"limit":5}
+        );
+        defer owned.deinit(std.testing.allocator);
+
+        try std.testing.expect(owned.req.full_text != null);
+        try std.testing.expect(owned.req.full_text.? == .match_all);
+        try std.testing.expect(std.mem.indexOf(u8, owned.req.filter_query_json, "\"status\":\"active\"") != null);
+    }
 } else struct {};
 
 pub fn totalHitsRelationString(relation: db_mod.types.TotalHitsRelation) []const u8 {

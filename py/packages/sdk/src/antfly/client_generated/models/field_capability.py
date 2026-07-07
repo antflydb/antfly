@@ -8,6 +8,7 @@ from attrs import field as _attrs_field
 
 from ..models.antfly_type import AntflyType
 from ..models.field_capability_index_sort_order import FieldCapabilityIndexSortOrder
+from ..models.field_capability_query_modes_item import FieldCapabilityQueryModesItem
 from ..models.field_capability_sort_lifecycle_state import FieldCapabilitySortLifecycleState
 from ..types import UNSET, Unset
 
@@ -16,21 +17,18 @@ T = TypeVar("T", bound="FieldCapability")
 
 @_attrs_define
 class FieldCapability:
-    """Runtime field capability exposed for planning, sortable field discovery, and operator diagnostics.
+    """Public field capability derived from Antfly schema mappings and observed dynamic field metadata.
 
     Attributes:
         type_ (AntflyType):
-        searchable (bool):
-        filterable (bool):
-        aggregatable (bool):
-        doc_values (bool):
+        query_modes (list[FieldCapabilityQueryModesItem]): Query modes supported by this concrete field variant. These
+            modes are derived from
+            Antfly field types such as `text`, `keyword`, `datetime`, `geopoint`, and
+            `search_as_you_type`; they are not separate schema toggles.
         sortable (bool):
-        doc_value_coverage (str): Coverage state for native doc values, such as identity_metadata, schema_declared,
-            observed_declared, or not_declared.
         provenance (str): Capability source, such as reserved, document_schema, dynamic_template, or observed_dynamic.
         missing_null_policy (str): Current missing/null handling policy for this field.
-        queryability_state (str): Whether the field is currently usable by public query planning.
-        sort_lifecycle_state (FieldCapabilitySortLifecycleState): Operational lifecycle state for exact sort/filter use.
+        sort_lifecycle_state (FieldCapabilitySortLifecycleState): Operational lifecycle state for exact sort use.
             Queryable fields are accepted by public exact sort; accelerated fields are queryable and participate in the
             configured index_sort tuple.
         name (str | Unset): Mapping or dynamic-template name, when applicable.
@@ -49,15 +47,10 @@ class FieldCapability:
     """
 
     type_: AntflyType
-    searchable: bool
-    filterable: bool
-    aggregatable: bool
-    doc_values: bool
+    query_modes: list[FieldCapabilityQueryModesItem]
     sortable: bool
-    doc_value_coverage: str
     provenance: str
     missing_null_policy: str
-    queryability_state: str
     sort_lifecycle_state: FieldCapabilitySortLifecycleState
     name: str | Unset = UNSET
     field: str | Unset = UNSET
@@ -74,23 +67,16 @@ class FieldCapability:
     def to_dict(self) -> dict[str, Any]:
         type_ = self.type_.value
 
-        searchable = self.searchable
-
-        filterable = self.filterable
-
-        aggregatable = self.aggregatable
-
-        doc_values = self.doc_values
+        query_modes = []
+        for query_modes_item_data in self.query_modes:
+            query_modes_item = query_modes_item_data.value
+            query_modes.append(query_modes_item)
 
         sortable = self.sortable
-
-        doc_value_coverage = self.doc_value_coverage
 
         provenance = self.provenance
 
         missing_null_policy = self.missing_null_policy
-
-        queryability_state = self.queryability_state
 
         sort_lifecycle_state = self.sort_lifecycle_state.value
 
@@ -121,15 +107,10 @@ class FieldCapability:
         field_dict.update(
             {
                 "type": type_,
-                "searchable": searchable,
-                "filterable": filterable,
-                "aggregatable": aggregatable,
-                "doc_values": doc_values,
+                "query_modes": query_modes,
                 "sortable": sortable,
-                "doc_value_coverage": doc_value_coverage,
                 "provenance": provenance,
                 "missing_null_policy": missing_null_policy,
-                "queryability_state": queryability_state,
                 "sort_lifecycle_state": sort_lifecycle_state,
             }
         )
@@ -161,23 +142,18 @@ class FieldCapability:
         d = dict(src_dict)
         type_ = AntflyType(d.pop("type"))
 
-        searchable = d.pop("searchable")
+        query_modes = []
+        _query_modes = d.pop("query_modes")
+        for query_modes_item_data in _query_modes:
+            query_modes_item = FieldCapabilityQueryModesItem(query_modes_item_data)
 
-        filterable = d.pop("filterable")
-
-        aggregatable = d.pop("aggregatable")
-
-        doc_values = d.pop("doc_values")
+            query_modes.append(query_modes_item)
 
         sortable = d.pop("sortable")
-
-        doc_value_coverage = d.pop("doc_value_coverage")
 
         provenance = d.pop("provenance")
 
         missing_null_policy = d.pop("missing_null_policy")
-
-        queryability_state = d.pop("queryability_state")
 
         sort_lifecycle_state = FieldCapabilitySortLifecycleState(d.pop("sort_lifecycle_state"))
 
@@ -208,15 +184,10 @@ class FieldCapability:
 
         field_capability = cls(
             type_=type_,
-            searchable=searchable,
-            filterable=filterable,
-            aggregatable=aggregatable,
-            doc_values=doc_values,
+            query_modes=query_modes,
             sortable=sortable,
-            doc_value_coverage=doc_value_coverage,
             provenance=provenance,
             missing_null_policy=missing_null_policy,
-            queryability_state=queryability_state,
             sort_lifecycle_state=sort_lifecycle_state,
             name=name,
             field=field,

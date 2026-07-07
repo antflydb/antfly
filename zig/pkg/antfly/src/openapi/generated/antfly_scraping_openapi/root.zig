@@ -4,6 +4,6 @@
 pub const types = @import("types.zig");
 
 pub const ContentSecurityConfig = types.ContentSecurityConfig;
-pub const S3CredentialConfig = types.S3CredentialConfig;
 pub const HTTPCredentialConfig = types.HTTPCredentialConfig;
 pub const RemoteContentConfig = types.RemoteContentConfig;
+pub const S3CredentialConfig = types.S3CredentialConfig;

@@ -2,1304 +2,21 @@
 // Package: antfly_metadata_openapi
 
 const std = @import("std");
-const antfly_usermgr_openapi = @import("antfly_usermgr_openapi");
-const antfly_indexes_openapi = @import("antfly_indexes_openapi");
-const antfly_schema_openapi = @import("antfly_schema_openapi");
+const antfly_eval_openapi = @import("antfly_eval_openapi");
 const antfly_generating_api_openapi = @import("antfly_generating_api_openapi");
 const antfly_generating_openapi = @import("antfly_generating_openapi");
-const antfly_eval_openapi = @import("antfly_eval_openapi");
+const antfly_indexes_openapi = @import("antfly_indexes_openapi");
 const antfly_reranking_openapi = @import("antfly_reranking_openapi");
-
-pub const Error = antfly_usermgr_openapi.Error;
-
-pub const ExactSortError = struct {
-    /// Stable error class.
-    @"error": []const u8,
-    /// Human-readable error summary.
-    message: []const u8,
-    /// Stable machine-readable rejection reason. Known exact-sort reasons include `unmapped_sort_field`, `non_sortable_sort_field`, `missing_doc_values_coverage`, `missing_native_filter_coverage`, `invalid_cursor_arity`, `invalid_cursor_type`, `invalid_sort_tuple`, `approximate_candidate_source`, `candidate_budget_exceeded`, `missing_runtime_mapping`, `invalid_doc_value_type`, `missing_null_policy`, `non_score_bearing_source`, `invalid_score_value`, `count_only_ordered_page`, `stored_json_sort_disabled`, `unsupported_exact_sort`, and `distributed_merge_unsupported`.
-    reason: []const u8,
-    /// Stable exact-sort rejection reason; uses the same stable reason taxonomy as `reason`.
-    sort_rejection_reason: []const u8,
-    /// Stable budget rejection reason when the rejection was budget-driven. Known values include `text_exact_late_visibility_totals`, `text_field_sort_candidate_window`, `match_all_candidate_collect_limit`, `match_all_exact_candidate_window`, `sorted_segment_scan_window`, and `distributed_merge_shard_window`.
-    budget_rejection_reason: ?[]const u8 = null,
-    /// More specific exact-sort rejection detail. Known values include `unmapped_sort_field`, `unmapped_field`, `non_sortable_sort_field`, `non_scalar_field`, `non_sortable_field`, `mixed_field_type`, `missing_doc_values_section`, `malformed_doc_values_section`, `doc_values_kind_mismatch`, `sparse_live_doc_values`, `invalid_doc_value_doc_id`, `duplicate_doc_value_doc_id`, `unsupported_doc_values_type`, `missing_doc_values_coverage`, `missing_doc_values_capability`, `schema_declared`, `observed_declared`, `not_declared`, `missing_doc_values`, `non_sortable`, `declared`, `text_search_only`, `mixed`, `missing_native_filter_coverage`, `invalid_cursor_arity`, `invalid_cursor_type`, `invalid_sort_tuple`, `sort_tuple_arity`, `invalid_doc_value_type`, `incomplete_sort_tuple`, `mixed_sort_value_domain`, `unsorted_shard_window`, `unsorted_component_window`, `non_numeric_score`, `missing_score`, `non_finite_score`, `score_sort_tuple_mismatch`, `non_score_bearing_source`, `id_tiebreaker_mismatch`, `approximate_candidate_source`, `count_only_ordered_page`, `native_sort_loader_unavailable`, `sorted_segment_executor_unavailable`, `primary_key_stream_unavailable`, `native_candidate_stream_unavailable`, `candidate_stream_unavailable`, `incompatible_sort_plan`, `sorted_segment_bounds_unavailable`, `filter_query_json_unresolved`, `exclusion_query_json_unresolved`, `text_index_entry_unavailable`, `doc_ordinal_projection_unavailable`, `component_sort_profile_missing`, `unsupported_composed_sort_source`, `stored_json_sort_disabled`, `distributed_merge_unsupported`, `distributed_merge_plan_required`, `distributed_shard_window_incomplete`, `distributed_shard_cursor_window_invalid`, and `distributed_merge_shard_window`.
-    sort_rejection_detail: []const u8,
-    /// Sort field associated with the rejection when safe to expose.
-    sort_rejection_field: []const u8,
-    status: i32,
-};
-
-pub const SortDirection = antfly_indexes_openapi.SortDirection;
-
-pub const SortField = antfly_indexes_openapi.SortField;
-
-/// Overall health status of the cluster
-pub const ClusterHealth = enum {
-    unknown,
-    healthy,
-    unhealthy,
-    degraded,
-    @"error",
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .unknown => "unknown",
-            .healthy => "healthy",
-            .unhealthy => "unhealthy",
-            .degraded => "degraded",
-            .@"error" => "error",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "unknown", .unknown },
-            .{ "healthy", .healthy },
-            .{ "unhealthy", .unhealthy },
-            .{ "degraded", .degraded },
-            .{ "error", .@"error" },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Kind of external connection configured on this node.
-pub const ConnectionKind = enum {
-    inference,
-    web_search,
-    external_io,
-    cdc,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .inference => "inference",
-            .web_search => "web_search",
-            .external_io => "external_io",
-            .cdc => "cdc",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "inference", .inference },
-            .{ "web_search", .web_search },
-            .{ "external_io", .external_io },
-            .{ "cdc", .cdc },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Connection status. "connected" means a live probe or listing succeeded, "error" means the probe failed (see the error field), "configured" means the connection is present but was not probed, and "unsupported" means no probe is available for this connection kind or provider.
-pub const ConnectionStatus = enum {
-    connected,
-    @"error",
-    configured,
-    unsupported,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .connected => "connected",
-            .@"error" => "error",
-            .configured => "configured",
-            .unsupported => "unsupported",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "connected", .connected },
-            .{ "error", .@"error" },
-            .{ "configured", .configured },
-            .{ "unsupported", .unsupported },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Inference provider type for a connection.
-pub const InferenceProviderType = enum {
-    gemini,
-    vertex,
-    ollama,
-    openai,
-    openrouter,
-    bedrock,
-    cohere,
-    anthropic,
-    antfly,
-    mock,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .gemini => "gemini",
-            .vertex => "vertex",
-            .ollama => "ollama",
-            .openai => "openai",
-            .openrouter => "openrouter",
-            .bedrock => "bedrock",
-            .cohere => "cohere",
-            .anthropic => "anthropic",
-            .antfly => "antfly",
-            .mock => "mock",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "gemini", .gemini },
-            .{ "vertex", .vertex },
-            .{ "ollama", .ollama },
-            .{ "openai", .openai },
-            .{ "openrouter", .openrouter },
-            .{ "bedrock", .bedrock },
-            .{ "cohere", .cohere },
-            .{ "anthropic", .anthropic },
-            .{ "antfly", .antfly },
-            .{ "mock", .mock },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Model task type. Mirrors the inference registry taxonomy; "other" is used for models whose task type the provider's listing API does not classify.
-pub const ConnectedModelType = enum {
-    embedder,
-    generator,
-    reranker,
-    chunker,
-    recognizer,
-    classifier,
-    rewriter,
-    reader,
-    transcriber,
-    extractor,
-    other,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .embedder => "embedder",
-            .generator => "generator",
-            .reranker => "reranker",
-            .chunker => "chunker",
-            .recognizer => "recognizer",
-            .classifier => "classifier",
-            .rewriter => "rewriter",
-            .reader => "reader",
-            .transcriber => "transcriber",
-            .extractor => "extractor",
-            .other => "other",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "embedder", .embedder },
-            .{ "generator", .generator },
-            .{ "reranker", .reranker },
-            .{ "chunker", .chunker },
-            .{ "recognizer", .recognizer },
-            .{ "classifier", .classifier },
-            .{ "rewriter", .rewriter },
-            .{ "reader", .reader },
-            .{ "transcriber", .transcriber },
-            .{ "extractor", .extractor },
-            .{ "other", .other },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-pub const ConnectedModel = struct {
-    /// Model identifier as reported by the provider.
-    name: []const u8,
-    /// Human-readable model name when the provider reports one.
-    display_name: ?[]const u8 = null,
-    /// Embedding output dimension when known.
-    dimensions: ?i64 = null,
-    /// True when this model is referenced by a configured embedder, generator, reranker, or chunker.
-    configured: ?bool = null,
-};
-
-/// External IO transport protocol.
-pub const ExternalIoProtocol = enum {
-    s3,
-    gcs,
-    filesystem,
-    http,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .s3 => "s3",
-            .gcs => "gcs",
-            .filesystem => "filesystem",
-            .http => "http",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "s3", .s3 },
-            .{ "gcs", .gcs },
-            .{ "filesystem", .filesystem },
-            .{ "http", .http },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-pub const WebSearchConnection = struct {
-    /// Provider-specific service flavor, such as agent_search for provider vertex.
-    service: ?[]const u8 = null,
-    /// Maximum ranked results this connection is configured to return.
-    max_results: ?i64 = null,
-    /// Provider request timeout in milliseconds.
-    timeout_ms: ?i64 = null,
-    /// Whether safe-search filtering is requested.
-    safe_search: ?bool = null,
-    /// Preferred result language.
-    language: ?[]const u8 = null,
-    /// Preferred result region.
-    region: ?[]const u8 = null,
-    /// Whether extracted content is requested when supported.
-    include_content: ?bool = null,
-    /// Whether highlighted passages are requested when supported.
-    include_highlights: ?bool = null,
-    /// Provider endpoint override when configured.
-    endpoint: ?[]const u8 = null,
-    /// Google Cloud project for provider vertex.
-    project_id: ?[]const u8 = null,
-    /// Google Cloud location for provider vertex.
-    location: ?[]const u8 = null,
-    /// Agent Search data store ID for provider vertex.
-    data_store: ?[]const u8 = null,
-    /// Agent Search serving config ID for provider vertex.
-    serving_config: ?[]const u8 = null,
-    /// Domain allowlist when configured.
-    include_domains: ?[]const []const u8 = null,
-    /// Domain denylist when configured.
-    exclude_domains: ?[]const []const u8 = null,
-    /// True when required credentials/config are present. Secret values are never returned.
-    configured: ?bool = null,
-};
-
-pub const CdcConnection = struct {
-    /// CDC provider type. Currently "postgres"; future CDC providers may add new values.
-    provider: []const u8,
-    /// Antfly table receiving changes from this CDC source.
-    table_name: []const u8,
-    /// Zero-based ordinal of the replication source within the table config.
-    source_ordinal: i64,
-    /// Source-side table or stream name when reported by the provider.
-    external_table: ?[]const u8 = null,
-    /// Provider replication cursor or slot name when applicable.
-    slot_name: ?[]const u8 = null,
-    /// Provider publication or stream grouping name when applicable.
-    publication_name: ?[]const u8 = null,
-    /// Runtime CDC phase such as snapshot, streaming, configured, or failed.
-    phase: ?[]const u8 = null,
-    /// Source records behind, when reported by the runtime.
-    lag_records: ?i64 = null,
-    /// Source commit lag in milliseconds, when reported by the runtime.
-    lag_millis: ?i64 = null,
-    /// Wall-clock timestamp of the last successful CDC poll/apply, in milliseconds.
-    last_success_at_ms: ?i64 = null,
-    /// Wall-clock timestamp of the last applied source change, in milliseconds.
-    last_change_applied_at_ms: ?i64 = null,
-    /// Wall-clock timestamp when this CDC status was last updated, in milliseconds.
-    updated_at_ms: ?i64 = null,
-};
-
-/// Parsed child-range descriptor from a derived document artifact manifest.
-pub const DocumentArtifactChildRange = struct {
-    /// Stable range identifier within the artifact manifest generation.
-    range_id: []const u8,
-    /// Kind of children covered by this range, such as unit or chunk.
-    range_kind: []const u8,
-    /// Artifact namespace covered by this range.
-    artifact_name: []const u8,
-    /// Logical boundary used for splitting this range.
-    split_boundary: []const u8,
-    /// Current placement summary for the range.
-    placement: []const u8,
-    /// Owner group for this child artifact range, when assigned.
-    owner_group_id: ?i64 = null,
-    /// Placement generation for range ownership metadata.
-    placement_generation: ?i64 = null,
-    /// Current routing status for child writes in this range.
-    route_status: ?[]const u8 = null,
-    /// Whether this range may split at its configured split boundary.
-    split_eligible: ?bool = null,
-    /// Inclusive first internal child key covered by this range.
-    start_key: []const u8,
-    /// Exclusive end internal child key, or empty for the final range.
-    end_key_exclusive: []const u8,
-    /// Inclusive last internal child key covered by this range.
-    last_key: []const u8,
-    /// Number of child records covered by this range.
-    child_count: i64,
-    /// Approximate extracted text bytes covered by this range when available.
-    text_bytes: ?i64 = null,
-};
-
-/// Table-level generated artifact enrichments configured for a table.
-pub const TableArtifactEnrichmentList = struct {
-    /// Table containing the configured artifact enrichments.
-    table_name: []const u8,
-    artifacts: []const antfly_indexes_openapi.EnrichmentConfig,
-};
-
-/// Kind of stored artifact tracked by the repair queue.
-pub const ArtifactRepairKind = enum {
-    embedding,
-    asset,
-    chunk,
-    graph,
-    full_text,
-    algebraic,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .embedding => "embedding",
-            .asset => "asset",
-            .chunk => "chunk",
-            .graph => "graph",
-            .full_text => "full_text",
-            .algebraic => "algebraic",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "embedding", .embedding },
-            .{ "asset", .asset },
-            .{ "chunk", .chunk },
-            .{ "graph", .graph },
-            .{ "full_text", .full_text },
-            .{ "algebraic", .algebraic },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Reason an artifact was added to the repair queue.
-pub const ArtifactRepairReason = enum {
-    missing_artifact,
-    corrupt_artifact,
-    unreadable_artifact,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .missing_artifact => "missing_artifact",
-            .corrupt_artifact => "corrupt_artifact",
-            .unreadable_artifact => "unreadable_artifact",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "missing_artifact", .missing_artifact },
-            .{ "corrupt_artifact", .corrupt_artifact },
-            .{ "unreadable_artifact", .unreadable_artifact },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Repair subsystem to inspect or run.
-pub const RepairTarget = enum {
-    artifact,
-    index,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .artifact => "artifact",
-            .index => "index",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "artifact", .artifact },
-            .{ "index", .index },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Result of one bounded table repair pass.
-pub const TableRepairRunResult = struct {
-    /// Number of repair records attempted by this pass.
-    scanned: i64,
-    /// Number of table groups touched by this bounded repair pass.
-    groups_scanned: i64,
-    /// Number of artifacts whose source was reprocessed.
-    reprocessed: i64,
-    /// Number of repair records cleared because the artifact became readable.
-    repaired: i64,
-    /// Number of repair records whose source document no longer exists.
-    missing_source_docs: i64,
-    /// Number of supported repair attempts that failed.
-    failed: i64,
-    /// Number of repair records skipped because no automated repair exists for the selected target.
-    unsupported: i64,
-    /// Number of attempted repair records that remained queued after this pass.
-    unresolved: i64,
-    /// Number of selected repair records or indexes skipped because another repair pass already owns them.
-    in_progress: i64,
-    /// Number of indexes rebuilt by this pass when target is index.
-    indexes_rebuilt: i64,
-    /// Number of selected indexes that were already degraded or quarantined before repair.
-    indexes_degraded: i64,
-    /// Effective repair limit.
-    limit: i64,
-    /// Opaque cursor for the next artifact repair pass when has_more is true. Index repair currently repairs one named index per request and does not return a continuation cursor.
-    next_cursor: ?[]const u8 = null,
-    /// Whether another repair scan page is available via next_cursor.
-    has_more: bool,
-    /// Whether repair debt remains after this bounded pass. If true and next_cursor is absent, rerun repair from the beginning after addressing failed or unsupported records.
-    debt_remaining: bool,
-};
-
-pub const DocumentArtifactReprocessResponse = struct {
-    /// Indicates that reprocessing was accepted.
-    reprocess: []const u8,
-};
-
-pub const DocumentArtifactReprocessFailure = struct {
-    /// Source document key that failed during reprocessing.
-    key: []const u8,
-    /// Stable error code for the failed document reprocess attempt.
-    error_code: []const u8,
-};
-
-pub const DocumentArtifactReprocessShardCursor = struct {
-    /// Physical table group that produced this cursor, when known.
-    group_id: ?i64 = null,
-    /// Source key cursor for resuming this shard-local repair pass.
-    next_key: []const u8,
-    /// Number of source rows scanned by this shard-local pass.
-    scanned: i64,
-    /// Number of source rows whose artifact was reprocessed by this shard-local pass.
-    reprocessed: i64,
-    /// Number of scanned source rows that no longer had a reprocessable source document in this shard-local pass.
-    skipped: i64,
-    /// Number of scanned source rows that failed in this shard-local pass.
-    failed: i64,
-    /// Effective scan limit used by this shard-local pass.
-    limit: i64,
-};
-
-/// Request to create a durable table artifact reprocess job.
-pub const DocumentArtifactReprocessJobStartRequest = struct {
-    /// Exclusive lower bound source document key.
-    from_key: ?[]const u8 = null,
-    /// Inclusive upper bound source document key, or empty for the end of the table/range.
-    to_key: ?[]const u8 = null,
-    /// Maximum source rows to scan per shard-local repair pass. Zero uses the server default.
-    limit: ?i64 = null,
-    /// When true, immediately runs the first bounded pass before returning the job state.
-    advance: ?bool = null,
-};
-
-pub const ClusterDataNodeStatus = struct {
-    data_id: i64,
-    node_id: i64,
-    api_url: ?[]const u8 = null,
-    raft_url: ?[]const u8 = null,
-    role: ?[]const u8 = null,
-    state: ?[]const u8 = null,
-    health_class: ?[]const u8 = null,
-    failure_domain: ?[]const u8 = null,
-    live: ?bool = null,
-    drain_requested: ?bool = null,
-    capacity_bytes: ?i64 = null,
-    available_bytes: ?i64 = null,
-    lease_pressure: ?i64 = null,
-    read_load: ?i64 = null,
-    write_load: ?i64 = null,
-    active_backfills: ?i64 = null,
-};
-
-pub const ClusterDataRangeStatus = struct {
-    group_id: i64,
-    range_id: i64,
-    table_id: i64,
-    table_name: ?[]const u8 = null,
-    start_key: ?[]const u8 = null,
-    end_key: ?[]const u8 = null,
-    doc_identity_shard_id: ?i64 = null,
-    doc_identity_range_id: ?i64 = null,
-    state: ?[]const u8 = null,
-    leader_data_id: ?i64 = null,
-    voter_count: ?i64 = null,
-    doc_count: ?i64 = null,
-    disk_bytes: ?i64 = null,
-    empty: ?bool = null,
-};
-
-pub const ClusterDataReplicaStatus = struct {
-    group_id: i64,
-    data_id: i64,
-    node_id: i64,
-    replica_id: i64,
-    peer_node_ids: ?[]const i64 = null,
-};
-
-pub const ClusterDataGroupStatus = struct {
-    group_id: i64,
-    leader_known: ?bool = null,
-    leader_data_id: ?i64 = null,
-    voter_count_known: ?bool = null,
-    voter_count: ?i64 = null,
-    healthy_voter_reports: ?i64 = null,
-    joint_consensus: ?bool = null,
-    transition_pending: ?bool = null,
-    replay_required: ?bool = null,
-    replay_caught_up: ?bool = null,
-    cutover_ready: ?bool = null,
-    reads_ready_after_cutover: ?bool = null,
-    doc_identity_lifecycle: ?[]const u8 = null,
-    doc_count: ?i64 = null,
-    disk_bytes: ?i64 = null,
-    empty: ?bool = null,
-};
-
-/// Non-secret status for the local secrets file store, when one is available.
-pub const SecretStoreStatus = struct {
-    /// Whether Antfly is serving a last-known-good secrets snapshot after a failed refresh.
-    stale: ?bool = null,
-};
-
-/// Source of the secret configuration
-pub const SecretStatus = enum {
-    configured_keystore,
-    configured_env,
-    configured_both,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .configured_keystore => "configured_keystore",
-            .configured_env => "configured_env",
-            .configured_both => "configured_both",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "configured_keystore", .configured_keystore },
-            .{ "configured_env", .configured_env },
-            .{ "configured_both", .configured_both },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-pub const SecretWriteRequest = struct {
-    /// Secret value (stored encrypted, never returned)
-    value: []const u8,
-};
-
-pub const ByteRange = []const []const u8;
-
-/// Synchronization level for batch operations: - "propose": Wait for Raft proposal acceptance (fastest, default) - "write": Wait for Pebble KV write - "full_text": Wait for full-text index WAL write - "enrichments": Pre-compute enrichments before Raft proposal (synchronous enrichment generation) - "full_index": Wait for all index writes to complete (full-text + enrichments + vector indexes)
-pub const SyncLevel = enum {
-    propose,
-    write,
-    full_text,
-    enrichments,
-    full_index,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .propose => "propose",
-            .write => "write",
-            .full_text => "full_text",
-            .enrichments => "enrichments",
-            .full_index => "full_index",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "propose", .propose },
-            .{ "write", .write },
-            .{ "full_text", .full_text },
-            .{ "enrichments", .enrichments },
-            .{ "full_index", .full_index },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-pub const AntflyType = antfly_indexes_openapi.AntflyType;
-
-/// Describes an in-progress schema migration. The table serves reads from read_schema while rebuilding full-text indexes for the new schema.
-pub const TableMigration = struct {
-    state: []const u8,
-    read_schema: antfly_schema_openapi.TableSchema,
-};
-
-/// Type of aggregation to compute: - Metrics: sum, avg, min, max, count, sumsquares, stats, cardinality - Bucketing: terms, range, date_range, histogram, date_histogram - Geo: geohash_grid, geo_distance - Analytics: significant_terms
-pub const AggregationType = enum {
-    sum,
-    avg,
-    min,
-    max,
-    count,
-    sumsquares,
-    stats,
-    cardinality,
-    terms,
-    range,
-    date_range,
-    histogram,
-    date_histogram,
-    geohash_grid,
-    geo_distance,
-    significant_terms,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .sum => "sum",
-            .avg => "avg",
-            .min => "min",
-            .max => "max",
-            .count => "count",
-            .sumsquares => "sumsquares",
-            .stats => "stats",
-            .cardinality => "cardinality",
-            .terms => "terms",
-            .range => "range",
-            .date_range => "date_range",
-            .histogram => "histogram",
-            .date_histogram => "date_histogram",
-            .geohash_grid => "geohash_grid",
-            .geo_distance => "geo_distance",
-            .significant_terms => "significant_terms",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "sum", .sum },
-            .{ "avg", .avg },
-            .{ "min", .min },
-            .{ "max", .max },
-            .{ "count", .count },
-            .{ "sumsquares", .sumsquares },
-            .{ "stats", .stats },
-            .{ "cardinality", .cardinality },
-            .{ "terms", .terms },
-            .{ "range", .range },
-            .{ "date_range", .date_range },
-            .{ "histogram", .histogram },
-            .{ "date_histogram", .date_histogram },
-            .{ "geohash_grid", .geohash_grid },
-            .{ "geo_distance", .geo_distance },
-            .{ "significant_terms", .significant_terms },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-pub const AggregationRange = struct {
-    /// Name of the range bucket
-    name: []const u8,
-    /// Lower bound (inclusive)
-    from: ?f32 = null,
-    /// Upper bound (exclusive)
-    to: ?f32 = null,
-};
-
-pub const AggregationDateRange = struct {
-    /// Name of the date range bucket
-    name: []const u8,
-    /// Start date (ISO 8601 or relative like "now-7d")
-    from: ?[]const u8 = null,
-    /// End date (ISO 8601 or relative like "now")
-    to: ?[]const u8 = null,
-};
-
-/// Calendar-aware interval for date_histogram aggregations
-pub const CalendarInterval = enum {
-    minute,
-    hour,
-    day,
-    week,
-    month,
-    quarter,
-    year,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .minute => "minute",
-            .hour => "hour",
-            .day => "day",
-            .week => "week",
-            .month => "month",
-            .quarter => "quarter",
-            .year => "year",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "minute", .minute },
-            .{ "hour", .hour },
-            .{ "day", .day },
-            .{ "week", .week },
-            .{ "month", .month },
-            .{ "quarter", .quarter },
-            .{ "year", .year },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Distance unit for geo aggregations: - m: meters - km: kilometers - mi: miles - ft: feet - yd: yards
-pub const DistanceUnit = enum {
-    m,
-    km,
-    mi,
-    ft,
-    yd,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .m => "m",
-            .km => "km",
-            .mi => "mi",
-            .ft => "ft",
-            .yd => "yd",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "m", .m },
-            .{ "km", .km },
-            .{ "mi", .mi },
-            .{ "ft", .ft },
-            .{ "yd", .yd },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-pub const DistanceRange = struct {
-    /// Name of the distance range bucket
-    name: []const u8,
-    /// Minimum distance (inclusive)
-    from: ?f32 = null,
-    /// Maximum distance (exclusive)
-    to: ?f32 = null,
-};
-
-/// Algorithm for computing term significance: - jlh: JLH algorithm (default) - mutual_information: Mutual Information - chi_squared: Chi-squared test - percentage: Simple percentage comparison
-pub const SignificanceAlgorithm = enum {
-    jlh,
-    mutual_information,
-    chi_squared,
-    percentage,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .jlh => "jlh",
-            .mutual_information => "mutual_information",
-            .chi_squared => "chi_squared",
-            .percentage => "percentage",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "jlh", .jlh },
-            .{ "mutual_information", .mutual_information },
-            .{ "chi_squared", .chi_squared },
-            .{ "percentage", .percentage },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-pub const AlgebraicAggregationJoin = struct {
-    /// Algebraic join materialization or capability name
-    name: []const u8,
-    /// Temporal join mode for the algebraic materialization
-    kind: ?[]const u8 = null,
-    /// Join side that supplies grouping bucket values
-    group_side: []const u8,
-    /// Join side that supplies metric values
-    measure_side: []const u8,
-};
-
-pub const IndexStatus = struct {
-    shard_status: std.json.ArrayHashMap(antfly_indexes_openapi.IndexStats),
-    config: antfly_indexes_openapi.IndexConfig,
-    status: antfly_indexes_openapi.IndexStats,
-};
-
-/// Compact LSM backend operational status. Detailed low-level counters are available through metrics.
-pub const LsmStorageStatus = struct {
-    run_count: ?i64 = null,
-    run_bytes: ?i64 = null,
-    l0_run_count: ?i64 = null,
-    l0_bytes: ?i64 = null,
-    lower_level_run_count: ?i64 = null,
-    lower_level_bytes: ?i64 = null,
-    max_level: ?i64 = null,
-    compactable_l0_run_count: ?i64 = null,
-    overlapping_l0_run_count: ?i64 = null,
-    soft_limit_l0_run_count: ?i64 = null,
-    hard_limit_l0_run_count: ?i64 = null,
-    write_stall_l0_run_debt: ?i64 = null,
-    soft_limit_l0_bytes: ?i64 = null,
-    hard_limit_l0_bytes: ?i64 = null,
-    write_stall_l0_byte_debt: ?i64 = null,
-    level_overflow_run_count: ?i64 = null,
-    level_overflow_bytes: ?i64 = null,
-    obsolete_path_count: ?i64 = null,
-    obsolete_paths_pinned_by_readers: ?i64 = null,
-    obsolete_paths_pinned_by_versions: ?i64 = null,
-    obsolete_paths_waiting_for_retry: ?i64 = null,
-    obsolete_paths_reclaimable: ?i64 = null,
-    obsolete_delete_failures: ?i64 = null,
-    obsolete_delete_retries: ?i64 = null,
-    current_manifest_bytes: ?i64 = null,
-    mutable_entry_count: ?i64 = null,
-    mutable_bytes: ?i64 = null,
-    immutable_memtable_count: ?i64 = null,
-    immutable_entry_count: ?i64 = null,
-    immutable_bytes: ?i64 = null,
-    mutable_snapshot_clone_count: ?i64 = null,
-    mutable_snapshot_clone_bytes: ?i64 = null,
-    mutable_snapshot_clone_peak_bytes: ?i64 = null,
-    read_snapshot_mutable_rotation_count: ?i64 = null,
-    read_snapshot_mutable_rotation_bytes: ?i64 = null,
-    wal_retained_bytes: ?i64 = null,
-    compaction_backlog_bytes: ?i64 = null,
-    active_readers: ?i64 = null,
-    active_readers_bound_read_txn: ?i64 = null,
-    active_readers_namespace_read_txn: ?i64 = null,
-    active_readers_probe_txn: ?i64 = null,
-    active_readers_current_scan: ?i64 = null,
-    active_readers_write_txn: ?i64 = null,
-    active_readers_compaction: ?i64 = null,
-    active_readers_other: ?i64 = null,
-    obsolete_paths_pinned_by_reader_bound_read_txn: ?i64 = null,
-    obsolete_paths_pinned_by_reader_namespace_read_txn: ?i64 = null,
-    obsolete_paths_pinned_by_reader_probe_txn: ?i64 = null,
-    obsolete_paths_pinned_by_reader_current_scan: ?i64 = null,
-    obsolete_paths_pinned_by_reader_write_txn: ?i64 = null,
-    obsolete_paths_pinned_by_reader_compaction: ?i64 = null,
-    obsolete_paths_pinned_by_reader_other: ?i64 = null,
-    active_bulk_ingest_batches: ?i64 = null,
-    manifest_dirty: ?bool = null,
-    obsolete_manifest_dirty: ?bool = null,
-    maintenance_score: ?i64 = null,
-    maintenance_debt_hint: ?i64 = null,
-    flush_count: ?i64 = null,
-    flush_output_run_count: ?i64 = null,
-    flush_output_bytes: ?i64 = null,
-    sorted_ingest_run_count: ?i64 = null,
-    sorted_ingest_bytes: ?i64 = null,
-    manifest_write_count: ?i64 = null,
-    manifest_bytes: ?i64 = null,
-    write_pressure_event_count: ?i64 = null,
-    write_pressure_compaction_count: ?i64 = null,
-    write_pressure_compaction_step_count: ?i64 = null,
-    write_pressure_overload_count: ?i64 = null,
-    write_pressure_overload_l0_run_debt: ?i64 = null,
-    immutable_rotation_count: ?i64 = null,
-    immutable_flush_count: ?i64 = null,
-    direct_bulk_ingest_attempt_count: ?i64 = null,
-    direct_bulk_ingest_success_count: ?i64 = null,
-    direct_bulk_ingest_entry_count: ?i64 = null,
-    bulk_append_attempt_count: ?i64 = null,
-    bulk_append_entry_count: ?i64 = null,
-    bulk_append_direct_success_count: ?i64 = null,
-    bulk_append_direct_entry_count: ?i64 = null,
-    bulk_append_fallback_backend_pending_count: ?i64 = null,
-    bulk_append_fallback_below_threshold_count: ?i64 = null,
-    bulk_append_fallback_duplicate_key_count: ?i64 = null,
-    bulk_append_fallback_to_mutable_entry_count: ?i64 = null,
-    direct_bulk_ingest_direct_entry_count: ?i64 = null,
-    direct_bulk_ingest_fallback_unsupported_count: ?i64 = null,
-    direct_bulk_ingest_fallback_backend_mutable_count: ?i64 = null,
-    direct_bulk_ingest_fallback_below_threshold_count: ?i64 = null,
-};
-
-/// MongoDB-style update operator
-pub const TransformOpType = enum {
-    @"$set",
-    @"$set_on_insert",
-    @"$unset",
-    @"$inc",
-    @"$push",
-    @"$pull",
-    @"$add_to_set",
-    @"$pop",
-    @"$mul",
-    @"$min",
-    @"$max",
-    @"$current_date",
-    @"$rename",
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .@"$set" => "$set",
-            .@"$set_on_insert" => "$setOnInsert",
-            .@"$unset" => "$unset",
-            .@"$inc" => "$inc",
-            .@"$push" => "$push",
-            .@"$pull" => "$pull",
-            .@"$add_to_set" => "$addToSet",
-            .@"$pop" => "$pop",
-            .@"$mul" => "$mul",
-            .@"$min" => "$min",
-            .@"$max" => "$max",
-            .@"$current_date" => "$currentDate",
-            .@"$rename" => "$rename",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "$set", .@"$set" },
-            .{ "$setOnInsert", .@"$set_on_insert" },
-            .{ "$unset", .@"$unset" },
-            .{ "$inc", .@"$inc" },
-            .{ "$push", .@"$push" },
-            .{ "$pull", .@"$pull" },
-            .{ "$addToSet", .@"$add_to_set" },
-            .{ "$pop", .@"$pop" },
-            .{ "$mul", .@"$mul" },
-            .{ "$min", .@"$min" },
-            .{ "$max", .@"$max" },
-            .{ "$currentDate", .@"$current_date" },
-            .{ "$rename", .@"$rename" },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Request to scan keys in a table within a key range. If no range is specified, scans all keys in the table.
-pub const ScanKeysRequest = struct {
-    /// Start of the key range to scan (exclusive by default). Can be a full key or a prefix. If not specified, starts from the beginning of the table.
-    from: ?[]const u8 = null,
-    /// End of the key range to scan (inclusive by default). Can be a full key or a prefix. If not specified, scans to the end of the table.
-    to: ?[]const u8 = null,
-    /// If true, include keys matching 'from' in the results. Default: false (exclusive lower bound for pagination).
-    inclusive_from: ?bool = null,
-    /// If true, exclude keys matching 'to' from the results. Default: false (inclusive upper bound).
-    exclusive_to: ?bool = null,
-    /// List of fields to include in each result. If not specified, only returns the key. Supports: - Simple fields: "title", "author" - Nested paths: "user.address.city" - Wildcards: "_chunks.*" - Exclusions: "-_chunks.*._embedding" - Special fields: "_embeddings", "_summaries", "_chunks"
-    fields: ?[]const []const u8 = null,
-    /// Antfly query to filter documents. Only documents matching this query are included in results. Uses the sear library for efficient per-document matching without requiring a full index. Examples: - Status filtering: `{"query": "status:published"}` - Date ranges: `{"query": "created_at:>2023-01-01"}` - Field matching: `{"query": "category:technology"}`
-    filter_query: ?std.json.Value = null,
-    /// Maximum number of results to return. If not specified, returns all matching keys in the range. Useful for pagination or sampling.
-    limit: ?i64 = null,
-};
-
-pub const BatchResponse = struct {
-    /// Number of documents successfully inserted
-    inserted: ?i64 = null,
-    /// Number of documents successfully deleted
-    deleted: ?i64 = null,
-    /// Number of documents successfully transformed
-    transformed: ?i64 = null,
-};
-
-/// A key that was read as part of an OCC transaction, along with the version observed at read time. Used to detect conflicts at commit time.
-pub const TransactionReadItem = struct {
-    /// Table name the key belongs to
-    table: []const u8,
-    /// Document key that was read
-    key: []const u8,
-    /// Version token observed at read time (from X-Antfly-Version header). Use "0" to assert the key did not exist at read time.
-    version: []const u8,
-};
-
-pub const TransactionBeginResponse = struct {
-    transaction_id: []const u8,
-    begin_timestamp: i64,
-    sync_level: []const u8,
-};
-
-pub const TransactionStatusResponse = struct {
-    status: []const u8,
-    transaction_id: []const u8,
-};
-
-pub const TransactionSavepointResponse = struct {
-    status: []const u8,
-    transaction_id: []const u8,
-    savepoint_id: i64,
-};
-
-pub const TransactionStageReadRequest = struct {
-    table: []const u8,
-    key: []const u8,
-    version: []const u8,
-};
-
-pub const TransactionStageWriteRequest = struct {
-    table: []const u8,
-    key: []const u8,
-    document: std.json.Value,
-};
-
-pub const TransactionStageDeleteRequest = struct {
-    table: []const u8,
-    key: []const u8,
-};
-
-pub const TransactionStageReadSnapshot = struct {
-    table: []const u8,
-    key: []const u8,
-    version: []const u8,
-    document: ?std.json.Value,
-};
-
-pub const TransactionSessionStatus = struct {
-    transaction_id: []const u8,
-    owner_node_id: i64,
-    begin_timestamp: i64,
-    last_touched_timestamp: i64,
-    lease_expires_at: i64,
-    lease_state: []const u8,
-    sync_level: []const u8,
-    staged_table_count: i64,
-    staged_read_count: i64,
-    staged_write_count: i64,
-    staged_delete_count: i64,
-    read_snapshot_count: i64,
-    savepoint_count: i64,
-    savepoint_limit: ?i64 = null,
-    remaining_savepoints: ?i64 = null,
-    durable: bool,
-};
-
-pub const TransactionSessionTableDetail = struct {
-    table: ?[]const u8 = null,
-    staged_read_count: ?i64 = null,
-    staged_write_count: ?i64 = null,
-    staged_delete_count: ?i64 = null,
-    staged_predicate_count: ?i64 = null,
-};
-
-pub const TransactionSessionReadSnapshot = struct {
-    table: ?[]const u8 = null,
-    key: ?[]const u8 = null,
-    version: ?i64 = null,
-    document: ?std.json.Value = null,
-};
-
-pub const TransactionSessionCleanupResponse = struct {
-    removed: ?i64 = null,
-    cutoff_ns: ?i64 = null,
-};
-
-pub const BackupRequest = struct {
-    /// Unique identifier for this backup. Used to reference the backup for restore operations. Choose a meaningful name that includes date/version information.
-    backup_id: []const u8,
-    /// Storage location for the backup. Supports multiple backends: - Local filesystem: `file:///path/to/backup` - Amazon S3: `s3://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata for the specified table.
-    location: []const u8,
-    /// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
-    format: ?[]const u8 = null,
-};
-
-pub const ClusterBackupRequest = struct {
-    /// Unique identifier for this backup. Used to reference the backup for restore operations. Choose a meaningful name that includes date/version information.
-    backup_id: []const u8,
-    /// Storage location for the backup. Supports multiple backends: - Local filesystem: `file:///path/to/backup` - Amazon S3: `s3://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata.
-    location: []const u8,
-    /// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
-    format: ?[]const u8 = null,
-    /// Optional list of tables to backup. If omitted, all tables are backed up.
-    table_names: ?[]const []const u8 = null,
-};
-
-pub const TableBackupStatus = struct {
-    /// Table name
-    name: []const u8,
-    /// Backup status for this table
-    status: []const u8,
-    /// Error message if backup failed
-    @"error": ?[]const u8 = null,
-};
-
-pub const ClusterRestoreRequest = struct {
-    /// Unique identifier of the backup to restore from.
-    backup_id: []const u8,
-    /// Storage location where the backup is stored.
-    location: []const u8,
-    /// Optional list of tables to restore. If omitted, all tables in the backup are restored.
-    table_names: ?[]const []const u8 = null,
-    /// How to handle existing tables: - `fail_if_exists`: Abort if any table already exists (default) - `skip_if_exists`: Skip existing tables, restore others - `overwrite`: Drop and recreate existing tables
-    restore_mode: ?[]const u8 = null,
-};
-
-pub const TableRestoreStatus = struct {
-    /// Table name
-    name: []const u8,
-    /// Restore status for this table
-    status: []const u8,
-    /// Error message if restore failed
-    @"error": ?[]const u8 = null,
-};
-
-pub const BackupInfo = struct {
-    /// The backup identifier
-    backup_id: []const u8,
-    /// When the backup was created
-    timestamp: []const u8,
-    /// Tables included in the backup
-    tables: []const []const u8,
-    /// Storage location of the backup
-    location: []const u8,
-    /// Antfly version that created the backup
-    antfly_version: ?[]const u8 = null,
-    /// Backup format used
-    format: ?[]const u8 = null,
-};
-
-/// Explains why the agent stopped before completion. Present when status is "incomplete".
-pub const IncompleteDetails = struct {
-    /// Why the agent stopped: - max_internal_iterations: Hit the configured max_internal_iterations limit - max_tokens: LLM output was truncated - no_tools: No tools were available for agentic mode - clarification_required: The agent needs a user decision before it can continue
-    reason: []const u8,
-};
-
-/// Strategy for document retrieval: - semantic: Vector similarity search using embeddings - bm25: Full-text search using BM25 scoring - metadata: Structured query on document fields - tree: Iterative tree navigation with summarization - graph: Relationship-based traversal - hybrid: Combine multiple strategies with RRF or rerank
-pub const RetrievalStrategy = enum {
-    semantic,
-    bm25,
-    metadata,
-    tree,
-    graph,
-    hybrid,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .semantic => "semantic",
-            .bm25 => "bm25",
-            .metadata => "metadata",
-            .tree => "tree",
-            .graph => "graph",
-            .hybrid => "hybrid",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "semantic", .semantic },
-            .{ "bm25", .bm25 },
-            .{ "metadata", .metadata },
-            .{ "tree", .tree },
-            .{ "graph", .graph },
-            .{ "hybrid", .hybrid },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Configuration for tree search strategy. Tree search navigates hierarchical document structures by evaluating summaries at each level.
-pub const TreeSearchConfig = struct {
-    /// Name of the graph index to use for tree navigation
-    index: []const u8,
-    /// Starting nodes for tree search: - "$roots" - Query for root nodes (nodes with no parents) - Comma-separated explicit node IDs When omitted and combined with a QueryRequest in a RetrievalQueryRequest, the query results are used as start nodes.
-    start_nodes: ?[]const u8 = null,
-    /// Maximum depth to traverse in the tree
-    max_depth: ?i64 = null,
-    /// Number of branches to explore at each level
-    beam_width: ?i64 = null,
+const antfly_schema_openapi = @import("antfly_schema_openapi");
+const antfly_usermgr_openapi = @import("antfly_usermgr_openapi");
+
+pub const AgentDecision = struct {
+    /// The question being answered
+    question_id: []const u8,
+    /// User answer, scalar or structured depending on the question kind
+    answer: ?std.json.Value = null,
+    /// Used for confirm/review steps where the draft may be accepted as-is
+    approved: ?bool = null,
 };
 
 /// UI rendering/answer handling hint for a bounded agent question
@@ -1335,15 +52,6 @@ pub const AgentQuestionKind = enum {
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
-};
-
-pub const AgentDecision = struct {
-    /// The question being answered
-    question_id: []const u8,
-    /// User answer, scalar or structured depending on the question kind
-    answer: ?std.json.Value = null,
-    /// Used for confirm/review steps where the draft may be accepted as-is
-    approved: ?bool = null,
 };
 
 /// Shared bounded-agent execution status
@@ -1448,6 +156,1227 @@ pub const AgentStepStatus = enum {
     }
 };
 
+pub const AggregationDateRange = struct {
+    /// Name of the date range bucket
+    name: []const u8,
+    /// Start date (ISO 8601 or relative like "now-7d")
+    from: ?[]const u8 = null,
+    /// End date (ISO 8601 or relative like "now")
+    to: ?[]const u8 = null,
+};
+
+pub const AggregationRange = struct {
+    /// Name of the range bucket
+    name: []const u8,
+    /// Lower bound (inclusive)
+    from: ?f32 = null,
+    /// Upper bound (exclusive)
+    to: ?f32 = null,
+};
+
+/// Type of aggregation to compute: - Metrics: sum, avg, min, max, count, sumsquares, stats, cardinality - Bucketing: terms, range, date_range, histogram, date_histogram - Geo: geohash_grid, geo_distance - Analytics: significant_terms
+pub const AggregationType = enum {
+    sum,
+    avg,
+    min,
+    max,
+    count,
+    sumsquares,
+    stats,
+    cardinality,
+    terms,
+    range,
+    date_range,
+    histogram,
+    date_histogram,
+    geohash_grid,
+    geo_distance,
+    significant_terms,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .sum => "sum",
+            .avg => "avg",
+            .min => "min",
+            .max => "max",
+            .count => "count",
+            .sumsquares => "sumsquares",
+            .stats => "stats",
+            .cardinality => "cardinality",
+            .terms => "terms",
+            .range => "range",
+            .date_range => "date_range",
+            .histogram => "histogram",
+            .date_histogram => "date_histogram",
+            .geohash_grid => "geohash_grid",
+            .geo_distance => "geo_distance",
+            .significant_terms => "significant_terms",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "sum", .sum },
+            .{ "avg", .avg },
+            .{ "min", .min },
+            .{ "max", .max },
+            .{ "count", .count },
+            .{ "sumsquares", .sumsquares },
+            .{ "stats", .stats },
+            .{ "cardinality", .cardinality },
+            .{ "terms", .terms },
+            .{ "range", .range },
+            .{ "date_range", .date_range },
+            .{ "histogram", .histogram },
+            .{ "date_histogram", .date_histogram },
+            .{ "geohash_grid", .geohash_grid },
+            .{ "geo_distance", .geo_distance },
+            .{ "significant_terms", .significant_terms },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const AlgebraicAggregationJoin = struct {
+    /// Algebraic join materialization or capability name
+    name: []const u8,
+    /// Temporal join mode for the algebraic materialization
+    kind: ?[]const u8 = null,
+    /// Join side that supplies grouping bucket values
+    group_side: []const u8,
+    /// Join side that supplies metric values
+    measure_side: []const u8,
+};
+
+pub const Analyses = struct {
+    pca: ?bool = null,
+    tsne: ?bool = null,
+};
+
+pub const AnalysesResult = struct {
+    pca: ?[]const f32 = null,
+    tsne: ?[]const f32 = null,
+};
+
+/// DEPRECATED: Use RetrievalAgentSteps instead. Configuration for the answer agent's pipeline steps.
+pub const AnswerAgentSteps = struct {
+    /// Configuration for query classification and transformation.
+    classification: ?antfly_generating_api_openapi.ClassificationStepConfig = null,
+    /// DEPRECATED: Use steps.generation on RetrievalAgentRequest instead. Configuration for answer generation from retrieved documents.
+    answer: ?antfly_generating_api_openapi.GenerationStepConfig = null,
+    /// Configuration for generating follow-up questions.
+    followup: ?antfly_generating_api_openapi.FollowupStepConfig = null,
+    /// Configuration for confidence assessment.
+    confidence: ?antfly_generating_api_openapi.ConfidenceStepConfig = null,
+};
+
+pub const AntflyType = antfly_indexes_openapi.AntflyType;
+
+/// Kind of stored artifact tracked by the repair queue.
+pub const ArtifactRepairKind = enum {
+    embedding,
+    asset,
+    chunk,
+    graph,
+    full_text,
+    algebraic,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .embedding => "embedding",
+            .asset => "asset",
+            .chunk => "chunk",
+            .graph => "graph",
+            .full_text => "full_text",
+            .algebraic => "algebraic",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "embedding", .embedding },
+            .{ "asset", .asset },
+            .{ "chunk", .chunk },
+            .{ "graph", .graph },
+            .{ "full_text", .full_text },
+            .{ "algebraic", .algebraic },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Reason an artifact was added to the repair queue.
+pub const ArtifactRepairReason = enum {
+    missing_artifact,
+    corrupt_artifact,
+    unreadable_artifact,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .missing_artifact => "missing_artifact",
+            .corrupt_artifact => "corrupt_artifact",
+            .unreadable_artifact => "unreadable_artifact",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "missing_artifact", .missing_artifact },
+            .{ "corrupt_artifact", .corrupt_artifact },
+            .{ "unreadable_artifact", .unreadable_artifact },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const BackupInfo = struct {
+    /// The backup identifier
+    backup_id: []const u8,
+    /// When the backup was created
+    timestamp: []const u8,
+    /// Tables included in the backup
+    tables: []const []const u8,
+    /// Storage location of the backup
+    location: []const u8,
+    /// Antfly version that created the backup
+    antfly_version: ?[]const u8 = null,
+    /// Backup format used
+    format: ?[]const u8 = null,
+};
+
+pub const BackupRequest = struct {
+    /// Unique identifier for this backup. Used to reference the backup for restore operations. Choose a meaningful name that includes date/version information.
+    backup_id: []const u8,
+    /// Storage location for the backup. Supports multiple backends: - Local filesystem: `file:///path/to/backup` - Amazon S3: `s3://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata for the specified table.
+    location: []const u8,
+    /// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
+    format: ?[]const u8 = null,
+};
+
+pub const BatchResponse = struct {
+    /// Number of documents successfully inserted
+    inserted: ?i64 = null,
+    /// Number of documents successfully deleted
+    deleted: ?i64 = null,
+    /// Number of documents successfully transformed
+    transformed: ?i64 = null,
+};
+
+pub const ByteRange = []const []const u8;
+
+/// Calendar-aware interval for date_histogram aggregations
+pub const CalendarInterval = enum {
+    minute,
+    hour,
+    day,
+    week,
+    month,
+    quarter,
+    year,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .minute => "minute",
+            .hour => "hour",
+            .day => "day",
+            .week => "week",
+            .month => "month",
+            .quarter => "quarter",
+            .year => "year",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "minute", .minute },
+            .{ "hour", .hour },
+            .{ "day", .day },
+            .{ "week", .week },
+            .{ "month", .month },
+            .{ "quarter", .quarter },
+            .{ "year", .year },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const CdcConnection = struct {
+    /// CDC provider type. Currently "postgres"; future CDC providers may add new values.
+    provider: []const u8,
+    /// Antfly table receiving changes from this CDC source.
+    table_name: []const u8,
+    /// Zero-based ordinal of the replication source within the table config.
+    source_ordinal: i64,
+    /// Source-side table or stream name when reported by the provider.
+    external_table: ?[]const u8 = null,
+    /// Provider replication cursor or slot name when applicable.
+    slot_name: ?[]const u8 = null,
+    /// Provider publication or stream grouping name when applicable.
+    publication_name: ?[]const u8 = null,
+    /// Runtime CDC phase such as snapshot, streaming, configured, or failed.
+    phase: ?[]const u8 = null,
+    /// Source records behind, when reported by the runtime.
+    lag_records: ?i64 = null,
+    /// Source commit lag in milliseconds, when reported by the runtime.
+    lag_millis: ?i64 = null,
+    /// Wall-clock timestamp of the last successful CDC poll/apply, in milliseconds.
+    last_success_at_ms: ?i64 = null,
+    /// Wall-clock timestamp of the last applied source change, in milliseconds.
+    last_change_applied_at_ms: ?i64 = null,
+    /// Wall-clock timestamp when this CDC status was last updated, in milliseconds.
+    updated_at_ms: ?i64 = null,
+};
+
+pub const ClusterBackupRequest = struct {
+    /// Unique identifier for this backup. Used to reference the backup for restore operations. Choose a meaningful name that includes date/version information.
+    backup_id: []const u8,
+    /// Storage location for the backup. Supports multiple backends: - Local filesystem: `file:///path/to/backup` - Amazon S3: `s3://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata.
+    location: []const u8,
+    /// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
+    format: ?[]const u8 = null,
+    /// Optional list of tables to backup. If omitted, all tables are backed up.
+    table_names: ?[]const []const u8 = null,
+};
+
+pub const ClusterDataGroupStatus = struct {
+    group_id: i64,
+    leader_known: ?bool = null,
+    leader_data_id: ?i64 = null,
+    voter_count_known: ?bool = null,
+    voter_count: ?i64 = null,
+    healthy_voter_reports: ?i64 = null,
+    joint_consensus: ?bool = null,
+    transition_pending: ?bool = null,
+    replay_required: ?bool = null,
+    replay_caught_up: ?bool = null,
+    cutover_ready: ?bool = null,
+    reads_ready_after_cutover: ?bool = null,
+    doc_identity_lifecycle: ?[]const u8 = null,
+    doc_count: ?i64 = null,
+    disk_bytes: ?i64 = null,
+    empty: ?bool = null,
+};
+
+pub const ClusterDataNodeStatus = struct {
+    data_id: i64,
+    node_id: i64,
+    api_url: ?[]const u8 = null,
+    raft_url: ?[]const u8 = null,
+    role: ?[]const u8 = null,
+    state: ?[]const u8 = null,
+    health_class: ?[]const u8 = null,
+    failure_domain: ?[]const u8 = null,
+    live: ?bool = null,
+    drain_requested: ?bool = null,
+    capacity_bytes: ?i64 = null,
+    available_bytes: ?i64 = null,
+    lease_pressure: ?i64 = null,
+    read_load: ?i64 = null,
+    write_load: ?i64 = null,
+    active_backfills: ?i64 = null,
+};
+
+pub const ClusterDataRangeStatus = struct {
+    group_id: i64,
+    range_id: i64,
+    table_id: i64,
+    table_name: ?[]const u8 = null,
+    start_key: ?[]const u8 = null,
+    end_key: ?[]const u8 = null,
+    doc_identity_shard_id: ?i64 = null,
+    doc_identity_range_id: ?i64 = null,
+    state: ?[]const u8 = null,
+    leader_data_id: ?i64 = null,
+    voter_count: ?i64 = null,
+    doc_count: ?i64 = null,
+    disk_bytes: ?i64 = null,
+    empty: ?bool = null,
+};
+
+pub const ClusterDataReplicaStatus = struct {
+    group_id: i64,
+    data_id: i64,
+    node_id: i64,
+    replica_id: i64,
+    peer_node_ids: ?[]const i64 = null,
+};
+
+/// Overall health status of the cluster
+pub const ClusterHealth = enum {
+    unknown,
+    healthy,
+    unhealthy,
+    degraded,
+    @"error",
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .unknown => "unknown",
+            .healthy => "healthy",
+            .unhealthy => "unhealthy",
+            .degraded => "degraded",
+            .@"error" => "error",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "unknown", .unknown },
+            .{ "healthy", .healthy },
+            .{ "unhealthy", .unhealthy },
+            .{ "degraded", .degraded },
+            .{ "error", .@"error" },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const ClusterRestoreRequest = struct {
+    /// Unique identifier of the backup to restore from.
+    backup_id: []const u8,
+    /// Storage location where the backup is stored.
+    location: []const u8,
+    /// Optional list of tables to restore. If omitted, all tables in the backup are restored.
+    table_names: ?[]const []const u8 = null,
+    /// How to handle existing tables: - `fail_if_exists`: Abort if any table already exists (default) - `skip_if_exists`: Skip existing tables, restore others - `overwrite`: Drop and recreate existing tables
+    restore_mode: ?[]const u8 = null,
+};
+
+pub const ConnectedModel = struct {
+    /// Model identifier as reported by the provider.
+    name: []const u8,
+    /// Human-readable model name when the provider reports one.
+    display_name: ?[]const u8 = null,
+    /// Embedding output dimension when known.
+    dimensions: ?i64 = null,
+    /// True when this model is referenced by a configured embedder, generator, reranker, or chunker.
+    configured: ?bool = null,
+};
+
+/// Model task type. Mirrors the inference registry taxonomy; "other" is used for models whose task type the provider's listing API does not classify.
+pub const ConnectedModelType = enum {
+    embedder,
+    generator,
+    reranker,
+    chunker,
+    recognizer,
+    classifier,
+    rewriter,
+    reader,
+    transcriber,
+    extractor,
+    other,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .embedder => "embedder",
+            .generator => "generator",
+            .reranker => "reranker",
+            .chunker => "chunker",
+            .recognizer => "recognizer",
+            .classifier => "classifier",
+            .rewriter => "rewriter",
+            .reader => "reader",
+            .transcriber => "transcriber",
+            .extractor => "extractor",
+            .other => "other",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "embedder", .embedder },
+            .{ "generator", .generator },
+            .{ "reranker", .reranker },
+            .{ "chunker", .chunker },
+            .{ "recognizer", .recognizer },
+            .{ "classifier", .classifier },
+            .{ "rewriter", .rewriter },
+            .{ "reader", .reader },
+            .{ "transcriber", .transcriber },
+            .{ "extractor", .extractor },
+            .{ "other", .other },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Kind of external connection configured on this node.
+pub const ConnectionKind = enum {
+    inference,
+    web_search,
+    external_io,
+    cdc,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .inference => "inference",
+            .web_search => "web_search",
+            .external_io => "external_io",
+            .cdc => "cdc",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "inference", .inference },
+            .{ "web_search", .web_search },
+            .{ "external_io", .external_io },
+            .{ "cdc", .cdc },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Connection status. "connected" means a live probe or listing succeeded, "error" means the probe failed (see the error field), "configured" means the connection is present but was not probed, and "unsupported" means no probe is available for this connection kind or provider.
+pub const ConnectionStatus = enum {
+    connected,
+    @"error",
+    configured,
+    unsupported,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .connected => "connected",
+            .@"error" => "error",
+            .configured => "configured",
+            .unsupported => "unsupported",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "connected", .connected },
+            .{ "error", .@"error" },
+            .{ "configured", .configured },
+            .{ "unsupported", .unsupported },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const DistanceRange = struct {
+    /// Name of the distance range bucket
+    name: []const u8,
+    /// Minimum distance (inclusive)
+    from: ?f32 = null,
+    /// Maximum distance (exclusive)
+    to: ?f32 = null,
+};
+
+/// Distance unit for geo aggregations: - m: meters - km: kilometers - mi: miles - ft: feet - yd: yards
+pub const DistanceUnit = enum {
+    m,
+    km,
+    mi,
+    ft,
+    yd,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .m => "m",
+            .km => "km",
+            .mi => "mi",
+            .ft => "ft",
+            .yd => "yd",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "m", .m },
+            .{ "km", .km },
+            .{ "mi", .mi },
+            .{ "ft", .ft },
+            .{ "yd", .yd },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Parsed child-range descriptor from a derived document artifact manifest.
+pub const DocumentArtifactChildRange = struct {
+    /// Stable range identifier within the artifact manifest generation.
+    range_id: []const u8,
+    /// Kind of children covered by this range, such as unit or chunk.
+    range_kind: []const u8,
+    /// Artifact namespace covered by this range.
+    artifact_name: []const u8,
+    /// Logical boundary used for splitting this range.
+    split_boundary: []const u8,
+    /// Current placement summary for the range.
+    placement: []const u8,
+    /// Owner group for this child artifact range, when assigned.
+    owner_group_id: ?i64 = null,
+    /// Placement generation for range ownership metadata.
+    placement_generation: ?i64 = null,
+    /// Current routing status for child writes in this range.
+    route_status: ?[]const u8 = null,
+    /// Whether this range may split at its configured split boundary.
+    split_eligible: ?bool = null,
+    /// Inclusive first internal child key covered by this range.
+    start_key: []const u8,
+    /// Exclusive end internal child key, or empty for the final range.
+    end_key_exclusive: []const u8,
+    /// Inclusive last internal child key covered by this range.
+    last_key: []const u8,
+    /// Number of child records covered by this range.
+    child_count: i64,
+    /// Approximate extracted text bytes covered by this range when available.
+    text_bytes: ?i64 = null,
+};
+
+pub const DocumentArtifactReprocessFailure = struct {
+    /// Source document key that failed during reprocessing.
+    key: []const u8,
+    /// Stable error code for the failed document reprocess attempt.
+    error_code: []const u8,
+};
+
+/// Request to create a durable table artifact reprocess job.
+pub const DocumentArtifactReprocessJobStartRequest = struct {
+    /// Exclusive lower bound source document key.
+    from_key: ?[]const u8 = null,
+    /// Inclusive upper bound source document key, or empty for the end of the table/range.
+    to_key: ?[]const u8 = null,
+    /// Maximum source rows to scan per shard-local repair pass. Zero uses the server default.
+    limit: ?i64 = null,
+    /// When true, immediately runs the first bounded pass before returning the job state.
+    advance: ?bool = null,
+};
+
+pub const DocumentArtifactReprocessResponse = struct {
+    /// Indicates that reprocessing was accepted.
+    reprocess: []const u8,
+};
+
+pub const DocumentArtifactReprocessShardCursor = struct {
+    /// Physical table group that produced this cursor, when known.
+    group_id: ?i64 = null,
+    /// Source key cursor for resuming this shard-local repair pass.
+    next_key: []const u8,
+    /// Number of source rows scanned by this shard-local pass.
+    scanned: i64,
+    /// Number of source rows whose artifact was reprocessed by this shard-local pass.
+    reprocessed: i64,
+    /// Number of scanned source rows that no longer had a reprocessable source document in this shard-local pass.
+    skipped: i64,
+    /// Number of scanned source rows that failed in this shard-local pass.
+    failed: i64,
+    /// Effective scan limit used by this shard-local pass.
+    limit: i64,
+};
+
+pub const Edge = antfly_indexes_openapi.Edge;
+
+pub const EdgeDirection = antfly_indexes_openapi.EdgeDirection;
+
+pub const Embedding = std.json.Value;
+
+pub const Error = antfly_usermgr_openapi.Error;
+
+pub const ExactSortError = struct {
+    /// Stable error class.
+    @"error": []const u8,
+    /// Human-readable error summary.
+    message: []const u8,
+    /// Stable machine-readable rejection reason. Known exact-sort reasons include `unmapped_sort_field`, `non_sortable_sort_field`, `missing_doc_values_coverage`, `missing_native_filter_coverage`, `invalid_cursor_arity`, `invalid_cursor_type`, `invalid_sort_tuple`, `approximate_candidate_source`, `candidate_budget_exceeded`, `missing_runtime_mapping`, `invalid_doc_value_type`, `missing_null_policy`, `non_score_bearing_source`, `invalid_score_value`, `count_only_ordered_page`, `stored_json_sort_disabled`, `unsupported_exact_sort`, and `distributed_merge_unsupported`.
+    reason: []const u8,
+    /// Stable exact-sort rejection reason; uses the same stable reason taxonomy as `reason`.
+    sort_rejection_reason: []const u8,
+    /// Stable budget rejection reason when the rejection was budget-driven. Known values include `text_exact_late_visibility_totals`, `text_field_sort_candidate_window`, `match_all_candidate_collect_limit`, `match_all_exact_candidate_window`, `sorted_segment_scan_window`, and `distributed_merge_shard_window`.
+    budget_rejection_reason: ?[]const u8 = null,
+    /// More specific exact-sort rejection detail. Known values include `unmapped_sort_field`, `unmapped_field`, `non_sortable_sort_field`, `non_scalar_field`, `non_sortable_field`, `mixed_field_type`, `missing_doc_values_section`, `malformed_doc_values_section`, `doc_values_kind_mismatch`, `sparse_live_doc_values`, `invalid_doc_value_doc_id`, `duplicate_doc_value_doc_id`, `unsupported_doc_values_type`, `missing_doc_values_coverage`, `missing_doc_values_capability`, `schema_declared`, `observed_declared`, `not_declared`, `missing_doc_values`, `non_sortable`, `declared`, `text_search_only`, `mixed`, `missing_native_filter_coverage`, `invalid_cursor_arity`, `invalid_cursor_type`, `invalid_sort_tuple`, `sort_tuple_arity`, `invalid_doc_value_type`, `incomplete_sort_tuple`, `mixed_sort_value_domain`, `unsorted_shard_window`, `unsorted_component_window`, `non_numeric_score`, `missing_score`, `non_finite_score`, `score_sort_tuple_mismatch`, `non_score_bearing_source`, `id_tiebreaker_mismatch`, `approximate_candidate_source`, `count_only_ordered_page`, `native_sort_loader_unavailable`, `sorted_segment_executor_unavailable`, `primary_key_stream_unavailable`, `native_candidate_stream_unavailable`, `candidate_stream_unavailable`, `incompatible_sort_plan`, `sorted_segment_bounds_unavailable`, `filter_query_json_unresolved`, `exclusion_query_json_unresolved`, `text_index_entry_unavailable`, `doc_ordinal_projection_unavailable`, `component_sort_profile_missing`, `unsupported_composed_sort_source`, `stored_json_sort_disabled`, `distributed_merge_unsupported`, `distributed_merge_plan_required`, `distributed_shard_window_incomplete`, `distributed_shard_cursor_window_invalid`, and `distributed_merge_shard_window`.
+    sort_rejection_detail: []const u8,
+    /// Sort field associated with the rejection when safe to expose.
+    sort_rejection_field: []const u8,
+    status: i32,
+};
+
+/// External IO transport protocol.
+pub const ExternalIoProtocol = enum {
+    s3,
+    gcs,
+    filesystem,
+    http,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .s3 => "s3",
+            .gcs => "gcs",
+            .filesystem => "filesystem",
+            .http => "http",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "s3", .s3 },
+            .{ "gcs", .gcs },
+            .{ "filesystem", .filesystem },
+            .{ "http", .http },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const FailedOperation = struct {
+    id: ?[]const u8 = null,
+    operation: ?[]const u8 = null,
+    @"error": ?[]const u8 = null,
+};
+
+/// Statistics about a specific field.
+pub const FieldStatistics = struct {
+    /// Approximate number of unique values (via HyperLogLog).
+    cardinality: ?i64 = null,
+    /// Number of rows with null values for this field.
+    null_count: ?i64 = null,
+    /// Minimum value for numeric/date fields.
+    min_value: ?std.json.Value = null,
+    /// Maximum value for numeric/date fields.
+    max_value: ?std.json.Value = null,
+    /// Average size in bytes for variable-length fields.
+    avg_size: ?i64 = null,
+};
+
+pub const ForeignColumn = struct {
+    /// Column name in the foreign table.
+    name: []const u8,
+    /// Column data type. Used for filter validation and type coercion. Common types: text, integer, bigint, float, boolean, timestamp, uuid, jsonb.
+    type: []const u8,
+    /// Whether the column allows NULL values.
+    nullable: ?bool = null,
+};
+
+/// Explains why the agent stopped before completion. Present when status is "incomplete".
+pub const IncompleteDetails = struct {
+    /// Why the agent stopped: - max_internal_iterations: Hit the configured max_internal_iterations limit - max_tokens: LLM output was truncated - no_tools: No tools were available for agentic mode - clarification_required: The agent needs a user decision before it can continue
+    reason: []const u8,
+};
+
+pub const IndexStatus = struct {
+    shard_status: std.json.ArrayHashMap(antfly_indexes_openapi.IndexStats),
+    config: antfly_indexes_openapi.IndexConfig,
+    status: antfly_indexes_openapi.IndexStats,
+};
+
+/// Inference provider type for a connection.
+pub const InferenceProviderType = enum {
+    gemini,
+    vertex,
+    ollama,
+    openai,
+    openrouter,
+    bedrock,
+    cohere,
+    anthropic,
+    antfly,
+    mock,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .gemini => "gemini",
+            .vertex => "vertex",
+            .ollama => "ollama",
+            .openai => "openai",
+            .openrouter => "openrouter",
+            .bedrock => "bedrock",
+            .cohere => "cohere",
+            .anthropic => "anthropic",
+            .antfly => "antfly",
+            .mock => "mock",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "gemini", .gemini },
+            .{ "vertex", .vertex },
+            .{ "ollama", .ollama },
+            .{ "openai", .openai },
+            .{ "openrouter", .openrouter },
+            .{ "bedrock", .bedrock },
+            .{ "cohere", .cohere },
+            .{ "anthropic", .anthropic },
+            .{ "antfly", .antfly },
+            .{ "mock", .mock },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Filters to apply to a table before joining.
+pub const JoinFilters = struct {
+    /// Antfly query to filter rows before joining.
+    filter_query: ?std.json.Value = null,
+    /// Key prefix filter for the table.
+    filter_prefix: ?[]const u8 = null,
+    /// Maximum number of rows to include from this table.
+    limit: ?i64 = null,
+};
+
+/// Comparison operator for join condition: - `eq`: Equal (default) - `neq`: Not equal - `lt`: Less than - `lte`: Less than or equal - `gt`: Greater than - `gte`: Greater than or equal
+pub const JoinOperator = enum {
+    eq,
+    neq,
+    lt,
+    lte,
+    gt,
+    gte,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .eq => "eq",
+            .neq => "neq",
+            .lt => "lt",
+            .lte => "lte",
+            .gt => "gt",
+            .gte => "gte",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "eq", .eq },
+            .{ "neq", .neq },
+            .{ "lt", .lt },
+            .{ "lte", .lte },
+            .{ "gt", .gt },
+            .{ "gte", .gte },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Strategy for executing the join: - `broadcast`: Broadcast small table to all shards of large table. Best for dimension tables < 10MB. O(small_table) memory per shard. - `index_lookup`: Use batch key lookups via indexes. Best for selective joins with indexed join keys. Low memory overhead. - `shuffle`: Hash-partition both tables by join key. Best for large-large table joins. Requires data movement.
+pub const JoinStrategy = enum {
+    broadcast,
+    index_lookup,
+    shuffle,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .broadcast => "broadcast",
+            .index_lookup => "index_lookup",
+            .shuffle => "shuffle",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "broadcast", .broadcast },
+            .{ "index_lookup", .index_lookup },
+            .{ "shuffle", .shuffle },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Type of join to perform: - `inner`: Only return rows with matches in both tables - `left`: Return all rows from left table, NULL for non-matching right rows - `right`: Return all rows from right table, NULL for non-matching left rows
+pub const JoinType = enum {
+    inner,
+    left,
+    right,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .inner => "inner",
+            .left => "left",
+            .right => "right",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "inner", .inner },
+            .{ "left", .left },
+            .{ "right", .right },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Key range processed in this request
+pub const KeyRange = struct {
+    from: ?[]const u8 = null,
+    to: ?[]const u8 = null,
+};
+
+/// Status of a linear merge page operation: - "success": All records in batch processed successfully - "partial": Processing stopped at shard boundary, client should retry with next_cursor - "error": Fatal error occurred, no records processed successfully
+pub const LinearMergePageStatus = enum {
+    success,
+    partial,
+    @"error",
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .success => "success",
+            .partial => "partial",
+            .@"error" => "error",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "success", .success },
+            .{ "partial", .partial },
+            .{ "error", .@"error" },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Compact LSM backend operational status. Detailed low-level counters are available through metrics.
+pub const LsmStorageStatus = struct {
+    run_count: ?i64 = null,
+    run_bytes: ?i64 = null,
+    l0_run_count: ?i64 = null,
+    l0_bytes: ?i64 = null,
+    lower_level_run_count: ?i64 = null,
+    lower_level_bytes: ?i64 = null,
+    max_level: ?i64 = null,
+    compactable_l0_run_count: ?i64 = null,
+    overlapping_l0_run_count: ?i64 = null,
+    soft_limit_l0_run_count: ?i64 = null,
+    hard_limit_l0_run_count: ?i64 = null,
+    write_stall_l0_run_debt: ?i64 = null,
+    soft_limit_l0_bytes: ?i64 = null,
+    hard_limit_l0_bytes: ?i64 = null,
+    write_stall_l0_byte_debt: ?i64 = null,
+    level_overflow_run_count: ?i64 = null,
+    level_overflow_bytes: ?i64 = null,
+    obsolete_path_count: ?i64 = null,
+    obsolete_paths_pinned_by_readers: ?i64 = null,
+    obsolete_paths_pinned_by_versions: ?i64 = null,
+    obsolete_paths_waiting_for_retry: ?i64 = null,
+    obsolete_paths_reclaimable: ?i64 = null,
+    obsolete_delete_failures: ?i64 = null,
+    obsolete_delete_retries: ?i64 = null,
+    current_manifest_bytes: ?i64 = null,
+    mutable_entry_count: ?i64 = null,
+    mutable_bytes: ?i64 = null,
+    immutable_memtable_count: ?i64 = null,
+    immutable_entry_count: ?i64 = null,
+    immutable_bytes: ?i64 = null,
+    mutable_snapshot_clone_count: ?i64 = null,
+    mutable_snapshot_clone_bytes: ?i64 = null,
+    mutable_snapshot_clone_peak_bytes: ?i64 = null,
+    read_snapshot_mutable_rotation_count: ?i64 = null,
+    read_snapshot_mutable_rotation_bytes: ?i64 = null,
+    wal_retained_bytes: ?i64 = null,
+    compaction_backlog_bytes: ?i64 = null,
+    active_readers: ?i64 = null,
+    active_readers_bound_read_txn: ?i64 = null,
+    active_readers_namespace_read_txn: ?i64 = null,
+    active_readers_probe_txn: ?i64 = null,
+    active_readers_current_scan: ?i64 = null,
+    active_readers_write_txn: ?i64 = null,
+    active_readers_compaction: ?i64 = null,
+    active_readers_other: ?i64 = null,
+    obsolete_paths_pinned_by_reader_bound_read_txn: ?i64 = null,
+    obsolete_paths_pinned_by_reader_namespace_read_txn: ?i64 = null,
+    obsolete_paths_pinned_by_reader_probe_txn: ?i64 = null,
+    obsolete_paths_pinned_by_reader_current_scan: ?i64 = null,
+    obsolete_paths_pinned_by_reader_write_txn: ?i64 = null,
+    obsolete_paths_pinned_by_reader_compaction: ?i64 = null,
+    obsolete_paths_pinned_by_reader_other: ?i64 = null,
+    active_bulk_ingest_batches: ?i64 = null,
+    manifest_dirty: ?bool = null,
+    obsolete_manifest_dirty: ?bool = null,
+    maintenance_score: ?i64 = null,
+    maintenance_debt_hint: ?i64 = null,
+    flush_count: ?i64 = null,
+    flush_output_run_count: ?i64 = null,
+    flush_output_bytes: ?i64 = null,
+    sorted_ingest_run_count: ?i64 = null,
+    sorted_ingest_bytes: ?i64 = null,
+    manifest_write_count: ?i64 = null,
+    manifest_bytes: ?i64 = null,
+    write_pressure_event_count: ?i64 = null,
+    write_pressure_compaction_count: ?i64 = null,
+    write_pressure_compaction_step_count: ?i64 = null,
+    write_pressure_overload_count: ?i64 = null,
+    write_pressure_overload_l0_run_debt: ?i64 = null,
+    immutable_rotation_count: ?i64 = null,
+    immutable_flush_count: ?i64 = null,
+    direct_bulk_ingest_attempt_count: ?i64 = null,
+    direct_bulk_ingest_success_count: ?i64 = null,
+    direct_bulk_ingest_entry_count: ?i64 = null,
+    bulk_append_attempt_count: ?i64 = null,
+    bulk_append_entry_count: ?i64 = null,
+    bulk_append_direct_success_count: ?i64 = null,
+    bulk_append_direct_entry_count: ?i64 = null,
+    bulk_append_fallback_backend_pending_count: ?i64 = null,
+    bulk_append_fallback_below_threshold_count: ?i64 = null,
+    bulk_append_fallback_duplicate_key_count: ?i64 = null,
+    bulk_append_fallback_to_mutable_entry_count: ?i64 = null,
+    direct_bulk_ingest_direct_entry_count: ?i64 = null,
+    direct_bulk_ingest_fallback_unsupported_count: ?i64 = null,
+    direct_bulk_ingest_fallback_backend_mutable_count: ?i64 = null,
+    direct_bulk_ingest_fallback_below_threshold_count: ?i64 = null,
+};
+
+/// Result merge statistics for hybrid search.
+pub const MergeProfile = struct {
+    /// Merge strategy that was used.
+    strategy: ?antfly_indexes_openapi.MergeStrategy = null,
+    /// Number of hits from full-text search before merge.
+    full_text_hits: ?i64 = null,
+    /// Number of hits from semantic search before merge.
+    semantic_hits: ?i64 = null,
+    /// Time spent merging results in milliseconds.
+    duration_ms: ?i64 = null,
+};
+
+pub const Path = antfly_indexes_openapi.Path;
+
+pub const PathEdge = antfly_indexes_openapi.PathEdge;
+
+pub const PathFindRequest = antfly_indexes_openapi.PathFindRequest;
+
+pub const PathFindResult = antfly_indexes_openapi.PathFindResult;
+
+pub const PathFindWeightMode = antfly_indexes_openapi.PathFindWeightMode;
+
+/// Statistics from token-based document pruning
+pub const PruneStats = struct {
+    /// Number of resources kept after pruning
+    resources_kept: ?i64 = null,
+    /// Number of resources pruned to fit token budget
+    resources_pruned: ?i64 = null,
+    /// Estimated tokens in kept resources
+    tokens_kept: ?i64 = null,
+    /// Estimated tokens in pruned resources
+    tokens_pruned: ?i64 = null,
+};
+
+/// A single query result hit
+pub const QueryHit = struct {
+    /// ID of the record.
+    _id: []const u8,
+    /// Relevance score of the hit.
+    _score: f32,
+    /// Scores partitioned by index when using RRF search.
+    _index_scores: ?std.json.Value = null,
+    _source: ?std.json.Value = null,
+    /// Stable ancestry envelope for derived document hierarchy hits. Present when the hit is a derived unit/chunk/embedding artifact or when a source-level rollup includes child chunks. Standard fields include `level`, `parent_doc_key`, optional `parent_unit_id`, `artifact`, `chunks`, and `ancestors` with response-local or requested DB-backed source/unit context when available.
+    hierarchy: ?std.json.Value = null,
+    /// Sort key values for this hit. Pass as search_after or search_before to paginate to the next/previous page. Values preserve their JSON types. Present for ordered result pages, including cursor-only requests whose effective order is `_id` ascending.
+    _sort: ?[]const std.json.Value = null,
+};
+
+/// Total hit count metadata.
+pub const QueryHitsTotal = struct {
+    /// Hit count value.
+    value: i64,
+    /// Whether value is exact or a lower bound.
+    relation: []const u8,
+};
+
+/// Repair subsystem to inspect or run.
+pub const RepairTarget = enum {
+    artifact,
+    index,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .artifact => "artifact",
+            .index => "index",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "artifact", .artifact },
+            .{ "index", .index },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Action hint for this replication source when remediation is recommended. Present only in GET table detail responses.
+pub const ReplicationSourceActionHint = struct {
+    /// Recommended action (e.g., "reseed_exact_cutover").
+    action: ?[]const u8 = null,
+    /// Human-readable reason for the recommendation.
+    reason: ?[]const u8 = null,
+    /// API path to trigger a reseed exact cutover, if applicable.
+    reseed_exact_cutover_path: ?[]const u8 = null,
+};
+
+/// Runtime status of this replication source. Present only in GET table detail responses, not in create/update requests.
+pub const ReplicationSourceStatus = struct {
+    source_kind: ?[]const u8 = null,
+    external_table: ?[]const u8 = null,
+    cutover_mode: ?[]const u8 = null,
+    slot_name: ?[]const u8 = null,
+    publication_name: ?[]const u8 = null,
+    phase: ?[]const u8 = null,
+    checkpoint: ?[]const u8 = null,
+    snapshot_offset: ?i64 = null,
+    prepared_checkpoint: ?[]const u8 = null,
+    stream_checkpoint: ?[]const u8 = null,
+    last_error: ?[]const u8 = null,
+    failure_class: ?[]const u8 = null,
+    lag_records: ?i64 = null,
+    lag_millis: ?i64 = null,
+    consecutive_failures: ?i64 = null,
+    last_source_commit_at_ms: ?i64 = null,
+    last_success_at_ms: ?i64 = null,
+    last_change_applied_at_ms: ?i64 = null,
+    updated_at_ms: ?i64 = null,
+};
+
+pub const ReplicationTransformOp = struct {
+    /// Transform operation. Standard ops: `$set`, `$unset`, `$inc`, `$push`, `$pull`, `$addToSet`, `$pop`, `$mul`, `$min`, `$max`, `$currentDate`, `$rename`. Replication-specific: `$merge` (flatten JSONB into top-level fields), `$delete_document` (delete entire Antfly doc, `on_delete` only).
+    op: []const u8,
+    /// Antfly document field path. Required for `$set`, `$unset`, etc.
+    path: ?[]const u8 = null,
+    /// Value for the operation. Can be a literal (string, number, boolean) or a `{{column}}` reference to a PG column value. Use `{{col.key}}` to navigate into decoded JSONB columns.
+    value: ?std.json.Value = null,
+};
+
+/// Reranking execution statistics.
+pub const RerankerProfile = struct {
+    /// Reranker model that was used.
+    model: ?[]const u8 = null,
+    /// Number of documents that were reranked.
+    documents_reranked: ?i64 = null,
+    /// Time spent reranking in milliseconds.
+    duration_ms: ?i64 = null,
+};
+
+/// Configuration for the retrieval step. Retrieval tools are constrained by the top-level request tools policy when both are present.
+pub const RetrievalStepConfig = struct {
+    /// Tool configuration for the retrieval step. When set, this narrows the top-level tools policy for retrieval execution.
+    tools: ?antfly_generating_api_openapi.ChatToolsConfig = null,
+};
+
+/// Strategy for document retrieval: - semantic: Vector similarity search using embeddings - bm25: Full-text search using BM25 scoring - metadata: Structured query on document fields - tree: Iterative tree navigation with summarization - graph: Relationship-based traversal - hybrid: Combine multiple strategies with RRF or rerank
+pub const RetrievalStrategy = enum {
+    semantic,
+    bm25,
+    metadata,
+    tree,
+    graph,
+    hybrid,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .semantic => "semantic",
+            .bm25 => "bm25",
+            .metadata => "metadata",
+            .tree => "tree",
+            .graph => "graph",
+            .hybrid => "hybrid",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "semantic", .semantic },
+            .{ "bm25", .bm25 },
+            .{ "metadata", .metadata },
+            .{ "tree", .tree },
+            .{ "graph", .graph },
+            .{ "hybrid", .hybrid },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Emitted when an error occurs during retrieval
+pub const SSEError = struct {
+    /// Error message
+    @"error": []const u8,
+};
+
 /// SSE event types emitted by the retrieval agent streaming endpoint
 pub const SSEEvent = enum {
     step_started,
@@ -1518,137 +1447,35 @@ pub const SSEToolMode = struct {
     tools_count: ?i64 = null,
 };
 
-/// Emitted when an error occurs during retrieval
-pub const SSEError = struct {
-    /// Error message
-    @"error": []const u8,
-};
-
-/// Statistics from token-based document pruning
-pub const PruneStats = struct {
-    /// Number of resources kept after pruning
-    resources_kept: ?i64 = null,
-    /// Number of resources pruned to fit token budget
-    resources_pruned: ?i64 = null,
-    /// Estimated tokens in kept resources
-    tokens_kept: ?i64 = null,
-    /// Estimated tokens in pruned resources
-    tokens_pruned: ?i64 = null,
-};
-
-/// Configuration for the retrieval step. Retrieval tools are constrained by the top-level request tools policy when both are present.
-pub const RetrievalStepConfig = struct {
-    /// Tool configuration for the retrieval step. When set, this narrows the top-level tools policy for retrieval execution.
-    tools: ?antfly_generating_api_openapi.ChatToolsConfig = null,
-};
-
-/// DEPRECATED: Use RetrievalAgentSteps instead. Configuration for the answer agent's pipeline steps.
-pub const AnswerAgentSteps = struct {
-    /// Configuration for query classification and transformation.
-    classification: ?antfly_generating_api_openapi.ClassificationStepConfig = null,
-    /// DEPRECATED: Use steps.generation on RetrievalAgentRequest instead. Configuration for answer generation from retrieved documents.
-    answer: ?antfly_generating_api_openapi.GenerationStepConfig = null,
-    /// Configuration for generating follow-up questions.
-    followup: ?antfly_generating_api_openapi.FollowupStepConfig = null,
-    /// Configuration for confidence assessment.
-    confidence: ?antfly_generating_api_openapi.ConfidenceStepConfig = null,
-};
-
-pub const Embedding = std.json.Value;
-
-pub const Analyses = struct {
-    pca: ?bool = null,
-    tsne: ?bool = null,
-};
-
-/// Type of join to perform: - `inner`: Only return rows with matches in both tables - `left`: Return all rows from left table, NULL for non-matching right rows - `right`: Return all rows from right table, NULL for non-matching left rows
-pub const JoinType = enum {
-    inner,
-    left,
-    right,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .inner => "inner",
-            .left => "left",
-            .right => "right",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "inner", .inner },
-            .{ "left", .left },
-            .{ "right", .right },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Comparison operator for join condition: - `eq`: Equal (default) - `neq`: Not equal - `lt`: Less than - `lte`: Less than or equal - `gt`: Greater than - `gte`: Greater than or equal
-pub const JoinOperator = enum {
-    eq,
-    neq,
-    lt,
-    lte,
-    gt,
-    gte,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .eq => "eq",
-            .neq => "neq",
-            .lt => "lt",
-            .lte => "lte",
-            .gt => "gt",
-            .gte => "gte",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "eq", .eq },
-            .{ "neq", .neq },
-            .{ "lt", .lt },
-            .{ "lte", .lte },
-            .{ "gt", .gt },
-            .{ "gte", .gte },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Filters to apply to a table before joining.
-pub const JoinFilters = struct {
-    /// Antfly query to filter rows before joining.
+/// Request to scan keys in a table within a key range. If no range is specified, scans all keys in the table.
+pub const ScanKeysRequest = struct {
+    /// Start of the key range to scan (exclusive by default). Can be a full key or a prefix. If not specified, starts from the beginning of the table.
+    from: ?[]const u8 = null,
+    /// End of the key range to scan (inclusive by default). Can be a full key or a prefix. If not specified, scans to the end of the table.
+    to: ?[]const u8 = null,
+    /// If true, include keys matching 'from' in the results. Default: false (exclusive lower bound for pagination).
+    inclusive_from: ?bool = null,
+    /// If true, exclude keys matching 'to' from the results. Default: false (inclusive upper bound).
+    exclusive_to: ?bool = null,
+    /// List of fields to include in each result. If not specified, only returns the key. Supports: - Simple fields: "title", "author" - Nested paths: "user.address.city" - Wildcards: "_chunks.*" - Exclusions: "-_chunks.*._embedding" - Special fields: "_embeddings", "_summaries", "_chunks"
+    fields: ?[]const []const u8 = null,
+    /// Antfly query to filter documents. Only documents matching this query are included in results. Uses the sear library for efficient per-document matching without requiring a full index. Examples: - Status filtering: `{"query": "status:published"}` - Date ranges: `{"query": "created_at:>2023-01-01"}` - Field matching: `{"query": "category:technology"}`
     filter_query: ?std.json.Value = null,
-    /// Key prefix filter for the table.
-    filter_prefix: ?[]const u8 = null,
-    /// Maximum number of rows to include from this table.
+    /// Maximum number of results to return. If not specified, returns all matching keys in the range. Useful for pagination or sampling.
     limit: ?i64 = null,
 };
 
-/// Strategy for executing the join: - `broadcast`: Broadcast small table to all shards of large table. Best for dimension tables < 10MB. O(small_table) memory per shard. - `index_lookup`: Use batch key lookups via indexes. Best for selective joins with indexed join keys. Low memory overhead. - `shuffle`: Hash-partition both tables by join key. Best for large-large table joins. Requires data movement.
-pub const JoinStrategy = enum {
-    broadcast,
-    index_lookup,
-    shuffle,
+/// Source of the secret configuration
+pub const SecretStatus = enum {
+    configured_keystore,
+    configured_env,
+    configured_both,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
-            .broadcast => "broadcast",
-            .index_lookup => "index_lookup",
-            .shuffle => "shuffle",
+            .configured_keystore => "configured_keystore",
+            .configured_env => "configured_env",
+            .configured_both => "configured_both",
         };
         try jw.write(s);
     }
@@ -1659,12 +1486,23 @@ pub const JoinStrategy = enum {
             else => return error.UnexpectedToken,
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "broadcast", .broadcast },
-            .{ "index_lookup", .index_lookup },
-            .{ "shuffle", .shuffle },
+            .{ "configured_keystore", .configured_keystore },
+            .{ "configured_env", .configured_env },
+            .{ "configured_both", .configured_both },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
+};
+
+/// Non-secret status for the local secrets file store, when one is available.
+pub const SecretStoreStatus = struct {
+    /// Whether Antfly is serving a last-known-good secrets snapshot after a failed refresh.
+    stale: ?bool = null,
+};
+
+pub const SecretWriteRequest = struct {
+    /// Secret value (stored encrypted, never returned)
+    value: []const u8,
 };
 
 /// Shard-level execution statistics.
@@ -1677,81 +1515,19 @@ pub const ShardsProfile = struct {
     failed: ?i64 = null,
 };
 
-/// Reranking execution statistics.
-pub const RerankerProfile = struct {
-    /// Reranker model that was used.
-    model: ?[]const u8 = null,
-    /// Number of documents that were reranked.
-    documents_reranked: ?i64 = null,
-    /// Time spent reranking in milliseconds.
-    duration_ms: ?i64 = null,
-};
-
-/// Result merge statistics for hybrid search.
-pub const MergeProfile = struct {
-    /// Merge strategy that was used.
-    strategy: ?antfly_indexes_openapi.MergeStrategy = null,
-    /// Number of hits from full-text search before merge.
-    full_text_hits: ?i64 = null,
-    /// Number of hits from semantic search before merge.
-    semantic_hits: ?i64 = null,
-    /// Time spent merging results in milliseconds.
-    duration_ms: ?i64 = null,
-};
-
-/// Statistics about a specific field.
-pub const FieldStatistics = struct {
-    /// Approximate number of unique values (via HyperLogLog).
-    cardinality: ?i64 = null,
-    /// Number of rows with null values for this field.
-    null_count: ?i64 = null,
-    /// Minimum value for numeric/date fields.
-    min_value: ?std.json.Value = null,
-    /// Maximum value for numeric/date fields.
-    max_value: ?std.json.Value = null,
-    /// Average size in bytes for variable-length fields.
-    avg_size: ?i64 = null,
-};
-
-pub const AnalysesResult = struct {
-    pca: ?[]const f32 = null,
-    tsne: ?[]const f32 = null,
-};
-
-/// A single query result hit
-pub const QueryHit = struct {
-    /// ID of the record.
-    _id: []const u8,
-    /// Relevance score of the hit.
-    _score: f32,
-    /// Scores partitioned by index when using RRF search.
-    _index_scores: ?std.json.Value = null,
-    _source: ?std.json.Value = null,
-    /// Stable ancestry envelope for derived document hierarchy hits. Present when the hit is a derived unit/chunk/embedding artifact or when a source-level rollup includes child chunks. Standard fields include `level`, `parent_doc_key`, optional `parent_unit_id`, `artifact`, `chunks`, and `ancestors` with response-local or requested DB-backed source/unit context when available.
-    hierarchy: ?std.json.Value = null,
-    /// Sort key values for this hit. Pass as search_after or search_before to paginate to the next/previous page. Values preserve their JSON types. Present for ordered result pages, including cursor-only requests whose effective order is `_id` ascending.
-    _sort: ?[]const std.json.Value = null,
-};
-
-/// Total hit count metadata.
-pub const QueryHitsTotal = struct {
-    /// Hit count value.
-    value: i64,
-    /// Whether value is exact or a lower bound.
-    relation: []const u8,
-};
-
-/// Status of a linear merge page operation: - "success": All records in batch processed successfully - "partial": Processing stopped at shard boundary, client should retry with next_cursor - "error": Fatal error occurred, no records processed successfully
-pub const LinearMergePageStatus = enum {
-    success,
-    partial,
-    @"error",
+/// Algorithm for computing term significance: - jlh: JLH algorithm (default) - mutual_information: Mutual Information - chi_squared: Chi-squared test - percentage: Simple percentage comparison
+pub const SignificanceAlgorithm = enum {
+    jlh,
+    mutual_information,
+    chi_squared,
+    percentage,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
-            .success => "success",
-            .partial => "partial",
-            .@"error" => "error",
+            .jlh => "jlh",
+            .mutual_information => "mutual_information",
+            .chi_squared => "chi_squared",
+            .percentage => "percentage",
         };
         try jw.write(s);
     }
@@ -1762,173 +1538,504 @@ pub const LinearMergePageStatus = enum {
             else => return error.UnexpectedToken,
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "success", .success },
-            .{ "partial", .partial },
-            .{ "error", .@"error" },
+            .{ "jlh", .jlh },
+            .{ "mutual_information", .mutual_information },
+            .{ "chi_squared", .chi_squared },
+            .{ "percentage", .percentage },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
 };
 
-pub const FailedOperation = struct {
-    id: ?[]const u8 = null,
-    operation: ?[]const u8 = null,
+pub const SortDirection = antfly_indexes_openapi.SortDirection;
+
+pub const SortField = antfly_indexes_openapi.SortField;
+
+/// Synchronization level for batch operations: - "propose": Wait for Raft proposal acceptance (fastest, default) - "write": Wait for Pebble KV write - "full_text": Wait for full-text index WAL write - "enrichments": Pre-compute enrichments before Raft proposal (synchronous enrichment generation) - "full_index": Wait for all index writes to complete (full-text + enrichments + vector indexes)
+pub const SyncLevel = enum {
+    propose,
+    write,
+    full_text,
+    enrichments,
+    full_index,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .propose => "propose",
+            .write => "write",
+            .full_text => "full_text",
+            .enrichments => "enrichments",
+            .full_index => "full_index",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "propose", .propose },
+            .{ "write", .write },
+            .{ "full_text", .full_text },
+            .{ "enrichments", .enrichments },
+            .{ "full_index", .full_index },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Table-level generated artifact enrichments configured for a table.
+pub const TableArtifactEnrichmentList = struct {
+    /// Table containing the configured artifact enrichments.
+    table_name: []const u8,
+    artifacts: []const antfly_indexes_openapi.EnrichmentConfig,
+};
+
+pub const TableBackupStatus = struct {
+    /// Table name
+    name: []const u8,
+    /// Backup status for this table
+    status: []const u8,
+    /// Error message if backup failed
     @"error": ?[]const u8 = null,
 };
 
-/// Key range processed in this request
-pub const KeyRange = struct {
-    from: ?[]const u8 = null,
-    to: ?[]const u8 = null,
+/// Describes an in-progress schema migration. The table serves reads from read_schema while rebuilding full-text indexes for the new schema.
+pub const TableMigration = struct {
+    state: []const u8,
+    read_schema: antfly_schema_openapi.TableSchema,
 };
 
-pub const Edge = antfly_indexes_openapi.Edge;
+/// Result of one bounded table repair pass.
+pub const TableRepairRunResult = struct {
+    /// Number of repair records attempted by this pass.
+    scanned: i64,
+    /// Number of table groups touched by this bounded repair pass.
+    groups_scanned: i64,
+    /// Number of artifacts whose source was reprocessed.
+    reprocessed: i64,
+    /// Number of repair records cleared because the artifact became readable.
+    repaired: i64,
+    /// Number of repair records whose source document no longer exists.
+    missing_source_docs: i64,
+    /// Number of supported repair attempts that failed.
+    failed: i64,
+    /// Number of repair records skipped because no automated repair exists for the selected target.
+    unsupported: i64,
+    /// Number of attempted repair records that remained queued after this pass.
+    unresolved: i64,
+    /// Number of selected repair records or indexes skipped because another repair pass already owns them.
+    in_progress: i64,
+    /// Number of indexes rebuilt by this pass when target is index.
+    indexes_rebuilt: i64,
+    /// Number of selected indexes that were already degraded or quarantined before repair.
+    indexes_degraded: i64,
+    /// Effective repair limit.
+    limit: i64,
+    /// Opaque cursor for the next artifact repair pass when has_more is true. Index repair currently repairs one named index per request and does not return a continuation cursor.
+    next_cursor: ?[]const u8 = null,
+    /// Whether another repair scan page is available via next_cursor.
+    has_more: bool,
+    /// Whether repair debt remains after this bounded pass. If true and next_cursor is absent, rerun repair from the beginning after addressing failed or unsupported records.
+    debt_remaining: bool,
+};
 
-pub const EdgeDirection = antfly_indexes_openapi.EdgeDirection;
+pub const TableRestoreStatus = struct {
+    /// Table name
+    name: []const u8,
+    /// Restore status for this table
+    status: []const u8,
+    /// Error message if restore failed
+    @"error": ?[]const u8 = null,
+};
 
-pub const TraversalRules = antfly_indexes_openapi.TraversalRules;
+pub const TransactionBeginResponse = struct {
+    transaction_id: []const u8,
+    begin_timestamp: i64,
+    sync_level: []const u8,
+};
+
+/// A key that was read as part of an OCC transaction, along with the version observed at read time. Used to detect conflicts at commit time.
+pub const TransactionReadItem = struct {
+    /// Table name the key belongs to
+    table: []const u8,
+    /// Document key that was read
+    key: []const u8,
+    /// Version token observed at read time (from X-Antfly-Version header). Use "0" to assert the key did not exist at read time.
+    version: []const u8,
+};
+
+pub const TransactionSavepointResponse = struct {
+    status: []const u8,
+    transaction_id: []const u8,
+    savepoint_id: i64,
+};
+
+pub const TransactionSessionCleanupResponse = struct {
+    removed: ?i64 = null,
+    cutoff_ns: ?i64 = null,
+};
+
+pub const TransactionSessionReadSnapshot = struct {
+    table: ?[]const u8 = null,
+    key: ?[]const u8 = null,
+    version: ?i64 = null,
+    document: ?std.json.Value = null,
+};
+
+pub const TransactionSessionStatus = struct {
+    transaction_id: []const u8,
+    owner_node_id: i64,
+    begin_timestamp: i64,
+    last_touched_timestamp: i64,
+    lease_expires_at: i64,
+    lease_state: []const u8,
+    sync_level: []const u8,
+    staged_table_count: i64,
+    staged_read_count: i64,
+    staged_write_count: i64,
+    staged_delete_count: i64,
+    read_snapshot_count: i64,
+    savepoint_count: i64,
+    savepoint_limit: ?i64 = null,
+    remaining_savepoints: ?i64 = null,
+    durable: bool,
+};
+
+pub const TransactionSessionTableDetail = struct {
+    table: ?[]const u8 = null,
+    staged_read_count: ?i64 = null,
+    staged_write_count: ?i64 = null,
+    staged_delete_count: ?i64 = null,
+    staged_predicate_count: ?i64 = null,
+};
+
+pub const TransactionStageDeleteRequest = struct {
+    table: []const u8,
+    key: []const u8,
+};
+
+pub const TransactionStageReadRequest = struct {
+    table: []const u8,
+    key: []const u8,
+    version: []const u8,
+};
+
+pub const TransactionStageReadSnapshot = struct {
+    table: []const u8,
+    key: []const u8,
+    version: []const u8,
+    document: ?std.json.Value,
+};
+
+pub const TransactionStageWriteRequest = struct {
+    table: []const u8,
+    key: []const u8,
+    document: std.json.Value,
+};
+
+pub const TransactionStatusResponse = struct {
+    status: []const u8,
+    transaction_id: []const u8,
+};
+
+/// MongoDB-style update operator
+pub const TransformOpType = enum {
+    @"$set",
+    @"$set_on_insert",
+    @"$unset",
+    @"$inc",
+    @"$push",
+    @"$pull",
+    @"$add_to_set",
+    @"$pop",
+    @"$mul",
+    @"$min",
+    @"$max",
+    @"$current_date",
+    @"$rename",
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .@"$set" => "$set",
+            .@"$set_on_insert" => "$setOnInsert",
+            .@"$unset" => "$unset",
+            .@"$inc" => "$inc",
+            .@"$push" => "$push",
+            .@"$pull" => "$pull",
+            .@"$add_to_set" => "$addToSet",
+            .@"$pop" => "$pop",
+            .@"$mul" => "$mul",
+            .@"$min" => "$min",
+            .@"$max" => "$max",
+            .@"$current_date" => "$currentDate",
+            .@"$rename" => "$rename",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "$set", .@"$set" },
+            .{ "$setOnInsert", .@"$set_on_insert" },
+            .{ "$unset", .@"$unset" },
+            .{ "$inc", .@"$inc" },
+            .{ "$push", .@"$push" },
+            .{ "$pull", .@"$pull" },
+            .{ "$addToSet", .@"$add_to_set" },
+            .{ "$pop", .@"$pop" },
+            .{ "$mul", .@"$mul" },
+            .{ "$min", .@"$min" },
+            .{ "$max", .@"$max" },
+            .{ "$currentDate", .@"$current_date" },
+            .{ "$rename", .@"$rename" },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
 
 pub const TraversalResult = antfly_indexes_openapi.TraversalResult;
 
-pub const PathFindWeightMode = antfly_indexes_openapi.PathFindWeightMode;
+pub const TraversalRules = antfly_indexes_openapi.TraversalRules;
 
-pub const PathFindRequest = antfly_indexes_openapi.PathFindRequest;
-
-pub const PathFindResult = antfly_indexes_openapi.PathFindResult;
-
-pub const Path = antfly_indexes_openapi.Path;
-
-pub const PathEdge = antfly_indexes_openapi.PathEdge;
-
-pub const ForeignColumn = struct {
-    /// Column name in the foreign table.
-    name: []const u8,
-    /// Column data type. Used for filter validation and type coercion. Common types: text, integer, bigint, float, boolean, timestamp, uuid, jsonb.
-    type: []const u8,
-    /// Whether the column allows NULL values.
-    nullable: ?bool = null,
+/// Configuration for tree search strategy. Tree search navigates hierarchical document structures by evaluating summaries at each level.
+pub const TreeSearchConfig = struct {
+    /// Name of the graph index to use for tree navigation
+    index: []const u8,
+    /// Starting nodes for tree search: - "$roots" - Query for root nodes (nodes with no parents) - Comma-separated explicit node IDs When omitted and combined with a QueryRequest in a RetrievalQueryRequest, the query results are used as start nodes.
+    start_nodes: ?[]const u8 = null,
+    /// Maximum depth to traverse in the tree
+    max_depth: ?i64 = null,
+    /// Number of branches to explore at each level
+    beam_width: ?i64 = null,
 };
 
-/// Runtime status of this replication source. Present only in GET table detail responses, not in create/update requests.
-pub const ReplicationSourceStatus = struct {
-    source_kind: ?[]const u8 = null,
-    external_table: ?[]const u8 = null,
-    cutover_mode: ?[]const u8 = null,
-    slot_name: ?[]const u8 = null,
-    publication_name: ?[]const u8 = null,
-    phase: ?[]const u8 = null,
-    checkpoint: ?[]const u8 = null,
-    snapshot_offset: ?i64 = null,
-    prepared_checkpoint: ?[]const u8 = null,
-    stream_checkpoint: ?[]const u8 = null,
-    last_error: ?[]const u8 = null,
-    failure_class: ?[]const u8 = null,
-    lag_records: ?i64 = null,
-    lag_millis: ?i64 = null,
-    consecutive_failures: ?i64 = null,
-    last_source_commit_at_ms: ?i64 = null,
-    last_success_at_ms: ?i64 = null,
-    last_change_applied_at_ms: ?i64 = null,
-    updated_at_ms: ?i64 = null,
-};
-
-/// Action hint for this replication source when remediation is recommended. Present only in GET table detail responses.
-pub const ReplicationSourceActionHint = struct {
-    /// Recommended action (e.g., "reseed_exact_cutover").
-    action: ?[]const u8 = null,
-    /// Human-readable reason for the recommendation.
-    reason: ?[]const u8 = null,
-    /// API path to trigger a reseed exact cutover, if applicable.
-    reseed_exact_cutover_path: ?[]const u8 = null,
-};
-
-pub const ReplicationTransformOp = struct {
-    /// Transform operation. Standard ops: `$set`, `$unset`, `$inc`, `$push`, `$pull`, `$addToSet`, `$pop`, `$mul`, `$min`, `$max`, `$currentDate`, `$rename`. Replication-specific: `$merge` (flatten JSONB into top-level fields), `$delete_document` (delete entire Antfly doc, `on_delete` only).
-    op: []const u8,
-    /// Antfly document field path. Required for `$set`, `$unset`, etc.
-    path: ?[]const u8 = null,
-    /// Value for the operation. Can be a literal (string, number, boolean) or a `{{column}}` reference to a PG column value. Use `{{col.key}}` to navigate into decoded JSONB columns.
-    value: ?std.json.Value = null,
-};
-
-/// Sort execution profile. The fields below are the stable public diagnostic surface; profiling responses may include additional implementation counters. Additional properties may include low-level implementation details such as doc-value load timings, stored-source loads, collector/window internals, cost-model inputs, native-filter modes, and index-sort availability flags; treat those properties as diagnostic and not as a frozen SDK contract.
-pub const SortProfile = struct {
-    /// Stable physical sort plan name. Known values include `none`, `id_only`, `id_seek`, `sorted_segment_seek`, `native_doc_values_top_n`, `score_top_k`, `distributed_k_way_merge`, `stored_json_debug`, and `unsupported_exact_sort`. Public exact sort requests must not silently move from native plans to `stored_json_debug`; missing native coverage is reported through the rejection fields instead.
-    plan: ?[]const u8 = null,
-    /// Requested order fields, including the implicit _id tie-breaker when applicable.
-    order_by: ?[]const SortField = null,
-    /// Cursor mode for this request.
-    cursor: ?[]const u8 = null,
-    /// Exactness class for the selected plan. Known values include `none`, `exact`, `bounded_exact`, `approximate`, and `unsupported`.
-    exactness: ?[]const u8 = null,
-    /// Sort execution primitive used by the selected plan. Known values include `none`, `candidate_collector`, `primary_key_scan`, `sorted_segment_scan`, `score_top_k`, `doc_values_collector`, `distributed_merge`, `stored_json_debug`, and `unsupported`.
-    source: ?[]const u8 = null,
-    /// Exact candidate source consumed by the selected sort primitive.
-    candidate_source: ?[]const u8 = null,
-    /// Cursor support level for the selected plan. Known values include `none`, `comparator`, `segment_seek`, `distributed_seek`, and `unsupported`.
-    cursor_support: ?[]const u8 = null,
-    /// Stored source load strategy. Known values include `none`, `source_free`, `projected_source_after_page`, `stored_source_required`, and `unsupported`.
-    source_load: ?[]const u8 = null,
-    /// Distributed sort behavior. Known values include `none`, `shard_local_only`, `coordinator_merge`, and `unsupported`.
-    distributed_behavior: ?[]const u8 = null,
-    /// Stable reason the planner selected this sort plan. Known values include `none`, `unsupported_exact_sort`, `distributed_k_way_merge`, `stored_json_debug`, `id_candidate_order`, `id_primary_key_seek`, `score_top_k`, `index_sort_sorted_segment_seek`, `sorted_segment_seek`, `doc_values_collector`, `index_sort_unavailable_doc_values_collector`, `caller_selected_doc_values_collector`, and `selective_filter_doc_values_collector`.
-    selection_reason: ?[]const u8 = null,
-    /// Whether exact execution required native typed sort values.
-    require_native: ?bool = null,
-    /// Conservative lifecycle state for the requested sort path. Queryable fields are accepted by public exact sort; accelerated fields are queryable and have an index_sort-compatible physical path.
-    sort_lifecycle_state: ?[]const u8 = null,
-    /// Native typed doc-values coverage status for mapped sort fields. Known values include `covered`, `identity_metadata`, `schema_declared`, `observed_declared`, and `not_declared`.
-    native_doc_values_coverage: ?[]const u8 = null,
-    /// Physical index_sort coverage status for the requested order. Known values include `request_mismatch`, `no_live_segments`, `missing_segment_index_sort`, `covered_without_bounds`, and `covered_with_bounds`.
-    index_sort_coverage: ?[]const u8 = null,
-    /// Candidate documents considered by sort execution.
-    candidate_count: ?i64 = null,
-    /// Candidates rejected by cursor comparison.
-    cursor_rejected_count: ?i64 = null,
-    /// Hits selected for the returned page.
-    selected_count: ?i64 = null,
-    /// Total sort execution time in microseconds.
-    total_us: ?i64 = null,
-    /// Shards participating in distributed sort execution.
-    distributed_shard_count: ?i64 = null,
-    /// Stable budget rejection reason. Known values include `text_exact_late_visibility_totals`, `text_field_sort_candidate_window`, `match_all_candidate_collect_limit`, `match_all_exact_candidate_window`, `sorted_segment_scan_window`, and `distributed_merge_shard_window`.
-    budget_rejection_reason: ?[]const u8 = null,
-    /// Stable exact-sort rejection reason. Known values include `unmapped_sort_field`, `non_sortable_sort_field`, `missing_doc_values_coverage`, `missing_native_filter_coverage`, `invalid_cursor_arity`, `invalid_cursor_type`, `invalid_sort_tuple`, `approximate_candidate_source`, `candidate_budget_exceeded`, `missing_runtime_mapping`, `invalid_doc_value_type`, `missing_null_policy`, `non_score_bearing_source`, `invalid_score_value`, `count_only_ordered_page`, `stored_json_sort_disabled`, `unsupported_exact_sort`, and `distributed_merge_unsupported`.
-    sort_rejection_reason: ?[]const u8 = null,
-    /// Stable rejection detail. Known exact-sort details include `unmapped_sort_field`, `unmapped_field`, `non_sortable_sort_field`, `non_scalar_field`, `non_sortable_field`, `mixed_field_type`, `missing_doc_values_section`, `malformed_doc_values_section`, `doc_values_kind_mismatch`, `sparse_live_doc_values`, `invalid_doc_value_doc_id`, `duplicate_doc_value_doc_id`, `unsupported_doc_values_type`, `missing_doc_values_coverage`, `missing_doc_values_capability`, `schema_declared`, `observed_declared`, `not_declared`, `missing_doc_values`, `non_sortable`, `declared`, `text_search_only`, `mixed`, `missing_native_filter_coverage`, `invalid_cursor_arity`, `invalid_cursor_type`, `invalid_sort_tuple`, `sort_tuple_arity`, `invalid_doc_value_type`, `incomplete_sort_tuple`, `mixed_sort_value_domain`, `unsorted_shard_window`, `unsorted_component_window`, `non_numeric_score`, `missing_score`, `non_finite_score`, `score_sort_tuple_mismatch`, `non_score_bearing_source`, `id_tiebreaker_mismatch`, `approximate_candidate_source`, `count_only_ordered_page`, `native_sort_loader_unavailable`, `sorted_segment_executor_unavailable`, `primary_key_stream_unavailable`, `native_candidate_stream_unavailable`, `candidate_stream_unavailable`, `incompatible_sort_plan`, `sorted_segment_bounds_unavailable`, `filter_query_json_unresolved`, `exclusion_query_json_unresolved`, `text_index_entry_unavailable`, `doc_ordinal_projection_unavailable`, `component_sort_profile_missing`, `unsupported_composed_sort_source`, `stored_json_sort_disabled`, `distributed_merge_unsupported`, `distributed_merge_plan_required`, `distributed_shard_window_incomplete`, `distributed_shard_cursor_window_invalid`, and `distributed_merge_shard_window`.
-    sort_rejection_detail: ?[]const u8 = null,
-    /// Sort field associated with the rejection when safe to expose.
-    sort_rejection_field: ?[]const u8 = null,
-};
-
-pub const InferenceConnection = struct {
-    provider: InferenceProviderType,
-    /// Resolved endpoint URL when applicable.
-    url: ?[]const u8 = null,
-    /// Cloud region (Bedrock).
+pub const WebSearchConnection = struct {
+    /// Provider-specific service flavor, such as agent_search for provider vertex.
+    service: ?[]const u8 = null,
+    /// Maximum ranked results this connection is configured to return.
+    max_results: ?i64 = null,
+    /// Provider request timeout in milliseconds.
+    timeout_ms: ?i64 = null,
+    /// Whether safe-search filtering is requested.
+    safe_search: ?bool = null,
+    /// Preferred result language.
+    language: ?[]const u8 = null,
+    /// Preferred result region.
     region: ?[]const u8 = null,
-    /// Google Cloud project (Vertex).
+    /// Whether extracted content is requested when supported.
+    include_content: ?bool = null,
+    /// Whether highlighted passages are requested when supported.
+    include_highlights: ?bool = null,
+    /// Provider endpoint override when configured.
+    endpoint: ?[]const u8 = null,
+    /// Google Cloud project for provider vertex.
     project_id: ?[]const u8 = null,
-    /// Google Cloud location (Vertex).
+    /// Google Cloud location for provider vertex.
     location: ?[]const u8 = null,
-    /// Named registry entries from node config that resolve to this provider instance.
-    names: ?[]const []const u8 = null,
-    /// Model types this instance is configured for.
-    configured_model_types: ?[]const ConnectedModelType = null,
-    /// Models reported by the provider, grouped by model type. Keys are pluralized ConnectedModelType values ("embedders", "generators", "rerankers", "chunkers", "recognizers", "classifiers", "rewriters", "readers", "transcribers", "extractors") plus "other" for models the provider's listing API does not classify by task. Populated only when the request includes the "models" expansion.
-    models: ?std.json.ArrayHashMap([]const ConnectedModel) = null,
+    /// Agent Search data store ID for provider vertex.
+    data_store: ?[]const u8 = null,
+    /// Agent Search serving config ID for provider vertex.
+    serving_config: ?[]const u8 = null,
+    /// Domain allowlist when configured.
+    include_domains: ?[]const []const u8 = null,
+    /// Domain denylist when configured.
+    exclude_domains: ?[]const []const u8 = null,
+    /// True when required credentials/config are present. Secret values are never returned.
+    configured: ?bool = null,
 };
 
-pub const ExternalIoConnection = struct {
-    protocol: ExternalIoProtocol,
-    /// Custom endpoint URL when configured.
-    endpoint: ?[]const u8 = null,
-    /// Buckets this connection is configured for.
-    buckets: ?[]const []const u8 = null,
-    /// Key prefix when configured.
-    prefix: ?[]const u8 = null,
-    /// Hosts or base URLs this connection applies to.
-    hosts: ?[]const []const u8 = null,
+pub const QueryBuilderRequest = struct {
+    /// Correlation identifier for a bounded agent interaction. In Phase 1 this is echoed back to the client but does not imply server-side session persistence.
+    session_id: ?[]const u8 = null,
+    /// Structured answers provided by the user as part of client-carried continuation.
+    decisions: ?[]const AgentDecision = null,
+    /// If true, the agent may return clarification questions when needed.
+    interactive: ?bool = null,
+    /// Additive bounded-agent field for the query builder. Phase 1 remains a single-pass generation flow, but this field is echoed in result accounting.
+    max_internal_iterations: ?i64 = null,
+    /// Maximum number of clarification turns the agent may request from the user.
+    max_user_clarifications: ?i64 = null,
+    /// Force a user-facing decision after this many unresolved internal passes.
+    require_decision_after: ?i64 = null,
+    /// Optional example documents to help the query builder infer field shapes and representative values. When omitted and the table has data but no schema, the server samples up to one document automatically.
+    example_documents: ?[]const std.json.Value = null,
+    /// Name of the table to build query for. If provided, uses table schema for field context.
+    table: ?[]const u8 = null,
+    /// Natural language description of the search intent
+    intent: []const u8,
+    /// List of searchable field names to consider. Overrides table schema if provided.
+    schema_fields: ?[]const []const u8 = null,
+    /// Optional strategy hint for the coordinator. Suggested values are `auto`, `full_text`, `semantic`, `hybrid`, `filter`, `tree`, and `graph`. Unknown values are accepted for forward compatibility and may fall back to `auto`.
+    mode: ?[]const u8 = null,
+    /// Preferred output artifact. Suggested values are `query_request`, `bleve`, and `filter_query`. The compatibility `query` field is still returned for existing clients.
+    output: ?[]const u8 = null,
+    /// Optional execution constraints for the coordinator, such as `limit`, `allowed_fields`, `prefer_indexes`, and `require_executable`.
+    constraints: ?std.json.Value = null,
+    generator: ?antfly_generating_openapi.GeneratorConfig = null,
+};
+
+pub const AgentQuestion = struct {
+    /// Stable question identifier for client-carried continuation
+    id: []const u8,
+    kind: AgentQuestionKind,
+    /// The clarifying question to ask the user
+    question: []const u8,
+    /// Why clarification is needed
+    reason: ?[]const u8 = null,
+    /// Optional list of choices for the user
+    options: ?[]const []const u8 = null,
+    /// Suggested default answer when the server has a preferred choice
+    default_answer: ?[]const u8 = null,
+    /// High-level result areas affected by this decision
+    affects: ?[]const []const u8 = null,
+};
+
+/// Emitted when a pipeline step begins execution
+pub const SSEStepStarted = struct {
+    /// Unique step ID for correlating with step_completed
+    id: []const u8,
+    kind: ?AgentStepKind = null,
+    /// Stable step name used for correlation across JSON and SSE surfaces
+    name: []const u8,
+    /// Human-readable description of the action being taken
+    action: []const u8,
+};
+
+/// A step in the shared bounded-agent execution trace
+pub const AgentStep = struct {
+    /// Unique step ID for correlation and tracing
+    id: ?[]const u8 = null,
+    kind: ?AgentStepKind = null,
+    /// Stable step name used for correlation across JSON and SSE surfaces
+    name: []const u8,
+    /// What action was taken
+    action: []const u8,
+    status: ?AgentStepStatus = null,
+    /// Error details when status is "error"
+    error_message: ?[]const u8 = null,
+    /// Server-side execution time in milliseconds
+    duration_ms: ?i64 = null,
+    /// Additional details about the step
+    details: ?std.json.Value = null,
+};
+
+/// Public field capability derived from Antfly schema mappings and observed dynamic field metadata.
+pub const FieldCapability = struct {
+    /// Mapping or dynamic-template name, when applicable.
+    name: ?[]const u8 = null,
+    /// Concrete query field path when known. Pattern-only dynamic templates may omit this.
+    field: ?[]const u8 = null,
+    /// Dynamic-template path_match pattern, when applicable.
+    path_pattern: ?[]const u8 = null,
+    /// Dynamic-template match pattern, when applicable.
+    field_pattern: ?[]const u8 = null,
+    /// Dynamic-template match_mapping_type, when applicable.
+    match_mapping_type: ?[]const u8 = null,
+    /// Physical emitted field name for schema-derived text fields, when different from the logical path.
+    emitted_name: ?[]const u8 = null,
+    /// Document schema that produced this capability, when applicable.
+    document_schema: ?[]const u8 = null,
+    type: AntflyType,
+    /// Query modes supported by this concrete field variant. These modes are derived from Antfly field types such as `text`, `keyword`, `datetime`, `geopoint`, and `search_as_you_type`; they are not separate schema toggles.
+    query_modes: []const []const u8,
+    sortable: bool,
+    /// Capability source, such as reserved, document_schema, dynamic_template, or observed_dynamic.
+    provenance: []const u8,
+    /// Current missing/null handling policy for this field.
+    missing_null_policy: []const u8,
+    /// Operational lifecycle state for exact sort use. Queryable fields are accepted by public exact sort; accelerated fields are queryable and participate in the configured index_sort tuple.
+    sort_lifecycle_state: []const u8,
+    /// Analyzer name for text/searchable fields, when applicable.
+    analyzer: ?[]const u8 = null,
+    /// Zero-based position in the table index_sort tuple when this field participates.
+    index_sort_position: ?i64 = null,
+    /// Sort direction in the table index_sort tuple when this field participates.
+    index_sort_order: ?[]const u8 = null,
+};
+
+/// Durable table repair debt. Artifact targets include exact source and artifact identifiers; index targets include the affected index and repair status.
+pub const TableRepairIssue = struct {
+    artifact_kind: ArtifactRepairKind,
+    /// Index whose replay or derived state observed the artifact problem.
+    index_name: []const u8,
+    /// Source or derived document key whose artifact is missing or unreadable.
+    doc_key: []const u8,
+    /// Parent source document key for chunk-derived artifacts.
+    parent_doc_key: ?[]const u8 = null,
+    /// Unit identifier for unit-scoped artifacts, when applicable.
+    unit_id: ?[]const u8 = null,
+    /// Source artifact stream used to produce this artifact, when applicable.
+    source_artifact_name: ?[]const u8 = null,
+    /// Derived artifact name that must be reprocessed or made readable.
+    artifact_name: []const u8,
+    /// Hex-encoded internal artifact storage key, when known.
+    artifact_key: ?[]const u8 = null,
+    /// Chunk ordinal for chunk-derived artifacts.
+    chunk_id: ?i64 = null,
+    /// Whether this artifact kind currently has an automated repair reprocessor.
+    repairable: bool,
+    /// Stable reason code when repairable is false.
+    unsupported_reason: ?[]const u8 = null,
+    /// Derived replay sequence that observed the issue.
+    sequence: i64,
+    reason: ArtifactRepairReason,
+    /// Number of repair attempts made for this issue.
+    attempts: i64,
+    /// Monotonic timestamp when this issue was first recorded.
+    first_seen_ns: i64,
+    /// Monotonic timestamp when this issue was last observed or attempted.
+    last_seen_ns: i64,
+    /// Last stable repair error code, when a repair attempt failed.
+    last_error: ?[]const u8 = null,
+};
+
+pub const BackupListResponse = struct {
+    /// List of available backups
+    backups: []const BackupInfo,
+};
+
+pub const RestoreRequest = struct {
+    /// Unique identifier for this backup. Used to reference the backup for restore operations. Choose a meaningful name that includes date/version information.
+    backup_id: []const u8,
+    /// Storage location for the backup. Supports multiple backends: - Local filesystem: `file:///path/to/backup` - Amazon S3: `s3://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata for the specified table.
+    location: []const u8,
+    /// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
+    format: ?[]const u8 = null,
+};
+
+/// Response for a cross-table batch operation. Contains per-table results.
+pub const MultiBatchResponse = struct {
+    /// Per-table batch results
+    tables: ?std.json.ArrayHashMap(BatchResponse) = null,
+};
+
+/// Result of an OCC transaction commit attempt.
+pub const TransactionCommitResponse = struct {
+    /// Whether the transaction was committed or aborted due to a conflict
+    status: []const u8,
+    /// Details about the conflict that caused an abort (only present when status is "aborted")
+    conflict: ?std.json.Value = null,
+    /// Per-table batch results (only present when status is "committed")
+    tables: ?std.json.ArrayHashMap(BatchResponse) = null,
+};
+
+pub const ShardConfig = struct {
+    byte_range: ByteRange,
+};
+
+/// Typed Zig status view for table data topology and range placement.
+pub const ClusterDataStatus = struct {
+    nodes: ?[]const ClusterDataNodeStatus = null,
+    ranges: ?[]const ClusterDataRangeStatus = null,
+    replicas: ?[]const ClusterDataReplicaStatus = null,
+    groups: ?[]const ClusterDataGroupStatus = null,
 };
 
 /// Inspection view for a derived document artifact produced from a source table row. The typed fields form the stable summary contract. The embedded manifest/state JSON fields are optional raw detail intended for admin/debug inspection so producers can evolve their internal unit schema without changing this route contract.
@@ -1981,168 +2088,6 @@ pub const DocumentArtifactManifest = struct {
     state_json: ?[]const u8 = null,
 };
 
-/// Durable table repair debt. Artifact targets include exact source and artifact identifiers; index targets include the affected index and repair status.
-pub const TableRepairIssue = struct {
-    artifact_kind: ArtifactRepairKind,
-    /// Index whose replay or derived state observed the artifact problem.
-    index_name: []const u8,
-    /// Source or derived document key whose artifact is missing or unreadable.
-    doc_key: []const u8,
-    /// Parent source document key for chunk-derived artifacts.
-    parent_doc_key: ?[]const u8 = null,
-    /// Unit identifier for unit-scoped artifacts, when applicable.
-    unit_id: ?[]const u8 = null,
-    /// Source artifact stream used to produce this artifact, when applicable.
-    source_artifact_name: ?[]const u8 = null,
-    /// Derived artifact name that must be reprocessed or made readable.
-    artifact_name: []const u8,
-    /// Hex-encoded internal artifact storage key, when known.
-    artifact_key: ?[]const u8 = null,
-    /// Chunk ordinal for chunk-derived artifacts.
-    chunk_id: ?i64 = null,
-    /// Whether this artifact kind currently has an automated repair reprocessor.
-    repairable: bool,
-    /// Stable reason code when repairable is false.
-    unsupported_reason: ?[]const u8 = null,
-    /// Derived replay sequence that observed the issue.
-    sequence: i64,
-    reason: ArtifactRepairReason,
-    /// Number of repair attempts made for this issue.
-    attempts: i64,
-    /// Monotonic timestamp when this issue was first recorded.
-    first_seen_ns: i64,
-    /// Monotonic timestamp when this issue was last observed or attempted.
-    last_seen_ns: i64,
-    /// Last stable repair error code, when a repair attempt failed.
-    last_error: ?[]const u8 = null,
-};
-
-/// Bounded request to list table repair issues.
-pub const RepairIssueListRequest = struct {
-    /// Repair subsystem to list. `artifact` lists durable artifact queue records; `index` lists index repair candidates derived from index status and artifact debt.
-    target: ?RepairTarget = null,
-    kind: ?ArtifactRepairKind = null,
-    /// Restrict results to one index name.
-    index: ?[]const u8 = null,
-    /// Opaque cursor returned by a prior response.
-    cursor: ?[]const u8 = null,
-    /// Maximum repair records to return.
-    limit: ?i64 = null,
-};
-
-/// Bounded request to run a table repair pass.
-pub const RepairRunRequest = struct {
-    target: ?RepairTarget = null,
-    kind: ?ArtifactRepairKind = null,
-    /// Restrict repair attempts to one index name.
-    index: ?[]const u8 = null,
-    /// Opaque cursor returned by a prior repair response.
-    cursor: ?[]const u8 = null,
-    /// Force a named index rebuild even when no repair debt is currently recorded. Only applies to target=index.
-    force: ?bool = null,
-    /// Maximum artifact repair records to attempt. For target=index, any positive value permits one named index repair.
-    limit: ?i64 = null,
-};
-
-/// Starts a durable table repair job. The job advances in bounded passes using the same repair request shape as runTableRepair.
-pub const TableRepairJobStartRequest = struct {
-    target: ?RepairTarget = null,
-    kind: ?ArtifactRepairKind = null,
-    /// Restrict repair attempts to one index name.
-    index: ?[]const u8 = null,
-    /// Opaque cursor returned by a prior repair response.
-    cursor: ?[]const u8 = null,
-    /// Force a named index rebuild even when no repair debt is currently recorded. Only applies to target=index.
-    force: ?bool = null,
-    /// Maximum artifact repair records to attempt per pass. For target=index, any positive value permits one named index repair.
-    limit: ?i64 = null,
-    /// When true, the server immediately attempts the first bounded repair pass before returning the job.
-    advance: ?bool = null,
-};
-
-/// Response for a bounded table repair pass.
-pub const TableRepairRunResponse = struct {
-    /// Table whose repair queue was processed.
-    table: []const u8,
-    target: RepairTarget,
-    /// Effective repair limit.
-    limit: i64,
-    result: TableRepairRunResult,
-};
-
-/// Durable table repair job state.
-pub const TableRepairJob = struct {
-    /// Server-assigned durable repair job identifier.
-    job_id: i64,
-    /// Monotonic execution attempt token for the current running pass.
-    attempt_id: i64,
-    /// Table being repaired.
-    table_name: []const u8,
-    /// Lifecycle phase of the repair job.
-    phase: []const u8,
-    /// User-facing repair progress state. `debt_remaining` means the bounded job stopped because unsupported or failed debt still requires operator action.
-    repair_status: []const u8,
-    target: RepairTarget,
-    kind: ?ArtifactRepairKind = null,
-    /// Index name when the job is restricted to one index.
-    index: ?[]const u8 = null,
-    /// Opaque continuation cursor for the next bounded repair pass.
-    cursor: ?[]const u8 = null,
-    /// Effective per-pass repair limit.
-    limit: i64,
-    /// Whether the job forces a named index rebuild.
-    force: bool,
-    result: TableRepairRunResult,
-    /// Last stable job-level error code.
-    last_error: ?[]const u8 = null,
-    /// Whether cancellation has been requested for a running pass. Running passes finish at a bounded repair boundary before the job transitions to cancelled.
-    cancel_requested: bool,
-    /// Unix epoch milliseconds when the job was created.
-    created_at_millis: i64,
-    /// Unix epoch milliseconds when the job state was last updated.
-    last_updated_at_millis: i64,
-    /// Unix epoch milliseconds when the job is eligible for cleanup.
-    expires_at_millis: i64,
-};
-
-/// Bounded request for reprocessing a derived artifact across source rows in key order.
-pub const DocumentArtifactTableReprocessRequest = struct {
-    /// Exclusive lower bound source document key. Use the prior response next_key to continue.
-    from_key: ?[]const u8 = null,
-    /// Inclusive upper bound source document key, or empty for the end of the table/range.
-    to_key: ?[]const u8 = null,
-    /// Maximum source rows to scan per shard-local repair pass. Zero uses the server default.
-    limit: ?i64 = null,
-    /// Per-shard continuation cursors returned by a prior response. When present, distributed repair resumes exactly these shard-local cursors instead of resolving a fresh global key span.
-    shard_cursors: ?[]const DocumentArtifactReprocessShardCursor = null,
-};
-
-pub const DocumentArtifactTableReprocessResponse = struct {
-    /// Indicates that reprocessing was accepted.
-    reprocess: []const u8,
-    /// Completion state for this bounded pass. `in_progress` means the caller should persist the returned cursor(s) and schedule another pass; `complete` means no continuation cursor remains.
-    reprocess_status: []const u8,
-    /// Name of the derived artifact that was reprocessed.
-    artifact_name: []const u8,
-    /// Number of source rows scanned by this bounded pass.
-    scanned: i64,
-    /// Number of source rows whose artifact was reprocessed.
-    reprocessed: i64,
-    /// Number of scanned source rows that no longer had a reprocessable source document.
-    skipped: i64,
-    /// Number of scanned source rows that failed before recording a normal artifact manifest.
-    failed: i64,
-    /// Effective scan limit used by the bounded pass.
-    limit: i64,
-    /// Source key cursor for the next bounded pass, when more rows may remain.
-    next_key: ?[]const u8 = null,
-    /// Number of shard-local continuations still pending after this pass. For single-shard callers this is 1 when only `next_key` remains and 0 when complete.
-    pending_shards: i64,
-    failures: []const DocumentArtifactReprocessFailure,
-    /// Per-shard continuation cursors for distributed repairs. Durable background repair jobs should persist and resume these independently instead of collapsing progress into a single global cursor.
-    shard_cursors: []const DocumentArtifactReprocessShardCursor,
-};
-
 pub const DocumentArtifactReprocessJob = struct {
     /// Server-assigned durable repair job identifier.
     job_id: i64,
@@ -2190,23 +2135,257 @@ pub const DocumentArtifactReprocessJob = struct {
     expires_at_millis: i64,
 };
 
-/// Typed Zig status view for table data topology and range placement.
-pub const ClusterDataStatus = struct {
-    nodes: ?[]const ClusterDataNodeStatus = null,
-    ranges: ?[]const ClusterDataRangeStatus = null,
-    replicas: ?[]const ClusterDataReplicaStatus = null,
-    groups: ?[]const ClusterDataGroupStatus = null,
+/// Bounded request for reprocessing a derived artifact across source rows in key order.
+pub const DocumentArtifactTableReprocessRequest = struct {
+    /// Exclusive lower bound source document key. Use the prior response next_key to continue.
+    from_key: ?[]const u8 = null,
+    /// Inclusive upper bound source document key, or empty for the end of the table/range.
+    to_key: ?[]const u8 = null,
+    /// Maximum source rows to scan per shard-local repair pass. Zero uses the server default.
+    limit: ?i64 = null,
+    /// Per-shard continuation cursors returned by a prior response. When present, distributed repair resumes exactly these shard-local cursors instead of resolving a fresh global key span.
+    shard_cursors: ?[]const DocumentArtifactReprocessShardCursor = null,
 };
 
-pub const ClusterStatus = struct {
-    health: ClusterHealth,
-    /// Optional message providing details about the health status
+pub const DocumentArtifactTableReprocessResponse = struct {
+    /// Indicates that reprocessing was accepted.
+    reprocess: []const u8,
+    /// Completion state for this bounded pass. `in_progress` means the caller should persist the returned cursor(s) and schedule another pass; `complete` means no continuation cursor remains.
+    reprocess_status: []const u8,
+    /// Name of the derived artifact that was reprocessed.
+    artifact_name: []const u8,
+    /// Number of source rows scanned by this bounded pass.
+    scanned: i64,
+    /// Number of source rows whose artifact was reprocessed.
+    reprocessed: i64,
+    /// Number of scanned source rows that no longer had a reprocessable source document.
+    skipped: i64,
+    /// Number of scanned source rows that failed before recording a normal artifact manifest.
+    failed: i64,
+    /// Effective scan limit used by the bounded pass.
+    limit: i64,
+    /// Source key cursor for the next bounded pass, when more rows may remain.
+    next_key: ?[]const u8 = null,
+    /// Number of shard-local continuations still pending after this pass. For single-shard callers this is 1 when only `next_key` remains and 0 when complete.
+    pending_shards: i64,
+    failures: []const DocumentArtifactReprocessFailure,
+    /// Per-shard continuation cursors for distributed repairs. Durable background repair jobs should persist and resume these independently instead of collapsing progress into a single global cursor.
+    shard_cursors: []const DocumentArtifactReprocessShardCursor,
+};
+
+pub const EdgesResponse = struct {
+    edges: ?[]const Edge = null,
+    /// Total number of edges returned
+    count: ?i64 = null,
+};
+
+pub const ExternalIoConnection = struct {
+    protocol: ExternalIoProtocol,
+    /// Custom endpoint URL when configured.
+    endpoint: ?[]const u8 = null,
+    /// Buckets this connection is configured for.
+    buckets: ?[]const []const u8 = null,
+    /// Key prefix when configured.
+    prefix: ?[]const u8 = null,
+    /// Hosts or base URLs this connection applies to.
+    hosts: ?[]const []const u8 = null,
+};
+
+/// Statistics about a table used for query planning.
+pub const TableStatistics = struct {
+    /// Approximate number of rows in the table.
+    row_count: ?i64 = null,
+    /// Approximate size of the table in bytes.
+    size_bytes: ?i64 = null,
+    /// Per-field statistics for query optimization.
+    field_stats: ?std.json.ArrayHashMap(FieldStatistics) = null,
+    /// When these statistics were last computed.
+    last_updated: ?[]const u8 = null,
+};
+
+pub const ForeignSource = struct {
+    /// Type of the foreign data source. Currently only "postgres" is supported.
+    type: []const u8,
+    /// Data source name (connection string) for the foreign database. Supports `${secret:key_name}` references that resolve from the Antfly keystore or environment variables.
+    dsn: []const u8,
+    /// Name of the table or view in the foreign PostgreSQL database to query.
+    postgres_table: []const u8,
+    /// Optional column definitions for the foreign table. If omitted, columns are auto-discovered from `information_schema.columns` on first query.
+    columns: ?[]const ForeignColumn = null,
+};
+
+pub const InferenceConnection = struct {
+    provider: InferenceProviderType,
+    /// Resolved endpoint URL when applicable.
+    url: ?[]const u8 = null,
+    /// Cloud region (Bedrock).
+    region: ?[]const u8 = null,
+    /// Google Cloud project (Vertex).
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location (Vertex).
+    location: ?[]const u8 = null,
+    /// Named registry entries from node config that resolve to this provider instance.
+    names: ?[]const []const u8 = null,
+    /// Model types this instance is configured for.
+    configured_model_types: ?[]const ConnectedModelType = null,
+    /// Models reported by the provider, grouped by model type. Keys are pluralized ConnectedModelType values ("embedders", "generators", "rerankers", "chunkers", "recognizers", "classifiers", "rewriters", "readers", "transcribers", "extractors") plus "other" for models the provider's listing API does not classify by task. Populated only when the request includes the "models" expansion.
+    models: ?std.json.ArrayHashMap([]const ConnectedModel) = null,
+};
+
+/// Condition for matching rows between tables.
+pub const JoinCondition = struct {
+    /// Field from the left (primary) table to match on.
+    left_field: []const u8,
+    /// Field from the right (joined) table to match on.
+    right_field: []const u8,
+    /// Comparison operator. Defaults to "eq" (equality).
+    operator: ?JoinOperator = null,
+};
+
+/// Join execution statistics.
+pub const JoinProfile = struct {
+    /// The join strategy that was used.
+    strategy_used: ?JoinStrategy = null,
+    /// Number of rows scanned from the left table.
+    left_rows_scanned: ?i64 = null,
+    /// Number of rows scanned from the right table.
+    right_rows_scanned: ?i64 = null,
+    /// Number of rows that matched the join condition.
+    rows_matched: ?i64 = null,
+    /// Number of left rows without a match (for left/full joins).
+    rows_unmatched_left: ?i64 = null,
+    /// Number of right rows without a match (for right/full joins).
+    rows_unmatched_right: ?i64 = null,
+    /// Time spent executing the join in milliseconds.
+    duration_ms: ?i64 = null,
+};
+
+pub const LinearMergeResult = struct {
+    status: LinearMergePageStatus,
+    /// Records inserted or updated (0 if dry_run=true)
+    upserted: i64,
+    /// Records skipped because content hash matched (unchanged)
+    skipped: i64,
+    /// Records deleted or would be deleted (if dry_run=true)
+    deleted: i64,
+    /// IDs that were deleted (or would be deleted if dry_run=true). Only included if dry_run=true.
+    deleted_ids: ?[]const []const u8 = null,
+    failed: ?[]const FailedOperation = null,
+    /// ID of last record in this batch (use for next request)
+    next_cursor: []const u8,
+    key_range: ?KeyRange = null,
+    /// Total number of keys scanned from Antfly during range query
+    keys_scanned: ?i64 = null,
+    /// Additional information (e.g., "stopped at shard boundary", "dry run - no changes made")
     message: ?[]const u8 = null,
-    /// Indicates whether authentication is enabled for the cluster
-    auth_enabled: ?bool = null,
-    /// Indicates whether the cluster is running in single-node swarm mode
-    swarm_mode: ?bool = null,
-    secret_store: ?SecretStoreStatus = null,
+    took: ?i64 = null,
+};
+
+pub const StorageStatus = struct {
+    /// Disk usage in bytes.
+    disk_usage: ?i64 = null,
+    /// Whether the table has received data.
+    empty: ?bool = null,
+    lsm: ?LsmStorageStatus = null,
+};
+
+/// Token usage and resource statistics from the retrieval agent execution
+pub const RetrievalAgentUsage = struct {
+    /// Total input tokens across all LLM calls
+    input_tokens: ?i64 = null,
+    /// Total output tokens across all LLM calls
+    output_tokens: ?i64 = null,
+    /// Sum of input + output tokens
+    total_tokens: ?i64 = null,
+    /// Input tokens served from cache
+    cached_input_tokens: ?i64 = null,
+    /// Number of LLM invocations made
+    llm_calls: ?i64 = null,
+    /// Total resources found across all search queries
+    resources_retrieved: ?i64 = null,
+    /// Token pruning statistics, present when max_context_tokens was configured
+    prune_stats: ?PruneStats = null,
+};
+
+/// A list of query hits.
+pub const QueryHits = struct {
+    /// Total number of hits available and whether it is exact.
+    total: ?QueryHitsTotal = null,
+    hits: ?[]const QueryHit = null,
+    /// Maximum score of the results.
+    max_score: ?f32 = null,
+};
+
+/// Bounded request to list table repair issues.
+pub const RepairIssueListRequest = struct {
+    /// Repair subsystem to list. `artifact` lists durable artifact queue records; `index` lists index repair candidates derived from index status and artifact debt.
+    target: ?RepairTarget = null,
+    kind: ?ArtifactRepairKind = null,
+    /// Restrict results to one index name.
+    index: ?[]const u8 = null,
+    /// Opaque cursor returned by a prior response.
+    cursor: ?[]const u8 = null,
+    /// Maximum repair records to return.
+    limit: ?i64 = null,
+};
+
+/// Bounded request to run a table repair pass.
+pub const RepairRunRequest = struct {
+    target: ?RepairTarget = null,
+    kind: ?ArtifactRepairKind = null,
+    /// Restrict repair attempts to one index name.
+    index: ?[]const u8 = null,
+    /// Opaque cursor returned by a prior repair response.
+    cursor: ?[]const u8 = null,
+    /// Force a named index rebuild even when no repair debt is currently recorded. Only applies to target=index.
+    force: ?bool = null,
+    /// Maximum artifact repair records to attempt. For target=index, any positive value permits one named index repair.
+    limit: ?i64 = null,
+};
+
+/// Starts a durable table repair job. The job advances in bounded passes using the same repair request shape as runTableRepair.
+pub const TableRepairJobStartRequest = struct {
+    target: ?RepairTarget = null,
+    kind: ?ArtifactRepairKind = null,
+    /// Restrict repair attempts to one index name.
+    index: ?[]const u8 = null,
+    /// Opaque cursor returned by a prior repair response.
+    cursor: ?[]const u8 = null,
+    /// Force a named index rebuild even when no repair debt is currently recorded. Only applies to target=index.
+    force: ?bool = null,
+    /// Maximum artifact repair records to attempt per pass. For target=index, any positive value permits one named index repair.
+    limit: ?i64 = null,
+    /// When true, the server immediately attempts the first bounded repair pass before returning the job.
+    advance: ?bool = null,
+};
+
+pub const ReplicationRoute = struct {
+    /// Name of the Antfly table to write matching rows to. The table must already exist.
+    target_table: []const u8,
+    /// Bleve-style filter query evaluated against each CDC row. Only rows matching this filter are written to `target_table`. If omitted, all rows match (equivalent to `match_all`).
+    where: ?std.json.Value = null,
+    /// Override the source-level `key_template` for this route. If omitted, the source-level template is used.
+    key_template: ?[]const u8 = null,
+    /// Transform operations for INSERT/UPDATE events on this route. If omitted, auto-generates `$set` for every column (passthrough mode).
+    on_update: ?[]const ReplicationTransformOp = null,
+    /// Transform operations for DELETE events on this route. If omitted, auto-derives from this route's `on_update` paths.
+    on_delete: ?[]const ReplicationTransformOp = null,
+};
+
+/// Configuration for the retrieval agent's pipeline steps and tool-use behavior. Each step can have its own generator (or chain of generators) and step-specific options. If a step is not configured, it is skipped (retrieval always runs).
+pub const RetrievalAgentSteps = struct {
+    /// Configuration for query classification and transformation. When set, runs classification before retrieval to select the optimal strategy (simple/decompose/step_back/hyde) and transform the query.
+    classification: ?antfly_generating_api_openapi.ClassificationStepConfig = null,
+    /// Configuration for retrieval tool execution. Retrieval-step tools narrow the top-level tools policy when both are provided.
+    retrieval: ?RetrievalStepConfig = null,
+    /// Configuration for generation from retrieved documents. When set, generates a response with citations after retrieval completes.
+    generation: ?antfly_generating_api_openapi.GenerationStepConfig = null,
+    /// Configuration for generating follow-up questions. Requires steps.generation to be set.
+    followup: ?antfly_generating_api_openapi.FollowupStepConfig = null,
+    /// Configuration for confidence assessment of the generated response. Requires steps.generation to be set.
+    confidence: ?antfly_generating_api_openapi.ConfidenceStepConfig = null,
+    /// Configuration for inline evaluation. Runs evaluators on retrieved documents and/or generated response. Requires steps.generation for generation-quality evaluators (faithfulness, completeness, etc.).
+    eval: ?antfly_eval_openapi.EvalConfig = null,
 };
 
 pub const SecretEntry = struct {
@@ -2219,63 +2398,15 @@ pub const SecretEntry = struct {
     updated_at: ?[]const u8 = null,
 };
 
-pub const ShardConfig = struct {
-    byte_range: ByteRange,
-};
-
-pub const TransactionBeginRequest = struct {
-    sync_level: ?SyncLevel = null,
-};
-
-/// Linear merge operation for syncing sorted records from external sources. Use this to keep Antfly in sync with an external database or data source. Requests may be sent as plain JSON or gzip-compressed JSON (`Content-Encoding: gzip`). Request bodies are limited to 64 MiB after decompression. Requests that exceed this limit return HTTP 413. **How it works:** 1. Send sorted records from your external source 2. Server upserts records that exist in your batch 3. Server deletes Antfly records in the key range that are absent from your batch 4. If stopped at shard boundary, use next_cursor for next request **WARNING:** Not safe for concurrent operations with overlapping key ranges.
-pub const LinearMergeRequest = struct {
-    /// Map of resource ID to resource object: {"resource_id_1": {...}, "resource_id_2": {...}} Requirements: - The server processes keys in lexicographic order - Use consistent key naming (e.g., all start with same prefix) This format avoids duplicate IDs and matches Antfly's batch write interface.
-    records: std.json.Value,
-    /// ID of last record from previous merge request. - First request: Use empty string "" - Subsequent requests: Use next_cursor from previous response - Defines lower bound of key range to process This enables pagination for large datasets.
-    last_merged_id: ?[]const u8 = null,
-    /// If true, returns what would be deleted without making changes. Use cases: - Validate sync behavior before committing - Check which records will be removed - Test key range boundaries Response includes deleted_ids array when dry_run=true.
-    dry_run: ?bool = null,
-    sync_level: ?SyncLevel = null,
-};
-
-/// Runtime field capability exposed for planning, sortable field discovery, and operator diagnostics.
-pub const FieldCapability = struct {
-    /// Mapping or dynamic-template name, when applicable.
-    name: ?[]const u8 = null,
-    /// Concrete query field path when known. Pattern-only dynamic templates may omit this.
-    field: ?[]const u8 = null,
-    /// Dynamic-template path_match pattern, when applicable.
-    path_pattern: ?[]const u8 = null,
-    /// Dynamic-template match pattern, when applicable.
-    field_pattern: ?[]const u8 = null,
-    /// Dynamic-template match_mapping_type, when applicable.
-    match_mapping_type: ?[]const u8 = null,
-    /// Physical emitted field name for schema-derived text fields, when different from the logical path.
-    emitted_name: ?[]const u8 = null,
-    /// Document schema that produced this capability, when applicable.
-    document_schema: ?[]const u8 = null,
-    type: AntflyType,
-    searchable: bool,
-    filterable: bool,
-    aggregatable: bool,
-    doc_values: bool,
-    sortable: bool,
-    /// Coverage state for native doc values, such as identity_metadata, schema_declared, observed_declared, or not_declared.
-    doc_value_coverage: []const u8,
-    /// Capability source, such as reserved, document_schema, dynamic_template, or observed_dynamic.
-    provenance: []const u8,
-    /// Current missing/null handling policy for this field.
-    missing_null_policy: []const u8,
-    /// Whether the field is currently usable by public query planning.
-    queryability_state: []const u8,
-    /// Operational lifecycle state for exact sort/filter use. Queryable fields are accepted by public exact sort; accelerated fields are queryable and participate in the configured index_sort tuple.
-    sort_lifecycle_state: []const u8,
-    /// Analyzer name for text/searchable fields, when applicable.
-    analyzer: ?[]const u8 = null,
-    /// Zero-based position in the table index_sort tuple when this field participates.
-    index_sort_position: ?i64 = null,
-    /// Sort direction in the table index_sort tuple when this field participates.
-    index_sort_order: ?[]const u8 = null,
+pub const ClusterStatus = struct {
+    health: ClusterHealth,
+    /// Optional message providing details about the health status
+    message: ?[]const u8 = null,
+    /// Indicates whether authentication is enabled for the cluster
+    auth_enabled: ?bool = null,
+    /// Indicates whether the cluster is running in single-node swarm mode
+    swarm_mode: ?bool = null,
+    secret_store: ?SecretStoreStatus = null,
 };
 
 pub const AggregationRequest = struct {
@@ -2314,42 +2445,130 @@ pub const AggregationRequest = struct {
     sub_aggregations: ?std.json.ArrayHashMap(AggregationRequest) = null,
 };
 
-pub const StorageStatus = struct {
-    /// Disk usage in bytes.
-    disk_usage: ?i64 = null,
-    /// Whether the table has received data.
-    empty: ?bool = null,
-    lsm: ?LsmStorageStatus = null,
+/// Sort execution profile. The fields below are the stable public diagnostic surface; profiling responses may include additional implementation counters. Additional properties may include low-level implementation details such as doc-value load timings, stored-source loads, collector/window internals, cost-model inputs, native-filter modes, and index-sort availability flags; treat those properties as diagnostic and not as a frozen SDK contract.
+pub const SortProfile = struct {
+    /// Stable physical sort plan name. Known values include `none`, `id_only`, `id_seek`, `sorted_segment_seek`, `native_doc_values_top_n`, `score_top_k`, `distributed_k_way_merge`, `stored_json_debug`, and `unsupported_exact_sort`. Public exact sort requests must not silently move from native plans to `stored_json_debug`; missing native coverage is reported through the rejection fields instead.
+    plan: ?[]const u8 = null,
+    /// Requested order fields, including the implicit _id tie-breaker when applicable.
+    order_by: ?[]const SortField = null,
+    /// Cursor mode for this request.
+    cursor: ?[]const u8 = null,
+    /// Exactness class for the selected plan. Known values include `none`, `exact`, `bounded_exact`, `approximate`, and `unsupported`.
+    exactness: ?[]const u8 = null,
+    /// Sort execution primitive used by the selected plan. Known values include `none`, `candidate_collector`, `primary_key_scan`, `sorted_segment_scan`, `score_top_k`, `doc_values_collector`, `distributed_merge`, `stored_json_debug`, and `unsupported`.
+    source: ?[]const u8 = null,
+    /// Exact candidate source consumed by the selected sort primitive.
+    candidate_source: ?[]const u8 = null,
+    /// Cursor support level for the selected plan. Known values include `none`, `comparator`, `segment_seek`, `distributed_seek`, and `unsupported`.
+    cursor_support: ?[]const u8 = null,
+    /// Stored source load strategy. Known values include `none`, `source_free`, `projected_source_after_page`, `stored_source_required`, and `unsupported`.
+    source_load: ?[]const u8 = null,
+    /// Distributed sort behavior. Known values include `none`, `shard_local_only`, `coordinator_merge`, and `unsupported`.
+    distributed_behavior: ?[]const u8 = null,
+    /// Stable reason the planner selected this sort plan. Known values include `none`, `unsupported_exact_sort`, `distributed_k_way_merge`, `stored_json_debug`, `id_candidate_order`, `id_primary_key_seek`, `score_top_k`, `index_sort_sorted_segment_seek`, `sorted_segment_seek`, `doc_values_collector`, `index_sort_unavailable_doc_values_collector`, `caller_selected_doc_values_collector`, and `selective_filter_doc_values_collector`.
+    selection_reason: ?[]const u8 = null,
+    /// Whether exact execution required native typed sort values.
+    require_native: ?bool = null,
+    /// Conservative lifecycle state for the requested sort path. Queryable fields are accepted by public exact sort; accelerated fields are queryable and have an index_sort-compatible physical path.
+    sort_lifecycle_state: ?[]const u8 = null,
+    /// Native typed doc-values coverage status for mapped sort fields. Known values include `covered`, `identity_metadata`, `schema_declared`, `observed_declared`, and `not_declared`.
+    native_doc_values_coverage: ?[]const u8 = null,
+    /// Physical index_sort coverage status for the requested order. Known values include `request_mismatch`, `no_live_segments`, `missing_segment_index_sort`, `covered_without_bounds`, and `covered_with_bounds`.
+    index_sort_coverage: ?[]const u8 = null,
+    /// Candidate documents considered by sort execution.
+    candidate_count: ?i64 = null,
+    /// Candidates rejected by cursor comparison.
+    cursor_rejected_count: ?i64 = null,
+    /// Hits selected for the returned page.
+    selected_count: ?i64 = null,
+    /// Total sort execution time in microseconds.
+    total_us: ?i64 = null,
+    /// Shards participating in distributed sort execution.
+    distributed_shard_count: ?i64 = null,
+    /// Stable budget rejection reason. Known values include `text_exact_late_visibility_totals`, `text_field_sort_candidate_window`, `match_all_candidate_collect_limit`, `match_all_exact_candidate_window`, `sorted_segment_scan_window`, and `distributed_merge_shard_window`.
+    budget_rejection_reason: ?[]const u8 = null,
+    /// Stable exact-sort rejection reason. Known values include `unmapped_sort_field`, `non_sortable_sort_field`, `missing_doc_values_coverage`, `missing_native_filter_coverage`, `invalid_cursor_arity`, `invalid_cursor_type`, `invalid_sort_tuple`, `approximate_candidate_source`, `candidate_budget_exceeded`, `missing_runtime_mapping`, `invalid_doc_value_type`, `missing_null_policy`, `non_score_bearing_source`, `invalid_score_value`, `count_only_ordered_page`, `stored_json_sort_disabled`, `unsupported_exact_sort`, and `distributed_merge_unsupported`.
+    sort_rejection_reason: ?[]const u8 = null,
+    /// Stable rejection detail. Known exact-sort details include `unmapped_sort_field`, `unmapped_field`, `non_sortable_sort_field`, `non_scalar_field`, `non_sortable_field`, `mixed_field_type`, `missing_doc_values_section`, `malformed_doc_values_section`, `doc_values_kind_mismatch`, `sparse_live_doc_values`, `invalid_doc_value_doc_id`, `duplicate_doc_value_doc_id`, `unsupported_doc_values_type`, `missing_doc_values_coverage`, `missing_doc_values_capability`, `schema_declared`, `observed_declared`, `not_declared`, `missing_doc_values`, `non_sortable`, `declared`, `text_search_only`, `mixed`, `missing_native_filter_coverage`, `invalid_cursor_arity`, `invalid_cursor_type`, `invalid_sort_tuple`, `sort_tuple_arity`, `invalid_doc_value_type`, `incomplete_sort_tuple`, `mixed_sort_value_domain`, `unsorted_shard_window`, `unsorted_component_window`, `non_numeric_score`, `missing_score`, `non_finite_score`, `score_sort_tuple_mismatch`, `non_score_bearing_source`, `id_tiebreaker_mismatch`, `approximate_candidate_source`, `count_only_ordered_page`, `native_sort_loader_unavailable`, `sorted_segment_executor_unavailable`, `primary_key_stream_unavailable`, `native_candidate_stream_unavailable`, `candidate_stream_unavailable`, `incompatible_sort_plan`, `sorted_segment_bounds_unavailable`, `filter_query_json_unresolved`, `exclusion_query_json_unresolved`, `text_index_entry_unavailable`, `doc_ordinal_projection_unavailable`, `component_sort_profile_missing`, `unsupported_composed_sort_source`, `stored_json_sort_disabled`, `distributed_merge_unsupported`, `distributed_merge_plan_required`, `distributed_shard_window_incomplete`, `distributed_shard_cursor_window_invalid`, and `distributed_merge_shard_window`.
+    sort_rejection_detail: ?[]const u8 = null,
+    /// Sort field associated with the rejection when safe to expose.
+    sort_rejection_field: ?[]const u8 = null,
 };
 
-pub const TransformOp = struct {
-    op: TransformOpType,
-    /// JSONPath to field (e.g., "$.user.name", "$.tags", or "user.name")
-    path: []const u8,
-    /// Value for operation (not required for $unset, $currentDate). Type depends on operator (number for $inc/$mul, any for $set/$setOnInsert, etc.)
-    value: ?std.json.Value = null,
+/// Linear merge operation for syncing sorted records from external sources. Use this to keep Antfly in sync with an external database or data source. Requests may be sent as plain JSON or gzip-compressed JSON (`Content-Encoding: gzip`). Request bodies are limited to 64 MiB after decompression. Requests that exceed this limit return HTTP 413. **How it works:** 1. Send sorted records from your external source 2. Server upserts records that exist in your batch 3. Server deletes Antfly records in the key range that are absent from your batch 4. If stopped at shard boundary, use next_cursor for next request **WARNING:** Not safe for concurrent operations with overlapping key ranges.
+pub const LinearMergeRequest = struct {
+    /// Map of resource ID to resource object: {"resource_id_1": {...}, "resource_id_2": {...}} Requirements: - The server processes keys in lexicographic order - Use consistent key naming (e.g., all start with same prefix) This format avoids duplicate IDs and matches Antfly's batch write interface.
+    records: std.json.Value,
+    /// ID of last record from previous merge request. - First request: Use empty string "" - Subsequent requests: Use next_cursor from previous response - Defines lower bound of key range to process This enables pagination for large datasets.
+    last_merged_id: ?[]const u8 = null,
+    /// If true, returns what would be deleted without making changes. Use cases: - Validate sync behavior before committing - Check which records will be removed - Test key range boundaries Response includes deleted_ids array when dry_run=true.
+    dry_run: ?bool = null,
+    sync_level: ?SyncLevel = null,
 };
 
-/// Response for a cross-table batch operation. Contains per-table results.
-pub const MultiBatchResponse = struct {
-    /// Per-table batch results
-    tables: ?std.json.ArrayHashMap(BatchResponse) = null,
+pub const TransactionBeginRequest = struct {
+    sync_level: ?SyncLevel = null,
 };
 
-/// Result of an OCC transaction commit attempt.
-pub const TransactionCommitResponse = struct {
-    /// Whether the transaction was committed or aborted due to a conflict
+pub const ClusterBackupResponse = struct {
+    /// The backup identifier
+    backup_id: []const u8,
+    /// Status of each table backup
+    tables: []const TableBackupStatus,
+    /// Overall backup status
     status: []const u8,
-    /// Details about the conflict that caused an abort (only present when status is "aborted")
-    conflict: ?std.json.Value = null,
-    /// Per-table batch results (only present when status is "committed")
-    tables: ?std.json.ArrayHashMap(BatchResponse) = null,
 };
 
-pub const TransactionStageReadResponse = struct {
+/// Durable table repair job state.
+pub const TableRepairJob = struct {
+    /// Server-assigned durable repair job identifier.
+    job_id: i64,
+    /// Monotonic execution attempt token for the current running pass.
+    attempt_id: i64,
+    /// Table being repaired.
+    table_name: []const u8,
+    /// Lifecycle phase of the repair job.
+    phase: []const u8,
+    /// User-facing repair progress state. `debt_remaining` means the bounded job stopped because unsupported or failed debt still requires operator action.
+    repair_status: []const u8,
+    target: RepairTarget,
+    kind: ?ArtifactRepairKind = null,
+    /// Index name when the job is restricted to one index.
+    index: ?[]const u8 = null,
+    /// Opaque continuation cursor for the next bounded repair pass.
+    cursor: ?[]const u8 = null,
+    /// Effective per-pass repair limit.
+    limit: i64,
+    /// Whether the job forces a named index rebuild.
+    force: bool,
+    result: TableRepairRunResult,
+    /// Last stable job-level error code.
+    last_error: ?[]const u8 = null,
+    /// Whether cancellation has been requested for a running pass. Running passes finish at a bounded repair boundary before the job transitions to cancelled.
+    cancel_requested: bool,
+    /// Unix epoch milliseconds when the job was created.
+    created_at_millis: i64,
+    /// Unix epoch milliseconds when the job state was last updated.
+    last_updated_at_millis: i64,
+    /// Unix epoch milliseconds when the job is eligible for cleanup.
+    expires_at_millis: i64,
+};
+
+/// Response for a bounded table repair pass.
+pub const TableRepairRunResponse = struct {
+    /// Table whose repair queue was processed.
+    table: []const u8,
+    target: RepairTarget,
+    /// Effective repair limit.
+    limit: i64,
+    result: TableRepairRunResult,
+};
+
+pub const ClusterRestoreResponse = struct {
+    /// Status of each table restore
+    tables: []const TableRestoreStatus,
+    /// Overall restore status
     status: []const u8,
-    transaction_id: []const u8,
-    snapshot: TransactionStageReadSnapshot,
 };
 
 pub const TransactionSessionListResponse = struct {
@@ -2381,219 +2600,18 @@ pub const TransactionSessionDetailsResponse = struct {
     savepoint_ids: ?[]const i64 = null,
 };
 
-pub const RestoreRequest = struct {
-    /// Unique identifier for this backup. Used to reference the backup for restore operations. Choose a meaningful name that includes date/version information.
-    backup_id: []const u8,
-    /// Storage location for the backup. Supports multiple backends: - Local filesystem: `file:///path/to/backup` - Amazon S3: `s3://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata for the specified table.
-    location: []const u8,
-    /// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
-    format: ?[]const u8 = null,
-};
-
-pub const ClusterBackupResponse = struct {
-    /// The backup identifier
-    backup_id: []const u8,
-    /// Status of each table backup
-    tables: []const TableBackupStatus,
-    /// Overall backup status
+pub const TransactionStageReadResponse = struct {
     status: []const u8,
+    transaction_id: []const u8,
+    snapshot: TransactionStageReadSnapshot,
 };
 
-pub const ClusterRestoreResponse = struct {
-    /// Status of each table restore
-    tables: []const TableRestoreStatus,
-    /// Overall restore status
-    status: []const u8,
-};
-
-pub const BackupListResponse = struct {
-    /// List of available backups
-    backups: []const BackupInfo,
-};
-
-pub const AgentQuestion = struct {
-    /// Stable question identifier for client-carried continuation
-    id: []const u8,
-    kind: AgentQuestionKind,
-    /// The clarifying question to ask the user
-    question: []const u8,
-    /// Why clarification is needed
-    reason: ?[]const u8 = null,
-    /// Optional list of choices for the user
-    options: ?[]const []const u8 = null,
-    /// Suggested default answer when the server has a preferred choice
-    default_answer: ?[]const u8 = null,
-    /// High-level result areas affected by this decision
-    affects: ?[]const []const u8 = null,
-};
-
-pub const QueryBuilderRequest = struct {
-    /// Correlation identifier for a bounded agent interaction. In Phase 1 this is echoed back to the client but does not imply server-side session persistence.
-    session_id: ?[]const u8 = null,
-    /// Structured answers provided by the user as part of client-carried continuation.
-    decisions: ?[]const AgentDecision = null,
-    /// If true, the agent may return clarification questions when needed.
-    interactive: ?bool = null,
-    /// Additive bounded-agent field for the query builder. Phase 1 remains a single-pass generation flow, but this field is echoed in result accounting.
-    max_internal_iterations: ?i64 = null,
-    /// Maximum number of clarification turns the agent may request from the user.
-    max_user_clarifications: ?i64 = null,
-    /// Force a user-facing decision after this many unresolved internal passes.
-    require_decision_after: ?i64 = null,
-    /// Optional example documents to help the query builder infer field shapes and representative values. When omitted and the table has data but no schema, the server samples up to one document automatically.
-    example_documents: ?[]const std.json.Value = null,
-    /// Name of the table to build query for. If provided, uses table schema for field context.
-    table: ?[]const u8 = null,
-    /// Natural language description of the search intent
-    intent: []const u8,
-    /// List of searchable field names to consider. Overrides table schema if provided.
-    schema_fields: ?[]const []const u8 = null,
-    /// Optional strategy hint for the coordinator. Suggested values are `auto`, `full_text`, `semantic`, `hybrid`, `filter`, `tree`, and `graph`. Unknown values are accepted for forward compatibility and may fall back to `auto`.
-    mode: ?[]const u8 = null,
-    /// Preferred output artifact. Suggested values are `query_request`, `bleve`, and `filter_query`. The compatibility `query` field is still returned for existing clients.
-    output: ?[]const u8 = null,
-    /// Optional execution constraints for the coordinator, such as `limit`, `allowed_fields`, `prefer_indexes`, and `require_executable`.
-    constraints: ?std.json.Value = null,
-    generator: ?antfly_generating_openapi.GeneratorConfig = null,
-};
-
-/// Emitted when a pipeline step begins execution
-pub const SSEStepStarted = struct {
-    /// Unique step ID for correlating with step_completed
-    id: []const u8,
-    kind: ?AgentStepKind = null,
-    /// Stable step name used for correlation across JSON and SSE surfaces
-    name: []const u8,
-    /// Human-readable description of the action being taken
-    action: []const u8,
-};
-
-/// A step in the shared bounded-agent execution trace
-pub const AgentStep = struct {
-    /// Unique step ID for correlation and tracing
-    id: ?[]const u8 = null,
-    kind: ?AgentStepKind = null,
-    /// Stable step name used for correlation across JSON and SSE surfaces
-    name: []const u8,
-    /// What action was taken
-    action: []const u8,
-    status: ?AgentStepStatus = null,
-    /// Error details when status is "error"
-    error_message: ?[]const u8 = null,
-    /// Server-side execution time in milliseconds
-    duration_ms: ?i64 = null,
-    /// Additional details about the step
-    details: ?std.json.Value = null,
-};
-
-/// Token usage and resource statistics from the retrieval agent execution
-pub const RetrievalAgentUsage = struct {
-    /// Total input tokens across all LLM calls
-    input_tokens: ?i64 = null,
-    /// Total output tokens across all LLM calls
-    output_tokens: ?i64 = null,
-    /// Sum of input + output tokens
-    total_tokens: ?i64 = null,
-    /// Input tokens served from cache
-    cached_input_tokens: ?i64 = null,
-    /// Number of LLM invocations made
-    llm_calls: ?i64 = null,
-    /// Total resources found across all search queries
-    resources_retrieved: ?i64 = null,
-    /// Token pruning statistics, present when max_context_tokens was configured
-    prune_stats: ?PruneStats = null,
-};
-
-/// Configuration for the retrieval agent's pipeline steps and tool-use behavior. Each step can have its own generator (or chain of generators) and step-specific options. If a step is not configured, it is skipped (retrieval always runs).
-pub const RetrievalAgentSteps = struct {
-    /// Configuration for query classification and transformation. When set, runs classification before retrieval to select the optimal strategy (simple/decompose/step_back/hyde) and transform the query.
-    classification: ?antfly_generating_api_openapi.ClassificationStepConfig = null,
-    /// Configuration for retrieval tool execution. Retrieval-step tools narrow the top-level tools policy when both are provided.
-    retrieval: ?RetrievalStepConfig = null,
-    /// Configuration for generation from retrieved documents. When set, generates a response with citations after retrieval completes.
-    generation: ?antfly_generating_api_openapi.GenerationStepConfig = null,
-    /// Configuration for generating follow-up questions. Requires steps.generation to be set.
-    followup: ?antfly_generating_api_openapi.FollowupStepConfig = null,
-    /// Configuration for confidence assessment of the generated response. Requires steps.generation to be set.
-    confidence: ?antfly_generating_api_openapi.ConfidenceStepConfig = null,
-    /// Configuration for inline evaluation. Runs evaluators on retrieved documents and/or generated response. Requires steps.generation for generation-quality evaluators (faithfulness, completeness, etc.).
-    eval: ?antfly_eval_openapi.EvalConfig = null,
-};
-
-/// Condition for matching rows between tables.
-pub const JoinCondition = struct {
-    /// Field from the left (primary) table to match on.
-    left_field: []const u8,
-    /// Field from the right (joined) table to match on.
-    right_field: []const u8,
-    /// Comparison operator. Defaults to "eq" (equality).
-    operator: ?JoinOperator = null,
-};
-
-/// Join execution statistics.
-pub const JoinProfile = struct {
-    /// The join strategy that was used.
-    strategy_used: ?JoinStrategy = null,
-    /// Number of rows scanned from the left table.
-    left_rows_scanned: ?i64 = null,
-    /// Number of rows scanned from the right table.
-    right_rows_scanned: ?i64 = null,
-    /// Number of rows that matched the join condition.
-    rows_matched: ?i64 = null,
-    /// Number of left rows without a match (for left/full joins).
-    rows_unmatched_left: ?i64 = null,
-    /// Number of right rows without a match (for right/full joins).
-    rows_unmatched_right: ?i64 = null,
-    /// Time spent executing the join in milliseconds.
-    duration_ms: ?i64 = null,
-};
-
-/// Statistics about a table used for query planning.
-pub const TableStatistics = struct {
-    /// Approximate number of rows in the table.
-    row_count: ?i64 = null,
-    /// Approximate size of the table in bytes.
-    size_bytes: ?i64 = null,
-    /// Per-field statistics for query optimization.
-    field_stats: ?std.json.ArrayHashMap(FieldStatistics) = null,
-    /// When these statistics were last computed.
-    last_updated: ?[]const u8 = null,
-};
-
-/// A list of query hits.
-pub const QueryHits = struct {
-    /// Total number of hits available and whether it is exact.
-    total: ?QueryHitsTotal = null,
-    hits: ?[]const QueryHit = null,
-    /// Maximum score of the results.
-    max_score: ?f32 = null,
-};
-
-pub const LinearMergeResult = struct {
-    status: LinearMergePageStatus,
-    /// Records inserted or updated (0 if dry_run=true)
-    upserted: i64,
-    /// Records skipped because content hash matched (unchanged)
-    skipped: i64,
-    /// Records deleted or would be deleted (if dry_run=true)
-    deleted: i64,
-    /// IDs that were deleted (or would be deleted if dry_run=true). Only included if dry_run=true.
-    deleted_ids: ?[]const []const u8 = null,
-    failed: ?[]const FailedOperation = null,
-    /// ID of last record in this batch (use for next request)
-    next_cursor: []const u8,
-    key_range: ?KeyRange = null,
-    /// Total number of keys scanned from Antfly during range query
-    keys_scanned: ?i64 = null,
-    /// Additional information (e.g., "stopped at shard boundary", "dry run - no changes made")
-    message: ?[]const u8 = null,
-    took: ?i64 = null,
-};
-
-pub const EdgesResponse = struct {
-    edges: ?[]const Edge = null,
-    /// Total number of edges returned
-    count: ?i64 = null,
+pub const TransformOp = struct {
+    op: TransformOpType,
+    /// JSONPath to field (e.g., "$.user.name", "$.tags", or "user.name")
+    path: []const u8,
+    /// Value for operation (not required for $unset, $currentDate). Type depends on operator (number for $inc/$mul, any for $set/$setOnInsert, etc.)
+    value: ?std.json.Value = null,
 };
 
 pub const TraverseResponse = struct {
@@ -2602,28 +2620,53 @@ pub const TraverseResponse = struct {
     count: ?i64 = null,
 };
 
-pub const ForeignSource = struct {
-    /// Type of the foreign data source. Currently only "postgres" is supported.
-    type: []const u8,
-    /// Data source name (connection string) for the foreign database. Supports `${secret:key_name}` references that resolve from the Antfly keystore or environment variables.
-    dsn: []const u8,
-    /// Name of the table or view in the foreign PostgreSQL database to query.
-    postgres_table: []const u8,
-    /// Optional column definitions for the foreign table. If omitted, columns are auto-discovered from `information_schema.columns` on first query.
-    columns: ?[]const ForeignColumn = null,
+pub const SSEStepCompleted = AgentStep;
+
+/// Bounded page of table repair issues.
+pub const TableRepairIssueList = struct {
+    /// Table whose repair queue was listed.
+    table: []const u8,
+    target: RepairTarget,
+    /// Effective page limit.
+    limit: i64,
+    /// Number of repair records scanned while building this page.
+    scanned: i64,
+    /// Number of table groups touched while building this page.
+    groups_scanned: i64,
+    /// Whether another page is available.
+    has_more: bool,
+    /// Opaque cursor for the next page when has_more is true.
+    next_cursor: ?[]const u8 = null,
+    issues: []const TableRepairIssue,
 };
 
-pub const ReplicationRoute = struct {
-    /// Name of the Antfly table to write matching rows to. The table must already exist.
-    target_table: []const u8,
-    /// Bleve-style filter query evaluated against each CDC row. Only rows matching this filter are written to `target_table`. If omitted, all rows match (equivalent to `match_all`).
-    where: ?std.json.Value = null,
-    /// Override the source-level `key_template` for this route. If omitted, the source-level template is used.
-    key_template: ?[]const u8 = null,
-    /// Transform operations for INSERT/UPDATE events on this route. If omitted, auto-generates `$set` for every column (passthrough mode).
-    on_update: ?[]const ReplicationTransformOp = null,
-    /// Transform operations for DELETE events on this route. If omitted, auto-derives from this route's `on_update` paths.
-    on_delete: ?[]const ReplicationTransformOp = null,
+pub const TransactionSessionCommitResponse = struct {
+    /// Whether the transaction was committed or aborted due to a conflict
+    status: []const u8,
+    /// Details about the conflict that caused an abort (only present when status is "aborted")
+    conflict: ?std.json.Value = null,
+    /// Per-table batch results (only present when status is "committed")
+    tables: ?std.json.ArrayHashMap(BatchResponse) = null,
+    transaction_id: []const u8,
+};
+
+pub const ClusterTopology = struct {
+    health: ClusterHealth,
+    /// Optional message providing details about the health status
+    message: ?[]const u8 = null,
+    /// Indicates whether authentication is enabled for the cluster
+    auth_enabled: ?bool = null,
+    /// Indicates whether the cluster is running in single-node swarm mode
+    swarm_mode: ?bool = null,
+    secret_store: ?SecretStoreStatus = null,
+    data: ClusterDataStatus,
+};
+
+/// Available derived document artifact manifests for a source document.
+pub const DocumentArtifactManifestList = struct {
+    /// Stable identity of the source document.
+    document_id: []const u8,
+    artifacts: []const DocumentArtifactManifest,
 };
 
 pub const Connection = struct {
@@ -2649,68 +2692,23 @@ pub const Connection = struct {
     cdc: ?CdcConnection = null,
 };
 
-/// Available derived document artifact manifests for a source document.
-pub const DocumentArtifactManifestList = struct {
-    /// Stable identity of the source document.
-    document_id: []const u8,
-    artifacts: []const DocumentArtifactManifest,
+/// Configuration for joining data from another table. Supports inner, left, and right joins with automatic strategy selection.
+pub const JoinClause = struct {
+    /// Name of the table to join with.
+    right_table: []const u8,
+    /// Type of join to perform. Defaults to "inner".
+    join_type: ?JoinType = null,
+    /// Join condition specifying which fields to match.
+    on: JoinCondition,
+    /// Optional filters to apply to the right table before joining. Use to reduce the amount of data being joined.
+    right_filters: ?JoinFilters = null,
+    /// Fields to include from the right table in the result. If not specified, all fields from the right table are included. Fields are prefixed with the right table name in the result.
+    right_fields: ?[]const []const u8 = null,
+    /// Optional hint for which join strategy to use. If not specified, the planner automatically selects based on table statistics.
+    strategy_hint: ?JoinStrategy = null,
+    /// Optional nested join for multi-way joins. The nested join operates on the result of the current join.
+    nested_join: ?std.json.Value = null,
 };
-
-/// Bounded page of table repair issues.
-pub const TableRepairIssueList = struct {
-    /// Table whose repair queue was listed.
-    table: []const u8,
-    target: RepairTarget,
-    /// Effective page limit.
-    limit: i64,
-    /// Number of repair records scanned while building this page.
-    scanned: i64,
-    /// Number of table groups touched while building this page.
-    groups_scanned: i64,
-    /// Whether another page is available.
-    has_more: bool,
-    /// Opaque cursor for the next page when has_more is true.
-    next_cursor: ?[]const u8 = null,
-    issues: []const TableRepairIssue,
-};
-
-pub const ClusterTopology = struct {
-    health: ClusterHealth,
-    /// Optional message providing details about the health status
-    message: ?[]const u8 = null,
-    /// Indicates whether authentication is enabled for the cluster
-    auth_enabled: ?bool = null,
-    /// Indicates whether the cluster is running in single-node swarm mode
-    swarm_mode: ?bool = null,
-    secret_store: ?SecretStoreStatus = null,
-    data: ClusterDataStatus,
-};
-
-pub const SecretList = struct {
-    secrets: []const SecretEntry,
-};
-
-/// In-place document transformation using MongoDB-style operators. Transforms are applied atomically at the storage layer, eliminating read-modify-write races. **Important:** Transform results are NOT validated against the table schema. This improves performance but means it's possible to create invalid documents. Use with care and ensure your operations maintain schema compliance.
-pub const Transform = struct {
-    /// Document key (must be a string, not an object like inserts)
-    key: []const u8,
-    /// List of operations to apply in sequence
-    operations: []const TransformOp,
-    /// If true, create document if it doesn't exist (like MongoDB upsert)
-    upsert: ?bool = null,
-};
-
-pub const TransactionSessionCommitResponse = struct {
-    /// Whether the transaction was committed or aborted due to a conflict
-    status: []const u8,
-    /// Details about the conflict that caused an abort (only present when status is "aborted")
-    conflict: ?std.json.Value = null,
-    /// Per-table batch results (only present when status is "committed")
-    tables: ?std.json.ArrayHashMap(BatchResponse) = null,
-    transaction_id: []const u8,
-};
-
-pub const SSEStepCompleted = AgentStep;
 
 /// Result from the retrieval agent
 pub const RetrievalAgentResult = struct {
@@ -2764,38 +2762,6 @@ pub const RetrievalAgentResult = struct {
     eval_result: ?antfly_eval_openapi.EvalResult = null,
 };
 
-/// Configuration for joining data from another table. Supports inner, left, and right joins with automatic strategy selection.
-pub const JoinClause = struct {
-    /// Name of the table to join with.
-    right_table: []const u8,
-    /// Type of join to perform. Defaults to "inner".
-    join_type: ?JoinType = null,
-    /// Join condition specifying which fields to match.
-    on: JoinCondition,
-    /// Optional filters to apply to the right table before joining. Use to reduce the amount of data being joined.
-    right_filters: ?JoinFilters = null,
-    /// Fields to include from the right table in the result. If not specified, all fields from the right table are included. Fields are prefixed with the right table name in the result.
-    right_fields: ?[]const []const u8 = null,
-    /// Optional hint for which join strategy to use. If not specified, the planner automatically selects based on table statistics.
-    strategy_hint: ?JoinStrategy = null,
-    /// Optional nested join for multi-way joins. The nested join operates on the result of the current join.
-    nested_join: ?std.json.Value = null,
-};
-
-/// Detailed execution profiling for a query. Present in the response when the request sets `profile: true`.
-pub const QueryProfile = struct {
-    /// Shard-level execution statistics.
-    shards: ?ShardsProfile = null,
-    /// Join execution statistics (present when query used a join).
-    join: ?JoinProfile = null,
-    /// Reranking statistics (present when a reranker was used).
-    reranker: ?RerankerProfile = null,
-    /// Result merge statistics (present for hybrid search).
-    merge: ?MergeProfile = null,
-    /// Sort execution statistics (present when the query used ordered page options and profiling was enabled).
-    sort: ?SortProfile = null,
-};
-
 pub const ReplicationSource = struct {
     /// Type of the replication source. Currently only "postgres" is supported.
     type: []const u8,
@@ -2823,19 +2789,36 @@ pub const ReplicationSource = struct {
     action_hint: ?ReplicationSourceActionHint = null,
 };
 
-pub const ConnectionsResponse = struct {
-    connections: []const Connection,
+pub const SecretList = struct {
+    secrets: []const SecretEntry,
 };
 
-/// Batch insert, delete, and transform operations in a single request. **Atomicity**: - **Single shard**: Operations are atomic within shard boundaries - **Multiple shards**: Uses distributed 2-phase commit (2PC) for atomic cross-shard writes **How distributed transactions work**: 1. Metadata server allocates HLC timestamp and selects coordinator shard 2. Coordinator writes transaction record, participants write intents 3. After all intents succeed, coordinator commits transaction 4. Participants are notified asynchronously to resolve intents 5. Recovery loop ensures notifications complete even after coordinator failure **Performance**: - Single-shard batches: < 5ms latency - Cross-shard transactions: ~20ms latency - Intent resolution: < 30 seconds worst-case (via recovery loop) **Guarantees**: - All writes succeed or all fail (atomicity across all shards) - Coordinator failure is recoverable (new leader resumes notifications) - Idempotent resolution (duplicate notifications are safe) **Benefits**: - Reduces network overhead compared to individual requests - More efficient indexing (updates are batched) - Automatic distributed transactions when operations span shards The inserts are upserts - existing keys are overwritten, new keys are created.
-pub const BatchRequest = struct {
-    /// Map of document IDs to document objects. Each key is the unique identifier for the document. Best practices: - Use consistent key naming schemes (e.g., "user:123", "article:456") - Key length affects storage and performance - keep them reasonably short - Keys are sorted lexicographically, so choose prefixes that support range scans
-    inserts: ?std.json.ArrayHashMap(std.json.Value) = null,
-    /// Array of document IDs to delete. Documents are removed from all indexes. Notes: - Non-existent keys are silently ignored - Deletions are processed before inserts in the same batch - Keys are permanently removed from storage and indexes
-    deletes: ?[]const []const u8 = null,
-    /// Array of transform operations for in-place document updates using MongoDB-style operators. Transform operations allow you to modify documents without read-modify-write races: - Operations are applied atomically on the server - Multiple operations per document are applied in sequence - Supports numeric operations ($inc, $mul), array operations ($push, $pull), and more Common use cases: - Increment counters (views, likes, votes) - Update timestamps ($currentDate) - Manage arrays (add/remove tags, items) - Update nested fields without overwriting the entire document
-    transforms: ?[]const Transform = null,
-    sync_level: ?SyncLevel = null,
+/// Detailed execution profiling for a query. Present in the response when the request sets `profile: true`.
+pub const QueryProfile = struct {
+    /// Shard-level execution statistics.
+    shards: ?ShardsProfile = null,
+    /// Join execution statistics (present when query used a join).
+    join: ?JoinProfile = null,
+    /// Reranking statistics (present when a reranker was used).
+    reranker: ?RerankerProfile = null,
+    /// Result merge statistics (present for hybrid search).
+    merge: ?MergeProfile = null,
+    /// Sort execution statistics (present when the query used ordered page options and profiling was enabled).
+    sort: ?SortProfile = null,
+};
+
+/// In-place document transformation using MongoDB-style operators. Transforms are applied atomically at the storage layer, eliminating read-modify-write races. **Important:** Transform results are NOT validated against the table schema. This improves performance but means it's possible to create invalid documents. Use with care and ensure your operations maintain schema compliance.
+pub const Transform = struct {
+    /// Document key (must be a string, not an object like inserts)
+    key: []const u8,
+    /// List of operations to apply in sequence
+    operations: []const TransformOp,
+    /// If true, create document if it doesn't exist (like MongoDB upsert)
+    upsert: ?bool = null,
+};
+
+pub const ConnectionsResponse = struct {
+    connections: []const Connection,
 };
 
 pub const QueryRequest = struct {
@@ -2928,24 +2911,45 @@ pub const Table = struct {
     migration: ?TableMigration = null,
     /// PostgreSQL CDC replication sources configured for this table.
     replication_sources: ?[]const ReplicationSource = null,
-    /// Effective runtime field capabilities for this table. Clients can use this to discover concrete searchable, filterable, aggregatable, and sortable fields. Public exact field sort is supported only for `_id` or scalar fields marked sortable with native doc-value coverage and queryable state.
+    /// Effective runtime field capabilities for this table. Clients can use this to discover concrete field variants and their supported query modes, such as full_text, exact, range, geo, and autocomplete. Public exact field sort is supported only for `_id` or scalar fields marked sortable whose sort lifecycle is queryable or accelerated.
     field_capabilities: ?[]const FieldCapability = null,
 };
 
-/// Cross-table batch operations in a single atomic transaction. Groups batch operations by table name. All operations across all tables are committed atomically using distributed 2-phase commit (2PC). **Atomicity**: Either all operations across all tables succeed, or none do. This enables use cases like transferring a record from one table to another, or maintaining referential integrity across tables.
-pub const MultiBatchRequest = struct {
-    /// Map of table names to batch operations for that table. Each entry follows the same format as a single-table BatchRequest.
-    tables: std.json.ArrayHashMap(BatchRequest),
+/// Batch insert, delete, and transform operations in a single request. **Atomicity**: - **Single shard**: Operations are atomic within shard boundaries - **Multiple shards**: Uses distributed 2-phase commit (2PC) for atomic cross-shard writes **How distributed transactions work**: 1. Metadata server allocates HLC timestamp and selects coordinator shard 2. Coordinator writes transaction record, participants write intents 3. After all intents succeed, coordinator commits transaction 4. Participants are notified asynchronously to resolve intents 5. Recovery loop ensures notifications complete even after coordinator failure **Performance**: - Single-shard batches: < 5ms latency - Cross-shard transactions: ~20ms latency - Intent resolution: < 30 seconds worst-case (via recovery loop) **Guarantees**: - All writes succeed or all fail (atomicity across all shards) - Coordinator failure is recoverable (new leader resumes notifications) - Idempotent resolution (duplicate notifications are safe) **Benefits**: - Reduces network overhead compared to individual requests - More efficient indexing (updates are batched) - Automatic distributed transactions when operations span shards The inserts are upserts - existing keys are overwritten, new keys are created.
+pub const BatchRequest = struct {
+    /// Map of document IDs to document objects. Each key is the unique identifier for the document. Best practices: - Use consistent key naming schemes (e.g., "user:123", "article:456") - Key length affects storage and performance - keep them reasonably short - Keys are sorted lexicographically, so choose prefixes that support range scans
+    inserts: ?std.json.ArrayHashMap(std.json.Value) = null,
+    /// Array of document IDs to delete. Documents are removed from all indexes. Notes: - Non-existent keys are silently ignored - Deletions are processed before inserts in the same batch - Keys are permanently removed from storage and indexes
+    deletes: ?[]const []const u8 = null,
+    /// Array of transform operations for in-place document updates using MongoDB-style operators. Transform operations allow you to modify documents without read-modify-write races: - Operations are applied atomically on the server - Multiple operations per document are applied in sequence - Supports numeric operations ($inc, $mul), array operations ($push, $pull), and more Common use cases: - Increment counters (views, likes, votes) - Update timestamps ($currentDate) - Manage arrays (add/remove tags, items) - Update nested fields without overwriting the entire document
+    transforms: ?[]const Transform = null,
     sync_level: ?SyncLevel = null,
 };
 
-/// Stateless OCC (Optimistic Concurrency Control) transaction commit request. The client reads documents (capturing version tokens from the X-Antfly-Version response header on lookups), computes writes locally, then submits everything in this single commit request. The server validates that all read versions still match before executing writes atomically via 2PC. **No server-side state**: There is no "begin" endpoint. The client manages its own read set and submits the full transaction in one request.
-pub const TransactionCommitRequest = struct {
-    /// Set of keys that were read during the transaction, with their observed versions. The server verifies these versions still match before committing writes.
-    read_set: []const TransactionReadItem,
-    /// Write set: map of table names to batch operations, same format as MultiBatchRequest.tables.
-    tables: std.json.ArrayHashMap(BatchRequest),
-    sync_level: ?SyncLevel = null,
+/// DEPRECATED: Use RetrievalAgentRequest instead. Request for the answer agent. Accepts the old request format and internally delegates to the retrieval agent.
+pub const AnswerAgentRequest = struct {
+    /// User's natural language query
+    query: []const u8,
+    /// Queries to execute. Each query specifies its own table.
+    queries: []const QueryRequest,
+    /// DEPRECATED: Use stream on RetrievalAgentRequest instead. Enable SSE streaming vs JSON response.
+    with_streaming: ?bool = null,
+    /// Generator for LLM calls
+    generator: ?antfly_generating_openapi.GeneratorConfig = null,
+    /// Chain of generators
+    chain: ?[]const antfly_generating_openapi.ChainLink = null,
+    /// Domain-specific knowledge for the agent
+    agent_knowledge: ?[]const u8 = null,
+    /// Maximum tokens for document context
+    max_context_tokens: ?i64 = null,
+    /// Tokens to reserve for overhead
+    reserve_tokens: ?i64 = null,
+    /// Step configuration
+    steps: ?AnswerAgentSteps = null,
+    /// DEPRECATED: Use steps.eval on RetrievalAgentRequest instead. Evaluation configuration (moved to steps.eval in new API).
+    eval: ?antfly_eval_openapi.EvalConfig = null,
+    /// DEPRECATED: Omit steps.generation on RetrievalAgentRequest instead. If true, skip the generation step.
+    without_generation: ?bool = null,
 };
 
 /// A query in the retrieval pipeline. Extends QueryRequest with an optional tree search configuration. Each query specifies its own table. When both search fields (semantic_search, full_text_search) and tree_search are provided, the search results are used as start nodes for tree navigation.
@@ -3017,32 +3021,6 @@ pub const RetrievalQueryRequest = struct {
     tree_search: ?TreeSearchConfig = null,
 };
 
-/// DEPRECATED: Use RetrievalAgentRequest instead. Request for the answer agent. Accepts the old request format and internally delegates to the retrieval agent.
-pub const AnswerAgentRequest = struct {
-    /// User's natural language query
-    query: []const u8,
-    /// Queries to execute. Each query specifies its own table.
-    queries: []const QueryRequest,
-    /// DEPRECATED: Use stream on RetrievalAgentRequest instead. Enable SSE streaming vs JSON response.
-    with_streaming: ?bool = null,
-    /// Generator for LLM calls
-    generator: ?antfly_generating_openapi.GeneratorConfig = null,
-    /// Chain of generators
-    chain: ?[]const antfly_generating_openapi.ChainLink = null,
-    /// Domain-specific knowledge for the agent
-    agent_knowledge: ?[]const u8 = null,
-    /// Maximum tokens for document context
-    max_context_tokens: ?i64 = null,
-    /// Tokens to reserve for overhead
-    reserve_tokens: ?i64 = null,
-    /// Step configuration
-    steps: ?AnswerAgentSteps = null,
-    /// DEPRECATED: Use steps.eval on RetrievalAgentRequest instead. Evaluation configuration (moved to steps.eval in new API).
-    eval: ?antfly_eval_openapi.EvalConfig = null,
-    /// DEPRECATED: Omit steps.generation on RetrievalAgentRequest instead. If true, skip the generation step.
-    without_generation: ?bool = null,
-};
-
 pub const TableStatus = struct {
     name: []const u8,
     /// Optional description of the table.
@@ -3054,11 +3032,27 @@ pub const TableStatus = struct {
     migration: ?TableMigration = null,
     /// PostgreSQL CDC replication sources configured for this table.
     replication_sources: ?[]const ReplicationSource = null,
-    /// Effective runtime field capabilities for this table. Clients can use this to discover concrete searchable, filterable, aggregatable, and sortable fields. Public exact field sort is supported only for `_id` or scalar fields marked sortable with native doc-value coverage and queryable state.
+    /// Effective runtime field capabilities for this table. Clients can use this to discover concrete field variants and their supported query modes, such as full_text, exact, range, geo, and autocomplete. Public exact field sort is supported only for `_id` or scalar fields marked sortable whose sort lifecycle is queryable or accelerated.
     field_capabilities: ?[]const FieldCapability = null,
     storage_status: StorageStatus,
     /// Table-level generated artifact enrichments registered outside a specific index.
     artifact_enrichments: ?[]const antfly_indexes_openapi.EnrichmentConfig = null,
+};
+
+/// Cross-table batch operations in a single atomic transaction. Groups batch operations by table name. All operations across all tables are committed atomically using distributed 2-phase commit (2PC). **Atomicity**: Either all operations across all tables succeed, or none do. This enables use cases like transferring a record from one table to another, or maintaining referential integrity across tables.
+pub const MultiBatchRequest = struct {
+    /// Map of table names to batch operations for that table. Each entry follows the same format as a single-table BatchRequest.
+    tables: std.json.ArrayHashMap(BatchRequest),
+    sync_level: ?SyncLevel = null,
+};
+
+/// Stateless OCC (Optimistic Concurrency Control) transaction commit request. The client reads documents (capturing version tokens from the X-Antfly-Version response header on lookups), computes writes locally, then submits everything in this single commit request. The server validates that all read versions still match before executing writes atomically via 2PC. **No server-side state**: There is no "begin" endpoint. The client manages its own read set and submits the full transaction in one request.
+pub const TransactionCommitRequest = struct {
+    /// Set of keys that were read during the transaction, with their observed versions. The server verifies these versions still match before committing writes.
+    read_set: []const TransactionReadItem,
+    /// Write set: map of table names to batch operations, same format as MultiBatchRequest.tables.
+    tables: std.json.ArrayHashMap(BatchRequest),
+    sync_level: ?SyncLevel = null,
 };
 
 pub const QueryBuilderResult = struct {

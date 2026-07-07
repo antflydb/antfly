@@ -3,41 +3,15 @@
 
 const std = @import("std");
 
-pub const User = struct {
-    username: []const u8,
-    /// Base64 encoded password hash. Exposing this is a security risk.
-    password_hash: []const u8,
-    /// Server-side auth metadata available to stored row-filter policies through $auth metadata paths.
-    metadata: ?std.json.ArrayHashMap(std.json.Value) = null,
+pub const AuthSubject = struct {
+    /// Casbin subject name.
+    subject: []const u8,
+    /// Conservative subject classification inferred from user records and subject prefixes.
+    kind: []const u8,
 };
 
-/// Type of the resource, e.g., table, user, or global ('*').
-pub const ResourceType = enum {
-    table,
-    user,
-    @"*",
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .table => "table",
-            .user => "user",
-            .@"*" => "*",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "table", .table },
-            .{ "user", .user },
-            .{ "*", .@"*" },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
+pub const Error = struct {
+    @"error": []const u8,
 };
 
 /// Type of permission.
@@ -69,28 +43,38 @@ pub const PermissionType = enum {
     }
 };
 
+/// Type of the resource, e.g., table, user, or global ('*').
+pub const ResourceType = enum {
+    table,
+    user,
+    @"*",
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .table => "table",
+            .user => "user",
+            .@"*" => "*",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "table", .table },
+            .{ "user", .user },
+            .{ "*", .@"*" },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const RoleAssignment = struct {
     /// Role or group subject to assign, usually prefixed with role: or group:.
     role: []const u8,
-};
-
-pub const AuthSubject = struct {
-    /// Casbin subject name.
-    subject: []const u8,
-    /// Conservative subject classification inferred from user records and subject prefixes.
-    kind: []const u8,
-};
-
-pub const UpdatePasswordRequest = struct {
-    new_password: []const u8,
-};
-
-pub const SuccessMessage = struct {
-    message: ?[]const u8 = null,
-};
-
-pub const Error = struct {
-    @"error": []const u8,
 };
 
 /// A row filter policy for a user on a specific table.
@@ -101,21 +85,27 @@ pub const RowFilterEntry = struct {
     filter: std.json.ArrayHashMap(std.json.Value),
 };
 
+pub const SuccessMessage = struct {
+    message: ?[]const u8 = null,
+};
+
+pub const UpdatePasswordRequest = struct {
+    new_password: []const u8,
+};
+
+pub const User = struct {
+    username: []const u8,
+    /// Base64 encoded password hash. Exposing this is a security risk.
+    password_hash: []const u8,
+    /// Server-side auth metadata available to stored row-filter policies through $auth metadata paths.
+    metadata: ?std.json.ArrayHashMap(std.json.Value) = null,
+};
+
 pub const Permission = struct {
     /// Resource name (e.g., table name, target username, or '*' for global).
     resource: []const u8,
     resource_type: ResourceType,
     type: PermissionType,
-};
-
-pub const CreateUserRequest = struct {
-    /// Username for the new user. If provided in the path, this field can be omitted or must match the path parameter.
-    username: ?[]const u8 = null,
-    password: []const u8,
-    /// Optional list of initial permissions for the user.
-    initial_policies: ?[]const Permission = null,
-    /// Auth metadata available to stored row-filter policies.
-    metadata: ?std.json.ArrayHashMap(std.json.Value) = null,
 };
 
 /// Public metadata for an API key (secrets are never returned after creation).
@@ -146,6 +136,16 @@ pub const CreateApiKeyRequest = struct {
     permissions: ?[]const Permission = null,
     /// Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing.
     row_filter: ?std.json.ArrayHashMap(std.json.Value) = null,
+};
+
+pub const CreateUserRequest = struct {
+    /// Username for the new user. If provided in the path, this field can be omitted or must match the path parameter.
+    username: ?[]const u8 = null,
+    password: []const u8,
+    /// Optional list of initial permissions for the user.
+    initial_policies: ?[]const Permission = null,
+    /// Auth metadata available to stored row-filter policies.
+    metadata: ?std.json.ArrayHashMap(std.json.Value) = null,
 };
 
 /// API key creation response including the cleartext secret (shown once).
