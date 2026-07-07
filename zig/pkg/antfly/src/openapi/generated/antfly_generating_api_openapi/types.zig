@@ -5,15 +5,135 @@ const std = @import("std");
 const antfly_generating_openapi = @import("antfly_generating_openapi");
 const antfly_websearch_openapi = @import("antfly_websearch_openapi");
 
+pub const GeneratorProvider = antfly_generating_openapi.GeneratorProvider;
+
+pub const GeneratorConfig = antfly_generating_openapi.GeneratorConfig;
+
+/// Result of a generate operation. Formatted as markdown by default with inline resource references using [resource_id <id>] or [resource_id <id1>, <id2>] format.
+pub const GenerateResult = struct {
+    /// The generated text in markdown format with inline resource references like [resource_id res1] or [resource_id res1, res2]
+    text: []const u8,
+};
+
+/// Classification of query type: question (specific factual query) or search (exploratory query)
+pub const RouteType = enum {
+    question,
+    search,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .question => "question",
+            .search => "search",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "question", .question },
+            .{ "search", .search },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Strategy for query transformation and retrieval: - simple: Direct query with multi-phrase expansion. Best for straightforward factual queries. - decompose: Break complex queries into sub-questions, retrieve for each. Best for multi-part questions. - step_back: Generate broader background query first, then specific query. Best for questions needing context. - hyde: Generate hypothetical answer document, embed that for retrieval. Best for abstract/conceptual questions.
+pub const QueryStrategy = enum {
+    simple,
+    decompose,
+    step_back,
+    hyde,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .simple => "simple",
+            .decompose => "decompose",
+            .step_back => "step_back",
+            .hyde => "hyde",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "simple", .simple },
+            .{ "decompose", .decompose },
+            .{ "step_back", .step_back },
+            .{ "hyde", .hyde },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Mode for semantic query generation: - rewrite: Transform query into expanded keywords/concepts optimized for vector search (Level 2 optimization) - hypothetical: Generate a hypothetical answer that would appear in relevant documents (HyDE - Level 3 optimization)
+pub const SemanticQueryMode = enum {
+    rewrite,
+    hypothetical,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .rewrite => "rewrite",
+            .hypothetical => "hypothetical",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "rewrite", .rewrite },
+            .{ "hypothetical", .hypothetical },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Confidence assessment for the generated response
+pub const GenerationConfidence = struct {
+    /// Overall confidence in the generation (0.0 to 1.0). Considers both ability to answer from provided resources and general knowledge.
+    generation_confidence: f32,
+    /// Relevance of the provided resources to the question (0.0 to 1.0)
+    context_relevance: f32,
+};
+
+/// Result from generation with optional confidence and follow-up questions
+pub const GenerationResult = struct {
+    /// Overall confidence in the generation (0.0 to 1.0)
+    generation_confidence: ?f32 = null,
+    /// Relevance of the provided resources to the question (0.0 to 1.0)
+    context_relevance: ?f32 = null,
+    /// Generated response in markdown format
+    generation: []const u8,
+    /// Suggested follow-up questions
+    followup_questions: ?[]const []const u8 = null,
+};
+
+pub const RetryConfig = antfly_generating_openapi.RetryConfig;
+
 pub const ChainCondition = antfly_generating_openapi.ChainCondition;
 
 pub const ChainLink = antfly_generating_openapi.ChainLink;
 
-pub const ChatMessage = antfly_generating_openapi.ChatMessage;
+pub const ChatMessageRole = antfly_generating_openapi.ChatMessageRole;
 
 pub const ChatMessageContent = antfly_generating_openapi.ChatMessageContent;
 
-pub const ChatMessageRole = antfly_generating_openapi.ChatMessageRole;
+pub const ToolCall = antfly_generating_openapi.ToolCall;
+
+pub const ToolCallFunction = antfly_generating_openapi.ToolCallFunction;
+
+pub const ChatMessage = antfly_generating_openapi.ChatMessage;
 
 /// Available tool names for retrieval agents. - add_filter: Add search filters (field constraints) - ask_clarification: Ask user for clarification - web_search: Search the web (requires web_search_connection or web_search_config) - fetch: Fetch URL content (subject to security controls) - semantic_search: Execute semantic/vector search against an index - full_text_search: Execute full-text BM25 search against an index - tree_search: Execute tree search with beam search navigation - graph_search: Execute graph traversal search - aggregate: Execute aggregations against an index
 pub const ChatToolName = enum {
@@ -82,178 +202,25 @@ pub const FilterSpec = struct {
     value: std.json.Value,
 };
 
-/// Result of a generate operation. Formatted as markdown by default with inline resource references using [resource_id <id>] or [resource_id <id1>, <id2>] format.
-pub const GenerateResult = struct {
-    /// The generated text in markdown format with inline resource references like [resource_id res1] or [resource_id res1, res2]
-    text: []const u8,
-};
-
-/// Confidence assessment for the generated response
-pub const GenerationConfidence = struct {
-    /// Overall confidence in the generation (0.0 to 1.0). Considers both ability to answer from provided resources and general knowledge.
-    generation_confidence: f32,
-    /// Relevance of the provided resources to the question (0.0 to 1.0)
-    context_relevance: f32,
-};
-
-/// Result from generation with optional confidence and follow-up questions
-pub const GenerationResult = struct {
-    /// Overall confidence in the generation (0.0 to 1.0)
-    generation_confidence: ?f32 = null,
-    /// Relevance of the provided resources to the question (0.0 to 1.0)
-    context_relevance: ?f32 = null,
-    /// Generated response in markdown format
-    generation: []const u8,
-    /// Suggested follow-up questions
-    followup_questions: ?[]const []const u8 = null,
-};
-
-pub const GeneratorConfig = antfly_generating_openapi.GeneratorConfig;
-
-pub const GeneratorProvider = antfly_generating_openapi.GeneratorProvider;
-
-/// Strategy for query transformation and retrieval: - simple: Direct query with multi-phrase expansion. Best for straightforward factual queries. - decompose: Break complex queries into sub-questions, retrieve for each. Best for multi-part questions. - step_back: Generate broader background query first, then specific query. Best for questions needing context. - hyde: Generate hypothetical answer document, embed that for retrieval. Best for abstract/conceptual questions.
-pub const QueryStrategy = enum {
-    simple,
-    decompose,
-    step_back,
-    hyde,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .simple => "simple",
-            .decompose => "decompose",
-            .step_back => "step_back",
-            .hyde => "hyde",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "simple", .simple },
-            .{ "decompose", .decompose },
-            .{ "step_back", .step_back },
-            .{ "hyde", .hyde },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-pub const RetryConfig = antfly_generating_openapi.RetryConfig;
-
-/// Classification of query type: question (specific factual query) or search (exploratory query)
-pub const RouteType = enum {
-    question,
-    search,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .question => "question",
-            .search => "search",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "question", .question },
-            .{ "search", .search },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Mode for semantic query generation: - rewrite: Transform query into expanded keywords/concepts optimized for vector search (Level 2 optimization) - hypothetical: Generate a hypothetical answer that would appear in relevant documents (HyDE - Level 3 optimization)
-pub const SemanticQueryMode = enum {
-    rewrite,
-    hypothetical,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .rewrite => "rewrite",
-            .hypothetical => "hypothetical",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "rewrite", .rewrite },
-            .{ "hypothetical", .hypothetical },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-pub const ToolCall = antfly_generating_openapi.ToolCall;
-
-pub const ToolCallFunction = antfly_generating_openapi.ToolCallFunction;
-
-/// Configuration for retrieval agent tools. If `enabled_tools` is empty/omitted, retrieval agents default to all retrieval tools available for the request. Explicit retrieval policies should use semantic_search for vector retrieval. For models that don't support native tool calling (e.g., Ollama), a prompt-based fallback is used with structured output parsing.
-pub const ChatToolsConfig = struct {
-    /// List of tools to enable. If empty, retrieval agents default to all retrieval tools available for the request.
-    enabled_tools: ?[]const ChatToolName = null,
-    /// Inline web search provider configuration. Prefer web_search_connection for configured production agents; inline config remains useful for CLI/dev requests. See specs/openapi/antfly/websearch.yaml for provider-specific options.
-    web_search_config: ?antfly_websearch_openapi.WebSearchConfig = null,
-    /// Name of a configured connections.<id> resource with kind web_search. Request-level tool options may reduce scope, but cannot expand the connection's configured capabilities or policy.
-    web_search_connection: ?[]const u8 = null,
-    /// URL fetching configuration. See specs/openapi/antfly/websearch.yaml for available options and security controls.
-    fetch_config: ?antfly_websearch_openapi.FetchConfig = null,
-    /// Maximum number of tool call iterations per turn. Prevents infinite loops in tool execution.
-    max_tool_iterations: ?i64 = null,
-};
-
-/// Configuration for confidence assessment. Evaluates answer quality and resource relevance. Can use a model calibrated for scoring tasks.
-pub const ConfidenceStepConfig = struct {
-    /// Enable confidence scoring
-    enabled: ?bool = null,
-    /// Generator for confidence assessment. If not specified, uses the answer step's generator.
-    generator: ?GeneratorConfig = null,
-    /// Chain of generators to try in order. Mutually exclusive with 'generator'.
-    chain: ?[]const ChainLink = null,
-    /// Custom guidance for confidence assessment approach
-    context: ?[]const u8 = null,
-};
-
-/// Configuration for generating follow-up questions. Uses a separate generator call which can use a cheaper/faster model.
-pub const FollowupStepConfig = struct {
-    /// Enable follow-up question generation
-    enabled: ?bool = null,
-    /// Generator for follow-up questions. If not specified, uses the answer step's generator.
-    generator: ?GeneratorConfig = null,
-    /// Chain of generators to try in order. Mutually exclusive with 'generator'.
-    chain: ?[]const ChainLink = null,
-    /// Number of follow-up questions to generate
-    count: ?i64 = null,
-    /// Custom guidance for follow-up question focus and style
-    context: ?[]const u8 = null,
-};
-
-/// Configuration for the generation step. This step generates the final response from retrieved documents using the reasoning as context.
-pub const GenerationStepConfig = struct {
-    /// Enable generation from retrieved documents
-    enabled: ?bool = null,
-    /// Generator to use for generation. If not specified, uses the default summarizer.
-    generator: ?GeneratorConfig = null,
-    /// Chain of generators to try in order. Mutually exclusive with 'generator'.
-    chain: ?[]const ChainLink = null,
-    /// Custom system prompt for answer generation
-    system_prompt: ?[]const u8 = null,
-    /// Custom guidance for generation tone, detail level, and style
-    generation_context: ?[]const u8 = null,
+/// Query classification and transformation result combining all query enhancements including strategy selection and semantic optimization
+pub const ClassificationTransformationResult = struct {
+    route_type: RouteType,
+    strategy: QueryStrategy,
+    semantic_mode: SemanticQueryMode,
+    /// Clarified query with added context for answer generation (human-readable)
+    improved_query: []const u8,
+    /// Optimized query for vector/semantic search. Content style depends on semantic_mode: keywords for 'rewrite', hypothetical answer for 'hypothetical'
+    semantic_query: []const u8,
+    /// Broader background query for context (only present when strategy is 'step_back')
+    step_back_query: ?[]const u8 = null,
+    /// Decomposed sub-questions (only present when strategy is 'decompose')
+    sub_questions: ?[]const []const u8 = null,
+    /// Alternative phrasings of the query for expanded retrieval coverage
+    multi_phrases: ?[]const []const u8 = null,
+    /// Pre-retrieval reasoning explaining query analysis and strategy selection (only present when with_classification_reasoning is enabled)
+    reasoning: ?[]const u8 = null,
+    /// Classification confidence (0.0 to 1.0)
+    confidence: f32,
 };
 
 /// Configuration for the classification step. This step analyzes the query, selects the optimal retrieval strategy, and generates semantic transformations.
@@ -274,23 +241,56 @@ pub const ClassificationStepConfig = struct {
     multi_phrase_count: ?i64 = null,
 };
 
-/// Query classification and transformation result combining all query enhancements including strategy selection and semantic optimization
-pub const ClassificationTransformationResult = struct {
-    route_type: RouteType,
-    strategy: QueryStrategy,
-    semantic_mode: SemanticQueryMode,
-    /// Clarified query with added context for answer generation (human-readable)
-    improved_query: []const u8,
-    /// Optimized query for vector/semantic search. Content style depends on semantic_mode: keywords for 'rewrite', hypothetical answer for 'hypothetical'
-    semantic_query: []const u8,
-    /// Broader background query for context (only present when strategy is 'step_back')
-    step_back_query: ?[]const u8 = null,
-    /// Decomposed sub-questions (only present when strategy is 'decompose')
-    sub_questions: ?[]const []const u8 = null,
-    /// Alternative phrasings of the query for expanded retrieval coverage
-    multi_phrases: ?[]const []const u8 = null,
-    /// Pre-retrieval reasoning explaining query analysis and strategy selection (only present when with_classification_reasoning is enabled)
-    reasoning: ?[]const u8 = null,
-    /// Classification confidence (0.0 to 1.0)
-    confidence: f32,
+/// Configuration for the generation step. This step generates the final response from retrieved documents using the reasoning as context.
+pub const GenerationStepConfig = struct {
+    /// Enable generation from retrieved documents
+    enabled: ?bool = null,
+    /// Generator to use for generation. If not specified, uses the default summarizer.
+    generator: ?GeneratorConfig = null,
+    /// Chain of generators to try in order. Mutually exclusive with 'generator'.
+    chain: ?[]const ChainLink = null,
+    /// Custom system prompt for answer generation
+    system_prompt: ?[]const u8 = null,
+    /// Custom guidance for generation tone, detail level, and style
+    generation_context: ?[]const u8 = null,
+};
+
+/// Configuration for generating follow-up questions. Uses a separate generator call which can use a cheaper/faster model.
+pub const FollowupStepConfig = struct {
+    /// Enable follow-up question generation
+    enabled: ?bool = null,
+    /// Generator for follow-up questions. If not specified, uses the answer step's generator.
+    generator: ?GeneratorConfig = null,
+    /// Chain of generators to try in order. Mutually exclusive with 'generator'.
+    chain: ?[]const ChainLink = null,
+    /// Number of follow-up questions to generate
+    count: ?i64 = null,
+    /// Custom guidance for follow-up question focus and style
+    context: ?[]const u8 = null,
+};
+
+/// Configuration for confidence assessment. Evaluates answer quality and resource relevance. Can use a model calibrated for scoring tasks.
+pub const ConfidenceStepConfig = struct {
+    /// Enable confidence scoring
+    enabled: ?bool = null,
+    /// Generator for confidence assessment. If not specified, uses the answer step's generator.
+    generator: ?GeneratorConfig = null,
+    /// Chain of generators to try in order. Mutually exclusive with 'generator'.
+    chain: ?[]const ChainLink = null,
+    /// Custom guidance for confidence assessment approach
+    context: ?[]const u8 = null,
+};
+
+/// Configuration for retrieval agent tools. If `enabled_tools` is empty/omitted, retrieval agents default to all retrieval tools available for the request. Explicit retrieval policies should use semantic_search for vector retrieval. For models that don't support native tool calling (e.g., Ollama), a prompt-based fallback is used with structured output parsing.
+pub const ChatToolsConfig = struct {
+    /// List of tools to enable. If empty, retrieval agents default to all retrieval tools available for the request.
+    enabled_tools: ?[]const ChatToolName = null,
+    /// Inline web search provider configuration. Prefer web_search_connection for configured production agents; inline config remains useful for CLI/dev requests. See specs/openapi/antfly/websearch.yaml for provider-specific options.
+    web_search_config: ?antfly_websearch_openapi.WebSearchConfig = null,
+    /// Name of a configured connections.<id> resource with kind web_search. Request-level tool options may reduce scope, but cannot expand the connection's configured capabilities or policy.
+    web_search_connection: ?[]const u8 = null,
+    /// URL fetching configuration. See specs/openapi/antfly/websearch.yaml for available options and security controls.
+    fetch_config: ?antfly_websearch_openapi.FetchConfig = null,
+    /// Maximum number of tool call iterations per turn. Prevents infinite loops in tool execution.
+    max_tool_iterations: ?i64 = null,
 };

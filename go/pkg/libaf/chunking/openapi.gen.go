@@ -101,6 +101,11 @@ type InferenceChunkConfig struct {
 	Threshold float32 `json:"threshold,omitempty,omitzero"`
 }
 
+// InferenceChunkContentPart Content part supported by chunking requests.
+type InferenceChunkContentPart struct {
+	union json.RawMessage
+}
+
 // InferenceChunkRequest defines model for InferenceChunkRequest.
 type InferenceChunkRequest struct {
 	// Config Configuration for chunking requests to Antfly inference.
@@ -111,7 +116,7 @@ type InferenceChunkRequest struct {
 	// - Text string: `"This is a long document..."`
 	// - ContentPart: `{"type": "media", "data": "<base64>", "mime_type": "audio/wav"}`
 	// - ContentPart: `{"type": "text", "text": "..."}`
-	Input InferenceChunkRequest_Input `json:"input,omitempty,omitzero"`
+	Input InferenceChunkRequest_Input `json:"input"`
 }
 
 // InferenceChunkRequestInput0 Text to chunk
@@ -271,6 +276,68 @@ func (t *Chunk) UnmarshalJSON(b []byte) error {
 	return err
 }
 
+// AsExternalRef0TextContentPart returns the union data inside the InferenceChunkContentPart as a externalRef0.TextContentPart
+func (t InferenceChunkContentPart) AsExternalRef0TextContentPart() (externalRef0.TextContentPart, error) {
+	var body externalRef0.TextContentPart
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromExternalRef0TextContentPart overwrites any union data inside the InferenceChunkContentPart as the provided externalRef0.TextContentPart
+func (t *InferenceChunkContentPart) FromExternalRef0TextContentPart(v externalRef0.TextContentPart) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeExternalRef0TextContentPart performs a merge with any union data inside the InferenceChunkContentPart, using the provided externalRef0.TextContentPart
+func (t *InferenceChunkContentPart) MergeExternalRef0TextContentPart(v externalRef0.TextContentPart) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsExternalRef0MediaContentPart returns the union data inside the InferenceChunkContentPart as a externalRef0.MediaContentPart
+func (t InferenceChunkContentPart) AsExternalRef0MediaContentPart() (externalRef0.MediaContentPart, error) {
+	var body externalRef0.MediaContentPart
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromExternalRef0MediaContentPart overwrites any union data inside the InferenceChunkContentPart as the provided externalRef0.MediaContentPart
+func (t *InferenceChunkContentPart) FromExternalRef0MediaContentPart(v externalRef0.MediaContentPart) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeExternalRef0MediaContentPart performs a merge with any union data inside the InferenceChunkContentPart, using the provided externalRef0.MediaContentPart
+func (t *InferenceChunkContentPart) MergeExternalRef0MediaContentPart(v externalRef0.MediaContentPart) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+func (t InferenceChunkContentPart) MarshalJSON() ([]byte, error) {
+	b, err := t.union.MarshalJSON()
+	return b, err
+}
+
+func (t *InferenceChunkContentPart) UnmarshalJSON(b []byte) error {
+	err := t.union.UnmarshalJSON(b)
+	return err
+}
+
 // AsInferenceChunkRequestInput0 returns the union data inside the InferenceChunkRequest_Input as a InferenceChunkRequestInput0
 func (t InferenceChunkRequest_Input) AsInferenceChunkRequestInput0() (InferenceChunkRequestInput0, error) {
 	var body InferenceChunkRequestInput0
@@ -297,22 +364,22 @@ func (t *InferenceChunkRequest_Input) MergeInferenceChunkRequestInput0(v Inferen
 	return err
 }
 
-// AsExternalRef0ContentPart returns the union data inside the InferenceChunkRequest_Input as a externalRef0.ContentPart
-func (t InferenceChunkRequest_Input) AsExternalRef0ContentPart() (externalRef0.ContentPart, error) {
-	var body externalRef0.ContentPart
+// AsInferenceChunkContentPart returns the union data inside the InferenceChunkRequest_Input as a InferenceChunkContentPart
+func (t InferenceChunkRequest_Input) AsInferenceChunkContentPart() (InferenceChunkContentPart, error) {
+	var body InferenceChunkContentPart
 	err := json.Unmarshal(t.union, &body)
 	return body, err
 }
 
-// FromExternalRef0ContentPart overwrites any union data inside the InferenceChunkRequest_Input as the provided externalRef0.ContentPart
-func (t *InferenceChunkRequest_Input) FromExternalRef0ContentPart(v externalRef0.ContentPart) error {
+// FromInferenceChunkContentPart overwrites any union data inside the InferenceChunkRequest_Input as the provided InferenceChunkContentPart
+func (t *InferenceChunkRequest_Input) FromInferenceChunkContentPart(v InferenceChunkContentPart) error {
 	b, err := json.Marshal(v)
 	t.union = b
 	return err
 }
 
-// MergeExternalRef0ContentPart performs a merge with any union data inside the InferenceChunkRequest_Input, using the provided externalRef0.ContentPart
-func (t *InferenceChunkRequest_Input) MergeExternalRef0ContentPart(v externalRef0.ContentPart) error {
+// MergeInferenceChunkContentPart performs a merge with any union data inside the InferenceChunkRequest_Input, using the provided InferenceChunkContentPart
+func (t *InferenceChunkRequest_Input) MergeInferenceChunkContentPart(v InferenceChunkContentPart) error {
 	b, err := json.Marshal(v)
 	if err != nil {
 		return err
@@ -336,39 +403,37 @@ func (t *InferenceChunkRequest_Input) UnmarshalJSON(b []byte) error {
 // Base64 encoded, gzipped, json marshaled Swagger object
 var swaggerSpec = []string{
 
-	"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",
-	"JbPkFQWH2aWJUtmU5dN/AwAA//+PRcS8nRsAAA==",
+	"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",
+	"HObmNslVK+X6fwEAAP//mmQPZlwZAAA=",
 }
 
 // GetSwagger returns the content of the embedded swagger specification file

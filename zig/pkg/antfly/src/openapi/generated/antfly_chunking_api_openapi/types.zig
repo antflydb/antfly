@@ -3,12 +3,14 @@
 
 const std = @import("std");
 
-/// Options specific to audio chunking.
-pub const AudioChunkOptions = struct {
-    /// Window duration in milliseconds for fixed-window audio chunking (default: 30000).
-    window_duration_ms: ?i64 = null,
-    /// Overlap duration in milliseconds between audio chunks (default: 0).
-    overlap_duration_ms: ?i64 = null,
+/// Text content with character offsets.
+pub const TextContent = struct {
+    /// The chunk text content
+    text: []const u8,
+    /// Character position in original text where chunk starts
+    start_char: i64,
+    /// Character position in original text where chunk ends (exclusive)
+    end_char: i64,
 };
 
 /// Binary media content with format-specific metadata.
@@ -35,14 +37,12 @@ pub const TextChunkOptions = struct {
     separator: ?[]const u8 = null,
 };
 
-/// Text content with character offsets.
-pub const TextContent = struct {
-    /// The chunk text content
-    text: []const u8,
-    /// Character position in original text where chunk starts
-    start_char: i64,
-    /// Character position in original text where chunk ends (exclusive)
-    end_char: i64,
+/// Options specific to audio chunking.
+pub const AudioChunkOptions = struct {
+    /// Window duration in milliseconds for fixed-window audio chunking (default: 30000).
+    window_duration_ms: ?i64 = null,
+    /// Overlap duration in milliseconds between audio chunks (default: 0).
+    overlap_duration_ms: ?i64 = null,
 };
 
 /// Options for Voice Activity Detection (VAD) based audio segmentation.
@@ -57,15 +57,8 @@ pub const VADOptions = struct {
     max_segment_duration_ms: ?i64 = null,
 };
 
-/// Per-request configuration for chunking. All fields are optional - zero/omitted values use chunker defaults.
-pub const ChunkOptions = struct {
-    /// Maximum number of chunks to generate per document.
-    max_chunks: ?i64 = null,
-    /// Confidence threshold for model-based chunking (0.0-1.0).
-    threshold: ?f32 = null,
-    text: ?TextChunkOptions = null,
-    audio: ?AudioChunkOptions = null,
-};
+/// Content part supported by chunking requests.
+pub const InferenceChunkContentPart = std.json.Value;
 
 /// A chunk of content. Text chunks have mime_type text/plain.
 pub const Chunk = struct {
@@ -91,6 +84,16 @@ pub const Chunk = struct {
     mime_type: []const u8,
 };
 
+/// Per-request configuration for chunking. All fields are optional - zero/omitted values use chunker defaults.
+pub const ChunkOptions = struct {
+    /// Maximum number of chunks to generate per document.
+    max_chunks: ?i64 = null,
+    /// Confidence threshold for model-based chunking (0.0-1.0).
+    threshold: ?f32 = null,
+    text: ?TextChunkOptions = null,
+    audio: ?AudioChunkOptions = null,
+};
+
 /// Audio chunking configuration for inference, including VAD options.
 pub const InferenceAudioChunkConfig = struct {
     /// Window duration in milliseconds for fixed-window audio chunking (default: 30000).
@@ -114,6 +117,6 @@ pub const InferenceChunkConfig = struct {
 
 pub const InferenceChunkRequest = struct {
     /// Input content to chunk. Supports two formats: - Text string: `"This is a long document..."` - ContentPart: `{"type": "media", "data": "<base64>", "mime_type": "audio/wav"}` - ContentPart: `{"type": "text", "text": "..."}`
-    input: ?std.json.Value = null,
+    input: std.json.Value,
     config: ?InferenceChunkConfig = null,
 };

@@ -19236,6 +19236,8 @@ components:
               description: 'MIME type: text/plain, audio/wav, image/png, etc.'
     InferenceChunkRequest:
       type: object
+      required:
+        - input
       properties:
         input:
           description: >
@@ -19249,7 +19251,7 @@ components:
           oneOf:
             - type: string
               description: Text to chunk
-            - $ref: '#/components/schemas/ContentPart'
+            - $ref: '#/components/schemas/InferenceChunkContentPart'
               description: Content part (text or media)
         config:
           $ref: '#/components/schemas/InferenceChunkConfig'
@@ -21366,6 +21368,11 @@ components:
         usage:
           type: object
           additionalProperties: true
+    InferenceChunkContentPart:
+      description: Content part supported by chunking requests.
+      oneOf:
+        - $ref: '#/components/schemas/TextContentPart'
+        - $ref: '#/components/schemas/MediaContentPart'
     VADOptions:
       type: object
       description: Options for Voice Activity Detection (VAD) based audio segmentation.

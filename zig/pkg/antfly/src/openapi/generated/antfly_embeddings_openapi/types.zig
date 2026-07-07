@@ -3,46 +3,6 @@
 
 const std = @import("std");
 
-/// Configuration for the Antfly inference embedding provider. Antfly inference is Antfly's built-in ML service for local embeddings using ONNX models. It provides embedding generation with multi-tier caching (memory + persistent). **Features:** - Local ONNX-based embedding generation - L1 memory cache with configurable TTL - L2 persistent Pebble database cache - Singleflight deduplication for concurrent identical requests **Example Models:** bge-base-en-v1.5 (768 dims), all-MiniLM-L6-v2 (384 dims) Models are loaded from the `models/embedders/{name}/` directory.
-pub const AntflyEmbedderConfig = struct {
-    /// The embedding model name (maps to models/embedders/{name}/ directory).
-    model: []const u8,
-    /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
-    api_url: ?[]const u8 = null,
-};
-
-/// Configuration for the AWS Bedrock embedding provider. Uses the AWS credential chain: environment variables, web identity, shared credentials, ECS task roles, and EC2 instance roles. **Example Models:** cohere.embed-v4, amazon.titan-embed-text-v2:0 **Docs:** https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html
-pub const BedrockEmbedderConfig = struct {
-    /// The Bedrock model ID to use (e.g., 'cohere.embed-v4', 'amazon.titan-embed-text-v2:0').
-    model: []const u8,
-    /// The AWS region for the Bedrock service (e.g., 'us-east-1').
-    region: ?[]const u8 = null,
-    /// Output dimension for Bedrock embedding models that support configurable dimensions.
-    dimension: ?i64 = null,
-    /// Alias for output dimension when using OpenAI-compatible configuration fields.
-    dimensions: ?i64 = null,
-    /// Cohere Bedrock input type, such as search_document, search_query, classification, or clustering.
-    input_type: ?[]const u8 = null,
-    /// Cohere Bedrock truncate behavior.
-    truncate: ?[]const u8 = null,
-    /// Whether to strip new lines from the input text before embedding.
-    strip_new_lines: ?bool = null,
-    /// The batch size for embedding requests to optimize throughput.
-    batch_size: ?i64 = null,
-};
-
-/// Configuration for the Cohere embedding provider. API key via `api_key` field or `COHERE_API_KEY` environment variable. **Example Models:** embed-english-v3.0 (default, 1024 dims), embed-multilingual-v3.0 **Docs:** https://docs.cohere.com/reference/embed
-pub const CohereEmbedderConfig = struct {
-    /// The name of the Cohere embedding model to use.
-    model: []const u8,
-    /// The Cohere API key. Can also be set via COHERE_API_KEY environment variable.
-    api_key: ?[]const u8 = null,
-    /// Specifies the type of input for optimized embeddings.
-    input_type: ?[]const u8 = null,
-    /// How to handle inputs longer than the max token length.
-    truncate: ?[]const u8 = null,
-};
-
 /// The embedding provider to use.
 pub const EmbedderProvider = enum {
     gemini,
@@ -106,6 +66,20 @@ pub const GoogleEmbedderConfig = struct {
     url: ?[]const u8 = null,
 };
 
+/// Configuration for Google Cloud Vertex AI embedding models (enterprise-grade). Uses Application Default Credentials (ADC) for authentication. Requires IAM role `roles/aiplatform.user`. **Example Models:** gemini-embedding-001 (default, 3072 dims), multimodalembedding (images/audio/video) **Docs:** https://cloud.google.com/vertex-ai/generative-ai/docs/embeddings/get-text-embeddings
+pub const VertexEmbedderConfig = struct {
+    /// The name of the Vertex AI embedding model to use.
+    model: []const u8,
+    /// Google Cloud project ID. Can also be set via GOOGLE_CLOUD_PROJECT environment variable.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud region for Vertex AI API (e.g., 'us-central1', 'europe-west1'). Can also be set via GOOGLE_CLOUD_LOCATION. Defaults to 'us-central1'.
+    location: ?[]const u8 = null,
+    /// Path to service account JSON key file. Alternative to ADC for non-GCP environments.
+    credentials_path: ?[]const u8 = null,
+    /// The dimension of the embedding vector (768, 1536, or 3072 for gemini-embedding-001; 128-1408 for multimodalembedding).
+    dimension: ?i64 = null,
+};
+
 /// Configuration for the Ollama embedding provider. Local embeddings for privacy and offline use. URL via `url` field or `OLLAMA_HOST` env var. **Example Models:** nomic-embed-text (768 dims), mxbai-embed-large (1024 dims), all-minilm (384 dims) **Docs:** https://ollama.com/search?c=embedding
 pub const OllamaEmbedderConfig = struct {
     /// The name of the Ollama model to use (e.g., 'nomic-embed-text', 'mxbai-embed-large').
@@ -126,6 +100,38 @@ pub const OpenAIEmbedderConfig = struct {
     dimensions: ?i64 = null,
 };
 
+/// Configuration for the AWS Bedrock embedding provider. Uses the AWS credential chain: environment variables, web identity, shared credentials, ECS task roles, and EC2 instance roles. **Example Models:** cohere.embed-v4, amazon.titan-embed-text-v2:0 **Docs:** https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html
+pub const BedrockEmbedderConfig = struct {
+    /// The Bedrock model ID to use (e.g., 'cohere.embed-v4', 'amazon.titan-embed-text-v2:0').
+    model: []const u8,
+    /// The AWS region for the Bedrock service (e.g., 'us-east-1').
+    region: ?[]const u8 = null,
+    /// Output dimension for Bedrock embedding models that support configurable dimensions.
+    dimension: ?i64 = null,
+    /// Alias for output dimension when using OpenAI-compatible configuration fields.
+    dimensions: ?i64 = null,
+    /// Cohere Bedrock input type, such as search_document, search_query, classification, or clustering.
+    input_type: ?[]const u8 = null,
+    /// Cohere Bedrock truncate behavior.
+    truncate: ?[]const u8 = null,
+    /// Whether to strip new lines from the input text before embedding.
+    strip_new_lines: ?bool = null,
+    /// The batch size for embedding requests to optimize throughput.
+    batch_size: ?i64 = null,
+};
+
+/// Configuration for the Cohere embedding provider. API key via `api_key` field or `COHERE_API_KEY` environment variable. **Example Models:** embed-english-v3.0 (default, 1024 dims), embed-multilingual-v3.0 **Docs:** https://docs.cohere.com/reference/embed
+pub const CohereEmbedderConfig = struct {
+    /// The name of the Cohere embedding model to use.
+    model: []const u8,
+    /// The Cohere API key. Can also be set via COHERE_API_KEY environment variable.
+    api_key: ?[]const u8 = null,
+    /// Specifies the type of input for optimized embeddings.
+    input_type: ?[]const u8 = null,
+    /// How to handle inputs longer than the max token length.
+    truncate: ?[]const u8 = null,
+};
+
 /// Configuration for the OpenRouter embedding provider. OpenRouter provides a unified API for multiple embedding models from different providers. API key via `api_key` field or `OPENROUTER_API_KEY` environment variable. **Example Models:** openai/text-embedding-3-small (default), openai/text-embedding-3-large, google/gemini-embedding-001, qwen/qwen3-embedding-8b **Docs:** https://openrouter.ai/docs/api/reference/embeddings
 pub const OpenRouterEmbedderConfig = struct {
     /// The OpenRouter model identifier (e.g., 'openai/text-embedding-3-small', 'google/gemini-embedding-001').
@@ -136,18 +142,12 @@ pub const OpenRouterEmbedderConfig = struct {
     dimensions: ?i64 = null,
 };
 
-/// Configuration for Google Cloud Vertex AI embedding models (enterprise-grade). Uses Application Default Credentials (ADC) for authentication. Requires IAM role `roles/aiplatform.user`. **Example Models:** gemini-embedding-001 (default, 3072 dims), multimodalembedding (images/audio/video) **Docs:** https://cloud.google.com/vertex-ai/generative-ai/docs/embeddings/get-text-embeddings
-pub const VertexEmbedderConfig = struct {
-    /// The name of the Vertex AI embedding model to use.
+/// Configuration for the Antfly inference embedding provider. Antfly inference is Antfly's built-in ML service for local embeddings using ONNX models. It provides embedding generation with multi-tier caching (memory + persistent). **Features:** - Local ONNX-based embedding generation - L1 memory cache with configurable TTL - L2 persistent Pebble database cache - Singleflight deduplication for concurrent identical requests **Example Models:** bge-base-en-v1.5 (768 dims), all-MiniLM-L6-v2 (384 dims) Models are loaded from the `models/embedders/{name}/` directory.
+pub const AntflyEmbedderConfig = struct {
+    /// The embedding model name (maps to models/embedders/{name}/ directory).
     model: []const u8,
-    /// Google Cloud project ID. Can also be set via GOOGLE_CLOUD_PROJECT environment variable.
-    project_id: ?[]const u8 = null,
-    /// Google Cloud region for Vertex AI API (e.g., 'us-central1', 'europe-west1'). Can also be set via GOOGLE_CLOUD_LOCATION. Defaults to 'us-central1'.
-    location: ?[]const u8 = null,
-    /// Path to service account JSON key file. Alternative to ADC for non-GCP environments.
-    credentials_path: ?[]const u8 = null,
-    /// The dimension of the embedding vector (768, 1536, or 3072 for gemini-embedding-001; 128-1408 for multimodalembedding).
-    dimension: ?i64 = null,
+    /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
+    api_url: ?[]const u8 = null,
 };
 
 /// A unified configuration for an embedding provider. Embedders can be configured with templates to customize how documents are converted to text before embedding. Templates use Handlebars syntax and support various built-in helpers. **Template System:** - **Syntax**: Handlebars templating (https://handlebarsjs.com/guide/) - **Caching**: Templates are automatically cached with configurable TTL (default: 5 minutes) - **Context**: Templates receive the full document as context **Built-in Helpers:** 1. **scrubHtml** - Remove script/style tags and extract clean text from HTML ```handlebars {{scrubHtml html_content}} ``` - Removes `<script>` and `<style>` tags - Adds newlines after block elements (p, div, h1-h6, li, etc.) - Returns plain text with preserved readability 2. **eq** - Equality comparison for conditionals ```handlebars {{#if (eq status "active")}}Active user{{/if}} {{#if (eq @key "special")}}Special field{{/if}} ``` 3. **media** - GenKit dotprompt media directive for multimodal content ```handlebars {{media url=imageDataURI}} {{media url=this.image_url}} {{media url="https://example.com/image.jpg"}} {{media url="s3://endpoint/bucket/image.png"}} {{media url="file:///path/to/image.jpg"}} ``` **Supported URL Schemes:** - `data:` - Base64 encoded data URIs (e.g., `data:image/jpeg;base64,...`) - `http://` / `https://` - Web URLs with automatic content type detection - `file://` - Local filesystem paths - `s3://` - S3-compatible storage (format: `s3://endpoint/bucket/key`) **Automatic Content Processing:** - **Images**: Downloaded, resized (if needed), converted to data URIs - **PDFs**: Text extracted or first page rendered as image - **HTML**: Readable text extracted using Mozilla Readability **Security Controls:** Downloads are protected by content security settings (see Configuration Reference): - Allowed host whitelist - Private IP blocking (prevents SSRF attacks) - Download size limits (default: 100MB) - Download timeouts (default: 30s) - Image dimension limits (default: 2048px, auto-resized) See: https://antfly.io/docs/configuration#security--cors 4. **encodeToon** - Encode data in TOON format (Token-Oriented Object Notation) ```handlebars {{encodeToon this.fields}} {{encodeToon this.fields lengthMarker=false indent=4}} {{encodeToon this.fields delimiter="\t"}} ``` **What is TOON?** TOON is a compact, human-readable format designed for passing structured data to LLMs. It provides **30-60% token reduction** compared to JSON while maintaining high LLM comprehension accuracy. **Key Features:** - Compact syntax using `:` for key-value pairs - Array length markers: `tags[#3]: ai,search,ml` - Tabular format for uniform data structures - Optimized for LLM parsing and understanding - Maintains human readability **Benefits:** - **Lower API costs** - Reduced token usage means lower LLM API costs - **Faster responses** - Less tokens to process - **More context** - Fit more documents within token limits **Options:** - `lengthMarker` (bool): Add # prefix to array counts like `[#3]` (default: true) - `indent` (int): Indentation spacing for nested objects (default: 2) - `delimiter` (string): Field separator for tabular arrays (default: none, use `"\t"` for tabs) **Example output:** ``` title: Introduction to Vector Search author: Jane Doe tags[#3]: ai,search,ml metadata: edition: 2 pages: 450 ``` **Default in RAG:** TOON is the default format for document rendering in RAG queries. **References:** - TOON Specification: https://github.com/toon-format/toon - Go Implementation: https://github.com/alpkeskin/gotoon **Template Examples:** Document with metadata: ```handlebars Title: {{metadata.title}} Date: {{metadata.date}} Tags: {{#each metadata.tags}}{{this}}, {{/each}} {{content}} ``` HTML content extraction: ```handlebars Product: {{name}} Description: {{scrubHtml description_html}} Price: ${{price}} ``` Multimodal with image: ```handlebars Product: {{title}} {{media url=image}} Description: {{description}} ``` Conditional formatting: ```handlebars {{title}} {{#if author}}By: {{author}}{{/if}} {{#if (eq category "premium")}}⭐ Premium Content{{/if}} {{body}} ``` **Environment Variables:** - `GEMINI_API_KEY` - API key for Google AI - `OPENAI_API_KEY` - API key for OpenAI - `OPENAI_BASE_URL` - Base URL for OpenAI-compatible APIs - `OLLAMA_HOST` - Ollama server URL (e.g., http://localhost:11434) **Importing Pre-computed Embeddings:** You can import existing embeddings (from OpenAI, Cohere, or any provider), but only for indexes configured with `external: true`. External indexes accept vectors written directly through the document `_embeddings` field and do not generate prompts from `field` or `template`. **Steps:** 1. Create an embeddings index with `external: true` 2. For dense indexes, set the index `dimension` 3. Write documents with `_embeddings: { "<indexName>": [...<embedding>...] }` **Example:** ```json { "title": "My Document", "content": "Document text...", "_embeddings": { "my_vector_index": [0.1, 0.2, 0.3, ...] } } ``` **Delete Behavior:** - Use `"_embeddings": { "<indexName>": null }` to delete a stored external vector - Omitting `_embeddings[<indexName>]` leaves the existing vector unchanged **Use Cases:** - Migrating from another vector database with existing embeddings - Using embeddings generated by external systems - Importing pre-computed OpenAI, Cohere, or other provider embeddings - Batch processing embeddings offline before ingestion

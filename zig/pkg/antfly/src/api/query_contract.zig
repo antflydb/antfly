@@ -3030,7 +3030,7 @@ fn expectSortProfileDiagnosticsSerializationForTest() !void {
     try std.testing.expectEqual(@as(i64, 3), sort.get("distributed_shard_count").?.integer);
     try std.testing.expectEqualStrings("match_all_candidate_collect_limit", sort.get("budget_rejection_reason").?.string);
     try std.testing.expectEqualStrings("field_not_sort_ready", sort.get("sort_rejection_reason").?.string);
-    try std.testing.expectEqualStrings("field_not_sort_ready", sort.get("sort_rejection_detail").?.string);
+    try std.testing.expectEqualStrings("missing_doc_values_section", sort.get("sort_rejection_detail").?.string);
     try std.testing.expectEqualStrings("created_at", sort.get("sort_rejection_field").?.string);
 }
 
@@ -4428,12 +4428,12 @@ fn buildSortProfileValue(
     try sort.put(alloc, "total_us", try buildProfileUnsignedValue(alloc, profile.total_us));
     try sort.put(alloc, "distributed_shard_count", try buildProfileSizeValue(alloc, profile.distributed_shard_count));
     try sort.put(alloc, "budget_rejection_reason", .{ .string = profile.budget_rejection_reason });
-    const public_sort_rejection = if (profile.sort_rejection_reason.len > 0)
-        publicExactSortRejection(profile.sort_rejection_reason, profile.sort_rejection_detail)
+    const public_sort_rejection_reason = if (profile.sort_rejection_reason.len > 0)
+        publicExactSortReason(profile.sort_rejection_reason, profile.sort_rejection_detail)
     else
-        PublicExactSortRejection{ .reason = "", .detail = "" };
-    try sort.put(alloc, "sort_rejection_reason", .{ .string = public_sort_rejection.reason });
-    try sort.put(alloc, "sort_rejection_detail", .{ .string = public_sort_rejection.detail });
+        "";
+    try sort.put(alloc, "sort_rejection_reason", .{ .string = public_sort_rejection_reason });
+    try sort.put(alloc, "sort_rejection_detail", .{ .string = profile.sort_rejection_detail });
     try sort.put(alloc, "sort_rejection_field", .{ .string = try alloc.dupe(u8, profile.sort_rejection_field.slice()) });
     return .{ .object = sort };
 }

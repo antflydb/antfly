@@ -10620,7 +10620,7 @@ export interface components {
              *     - ContentPart: `{"type": "media", "data": "<base64>", "mime_type": "audio/wav"}`
              *     - ContentPart: `{"type": "text", "text": "..."}`
              */
-            input?: string | components["schemas"]["ContentPart"];
+            input: string | components["schemas"]["InferenceChunkContentPart"];
             config?: components["schemas"]["InferenceChunkConfig"];
         };
         /**
@@ -11948,6 +11948,8 @@ export interface components {
                 [key: string]: unknown;
             };
         };
+        /** @description Content part supported by chunking requests. */
+        InferenceChunkContentPart: components["schemas"]["TextContentPart"] | components["schemas"]["MediaContentPart"];
         /** @description Options for Voice Activity Detection (VAD) based audio segmentation. */
         VADOptions: {
             /** @description Minimum silence duration (ms) to split speech segments. Gaps shorter than this are merged. Higher values produce longer, fewer segments. Default: 300. */

@@ -9,7 +9,6 @@ from attrs import field as _attrs_field
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.image_url_content_part import ImageURLContentPart
     from ..models.inference_chunk_config import InferenceChunkConfig
     from ..models.media_content_part import MediaContentPart
     from ..models.text_content_part import TextContentPart
@@ -22,8 +21,7 @@ T = TypeVar("T", bound="InferenceChunkRequest")
 class InferenceChunkRequest:
     """
     Attributes:
-        input_ (ImageURLContentPart | MediaContentPart | str | TextContentPart | Unset): Input content to chunk.
-            Supports two formats:
+        input_ (MediaContentPart | str | TextContentPart): Input content to chunk. Supports two formats:
             - Text string: `"This is a long document..."`
             - ContentPart: `{"type": "media", "data": "<base64>", "mime_type": "audio/wav"}`
             - ContentPart: `{"type": "text", "text": "..."}`
@@ -31,21 +29,16 @@ class InferenceChunkRequest:
             Combines shared text options with inference-specific audio/VAD options.
     """
 
-    input_: ImageURLContentPart | MediaContentPart | str | TextContentPart | Unset = UNSET
+    input_: MediaContentPart | str | TextContentPart
     config: InferenceChunkConfig | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from ..models.image_url_content_part import ImageURLContentPart
         from ..models.media_content_part import MediaContentPart
         from ..models.text_content_part import TextContentPart
 
-        input_: dict[str, Any] | str | Unset
-        if isinstance(self.input_, Unset):
-            input_ = UNSET
-        elif isinstance(self.input_, TextContentPart):
-            input_ = self.input_.to_dict()
-        elif isinstance(self.input_, ImageURLContentPart):
+        input_: dict[str, Any] | str
+        if isinstance(self.input_, TextContentPart):
             input_ = self.input_.to_dict()
         elif isinstance(self.input_, MediaContentPart):
             input_ = self.input_.to_dict()
@@ -58,9 +51,11 @@ class InferenceChunkRequest:
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
-        field_dict.update({})
-        if input_ is not UNSET:
-            field_dict["input"] = input_
+        field_dict.update(
+            {
+                "input": input_,
+            }
+        )
         if config is not UNSET:
             field_dict["config"] = config
 
@@ -68,43 +63,32 @@ class InferenceChunkRequest:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.image_url_content_part import ImageURLContentPart
         from ..models.inference_chunk_config import InferenceChunkConfig
         from ..models.media_content_part import MediaContentPart
         from ..models.text_content_part import TextContentPart
 
         d = dict(src_dict)
 
-        def _parse_input_(data: object) -> ImageURLContentPart | MediaContentPart | str | TextContentPart | Unset:
-            if isinstance(data, Unset):
-                return data
+        def _parse_input_(data: object) -> MediaContentPart | str | TextContentPart:
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_content_part_type_0 = TextContentPart.from_dict(data)
+                componentsschemas_inference_chunk_content_part_type_0 = TextContentPart.from_dict(data)
 
-                return componentsschemas_content_part_type_0
+                return componentsschemas_inference_chunk_content_part_type_0
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_content_part_type_1 = ImageURLContentPart.from_dict(data)
+                componentsschemas_inference_chunk_content_part_type_1 = MediaContentPart.from_dict(data)
 
-                return componentsschemas_content_part_type_1
+                return componentsschemas_inference_chunk_content_part_type_1
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
-            try:
-                if not isinstance(data, dict):
-                    raise TypeError()
-                componentsschemas_content_part_type_2 = MediaContentPart.from_dict(data)
+            return cast(MediaContentPart | str | TextContentPart, data)
 
-                return componentsschemas_content_part_type_2
-            except (TypeError, ValueError, AttributeError, KeyError):
-                pass
-            return cast(ImageURLContentPart | MediaContentPart | str | TextContentPart | Unset, data)
-
-        input_ = _parse_input_(d.pop("input", UNSET))
+        input_ = _parse_input_(d.pop("input"))
 
         _config = d.pop("config", UNSET)
         config: InferenceChunkConfig | Unset

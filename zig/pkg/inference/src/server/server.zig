@@ -1745,67 +1745,73 @@ pub const Node = struct {
         defer self.metrics.decActive();
 
         const input: lib_chunker.Input = blk: {
-            if (body.input) |input_val| {
-                switch (input_val) {
-                    .string => |s| break :blk .{ .text = s },
-                    .object => |obj| {
-                        if (obj.get("type")) |type_val| {
-                            if (type_val != .string) return ctx.status(400).json(.{
-                                .@"error" = "INVALID_REQUEST",
-                                .message = "content part 'type' must be a string",
-                            });
-                            if (std.mem.eql(u8, type_val.string, "text")) {
-                                const text_val = obj.get("text") orelse return ctx.status(400).json(.{
-                                    .@"error" = "INVALID_REQUEST",
-                                    .message = "text content part missing 'text' field",
-                                });
-                                if (text_val != .string) return ctx.status(400).json(.{
-                                    .@"error" = "INVALID_REQUEST",
-                                    .message = "text content part 'text' must be a string",
-                                });
-                                break :blk .{ .text = text_val.string };
-                            }
-                        }
-
-                        const data_val = obj.get("data") orelse return ctx.status(400).json(.{
-                            .@"error" = "INVALID_REQUEST",
-                            .message = "media content part missing 'data' field",
-                        });
-                        if (data_val != .string) return ctx.status(400).json(.{
-                            .@"error" = "INVALID_REQUEST",
-                            .message = "media 'data' must be a base64 string",
-                        });
-                        const mime_val = obj.get("mime_type") orelse return ctx.status(400).json(.{
-                            .@"error" = "INVALID_REQUEST",
-                            .message = "media content part missing 'mime_type' field",
-                        });
-                        if (mime_val != .string) return ctx.status(400).json(.{
-                            .@"error" = "INVALID_REQUEST",
-                            .message = "media 'mime_type' must be a string",
-                        });
-                        const decoded_payload = decodeMediaData(ctx.allocator, data_val.string) catch
-                            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid base64 data" });
-                        const decoded = decoded_payload.data;
-                        errdefer ctx.allocator.free(decoded);
-                        if (!mediaMimeMatches(mime_val.string, decoded_payload.mime_type)) {
-                            ctx.allocator.free(decoded);
-                            return ctx.status(400).json(.{
-                                .@"error" = "INVALID_REQUEST",
-                                .message = "media data URI mime_type does not match content part mime_type",
-                            });
-                        }
-                        break :blk .{ .binary = .{
-                            .mime_type = mime_val.string,
-                            .data = decoded,
-                        } };
-                    },
-                    else => return ctx.status(400).json(.{
+            switch (body.input) {
+                .string => |s| {
+                    if (s.len == 0) return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "missing 'input' field" });
+                    break :blk .{ .text = s };
+                },
+                .object => |obj| {
+                    const type_val = obj.get("type") orelse return ctx.status(400).json(.{
                         .@"error" = "INVALID_REQUEST",
-                        .message = "'input' must be a string or content part object",
-                    }),
-                }
+                        .message = "input content part type must be 'text' or 'media'",
+                    });
+                    if (type_val != .string) return ctx.status(400).json(.{
+                        .@"error" = "INVALID_REQUEST",
+                        .message = "content part 'type' must be a string",
+                    });
+                    if (std.mem.eql(u8, type_val.string, "text")) {
+                        const text_val = obj.get("text") orelse return ctx.status(400).json(.{
+                            .@"error" = "INVALID_REQUEST",
+                            .message = "text content part missing 'text' field",
+                        });
+                        if (text_val != .string) return ctx.status(400).json(.{
+                            .@"error" = "INVALID_REQUEST",
+                            .message = "text content part 'text' must be a string",
+                        });
+                        break :blk .{ .text = text_val.string };
+                    }
+                    if (!std.mem.eql(u8, type_val.string, "media")) return ctx.status(400).json(.{
+                        .@"error" = "INVALID_REQUEST",
+                        .message = "input content part type must be 'text' or 'media'",
+                    });
+
+                    const data_val = obj.get("data") orelse return ctx.status(400).json(.{
+                        .@"error" = "INVALID_REQUEST",
+                        .message = "media content part missing 'data' field",
+                    });
+                    if (data_val != .string) return ctx.status(400).json(.{
+                        .@"error" = "INVALID_REQUEST",
+                        .message = "media 'data' must be a base64 string",
+                    });
+                    const mime_val = obj.get("mime_type") orelse return ctx.status(400).json(.{
+                        .@"error" = "INVALID_REQUEST",
+                        .message = "media content part missing 'mime_type' field",
+                    });
+                    if (mime_val != .string) return ctx.status(400).json(.{
+                        .@"error" = "INVALID_REQUEST",
+                        .message = "media 'mime_type' must be a string",
+                    });
+                    const decoded_payload = decodeMediaData(ctx.allocator, data_val.string) catch
+                        return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "invalid base64 data" });
+                    const decoded = decoded_payload.data;
+                    errdefer ctx.allocator.free(decoded);
+                    if (!mediaMimeMatches(mime_val.string, decoded_payload.mime_type)) {
+                        ctx.allocator.free(decoded);
+                        return ctx.status(400).json(.{
+                            .@"error" = "INVALID_REQUEST",
+                            .message = "media data URI mime_type does not match content part mime_type",
+                        });
+                    }
+                    break :blk .{ .binary = .{
+                        .mime_type = mime_val.string,
+                        .data = decoded,
+                    } };
+                },
+                else => return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = "'input' must be a string or content part object",
+                }),
             }
-            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "missing 'input' field" });
         };
 
         var config = lib_chunker.FixedChunkConfig{};

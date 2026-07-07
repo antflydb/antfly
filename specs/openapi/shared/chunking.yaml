@@ -161,6 +161,8 @@ components:
 
     InferenceChunkRequest:
       type: object
+      required:
+        - input
       properties:
         input:
           description: |
@@ -171,7 +173,13 @@ components:
           oneOf:
             - type: string
               description: "Text to chunk"
-            - $ref: "generating.yaml#/components/schemas/ContentPart"
+            - $ref: "#/components/schemas/InferenceChunkContentPart"
               description: "Content part (text or media)"
         config:
           $ref: "#/components/schemas/InferenceChunkConfig"
+
+    InferenceChunkContentPart:
+      description: "Content part supported by chunking requests."
+      oneOf:
+        - $ref: "generating.yaml#/components/schemas/TextContentPart"
+        - $ref: "generating.yaml#/components/schemas/MediaContentPart"
