@@ -4227,6 +4227,7 @@ pub fn build(b: *std.Build) void {
             "aggregation completeness requires exact total relation",
             "provisioned read cache invalidates repeated ownership moves with pinned leases",
             "parseRemoteSearchResult preserves fused index scores",
+            "table read distributed sorted merge uses catalog runtime schema and rejects incomplete shard windows",
             "provisioned standby read gate permits stale reads and routes non-stale reads to primary",
             "catalog backed router skips non-serving relocation placements",
         },

@@ -2,6 +2,9 @@
  * Type tests for Antfly query integration
  * These tests verify that the Antfly query types are properly integrated
  */
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, expectTypeOf, it } from "vitest";
 import type {
   AntflyQuery,
@@ -23,6 +26,17 @@ import {
   queryResultHitsTotal,
   queryResultTotalHits,
 } from "../src/types.js";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+function generatedSortProfileDeclaration(): string {
+  const generatedApi = readFileSync(join(__dirname, "../src/public-api.d.ts"), "utf8");
+  const match = generatedApi.match(/SortProfile: \{[\s\S]*?\n        \};/);
+  if (!match) {
+    throw new Error("generated SortProfile declaration not found");
+  }
+  return match[0];
+}
 
 describe("Antfly Query Type Integration", () => {
   describe("QueryRequest type safety", () => {
@@ -86,19 +100,21 @@ describe("Antfly Query Type Integration", () => {
   });
 
   describe("SortProfile diagnostics", () => {
-    it("keeps stable fields typed while allowing additive diagnostics", () => {
+    it("keeps the public diagnostic surface closed to stable fields", () => {
       const profile: SortProfile = {
         plan: "native_doc_values_top_n",
         candidate_count: 7,
-        native_doc_value_load_us: 13,
-        collector_heap_peak: 5,
       };
 
       expect(profile.plan).toBe("native_doc_values_top_n");
-      expect(profile["native_doc_value_load_us"]).toBe(13);
       expectTypeOf(profile.plan).toEqualTypeOf<string | undefined>();
       expectTypeOf(profile.candidate_count).toEqualTypeOf<number | undefined>();
-      expectTypeOf(profile["native_doc_value_load_us"]).toEqualTypeOf<unknown>();
+
+      const declaration = generatedSortProfileDeclaration();
+      expect(declaration).toContain("plan?: string");
+      expect(declaration).toContain("candidate_count?: number");
+      expect(declaration).not.toContain("native_doc_value_load_us");
+      expect(declaration).not.toContain("collector_heap_peak");
     });
   });
 

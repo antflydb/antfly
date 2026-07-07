@@ -25,6 +25,7 @@ const fs_paths = @import("../../common/fs_paths.zig");
 const common_secrets = @import("../../common/secrets.zig");
 const backend_types = @import("../backend_types.zig");
 const docstore_mod = @import("../docstore.zig");
+const segment_mod = @import("../../segment.zig");
 const backend_erased_mod = @import("../backend_erased.zig");
 const db_config = @import("config.zig");
 const apply_rw_lock_mod = @import("apply_rw_lock.zig");
@@ -54671,6 +54672,308 @@ test "db force compacts text index to searchable merge tier" {
     for (result.hits) |hit| {
         try std.testing.expect(!std.mem.eql(u8, hit.id, "doc:3"));
     }
+}
+
+test "db text compaction preserves index sort acceleration" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"default_type":"doc","enforce_types":false,"index_sort":[{"field":"price","order":"asc"},{"field":"_id","order":"asc"}],"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true,"properties":{"body":{"type":"string","x-antfly-field":{"type":"text"}},"price":{"type":"number","x-antfly-field":{"type":"number","sortable":true}}}}}}}
+    ;
+    try db.setSchemaJson(alloc, schema_json);
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    for (0..12) |i| {
+        const key = try std.fmt.allocPrint(alloc, "doc:{d:0>3}", .{i});
+        defer alloc.free(key);
+        const price = 100 - i;
+        const value = try std.fmt.allocPrint(alloc, "{{\"body\":\"common token {d}\",\"price\":{d}}}", .{ i, price });
+        defer alloc.free(value);
+
+        try db.batch(.{
+            .writes = &.{.{ .key = key, .value = value }},
+            .sync_level = .full_index,
+        });
+    }
+
+    try db.forceCompactTextIndexes();
+
+    const text_index = db.core.index_manager.textIndex("ft_v1").?;
+    const snapshot = text_index.snapshot();
+    try std.testing.expect(snapshot.segments.len <= index_manager_mod.default_text_merge_max_segments_per_tier);
+    for (snapshot.segments) |segment| {
+        const fields = (try segment.reader.indexSortFieldsAlloc(alloc)) orelse return error.TestUnexpectedResult;
+        defer segment_mod.freeIndexSortFields(alloc, fields);
+        try std.testing.expectEqual(@as(usize, 2), fields.len);
+        try std.testing.expectEqualStrings("price", fields[0].field);
+        try std.testing.expectEqualStrings("_id", fields[1].field);
+
+        var bounds = (try segment.reader.indexSortBoundsAlloc(alloc)) orelse return error.TestUnexpectedResult;
+        defer bounds.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 2), bounds.first.len);
+        try std.testing.expectEqual(@as(usize, 2), bounds.last.len);
+    }
+
+    const order_by = [_]types.SortField{
+        .{ .field = "price" },
+        .{ .field = "_id" },
+    };
+    var result = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match_all = {} },
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 3,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), result.hits.len);
+    try std.testing.expectEqualStrings("doc:011", result.hits[0].id);
+    try std.testing.expectEqualStrings("doc:010", result.hits[1].id);
+    try std.testing.expectEqualStrings("doc:009", result.hits[2].id);
+    {
+        var txn = try db.core.store.beginProbeTxn();
+        defer txn.abort();
+        for (result.hits) |hit| {
+            const ordinal = try doc_identity.lookupOrdinalTxn(alloc, &txn, hit.id);
+            try std.testing.expectEqual(ordinal, hit.doc_ordinal);
+        }
+    }
+    const sort_profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("sorted_segment_seek", sort_profile.plan);
+    try std.testing.expectEqualStrings("sorted_segment_scan", sort_profile.source);
+    try std.testing.expectEqualStrings("index_sort_sorted_segment_seek", sort_profile.selection_reason);
+    try std.testing.expectEqualStrings("source_free", sort_profile.source_load);
+    try std.testing.expect(sort_profile.index_sort_match);
+    try std.testing.expect(sort_profile.sorted_segment_executor_available);
+    try std.testing.expect(sort_profile.sorted_segment_bounds_available);
+    try std.testing.expectEqual(@as(u64, 0), sort_profile.stored_json_load_count);
+
+    var after_page = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match_all = {} },
+        .order_by = &order_by,
+        .search_after = result.hits[1].sort_values,
+        .include_stored = false,
+        .profile = true,
+        .limit = 2,
+    });
+    defer after_page.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), after_page.hits.len);
+    try std.testing.expectEqualStrings("doc:009", after_page.hits[0].id);
+    try std.testing.expectEqualStrings("doc:008", after_page.hits[1].id);
+    const after_profile = after_page.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("sorted_segment_seek", after_profile.plan);
+    try std.testing.expectEqualStrings("sorted_segment_scan", after_profile.source);
+    try std.testing.expectEqualStrings("index_sort_sorted_segment_seek", after_profile.selection_reason);
+    try std.testing.expectEqualStrings("source_free", after_profile.source_load);
+    try std.testing.expectEqualStrings("covered_with_bounds", after_profile.index_sort_coverage);
+    try std.testing.expect(after_profile.index_sort_match);
+    try std.testing.expect(after_profile.sorted_segment_executor_available);
+    try std.testing.expect(after_profile.sorted_segment_bounds_available);
+    try std.testing.expectEqual(@as(u64, 0), after_profile.stored_json_load_count);
+
+    var before_page = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match_all = {} },
+        .order_by = &order_by,
+        .search_before = result.hits[2].sort_values,
+        .include_stored = false,
+        .profile = true,
+        .limit = 2,
+    });
+    defer before_page.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), before_page.hits.len);
+    try std.testing.expectEqualStrings("doc:011", before_page.hits[0].id);
+    try std.testing.expectEqualStrings("doc:010", before_page.hits[1].id);
+    const before_profile = before_page.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("sorted_segment_seek", before_profile.plan);
+    try std.testing.expectEqualStrings("sorted_segment_scan", before_profile.source);
+    try std.testing.expectEqualStrings("index_sort_sorted_segment_seek", before_profile.selection_reason);
+    try std.testing.expectEqualStrings("source_free", before_profile.source_load);
+    try std.testing.expectEqualStrings("covered_with_bounds", before_profile.index_sort_coverage);
+    try std.testing.expect(before_profile.index_sort_match);
+    try std.testing.expect(before_profile.sorted_segment_executor_available);
+    try std.testing.expect(before_profile.sorted_segment_bounds_available);
+    try std.testing.expectEqual(@as(u64, 0), before_profile.stored_json_load_count);
+
+    var text_membership_page = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match = .{ .field = "body", .text = "common" } },
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 2,
+    });
+    defer text_membership_page.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), text_membership_page.hits.len);
+    try std.testing.expectEqualStrings("doc:011", text_membership_page.hits[0].id);
+    try std.testing.expectEqualStrings("doc:010", text_membership_page.hits[1].id);
+    const text_profile = text_membership_page.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("sorted_segment_seek", text_profile.plan);
+    try std.testing.expectEqualStrings("sorted_segment_scan", text_profile.source);
+    try std.testing.expectEqualStrings("index_sort_sorted_segment_seek", text_profile.selection_reason);
+    try std.testing.expectEqualStrings("source_free", text_profile.source_load);
+    try std.testing.expectEqualStrings("covered_with_bounds", text_profile.index_sort_coverage);
+    try std.testing.expect(text_profile.index_sort_match);
+    try std.testing.expect(text_profile.sorted_segment_executor_available);
+    try std.testing.expect(text_profile.sorted_segment_bounds_available);
+    try std.testing.expectEqual(@as(u64, 0), text_profile.stored_json_load_count);
+
+    var structured_filter_page = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match_all = {} },
+        .filter_query_json = "{\"numeric_range\":{\"field\":\"price\",\"min\":90}}",
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 2,
+    });
+    defer structured_filter_page.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), structured_filter_page.hits.len);
+    try std.testing.expectEqualStrings("doc:010", structured_filter_page.hits[0].id);
+    try std.testing.expectEqualStrings("doc:009", structured_filter_page.hits[1].id);
+    const filter_profile = structured_filter_page.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("sorted_segment_seek", filter_profile.plan);
+    try std.testing.expectEqualStrings("sorted_segment_scan", filter_profile.source);
+    try std.testing.expectEqualStrings("index_sort_sorted_segment_seek", filter_profile.selection_reason);
+    try std.testing.expectEqualStrings("source_free", filter_profile.source_load);
+    try std.testing.expectEqualStrings("covered_with_bounds", filter_profile.index_sort_coverage);
+    try std.testing.expect(filter_profile.index_sort_match);
+    try std.testing.expect(filter_profile.sorted_segment_executor_available);
+    try std.testing.expect(filter_profile.sorted_segment_bounds_available);
+    try std.testing.expectEqual(@as(u64, 0), filter_profile.stored_json_load_count);
+}
+
+test "db index sort schema change requires a new text index generation" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    const sortable_schema_json =
+        \\{"version":1,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true,"properties":{"body":{"type":"string","x-antfly-field":{"type":"text"}},"price":{"type":"number","x-antfly-field":{"type":"number","sortable":true}}}}}}}
+    ;
+    try db.setSchemaJson(alloc, sortable_schema_json);
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:b", .value = "{\"body\":\"common old\",\"price\":2}" },
+            .{ .key = "doc:d", .value = "{\"body\":\"common old\",\"price\":4}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    const index_sort_schema_json =
+        \\{"version":2,"default_type":"doc","enforce_types":false,"index_sort":[{"field":"price","order":"asc"},{"field":"_id","order":"asc"}],"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true,"properties":{"body":{"type":"string","x-antfly-field":{"type":"text"}},"price":{"type":"number","x-antfly-field":{"type":"number","sortable":true}}}}}}}
+    ;
+    try db.setSchemaJson(alloc, index_sort_schema_json);
+
+    try db.addIndex(.{
+        .name = "ft_v2",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"common new\",\"price\":1}" },
+            .{ .key = "doc:c", .value = "{\"body\":\"common new\",\"price\":3}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    const order_by = [_]types.SortField{
+        .{ .field = "price" },
+        .{ .field = "_id" },
+    };
+    var original_generation = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match_all = {} },
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 4,
+    });
+    defer original_generation.deinit();
+
+    try std.testing.expectEqual(@as(usize, 4), original_generation.hits.len);
+    try std.testing.expectEqualStrings("doc:a", original_generation.hits[0].id);
+    try std.testing.expectEqualStrings("doc:b", original_generation.hits[1].id);
+    try std.testing.expectEqualStrings("doc:c", original_generation.hits[2].id);
+    try std.testing.expectEqualStrings("doc:d", original_generation.hits[3].id);
+    const original_profile = original_generation.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", original_profile.plan);
+    try std.testing.expectEqualStrings("doc_values_collector", original_profile.source);
+    try std.testing.expectEqualStrings("doc_values_collector", original_profile.selection_reason);
+    try std.testing.expect(!original_profile.index_sort_match);
+    try std.testing.expect(!original_profile.sorted_segment_executor_available);
+    try std.testing.expectEqualStrings("request_mismatch", original_profile.index_sort_coverage);
+    try std.testing.expectEqual(@as(u64, 0), original_profile.stored_json_load_count);
+
+    var next_generation = try db.search(alloc, .{
+        .index_name = "ft_v2",
+        .query = .{ .match_all = {} },
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 4,
+    });
+    defer next_generation.deinit();
+
+    try std.testing.expectEqual(@as(usize, 4), next_generation.hits.len);
+    try std.testing.expectEqualStrings("doc:a", next_generation.hits[0].id);
+    try std.testing.expectEqualStrings("doc:b", next_generation.hits[1].id);
+    try std.testing.expectEqualStrings("doc:c", next_generation.hits[2].id);
+    try std.testing.expectEqualStrings("doc:d", next_generation.hits[3].id);
+    {
+        var txn = try db.core.store.beginProbeTxn();
+        defer txn.abort();
+        for (next_generation.hits) |hit| {
+            const ordinal = try doc_identity.lookupOrdinalTxn(alloc, &txn, hit.id);
+            try std.testing.expectEqual(ordinal, hit.doc_ordinal);
+        }
+    }
+    const next_profile = next_generation.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("sorted_segment_seek", next_profile.plan);
+    try std.testing.expectEqualStrings("sorted_segment_scan", next_profile.source);
+    try std.testing.expectEqualStrings("index_sort_sorted_segment_seek", next_profile.selection_reason);
+    try std.testing.expectEqualStrings("covered_with_bounds", next_profile.index_sort_coverage);
+    try std.testing.expect(next_profile.index_sort_match);
+    try std.testing.expect(next_profile.sorted_segment_executor_available);
+    try std.testing.expect(next_profile.sorted_segment_bounds_available);
+    try std.testing.expectEqual(@as(u64, 0), next_profile.stored_json_load_count);
 }
 
 test "db text compaction preserves ordinal filters across reopen" {

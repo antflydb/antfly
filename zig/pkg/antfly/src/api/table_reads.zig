@@ -4461,6 +4461,235 @@ fn mergeSearchResultsWithTableRuntimeSchema(
     return try query_api.mergeSearchResultsWithRuntimeSchema(alloc, req, shard_results, offset, limit, runtime_schema);
 }
 
+fn testTableReadSortedHitAlloc(alloc: std.mem.Allocator, id: []const u8, rank: i64) !db_mod.types.SearchHit {
+    const sort_values = try alloc.alloc(std.json.Value, 2);
+    errdefer alloc.free(sort_values);
+    sort_values[0] = .{ .integer = rank };
+    sort_values[1] = .{ .string = try alloc.dupe(u8, id) };
+    errdefer db_mod.types.deinitJsonValue(alloc, &sort_values[1]);
+    return .{
+        .id = try alloc.dupe(u8, id),
+        .sort_values = sort_values,
+    };
+}
+
+fn testTableReadStringSortedHitAlloc(alloc: std.mem.Allocator, id: []const u8, rank: []const u8) !db_mod.types.SearchHit {
+    const sort_values = try alloc.alloc(std.json.Value, 2);
+    errdefer alloc.free(sort_values);
+    sort_values[0] = .{ .string = try alloc.dupe(u8, rank) };
+    errdefer db_mod.types.deinitJsonValue(alloc, &sort_values[0]);
+    sort_values[1] = .{ .string = try alloc.dupe(u8, id) };
+    errdefer db_mod.types.deinitJsonValue(alloc, &sort_values[1]);
+    return .{
+        .id = try alloc.dupe(u8, id),
+        .sort_values = sort_values,
+    };
+}
+
+fn testTableReadIdSortedHitAlloc(alloc: std.mem.Allocator, id: []const u8) !db_mod.types.SearchHit {
+    const sort_values = try alloc.alloc(std.json.Value, 1);
+    errdefer alloc.free(sort_values);
+    sort_values[0] = .{ .string = try alloc.dupe(u8, id) };
+    errdefer db_mod.types.deinitJsonValue(alloc, &sort_values[0]);
+    return .{
+        .id = try alloc.dupe(u8, id),
+        .sort_values = sort_values,
+    };
+}
+
+fn testTableReadScoreSortedHitAlloc(alloc: std.mem.Allocator, id: []const u8, score: f32) !db_mod.types.SearchHit {
+    const sort_values = try alloc.alloc(std.json.Value, 2);
+    errdefer alloc.free(sort_values);
+    sort_values[0] = .{ .float = @floatCast(score) };
+    sort_values[1] = .{ .string = try alloc.dupe(u8, id) };
+    errdefer db_mod.types.deinitJsonValue(alloc, &sort_values[1]);
+    return .{
+        .id = try alloc.dupe(u8, id),
+        .score = score,
+        .sort_values = sort_values,
+    };
+}
+
+test "table read distributed sorted merge uses catalog runtime schema and rejects incomplete shard windows" {
+    const alloc = std.testing.allocator;
+    const non_sortable_rank_schema_json =
+        \\{"version":1,"default_type":"doc","dynamic_templates":[{"name":"rank","path_match":"rank","mapping":{"type":"numeric","sortable":false}}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"rank":{"type":"number"}}}}}}
+    ;
+    const sortable_rank_schema_json =
+        \\{"version":1,"default_type":"doc","dynamic_templates":[{"name":"rank","path_match":"rank","mapping":{"type":"numeric","sortable":true}}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"rank":{"type":"number"}}}}}}
+    ;
+
+    const FakeCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .description = "docs table",
+                    .schema_json = non_sortable_rank_schema_json,
+                    .read_schema_json = sortable_rank_schema_json,
+                    .indexes_json = tables_api.default_indexes_json,
+                    .replication_sources_json = "[]",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const order_by = [_]db_mod.types.SortField{.{ .field = "rank" }};
+
+    var left_hits = try alloc.alloc(db_mod.types.SearchHit, 3);
+    left_hits[0] = try testTableReadSortedHitAlloc(alloc, "doc:a", 1);
+    left_hits[1] = try testTableReadSortedHitAlloc(alloc, "doc:c", 3);
+    left_hits[2] = try testTableReadSortedHitAlloc(alloc, "doc:f", 6);
+    var right_hits = try alloc.alloc(db_mod.types.SearchHit, 3);
+    right_hits[0] = try testTableReadSortedHitAlloc(alloc, "doc:b", 2);
+    right_hits[1] = try testTableReadSortedHitAlloc(alloc, "doc:d", 4);
+    right_hits[2] = try testTableReadSortedHitAlloc(alloc, "doc:e", 5);
+
+    var left = db_mod.types.SearchResult{ .alloc = alloc, .hits = left_hits, .total_hits = 3 };
+    defer left.deinit();
+    var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 3, .total_hits_relation = .gte };
+    defer right.deinit();
+
+    var merged = try mergeSearchResultsWithTableRuntimeSchema(alloc, FakeCatalog.iface(), "docs", .{
+        .order_by = &order_by,
+        .limit = 3,
+        .profile = true,
+    }, &.{ left, right }, 0, 3);
+    defer merged.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), merged.hits.len);
+    try std.testing.expectEqualStrings("doc:a", merged.hits[0].id);
+    try std.testing.expectEqualStrings("doc:b", merged.hits[1].id);
+    try std.testing.expectEqualStrings("doc:c", merged.hits[2].id);
+    try std.testing.expectEqual(@as(u32, 6), merged.total_hits);
+    try std.testing.expectEqual(db_mod.types.TotalHitsRelation.gte, merged.total_hits_relation);
+    const sort_profile = merged.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("distributed_k_way_merge", sort_profile.plan);
+    try std.testing.expectEqualStrings("distributed_merge", sort_profile.source);
+    try std.testing.expectEqual(@as(usize, 2), sort_profile.distributed_shard_count);
+    try std.testing.expectEqual(@as(usize, 3), sort_profile.distributed_shard_window);
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResultsWithTableRuntimeSchema(alloc, table_catalog.emptyCatalogSource(), "docs", .{
+        .order_by = &order_by,
+        .limit = 3,
+    }, &.{ left, right }, 0, 3));
+
+    var incomplete_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    incomplete_hits[0] = try testTableReadSortedHitAlloc(alloc, "doc:e", 5);
+    var incomplete = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = incomplete_hits,
+        .total_hits = 2,
+        .total_hits_relation = .gte,
+    };
+    defer incomplete.deinit();
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResultsWithTableRuntimeSchema(alloc, FakeCatalog.iface(), "docs", .{
+        .order_by = &order_by,
+        .limit = 2,
+    }, &.{incomplete}, 0, 2));
+
+    var tie_left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    tie_left_hits[0] = try testTableReadSortedHitAlloc(alloc, "doc:b", 1);
+    var tie_right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    tie_right_hits[0] = try testTableReadSortedHitAlloc(alloc, "doc:a", 1);
+    var tie_left = db_mod.types.SearchResult{ .alloc = alloc, .hits = tie_left_hits, .total_hits = 1 };
+    defer tie_left.deinit();
+    var tie_right = db_mod.types.SearchResult{ .alloc = alloc, .hits = tie_right_hits, .total_hits = 1 };
+    defer tie_right.deinit();
+
+    var tie_merged = try mergeSearchResultsWithTableRuntimeSchema(alloc, FakeCatalog.iface(), "docs", .{
+        .order_by = &order_by,
+        .limit = 2,
+    }, &.{ tie_left, tie_right }, 0, 2);
+    defer tie_merged.deinit();
+    try std.testing.expectEqual(@as(usize, 2), tie_merged.hits.len);
+    try std.testing.expectEqualStrings("doc:a", tie_merged.hits[0].id);
+    try std.testing.expectEqualStrings("doc:b", tie_merged.hits[1].id);
+
+    var id_left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    id_left_hits[0] = try testTableReadIdSortedHitAlloc(alloc, "doc:c");
+    var id_right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    id_right_hits[0] = try testTableReadIdSortedHitAlloc(alloc, "doc:d");
+    var id_left = db_mod.types.SearchResult{ .alloc = alloc, .hits = id_left_hits, .total_hits = 1 };
+    defer id_left.deinit();
+    var id_right = db_mod.types.SearchResult{ .alloc = alloc, .hits = id_right_hits, .total_hits = 1 };
+    defer id_right.deinit();
+
+    const id_after = [_]std.json.Value{.{ .string = "doc:b" }};
+    var id_page = try mergeSearchResultsWithTableRuntimeSchema(alloc, FakeCatalog.iface(), "docs", .{
+        .search_after = &id_after,
+        .limit = 2,
+        .profile = true,
+    }, &.{ id_left, id_right }, 0, 2);
+    defer id_page.deinit();
+    try std.testing.expectEqual(@as(usize, 2), id_page.hits.len);
+    try std.testing.expectEqualStrings("doc:c", id_page.hits[0].id);
+    try std.testing.expectEqualStrings("doc:d", id_page.hits[1].id);
+    const id_profile = id_page.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("distributed_k_way_merge", id_profile.plan);
+    try std.testing.expectEqualStrings("distributed_merge", id_profile.source);
+
+    const bad_id_after = [_]std.json.Value{.{ .integer = 1 }};
+    try std.testing.expectError(error.InvalidQueryRequest, mergeSearchResultsWithTableRuntimeSchema(alloc, FakeCatalog.iface(), "docs", .{
+        .search_after = &bad_id_after,
+        .limit = 2,
+    }, &.{ id_left, id_right }, 0, 2));
+
+    const score_order = [_]db_mod.types.SortField{.{ .field = "_score", .desc = true }};
+    var score_left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    score_left_hits[0] = try testTableReadScoreSortedHitAlloc(alloc, "doc:a", 0.8);
+    var score_right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    score_right_hits[0] = try testTableReadScoreSortedHitAlloc(alloc, "doc:b", 0.9);
+    var score_left = db_mod.types.SearchResult{ .alloc = alloc, .hits = score_left_hits, .total_hits = 1 };
+    defer score_left.deinit();
+    var score_right = db_mod.types.SearchResult{ .alloc = alloc, .hits = score_right_hits, .total_hits = 1 };
+    defer score_right.deinit();
+
+    var score_page = try mergeSearchResultsWithTableRuntimeSchema(alloc, FakeCatalog.iface(), "docs", .{
+        .order_by = &score_order,
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .limit = 2,
+        .profile = true,
+    }, &.{ score_left, score_right }, 0, 2);
+    defer score_page.deinit();
+    try std.testing.expectEqual(@as(usize, 2), score_page.hits.len);
+    try std.testing.expectEqualStrings("doc:b", score_page.hits[0].id);
+    try std.testing.expectEqualStrings("doc:a", score_page.hits[1].id);
+    const score_profile = score_page.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("distributed_k_way_merge", score_profile.plan);
+    try std.testing.expectEqualStrings("distributed_merge", score_profile.source);
+
+    var string_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    string_hits[0] = try testTableReadStringSortedHitAlloc(alloc, "doc:z", "two");
+    var string_result = db_mod.types.SearchResult{ .alloc = alloc, .hits = string_hits, .total_hits = 1 };
+    defer string_result.deinit();
+    try std.testing.expectError(error.InvalidQueryRequest, mergeSearchResultsWithTableRuntimeSchema(alloc, FakeCatalog.iface(), "docs", .{
+        .order_by = &order_by,
+        .limit = 2,
+    }, &.{ left, string_result }, 0, 2));
+}
+
 fn cloneRuntimePreflightSummary(
     alloc: std.mem.Allocator,
     summary: db_mod.RuntimePreflightSummary,

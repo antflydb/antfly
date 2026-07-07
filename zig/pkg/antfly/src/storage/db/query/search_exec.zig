@@ -21846,6 +21846,7 @@ test "text field sort uses sorted segment membership path when index sort matche
         .index_name = "ft",
         .order_by = &order_by,
         .include_stored = false,
+        .profile = true,
         .limit = 2,
     }, .{ .term = .{ .field = "body", .term = "alpha" } }, .{
         .ctx = &harness,
@@ -21866,6 +21867,15 @@ test "text field sort uses sorted segment membership path when index sort matche
     try std.testing.expectApproxEqAbs(@as(f64, 1.0), result.hits[0].sort_values[0].float, 0.001);
     try std.testing.expectEqualStrings("doc:c", result.hits[1].id);
     try std.testing.expectApproxEqAbs(@as(f64, 3.0), result.hits[1].sort_values[0].float, 0.001);
+    const broad_profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("sorted_segment_seek", broad_profile.plan);
+    try std.testing.expectEqualStrings("sorted_segment_scan", broad_profile.source);
+    try std.testing.expectEqualStrings("index_sort_sorted_segment_seek", broad_profile.selection_reason);
+    try std.testing.expect(!broad_profile.selective_filter_doc_values_preferred);
+    try std.testing.expectEqual(@as(u64, 4), broad_profile.cost_model_live_docs);
+    try std.testing.expectEqual(@as(u64, 3), broad_profile.cost_model_candidate_count);
+    try std.testing.expectEqual(@as(u64, 4096), broad_profile.cost_model_selective_limit);
+    try std.testing.expectEqual(@as(u64, 0), broad_profile.stored_json_load_count);
 
     var zero_limit_result = try searchTextQuery(alloc, .{
         .index_name = "ft",

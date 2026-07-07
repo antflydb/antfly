@@ -1558,7 +1558,6 @@ Performance coverage:
 
 ## Related Docs
 
-- `SORT_SLICES.md`
 - `SCHEMA.md`
 - `FULL_TEXT.md`
 - `DOCID.md`

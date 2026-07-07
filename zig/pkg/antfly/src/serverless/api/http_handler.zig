@@ -9598,6 +9598,30 @@ test "serverless public graph seed total marks saturated pages incomplete" {
     try testPublicGraphSeedTotalHits();
 }
 
+test "serverless public graph query rejects exact sort controls" {
+    const alloc = std.testing.allocator;
+    var handler = HttpHandler{
+        .alloc = alloc,
+        .api = undefined,
+        .catalog = undefined,
+        .manifests = undefined,
+        .progress = undefined,
+        .query = undefined,
+        .runtime_status = undefined,
+    };
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, handler.handleTablePublicGraphQueryRequest(
+        "docs",
+        "docs",
+        "{\"graph_searches\":{\"related\":{\"type\":\"neighbors\",\"index_name\":\"graph_idx\",\"start_nodes\":{\"keys\":[\"doc:1\"]}}},\"order_by\":[{\"field\":\"created_at\"}]}",
+    ));
+    try std.testing.expectError(error.UnsupportedQueryRequest, handler.handleTablePublicGraphQueryRequest(
+        "docs",
+        "docs",
+        "{\"graph_searches\":{\"related\":{\"type\":\"neighbors\",\"index_name\":\"graph_idx\",\"start_nodes\":{\"keys\":[\"doc:1\"]}}},\"search_after\":[\"2026-01-01T00:00:00Z\",\"doc:1\"]}",
+    ));
+}
+
 var test_nonce: std.atomic.Value(u64) = .init(0);
 
 fn threadedIo() std.Io.Threaded {
