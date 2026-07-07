@@ -6428,12 +6428,22 @@ fn sortAndPageSearchResultInPlace(
     const bench_query_profile = shouldLogBenchQueryProfile();
     const collect_sort_profile = bench_query_profile or effective_req.profile;
     if (effective_req.limit == 0) {
+        const zero_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
         const alloc = result.alloc;
+        const candidate_count = result.hits.len;
         for (result.hits) |*hit| hit.deinit(alloc);
         if (result.hits.len > 0) alloc.free(result.hits);
         result.hits = &.{};
+        var profile = SortCollectorProfile{};
         if (collect_sort_profile) {
-            result.sort_profile = sortResultProfile(effective_req, plan, native_loader != null, .{ .window_capacity = 0 });
+            profile.candidate_count = @intCast(@min(candidate_count, @as(usize, std.math.maxInt(u64))));
+            profile.window_capacity = 0;
+            profile.window_len = 0;
+            profile.total_ns = platform_time.monotonicNs() - zero_start_ns;
+            result.sort_profile = sortResultProfile(effective_req, plan, native_loader != null, profile);
+        }
+        if (bench_query_profile) {
+            logBenchSortCollectorProfile(effective_req, plan, native_loader != null, profile);
         }
         return;
     }
@@ -6575,12 +6585,23 @@ fn sortAndPageMatchAllCandidatesAlloc(
     const bench_query_profile = shouldLogBenchQueryProfile();
     const collect_sort_profile = bench_query_profile or effective_req.profile;
     if (effective_req.limit == 0) {
+        const zero_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
+        var profile = SortCollectorProfile{};
+        if (collect_sort_profile) {
+            profile.candidate_count = @intCast(@min(candidates.items.len, @as(usize, std.math.maxInt(u64))));
+            profile.window_capacity = 0;
+            profile.window_len = 0;
+            profile.total_ns = platform_time.monotonicNs() - zero_start_ns;
+        }
+        if (bench_query_profile) {
+            logBenchSortCollectorProfile(effective_req, plan, native_loader != null, profile);
+        }
         return .{
             .alloc = alloc,
             .hits = &.{},
             .total_hits = @intCast(@min(candidates.items.len, @as(usize, std.math.maxInt(u32)))),
             .total_hits_relation = .exact,
-            .sort_profile = if (collect_sort_profile) sortResultProfile(effective_req, plan, native_loader != null, .{ .window_capacity = 0 }) else null,
+            .sort_profile = if (collect_sort_profile) sortResultProfile(effective_req, plan, native_loader != null, profile) else null,
             .graph_results = &.{},
         };
     }
@@ -7005,12 +7026,35 @@ fn sortAndPageMatchAllIdSeekAlloc(
     const bench_query_profile = shouldLogBenchQueryProfile();
     const collect_sort_profile = bench_query_profile or effective_req.profile;
     if (requested_limit == 0) {
+        const count_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
+        var count_ctx = MatchAllCountStreamContext{
+            .alloc = alloc,
+            .req = effective_req,
+        };
+        const stats = try collect_stream(executor.ctx, alloc, effective_req, .{
+            .constraints = constraints,
+            .primary_key_start_after = idOnlySearchAfterCursor(effective_req),
+            .primary_key_stop_before = idOnlySearchBeforeCursor(effective_req),
+            .primary_key_reverse = reverse,
+            .scan_batch_size = default_match_all_primary_key_scan_batch_size,
+        }, &count_ctx, countMatchAllSortCandidate);
+        try checkSearchRequestDeadline(effective_req);
+        var profile = SortCollectorProfile{};
+        if (collect_sort_profile) {
+            profile.candidate_count = @intCast(@min(count_ctx.accepted_count, @as(usize, std.math.maxInt(u64))));
+            profile.window_capacity = 0;
+            profile.window_len = 0;
+            profile.total_ns = platform_time.monotonicNs() - count_start_ns;
+        }
+        if (bench_query_profile) {
+            logBenchSortCollectorProfile(effective_req, plan, false, profile);
+        }
         return .{
             .alloc = alloc,
             .hits = &.{},
-            .total_hits = 0,
-            .total_hits_relation = .gte,
-            .sort_profile = if (collect_sort_profile) sortResultProfile(effective_req, plan, false, .{}) else null,
+            .total_hits = boundedU32(count_ctx.accepted_count),
+            .total_hits_relation = if (stats.stopped_early or count_ctx.accepted_count > std.math.maxInt(u32)) .gte else .exact,
+            .sort_profile = if (collect_sort_profile) sortResultProfile(effective_req, plan, false, profile) else null,
             .graph_results = &.{},
         };
     }
@@ -7496,9 +7540,14 @@ fn sortAndPageMatchAllSortedSegmentsAlloc(
     const bench_query_profile = shouldLogBenchQueryProfile();
     const collect_sort_profile = bench_query_profile or effective_req.profile;
     if (effective_req.limit == 0) {
+        const zero_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
         var zero_profile = SortCollectorProfile{};
         zero_profile.window_capacity = 0;
         zero_profile.sorted_segment_scan_budget = sortedSegmentScanBudget();
+        zero_profile.total_ns = if (collect_sort_profile) platform_time.monotonicNs() - zero_start_ns else 0;
+        if (bench_query_profile) {
+            logBenchSortCollectorProfile(effective_req, plan, true, zero_profile);
+        }
         return .{
             .alloc = alloc,
             .hits = &.{},
@@ -9543,13 +9592,24 @@ fn sortAndPageTextDocValueDocNumsAlloc(
     const bench_query_profile = shouldLogBenchQueryProfile();
     const collect_sort_profile = bench_query_profile or effective_req.profile;
     if (effective_req.limit == 0) {
+        const zero_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
         const visible_total = try visibleTextDocNumCount(alloc, effective_req, snapshot, doc_nums, executor);
+        var profile = SortCollectorProfile{};
+        if (collect_sort_profile) {
+            profile.candidate_count = @intCast(@min(visible_total, @as(usize, std.math.maxInt(u64))));
+            profile.window_capacity = 0;
+            profile.window_len = 0;
+            profile.total_ns = platform_time.monotonicNs() - zero_start_ns;
+        }
+        if (bench_query_profile) {
+            logBenchSortCollectorProfile(effective_req, plan, true, profile);
+        }
         return .{
             .alloc = alloc,
             .hits = &.{},
             .total_hits = boundedU32(visible_total),
             .total_hits_relation = if (visible_total > std.math.maxInt(u32)) .gte else .exact,
-            .sort_profile = if (collect_sort_profile) sortResultProfile(effective_req, plan, true, .{ .window_capacity = 0 }) else null,
+            .sort_profile = if (collect_sort_profile) sortResultProfile(effective_req, plan, true, profile) else null,
             .graph_results = &.{},
         };
     }
@@ -12837,6 +12897,7 @@ fn sortAndPageMatchAllOrdinalDocValueCandidatesAlloc(
     const bench_query_profile = shouldLogBenchQueryProfile();
     const collect_sort_profile = bench_query_profile or effective_req.profile;
     if (effective_req.limit == 0) {
+        const zero_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
         const visible_total = try visibleMatchAllOrdinalDocValueCandidateCount(
             alloc,
             effective_req,
@@ -12845,12 +12906,22 @@ fn sortAndPageMatchAllOrdinalDocValueCandidatesAlloc(
             constraints,
             ordinal_to_text_doc_id,
         );
+        var profile = SortCollectorProfile{};
+        if (collect_sort_profile) {
+            profile.candidate_count = @intCast(@min(visible_total, @as(usize, std.math.maxInt(u64))));
+            profile.window_capacity = 0;
+            profile.window_len = 0;
+            profile.total_ns = platform_time.monotonicNs() - zero_start_ns;
+        }
+        if (bench_query_profile) {
+            logBenchSortCollectorProfile(effective_req, plan, true, profile);
+        }
         return .{
             .alloc = alloc,
             .hits = &.{},
             .total_hits = boundedU32(visible_total),
             .total_hits_relation = if (visible_total > std.math.maxInt(u32)) .gte else .exact,
-            .sort_profile = if (collect_sort_profile) sortResultProfile(effective_req, plan, true, .{ .window_capacity = 0 }) else null,
+            .sort_profile = if (collect_sort_profile) sortResultProfile(effective_req, plan, true, profile) else null,
             .graph_results = &.{},
         };
     }
@@ -17925,7 +17996,7 @@ test "native sort zero limit avoids generic collector decoration" {
     try std.testing.expectEqual(@as(usize, 0), loader.load_count);
     const profile = result.sort_profile orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("native_doc_values_top_n", profile.plan);
-    try std.testing.expectEqual(@as(u64, 0), profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 2), profile.candidate_count);
     try std.testing.expectEqual(@as(u64, 0), profile.native_doc_value_hit_count);
     try std.testing.expectEqual(@as(u64, 0), profile.native_doc_value_miss_count);
 }
@@ -21093,7 +21164,7 @@ test "text doc values sort zero limit avoids budget and decoration" {
     try std.testing.expectEqual(types.TotalHitsRelation.exact, result.total_hits_relation);
     const profile = result.sort_profile orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("native_doc_values_top_n", profile.plan);
-    try std.testing.expectEqual(@as(u64, 0), profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 3), profile.candidate_count);
     try std.testing.expectEqual(@as(u64, 0), profile.native_doc_value_hit_count);
     try std.testing.expectEqual(@as(u64, 0), profile.native_doc_value_miss_count);
 }
@@ -21191,7 +21262,7 @@ test "match_all native ordinal doc values zero limit avoids budget and decoratio
     try std.testing.expectEqual(types.TotalHitsRelation.exact, result.total_hits_relation);
     const profile = result.sort_profile orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("native_doc_values_top_n", profile.plan);
-    try std.testing.expectEqual(@as(u64, 0), profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 3), profile.candidate_count);
     try std.testing.expectEqual(@as(u64, 0), profile.native_doc_value_hit_count);
     try std.testing.expectEqual(@as(u64, 0), profile.native_doc_value_miss_count);
 }
@@ -21465,9 +21536,122 @@ test "match_all native candidate sort zero limit avoids decoration" {
     try std.testing.expectEqual(@as(usize, 0), loader.load_count);
     const profile = result.sort_profile orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("native_doc_values_top_n", profile.plan);
-    try std.testing.expectEqual(@as(u64, 0), profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 2), profile.candidate_count);
     try std.testing.expectEqual(@as(u64, 0), profile.native_doc_value_hit_count);
     try std.testing.expectEqual(@as(u64, 0), profile.native_doc_value_miss_count);
+}
+
+test "match_all native candidate sort applies cursor before admission" {
+    const alloc = std.testing.allocator;
+
+    const Loader = struct {
+        load_count: usize = 0,
+
+        fn load(ctx: ?*anyopaque, _: Allocator, hit: types.SearchHit, field: []const u8) anyerror!?SortValue {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.load_count += 1;
+            try std.testing.expectEqualStrings("rank", field);
+            if (std.mem.eql(u8, hit.id, "doc:a")) return .{ .integer = 1 };
+            if (std.mem.eql(u8, hit.id, "doc:b")) return .{ .integer = 2 };
+            if (std.mem.eql(u8, hit.id, "doc:c")) return .{ .integer = 3 };
+            return error.UnexpectedTestCall;
+        }
+    };
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "rank",
+        .path_match = "rank",
+        .mapping = .{
+            .field_type = .numeric,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+    const order_by = [_]types.SortField{.{ .field = "rank", .desc = false }};
+    const after_cursor = [_]std.json.Value{
+        .{ .integer = 1 },
+        .{ .string = "doc:a" },
+    };
+    const before_cursor = [_]std.json.Value{
+        .{ .integer = 3 },
+        .{ .string = "doc:c" },
+    };
+    const plan = SortExecutionPlan{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .runtime_schema = schema,
+    };
+
+    var after_candidates = MatchAllCandidates{
+        .items = try alloc.alloc(MatchAllCandidate, 3),
+    };
+    after_candidates.items[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .ordinal = 1 };
+    after_candidates.items[1] = .{ .id = try alloc.dupe(u8, "doc:b"), .ordinal = 2 };
+    after_candidates.items[2] = .{ .id = try alloc.dupe(u8, "doc:c"), .ordinal = 3 };
+    defer after_candidates.deinit(alloc);
+
+    var after_loader = Loader{};
+    var after_result = try sortAndPageMatchAllCandidatesAlloc(alloc, .{
+        .order_by = &order_by,
+        .search_after = &after_cursor,
+        .include_stored = false,
+        .profile = true,
+        .limit = 1,
+    }, &after_candidates, null, testUnexpectedLoadStoredCallback, plan, .{
+        .ctx = &after_loader,
+        .require_native = true,
+        .load = Loader.load,
+    });
+    defer after_result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), after_result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", after_result.hits[0].id);
+    try std.testing.expectEqual(@as(i64, 2), after_result.hits[0].sort_values[0].integer);
+    try std.testing.expectEqualStrings("doc:b", after_result.hits[0].sort_values[1].string);
+    try std.testing.expectEqual(@as(usize, 3), after_loader.load_count);
+    const after_profile = after_result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", after_profile.plan);
+    try std.testing.expectEqual(@as(u64, 3), after_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 1), after_profile.cursor_rejected_count);
+    try std.testing.expectEqual(@as(u64, 1), after_profile.selected_count);
+    try std.testing.expectEqual(@as(usize, 1), after_profile.window_capacity);
+    try std.testing.expectEqual(@as(usize, 1), after_profile.window_len);
+
+    var before_candidates = MatchAllCandidates{
+        .items = try alloc.alloc(MatchAllCandidate, 3),
+    };
+    before_candidates.items[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .ordinal = 1 };
+    before_candidates.items[1] = .{ .id = try alloc.dupe(u8, "doc:b"), .ordinal = 2 };
+    before_candidates.items[2] = .{ .id = try alloc.dupe(u8, "doc:c"), .ordinal = 3 };
+    defer before_candidates.deinit(alloc);
+
+    var before_loader = Loader{};
+    var before_result = try sortAndPageMatchAllCandidatesAlloc(alloc, .{
+        .order_by = &order_by,
+        .search_before = &before_cursor,
+        .include_stored = false,
+        .profile = true,
+        .limit = 1,
+    }, &before_candidates, null, testUnexpectedLoadStoredCallback, plan, .{
+        .ctx = &before_loader,
+        .require_native = true,
+        .load = Loader.load,
+    });
+    defer before_result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), before_result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", before_result.hits[0].id);
+    try std.testing.expectEqual(@as(i64, 2), before_result.hits[0].sort_values[0].integer);
+    try std.testing.expectEqualStrings("doc:b", before_result.hits[0].sort_values[1].string);
+    try std.testing.expectEqual(@as(usize, 3), before_loader.load_count);
+    const before_profile = before_result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", before_profile.plan);
+    try std.testing.expectEqual(@as(u64, 3), before_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 1), before_profile.cursor_rejected_count);
+    try std.testing.expectEqual(@as(u64, 1), before_profile.selected_count);
+    try std.testing.expectEqual(@as(usize, 1), before_profile.window_capacity);
+    try std.testing.expectEqual(@as(usize, 1), before_profile.window_len);
 }
 
 test "match_all applies explicit doc id constraints before paging" {
@@ -22438,9 +22622,13 @@ test "match_all supports id-only sort without native doc values" {
 
 test "match_all id seek zero limit exposes internal sort profile when sampled" {
     const alloc = std.testing.allocator;
+    var stream_collect_count: usize = 0;
+    var stream_accepted_count: usize = 0;
     const ctx = TestMatchAllCtx{
         .ids = &.{ "doc:a", "doc:b" },
         .ordinals = &.{ 1, 2 },
+        .stream_collect_count = &stream_collect_count,
+        .stream_accepted_count = &stream_accepted_count,
     };
     const order_by = [_]types.SortField{.{ .field = "_id" }};
     var executor = testMatchAllExecutor(&ctx);
@@ -22472,11 +22660,113 @@ test "match_all id seek zero limit exposes internal sort profile when sampled" {
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), result.hits.len);
+    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, result.total_hits_relation);
+    try std.testing.expectEqual(@as(usize, 1), stream_collect_count);
+    try std.testing.expectEqual(@as(usize, 2), stream_accepted_count);
     const profile = result.sort_profile orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("id_seek", profile.plan);
     try std.testing.expectEqualStrings("primary_key_scan", profile.source);
     try std.testing.expectEqualStrings("segment_seek", profile.cursor_support);
+    try std.testing.expectEqual(@as(u64, 2), profile.candidate_count);
     try std.testing.expectEqual(@as(u64, 0), profile.selected_count);
+    try std.testing.expectEqual(@as(usize, 0), profile.window_capacity);
+    try std.testing.expectEqual(@as(usize, 0), profile.window_len);
+}
+
+test "match_all id seek zero limit respects cursor bounds exactly" {
+    const alloc = std.testing.allocator;
+    const order_by = [_]types.SortField{.{ .field = "_id" }};
+    const after_cursor = [_]std.json.Value{.{ .string = "doc:b" }};
+    const before_cursor = [_]std.json.Value{.{ .string = "doc:c" }};
+
+    var after_stream_collect_count: usize = 0;
+    var after_stream_accepted_count: usize = 0;
+    const after_ctx = TestMatchAllCtx{
+        .ids = &.{ "doc:a", "doc:b", "doc:c", "doc:d" },
+        .ordinals = &.{ 1, 2, 3, 4 },
+        .stream_collect_count = &after_stream_collect_count,
+        .stream_accepted_count = &after_stream_accepted_count,
+    };
+    var after_executor = testMatchAllExecutor(&after_ctx);
+    after_executor.live_filter_doc_set = null;
+
+    var after_result = try sortAndPageMatchAllIdSeekAlloc(
+        alloc,
+        .{
+            .order_by = &order_by,
+            .search_after = &after_cursor,
+            .include_stored = false,
+            .limit = 0,
+            .profile = true,
+        },
+        after_executor,
+        &.{},
+        .{
+            .kind = .id_seek,
+            .source = .primary_key_scan,
+            .cursor_support = .segment_seek,
+        },
+    );
+    defer after_result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), after_result.hits.len);
+    try std.testing.expectEqual(@as(u32, 2), after_result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, after_result.total_hits_relation);
+    try std.testing.expectEqual(@as(usize, 1), after_stream_collect_count);
+    try std.testing.expectEqual(@as(usize, 2), after_stream_accepted_count);
+    const after_profile = after_result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("id_seek", after_profile.plan);
+    try std.testing.expectEqualStrings("primary_key_scan", after_profile.source);
+    try std.testing.expectEqualStrings("segment_seek", after_profile.cursor_support);
+    try std.testing.expectEqual(@as(u64, 2), after_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 0), after_profile.selected_count);
+    try std.testing.expectEqual(@as(usize, 0), after_profile.window_capacity);
+    try std.testing.expectEqual(@as(usize, 0), after_profile.window_len);
+
+    var before_stream_collect_count: usize = 0;
+    var before_stream_accepted_count: usize = 0;
+    const before_ctx = TestMatchAllCtx{
+        .ids = &.{ "doc:a", "doc:b", "doc:c", "doc:d" },
+        .ordinals = &.{ 1, 2, 3, 4 },
+        .stream_collect_count = &before_stream_collect_count,
+        .stream_accepted_count = &before_stream_accepted_count,
+    };
+    var before_executor = testMatchAllExecutor(&before_ctx);
+    before_executor.live_filter_doc_set = null;
+
+    var before_result = try sortAndPageMatchAllIdSeekAlloc(
+        alloc,
+        .{
+            .order_by = &order_by,
+            .search_before = &before_cursor,
+            .include_stored = false,
+            .limit = 0,
+            .profile = true,
+        },
+        before_executor,
+        &.{},
+        .{
+            .kind = .id_seek,
+            .source = .primary_key_scan,
+            .cursor_support = .segment_seek,
+        },
+    );
+    defer before_result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), before_result.hits.len);
+    try std.testing.expectEqual(@as(u32, 2), before_result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, before_result.total_hits_relation);
+    try std.testing.expectEqual(@as(usize, 1), before_stream_collect_count);
+    try std.testing.expectEqual(@as(usize, 2), before_stream_accepted_count);
+    const before_profile = before_result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("id_seek", before_profile.plan);
+    try std.testing.expectEqualStrings("primary_key_scan", before_profile.source);
+    try std.testing.expectEqualStrings("segment_seek", before_profile.cursor_support);
+    try std.testing.expectEqual(@as(u64, 2), before_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 0), before_profile.selected_count);
+    try std.testing.expectEqual(@as(usize, 0), before_profile.window_capacity);
+    try std.testing.expectEqual(@as(usize, 0), before_profile.window_len);
 }
 
 test "match_all id-only sort without stream reports bounded candidate collector" {
