@@ -562,6 +562,207 @@ fn metadataValidateBleveTextOperatorFields(
     return null;
 }
 
+fn metadataValidateFilterFieldsAgainstContext(
+    alloc: std.mem.Allocator,
+    context: *const QueryBuilderTableContext,
+    value: std.json.Value,
+    label: []const u8,
+) !?[]const u8 {
+    switch (value) {
+        .object => |object| {
+            const object_mode = metadataFilterModeForObject(object);
+            if (object.get("field")) |field_value| {
+                const field = queryBuilderStringValue(field_value) orelse return try std.fmt.allocPrint(alloc, "{s} has a non-string field", .{label});
+                if (try metadataFilterFieldFeedback(alloc, context, field, object_mode, label)) |feedback| return feedback;
+            }
+            if (object.get("path")) |path_value| {
+                const path = queryBuilderStringValue(path_value) orelse return try std.fmt.allocPrint(alloc, "{s} has a non-string path", .{label});
+                if (try metadataFilterFieldFeedback(alloc, context, path, object_mode, label)) |feedback| return feedback;
+            }
+
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                if (std.mem.eql(u8, entry.key_ptr.*, "field") or std.mem.eql(u8, entry.key_ptr.*, "path")) continue;
+                if (metadataFilterModeForOperator(entry.key_ptr.*)) |mode| {
+                    if (try metadataValidateFilterOperatorFields(alloc, context, entry.value_ptr.*, mode, label)) |feedback| return feedback;
+                }
+                if (try metadataValidateFilterFieldsAgainstContext(alloc, context, entry.value_ptr.*, label)) |feedback| return feedback;
+            }
+            return null;
+        },
+        .array => |array| {
+            for (array.items) |item| {
+                if (try metadataValidateFilterFieldsAgainstContext(alloc, context, item, label)) |feedback| return feedback;
+            }
+            return null;
+        },
+        else => return null,
+    }
+}
+
+fn metadataValidateFilterOperatorFields(
+    alloc: std.mem.Allocator,
+    context: *const QueryBuilderTableContext,
+    value: std.json.Value,
+    mode: []const u8,
+    label: []const u8,
+) !?[]const u8 {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return null,
+    };
+    if (object.get("field")) |field_value| {
+        const field = queryBuilderStringValue(field_value) orelse return try std.fmt.allocPrint(alloc, "{s} has a non-string field", .{label});
+        return try metadataFilterFieldFeedback(alloc, context, field, mode, label);
+    }
+    if (object.get("path")) |path_value| {
+        const path = queryBuilderStringValue(path_value) orelse return try std.fmt.allocPrint(alloc, "{s} has a non-string path", .{label});
+        return try metadataFilterFieldFeedback(alloc, context, path, mode, label);
+    }
+    if (object.count() != 1) return null;
+    var it = object.iterator();
+    const entry = it.next() orelse return null;
+    const field = entry.key_ptr.*;
+    if (isQueryBuilderScalarOptionKey(field) or
+        isQueryBuilderTextPayloadKey(field) or
+        isQueryBuilderRangeKey(field) or
+        std.mem.eql(u8, field, "query") or
+        std.mem.eql(u8, field, "ids") or
+        std.mem.eql(u8, field, "values"))
+    {
+        return null;
+    }
+    return try metadataFilterFieldFeedback(alloc, context, field, mode, label);
+}
+
+fn metadataFilterFieldFeedback(
+    alloc: std.mem.Allocator,
+    context: *const QueryBuilderTableContext,
+    raw_field: []const u8,
+    mode: ?[]const u8,
+    label: []const u8,
+) !?[]const u8 {
+    if (raw_field.len == 0) return try std.fmt.allocPrint(alloc, "{s} references an empty field", .{label});
+    if (std.mem.eql(u8, raw_field, "_id")) return null;
+    const capability = metadataFilterFieldCapability(context, raw_field);
+    if (capability) |cap| {
+        if (mode) |required_mode| {
+            if (!metadataFilterCapabilitySupportsMode(cap, required_mode)) {
+                return try std.fmt.allocPrint(alloc, "{s} references field '{s}' without required query mode '{s}'", .{ label, raw_field, required_mode });
+            }
+        }
+        return null;
+    }
+    if (metadataContextAllowsFilterField(context, raw_field)) return null;
+    return try std.fmt.allocPrint(alloc, "{s} references unknown field '{s}'", .{ label, raw_field });
+}
+
+fn metadataFilterModeForObject(object: std.json.ObjectMap) ?[]const u8 {
+    var it = object.iterator();
+    while (it.next()) |entry| {
+        if (metadataFilterModeForOperator(entry.key_ptr.*)) |mode| return mode;
+    }
+    if (object.get("min") != null or object.get("max") != null or object.get("start") != null or object.get("end") != null or object.get("gte") != null or object.get("gt") != null or object.get("lte") != null or object.get("lt") != null) return "range";
+    return null;
+}
+
+fn metadataFilterModeForOperator(operator: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, operator, "term") or
+        std.mem.eql(u8, operator, "terms") or
+        std.mem.eql(u8, operator, "bool_field") or
+        std.mem.eql(u8, operator, "doc_id"))
+    {
+        return "exact";
+    }
+    if (std.mem.eql(u8, operator, "range") or
+        std.mem.eql(u8, operator, "numeric_range") or
+        std.mem.eql(u8, operator, "date_range") or
+        std.mem.eql(u8, operator, "term_range") or
+        std.mem.eql(u8, operator, "ip_range"))
+    {
+        return "range";
+    }
+    if (std.mem.eql(u8, operator, "geo_distance") or
+        std.mem.eql(u8, operator, "geo_bbox") or
+        std.mem.eql(u8, operator, "geo_shape"))
+    {
+        return "geo";
+    }
+    if (std.mem.eql(u8, operator, "match") or std.mem.eql(u8, operator, "match_phrase")) return "full_text";
+    if (std.mem.eql(u8, operator, "prefix") or
+        std.mem.eql(u8, operator, "wildcard") or
+        std.mem.eql(u8, operator, "regexp") or
+        std.mem.eql(u8, operator, "fuzzy"))
+    {
+        return "pattern";
+    }
+    return null;
+}
+
+fn metadataFilterCapabilitySupportsMode(capability: QueryBuilderFieldCapability, mode: []const u8) bool {
+    for (capability.query_modes) |query_mode| {
+        if (std.mem.eql(u8, query_mode, mode)) return true;
+        if (std.mem.eql(u8, mode, "pattern") and
+            (std.mem.eql(u8, query_mode, "exact") or
+                std.mem.eql(u8, query_mode, "full_text") or
+                std.mem.eql(u8, query_mode, "autocomplete")))
+        {
+            return true;
+        }
+    }
+    if (capability.query_modes.len != 0) return false;
+    const field_type = capability.field_type orelse return true;
+    if (std.mem.eql(u8, mode, "exact")) {
+        return switch (field_type) {
+            .keyword, .link, .numeric, .datetime, .boolean => true,
+            else => false,
+        };
+    }
+    if (std.mem.eql(u8, mode, "range")) {
+        return switch (field_type) {
+            .numeric, .datetime => true,
+            else => false,
+        };
+    }
+    if (std.mem.eql(u8, mode, "geo")) {
+        return field_type == .geopoint or field_type == .geoshape;
+    }
+    if (std.mem.eql(u8, mode, "full_text")) {
+        return field_type == .text or field_type == .html or field_type == .search_as_you_type;
+    }
+    if (std.mem.eql(u8, mode, "pattern")) {
+        return field_type == .keyword or field_type == .link or field_type == .text or field_type == .html or field_type == .search_as_you_type;
+    }
+    return true;
+}
+
+fn metadataFilterFieldCapability(context: *const QueryBuilderTableContext, field: []const u8) ?QueryBuilderFieldCapability {
+    for (context.field_capabilities) |capability| {
+        if (metadataFilterFieldMatches(capability.field, field)) return capability;
+    }
+    return null;
+}
+
+fn metadataContextAllowsFilterField(context: *const QueryBuilderTableContext, field: []const u8) bool {
+    if (context.schema_fields.len == 0) return true;
+    for (context.schema_fields) |schema_field| {
+        if (metadataFilterFieldMatches(schema_field, field)) return true;
+    }
+    return false;
+}
+
+fn metadataFilterFieldMatches(candidate: []const u8, raw_field: []const u8) bool {
+    const field = if (std.mem.startsWith(u8, raw_field, "/")) raw_field[1..] else raw_field;
+    if (queryBuilderFieldMatches(candidate, field)) return true;
+    if (candidate.len != field.len) return false;
+    for (candidate, field) |left, right| {
+        if (left == right) continue;
+        if ((left == '.' and right == '/') or (left == '/' and right == '.')) continue;
+        return false;
+    }
+    return true;
+}
+
 fn metadataValidateQueryRequest(
     ptr: *anyopaque,
     alloc: std.mem.Allocator,
@@ -652,12 +853,14 @@ fn preflightQueryRequestAgainstContext(
     var runtime_preflight: ?db_mod.RuntimePreflightSummary = null;
     defer if (runtime_preflight) |*summary| summary.deinit(alloc);
     var contract_preflight = query_contract.preflightQueryRequestAlloc(alloc, query_request) catch |err| blk: {
-        const feedback = if (query_request.graph_searches != null)
-            try std.fmt.allocPrint(alloc, "query_request.graph_searches failed executor preflight: {s}", .{@errorName(err)})
-        else
-            try std.fmt.allocPrint(alloc, "query_request failed contract preflight: {s}", .{@errorName(err)});
-        defer alloc.free(feedback);
-        try appendQueryPreflightDiagnostic(alloc, &diagnostics, .@"error", "query_contract_preflight_failed", "query_request", feedback);
+        if (!metadataSortCursorShapeInvalid(query_request)) {
+            const feedback = if (query_request.graph_searches != null)
+                try std.fmt.allocPrint(alloc, "query_request.graph_searches failed executor preflight: {s}", .{@errorName(err)})
+            else
+                try std.fmt.allocPrint(alloc, "query_request failed contract preflight: {s}", .{@errorName(err)});
+            defer alloc.free(feedback);
+            try appendQueryPreflightDiagnostic(alloc, &diagnostics, .@"error", "query_contract_preflight_failed", "query_request", feedback);
+        }
         break :blk null;
     };
     defer if (contract_preflight) |*summary| summary.deinit(alloc);
@@ -672,13 +875,13 @@ fn preflightQueryRequestAgainstContext(
         }
     }
     if (query_request.filter_query) |filter_query| {
-        if (try metadataValidateBleveFieldsAgainstContext(alloc, context, filter_query, "query_request.filter_query")) |feedback| {
+        if (try metadataValidateFilterFieldsAgainstContext(alloc, context, filter_query, "query_request.filter_query")) |feedback| {
             defer alloc.free(feedback);
             try appendQueryPreflightDiagnostic(alloc, &diagnostics, .@"error", "invalid_filter_field", "query_request.filter_query", feedback);
         }
     }
     if (query_request.exclusion_query) |exclusion_query| {
-        if (try metadataValidateBleveFieldsAgainstContext(alloc, context, exclusion_query, "query_request.exclusion_query")) |feedback| {
+        if (try metadataValidateFilterFieldsAgainstContext(alloc, context, exclusion_query, "query_request.exclusion_query")) |feedback| {
             defer alloc.free(feedback);
             try appendQueryPreflightDiagnostic(alloc, &diagnostics, .@"error", "invalid_exclusion_field", "query_request.exclusion_query", feedback);
         }
@@ -1558,6 +1761,13 @@ fn metadataSortCursorFeedback(
     context: *const QueryBuilderTableContext,
     query_request: metadata_openapi.QueryRequest,
 ) !?SortCursorFeedback {
+    if (query_request.search_after != null and query_request.search_before != null) {
+        return .{
+            .path = "query_request",
+            .message = try alloc.dupe(u8, "query_request cannot specify both search_after and search_before"),
+        };
+    }
+
     const cursor = if (query_request.search_after) |values|
         values
     else if (query_request.search_before) |values|
@@ -1566,10 +1776,17 @@ fn metadataSortCursorFeedback(
         return null;
     const path = if (query_request.search_after != null) "query_request.search_after" else "query_request.search_before";
 
-    if (query_request.search_after != null and query_request.search_before != null) return null;
-
     const field_count = metadataEffectiveSortFieldCount(query_request);
-    if (cursor.len != field_count) return null;
+    if (cursor.len != field_count) {
+        return .{
+            .path = path,
+            .message = try std.fmt.allocPrint(
+                alloc,
+                "{s} has {d} value(s), but the effective order_by requires {d} value(s), including the implicit _id tie-breaker when present",
+                .{ path, cursor.len, field_count },
+            ),
+        };
+    }
 
     for (0..field_count) |i| {
         const field = metadataEffectiveSortFieldAt(query_request, i);
@@ -1599,6 +1816,17 @@ fn metadataSortCursorFeedback(
         }
     }
     return null;
+}
+
+fn metadataSortCursorShapeInvalid(query_request: metadata_openapi.QueryRequest) bool {
+    if (query_request.search_after != null and query_request.search_before != null) return true;
+    const cursor = if (query_request.search_after) |values|
+        values
+    else if (query_request.search_before) |values|
+        values
+    else
+        return false;
+    return cursor.len != metadataEffectiveSortFieldCount(query_request);
 }
 
 fn metadataEffectiveSortFieldCount(query_request: metadata_openapi.QueryRequest) usize {
@@ -6696,6 +6924,83 @@ test "query builder preflight accepts queryable mapped sort field outside full t
     try std.testing.expectEqual(@as(usize, 0), preflight.diagnostics.len);
 }
 
+test "query builder preflight validates filters against query modes not full text coverage" {
+    var parsed_filter = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"term\":\"published\",\"field\":\"status\"}", .{});
+    defer parsed_filter.deinit();
+    var parsed_range = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"range\":{\"published_at\":{\"gte\":\"2026-01-01\"}}}", .{});
+    defer parsed_range.deinit();
+
+    const capabilities = [_]QueryBuilderFieldCapability{
+        .{
+            .field = "body",
+            .field_type = .text,
+            .query_modes = &.{"full_text"},
+        },
+        .{
+            .field = "status",
+            .field_type = .keyword,
+            .query_modes = &.{"exact"},
+        },
+        .{
+            .field = "published_at",
+            .field_type = .datetime,
+            .query_modes = &.{ "exact", "range" },
+        },
+    };
+    var collected = collectQueryBuilderContext(.{
+        .schema_fields = &.{ "body", "status", "published_at" },
+        .field_capabilities = &capabilities,
+        .full_text_index_metadata = &.{.{ .name = "search_idx", .fields = &.{"body"} }},
+    });
+
+    var exact_preflight = try preflightQueryRequest(std.testing.allocator, &collected, .{
+        .intent = "published docs",
+    }, .{
+        .filter_query = parsed_filter.value,
+    }, null, "query_builder", .{});
+    defer exact_preflight.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), exact_preflight.diagnostics.len);
+
+    var range_preflight = try preflightQueryRequest(std.testing.allocator, &collected, .{
+        .intent = "recent docs",
+    }, .{
+        .filter_query = parsed_range.value,
+    }, null, "query_builder", .{});
+    defer range_preflight.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), range_preflight.diagnostics.len);
+}
+
+test "query builder preflight rejects filter operators without required query mode" {
+    var parsed_filter = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"term\":\"published\",\"field\":\"body\"}", .{});
+    defer parsed_filter.deinit();
+
+    const capabilities = [_]QueryBuilderFieldCapability{
+        .{
+            .field = "body",
+            .field_type = .text,
+            .query_modes = &.{"full_text"},
+        },
+    };
+    var collected = collectQueryBuilderContext(.{
+        .schema_fields = &.{"body"},
+        .field_capabilities = &capabilities,
+        .full_text_index_metadata = &.{.{ .name = "search_idx", .fields = &.{"body"} }},
+    });
+
+    var preflight = try preflightQueryRequest(std.testing.allocator, &collected, .{
+        .intent = "published docs",
+    }, .{
+        .filter_query = parsed_filter.value,
+    }, null, "query_builder", .{});
+    defer preflight.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), preflight.diagnostics.len);
+    try std.testing.expectEqual(QueryPreflightDiagnosticSeverity.@"error", preflight.diagnostics[0].severity);
+    try std.testing.expectEqualStrings("invalid_filter_field", preflight.diagnostics[0].code);
+    try std.testing.expectEqualStrings("query_request.filter_query", preflight.diagnostics[0].path);
+    try std.testing.expect(std.mem.indexOf(u8, preflight.diagnostics[0].message, "required query mode 'exact'") != null);
+}
+
 test "query builder preflight validates cursor values against mapped sort field types" {
     const capabilities = [_]QueryBuilderFieldCapability{
         .{
@@ -6765,6 +7070,52 @@ test "query builder preflight validates cursor values against mapped sort field 
     try std.testing.expectEqualStrings("invalid_sort_cursor", invalid_status_preflight.diagnostics[0].code);
     try std.testing.expectEqualStrings("query_request.search_before", invalid_status_preflight.diagnostics[0].path);
     try std.testing.expect(std.mem.indexOf(u8, invalid_status_preflight.diagnostics[0].message, "status") != null);
+}
+
+test "query builder preflight reports cursor shape diagnostics directly" {
+    const capabilities = [_]QueryBuilderFieldCapability{.{
+        .field = "created_at",
+        .field_type = .datetime,
+        .sortable = true,
+        .sort_lifecycle_state = "queryable",
+    }};
+    var collected = collectQueryBuilderContext(.{
+        .schema_fields = &.{"created_at"},
+        .field_capabilities = &capabilities,
+    });
+
+    const created_order = [_]metadata_openapi.SortField{.{ .field = "created_at", .desc = true }};
+    const short_cursor = [_]std.json.Value{.{ .string = "2026-01-01T00:00:00Z" }};
+    var short_preflight = try preflightQueryRequest(std.testing.allocator, &collected, .{
+        .intent = "newest docs after short cursor",
+    }, .{
+        .order_by = &created_order,
+        .search_after = &short_cursor,
+    }, null, "query_builder", .{});
+    defer short_preflight.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), short_preflight.diagnostics.len);
+    try std.testing.expectEqualStrings("invalid_sort_cursor", short_preflight.diagnostics[0].code);
+    try std.testing.expectEqualStrings("query_request.search_after", short_preflight.diagnostics[0].path);
+    try std.testing.expect(std.mem.indexOf(u8, short_preflight.diagnostics[0].message, "requires 2 value") != null);
+
+    const full_cursor = [_]std.json.Value{
+        .{ .string = "2026-01-01T00:00:00Z" },
+        .{ .string = "doc-9" },
+    };
+    var both_preflight = try preflightQueryRequest(std.testing.allocator, &collected, .{
+        .intent = "newest docs with conflicting cursors",
+    }, .{
+        .order_by = &created_order,
+        .search_after = &full_cursor,
+        .search_before = &full_cursor,
+    }, null, "query_builder", .{});
+    defer both_preflight.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), both_preflight.diagnostics.len);
+    try std.testing.expectEqualStrings("invalid_sort_cursor", both_preflight.diagnostics[0].code);
+    try std.testing.expectEqualStrings("query_request", both_preflight.diagnostics[0].path);
+    try std.testing.expect(std.mem.indexOf(u8, both_preflight.diagnostics[0].message, "both search_after and search_before") != null);
 }
 
 test "query builder preflight rejects declared sort field before sortable runtime coverage" {
