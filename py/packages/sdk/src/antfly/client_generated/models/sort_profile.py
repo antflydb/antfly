@@ -86,16 +86,16 @@ class SortProfile:
                 `match_all_exact_candidate_window`,
                 `sorted_segment_scan_window`, and
                 `distributed_merge_shard_window`.
-            sort_rejection_reason (str | Unset): Stable exact-sort rejection reason. Known values include
-                `unmapped_sort_field`, `non_sortable_sort_field`,
-                `missing_doc_values_coverage`,
-                `missing_native_filter_coverage`, `invalid_cursor_arity`,
-                `invalid_cursor_type`, `invalid_sort_tuple`,
-                `approximate_candidate_source`, `candidate_budget_exceeded`,
-                `missing_runtime_mapping`, `invalid_doc_value_type`,
-                `missing_null_policy`, `non_score_bearing_source`,
-                `invalid_score_value`, `count_only_ordered_page`,
-                `stored_json_sort_disabled`, `unsupported_exact_sort`, and
+            sort_rejection_reason (str | Unset): Stable public exact-sort rejection reason. Known values include
+                `unmapped_field`, `non_sortable_field`,
+                `unsupported_sort_field`, `mixed_field_type`,
+                `field_not_sort_ready`, `filter_not_queryable`,
+                `invalid_cursor_arity`, `invalid_cursor_type`,
+                `invalid_sort_tuple`, `approximate_candidate_source`,
+                `candidate_budget_exceeded`, `missing_null_policy`,
+                `non_score_bearing_source`, `invalid_score_value`,
+                `count_only_ordered_page`, `stored_json_sort_disabled`,
+                `unsupported_exact_sort`, and
                 `distributed_merge_unsupported`.
             sort_rejection_detail (str | Unset): Stable rejection detail. Known exact-sort details include
                 `unmapped_sort_field`, `unmapped_field`,
@@ -111,8 +111,9 @@ class SortProfile:
                 `missing_native_filter_coverage`, `invalid_cursor_arity`,
                 `invalid_cursor_type`, `invalid_sort_tuple`,
                 `sort_tuple_arity`, `invalid_doc_value_type`,
-                `incomplete_sort_tuple`, `mixed_sort_value_domain`,
-                `unsorted_shard_window`, `unsorted_component_window`,
+                `missing_runtime_mapping`, `incomplete_sort_tuple`,
+                `mixed_sort_value_domain`, `unsorted_shard_window`,
+                `unsorted_component_window`,
                 `non_numeric_score`, `missing_score`, `non_finite_score`,
                 `score_sort_tuple_mismatch`, `non_score_bearing_source`,
                 `id_tiebreaker_mismatch`, `approximate_candidate_source`,

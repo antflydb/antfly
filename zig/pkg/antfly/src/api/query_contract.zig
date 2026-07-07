@@ -3050,7 +3050,7 @@ fn expectSortProfileDiagnosticsSerializationForTest() !void {
     try std.testing.expectEqual(@as(i64, 11), sort.get("distributed_shard_window").?.integer);
     try std.testing.expectEqualStrings("match_all_candidate_collect_limit", sort.get("budget_rejection_reason").?.string);
     try std.testing.expectEqualStrings("field_not_sort_ready", sort.get("sort_rejection_reason").?.string);
-    try std.testing.expectEqualStrings("missing_doc_values_section", sort.get("sort_rejection_detail").?.string);
+    try std.testing.expectEqualStrings("field_not_sort_ready", sort.get("sort_rejection_detail").?.string);
     try std.testing.expectEqualStrings("created_at", sort.get("sort_rejection_field").?.string);
 }
 
@@ -4477,12 +4477,12 @@ fn buildSortProfileValue(
     try sort.put(alloc, "distributed_shard_count", try buildProfileSizeValue(alloc, profile.distributed_shard_count));
     try sort.put(alloc, "distributed_shard_window", try buildProfileSizeValue(alloc, profile.distributed_shard_window));
     try sort.put(alloc, "budget_rejection_reason", .{ .string = profile.budget_rejection_reason });
-    const public_sort_rejection_reason = if (profile.sort_rejection_reason.len > 0)
-        publicExactSortReason(profile.sort_rejection_reason, profile.sort_rejection_detail)
+    const public_sort_rejection = if (profile.sort_rejection_reason.len > 0)
+        publicExactSortRejection(profile.sort_rejection_reason, profile.sort_rejection_detail)
     else
-        "";
-    try sort.put(alloc, "sort_rejection_reason", .{ .string = public_sort_rejection_reason });
-    try sort.put(alloc, "sort_rejection_detail", .{ .string = profile.sort_rejection_detail });
+        PublicExactSortRejection{ .reason = "", .detail = "" };
+    try sort.put(alloc, "sort_rejection_reason", .{ .string = public_sort_rejection.reason });
+    try sort.put(alloc, "sort_rejection_detail", .{ .string = public_sort_rejection.detail });
     try sort.put(alloc, "sort_rejection_field", .{ .string = try alloc.dupe(u8, profile.sort_rejection_field.slice()) });
     return .{ .object = sort };
 }
@@ -4915,6 +4915,13 @@ fn isUnambiguousStructuredFilterValue(value: std.json.Value) bool {
         "bool",
     }) |key| {
         if (value.object.get(key) != null) return true;
+    }
+    inline for ([_][]const u8{ "term", "match", "prefix", "wildcard", "regexp", "fuzzy" }) |key| {
+        if (value.object.get(key)) |operator_value| {
+            if (operator_value != .object) return false;
+            if (operator_value.object.get("path") != null) return true;
+            if (operator_value.object.get("values") != null) return true;
+        }
     }
     return false;
 }
@@ -7177,6 +7184,20 @@ test "api query contract treats canonical typed scalar term as structured filter
 
     try std.testing.expect(parsed.req.full_text.? == .match_all);
     try std.testing.expectEqualStrings("{\"term\":{\"path\":\"/published\",\"value\":true}}", parsed.req.filter_query_json);
+    try std.testing.expectEqualStrings("", parsed.req.exclusion_query_json);
+}
+
+test "api query contract treats canonical string path term as structured filter" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{"query":{"term":{"path":"/tier","value":"gold"}}}
+    ;
+
+    var parsed = try parseQueryRequest(alloc, null, "docs", body);
+    defer parsed.deinit(alloc);
+
+    try std.testing.expect(parsed.req.full_text.? == .match_all);
+    try std.testing.expectEqualStrings("{\"term\":{\"path\":\"/tier\",\"value\":\"gold\"}}", parsed.req.filter_query_json);
     try std.testing.expectEqualStrings("", parsed.req.exclusion_query_json);
 }
 

@@ -999,14 +999,16 @@ fn generatedFieldCapabilitiesAlloc(
     defer runtime_schema_mod.freeFieldCapabilities(alloc, schema_capabilities);
 
     var out = std.ArrayListUnmanaged(GeneratedFieldCapability).empty;
+    var capability_index = GeneratedFieldCapabilityIndex.empty;
+    defer freeGeneratedFieldCapabilityIndex(alloc, &capability_index);
     errdefer freeGeneratedFieldCapabilitiesFromList(alloc, &out);
     for (schema_capabilities) |capability| {
-        try appendGeneratedFieldCapability(alloc, &out, try generatedFieldCapabilityAlloc(alloc, capability));
+        try appendGeneratedFieldCapability(alloc, &out, &capability_index, try generatedFieldCapabilityAlloc(alloc, capability));
     }
 
     for (observedDynamicFieldCapabilitySetsFromStatus(storage_status)) |set| {
         for (set.field_capabilities) |capability| {
-            try appendRuntimeGeneratedFieldCapability(alloc, &out, try generatedFieldCapabilityAlloc(alloc, capability));
+            try appendRuntimeGeneratedFieldCapability(alloc, &out, &capability_index, try generatedFieldCapabilityAlloc(alloc, capability));
         }
     }
 
@@ -1034,31 +1036,51 @@ const GeneratedFieldCapability = struct {
     index_sort_order: ?[]const u8 = null,
 };
 
+const GeneratedFieldCapabilityIndex = std.StringHashMapUnmanaged(usize);
+
 fn appendGeneratedFieldCapability(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(GeneratedFieldCapability),
+    capability_index: *GeneratedFieldCapabilityIndex,
     capability: GeneratedFieldCapability,
 ) !void {
     const owned = capability;
-    errdefer freeGeneratedFieldCapability(alloc, owned);
-    for (out.items) |*existing| {
-        if (!generatedFieldCapabilityAggregationKeyEqual(existing.*, owned)) continue;
+    var owned_in_list = false;
+    errdefer if (!owned_in_list) freeGeneratedFieldCapability(alloc, owned);
+    const key = try generatedFieldCapabilityAggregationKeyAlloc(alloc, owned);
+    if (capability_index.get(key)) |existing_index| {
+        defer alloc.free(key);
+        const existing = &out.items[existing_index];
+        std.debug.assert(generatedFieldCapabilityAggregationKeyEqual(existing.*, owned));
         try mergeGeneratedFieldCapability(alloc, existing, owned);
         freeGeneratedFieldCapability(alloc, owned);
         return;
     }
+    var key_in_index = false;
+    errdefer if (key_in_index) {
+        _ = capability_index.remove(key);
+        alloc.free(key);
+    };
+    try capability_index.put(alloc, key, out.items.len);
+    key_in_index = true;
     try out.append(alloc, owned);
+    owned_in_list = true;
 }
 
 fn appendRuntimeGeneratedFieldCapability(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(GeneratedFieldCapability),
+    capability_index: *GeneratedFieldCapabilityIndex,
     capability: GeneratedFieldCapability,
 ) !void {
     const owned = capability;
-    errdefer freeGeneratedFieldCapability(alloc, owned);
-    for (out.items) |*existing| {
-        if (!generatedFieldCapabilityAggregationKeyEqual(existing.*, owned)) continue;
+    var owned_in_list = false;
+    errdefer if (!owned_in_list) freeGeneratedFieldCapability(alloc, owned);
+    const key = try generatedFieldCapabilityAggregationKeyAlloc(alloc, owned);
+    if (capability_index.get(key)) |existing_index| {
+        defer alloc.free(key);
+        const existing = &out.items[existing_index];
+        std.debug.assert(generatedFieldCapabilityAggregationKeyEqual(existing.*, owned));
         if (runtimeCapabilityCanPromoteSchemaDeclaration(existing.*, owned)) {
             try replaceOwnedStringIfDifferent(alloc, &existing.doc_value_coverage, owned.doc_value_coverage);
             try replaceOwnedStringIfDifferent(alloc, &existing.queryability_state, owned.queryability_state);
@@ -1070,7 +1092,15 @@ fn appendRuntimeGeneratedFieldCapability(
         freeGeneratedFieldCapability(alloc, owned);
         return;
     }
+    var key_in_index = false;
+    errdefer if (key_in_index) {
+        _ = capability_index.remove(key);
+        alloc.free(key);
+    };
+    try capability_index.put(alloc, key, out.items.len);
+    key_in_index = true;
     try out.append(alloc, owned);
+    owned_in_list = true;
 }
 
 fn runtimeCapabilityCanPromoteSchemaDeclaration(
@@ -1118,6 +1148,54 @@ fn generatedFieldCapabilityAggregationKeyEqual(
         left.type == right.type and
         std.mem.eql(u8, left.provenance, right.provenance) and
         optionalStringEql(left.analyzer, right.analyzer);
+}
+
+fn generatedFieldCapabilityAggregationKeyAlloc(
+    alloc: std.mem.Allocator,
+    capability: GeneratedFieldCapability,
+) ![]const u8 {
+    var key = std.ArrayListUnmanaged(u8).empty;
+    errdefer key.deinit(alloc);
+
+    try appendCapabilityKeyPart(alloc, &key, capability.field);
+    try appendCapabilityKeyPart(alloc, &key, capability.name);
+    try appendCapabilityKeyPart(alloc, &key, capability.path_pattern);
+    try appendCapabilityKeyPart(alloc, &key, capability.field_pattern);
+    try appendCapabilityKeyPart(alloc, &key, capability.match_mapping_type);
+    try appendCapabilityKeyPart(alloc, &key, capability.emitted_name);
+    try appendCapabilityKeyPart(alloc, &key, capability.document_schema);
+    try appendCapabilityKeyPart(alloc, &key, @tagName(capability.type));
+    try appendCapabilityKeyPart(alloc, &key, capability.provenance);
+    try appendCapabilityKeyPart(alloc, &key, capability.analyzer);
+
+    return try key.toOwnedSlice(alloc);
+}
+
+fn appendCapabilityKeyPart(
+    alloc: std.mem.Allocator,
+    key: *std.ArrayListUnmanaged(u8),
+    value: ?[]const u8,
+) !void {
+    if (value) |text| {
+        var len_buf: [20]u8 = undefined;
+        const len_text = std.fmt.bufPrint(&len_buf, "{d}", .{text.len}) catch unreachable;
+        try key.appendSlice(alloc, len_text);
+        try key.append(alloc, ':');
+        try key.appendSlice(alloc, text);
+        try key.append(alloc, '|');
+    } else {
+        try key.appendSlice(alloc, "-:|");
+    }
+}
+
+fn freeGeneratedFieldCapabilityIndex(
+    alloc: std.mem.Allocator,
+    capability_index: *GeneratedFieldCapabilityIndex,
+) void {
+    var it = capability_index.keyIterator();
+    while (it.next()) |key| alloc.free(@constCast(key.*));
+    capability_index.deinit(alloc);
+    capability_index.* = .empty;
 }
 
 fn mergeGeneratedFieldCapability(

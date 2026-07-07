@@ -4198,6 +4198,7 @@ pub fn build(b: *std.Build) void {
             "public table query handler maps doc identity unavailable errors",
             "public table query handler maps HA read gate errors",
             "public table query handler maps unsupported exact sort",
+            "public table query handler exposes stable count-only sort rejection reason",
             "public table query handler surfaces exact sort rejection diagnostics",
             "public table query view handler maps doc identity unavailable errors",
             "public table backup handler accepts portable format",
