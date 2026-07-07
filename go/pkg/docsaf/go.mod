@@ -1,8 +1,9 @@
 module github.com/antflydb/antfly/go/pkg/docsaf
 
-go 1.26
+go 1.26.0
 
 replace (
+	github.com/antflydb/antfly/go/pkg/generating => ../generating
 	github.com/antflydb/antfly/go/pkg/libaf => ../libaf
 	github.com/antflydb/antfly/go/pkg/sdk => ../sdk
 )
@@ -11,8 +12,8 @@ require (
 	github.com/PuerkitoBio/goquery v1.12.0
 	github.com/ajroetker/pdf v0.0.1-antfly001
 	github.com/ajroetker/pdf/render v0.0.1-antfly003
-	github.com/antflydb/antfly/go/pkg/libaf v0.0.0-20260619041320-35ccb29dfeb9
-	github.com/antflydb/antfly/go/pkg/sdk v0.0.0-20260619041320-35ccb29dfeb9
+	github.com/antflydb/antfly/go/pkg/libaf v0.0.1
+	github.com/antflydb/antfly/go/pkg/sdk v0.0.0
 	github.com/bmatcuk/doublestar/v4 v4.10.0
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/gocolly/colly/v2 v2.3.0
@@ -37,13 +38,14 @@ require (
 	github.com/antchfx/htmlquery v1.3.6 // indirect
 	github.com/antchfx/xmlquery v1.5.0 // indirect
 	github.com/antchfx/xpath v1.3.6 // indirect
+	github.com/antflydb/antfly/go/pkg/generating v0.0.0-20260707135339-05a2b0b8ac61 // indirect
 	github.com/apapsch/go-jsonmerge/v2 v2.0.0 // indirect
 	github.com/bahlo/generic-list-go v0.2.0 // indirect
 	github.com/bits-and-blooms/bitset v1.24.4 // indirect
 	github.com/buger/jsonparser v1.1.2 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
-	github.com/getkin/kin-openapi v0.133.0 // indirect
+	github.com/getkin/kin-openapi v0.134.0 // indirect
 	github.com/go-ini/ini v1.67.0 // indirect
 	github.com/go-json-experiment/json v0.0.0-20260214004413-d219187c3433 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
@@ -76,8 +78,8 @@ require (
 	github.com/mohae/deepcopy v0.0.0-20170929034955-c48cc78d4826 // indirect
 	github.com/nlnwa/whatwg-url v0.6.2 // indirect
 	github.com/oapi-codegen/runtime v1.3.0 // indirect
-	github.com/oasdiff/yaml v0.0.0-20250309154309-f31be36b4037 // indirect
-	github.com/oasdiff/yaml3 v0.0.0-20250309153720-d2182401db90 // indirect
+	github.com/oasdiff/yaml v0.0.1 // indirect
+	github.com/oasdiff/yaml3 v0.0.1 // indirect
 	github.com/pb33f/jsonpath v0.8.2 // indirect
 	github.com/pb33f/ordered-map/v2 v2.3.0 // indirect
 	github.com/pdfcpu/pdfcpu v0.11.1 // indirect

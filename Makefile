@@ -21,7 +21,8 @@ GO_SUBMODULES := \
 	./go/pkg/evalaf/plugins/antfly \
 	./go/pkg/genkit/antfly \
 	./go/pkg/genkit/openrouter \
-	./go/pkg/memoryaf
+	./go/pkg/memoryaf \
+	./go/pkg/termite
 
 # ====================================================================================
 # General Commands

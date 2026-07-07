@@ -3,42 +3,160 @@
 
 const std = @import("std");
 const antfly_generating_openapi = @import("antfly_generating_openapi");
+const antfly_chunking_api_openapi = @import("antfly_chunking_api_openapi");
 
-/// Backend priority entry for model loading. Use `backend` or `backend:device`, where device defaults to `auto`. Backends: - `native` - Native CPU backend - `onnx` - ONNX Runtime backend - `metal` - Apple Metal backend - `cuda` - NVIDIA CUDA backend - `xla` - PJRT/XLA compiled backend - `webgpu` or `wasm` - Wasm/WebGPU backend in Wasm builds Devices: - `auto` - Auto-detect best available (default) - `cuda` - NVIDIA CUDA GPU - `tpu` - Google TPU (used by XLA) - `cpu` - Force CPU only
-pub const BackendPriorityEntry = []const u8;
-
-/// Runtime backends compiled into this inference server.
-pub const BackendRuntimes = struct {
-    /// Whether the native CPU backend is built into this runtime
-    native: ?bool = null,
-    /// Whether the ONNX Runtime backend is built into this runtime
-    onnx: ?bool = null,
-    /// Whether the Metal backend is built into this runtime
-    metal: ?bool = null,
-    /// Whether the CUDA backend is built into this runtime
-    cuda: ?bool = null,
-    /// Whether the PJRT/XLA backend is built into this runtime
-    xla: ?bool = null,
-    /// Whether the WASM backend is built into this runtime
-    wasm: ?bool = null,
+pub const Error = struct {
+    /// Error message
+    @"error": []const u8,
 };
 
-/// Binary media content with format-specific metadata.
-pub const BinaryContent = struct {
-    /// Base64-encoded binary data (valid WAV, PNG, etc.)
-    data: ?[]const u8 = null,
-    /// Audio: window start time in milliseconds
-    start_time_ms: ?f32 = null,
-    /// Audio: window end time in milliseconds
-    end_time_ms: ?f32 = null,
-    /// Animation: frame number
-    frame_index: ?i64 = null,
-    /// Animation: display delay in milliseconds
-    frame_delay_ms: ?i64 = null,
+pub const PredictRequest = struct {
+    /// Predictor name from the model catalog.
+    model: []const u8,
+    /// Batch of feature vectors. Max 10000 rows.
+    input: []const []const f32,
 };
 
-/// Message content. Supports two formats: - Simple string: "Hello, how are you?" - Array of content parts (OpenAI multimodal format): [{"type": "text", "text": "Hello"}]
-pub const ChatMessageContent = std.json.Value;
+/// Task type for tabular predictors.
+pub const PredictorTask = enum {
+    regression,
+    binary_classification,
+    multiclass,
+    ranking,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .regression => "regression",
+            .binary_classification => "binary_classification",
+            .multiclass => "multiclass",
+            .ranking => "ranking",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "regression", .regression },
+            .{ "binary_classification", .binary_classification },
+            .{ "multiclass", .multiclass },
+            .{ "ranking", .ranking },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const TextContentPart = antfly_generating_openapi.TextContentPart;
+
+pub const ImageURL = antfly_generating_openapi.ImageURL;
+
+pub const ImageURLContentPart = antfly_generating_openapi.ImageURLContentPart;
+
+pub const MediaContentPart = antfly_generating_openapi.MediaContentPart;
+
+pub const ContentPart = antfly_generating_openapi.ContentPart;
+
+/// OpenAI-compatible embedding request with inference multimodal content-part extension
+pub const EmbedRequest = struct {
+    /// Model name to use for embedding generation
+    model: []const u8,
+    /// Input content to embed. Supports: - a single string - an array of strings - an array of OpenAI-style content parts for multimodal embedding
+    input: std.json.Value,
+    /// Encoding format for the embeddings (only "float" supported)
+    encoding_format: ?[]const u8 = null,
+    /// Optional truncation size for dense embeddings. Must be a positive integer no larger than the model embedding size. Not supported for sparse models.
+    dimensions: ?i64 = null,
+    /// Optional embedding task type using Google embedding task-type names. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix.
+    task_type: ?[]const u8 = null,
+    /// Deprecated compatibility alias for task_type. search_query/query map to RETRIEVAL_QUERY; search_document/document map to RETRIEVAL_DOCUMENT; classification and clustering map to their Google task_type equivalents.
+    input_type: ?[]const u8 = null,
+};
+
+/// A sparse vector with parallel index/value arrays, sorted by index ascending
+pub const SparseVector = struct {
+    /// Token IDs from the model vocabulary (sorted ascending)
+    indices: []const i32,
+    /// Corresponding weights for each index (always positive)
+    values: []const f32,
+};
+
+pub const VADOptions = antfly_chunking_api_openapi.VADOptions;
+
+pub const AudioChunkConfig = antfly_chunking_api_openapi.InferenceAudioChunkConfig;
+
+pub const ChunkConfig = antfly_chunking_api_openapi.InferenceChunkConfig;
+
+pub const ChunkRequest = antfly_chunking_api_openapi.InferenceChunkRequest;
+
+pub const RerankRequest = struct {
+    /// Name of reranking model from models_dir/rerankers/
+    model: []const u8,
+    /// Search query for relevance scoring
+    query: []const u8,
+    /// Pre-rendered document texts to rerank. The client is responsible for extracting and rendering document fields/templates before calling this endpoint.
+    prompts: []const []const u8,
+};
+
+pub const RerankMultimodalDocument = struct {
+    /// Optional caller-provided document identifier
+    id: ?[]const u8 = null,
+    content: antfly_generating_openapi.ChatMessageContent,
+};
+
+pub const RerankObject = struct {
+    object: []const u8,
+    /// Original prompt index.
+    index: i64,
+    /// Relevance score for this prompt.
+    score: f32,
+};
+
+pub const RecognizeEntity = struct {
+    /// The entity text
+    text: []const u8,
+    /// Entity type (PER, ORG, LOC, MISC)
+    label: []const u8,
+    /// Character offset where entity begins
+    start: i64,
+    /// Character offset where entity ends (exclusive)
+    end: i64,
+    /// Confidence score (0.0 to 1.0)
+    score: f32,
+};
+
+/// Configuration for entity resolution. When present in a RecognizeRequest, the response entities and relations are deduplicated via entity resolution (e.g., "Elon Musk" and "Musk" are merged into a single entity).
+pub const ResolverConfig = struct {
+    /// Jaro-Winkler similarity threshold for merging entities (0.0-1.0)
+    similarity_threshold: ?f32 = null,
+    /// Whether entity types must match for merging
+    type_must_match: ?bool = null,
+    /// Minimum confidence score for entities to be included
+    min_entity_confidence: ?f32 = null,
+    /// Minimum confidence score for relations to be included
+    min_relation_confidence: ?f32 = null,
+    /// Whether to deduplicate relations after entity resolution
+    deduplicate_relations: ?bool = null,
+    /// Whether to track mention provenance for resolved entities
+    track_provenance: ?bool = null,
+};
+
+pub const RewriteRequest = struct {
+    /// Name of Seq2Seq rewriter model from models_dir/rewriters/
+    model: []const u8,
+    /// Input texts to rewrite/transform
+    inputs: []const []const u8,
+};
+
+pub const RewriteObject = struct {
+    object: []const u8,
+    /// Original input text index.
+    index: i64,
+    /// Rewritten texts for this input, one per beam.
+    texts: []const []const u8,
+};
 
 pub const ClassifyRequest = struct {
     /// Name of classifier model from models_dir/classifiers/
@@ -60,36 +178,17 @@ pub const ClassifyResult = struct {
     score: f32,
 };
 
-pub const ContentPart = antfly_generating_openapi.ContentPart;
-
-pub const ContentSecurityConfig = struct {
-    /// Whitelist of allowed hostnames/IPs for link downloads. If empty, all hosts are allowed (except private IPs if block_private_ips is true).
-    allowed_hosts: ?[]const []const u8 = null,
-    /// Block requests to private IP ranges (127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16)
-    block_private_ips: ?bool = null,
-    /// Maximum size of downloaded content in bytes
-    max_download_size_bytes: ?i64 = null,
-    /// Timeout for individual download operations in seconds
-    download_timeout_seconds: ?i64 = null,
-    /// Maximum image width/height in pixels (images will be resized)
-    max_image_dimension: ?i64 = null,
-    /// Whitelist of allowed path prefixes for file:// and s3:// URLs. If empty, all paths are allowed. For file:// use absolute paths (e.g., /Users/data/). For s3:// use bucket/prefix (e.g., my-bucket/uploads/).
-    allowed_paths: ?[]const []const u8 = null,
-    /// User-Agent header for HTTP downloads. Defaults to 'AntflyDB/1.0' if not set. Some servers (e.g., Wikipedia) reject requests without a User-Agent.
-    user_agent: ?[]const u8 = null,
-};
-
-pub const Credentials = struct {
-    /// S3-compatible endpoint (e.g., 's3.amazonaws.com' or 'localhost:9000' for MinIO)
-    endpoint: ?[]const u8 = null,
-    /// Enable SSL/TLS for S3 connections (default: true for AWS, false for local MinIO)
-    use_ssl: ?bool = null,
-    /// AWS access key ID. Supports keystore syntax for secret lookup. Falls back to AWS_ACCESS_KEY_ID environment variable if not set.
-    access_key_id: ?[]const u8 = null,
-    /// AWS secret access key. Supports keystore syntax for secret lookup. Falls back to AWS_SECRET_ACCESS_KEY environment variable if not set.
-    secret_access_key: ?[]const u8 = null,
-    /// Optional AWS session token for temporary credentials. Supports keystore syntax for secret lookup.
-    session_token: ?[]const u8 = null,
+pub const DocumentClassificationRequest = struct {
+    /// Name or path of the document classification model directory or checkpoint
+    model: []const u8,
+    /// Absolute or server-local path to the page image
+    image_path: []const u8,
+    /// Number of OCR/text tokens associated with the page
+    num_tokens: i64,
+    /// Labels in the same order expected by the checkpoint output head
+    labels: []const []const u8,
+    /// Optional tensor prefix inside the safetensors checkpoint
+    prefix: ?[]const u8 = null,
 };
 
 pub const DocumentClassificationFeatures = struct {
@@ -104,19 +203,6 @@ pub const DocumentClassificationFeatures = struct {
     left_darkness: f32,
     right_darkness: f32,
     center_darkness: f32,
-};
-
-pub const DocumentClassificationRequest = struct {
-    /// Name or path of the document classification model directory or checkpoint
-    model: []const u8,
-    /// Absolute or server-local path to the page image
-    image_path: []const u8,
-    /// Number of OCR/text tokens associated with the page
-    num_tokens: i64,
-    /// Labels in the same order expected by the checkpoint output head
-    labels: []const []const u8,
-    /// Optional tensor prefix inside the safetensors checkpoint
-    prefix: ?[]const u8 = null,
 };
 
 pub const DocumentClassificationResult = struct {
@@ -144,35 +230,6 @@ pub const DocumentTokenClassificationResult = struct {
     score: f32,
 };
 
-/// OpenAI-compatible embedding request with inference multimodal content-part extension
-pub const EmbedRequest = struct {
-    /// Model name to use for embedding generation
-    model: []const u8,
-    /// Input content to embed. Supports: - a single string - an array of strings - an array of OpenAI-style content parts for multimodal embedding
-    input: std.json.Value,
-    /// Encoding format for the embeddings (only "float" supported)
-    encoding_format: ?[]const u8 = null,
-    /// Optional truncation size for dense embeddings. Must be a positive integer no larger than the model embedding size. Not supported for sparse models.
-    dimensions: ?i64 = null,
-    /// Optional embedding task type using Google embedding task-type names. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix.
-    task_type: ?[]const u8 = null,
-    /// Deprecated compatibility alias for task_type. search_query/query map to RETRIEVAL_QUERY; search_document/document map to RETRIEVAL_DOCUMENT; classification and clustering map to their Google task_type equivalents.
-    input_type: ?[]const u8 = null,
-};
-
-/// Token usage information
-pub const EmbeddingUsage = struct {
-    /// Number of tokens in the input
-    prompt_tokens: i64,
-    /// Total tokens used
-    total_tokens: i64,
-};
-
-pub const Error = struct {
-    /// Error message
-    @"error": []const u8,
-};
-
 pub const ExtractFieldValue = struct {
     /// The extracted text value
     value: []const u8,
@@ -191,6 +248,61 @@ pub const ExtractObject = struct {
     /// Extraction result for this input. Maps structure names to arrays of extracted instances. Each instance maps field names to ExtractFieldValue (for ::str fields) or arrays of ExtractFieldValue (for ::list fields).
     results: std.json.ArrayHashMap([]const std.json.Value),
 };
+
+pub const TextRegion = struct {
+    /// Recognized text within the region
+    text: []const u8,
+    /// Bounding box [x1, y1, x2, y2] in pixel coordinates
+    bbox: []const f64,
+    /// Recognition confidence score (0-1)
+    confidence: ?f64 = null,
+    /// Semantic label from layout analysis (e.g., text, title, table)
+    label: ?[]const u8 = null,
+};
+
+pub const TranscribeRequest = struct {
+    /// Name of transcriber model from models_dir/transcribers/
+    model: ?[]const u8 = null,
+    /// Base64-encoded audio data (WAV, MP3, FLAC, etc.)
+    audio: []const u8,
+    /// Force specific language for transcription (optional, model-dependent)
+    language: ?[]const u8 = null,
+};
+
+pub const TranscribeObject = struct {
+    object: []const u8,
+    /// Input audio index.
+    index: i64,
+    /// Transcribed text from the audio
+    text: []const u8,
+    /// Detected or forced language
+    language: ?[]const u8 = null,
+};
+
+/// Information about a model including its capabilities
+pub const ModelInfo = struct {
+    /// List of capabilities this model supports (omitted when empty). For rerankers, `late_interaction` or `colbert` selects native MaxSim token scoring.
+    capabilities: ?[]const []const u8 = null,
+    /// List of input modalities this model accepts, such as `text`, `image`, or `audio`
+    inputs: ?[]const []const u8 = null,
+};
+
+/// Definition of a function that can be called by the model
+pub const FunctionDefinition = struct {
+    /// The name of the function to call
+    name: []const u8,
+    /// A description of what the function does
+    description: ?[]const u8 = null,
+    /// JSON Schema object describing the function parameters
+    parameters: ?std.json.Value = null,
+    /// Whether to enforce strict parameter validation
+    strict: ?bool = null,
+};
+
+/// Controls how the model uses tools. Options: - "auto": Model decides whether to call a tool (default) - "none": Model will not call any tools - "required": Model must call at least one tool - object: Force a specific function to be called
+pub const ToolChoice = std.json.Value;
+
+pub const Role = antfly_generating_openapi.ChatMessageRole;
 
 /// Reason why generation stopped
 pub const FinishReason = enum {
@@ -227,17 +339,8 @@ pub const FinishReason = enum {
     }
 };
 
-/// Definition of a function that can be called by the model
-pub const FunctionDefinition = struct {
-    /// The name of the function to call
-    name: []const u8,
-    /// A description of what the function does
-    description: ?[]const u8 = null,
-    /// JSON Schema object describing the function parameters
-    parameters: ?std.json.Value = null,
-    /// Whether to enforce strict parameter validation
-    strict: ?bool = null,
-};
+/// Message content. Supports two formats: - Simple string: "Hello, how are you?" - Array of content parts (OpenAI multimodal format): [{"type": "text", "text": "Hello"}]
+pub const ChatMessageContent = std.json.Value;
 
 pub const GenerateJsonSchemaConfig = struct {
     /// Schema name
@@ -257,23 +360,39 @@ pub const GenerateUsage = struct {
     total_tokens: i64,
 };
 
-pub const ImageURL = antfly_generating_openapi.ImageURL;
+/// Incremental function call data for streaming
+pub const ToolCallFunctionDelta = struct {
+    /// Function name (only in first delta)
+    name: ?[]const u8 = null,
+    /// Incremental arguments JSON string
+    arguments: ?[]const u8 = null,
+};
 
-pub const ImageURLContentPart = antfly_generating_openapi.ImageURLContentPart;
-
-/// Logging verbosity level
-pub const Level = enum {
-    debug,
-    info,
-    warn,
-    @"error",
+/// Model registry kind.
+pub const ModelKind = enum {
+    generator,
+    embedder,
+    reranker,
+    chunker,
+    classifier,
+    recognizer,
+    rewriter,
+    reader,
+    transcriber,
+    extractor,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
-            .debug => "debug",
-            .info => "info",
-            .warn => "warn",
-            .@"error" => "error",
+            .generator => "generator",
+            .embedder => "embedder",
+            .reranker => "reranker",
+            .chunker => "chunker",
+            .classifier => "classifier",
+            .recognizer => "recognizer",
+            .rewriter => "rewriter",
+            .reader => "reader",
+            .transcriber => "transcriber",
+            .extractor => "extractor",
         };
         try jw.write(s);
     }
@@ -284,16 +403,20 @@ pub const Level = enum {
             else => return error.UnexpectedToken,
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "debug", .debug },
-            .{ "info", .info },
-            .{ "warn", .warn },
-            .{ "error", .@"error" },
+            .{ "generator", .generator },
+            .{ "embedder", .embedder },
+            .{ "reranker", .reranker },
+            .{ "chunker", .chunker },
+            .{ "classifier", .classifier },
+            .{ "recognizer", .recognizer },
+            .{ "rewriter", .rewriter },
+            .{ "reader", .reader },
+            .{ "transcriber", .transcriber },
+            .{ "extractor", .extractor },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
 };
-
-pub const MediaContentPart = antfly_generating_openapi.MediaContentPart;
 
 /// Optional backend preference for model loading or request execution. `auto` keeps the node default behavior. `xla` selects the PJRT/XLA backend and may require a PJRT plugin path via `ANTFLY_INFERENCE_XLA_PLUGIN`, `ANTFLY_INFERENCE_PJRT_PLUGIN`, `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`. `webgpu` selects the Wasm/WebGPU backend in Wasm builds; pair it with `mode: "compiled"` on generation requests to request WebGPU graph partition execution.
 pub const ModelBackend = enum {
@@ -371,64 +494,6 @@ pub const ModelFormat = enum {
     }
 };
 
-/// Information about a model including its capabilities
-pub const ModelInfo = struct {
-    /// List of capabilities this model supports (omitted when empty). For rerankers, `late_interaction` or `colbert` selects native MaxSim token scoring.
-    capabilities: ?[]const []const u8 = null,
-    /// List of input modalities this model accepts, such as `text`, `image`, or `audio`
-    inputs: ?[]const []const u8 = null,
-};
-
-/// Model registry kind.
-pub const ModelKind = enum {
-    generator,
-    embedder,
-    reranker,
-    chunker,
-    classifier,
-    recognizer,
-    rewriter,
-    reader,
-    transcriber,
-    extractor,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .generator => "generator",
-            .embedder => "embedder",
-            .reranker => "reranker",
-            .chunker => "chunker",
-            .classifier => "classifier",
-            .recognizer => "recognizer",
-            .rewriter => "rewriter",
-            .reader => "reader",
-            .transcriber => "transcriber",
-            .extractor => "extractor",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "generator", .generator },
-            .{ "embedder", .embedder },
-            .{ "reranker", .reranker },
-            .{ "chunker", .chunker },
-            .{ "classifier", .classifier },
-            .{ "recognizer", .recognizer },
-            .{ "rewriter", .rewriter },
-            .{ "reader", .reader },
-            .{ "transcriber", .transcriber },
-            .{ "extractor", .extractor },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
 /// Optional quantization preference for loading a model.
 pub const ModelQuantization = enum {
     q4_k,
@@ -458,26 +523,102 @@ pub const ModelQuantization = enum {
     }
 };
 
-pub const PredictRequest = struct {
-    /// Predictor name from the model catalog.
-    model: []const u8,
-    /// Batch of feature vectors. Max 10000 rows.
-    input: []const []const f32,
+/// Backend priority entry for model loading. Use `backend` or `backend:device`, where device defaults to `auto`. Backends: - `native` - Native CPU backend - `onnx` - ONNX Runtime backend - `metal` - Apple Metal backend - `cuda` - NVIDIA CUDA backend - `xla` - PJRT/XLA compiled backend - `webgpu` or `wasm` - Wasm/WebGPU backend in Wasm builds Devices: - `auto` - Auto-detect best available (default) - `cuda` - NVIDIA CUDA GPU - `tpu` - Google TPU (used by XLA) - `cpu` - Force CPU only
+pub const BackendPriorityEntry = []const u8;
+
+/// Runtime backends compiled into this inference server.
+pub const BackendRuntimes = struct {
+    /// Whether the native CPU backend is built into this runtime
+    native: ?bool = null,
+    /// Whether the ONNX Runtime backend is built into this runtime
+    onnx: ?bool = null,
+    /// Whether the Metal backend is built into this runtime
+    metal: ?bool = null,
+    /// Whether the CUDA backend is built into this runtime
+    cuda: ?bool = null,
+    /// Whether the PJRT/XLA backend is built into this runtime
+    xla: ?bool = null,
+    /// Whether the WASM backend is built into this runtime
+    wasm: ?bool = null,
 };
 
-/// Task type for tabular predictors.
-pub const PredictorTask = enum {
-    regression,
-    binary_classification,
-    multiclass,
-    ranking,
+/// Options specific to text chunking.
+pub const TextChunkOptions = struct {
+    /// Target number of tokens per chunk.
+    target_tokens: ?i64 = null,
+    /// Number of tokens to overlap between consecutive chunks. Helps maintain context across chunk boundaries. Only used by fixed-size chunkers.
+    overlap_tokens: ?i64 = null,
+    /// Separator string for splitting (e.g., '\n\n' for paragraphs). Only used by fixed-size chunkers.
+    separator: ?[]const u8 = null,
+};
+
+/// Text content with character offsets.
+pub const TextContent = struct {
+    /// The chunk text content
+    text: []const u8,
+    /// Character position in original text where chunk starts
+    start_char: i64,
+    /// Character position in original text where chunk ends (exclusive)
+    end_char: i64,
+};
+
+/// Binary media content with format-specific metadata.
+pub const BinaryContent = struct {
+    /// Base64-encoded binary data (valid WAV, PNG, etc.)
+    data: ?[]const u8 = null,
+    /// Audio: window start time in milliseconds
+    start_time_ms: ?f32 = null,
+    /// Audio: window end time in milliseconds
+    end_time_ms: ?f32 = null,
+    /// Animation: frame number
+    frame_index: ?i64 = null,
+    /// Animation: display delay in milliseconds
+    frame_delay_ms: ?i64 = null,
+};
+
+pub const ContentSecurityConfig = struct {
+    /// Whitelist of allowed hostnames/IPs for link downloads. If empty, all hosts are allowed (except private IPs if block_private_ips is true).
+    allowed_hosts: ?[]const []const u8 = null,
+    /// Block requests to private IP ranges (127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16)
+    block_private_ips: ?bool = null,
+    /// Maximum size of downloaded content in bytes
+    max_download_size_bytes: ?i64 = null,
+    /// Timeout for individual download operations in seconds
+    download_timeout_seconds: ?i64 = null,
+    /// Maximum image width/height in pixels (images will be resized)
+    max_image_dimension: ?i64 = null,
+    /// Whitelist of allowed path prefixes for file:// and s3:// URLs. If empty, all paths are allowed. For file:// use absolute paths (e.g., /Users/data/). For s3:// use bucket/prefix (e.g., my-bucket/uploads/).
+    allowed_paths: ?[]const []const u8 = null,
+    /// User-Agent header for HTTP downloads. Defaults to 'AntflyDB/1.0' if not set. Some servers (e.g., Wikipedia) reject requests without a User-Agent.
+    user_agent: ?[]const u8 = null,
+};
+
+pub const Credentials = struct {
+    /// S3-compatible endpoint (e.g., 's3.amazonaws.com' or 'localhost:9000' for MinIO)
+    endpoint: ?[]const u8 = null,
+    /// Enable SSL/TLS for S3 connections (default: true for AWS, false for local MinIO)
+    use_ssl: ?bool = null,
+    /// AWS access key ID. Supports keystore syntax for secret lookup. Falls back to AWS_ACCESS_KEY_ID environment variable if not set.
+    access_key_id: ?[]const u8 = null,
+    /// AWS secret access key. Supports keystore syntax for secret lookup. Falls back to AWS_SECRET_ACCESS_KEY environment variable if not set.
+    secret_access_key: ?[]const u8 = null,
+    /// Optional AWS session token for temporary credentials. Supports keystore syntax for secret lookup.
+    session_token: ?[]const u8 = null,
+};
+
+/// Logging verbosity level
+pub const Level = enum {
+    debug,
+    info,
+    warn,
+    @"error",
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
-            .regression => "regression",
-            .binary_classification => "binary_classification",
-            .multiclass => "multiclass",
-            .ranking => "ranking",
+            .debug => "debug",
+            .info => "info",
+            .warn => "warn",
+            .@"error" => "error",
         };
         try jw.write(s);
     }
@@ -488,90 +629,13 @@ pub const PredictorTask = enum {
             else => return error.UnexpectedToken,
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "regression", .regression },
-            .{ "binary_classification", .binary_classification },
-            .{ "multiclass", .multiclass },
-            .{ "ranking", .ranking },
+            .{ "debug", .debug },
+            .{ "info", .info },
+            .{ "warn", .warn },
+            .{ "error", .@"error" },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
-};
-
-pub const RecognizeEntity = struct {
-    /// The entity text
-    text: []const u8,
-    /// Entity type (PER, ORG, LOC, MISC)
-    label: []const u8,
-    /// Character offset where entity begins
-    start: i64,
-    /// Character offset where entity ends (exclusive)
-    end: i64,
-    /// Confidence score (0.0 to 1.0)
-    score: f32,
-};
-
-pub const RerankMultimodalDocument = struct {
-    /// Optional caller-provided document identifier
-    id: ?[]const u8 = null,
-    content: antfly_generating_openapi.ChatMessageContent,
-};
-
-pub const RerankObject = struct {
-    object: []const u8,
-    /// Original prompt index.
-    index: i64,
-    /// Relevance score for this prompt.
-    score: f32,
-};
-
-pub const RerankRequest = struct {
-    /// Name of reranking model from models_dir/rerankers/
-    model: []const u8,
-    /// Search query for relevance scoring
-    query: []const u8,
-    /// Pre-rendered document texts to rerank. The client is responsible for extracting and rendering document fields/templates before calling this endpoint.
-    prompts: []const []const u8,
-};
-
-/// Configuration for entity resolution. When present in a RecognizeRequest, the response entities and relations are deduplicated via entity resolution (e.g., "Elon Musk" and "Musk" are merged into a single entity).
-pub const ResolverConfig = struct {
-    /// Jaro-Winkler similarity threshold for merging entities (0.0-1.0)
-    similarity_threshold: ?f32 = null,
-    /// Whether entity types must match for merging
-    type_must_match: ?bool = null,
-    /// Minimum confidence score for entities to be included
-    min_entity_confidence: ?f32 = null,
-    /// Minimum confidence score for relations to be included
-    min_relation_confidence: ?f32 = null,
-    /// Whether to deduplicate relations after entity resolution
-    deduplicate_relations: ?bool = null,
-    /// Whether to track mention provenance for resolved entities
-    track_provenance: ?bool = null,
-};
-
-pub const RewriteObject = struct {
-    object: []const u8,
-    /// Original input text index.
-    index: i64,
-    /// Rewritten texts for this input, one per beam.
-    texts: []const []const u8,
-};
-
-pub const RewriteRequest = struct {
-    /// Name of Seq2Seq rewriter model from models_dir/rewriters/
-    model: []const u8,
-    /// Input texts to rewrite/transform
-    inputs: []const []const u8,
-};
-
-pub const Role = antfly_generating_openapi.ChatMessageRole;
-
-/// A sparse vector with parallel index/value arrays, sorted by index ascending
-pub const SparseVector = struct {
-    /// Token IDs from the model vocabulary (sorted ascending)
-    indices: []const i32,
-    /// Corresponding weights for each index (always positive)
-    values: []const f32,
 };
 
 /// Logging output format style. 'terminal' for colorized console, 'json' for structured JSON, 'logfmt' for token-efficient key=value pairs, 'noop' for silent.
@@ -606,79 +670,109 @@ pub const Style = enum {
     }
 };
 
-/// Options specific to text chunking.
-pub const TextChunkOptions = struct {
-    /// Target number of tokens per chunk.
-    target_tokens: ?i64 = null,
-    /// Number of tokens to overlap between consecutive chunks. Helps maintain context across chunk boundaries. Only used by fixed-size chunkers.
-    overlap_tokens: ?i64 = null,
-    /// Separator string for splitting (e.g., '\n\n' for paragraphs). Only used by fixed-size chunkers.
-    separator: ?[]const u8 = null,
+/// Token usage information
+pub const EmbeddingUsage = struct {
+    /// Number of tokens in the input
+    prompt_tokens: i64,
+    /// Total tokens used
+    total_tokens: i64,
 };
 
-/// Text content with character offsets.
-pub const TextContent = struct {
-    /// The chunk text content
-    text: []const u8,
-    /// Character position in original text where chunk starts
-    start_char: i64,
-    /// Character position in original text where chunk ends (exclusive)
-    end_char: i64,
+pub const PredictResponse = struct {
+    model: []const u8,
+    task: PredictorTask,
+    /// Per-row prediction arrays. Length equals the model's `num_outputs` (1 for regression / binary, `num_classes` for multiclass).
+    predictions: []const []const f32,
 };
 
-pub const TextContentPart = antfly_generating_openapi.TextContentPart;
-
-pub const TextRegion = struct {
-    /// Recognized text within the region
-    text: []const u8,
-    /// Bounding box [x1, y1, x2, y2] in pixel coordinates
-    bbox: []const f64,
-    /// Recognition confidence score (0-1)
-    confidence: ?f64 = null,
-    /// Semantic label from layout analysis (e.g., text, title, table)
-    label: ?[]const u8 = null,
+/// Traditional ML predictor metadata.
+pub const PredictorInfo = struct {
+    task: PredictorTask,
+    /// Number of feature columns expected by the predictor.
+    num_features: i64,
+    /// Number of output values emitted per input row.
+    num_outputs: i64,
+    /// Optional feature names in input order.
+    feature_names: ?[]const []const u8 = null,
+    /// Source framework used to produce the predictor IR.
+    source_framework: ?[]const u8 = null,
 };
 
-/// Incremental function call data for streaming
-pub const ToolCallFunctionDelta = struct {
-    /// Function name (only in first delta)
-    name: ?[]const u8 = null,
-    /// Incremental arguments JSON string
-    arguments: ?[]const u8 = null,
+/// Exactly one of `texts` or `images` must be provided. When using `images`, the server selects a compatible reader internally and processes the request as: read document text -> run structured extraction.
+pub const ExtractRequest = struct {
+    /// Name of extractor model with 'extraction' capability
+    model: []const u8,
+    /// Texts to extract structured data from
+    texts: ?[]const []const u8 = null,
+    /// Optional images to extract structured data from. When provided, the server first reads document text with a compatible reader and then runs schema extraction on the read text.
+    images: ?[]const ImageURL = null,
+    /// Optional read-stage prompt used only when `images` are provided. Passed through to the reader before schema extraction.
+    prompt: ?[]const u8 = null,
+    /// Maximum tokens for the read stage when `images` are provided. Ignored for text-only extraction requests.
+    max_tokens: ?i64 = null,
+    /// Extraction schema mapping structure names to field definitions. Each field is defined as "field_name::type" where type is "str" or "list". Optional choice fields: "field_name::[opt1|opt2]::str". If no type is specified, defaults to "str".
+    schema: std.json.ArrayHashMap([]const []const u8),
+    /// Score threshold for span extraction (0.0-1.0)
+    threshold: ?f32 = null,
+    /// If true, don't allow nested/overlapping entities
+    flat_ner: ?bool = null,
+    /// If true, include confidence scores in output
+    include_confidence: ?bool = null,
+    /// If true, include character offset spans in output
+    include_spans: ?bool = null,
 };
 
-/// Controls how the model uses tools. Options: - "auto": Model decides whether to call a tool (default) - "none": Model will not call any tools - "required": Model must call at least one tool - object: Force a specific function to be called
-pub const ToolChoice = std.json.Value;
+pub const ReadRequest = struct {
+    /// Name of reader model from models_dir/readers/
+    model: []const u8,
+    /// Images to read text from. Supports: - Data URIs: `data:image/png;base64,...` - URLs (if content_security allows)
+    images: []const ImageURL,
+    /// Optional task prompt for document understanding models. - TrOCR: Not used (pure OCR) - Donut CORD: "<s_cord-v2>" for receipt parsing - Donut DocVQA: "<s_docvqa><s_question>What is the total?</s_question><s_answer>" - Florence-2: "<OCR>" for OCR, "<CAPTION>" for captioning - Pix2Struct: "What type of document is this?" - Moondream: "Describe this image."
+    prompt: ?[]const u8 = null,
+    /// Maximum tokens to generate
+    max_tokens: ?i64 = null,
+};
 
-pub const TranscribeObject = struct {
+/// A single embedding result
+pub const EmbeddingObject = struct {
+    /// Object type, always "embedding"
     object: []const u8,
-    /// Input audio index.
+    /// Dense float vector for dense models, or a sparse vector object for sparse-capable models
+    embedding: ?std.json.Value = null,
+    /// Index of the input this embedding corresponds to
     index: i64,
-    /// Transcribed text from the audio
-    text: []const u8,
-    /// Detected or forced language
-    language: ?[]const u8 = null,
 };
 
-pub const TranscribeRequest = struct {
-    /// Name of transcriber model from models_dir/transcribers/
-    model: ?[]const u8 = null,
-    /// Base64-encoded audio data (WAV, MP3, FLAC, etc.)
-    audio: []const u8,
-    /// Force specific language for transcription (optional, model-dependent)
-    language: ?[]const u8 = null,
+pub const RerankMultimodalRequest = struct {
+    /// Name of multimodal reranking model from models_dir/rerankers/
+    model: []const u8,
+    /// Text query for relevance scoring
+    query: []const u8,
+    /// Documents expressed as text and image content parts
+    documents: []const RerankMultimodalDocument,
 };
 
-/// Options for Voice Activity Detection (VAD) based audio segmentation. inference-specific.
-pub const VADOptions = struct {
-    /// Minimum silence duration (ms) to split speech segments. Gaps shorter than this are merged. Higher values produce longer, fewer segments. Default: 300.
-    min_silence_duration_ms: ?i64 = null,
-    /// Minimum speech duration (ms) for a segment to be kept. Shorter segments are discarded. Default: 250.
-    min_speech_duration_ms: ?i64 = null,
-    /// Padding (ms) added before and after detected speech. Default: 30.
-    speech_pad_ms: ?i64 = null,
-    /// Maximum segment duration (ms). Segments longer than this are split. Useful for Whisper-compatible chunking. Default: 30000.
-    max_segment_duration_ms: ?i64 = null,
+pub const Relation = struct {
+    /// The subject/head entity in the relationship
+    head: RecognizeEntity,
+    /// The object/tail entity in the relationship
+    tail: RecognizeEntity,
+    /// The relationship type
+    label: []const u8,
+    /// Confidence score for the relation (0.0 to 1.0)
+    score: f32,
+};
+
+pub const RecognizeRequest = struct {
+    /// Name of recognizer model from models_dir/recognizers/
+    model: []const u8,
+    /// Texts to extract entities from
+    texts: []const []const u8,
+    /// Custom entity labels to extract (GLiNER models only). When using a GLiNER model, you can specify any entity types to extract, enabling zero-shot NER without model retraining. If not provided, the model's default labels are used.
+    labels: ?[]const []const u8 = null,
+    /// Relation types to extract (for models with 'relations' capability). Only used when the model supports relation extraction (GLiNER multitask, REBEL). Relation extraction runs only when this array is provided and non-empty. GLiNER labels may be relation names (works_for), head-qualified labels (person::works_for), or head/tail-qualified labels (person::works_for::organization).
+    relation_labels: ?[]const []const u8 = null,
+    resolver: ?ResolverConfig = null,
 };
 
 pub const ClassifyObject = struct {
@@ -719,6 +813,15 @@ pub const DocumentTokenClassificationPrediction = struct {
     scores: []const DocumentTokenClassificationResult,
 };
 
+pub const ReadResult = struct {
+    /// Extracted text from the image
+    text: []const u8,
+    /// Structured fields extracted by document understanding models (Donut, Florence-2). Fields are flattened with dot notation for nested structures. Only present for models that output structured data.
+    fields: ?std.json.ArrayHashMap([]const u8) = null,
+    /// Individual text regions with bounding boxes and recognized text. Populated by multi-stage OCR models (Surya, PaddleOCR).
+    regions: ?[]const TextRegion = null,
+};
+
 /// A tool (function) that the model can call
 pub const Tool = struct {
     /// The type of tool (currently only "function" is supported)
@@ -726,11 +829,48 @@ pub const Tool = struct {
     function: FunctionDefinition,
 };
 
+pub const ChatMessage = struct {
+    role: Role,
+    content: ?antfly_generating_openapi.ChatMessageContent = null,
+    /// Tool calls made by the assistant (only for role=assistant)
+    tool_calls: ?[]const antfly_generating_openapi.ToolCall = null,
+    /// ID of the tool call this message is responding to (only for role=tool)
+    tool_call_id: ?[]const u8 = null,
+};
+
+pub const GenerateMessage = struct {
+    role: Role,
+    /// The generated message content (null when tool_calls is present)
+    content: ?[]const u8 = null,
+    /// Tool calls made by the model (only present when finish_reason is tool_calls)
+    tool_calls: ?[]const antfly_generating_openapi.ToolCall = null,
+};
+
 pub const GenerateResponseFormat = struct {
     /// Structured output mode
     type: []const u8,
     /// Optional schema payload for `type=json_schema`. Enforced during native constrained decoding and validated after generation.
     json_schema: ?GenerateJsonSchemaConfig = null,
+};
+
+pub const RerankResponse = struct {
+    /// Object type, always "list"
+    object: []const u8,
+    /// Rerank score objects, one per input prompt.
+    data: []const RerankObject,
+    /// Name of model used for reranking
+    model: []const u8,
+    usage: GenerateUsage,
+};
+
+pub const RewriteResponse = struct {
+    /// Object type, always "list"
+    object: []const u8,
+    /// Rewritten text objects, one per input.
+    data: []const RewriteObject,
+    /// Name of model used for rewriting
+    model: []const u8,
+    usage: GenerateUsage,
 };
 
 pub const ExtractResponse = struct {
@@ -743,39 +883,35 @@ pub const ExtractResponse = struct {
     usage: GenerateUsage,
 };
 
-/// Exactly one of `texts` or `images` must be provided. When using `images`, the server selects a compatible reader internally and processes the request as: read document text -> run structured extraction.
-pub const ExtractRequest = struct {
-    /// Name of extractor model with 'extraction' capability
+pub const TranscribeResponse = struct {
+    /// Object type, always "list"
+    object: []const u8,
+    /// Transcription result objects.
+    data: []const TranscribeObject,
+    /// Name of model used for transcription
     model: []const u8,
-    /// Texts to extract structured data from
-    texts: ?[]const []const u8 = null,
-    /// Optional images to extract structured data from. When provided, the server first reads document text with a compatible reader and then runs schema extraction on the read text.
-    images: ?[]const ImageURL = null,
-    /// Optional read-stage prompt used only when `images` are provided. Passed through to the reader before schema extraction.
-    prompt: ?[]const u8 = null,
-    /// Maximum tokens for the read stage when `images` are provided. Ignored for text-only extraction requests.
-    max_tokens: ?i64 = null,
-    /// Extraction schema mapping structure names to field definitions. Each field is defined as "field_name::type" where type is "str" or "list". Optional choice fields: "field_name::[opt1|opt2]::str". If no type is specified, defaults to "str".
-    schema: std.json.ArrayHashMap([]const []const u8),
-    /// Score threshold for span extraction (0.0-1.0)
-    threshold: ?f32 = null,
-    /// If true, don't allow nested/overlapping entities
-    flat_ner: ?bool = null,
-    /// If true, include confidence scores in output
-    include_confidence: ?bool = null,
-    /// If true, include character offset spans in output
-    include_spans: ?bool = null,
+    usage: GenerateUsage,
 };
 
-pub const ReadRequest = struct {
-    /// Name of reader model from models_dir/readers/
-    model: []const u8,
-    /// Images to read text from. Supports: - Data URIs: `data:image/png;base64,...` - URLs (if content_security allows)
-    images: []const ImageURL,
-    /// Optional task prompt for document understanding models. - TrOCR: Not used (pure OCR) - Donut CORD: "<s_cord-v2>" for receipt parsing - Donut DocVQA: "<s_docvqa><s_question>What is the total?</s_question><s_answer>" - Florence-2: "<OCR>" for OCR, "<CAPTION>" for captioning - Pix2Struct: "What type of document is this?" - Moondream: "Describe this image."
-    prompt: ?[]const u8 = null,
-    /// Maximum tokens to generate
-    max_tokens: ?i64 = null,
+/// Incremental tool call data for streaming
+pub const ToolCallDelta = struct {
+    /// Index of the tool call in the array
+    index: ?i64 = null,
+    /// Unique identifier (only in first delta for this index)
+    id: ?[]const u8 = null,
+    /// The type of tool call (only in first delta)
+    type: ?[]const u8 = null,
+    function: ?ToolCallFunctionDelta = null,
+};
+
+/// Model reference used by startup preload and model-loading configuration.
+pub const ModelRef = struct {
+    kind: ModelKind,
+    /// Model name to resolve within the registry for the selected kind, usually in `<owner>/<repo>` format.
+    name: []const u8,
+    backend: ?ModelBackend = null,
+    format: ?ModelFormat = null,
+    quantization: ?ModelQuantization = null,
 };
 
 pub const ModelsResponse = struct {
@@ -808,121 +944,6 @@ pub const ModelsResponse = struct {
     transcribers: std.json.ArrayHashMap(ModelInfo),
 };
 
-/// Model reference used by startup preload and model-loading configuration.
-pub const ModelRef = struct {
-    kind: ModelKind,
-    /// Model name to resolve within the registry for the selected kind, usually in `<owner>/<repo>` format.
-    name: []const u8,
-    backend: ?ModelBackend = null,
-    format: ?ModelFormat = null,
-    quantization: ?ModelQuantization = null,
-};
-
-pub const PredictResponse = struct {
-    model: []const u8,
-    task: PredictorTask,
-    /// Per-row prediction arrays. Length equals the model's `num_outputs` (1 for regression / binary, `num_classes` for multiclass).
-    predictions: []const []const f32,
-};
-
-/// Traditional ML predictor metadata.
-pub const PredictorInfo = struct {
-    task: PredictorTask,
-    /// Number of feature columns expected by the predictor.
-    num_features: i64,
-    /// Number of output values emitted per input row.
-    num_outputs: i64,
-    /// Optional feature names in input order.
-    feature_names: ?[]const []const u8 = null,
-    /// Source framework used to produce the predictor IR.
-    source_framework: ?[]const u8 = null,
-};
-
-pub const Relation = struct {
-    /// The subject/head entity in the relationship
-    head: RecognizeEntity,
-    /// The object/tail entity in the relationship
-    tail: RecognizeEntity,
-    /// The relationship type
-    label: []const u8,
-    /// Confidence score for the relation (0.0 to 1.0)
-    score: f32,
-};
-
-pub const RerankMultimodalRequest = struct {
-    /// Name of multimodal reranking model from models_dir/rerankers/
-    model: []const u8,
-    /// Text query for relevance scoring
-    query: []const u8,
-    /// Documents expressed as text and image content parts
-    documents: []const RerankMultimodalDocument,
-};
-
-pub const RerankResponse = struct {
-    /// Object type, always "list"
-    object: []const u8,
-    /// Rerank score objects, one per input prompt.
-    data: []const RerankObject,
-    /// Name of model used for reranking
-    model: []const u8,
-    usage: GenerateUsage,
-};
-
-pub const RecognizeRequest = struct {
-    /// Name of recognizer model from models_dir/recognizers/
-    model: []const u8,
-    /// Texts to extract entities from
-    texts: []const []const u8,
-    /// Custom entity labels to extract (GLiNER models only). When using a GLiNER model, you can specify any entity types to extract, enabling zero-shot NER without model retraining. If not provided, the model's default labels are used.
-    labels: ?[]const []const u8 = null,
-    /// Relation types to extract (for models with 'relations' capability). Only used when the model supports relation extraction (GLiNER multitask, REBEL). Relation extraction runs only when this array is provided and non-empty. GLiNER labels may be relation names (works_for), head-qualified labels (person::works_for), or head/tail-qualified labels (person::works_for::organization).
-    relation_labels: ?[]const []const u8 = null,
-    resolver: ?ResolverConfig = null,
-};
-
-pub const RewriteResponse = struct {
-    /// Object type, always "list"
-    object: []const u8,
-    /// Rewritten text objects, one per input.
-    data: []const RewriteObject,
-    /// Name of model used for rewriting
-    model: []const u8,
-    usage: GenerateUsage,
-};
-
-pub const ChatMessage = struct {
-    role: Role,
-    content: ?antfly_generating_openapi.ChatMessageContent = null,
-    /// Tool calls made by the assistant (only for role=assistant)
-    tool_calls: ?[]const antfly_generating_openapi.ToolCall = null,
-    /// ID of the tool call this message is responding to (only for role=tool)
-    tool_call_id: ?[]const u8 = null,
-};
-
-pub const GenerateMessage = struct {
-    role: Role,
-    /// The generated message content (null when tool_calls is present)
-    content: ?[]const u8 = null,
-    /// Tool calls made by the model (only present when finish_reason is tool_calls)
-    tool_calls: ?[]const antfly_generating_openapi.ToolCall = null,
-};
-
-/// A single embedding result
-pub const EmbeddingObject = struct {
-    /// Object type, always "embedding"
-    object: []const u8,
-    /// Dense float vector for dense models, or a sparse vector object for sparse-capable models
-    embedding: ?std.json.Value = null,
-    /// Index of the input this embedding corresponds to
-    index: i64,
-};
-
-/// Logging configuration for inference services
-pub const SchemasConfig = struct {
-    level: ?Level = null,
-    style: ?Style = null,
-};
-
 /// A chunk of content. Text chunks have mime_type text/plain.
 pub const Chunk = struct {
     /// The chunk text content
@@ -947,43 +968,38 @@ pub const Chunk = struct {
     mime_type: []const u8,
 };
 
-pub const ReadResult = struct {
-    /// Extracted text from the image
-    text: []const u8,
-    /// Structured fields extracted by document understanding models (Donut, Florence-2). Fields are flattened with dot notation for nested structures. Only present for models that output structured data.
-    fields: ?std.json.ArrayHashMap([]const u8) = null,
-    /// Individual text regions with bounding boxes and recognized text. Populated by multi-stage OCR models (Surya, PaddleOCR).
-    regions: ?[]const TextRegion = null,
+/// Logging configuration for inference services
+pub const SchemasConfig = struct {
+    level: ?Level = null,
+    style: ?Style = null,
 };
 
-/// Incremental tool call data for streaming
-pub const ToolCallDelta = struct {
-    /// Index of the tool call in the array
-    index: ?i64 = null,
-    /// Unique identifier (only in first delta for this index)
-    id: ?[]const u8 = null,
-    /// The type of tool call (only in first delta)
-    type: ?[]const u8 = null,
-    function: ?ToolCallFunctionDelta = null,
+pub const PredictorsResponse = struct {
+    /// Response object type.
+    object: []const u8,
+    /// Traditional ML predictors keyed by predictor name.
+    predictors: std.json.ArrayHashMap(PredictorInfo),
 };
 
-pub const TranscribeResponse = struct {
+/// OpenAI-compatible embedding response with a polymorphic `embedding` field for dense or sparse vectors
+pub const EmbedResponse = struct {
     /// Object type, always "list"
     object: []const u8,
-    /// Transcription result objects.
-    data: []const TranscribeObject,
-    /// Name of model used for transcription
+    /// List of embedding objects
+    data: []const EmbeddingObject,
+    /// Model used for embedding generation
     model: []const u8,
-    usage: GenerateUsage,
+    usage: EmbeddingUsage,
 };
 
-/// Audio chunking configuration for inference, including VAD options.
-pub const AudioChunkConfig = struct {
-    /// Window duration in milliseconds for fixed-window audio chunking (default: 30000).
-    window_duration_ms: ?i64 = null,
-    /// Overlap duration in milliseconds between audio chunks (default: 0).
-    overlap_duration_ms: ?i64 = null,
-    vad: ?VADOptions = null,
+pub const RecognizeObject = struct {
+    object: []const u8,
+    /// Original input text index.
+    index: i64,
+    /// Entities recognized for this input text.
+    entities: []const RecognizeEntity,
+    /// Relations recognized for this input text. Only present when using a model with 'relations' capability (GLiNER multitask, REBEL).
+    relations: ?[]const Relation = null,
 };
 
 pub const ClassifyResponse = struct {
@@ -1014,21 +1030,25 @@ pub const DocumentTokenClassificationObject = struct {
     predictions: []const DocumentTokenClassificationPrediction,
 };
 
-pub const PredictorsResponse = struct {
-    /// Response object type.
+pub const ReadObject = struct {
+    /// Extracted text from the image
+    text: []const u8,
+    /// Structured fields extracted by document understanding models (Donut, Florence-2). Fields are flattened with dot notation for nested structures. Only present for models that output structured data.
+    fields: ?std.json.ArrayHashMap([]const u8) = null,
+    /// Individual text regions with bounding boxes and recognized text. Populated by multi-stage OCR models (Surya, PaddleOCR).
+    regions: ?[]const TextRegion = null,
     object: []const u8,
-    /// Traditional ML predictors keyed by predictor name.
-    predictors: std.json.ArrayHashMap(PredictorInfo),
+    /// Original input image index.
+    index: i64,
 };
 
-pub const RecognizeObject = struct {
-    object: []const u8,
-    /// Original input text index.
+pub const GenerateChoice = struct {
+    /// Index of this choice in the list
     index: i64,
-    /// Entities recognized for this input text.
-    entities: []const RecognizeEntity,
-    /// Relations recognized for this input text. Only present when using a model with 'relations' capability (GLiNER multitask, REBEL).
-    relations: ?[]const Relation = null,
+    message: GenerateMessage,
+    finish_reason: FinishReason,
+    /// Log probability information (not supported, always null)
+    logprobs: ?std.json.Value = null,
 };
 
 pub const GenerateRequest = struct {
@@ -1077,24 +1097,40 @@ pub const GenerateRequest = struct {
     tool_choice: ?ToolChoice = null,
 };
 
-pub const GenerateChoice = struct {
-    /// Index of this choice in the list
-    index: i64,
-    message: GenerateMessage,
-    finish_reason: FinishReason,
-    /// Log probability information (not supported, always null)
-    logprobs: ?std.json.Value = null,
+/// Delta content for streaming
+pub const GenerateDelta = struct {
+    role: ?Role = null,
+    /// Token content delta
+    content: ?[]const u8 = null,
+    /// Tool call deltas for streaming tool calls
+    tool_calls: ?[]const ToolCallDelta = null,
 };
 
-/// OpenAI-compatible embedding response with a polymorphic `embedding` field for dense or sparse vectors
-pub const EmbedResponse = struct {
-    /// Object type, always "list"
+/// A chunk result object. Text chunks have mime_type text/plain.
+pub const ChunkObject = struct {
+    /// The chunk text content
+    text: ?[]const u8 = null,
+    /// Character position in original text where chunk starts
+    start_char: ?i64 = null,
+    /// Character position in original text where chunk ends (exclusive)
+    end_char: ?i64 = null,
+    /// Base64-encoded binary data (valid WAV, PNG, etc.)
+    data: ?[]const u8 = null,
+    /// Audio: window start time in milliseconds
+    start_time_ms: ?f32 = null,
+    /// Audio: window end time in milliseconds
+    end_time_ms: ?f32 = null,
+    /// Animation: frame number
+    frame_index: ?i64 = null,
+    /// Animation: display delay in milliseconds
+    frame_delay_ms: ?i64 = null,
+    /// Sequence number of the chunk (0, 1, 2, ...)
+    id: ?i64 = null,
+    /// MIME type: text/plain, audio/wav, image/png, etc.
+    mime_type: ?[]const u8 = null,
     object: []const u8,
-    /// List of embedding objects
-    data: []const EmbeddingObject,
-    /// Model used for embedding generation
-    model: []const u8,
-    usage: EmbeddingUsage,
+    /// Position of this chunk object in the response data array.
+    index: i64,
 };
 
 pub const Config = struct {
@@ -1135,64 +1171,14 @@ pub const Config = struct {
     log: ?SchemasConfig = null,
 };
 
-/// A chunk result object. Text chunks have mime_type text/plain.
-pub const ChunkObject = struct {
-    /// The chunk text content
-    text: ?[]const u8 = null,
-    /// Character position in original text where chunk starts
-    start_char: ?i64 = null,
-    /// Character position in original text where chunk ends (exclusive)
-    end_char: ?i64 = null,
-    /// Base64-encoded binary data (valid WAV, PNG, etc.)
-    data: ?[]const u8 = null,
-    /// Audio: window start time in milliseconds
-    start_time_ms: ?f32 = null,
-    /// Audio: window end time in milliseconds
-    end_time_ms: ?f32 = null,
-    /// Animation: frame number
-    frame_index: ?i64 = null,
-    /// Animation: display delay in milliseconds
-    frame_delay_ms: ?i64 = null,
-    /// Sequence number of the chunk (0, 1, 2, ...)
-    id: ?i64 = null,
-    /// MIME type: text/plain, audio/wav, image/png, etc.
-    mime_type: ?[]const u8 = null,
+pub const RecognizeResponse = struct {
+    /// Object type, always "list"
     object: []const u8,
-    /// Position of this chunk object in the response data array.
-    index: i64,
-};
-
-pub const ReadObject = struct {
-    /// Extracted text from the image
-    text: []const u8,
-    /// Structured fields extracted by document understanding models (Donut, Florence-2). Fields are flattened with dot notation for nested structures. Only present for models that output structured data.
-    fields: ?std.json.ArrayHashMap([]const u8) = null,
-    /// Individual text regions with bounding boxes and recognized text. Populated by multi-stage OCR models (Surya, PaddleOCR).
-    regions: ?[]const TextRegion = null,
-    object: []const u8,
-    /// Original input image index.
-    index: i64,
-};
-
-/// Delta content for streaming
-pub const GenerateDelta = struct {
-    role: ?Role = null,
-    /// Token content delta
-    content: ?[]const u8 = null,
-    /// Tool call deltas for streaming tool calls
-    tool_calls: ?[]const ToolCallDelta = null,
-};
-
-/// Configuration for chunking requests to Inference API. Combines shared text options with inference-specific audio/VAD options.
-pub const ChunkConfig = struct {
-    /// The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/.
-    model: ?[]const u8 = null,
-    /// Maximum number of chunks to generate per document.
-    max_chunks: ?i64 = null,
-    /// Confidence threshold for model-based chunking (0.0-1.0). Used by ONNX text models and VAD audio models.
-    threshold: ?f32 = null,
-    text: ?TextChunkOptions = null,
-    audio: ?AudioChunkConfig = null,
+    /// Recognition result objects, one per input text.
+    data: []const RecognizeObject,
+    /// Name of model used for NER
+    model: []const u8,
+    usage: GenerateUsage,
 };
 
 pub const DocumentTokenClassificationResponse = struct {
@@ -1203,12 +1189,12 @@ pub const DocumentTokenClassificationResponse = struct {
     usage: GenerateUsage,
 };
 
-pub const RecognizeResponse = struct {
+pub const ReadResponse = struct {
     /// Object type, always "list"
     object: []const u8,
-    /// Recognition result objects, one per input text.
-    data: []const RecognizeObject,
-    /// Name of model used for NER
+    /// Read result objects, one per input image.
+    data: []const ReadObject,
+    /// Name of model used for reading
     model: []const u8,
     usage: GenerateUsage,
 };
@@ -1228,6 +1214,12 @@ pub const GenerateResponse = struct {
     usage: GenerateUsage,
 };
 
+pub const GenerateChunkChoice = struct {
+    index: i64,
+    delta: GenerateDelta,
+    finish_reason: ?FinishReason = null,
+};
+
 pub const ChunkResponse = struct {
     /// Object type, always "list"
     object: []const u8,
@@ -1238,28 +1230,6 @@ pub const ChunkResponse = struct {
     usage: GenerateUsage,
     /// Whether result was served from cache
     cache_hit: bool,
-};
-
-pub const ReadResponse = struct {
-    /// Object type, always "list"
-    object: []const u8,
-    /// Read result objects, one per input image.
-    data: []const ReadObject,
-    /// Name of model used for reading
-    model: []const u8,
-    usage: GenerateUsage,
-};
-
-pub const GenerateChunkChoice = struct {
-    index: i64,
-    delta: GenerateDelta,
-    finish_reason: ?FinishReason = null,
-};
-
-pub const ChunkRequest = struct {
-    /// Input content to chunk. Supports two formats: - Text string: `"This is a long document..."` (backward compatible) - ContentPart: `{"type": "media", "data": "<base64>", "mime_type": "audio/wav"}` - ContentPart: `{"type": "text", "text": "..."}`
-    input: ?std.json.Value = null,
-    config: ?ChunkConfig = null,
 };
 
 /// Streaming generation chunk (SSE event data)

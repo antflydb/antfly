@@ -24,10 +24,10 @@ class InferenceChunkRequest:
     Attributes:
         input_ (ImageURLContentPart | MediaContentPart | str | TextContentPart | Unset): Input content to chunk.
             Supports two formats:
-            - Text string: `"This is a long document..."` (backward compatible)
+            - Text string: `"This is a long document..."`
             - ContentPart: `{"type": "media", "data": "<base64>", "mime_type": "audio/wav"}`
             - ContentPart: `{"type": "text", "text": "..."}`
-        config (InferenceChunkConfig | Unset): Configuration for chunking requests to Inference API.
+        config (InferenceChunkConfig | Unset): Configuration for chunking requests to Antfly inference.
             Combines shared text options with inference-specific audio/VAD options.
     """
 

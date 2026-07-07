@@ -1010,7 +1010,9 @@ fn addOpenApiRegenStep(
             .{ "../shared/logging.yaml", "antfly_logging_openapi" },
             .{ "../shared/generating.yaml", "antfly_generating_openapi" },
         }),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/shared/chunking.yaml"), "antfly_chunking_api_openapi", antfly_generated_root ++ "/antfly_chunking_api_openapi", "types", &.{}),
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/shared/chunking.yaml"), "antfly_chunking_api_openapi", antfly_generated_root ++ "/antfly_chunking_api_openapi", "types", &.{
+            .{ "generating.yaml", "antfly_generating_openapi" },
+        }),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/chunking.yaml"), "antfly_chunking_openapi", antfly_generated_root ++ "/antfly_chunking_openapi", "types", &.{
             .{ "../shared/chunking.yaml", "antfly_chunking_api_openapi" },
         }),
@@ -1038,6 +1040,7 @@ fn addOpenApiRegenStep(
         }),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/inference/api.yaml"), "inference_api", inference_generated_root ++ "/inference_api", "types,server", &.{
             .{ "../shared/generating.yaml", "antfly_generating_openapi" },
+            .{ "../shared/chunking.yaml", "antfly_chunking_api_openapi" },
             .{ "../ai/extraction.yaml", "antfly_extraction_openapi" },
         }),
         addOpenApiRegenRun(b, openapi_codegen, b.path("specs/openai-openapi.yaml"), "openai_api", antfly_generated_root ++ "/openai_api", "types", &.{}),
@@ -1213,6 +1216,7 @@ pub fn build(b: *std.Build) void {
     metadata_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     metadata_openapi_mod.addImport("antfly_reranking_openapi", reranking_openapi_mod);
     metadata_openapi_mod.addImport("antfly_query_openapi", query_openapi_mod);
+    chunking_api_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     chunking_openapi_mod.addImport("antfly_chunking_api_openapi", chunking_api_openapi_mod);
     audio_openapi_mod.addImport("antfly_s3_openapi", s3_openapi_mod);
     inference_config_openapi_mod.addImport("antfly_chunking_api_openapi", chunking_api_openapi_mod);
@@ -1564,6 +1568,7 @@ pub fn build(b: *std.Build) void {
     const inference_build_options_mod = inference_graph.build_options_mod;
     const inference_api_mod = inference_graph.inference_api_mod;
     inference_api_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
+    inference_api_mod.addImport("antfly_chunking_api_openapi", chunking_api_openapi_mod);
     inference_api_mod.addImport("antfly_extraction_openapi", extraction_openapi_mod);
     const inference_hf_tokenizer_mod = inference_graph.inference_hf_tokenizer_mod;
     const inference_fixed_tokenizer_data_mod = inference_graph.inference_fixed_tokenizer_data_mod;

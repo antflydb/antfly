@@ -379,7 +379,6 @@ from .inference_rewrite_response_object import InferenceRewriteResponseObject
 from .inference_role import InferenceRole
 from .inference_sparse_vector import InferenceSparseVector
 from .inference_style import InferenceStyle
-from .inference_text_chunk_options import InferenceTextChunkOptions
 from .inference_text_content import InferenceTextContent
 from .inference_text_content_part import InferenceTextContentPart
 from .inference_text_content_part_type import InferenceTextContentPartType
@@ -397,7 +396,6 @@ from .inference_transcribe_object_object import InferenceTranscribeObjectObject
 from .inference_transcribe_request import InferenceTranscribeRequest
 from .inference_transcribe_response import InferenceTranscribeResponse
 from .inference_transcribe_response_object import InferenceTranscribeResponseObject
-from .inference_vad_options import InferenceVADOptions
 from .inferenceschemas_config import InferenceschemasConfig
 from .install_extension_request import InstallExtensionRequest
 from .install_manifest import InstallManifest
@@ -620,6 +618,7 @@ from .update_manifest_ref import UpdateManifestRef
 from .update_password_request import UpdatePasswordRequest
 from .user import User
 from .user_metadata_type_0 import UserMetadataType0
+from .vad_options import VADOptions
 from .vertex_embedder_config import VertexEmbedderConfig
 from .vertex_generator_config import VertexGeneratorConfig
 from .vertex_reranker_config import VertexRerankerConfig
@@ -1010,7 +1009,6 @@ __all__ = (
     "InferenceschemasConfig",
     "InferenceSparseVector",
     "InferenceStyle",
-    "InferenceTextChunkOptions",
     "InferenceTextContent",
     "InferenceTextContentPart",
     "InferenceTextContentPartType",
@@ -1028,7 +1026,6 @@ __all__ = (
     "InferenceTranscribeRequest",
     "InferenceTranscribeResponse",
     "InferenceTranscribeResponseObject",
-    "InferenceVADOptions",
     "InstalledExtension",
     "InstalledExtensionStatus",
     "InstallExtensionRequest",
@@ -1250,6 +1247,7 @@ __all__ = (
     "UpdatePasswordRequest",
     "User",
     "UserMetadataType0",
+    "VADOptions",
     "VertexEmbedderConfig",
     "VertexGeneratorConfig",
     "VertexRerankerConfig",

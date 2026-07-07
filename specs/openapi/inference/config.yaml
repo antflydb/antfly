@@ -231,76 +231,14 @@ components:
     # Chunking Types - reference existing schemas
     Chunk:
       $ref: "../shared/chunking.yaml#/components/schemas/Chunk"
-
     VADOptions:
-      type: object
-      description: "Options for Voice Activity Detection (VAD) based audio segmentation. Antfly inference-specific."
-      properties:
-        min_silence_duration_ms:
-          type: integer
-          description: "Minimum silence duration (ms) to split speech segments. Gaps shorter than this are merged. Higher values produce longer, fewer segments. Default: 300."
-        min_speech_duration_ms:
-          type: integer
-          description: "Minimum speech duration (ms) for a segment to be kept. Shorter segments are discarded. Default: 250."
-        speech_pad_ms:
-          type: integer
-          description: "Padding (ms) added before and after detected speech. Default: 30."
-        max_segment_duration_ms:
-          type: integer
-          description: "Maximum segment duration (ms). Segments longer than this are split. Useful for Whisper-compatible chunking. Default: 30000."
-
+      $ref: "../shared/chunking.yaml#/components/schemas/VADOptions"
     AudioChunkConfig:
-      type: object
-      description: "Audio chunking configuration for Antfly inference, including VAD options."
-      properties:
-        window_duration_ms:
-          type: integer
-          description: "Window duration in milliseconds for fixed-window audio chunking (default: 30000)."
-        overlap_duration_ms:
-          type: integer
-          description: "Overlap duration in milliseconds between audio chunks (default: 0)."
-        vad:
-          $ref: "#/components/schemas/VADOptions"
-
+      $ref: "../shared/chunking.yaml#/components/schemas/InferenceAudioChunkConfig"
     ChunkConfig:
-      type: object
-      description: |
-        Configuration for chunking requests to Antfly inference.
-        Combines shared text options with inference-specific audio/VAD options.
-      properties:
-        model:
-          type: string
-          description: "The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/."
-          default: "fixed"
-          example: "fixed"
-        max_chunks:
-          type: integer
-          description: "Maximum number of chunks to generate per document."
-        threshold:
-          type: number
-          format: float
-          description: "Confidence threshold for model-based chunking (0.0-1.0). Used by ONNX text models and VAD audio models."
-        text:
-          $ref: "../shared/chunking.yaml#/components/schemas/TextChunkOptions"
-        audio:
-          $ref: "#/components/schemas/AudioChunkConfig"
-
+      $ref: "../shared/chunking.yaml#/components/schemas/InferenceChunkConfig"
     ChunkRequest:
-      type: object
-      properties:
-        input:
-          description: |
-            Input content to chunk. Supports two formats:
-            - Text string: `"This is a long document..."` (backward compatible)
-            - ContentPart: `{"type": "media", "data": "<base64>", "mime_type": "audio/wav"}`
-            - ContentPart: `{"type": "text", "text": "..."}`
-          oneOf:
-            - type: string
-              description: "Text to chunk (backward compatible)"
-            - $ref: "#/components/schemas/ContentPart"
-              description: "Content part (text or media)"
-        config:
-          $ref: "#/components/schemas/ChunkConfig"
+      $ref: "../shared/chunking.yaml#/components/schemas/InferenceChunkRequest"
 
     ChunkResponse:
       type: object

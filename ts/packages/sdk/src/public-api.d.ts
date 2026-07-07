@@ -10613,50 +10613,10 @@ export interface components {
             /** @description MIME type: text/plain, audio/wav, image/png, etc. */
             mime_type: string;
         };
-        /** @description Options for Voice Activity Detection (VAD) based audio segmentation. inference-specific. */
-        InferenceVADOptions: {
-            /** @description Minimum silence duration (ms) to split speech segments. Gaps shorter than this are merged. Higher values produce longer, fewer segments. Default: 300. */
-            min_silence_duration_ms?: number;
-            /** @description Minimum speech duration (ms) for a segment to be kept. Shorter segments are discarded. Default: 250. */
-            min_speech_duration_ms?: number;
-            /** @description Padding (ms) added before and after detected speech. Default: 30. */
-            speech_pad_ms?: number;
-            /** @description Maximum segment duration (ms). Segments longer than this are split. Useful for Whisper-compatible chunking. Default: 30000. */
-            max_segment_duration_ms?: number;
-        };
-        /** @description Audio chunking configuration for inference, including VAD options. */
-        InferenceAudioChunkConfig: {
-            /** @description Window duration in milliseconds for fixed-window audio chunking (default: 30000). */
-            window_duration_ms?: number;
-            /** @description Overlap duration in milliseconds between audio chunks (default: 0). */
-            overlap_duration_ms?: number;
-            vad?: components["schemas"]["InferenceVADOptions"];
-        };
-        /**
-         * @description Configuration for chunking requests to Inference API.
-         *     Combines shared text options with inference-specific audio/VAD options.
-         */
-        InferenceChunkConfig: {
-            /**
-             * @description The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/.
-             * @default fixed
-             * @example fixed
-             */
-            model?: string;
-            /** @description Maximum number of chunks to generate per document. */
-            max_chunks?: number;
-            /**
-             * Format: float
-             * @description Confidence threshold for model-based chunking (0.0-1.0). Used by ONNX text models and VAD audio models.
-             */
-            threshold?: number;
-            text?: components["schemas"]["InferenceTextChunkOptions"];
-            audio?: components["schemas"]["InferenceAudioChunkConfig"];
-        };
         InferenceChunkRequest: {
             /**
              * @description Input content to chunk. Supports two formats:
-             *     - Text string: `"This is a long document..."` (backward compatible)
+             *     - Text string: `"This is a long document..."`
              *     - ContentPart: `{"type": "media", "data": "<base64>", "mime_type": "audio/wav"}`
              *     - ContentPart: `{"type": "text", "text": "..."}`
              */
@@ -11558,15 +11518,6 @@ export interface components {
              */
             wasm?: boolean;
         };
-        /** @description Options specific to text chunking. */
-        InferenceTextChunkOptions: {
-            /** @description Target number of tokens per chunk. */
-            target_tokens?: number;
-            /** @description Number of tokens to overlap between consecutive chunks. Helps maintain context across chunk boundaries. Only used by fixed-size chunkers. */
-            overlap_tokens?: number;
-            /** @description Separator string for splitting (e.g., '\n\n' for paragraphs). Only used by fixed-size chunkers. */
-            separator?: string;
-        };
         /** @description Text content with character offsets. */
         InferenceTextContent: {
             /** @description The chunk text content */
@@ -11996,6 +11947,46 @@ export interface components {
             usage?: {
                 [key: string]: unknown;
             };
+        };
+        /** @description Options for Voice Activity Detection (VAD) based audio segmentation. */
+        VADOptions: {
+            /** @description Minimum silence duration (ms) to split speech segments. Gaps shorter than this are merged. Higher values produce longer, fewer segments. Default: 300. */
+            min_silence_duration_ms?: number;
+            /** @description Minimum speech duration (ms) for a segment to be kept. Shorter segments are discarded. Default: 250. */
+            min_speech_duration_ms?: number;
+            /** @description Padding (ms) added before and after detected speech. Default: 30. */
+            speech_pad_ms?: number;
+            /** @description Maximum segment duration (ms). Segments longer than this are split. Useful for Whisper-compatible chunking. Default: 30000. */
+            max_segment_duration_ms?: number;
+        };
+        /** @description Audio chunking configuration for inference, including VAD options. */
+        InferenceAudioChunkConfig: {
+            /** @description Window duration in milliseconds for fixed-window audio chunking (default: 30000). */
+            window_duration_ms?: number;
+            /** @description Overlap duration in milliseconds between audio chunks (default: 0). */
+            overlap_duration_ms?: number;
+            vad?: components["schemas"]["VADOptions"];
+        };
+        /**
+         * @description Configuration for chunking requests to Antfly inference.
+         *     Combines shared text options with inference-specific audio/VAD options.
+         */
+        InferenceChunkConfig: {
+            /**
+             * @description The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/.
+             * @default fixed
+             * @example fixed
+             */
+            model?: string;
+            /** @description Maximum number of chunks to generate per document. */
+            max_chunks?: number;
+            /**
+             * Format: float
+             * @description Confidence threshold for model-based chunking (0.0-1.0). Used by ONNX text models and VAD audio models.
+             */
+            threshold?: number;
+            text?: components["schemas"]["TextChunkOptions"];
+            audio?: components["schemas"]["InferenceAudioChunkConfig"];
         };
     };
     responses: {

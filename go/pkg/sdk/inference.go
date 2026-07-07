@@ -292,7 +292,7 @@ func (c *InferenceClient) Chunk(ctx context.Context, text string, config ChunkCo
 			Model:     config.Model,
 			MaxChunks: config.MaxChunks,
 			Threshold: config.Threshold,
-			Text: oapi.InferenceTextChunkOptions{
+			Text: oapi.TextChunkOptions{
 				TargetTokens:  config.TargetTokens,
 				OverlapTokens: config.OverlapTokens,
 				Separator:     config.Separator,

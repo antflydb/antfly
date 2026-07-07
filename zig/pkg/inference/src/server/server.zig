@@ -1805,9 +1805,7 @@ pub const Node = struct {
                     }),
                 }
             }
-            // Fall back to deprecated 'text' field
-            if (body.text) |t| break :blk .{ .text = t };
-            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "missing 'input' or 'text' field" });
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "missing 'input' field" });
         };
 
         var config = lib_chunker.FixedChunkConfig{};

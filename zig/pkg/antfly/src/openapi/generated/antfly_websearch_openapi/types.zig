@@ -4,38 +4,6 @@
 const std = @import("std");
 const antfly_s3_openapi = @import("antfly_s3_openapi");
 
-/// Configuration for URL content fetching. Uses go/pkg/antfly/lib/scraping for downloading and processing. Supports: - HTTP/HTTPS URLs with security validation - HTML pages (extracts readable text via go-readability) - PDF files (extracts text) - Images (returns as data URIs) - Plain text files - S3 URLs (requires s3_credentials) Security features (from go/pkg/antfly/lib/scraping.ContentSecurityConfig): - Allowed host whitelist - Private IP blocking (SSRF prevention) - Download size limits - Timeout controls
-pub const FetchConfig = struct {
-    /// S3 credentials for fetching S3 URLs. If not set, uses package-level defaults.
-    s3_credentials: ?antfly_s3_openapi.Credentials = null,
-    /// Maximum content length in characters (truncated if exceeded)
-    max_content_length: ?i64 = null,
-    /// Whitelist of allowed hostnames for fetching. If empty, all hosts are allowed (except private IPs). Example: ["docs.example.com", "api.example.com"]
-    allowed_hosts: ?[]const []const u8 = null,
-    /// Block requests to private IP ranges (SSRF prevention). Blocked: 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
-    block_private_ips: ?bool = null,
-    /// Maximum download size in bytes (default: 100MB)
-    max_download_size_bytes: ?i64 = null,
-    /// Download timeout in seconds
-    timeout_seconds: ?i64 = null,
-};
-
-/// Result from fetching a URL via go/pkg/antfly/lib/scraping. Content is automatically processed based on MIME type: - HTML: Readable text extracted via go-readability - PDF: Text extracted from all pages - Images: Returned as base64 data URIs - Text: Returned as-is
-pub const FetchResult = struct {
-    /// The URL that was fetched
-    url: []const u8,
-    /// Page title (extracted from HTML)
-    title: ?[]const u8 = null,
-    /// Extracted/processed content
-    content: []const u8,
-    /// MIME type of the original content
-    content_type: ?[]const u8 = null,
-    /// Whether content was truncated due to max_content_length
-    truncated: ?bool = null,
-    /// Time taken to fetch and process in milliseconds
-    fetch_time_ms: ?i64 = null,
-};
-
 /// The web search provider to use. - **exa**: Exa neural/semantic web search API - **serper**: Serper.dev Google Search API (simpler setup) - **tavily**: Tavily AI Search API (optimized for RAG) - **brave**: Brave Search API - **you**: You.com Search API for agent and research workflows - **linkup**: Linkup Search API for web search and content retrieval - **vertex**: Google Cloud Agent Search / Vertex AI Search
 pub const WebSearchProvider = enum {
     exa,
@@ -93,6 +61,38 @@ pub const WebSearchResult = struct {
     score: ?f32 = null,
 };
 
+/// Configuration for URL content fetching. Uses go/pkg/antfly/lib/scraping for downloading and processing. Supports: - HTTP/HTTPS URLs with security validation - HTML pages (extracts readable text via go-readability) - PDF files (extracts text) - Images (returns as data URIs) - Plain text files - S3 URLs (requires s3_credentials) Security features (from go/pkg/antfly/lib/scraping.ContentSecurityConfig): - Allowed host whitelist - Private IP blocking (SSRF prevention) - Download size limits - Timeout controls
+pub const FetchConfig = struct {
+    /// S3 credentials for fetching S3 URLs. If not set, uses package-level defaults.
+    s3_credentials: ?antfly_s3_openapi.Credentials = null,
+    /// Maximum content length in characters (truncated if exceeded)
+    max_content_length: ?i64 = null,
+    /// Whitelist of allowed hostnames for fetching. If empty, all hosts are allowed (except private IPs). Example: ["docs.example.com", "api.example.com"]
+    allowed_hosts: ?[]const []const u8 = null,
+    /// Block requests to private IP ranges (SSRF prevention). Blocked: 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+    block_private_ips: ?bool = null,
+    /// Maximum download size in bytes (default: 100MB)
+    max_download_size_bytes: ?i64 = null,
+    /// Download timeout in seconds
+    timeout_seconds: ?i64 = null,
+};
+
+/// Result from fetching a URL via go/pkg/antfly/lib/scraping. Content is automatically processed based on MIME type: - HTML: Readable text extracted via go-readability - PDF: Text extracted from all pages - Images: Returned as base64 data URIs - Text: Returned as-is
+pub const FetchResult = struct {
+    /// The URL that was fetched
+    url: []const u8,
+    /// Page title (extracted from HTML)
+    title: ?[]const u8 = null,
+    /// Extracted/processed content
+    content: []const u8,
+    /// MIME type of the original content
+    content_type: ?[]const u8 = null,
+    /// Whether content was truncated due to max_content_length
+    truncated: ?bool = null,
+    /// Time taken to fetch and process in milliseconds
+    fetch_time_ms: ?i64 = null,
+};
+
 /// A unified configuration for web search providers. Each provider has specific configuration requirements. Use the appropriate provider-specific config or set common options at the top level. **Environment Variables (fallbacks):** - EXA_API_KEY - SERPER_API_KEY - TAVILY_API_KEY - BRAVE_API_KEY - YOU_API_KEY - LINKUP_API_KEY - GOOGLE_APPLICATION_CREDENTIALS, GOOGLE_CLOUD_PROJECT, GOOGLE_CLOUD_LOCATION
 pub const WebSearchConfig = struct {
     provider: WebSearchProvider,
@@ -140,45 +140,6 @@ pub const WebSearchResponse = struct {
     search_time_ms: ?i64 = null,
 };
 
-/// Configuration for Brave Search API. Brave Search provides privacy-focused search with its own independent index. **Setup:** 1. Sign up at https://brave.com/search/api/ 2. Get API key from dashboard **Docs:** https://api.search.brave.com/app/documentation
-pub const BraveSearchConfig = struct {
-    provider: WebSearchProvider,
-    /// Provider API key or secret reference. Prefer named web_search connections for production use.
-    api_key: ?[]const u8 = null,
-    /// Provider endpoint override when applicable
-    endpoint: ?[]const u8 = null,
-    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
-    project_id: ?[]const u8 = null,
-    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
-    location: ?[]const u8 = null,
-    /// Agent Search data store ID for provider vertex.
-    data_store: ?[]const u8 = null,
-    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
-    serving_config: ?[]const u8 = null,
-    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
-    credentials_path: ?[]const u8 = null,
-    /// Maximum number of search results to return
-    max_results: ?i64 = null,
-    /// Request timeout in milliseconds
-    timeout_ms: ?i64 = null,
-    /// Enable safe search filtering
-    safe_search: ?bool = null,
-    /// Preferred language for results (e.g., 'en', 'es', 'fr')
-    language: ?[]const u8 = null,
-    /// Preferred region for results (e.g., 'us', 'uk', 'de')
-    region: ?[]const u8 = null,
-    /// Ask the provider to return extracted page content when supported
-    include_content: ?bool = null,
-    /// Ask the provider to return highlighted passages when supported
-    include_highlights: ?bool = null,
-    /// Freshness filter: pd=day, pw=week, pm=month, py=year
-    freshness: ?[]const u8 = null,
-    /// Include text decorations (bold, italic markers)
-    text_decorations: ?bool = null,
-    /// Enable spellcheck suggestions
-    spellcheck: ?bool = null,
-};
-
 /// Configuration for Exa neural/semantic web search. Exa is optimized for semantic web search, highlights, and retrieved page contents for RAG and agent workflows. **Setup:** 1. Sign up at https://exa.ai 2. Get API key from dashboard **Docs:** https://docs.exa.ai
 pub const ExaSearchConfig = struct {
     provider: WebSearchProvider,
@@ -222,43 +183,6 @@ pub const ExaSearchConfig = struct {
     include_domains: ?[]const []const u8 = null,
     /// Exclude results from these domains
     exclude_domains: ?[]const []const u8 = null,
-};
-
-/// Configuration for Linkup Search API. Linkup is useful for web search, source retrieval, and structured research workflows. **Setup:** 1. Sign up at https://linkup.so 2. Get API key from dashboard **Docs:** https://docs.linkup.so
-pub const LinkupSearchConfig = struct {
-    provider: WebSearchProvider,
-    /// Provider API key or secret reference. Prefer named web_search connections for production use.
-    api_key: ?[]const u8 = null,
-    /// Provider endpoint override when applicable
-    endpoint: ?[]const u8 = null,
-    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
-    project_id: ?[]const u8 = null,
-    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
-    location: ?[]const u8 = null,
-    /// Agent Search data store ID for provider vertex.
-    data_store: ?[]const u8 = null,
-    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
-    serving_config: ?[]const u8 = null,
-    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
-    credentials_path: ?[]const u8 = null,
-    /// Maximum number of search results to return
-    max_results: ?i64 = null,
-    /// Request timeout in milliseconds
-    timeout_ms: ?i64 = null,
-    /// Enable safe search filtering
-    safe_search: ?bool = null,
-    /// Preferred language for results (e.g., 'en', 'es', 'fr')
-    language: ?[]const u8 = null,
-    /// Preferred region for results (e.g., 'us', 'uk', 'de')
-    region: ?[]const u8 = null,
-    /// Ask the provider to return extracted page content when supported
-    include_content: ?bool = null,
-    /// Ask the provider to return highlighted passages when supported
-    include_highlights: ?bool = null,
-    /// Search depth to request from Linkup
-    depth: ?[]const u8 = null,
-    /// Linkup response shape to request
-    output_type: ?[]const u8 = null,
 };
 
 /// Configuration for Serper.dev Google Search API. Serper provides a simpler alternative to Google Custom Search with competitive pricing and easy setup. **Setup:** 1. Sign up at https://serper.dev 2. Get API key from dashboard **Docs:** https://serper.dev/docs
@@ -341,8 +265,8 @@ pub const TavilySearchConfig = struct {
     exclude_domains: ?[]const []const u8 = null,
 };
 
-/// Configuration for Google Cloud Agent Search / Vertex AI Search. Use this for bounded Google Cloud search over configured data stores or verified websites. The provider token is `vertex` to match Antfly's existing Google Cloud provider convention. **Setup:** 1. Enable Discovery Engine API in Google Cloud 2. Create an Agent Search app/data store 3. Grant service account access to query the serving config **Docs:** https://cloud.google.com/generative-ai-app-builder/docs
-pub const VertexSearchConfig = struct {
+/// Configuration for Brave Search API. Brave Search provides privacy-focused search with its own independent index. **Setup:** 1. Sign up at https://brave.com/search/api/ 2. Get API key from dashboard **Docs:** https://api.search.brave.com/app/documentation
+pub const BraveSearchConfig = struct {
     provider: WebSearchProvider,
     /// Provider API key or secret reference. Prefer named web_search connections for production use.
     api_key: ?[]const u8 = null,
@@ -372,8 +296,12 @@ pub const VertexSearchConfig = struct {
     include_content: ?bool = null,
     /// Ask the provider to return highlighted passages when supported
     include_highlights: ?bool = null,
-    /// Google Cloud search service flavor
-    service: ?[]const u8 = null,
+    /// Freshness filter: pd=day, pw=week, pm=month, py=year
+    freshness: ?[]const u8 = null,
+    /// Include text decorations (bold, italic markers)
+    text_decorations: ?bool = null,
+    /// Enable spellcheck suggestions
+    spellcheck: ?bool = null,
 };
 
 /// Configuration for You.com Search API. You.com is useful for agentic search and research-oriented result retrieval. **Setup:** 1. Sign up for You.com API access 2. Get API key from dashboard **Docs:** https://api.you.com
@@ -407,4 +335,76 @@ pub const YouSearchConfig = struct {
     include_content: ?bool = null,
     /// Ask the provider to return highlighted passages when supported
     include_highlights: ?bool = null,
+};
+
+/// Configuration for Linkup Search API. Linkup is useful for web search, source retrieval, and structured research workflows. **Setup:** 1. Sign up at https://linkup.so 2. Get API key from dashboard **Docs:** https://docs.linkup.so
+pub const LinkupSearchConfig = struct {
+    provider: WebSearchProvider,
+    /// Provider API key or secret reference. Prefer named web_search connections for production use.
+    api_key: ?[]const u8 = null,
+    /// Provider endpoint override when applicable
+    endpoint: ?[]const u8 = null,
+    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+    location: ?[]const u8 = null,
+    /// Agent Search data store ID for provider vertex.
+    data_store: ?[]const u8 = null,
+    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
+    serving_config: ?[]const u8 = null,
+    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+    credentials_path: ?[]const u8 = null,
+    /// Maximum number of search results to return
+    max_results: ?i64 = null,
+    /// Request timeout in milliseconds
+    timeout_ms: ?i64 = null,
+    /// Enable safe search filtering
+    safe_search: ?bool = null,
+    /// Preferred language for results (e.g., 'en', 'es', 'fr')
+    language: ?[]const u8 = null,
+    /// Preferred region for results (e.g., 'us', 'uk', 'de')
+    region: ?[]const u8 = null,
+    /// Ask the provider to return extracted page content when supported
+    include_content: ?bool = null,
+    /// Ask the provider to return highlighted passages when supported
+    include_highlights: ?bool = null,
+    /// Search depth to request from Linkup
+    depth: ?[]const u8 = null,
+    /// Linkup response shape to request
+    output_type: ?[]const u8 = null,
+};
+
+/// Configuration for Google Cloud Agent Search / Vertex AI Search. Use this for bounded Google Cloud search over configured data stores or verified websites. The provider token is `vertex` to match Antfly's existing Google Cloud provider convention. **Setup:** 1. Enable Discovery Engine API in Google Cloud 2. Create an Agent Search app/data store 3. Grant service account access to query the serving config **Docs:** https://cloud.google.com/generative-ai-app-builder/docs
+pub const VertexSearchConfig = struct {
+    provider: WebSearchProvider,
+    /// Provider API key or secret reference. Prefer named web_search connections for production use.
+    api_key: ?[]const u8 = null,
+    /// Provider endpoint override when applicable
+    endpoint: ?[]const u8 = null,
+    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+    location: ?[]const u8 = null,
+    /// Agent Search data store ID for provider vertex.
+    data_store: ?[]const u8 = null,
+    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
+    serving_config: ?[]const u8 = null,
+    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+    credentials_path: ?[]const u8 = null,
+    /// Maximum number of search results to return
+    max_results: ?i64 = null,
+    /// Request timeout in milliseconds
+    timeout_ms: ?i64 = null,
+    /// Enable safe search filtering
+    safe_search: ?bool = null,
+    /// Preferred language for results (e.g., 'en', 'es', 'fr')
+    language: ?[]const u8 = null,
+    /// Preferred region for results (e.g., 'us', 'uk', 'de')
+    region: ?[]const u8 = null,
+    /// Ask the provider to return extracted page content when supported
+    include_content: ?bool = null,
+    /// Ask the provider to return highlighted passages when supported
+    include_highlights: ?bool = null,
+    /// Google Cloud search service flavor
+    service: ?[]const u8 = null,
 };
