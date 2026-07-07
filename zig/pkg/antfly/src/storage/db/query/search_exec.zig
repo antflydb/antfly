@@ -8180,9 +8180,16 @@ fn resolvedDocSetForTextHitsFromOrdinalSidecarAlloc(
     hits: []const search_mod.ScoredHit,
     executor: StructuredFilterResolverExecutor,
 ) !?doc_set.ResolvedDocSet {
+    var seen = std.AutoHashMapUnmanaged(u32, void).empty;
+    defer seen.deinit(alloc);
+
     var doc_nums = std.ArrayListUnmanaged(u32).empty;
     defer doc_nums.deinit(alloc);
-    for (hits) |hit| try appendDocNum(alloc, &doc_nums, hit.doc_id);
+    for (hits) |hit| {
+        const gop = try seen.getOrPut(alloc, hit.doc_id);
+        if (gop.found_existing) continue;
+        try doc_nums.append(alloc, hit.doc_id);
+    }
 
     return try resolvedDocSetForTextDocNumsFromOrdinalSidecarAlloc(alloc, snapshot, doc_nums.items, executor);
 }
@@ -10734,6 +10741,8 @@ fn textDocNumsForDocIdsAlloc(
 ) ![]const u32 {
     var doc_id_set = try BorrowedDocIdSet.initAlloc(alloc, doc_ids);
     defer doc_id_set.deinit(alloc);
+    var doc_num_set = std.AutoHashMapUnmanaged(u32, void).empty;
+    defer doc_num_set.deinit(alloc);
 
     var out = std.ArrayListUnmanaged(u32).empty;
     errdefer out.deinit(alloc);
@@ -10749,7 +10758,10 @@ fn textDocNumsForDocIdsAlloc(
             }
             const stored = seg.reader.storedDoc(local_doc) orelse continue;
             if (!doc_id_set.contains(stored.id)) continue;
-            try appendDocNum(alloc, &out, doc_offset + local_doc);
+            const doc_num = doc_offset + local_doc;
+            const gop = try doc_num_set.getOrPut(alloc, doc_num);
+            if (gop.found_existing) continue;
+            try out.append(alloc, doc_num);
         }
         doc_offset += seg.reader.doc_count;
     }
@@ -13303,6 +13315,8 @@ fn matchAllDocOrdinalsForDocIdsAlloc(
 ) ![]const u32 {
     var doc_id_set = try BorrowedDocIdSet.initAlloc(alloc, doc_ids);
     defer doc_id_set.deinit(alloc);
+    var doc_num_set = std.AutoHashMapUnmanaged(u32, void).empty;
+    defer doc_num_set.deinit(alloc);
 
     var out = std.ArrayListUnmanaged(u32).empty;
     errdefer out.deinit(alloc);
@@ -13325,7 +13339,9 @@ fn matchAllDocOrdinalsForDocIdsAlloc(
                 );
                 return error.UnsupportedQueryRequest;
             };
-            try appendDocNum(alloc, &out, ordinal);
+            const gop = try doc_num_set.getOrPut(alloc, ordinal);
+            if (gop.found_existing) continue;
+            try out.append(alloc, ordinal);
         }
     }
     return try out.toOwnedSlice(alloc);
