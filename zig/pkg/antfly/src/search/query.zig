@@ -1057,7 +1057,7 @@ fn geoCandidateBitmapForRangesAlloc(
     precision: u8,
 ) FilterError!?roaring.RoaringBitmap {
     const inv_reader = (try seg.reader.invertedIndex(field)) orelse
-        return roaring.RoaringBitmap.init(alloc);
+        return null;
 
     var result = roaring.RoaringBitmap.init(alloc);
     errdefer result.deinit();
