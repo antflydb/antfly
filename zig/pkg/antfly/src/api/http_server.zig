@@ -9790,13 +9790,14 @@ fn unsupportedPublicTableQueryDispatchError(alloc: std.mem.Allocator, body: []co
 
 fn unsupportedExactSortResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
     const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse db_mod.SortRejectionDiagnostic{};
+    const public_rejection = query_contract.publicExactSortRejection(diagnostic.reason, diagnostic.detail);
     return try jsonResponseWithStatus(alloc, 422, .{
         .status = 422,
         .@"error" = "unsupported_exact_sort",
         .message = "exact sort is unsupported for this query",
-        .reason = diagnostic.reason,
-        .sort_rejection_reason = diagnostic.reason,
-        .sort_rejection_detail = diagnostic.detail,
+        .reason = public_rejection.reason,
+        .sort_rejection_reason = public_rejection.reason,
+        .sort_rejection_detail = public_rejection.detail,
         .sort_rejection_field = diagnostic.field,
     });
 }
@@ -11293,9 +11294,9 @@ test "api http unsupported sorted query response surfaces exact sort diagnostics
     try std.testing.expectEqual(@as(u16, 422), parsed.value.status);
     try std.testing.expectEqualStrings("unsupported_exact_sort", parsed.value.@"error");
     try std.testing.expectEqualStrings("exact sort is unsupported for this query", parsed.value.message);
-    try std.testing.expectEqualStrings("missing_doc_values_coverage", parsed.value.reason);
-    try std.testing.expectEqualStrings("missing_doc_values_coverage", parsed.value.sort_rejection_reason);
-    try std.testing.expectEqualStrings("missing_doc_values_section", parsed.value.sort_rejection_detail);
+    try std.testing.expectEqualStrings("field_not_sort_ready", parsed.value.reason);
+    try std.testing.expectEqualStrings("field_not_sort_ready", parsed.value.sort_rejection_reason);
+    try std.testing.expectEqualStrings("field_not_sort_ready", parsed.value.sort_rejection_detail);
     try std.testing.expectEqualStrings("created_at", parsed.value.sort_rejection_field);
 }
 

@@ -1302,18 +1302,24 @@ schema-time rules: sort on `_id` or mapped scalar fields declared
 for exact string sorting; pass returned `_sort` tuples to `search_after` /
 `search_before`; expect 422 when exact native execution is unavailable.
 
-Runtime introspection should expose the per-index field capability matrix so
-operators and clients can discover concrete configured fields. That endpoint or
-manifest should include:
+Runtime introspection should expose the per-index public field capability matrix
+so operators and clients can discover concrete configured fields. That endpoint
+or manifest should include:
 
 - field path
 - field type
-- `searchable`, `filterable`, `aggregatable`, and `sortable`
-- doc-value coverage state
+- `query_modes` derived from the field type and runtime capability, such as
+  `full_text`, `exact`, `range`, `geo`, and `autocomplete`
+- `sortable`
 - dynamic/static provenance
 - missing/null policy
 - whether the field participates in `index_sort`
-- current queryability state from the sortable field lifecycle
+- current state from the sortable field lifecycle
+
+The public capability surface should not expose `searchable`, `filterable`,
+`aggregatable`, `doc_values`, doc-value coverage, or queryability state as
+schema toggles. Those are internal runtime facts and may still appear in planner
+diagnostics when explaining exact-sort acceptance or rejection.
 
 The OpenAPI contract should keep `order_by.field` as a string because legal
 fields are index-specific and can be dynamic. SDKs can add optional helper

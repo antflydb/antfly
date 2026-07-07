@@ -219,6 +219,12 @@ pub fn expectPublicOpenApiDocumentsStableExactSortDiagnostics() !void {
     for (distributed_behavior_values) |value| try expectOpenApiDocumentsToken(value);
 
     const rejection_reasons = [_][]const u8{
+        "`unmapped_field`",
+        "`non_sortable_field`",
+        "`unsupported_sort_field`",
+        "`mixed_field_type`",
+        "`field_not_sort_ready`",
+        "`filter_not_queryable`",
         "`unmapped_sort_field`",
         "`non_sortable_sort_field`",
         "`missing_doc_values_coverage`",

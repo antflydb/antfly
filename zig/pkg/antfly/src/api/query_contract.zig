@@ -60,6 +60,10 @@ pub const testing = if (builtin.is_test) struct {
         return expectSortProfileDiagnosticsSerializationForTest();
     }
 
+    pub fn expectPublicExactSortRejectionMapping() !void {
+        try expectPublicExactSortRejectionMappingForTest();
+    }
+
     pub fn expectFilterOnlyQueryStringFilterPreserved() !void {
         var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
             \\{"filter_query":{"query":"status:active"},"limit":5}
@@ -77,6 +81,75 @@ pub fn totalHitsRelationString(relation: db_mod.types.TotalHitsRelation) []const
         .exact => "exact",
         .gte => "gte",
     };
+}
+
+pub const PublicExactSortRejection = struct {
+    reason: []const u8,
+    detail: []const u8,
+};
+
+pub fn publicExactSortRejection(reason: []const u8, detail: []const u8) PublicExactSortRejection {
+    const public_reason = publicExactSortReason(reason, detail);
+    return .{
+        .reason = public_reason,
+        .detail = publicExactSortDetail(public_reason, detail),
+    };
+}
+
+fn publicExactSortReason(reason: []const u8, detail: []const u8) []const u8 {
+    if (std.mem.eql(u8, reason, "missing_doc_values_coverage")) return "field_not_sort_ready";
+    if (std.mem.eql(u8, reason, "missing_native_filter_coverage")) return "filter_not_queryable";
+    if (std.mem.eql(u8, reason, "unmapped_sort_field")) return "unmapped_field";
+    if (std.mem.eql(u8, reason, "non_sortable_sort_field")) {
+        if (std.mem.eql(u8, detail, "non_scalar_field")) return "unsupported_sort_field";
+        if (std.mem.eql(u8, detail, "mixed_field_type")) return "mixed_field_type";
+        return "non_sortable_field";
+    }
+    if (std.mem.eql(u8, reason, "invalid_doc_value_type") or
+        std.mem.eql(u8, reason, "missing_runtime_mapping"))
+    {
+        return "unsupported_sort_field";
+    }
+    if (std.mem.eql(u8, reason, "invalid_cursor_arity")) return reason;
+    if (std.mem.eql(u8, reason, "invalid_cursor_type")) return reason;
+    if (std.mem.eql(u8, reason, "invalid_sort_tuple")) return reason;
+    if (std.mem.eql(u8, reason, "approximate_candidate_source")) return reason;
+    if (std.mem.eql(u8, reason, "candidate_budget_exceeded")) return reason;
+    if (std.mem.eql(u8, reason, "missing_null_policy")) return reason;
+    if (std.mem.eql(u8, reason, "non_score_bearing_source")) return reason;
+    if (std.mem.eql(u8, reason, "invalid_score_value")) return reason;
+    if (std.mem.eql(u8, reason, "count_only_ordered_page")) return reason;
+    if (std.mem.eql(u8, reason, "stored_json_sort_disabled")) return reason;
+    if (std.mem.eql(u8, reason, "unsupported_exact_sort")) return reason;
+    if (std.mem.eql(u8, reason, "distributed_merge_unsupported")) return reason;
+    return "unsupported_exact_sort";
+}
+
+fn publicExactSortDetail(public_reason: []const u8, detail: []const u8) []const u8 {
+    _ = detail;
+    return public_reason;
+}
+
+fn expectPublicExactSortRejectionMappingForTest() !void {
+    const missing_doc_values = publicExactSortRejection("missing_doc_values_coverage", "missing_doc_values_section");
+    try std.testing.expectEqualStrings("field_not_sort_ready", missing_doc_values.reason);
+    try std.testing.expectEqualStrings("field_not_sort_ready", missing_doc_values.detail);
+
+    const missing_filter = publicExactSortRejection("missing_native_filter_coverage", "native_filter_doc_nums_missing");
+    try std.testing.expectEqualStrings("filter_not_queryable", missing_filter.reason);
+    try std.testing.expectEqualStrings("filter_not_queryable", missing_filter.detail);
+
+    const non_sortable = publicExactSortRejection("non_sortable_sort_field", "non_scalar_field");
+    try std.testing.expectEqualStrings("unsupported_sort_field", non_sortable.reason);
+    try std.testing.expectEqualStrings("unsupported_sort_field", non_sortable.detail);
+
+    const public_reason = publicExactSortRejection("invalid_cursor_arity", "sort_tuple_arity");
+    try std.testing.expectEqualStrings("invalid_cursor_arity", public_reason.reason);
+    try std.testing.expectEqualStrings("invalid_cursor_arity", public_reason.detail);
+
+    const unknown_internal = publicExactSortRejection("missing_private_planner_state", "private_detail");
+    try std.testing.expectEqualStrings("unsupported_exact_sort", unknown_internal.reason);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", unknown_internal.detail);
 }
 
 pub fn parseTotalHitsRelation(value: []const u8) !db_mod.types.TotalHitsRelation {
@@ -2953,6 +3026,10 @@ test "api query contract serializes sort profile diagnostics" {
     try expectSortProfileDiagnosticsSerializationForTest();
 }
 
+test "api query contract maps public exact sort rejection diagnostics" {
+    try expectPublicExactSortRejectionMappingForTest();
+}
+
 test "api query contract serializes ordered hit sort tuple" {
     const alloc = std.testing.allocator;
 
@@ -4624,7 +4701,7 @@ fn appendCanonicalPublicQueryAlloc(
     }
 
     appendScoringQueryClausesAlloc(alloc, scoring_must, query, limit) catch |err| switch (err) {
-        error.UnsupportedQueryRequest, error.InvalidQueryRequest => {
+        error.UnsupportedQueryRequest, error.InvalidQueryRequest, error.UnexpectedToken => {
             if (!isStructuredFilterValue(query)) return err;
             try appendRawStructuredFilterClausesAlloc(alloc, filter_clauses, query);
         },
@@ -4825,7 +4902,7 @@ fn appendBoolMustClausesAlloc(
     }
 
     appendScoringQueryClausesAlloc(alloc, scoring_must, value, limit) catch |err| switch (err) {
-        error.UnsupportedQueryRequest, error.InvalidQueryRequest => {
+        error.UnsupportedQueryRequest, error.InvalidQueryRequest, error.UnexpectedToken => {
             if (!isStructuredFilterValue(value)) return err;
             try appendRawStructuredFilterClausesAlloc(alloc, filter_clauses, value);
         },

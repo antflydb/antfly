@@ -94,6 +94,13 @@ test "public openapi documents stable exact sort diagnostics" {
 
 test "api query contract serializes sort profile diagnostics" {
     try query_contract.testing.expectSortProfileDiagnosticsSerialization();
+}
+
+test "api query contract maps public exact sort rejection diagnostics" {
+    try query_contract.testing.expectPublicExactSortRejectionMapping();
+}
+
+test "api query contract preserves filter-only query string filters" {
     try query_contract.testing.expectFilterOnlyQueryStringFilterPreserved();
 }
 

@@ -4,26 +4,6 @@
 const std = @import("std");
 const antfly_generating_openapi = @import("antfly_generating_openapi");
 
-pub const ExtractionClassification = struct {
-    name: []const u8,
-    label: []const u8,
-    score: ?f32 = null,
-};
-
-pub const ExtractionClassificationSchema = struct {
-    name: []const u8,
-    labels: []const []const u8,
-    multi_label: ?bool = null,
-};
-
-pub const ExtractionEntity = struct {
-    label: []const u8,
-    text: []const u8,
-    start: ?i64 = null,
-    end: ?i64 = null,
-    score: ?f32 = null,
-};
-
 pub const ExtractionProvider = enum {
     antfly,
     pioneer,
@@ -55,16 +35,9 @@ pub const ExtractionProvider = enum {
     }
 };
 
-pub const ExtractionReaderOptions = struct {
-    provider: ?[]const u8 = null,
-    model: ?[]const u8 = null,
-    url: ?[]const u8 = null,
-    api_url: ?[]const u8 = null,
-};
-
-pub const ExtractionRelationEndpoint = struct {
-    entity_index: ?i64 = null,
-    id: ?[]const u8 = null,
+pub const ExtractionToken = struct {
+    text: []const u8,
+    box: ?[]const i64 = null,
 };
 
 pub const ExtractionRelationSchema = struct {
@@ -73,11 +46,49 @@ pub const ExtractionRelationSchema = struct {
     target: ?[]const u8 = null,
 };
 
+pub const ExtractionClassificationSchema = struct {
+    name: []const u8,
+    labels: []const []const u8,
+    multi_label: ?bool = null,
+};
+
 pub const ExtractionStructureField = std.json.Value;
 
-pub const ExtractionToken = struct {
+pub const ExtractionReaderOptions = struct {
+    provider: ?[]const u8 = null,
+    model: ?[]const u8 = null,
+    url: ?[]const u8 = null,
+    api_url: ?[]const u8 = null,
+};
+
+pub const ExtractionEntity = struct {
+    label: []const u8,
     text: []const u8,
-    box: ?[]const i64 = null,
+    start: ?i64 = null,
+    end: ?i64 = null,
+    score: ?f32 = null,
+};
+
+pub const ExtractionRelationEndpoint = struct {
+    entity_index: ?i64 = null,
+    id: ?[]const u8 = null,
+};
+
+pub const ExtractionClassification = struct {
+    name: []const u8,
+    label: []const u8,
+    score: ?f32 = null,
+};
+
+pub const ExtractionInput = struct {
+    id: ?[]const u8 = null,
+    content: antfly_generating_openapi.ChatMessageContent,
+    tokens: ?[]const ExtractionToken = null,
+    metadata: ?std.json.Value = null,
+};
+
+pub const ExtractionStructureSchema = struct {
+    fields: ?std.json.ArrayHashMap(ExtractionStructureField) = null,
 };
 
 pub const ExtractionOptions = struct {
@@ -95,15 +106,11 @@ pub const ExtractionRelation = struct {
     score: ?f32 = null,
 };
 
-pub const ExtractionStructureSchema = struct {
-    fields: ?std.json.ArrayHashMap(ExtractionStructureField) = null,
-};
-
-pub const ExtractionInput = struct {
-    id: ?[]const u8 = null,
-    content: antfly_generating_openapi.ChatMessageContent,
-    tokens: ?[]const ExtractionToken = null,
-    metadata: ?std.json.Value = null,
+pub const ExtractionSchema = struct {
+    entities: ?[]const []const u8 = null,
+    relations: ?[]const ExtractionRelationSchema = null,
+    classifications: ?[]const ExtractionClassificationSchema = null,
+    structures: ?std.json.ArrayHashMap(ExtractionStructureSchema) = null,
 };
 
 pub const ExtractionObject = struct {
@@ -112,20 +119,6 @@ pub const ExtractionObject = struct {
     relations: ?[]const ExtractionRelation = null,
     classifications: ?[]const ExtractionClassification = null,
     structures: ?std.json.Value = null,
-};
-
-pub const ExtractionSchema = struct {
-    entities: ?[]const []const u8 = null,
-    relations: ?[]const ExtractionRelationSchema = null,
-    classifications: ?[]const ExtractionClassificationSchema = null,
-    structures: ?std.json.ArrayHashMap(ExtractionStructureSchema) = null,
-};
-
-pub const ExtractionResponse = struct {
-    object: []const u8,
-    model: []const u8,
-    data: []const ExtractionObject,
-    usage: ?std.json.Value = null,
 };
 
 pub const ExtractionConfig = struct {
@@ -144,4 +137,11 @@ pub const ExtractionRequest = struct {
     inputs: []const ExtractionInput,
     schema: ExtractionSchema,
     options: ?ExtractionOptions = null,
+};
+
+pub const ExtractionResponse = struct {
+    object: []const u8,
+    model: []const u8,
+    data: []const ExtractionObject,
+    usage: ?std.json.Value = null,
 };

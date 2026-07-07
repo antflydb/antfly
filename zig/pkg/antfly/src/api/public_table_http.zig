@@ -20,6 +20,7 @@ const batch_api = @import("batch.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const common_secrets = @import("../common/secrets.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
+const query_contract = @import("query_contract.zig");
 
 pub const DocumentArtifactManifestDetail = enum {
     summary,
@@ -481,6 +482,7 @@ pub const OwnedResponse = struct {
 
 fn unsupportedExactSortBody(alloc: std.mem.Allocator) ![]u8 {
     const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse db_mod.SortRejectionDiagnostic{};
+    const public_rejection = query_contract.publicExactSortRejection(diagnostic.reason, diagnostic.detail);
     return try std.json.Stringify.valueAlloc(alloc, struct {
         @"error": []const u8 = "unsupported_exact_sort",
         message: []const u8 = "exact sort is unsupported for this query",
@@ -490,9 +492,9 @@ fn unsupportedExactSortBody(alloc: std.mem.Allocator) ![]u8 {
         sort_rejection_field: []const u8,
         status: u16 = 422,
     }{
-        .reason = diagnostic.reason,
-        .sort_rejection_reason = diagnostic.reason,
-        .sort_rejection_detail = diagnostic.detail,
+        .reason = public_rejection.reason,
+        .sort_rejection_reason = public_rejection.reason,
+        .sort_rejection_detail = public_rejection.detail,
         .sort_rejection_field = diagnostic.field,
     }, .{});
 }
@@ -2033,9 +2035,9 @@ test "public table query handler surfaces exact sort rejection diagnostics" {
     try std.testing.expectEqual(@as(u16, 422), parsed.value.status);
     try std.testing.expectEqualStrings("unsupported_exact_sort", parsed.value.@"error");
     try std.testing.expectEqualStrings("exact sort is unsupported for this query", parsed.value.message);
-    try std.testing.expectEqualStrings("missing_doc_values_coverage", parsed.value.reason);
-    try std.testing.expectEqualStrings("missing_doc_values_coverage", parsed.value.sort_rejection_reason);
-    try std.testing.expectEqualStrings("missing_doc_values_section", parsed.value.sort_rejection_detail);
+    try std.testing.expectEqualStrings("field_not_sort_ready", parsed.value.reason);
+    try std.testing.expectEqualStrings("field_not_sort_ready", parsed.value.sort_rejection_reason);
+    try std.testing.expectEqualStrings("field_not_sort_ready", parsed.value.sort_rejection_detail);
     try std.testing.expectEqualStrings("created_at", parsed.value.sort_rejection_field);
 }
 

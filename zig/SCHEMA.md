@@ -30,7 +30,7 @@ Table-level dynamic templates may use:
 - `mapping.index`
 - `mapping.store`
 - `mapping.include_in_all`
-- `mapping.doc_values`
+- `mapping.sortable`
 
 ## Runtime Model
 

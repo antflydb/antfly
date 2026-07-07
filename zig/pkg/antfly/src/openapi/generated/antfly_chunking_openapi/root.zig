@@ -3,8 +3,8 @@
 
 pub const types = @import("types.zig");
 
+pub const ChunkerProvider = types.ChunkerProvider;
+pub const ChunkerConfig = types.ChunkerConfig;
 pub const AntflyChunkerConfig = types.AntflyChunkerConfig;
 pub const Chunk = types.Chunk;
 pub const ChunkOptions = types.ChunkOptions;
-pub const ChunkerConfig = types.ChunkerConfig;
-pub const ChunkerProvider = types.ChunkerProvider;
