@@ -1321,7 +1321,7 @@ pub const ApiHttpServer = struct {
 
     fn joinCtxExecutePlainQuery(ptr: *anyopaque, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table_name: []const u8, body: []const u8, row_filter_json: ?[]const u8) anyerror!query_api.QueryResponse {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        return try self.executePlainPublicTableQuery(alloc, source, table_name, body, row_filter_json);
+        return try self.executePlainPublicTableQuery(alloc, source, table_name, body, row_filter_json, null);
     }
 
     fn joinCtxExecuteQueryDispatch(ptr: *anyopaque, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table_name: []const u8, body: []const u8, row_filter_json: ?[]const u8) anyerror![]u8 {
@@ -5947,7 +5947,7 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         row_filter_json: ?[]const u8,
     ) ![]u8 {
-        return try self.executePublicTableQueryDispatchWithIdentity(alloc, source, table_name, body, row_filter_json, null);
+        return try self.executePublicTableQueryDispatchWithIdentity(alloc, source, table_name, body, row_filter_json, null, null);
     }
 
     fn executePublicTableQueryDispatchWithReadinessRetry(
@@ -5972,6 +5972,7 @@ pub const ApiHttpServer = struct {
                 body,
                 row_filter_json,
                 authenticated_identity,
+                request_deadline_ns,
             ) catch |err| switch (err) {
                 error.DocIdentityNamespaceMismatch => {
                     const now_ns = platform_time.monotonicNs();
@@ -6001,6 +6002,7 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         row_filter_json: ?[]const u8,
         authenticated_identity: ?AuthenticatedIdentity,
+        request_deadline_ns: ?u64,
     ) ![]u8 {
         if (try shouldDispatchPlainPublicSearch(alloc, body)) {
             var result = self.executePlainPublicTableQuery(
@@ -6009,6 +6011,7 @@ pub const ApiHttpServer = struct {
                 table_name,
                 body,
                 row_filter_json,
+                request_deadline_ns,
             ) catch |err| switch (err) {
                 error.InvalidQueryRequest => return error.InvalidQueryRequest,
                 error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
@@ -6019,6 +6022,7 @@ pub const ApiHttpServer = struct {
                 error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
                 error.HAReadRequiresPrimary => return error.HAReadRequiresPrimary,
                 error.HAReadWaitForApply, error.HAReadWaitForMetadata => return err,
+                error.Timeout => return error.Timeout,
                 else => {
                     std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
                     return error.InternalFailure;
@@ -6070,6 +6074,7 @@ pub const ApiHttpServer = struct {
             table_name,
             body,
             row_filter_json,
+            request_deadline_ns,
         ) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
@@ -6080,6 +6085,7 @@ pub const ApiHttpServer = struct {
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.HAReadRequiresPrimary => return error.HAReadRequiresPrimary,
             error.HAReadWaitForApply, error.HAReadWaitForMetadata => return err,
+            error.Timeout => return error.Timeout,
             else => {
                 std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
@@ -6418,6 +6424,7 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         body: []const u8,
         row_filter_json: ?[]const u8,
+        request_deadline_ns: ?u64,
     ) !query_api.QueryResponse {
         var semantic_resolver = SemanticStatusResolver{
             .source = self.source,
@@ -6431,6 +6438,10 @@ pub const ApiHttpServer = struct {
             return error.InvalidQueryRequest;
         };
         defer query_req.deinit(alloc);
+        if (request_deadline_ns) |deadline| {
+            query_req.req.execution_deadline_ns = deadline;
+            if (retryDeadlineExpired(deadline, platform_time.monotonicNs())) return error.Timeout;
+        }
         self.maybeRouteQueryToReadSchema(table_name, &query_req.req) catch |err| switch (err) {
             error.TableNotFound => return error.TableNotFound,
             error.InvalidSchemaUpdateRequest, error.InvalidTableIndexMetadata => return error.InvalidQueryRequest,
@@ -11532,6 +11543,116 @@ test "api http transient read retry honors expired request deadline before sourc
         .read_index,
     ));
     try std.testing.expectEqual(@as(u32, 0), reads.attempts);
+}
+
+test "api http plain public query preserves outer absolute request deadline" {
+    const alloc = std.testing.allocator;
+    const outer_deadline_ns = platform_time.monotonicNs() + 10 * std.time.ns_per_s;
+
+    const FakeSource = struct {
+        fn iface() StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 1,
+                    .name = "docs",
+                    .schema_json = "{\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"body\":{\"type\":\"text\"}}}}}}",
+                    .indexes_json = "{}",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{ .group_id = 10, .table_id = 1, .start_key = "", .end_key = null }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeReads = struct {
+        expected_deadline_ns: u64,
+
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+            };
+        }
+
+        fn lookup(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?table_reads.LookupResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn scan(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.ScanOptions,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?table_reads.ScanResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn query(
+            ptr: *anyopaque,
+            inner_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            req: db_mod.types.SearchRequest,
+            consistency: raft_mod.ReadConsistency,
+        ) anyerror!?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
+            try std.testing.expectEqual(self.expected_deadline_ns, req.execution_deadline_ns.?);
+            return .{ .json = try inner_alloc.dupe(u8, "{\"hits\":[],\"total\":0}") };
+        }
+    };
+
+    var reads = FakeReads{ .expected_deadline_ns = outer_deadline_ns };
+    var server = ApiHttpServer.init(alloc, .{}, FakeSource.iface(), reads.source(), null);
+    const body =
+        \\{"query":{"match_all":{}},"timeout_ms":999999}
+    ;
+    var response = try server.executePlainPublicTableQuery(
+        alloc,
+        reads.source(),
+        "docs",
+        body,
+        null,
+        outer_deadline_ns,
+    );
+    defer response.deinit(alloc);
+    try std.testing.expectEqualStrings("{\"hits\":[],\"total\":0}", response.json);
 }
 
 test "api http public table dispatch preserves unsupported sorted query as exact sort" {
