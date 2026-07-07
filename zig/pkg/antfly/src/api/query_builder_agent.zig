@@ -1838,6 +1838,7 @@ pub fn buildQueryBuilderResponseWithContext(
         effective_intent,
         effective_fields,
         table_context.full_text_index_metadata,
+        table_context.field_capabilities,
         table_context.embedding_index_metadata,
         semantic_indexes,
         graph_indexes,
@@ -2132,6 +2133,7 @@ fn buildQueryBuilderSpecialist(
     intent: []const u8,
     fields: []const []const u8,
     full_text_index_metadata: []const QueryBuilderFullTextIndex,
+    field_capabilities: []const QueryBuilderFieldCapability,
     embedding_index_metadata: []const QueryBuilderEmbeddingIndex,
     semantic_indexes: []const []const u8,
     graph_indexes: []const []const u8,
@@ -2142,7 +2144,7 @@ fn buildQueryBuilderSpecialist(
 ) !BuiltQueryBuilderQuery {
     const effective_mode = try queryBuilderEffectiveMode(alloc, request, fields, semantic_indexes);
     if (shouldUseGeneratedSemanticBuilder(request, effective_mode, generation_runner)) {
-        return buildGeneratedSemanticOrHybridQueryBuilder(alloc, request, effective_mode.?, intent, fields, full_text_index_metadata, embedding_index_metadata, semantic_indexes, plan_validator, generation_runner.?, warnings) catch {
+        return buildGeneratedSemanticOrHybridQueryBuilder(alloc, request, effective_mode.?, intent, fields, full_text_index_metadata, field_capabilities, embedding_index_metadata, semantic_indexes, plan_validator, generation_runner.?, warnings) catch {
             try warnings.append(alloc, "Generator-backed semantic or hybrid query building failed, so the deterministic semantic or hybrid builder was used.");
             if (try buildSemanticOrHybridQueryBuilder(alloc, request, effective_mode, intent, fields, semantic_indexes, warnings)) |built| {
                 return built;
@@ -2157,7 +2159,7 @@ fn buildQueryBuilderSpecialist(
         return buildGeneratedGraphQueryBuilder(alloc, request, intent, fields, graph_indexes, graph_index_metadata, plan_validator, generation_runner.?, warnings);
     }
     if (shouldUseGeneratedFullTextBuilder(request, effective_mode, generation_runner)) {
-        return buildGeneratedFullTextQueryBuilder(alloc, request, intent, fields, full_text_index_metadata, plan_validator, generation_runner.?);
+        return buildGeneratedFullTextQueryBuilder(alloc, request, intent, fields, full_text_index_metadata, field_capabilities, plan_validator, generation_runner.?);
     }
     return try buildQueryBuilderQuery(alloc, request, intent, fields, warnings);
 }
@@ -2297,6 +2299,7 @@ fn buildGeneratedSemanticOrHybridQueryBuilder(
     intent: []const u8,
     fields: []const []const u8,
     full_text_index_metadata: []const QueryBuilderFullTextIndex,
+    field_capabilities: []const QueryBuilderFieldCapability,
     embedding_index_metadata: []const QueryBuilderEmbeddingIndex,
     semantic_indexes: []const []const u8,
     plan_validator: ?QueryBuilderPlanValidator,
@@ -2311,6 +2314,7 @@ fn buildGeneratedSemanticOrHybridQueryBuilder(
         intent,
         fields,
         full_text_index_metadata,
+        field_capabilities,
         embedding_index_metadata,
         semantic_indexes,
         plan_validator,
@@ -2337,6 +2341,7 @@ fn buildGeneratedSemanticOrHybridQueryBuilderPlan(
     intent: []const u8,
     fields: []const []const u8,
     full_text_index_metadata: []const QueryBuilderFullTextIndex,
+    field_capabilities: []const QueryBuilderFieldCapability,
     embedding_index_metadata: []const QueryBuilderEmbeddingIndex,
     semantic_indexes: []const []const u8,
     plan_validator: ?QueryBuilderPlanValidator,
@@ -2347,7 +2352,7 @@ fn buildGeneratedSemanticOrHybridQueryBuilderPlan(
     const preferred_indexes = try queryBuilderPreferredIndexSlice(alloc, request);
     const source_indexes = try queryBuilderGeneratedSemanticIndexNames(alloc, embedding_index_metadata, semantic_indexes, preferred_indexes);
     if (source_indexes.len == 0) return error.InvalidQueryBuilderGeneration;
-    const messages = try buildSemanticQueryBuilderMessages(alloc, intent, mode, fields, full_text_index_metadata, embedding_index_metadata, source_indexes, request.example_documents);
+    const messages = try buildSemanticQueryBuilderMessages(alloc, intent, mode, fields, full_text_index_metadata, field_capabilities, embedding_index_metadata, source_indexes, request.example_documents);
     const first_attempt = buildGeneratedSemanticQueryBuilderAttemptFromMessages(alloc, request, mode, fields, source_indexes, plan_validator, generation_runner, chain, messages) catch |first_err| switch (first_err) {
         error.InvalidQueryBuilderGeneration => {
             const repair_messages = try buildSemanticQueryBuilderRepairMessages(alloc, messages, null);
@@ -2478,10 +2483,11 @@ fn buildGeneratedFullTextQueryBuilder(
     intent: []const u8,
     fields: []const []const u8,
     full_text_index_metadata: []const QueryBuilderFullTextIndex,
+    field_capabilities: []const QueryBuilderFieldCapability,
     plan_validator: ?QueryBuilderPlanValidator,
     generation_runner: GenerationRunner,
 ) !BuiltQueryBuilderQuery {
-    const generated = try buildGeneratedFullTextQueryBuilderPlan(alloc, request, intent, fields, full_text_index_metadata, plan_validator, generation_runner);
+    const generated = try buildGeneratedFullTextQueryBuilderPlan(alloc, request, intent, fields, full_text_index_metadata, field_capabilities, plan_validator, generation_runner);
     return .{
         .query = generated.query,
         .temporal_hint = detectTemporalHint(intent),
@@ -2499,12 +2505,13 @@ fn buildGeneratedFullTextQueryBuilderPlan(
     intent: []const u8,
     fields: []const []const u8,
     full_text_index_metadata: []const QueryBuilderFullTextIndex,
+    field_capabilities: []const QueryBuilderFieldCapability,
     plan_validator: ?QueryBuilderPlanValidator,
     generation_runner: GenerationRunner,
 ) !GeneratedFullTextQueryBuilderPlan {
     const generator_cfg = request.generator orelse return error.UnsupportedQueryBuilderGeneration;
     const chain = try buildQueryBuilderGenerationChain(alloc, generator_cfg);
-    const messages = try buildBleveQueryBuilderMessages(alloc, intent, fields, full_text_index_metadata, request.example_documents);
+    const messages = try buildBleveQueryBuilderMessages(alloc, intent, fields, full_text_index_metadata, field_capabilities, request.example_documents);
     const first_attempt = buildGeneratedFullTextQueryBuilderAttemptFromMessages(alloc, request, fields, plan_validator, generation_runner, chain, messages) catch |first_err| switch (first_err) {
         error.InvalidQueryBuilderGeneration => {
             const repair_messages = try buildBleveQueryBuilderRepairMessages(alloc, messages, null);
@@ -2793,11 +2800,12 @@ fn buildSemanticQueryBuilderMessages(
     mode: []const u8,
     fields: []const []const u8,
     full_text_index_metadata: []const QueryBuilderFullTextIndex,
+    field_capabilities: []const QueryBuilderFieldCapability,
     embedding_index_metadata: []const QueryBuilderEmbeddingIndex,
     semantic_indexes: []const []const u8,
     example_documents: ?[]const std.json.Value,
 ) ![]const generating.ChatMessage {
-    const system = try buildSemanticQueryBuilderSystemPrompt(alloc, mode, fields, full_text_index_metadata, embedding_index_metadata, semantic_indexes, example_documents orelse &.{});
+    const system = try buildSemanticQueryBuilderSystemPrompt(alloc, mode, fields, full_text_index_metadata, field_capabilities, embedding_index_metadata, semantic_indexes, example_documents orelse &.{});
     const hybrid_mode = std.ascii.eqlIgnoreCase(mode, "hybrid");
     const user = try std.fmt.allocPrint(
         alloc,
@@ -2859,11 +2867,100 @@ fn buildSemanticQueryBuilderRepairMessages(
     return out;
 }
 
+fn nativeSortablePromptCapability(capability: QueryBuilderFieldCapability) bool {
+    if (!capability.sortable) return false;
+    if (std.mem.eql(u8, capability.field, "_id")) {
+        return std.mem.eql(u8, capability.queryability_state, "queryable");
+    }
+    if (!capability.doc_values) return false;
+    return metadataCapabilityNotQueryableForSort(capability) == null;
+}
+
+fn nativeSortablePromptCapabilityAppearedBefore(
+    capabilities: []const QueryBuilderFieldCapability,
+    limit: usize,
+    field: []const u8,
+) bool {
+    for (capabilities[0..limit]) |capability| {
+        if (!nativeSortablePromptCapability(capability)) continue;
+        if (std.mem.eql(u8, capability.field, field)) return true;
+    }
+    return false;
+}
+
+fn indexSortPromptLength(capabilities: []const QueryBuilderFieldCapability) usize {
+    var max_position: ?usize = null;
+    for (capabilities) |capability| {
+        const position = capability.index_sort_position orelse continue;
+        if (!nativeSortablePromptCapability(capability)) continue;
+        if (max_position == null or position > max_position.?) max_position = position;
+    }
+    const length = if (max_position) |position| position + 1 else return 0;
+    for (0..length) |position| {
+        if (indexSortPromptCapabilityAt(capabilities, position) == null) return 0;
+    }
+    return length;
+}
+
+fn indexSortPromptCapabilityAt(
+    capabilities: []const QueryBuilderFieldCapability,
+    position: usize,
+) ?QueryBuilderFieldCapability {
+    for (capabilities) |capability| {
+        if (capability.index_sort_position != null and capability.index_sort_position.? == position and nativeSortablePromptCapability(capability)) {
+            return capability;
+        }
+    }
+    return null;
+}
+
+fn appendNativeSortCapabilityPromptSection(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    field_capabilities: []const QueryBuilderFieldCapability,
+) !void {
+    if (field_capabilities.len == 0) return;
+
+    try out.appendSlice(alloc, "\nNative sortable fields:\n");
+    var emitted_sortable = false;
+    for (field_capabilities, 0..) |capability, i| {
+        if (!nativeSortablePromptCapability(capability)) continue;
+        if (nativeSortablePromptCapabilityAppearedBefore(field_capabilities, i, capability.field)) continue;
+        emitted_sortable = true;
+        try out.appendSlice(alloc, "- ");
+        try out.appendSlice(alloc, capability.field);
+        if (capability.field_type) |field_type| try out.print(alloc, " type: {s}", .{@tagName(field_type)});
+        if (capability.index_sort_position) |position| {
+            try out.print(alloc, " index_sort[{d}]", .{position});
+            if (capability.index_sort_order) |order| try out.print(alloc, " {s}", .{order});
+        }
+        try out.append(alloc, '\n');
+    }
+    if (!emitted_sortable) try out.appendSlice(alloc, "- <none covered>\n");
+
+    try out.appendSlice(alloc, "\nDominant index_sort:\n");
+    const index_sort_len = indexSortPromptLength(field_capabilities);
+    if (index_sort_len == 0) {
+        try out.appendSlice(alloc, "- <none configured>\n");
+        return;
+    }
+    try out.appendSlice(alloc, "- ");
+    for (0..index_sort_len) |position| {
+        const capability = indexSortPromptCapabilityAt(field_capabilities, position).?;
+        if (position > 0) try out.appendSlice(alloc, ", ");
+        try out.appendSlice(alloc, capability.field);
+        try out.append(alloc, ' ');
+        try out.appendSlice(alloc, capability.index_sort_order orelse "asc");
+    }
+    try out.append(alloc, '\n');
+}
+
 fn buildSemanticQueryBuilderSystemPrompt(
     alloc: std.mem.Allocator,
     mode: []const u8,
     fields: []const []const u8,
     full_text_index_metadata: []const QueryBuilderFullTextIndex,
+    field_capabilities: []const QueryBuilderFieldCapability,
     embedding_index_metadata: []const QueryBuilderEmbeddingIndex,
     semantic_indexes: []const []const u8,
     example_documents: []const std.json.Value,
@@ -2946,6 +3043,8 @@ fn buildSemanticQueryBuilderSystemPrompt(
         }
     }
 
+    try appendNativeSortCapabilityPromptSection(alloc, &out, field_capabilities);
+
     if (example_documents.len > 0) {
         try out.appendSlice(alloc, "\nExample documents:\n");
         for (example_documents[0..@min(example_documents.len, 3)], 0..) |document, i| {
@@ -2968,9 +3067,10 @@ fn buildBleveQueryBuilderMessages(
     intent: []const u8,
     fields: []const []const u8,
     full_text_index_metadata: []const QueryBuilderFullTextIndex,
+    field_capabilities: []const QueryBuilderFieldCapability,
     example_documents: ?[]const std.json.Value,
 ) ![]const generating.ChatMessage {
-    const system = try buildBleveQueryBuilderSystemPrompt(alloc, fields, full_text_index_metadata, example_documents orelse &.{});
+    const system = try buildBleveQueryBuilderSystemPrompt(alloc, fields, full_text_index_metadata, field_capabilities, example_documents orelse &.{});
     const user = try std.fmt.allocPrint(
         alloc,
         \\User's search intent: "{s}"
@@ -3031,6 +3131,7 @@ fn buildBleveQueryBuilderSystemPrompt(
     alloc: std.mem.Allocator,
     fields: []const []const u8,
     full_text_index_metadata: []const QueryBuilderFullTextIndex,
+    field_capabilities: []const QueryBuilderFieldCapability,
     example_documents: []const std.json.Value,
 ) ![]const u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
@@ -3080,6 +3181,8 @@ fn buildBleveQueryBuilderSystemPrompt(
             try out.append(alloc, '\n');
         }
     }
+
+    try appendNativeSortCapabilityPromptSection(alloc, &out, field_capabilities);
 
     if (example_documents.len > 0) {
         try out.appendSlice(alloc, "\nExample documents:\n");
@@ -6071,7 +6174,7 @@ fn isFieldNameByte(byte: u8) bool {
     return std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '.';
 }
 
-test "query builder uses generated full text specialist when runner is provided" {
+pub fn testQueryBuilderUsesGeneratedFullTextSpecialistWhenRunnerProvided() !void {
     const FakeGeneration = struct {
         fn iface() GenerationRunner {
             return .{
@@ -6089,10 +6192,23 @@ test "query builder uses generated full text specialist when runner is provided"
             try std.testing.expectEqual(@as(usize, 1), chain.len);
             try std.testing.expectEqualStrings("local-generator", chain[0].generator.model);
             try std.testing.expectEqual(@as(usize, 2), messages.len);
-            try std.testing.expect(std.mem.indexOf(u8, messages[0].content, "Native Bleve") != null or std.mem.indexOf(u8, messages[0].content, "native Bleve") != null);
-            try std.testing.expect(std.mem.indexOf(u8, messages[0].content, "Full-text indexes:") != null);
-            try std.testing.expect(std.mem.indexOf(u8, messages[0].content, "search_idx fields: title, body") != null);
-            try std.testing.expect(std.mem.indexOf(u8, messages[1].content, "raft snapshots") != null);
+            const system_prompt = switch (messages[0].content orelse return error.TestExpectedPromptContent) {
+                .text => |text| text,
+                .parts => return error.TestExpectedTextPromptContent,
+            };
+            const user_prompt = switch (messages[1].content orelse return error.TestExpectedPromptContent) {
+                .text => |text| text,
+                .parts => return error.TestExpectedTextPromptContent,
+            };
+            try std.testing.expect(std.mem.indexOf(u8, system_prompt, "Native Bleve") != null or std.mem.indexOf(u8, system_prompt, "native Bleve") != null);
+            try std.testing.expect(std.mem.indexOf(u8, system_prompt, "Full-text indexes:") != null);
+            try std.testing.expect(std.mem.indexOf(u8, system_prompt, "search_idx fields: title, body") != null);
+            try std.testing.expect(std.mem.indexOf(u8, system_prompt, "Native sortable fields:") != null);
+            try std.testing.expect(std.mem.indexOf(u8, system_prompt, "published_at type: datetime index_sort[0] desc") != null);
+            try std.testing.expect(std.mem.indexOf(u8, system_prompt, "_id type: keyword index_sort[1] asc") != null);
+            try std.testing.expect(std.mem.indexOf(u8, system_prompt, "Dominant index_sort:") != null);
+            try std.testing.expect(std.mem.indexOf(u8, system_prompt, "published_at desc, _id asc") != null);
+            try std.testing.expect(std.mem.indexOf(u8, user_prompt, "raft snapshots") != null);
             return .{
                 .content = try alloc.dupe(u8,
                     \\{"query":{"match_phrase":"raft snapshots","field":"body"},"explanation":"Uses phrase search over body.","confidence":0.91,"warnings":["checked schema fields"]}
@@ -6110,9 +6226,38 @@ test "query builder uses generated full text specialist when runner is provided"
         .name = "search_idx",
         .fields = &full_text_fields,
     }};
+    const capabilities = [_]QueryBuilderFieldCapability{
+        .{
+            .field = "published_at",
+            .field_type = .datetime,
+            .doc_values = true,
+            .sortable = true,
+            .doc_value_coverage = "schema_declared",
+            .queryability_state = "declared",
+        },
+        .{
+            .field = "published_at",
+            .field_type = .datetime,
+            .doc_values = true,
+            .sortable = true,
+            .doc_value_coverage = "covered",
+            .queryability_state = "queryable",
+            .index_sort_position = 0,
+            .index_sort_order = "desc",
+        },
+        .{
+            .field = "_id",
+            .field_type = .keyword,
+            .sortable = true,
+            .doc_value_coverage = "identity_metadata",
+            .queryability_state = "queryable",
+            .index_sort_position = 1,
+            .index_sort_order = "asc",
+        },
+    };
     const result = try buildQueryBuilderResponseWithContext(arena, .{
         .intent = "find raft snapshots",
-        .schema_fields = &.{ "title", "body", "status" },
+        .schema_fields = &.{ "title", "body", "status", "published_at" },
         .mode = "full_text",
         .output = "query_request",
         .generator = .{
@@ -6122,6 +6267,7 @@ test "query builder uses generated full text specialist when runner is provided"
         },
     }, .{
         .full_text_index_metadata = &full_text_metadata,
+        .field_capabilities = &capabilities,
     }, FakeGeneration.iface());
 
     try std.testing.expectEqualStrings("full_text", result.specialist.?);
@@ -6134,6 +6280,10 @@ test "query builder uses generated full text specialist when runner is provided"
     try std.testing.expect(result.warnings != null);
     try std.testing.expectEqualStrings("checked schema fields", result.warnings.?[0]);
     try std.testing.expect(result.plan.?.object.get("query_kind") != null);
+}
+
+test "query builder uses generated full text specialist when runner is provided" {
+    try testQueryBuilderUsesGeneratedFullTextSpecialistWhenRunnerProvided();
 }
 
 test "query builder uses generated semantic specialist with embedding metadata prompt" {

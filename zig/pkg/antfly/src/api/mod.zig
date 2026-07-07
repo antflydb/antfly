@@ -135,6 +135,10 @@ test "api query builder preflight describes missing physical sort coverage with 
     try query_builder_agent.testPreflightDescribesMissingPhysicalSortCoverageWithPublicSortableWording();
 }
 
+test "api query builder prompt exposes native sort capabilities" {
+    try query_builder_agent.testQueryBuilderUsesGeneratedFullTextSpecialistWhenRunnerProvided();
+}
+
 test "public batch default schema accepts docsaf doc_type row and rejects reserved _type" {
     const alloc = std.testing.allocator;
 
