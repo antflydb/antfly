@@ -2858,6 +2858,7 @@ pub fn build(b: *std.Build) void {
         "metadata.table status promotes schema capability when runtime coverage is complete",
         "metadata.table status promotes schema geo capability when runtime coverage is complete",
         "metadata.table status does not promote mismatched index sort runtime capability",
+        "metadata.table status does not advertise changed index sort direction before rebuild",
         "metadata.table status merges observed capabilities conservatively",
         "metadata.table debug encoder emits runtime schemas and index bindings",
         "api query builder preflight describes missing physical sort coverage with public sortable wording",

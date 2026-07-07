@@ -96,7 +96,7 @@ pub fn publicExactSortRejection(reason: []const u8, detail: []const u8) PublicEx
     };
 }
 
-fn publicExactSortReason(reason: []const u8, detail: []const u8) []const u8 {
+pub fn publicExactSortReason(reason: []const u8, detail: []const u8) []const u8 {
     if (std.mem.eql(u8, reason, "missing_doc_values_coverage")) return "field_not_sort_ready";
     if (std.mem.eql(u8, reason, "missing_native_filter_coverage")) return "filter_not_queryable";
     if (std.mem.eql(u8, reason, "unmapped_sort_field")) return "unmapped_field";
@@ -3017,7 +3017,7 @@ fn expectSortProfileDiagnosticsSerializationForTest() !void {
     try std.testing.expectEqual(@as(i64, 3), sort.get("distributed_shard_count").?.integer);
     try std.testing.expectEqual(@as(i64, 11), sort.get("distributed_shard_window").?.integer);
     try std.testing.expectEqualStrings("match_all_candidate_collect_limit", sort.get("budget_rejection_reason").?.string);
-    try std.testing.expectEqualStrings("missing_doc_values_coverage", sort.get("sort_rejection_reason").?.string);
+    try std.testing.expectEqualStrings("field_not_sort_ready", sort.get("sort_rejection_reason").?.string);
     try std.testing.expectEqualStrings("missing_doc_values_section", sort.get("sort_rejection_detail").?.string);
     try std.testing.expectEqualStrings("created_at", sort.get("sort_rejection_field").?.string);
 }
@@ -4445,7 +4445,11 @@ fn buildSortProfileValue(
     try sort.put(alloc, "distributed_shard_count", try buildProfileSizeValue(alloc, profile.distributed_shard_count));
     try sort.put(alloc, "distributed_shard_window", try buildProfileSizeValue(alloc, profile.distributed_shard_window));
     try sort.put(alloc, "budget_rejection_reason", .{ .string = profile.budget_rejection_reason });
-    try sort.put(alloc, "sort_rejection_reason", .{ .string = profile.sort_rejection_reason });
+    const public_sort_rejection_reason = if (profile.sort_rejection_reason.len > 0)
+        publicExactSortReason(profile.sort_rejection_reason, profile.sort_rejection_detail)
+    else
+        "";
+    try sort.put(alloc, "sort_rejection_reason", .{ .string = public_sort_rejection_reason });
     try sort.put(alloc, "sort_rejection_detail", .{ .string = profile.sort_rejection_detail });
     try sort.put(alloc, "sort_rejection_field", .{ .string = try alloc.dupe(u8, profile.sort_rejection_field.slice()) });
     return .{ .object = sort };
@@ -4700,7 +4704,7 @@ fn appendCanonicalPublicQueryAlloc(
         }
     }
 
-    if (isCanonicalStructuredFilterValue(query)) {
+    if (isUnambiguousStructuredFilterValue(query)) {
         try appendRawStructuredFilterClausesAlloc(alloc, filter_clauses, query);
         return;
     }
@@ -4853,6 +4857,36 @@ fn isCanonicalStructuredFilterValue(value: std.json.Value) bool {
     return false;
 }
 
+fn isUnambiguousStructuredFilterValue(value: std.json.Value) bool {
+    if (value != .object) return false;
+    inline for ([_][]const u8{
+        "match_all",
+        "match_none",
+        "exists",
+        "terms",
+        "range",
+        "numeric_range",
+        "term_range",
+        "date_range",
+        "bool_field",
+        "ip_range",
+        "geo_distance",
+        "geo_bbox",
+        "geo_shape",
+        "ids",
+        "doc_id",
+        "doc_ids",
+        "docids",
+        "ref",
+        "conjuncts",
+        "disjuncts",
+        "bool",
+    }) |key| {
+        if (value.object.get(key) != null) return true;
+    }
+    return false;
+}
+
 fn isQueryStringValue(value: std.json.Value) bool {
     if (value != .object) return false;
     return value.object.get("query") != null;
@@ -4944,7 +4978,7 @@ fn appendBoolMustClausesAlloc(
         return;
     }
 
-    if (isCanonicalStructuredFilterValue(value)) {
+    if (isUnambiguousStructuredFilterValue(value)) {
         try appendRawStructuredFilterClausesAlloc(alloc, filter_clauses, value);
         return;
     }
@@ -6866,6 +6900,29 @@ test "api query contract parses public with document filter bindings" {
     try std.testing.expectEqualStrings("raft", parsed.req.full_text.?.match.text);
     try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"ref\":\"visible\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, parsed.req.filter_query_json, "\"ref\":\"published\"") != null);
+}
+
+test "api query contract keeps ambiguous direct text operators score-bearing" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{
+        \\  "query": {
+        \\    "bool": {
+        \\      "must": [
+        \\        {"match":{"field":"body","value":"raft"}}
+        \\      ]
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var parsed = try parseQueryRequest(alloc, null, "docs", body);
+    defer parsed.deinit(alloc);
+
+    try std.testing.expect(parsed.req.full_text.? == .match);
+    try std.testing.expectEqualStrings("body", parsed.req.full_text.?.match.field);
+    try std.testing.expectEqualStrings("raft", parsed.req.full_text.?.match.text);
+    try std.testing.expectEqualStrings("", parsed.req.filter_query_json);
 }
 
 test "api query contract rejects malformed scoring clauses before filter fallback" {

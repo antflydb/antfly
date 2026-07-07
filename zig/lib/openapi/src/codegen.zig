@@ -127,7 +127,7 @@ pub fn generate(arena: Allocator, doc: *const types.OpenApiDoc, opts: GenerateOp
             }
         }
 
-        result.root = try w.toOwnedSlice();
+        result.root = try finishGeneratedModule(arena, w.toSlice());
     }
 
     return result;
@@ -159,7 +159,25 @@ fn buildModule(
     const combined = try arena.alloc(u8, header.len + body.len);
     @memcpy(combined[0..header.len], header);
     @memcpy(combined[header.len..], body);
-    return combined;
+    return finishGeneratedModule(arena, combined);
+}
+
+fn finishGeneratedModule(arena: Allocator, source: []const u8) ![]const u8 {
+    var end = source.len;
+    while (end > 0 and source[end - 1] == '\n') : (end -= 1) {}
+
+    const normalized = try arena.alloc(u8, end + 1);
+    @memcpy(normalized[0..end], source[0..end]);
+    normalized[end] = '\n';
+    return normalized;
+}
+
+test "finish generated module keeps exactly one trailing newline" {
+    const alloc = std.testing.allocator;
+    const normalized = try finishGeneratedModule(alloc, "const x = 1;\n\n");
+    defer alloc.free(normalized);
+
+    try std.testing.expectEqualStrings("const x = 1;\n", normalized);
 }
 
 test "generate minimal" {

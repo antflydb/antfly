@@ -1023,10 +1023,6 @@ const GeneratedFieldCapability = struct {
     document_schema: ?[]const u8 = null,
     type: metadata_openapi.AntflyType,
     query_modes: []const []const u8,
-    searchable: bool,
-    filterable: bool,
-    aggregatable: bool,
-    doc_values: bool,
     sortable: bool,
     doc_value_coverage: []const u8,
     provenance: []const u8,
@@ -1093,14 +1089,19 @@ fn generatedFieldCapabilityPromotionSurfaceEqual(
     left: GeneratedFieldCapability,
     right: GeneratedFieldCapability,
 ) bool {
-    return left.searchable == right.searchable and
-        left.filterable == right.filterable and
-        left.aggregatable == right.aggregatable and
-        left.doc_values == right.doc_values and
+    return queryModesEqual(left.query_modes, right.query_modes) and
         left.sortable == right.sortable and
         std.mem.eql(u8, left.missing_null_policy, right.missing_null_policy) and
         left.index_sort_position == right.index_sort_position and
         optionalStringEql(left.index_sort_order, right.index_sort_order);
+}
+
+fn queryModesEqual(left: []const []const u8, right: []const []const u8) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |left_mode, right_mode| {
+        if (!std.mem.eql(u8, left_mode, right_mode)) return false;
+    }
+    return true;
 }
 
 fn generatedFieldCapabilityAggregationKeyEqual(
@@ -1124,10 +1125,7 @@ fn mergeGeneratedFieldCapability(
     existing: *GeneratedFieldCapability,
     incoming: GeneratedFieldCapability,
 ) !void {
-    existing.searchable = existing.searchable and incoming.searchable;
-    existing.filterable = existing.filterable and incoming.filterable;
-    existing.aggregatable = existing.aggregatable and incoming.aggregatable;
-    existing.doc_values = existing.doc_values and incoming.doc_values;
+    try intersectOwnedQueryModes(alloc, &existing.query_modes, incoming.query_modes);
     existing.sortable = existing.sortable and incoming.sortable;
     try replaceOwnedStringIfDifferent(alloc, &existing.doc_value_coverage, runtime_schema_mod.conservativeDocValueCoverage(existing.doc_value_coverage, incoming.doc_value_coverage));
     try replaceOwnedStringIfDifferent(alloc, &existing.queryability_state, runtime_schema_mod.conservativeQueryabilityState(existing.queryability_state, incoming.queryability_state));
@@ -1142,6 +1140,36 @@ fn mergeGeneratedFieldCapability(
         if (existing.index_sort_order) |order| alloc.free(@constCast(order));
         existing.index_sort_order = null;
     }
+}
+
+fn intersectOwnedQueryModes(
+    alloc: std.mem.Allocator,
+    target: *[]const []const u8,
+    incoming: []const []const u8,
+) !void {
+    var intersection = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer freeOwnedStringSliceFromList(alloc, &intersection);
+    for (target.*) |mode| {
+        if (!stringSliceContains(incoming, mode)) continue;
+        try intersection.append(alloc, try alloc.dupe(u8, mode));
+    }
+    freeOwnedStringSlice(alloc, target.*);
+    target.* = if (intersection.items.len == 0) empty: {
+        intersection.deinit(alloc);
+        break :empty &.{};
+    } else try intersection.toOwnedSlice(alloc);
+}
+
+fn stringSliceContains(values: []const []const u8, needle: []const u8) bool {
+    for (values) |value| {
+        if (std.mem.eql(u8, value, needle)) return true;
+    }
+    return false;
+}
+
+fn freeOwnedStringSliceFromList(alloc: std.mem.Allocator, values: *std.ArrayListUnmanaged([]const u8)) void {
+    for (values.items) |value| alloc.free(@constCast(value));
+    values.deinit(alloc);
 }
 
 fn generatedFieldCapabilitiesPublicSliceAlloc(
@@ -1184,11 +1212,7 @@ fn optionalStringEql(left: ?[]const u8, right: ?[]const u8) bool {
 fn generatedFieldCapabilityAlloc(alloc: std.mem.Allocator, capability: runtime_schema_mod.FieldCapability) !GeneratedFieldCapability {
     var owned = GeneratedFieldCapability{
         .type = generatedAntflyType(capability.field_type),
-        .query_modes = queryModesForFieldCapability(capability),
-        .searchable = capability.searchable,
-        .filterable = capability.filterable,
-        .aggregatable = capability.aggregatable,
-        .doc_values = capability.doc_values,
+        .query_modes = try dupeStringSlice(alloc, queryModesForFieldCapability(capability)),
         .sortable = capability.sortable,
         .doc_value_coverage = "",
         .provenance = "",
@@ -1227,6 +1251,26 @@ fn replaceOwnedStringIfDifferent(alloc: std.mem.Allocator, target: *[]const u8, 
     target.* = owned;
 }
 
+fn dupeStringSlice(alloc: std.mem.Allocator, values: []const []const u8) ![]const []const u8 {
+    if (values.len == 0) return &.{};
+    const out = try alloc.alloc([]const u8, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |value| alloc.free(@constCast(value));
+        alloc.free(out);
+    }
+    for (values, 0..) |value, i| {
+        out[i] = try alloc.dupe(u8, value);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn freeOwnedStringSlice(alloc: std.mem.Allocator, values: []const []const u8) void {
+    for (values) |value| alloc.free(@constCast(value));
+    if (values.len > 0) alloc.free(@constCast(values));
+}
+
 fn freeGeneratedFieldCapabilitiesFromList(
     alloc: std.mem.Allocator,
     capabilities: *std.ArrayListUnmanaged(GeneratedFieldCapability),
@@ -1251,6 +1295,7 @@ fn freePublicGeneratedFieldCapability(alloc: std.mem.Allocator, capability: meta
     if (capability.match_mapping_type) |value| alloc.free(@constCast(value));
     if (capability.emitted_name) |value| alloc.free(@constCast(value));
     if (capability.document_schema) |value| alloc.free(@constCast(value));
+    freeOwnedStringSlice(alloc, capability.query_modes);
     if (capability.provenance.len > 0) alloc.free(@constCast(capability.provenance));
     if (capability.missing_null_policy.len > 0) alloc.free(@constCast(capability.missing_null_policy));
     if (capability.sort_lifecycle_state.len > 0) alloc.free(@constCast(capability.sort_lifecycle_state));
@@ -1266,6 +1311,7 @@ fn freeGeneratedFieldCapability(alloc: std.mem.Allocator, capability: GeneratedF
     if (capability.match_mapping_type) |value| alloc.free(@constCast(value));
     if (capability.emitted_name) |value| alloc.free(@constCast(value));
     if (capability.document_schema) |value| alloc.free(@constCast(value));
+    freeOwnedStringSlice(alloc, capability.query_modes);
     if (capability.doc_value_coverage.len > 0) alloc.free(@constCast(capability.doc_value_coverage));
     if (capability.provenance.len > 0) alloc.free(@constCast(capability.provenance));
     if (capability.missing_null_policy.len > 0) alloc.free(@constCast(capability.missing_null_policy));
@@ -2996,10 +3042,6 @@ test "metadata.table status exposes stable field capabilities" {
     try std.testing.expectEqualStrings("dynamic_template", created.object.get("provenance").?.string);
     try std.testing.expectEqual(@as(i64, 0), created.object.get("index_sort_position").?.integer);
     try std.testing.expectEqualStrings("desc", created.object.get("index_sort_order").?.string);
-    try std.testing.expect(created.object.get("searchable") == null);
-    try std.testing.expect(created.object.get("filterable") == null);
-    try std.testing.expect(created.object.get("aggregatable") == null);
-    try std.testing.expect(created.object.get("doc_values") == null);
 
     try std.testing.expectEqualStrings("not_null", id_capability.object.get("missing_null_policy").?.string);
     try std.testing.expect(testJsonArrayContainsString(id_capability.object.get("query_modes").?, "exact"));
@@ -3198,6 +3240,96 @@ test "metadata.table status does not promote mismatched index sort runtime capab
     try std.testing.expect(created.object.get("index_sort_order") == null);
 }
 
+test "metadata.table status does not advertise changed index sort direction before rebuild" {
+    const schema_json =
+        \\{"version":2,"default_type":"doc","dynamic_templates":[{"name":"created","path_match":"created_at","mapping":{"type":"datetime","sortable":true}}],"index_sort":[{"field":"created_at","order":"asc"}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"created_at":{"type":"string","format":"date-time"}}}}}}
+    ;
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs", .schema_json = schema_json, .indexes_json = "{}", .replication_sources_json = "[]", .placement_role = "data" }})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null }})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+    };
+
+    const template = runtime_schema_mod.DynamicTemplate{
+        .name = "created",
+        .path_match = "created_at",
+        .mapping = .{
+            .field_type = .datetime,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "standard",
+        },
+    };
+    const old_index_sort = [_]runtime_schema_mod.IndexSortField{.{ .field = "created_at", .desc = true }};
+    const old_runtime_schema = runtime_schema_mod.TableSchema{
+        .dynamic_templates = &.{template},
+        .index_sort = &old_index_sort,
+    };
+    var old_covered = runtime_schema_mod.dynamicTemplateFieldCapability(old_runtime_schema, template);
+    old_covered.doc_value_coverage = "covered";
+    old_covered.queryability_state = "queryable";
+    runtime_schema_mod.refreshSortLifecycleState(&old_covered);
+    try std.testing.expectEqualStrings("accelerated", old_covered.sort_lifecycle_state);
+    var runtime_capabilities = [_]runtime_schema_mod.FieldCapability{old_covered};
+    var observed_sets = [_]table_reads.ObservedDynamicFieldCapabilitySet{.{
+        .index_name = @constCast("full_text_index_v0"),
+        .field_capabilities = runtime_capabilities[0..],
+    }};
+    const storage_statuses = [_]TableStorageStatus{.{
+        .table_name = "docs",
+        .empty = false,
+        .observed_dynamic_field_capability_sets = observed_sets[0..],
+    }};
+
+    const encoded = (try encodeSingleTableStatusWithStorageStatuses(std.testing.allocator, &snapshot, "docs", storage_statuses[0..])).?;
+    defer std.testing.allocator.free(encoded);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+    const created = testFieldCapabilityByIdentifier(parsed.value, "created") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("datetime", created.object.get("type").?.string);
+    try std.testing.expect(testJsonArrayContainsString(created.object.get("query_modes").?, "exact"));
+    try std.testing.expect(testJsonArrayContainsString(created.object.get("query_modes").?, "range"));
+    try std.testing.expect(created.object.get("sortable").?.bool);
+    try std.testing.expectEqualStrings("declared", created.object.get("sort_lifecycle_state").?.string);
+    try std.testing.expect(created.object.get("index_sort_position") == null);
+    try std.testing.expect(created.object.get("index_sort_order") == null);
+}
+
+test "metadata.table status merges query modes conservatively" {
+    var queryable = runtime_schema_mod.observedDynamicFieldCapability(null, "price", .{
+        .field_type = .numeric,
+        .do_index = true,
+        .doc_values = true,
+        .sortable = true,
+    });
+    queryable.doc_value_coverage = "covered";
+    queryable.queryability_state = "queryable";
+    runtime_schema_mod.refreshSortLifecycleState(&queryable);
+    const unqueryable = runtime_schema_mod.observedDynamicFieldCapability(null, "price", .{
+        .field_type = .numeric,
+        .do_index = false,
+        .doc_values = true,
+        .sortable = false,
+    });
+
+    var merged = try generatedFieldCapabilityAlloc(std.testing.allocator, queryable);
+    defer freeGeneratedFieldCapability(std.testing.allocator, merged);
+    var incoming = try generatedFieldCapabilityAlloc(std.testing.allocator, unqueryable);
+    defer freeGeneratedFieldCapability(std.testing.allocator, incoming);
+    freeOwnedStringSlice(std.testing.allocator, incoming.query_modes);
+    incoming.query_modes = &.{};
+
+    try std.testing.expect(testStringSliceContains(merged.query_modes, "exact"));
+    try std.testing.expect(testStringSliceContains(merged.query_modes, "range"));
+    try mergeGeneratedFieldCapability(std.testing.allocator, &merged, incoming);
+    try std.testing.expectEqual(@as(usize, 0), merged.query_modes.len);
+    try std.testing.expect(!merged.sortable);
+}
+
 test "metadata.table status merges observed capabilities conservatively" {
     const snapshot: metadata_api.AdminSnapshot = .{
         .status = .{ .metadata_group_id = 1, .metrics = .{} },
@@ -3331,10 +3463,6 @@ test "metadata.table debug encoder emits runtime schemas and index bindings" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"field\":\"title\",\"emitted_name\":\"title\",\"document_schema\":\"doc\",\"type\":\"text\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"query_modes\":[\"full_text\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"queryability_state\":\"text_search_only\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"searchable\":") == null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"filterable\":") == null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"aggregatable\":") == null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"doc_values\":") == null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"algebraic_capabilities\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"capability_fingerprint\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"lifecycle_status\":\"rebuild_required\"") != null);
@@ -3428,7 +3556,6 @@ pub fn testRuntimeSchemaDebugEmitsSortCapabilities() !void {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"field\":\"title\",\"emitted_name\":\"title\",\"document_schema\":\"doc\",\"type\":\"text\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"query_modes\":[\"full_text\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"queryability_state\":\"text_search_only\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"doc_values\":") == null);
 }
 
 test "create table parser preserves supported metadata fields" {

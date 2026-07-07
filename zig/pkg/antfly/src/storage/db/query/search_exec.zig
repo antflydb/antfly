@@ -3181,7 +3181,7 @@ test "sort execution plan dimensions default from kind unless explicit" {
     try std.testing.expectEqual(SortPlanDistributedBehavior.coordinator_merge, sortExecutionPlanDistributedBehavior(distributed_plan));
 }
 
-test "sort result profile preserves budget reason without stale rejection diagnostic" {
+test "sort result profile classifies budget rejection without stale diagnostic" {
     resetLastSortRejectionDiagnostic();
     logNativeSortPlanRejection(
         "created_at",
@@ -3202,8 +3202,8 @@ test "sort result profile preserves budget reason without stale rejection diagno
     try std.testing.expectEqualStrings("id_seek", profile.plan);
     try std.testing.expectEqualStrings("queryable", profile.sort_lifecycle_state);
     try std.testing.expectEqualStrings("match_all_candidate_collect_limit", profile.budget_rejection_reason);
-    try std.testing.expectEqualStrings("", profile.sort_rejection_reason);
-    try std.testing.expectEqualStrings("", profile.sort_rejection_detail);
+    try std.testing.expectEqualStrings("candidate_budget_exceeded", profile.sort_rejection_reason);
+    try std.testing.expectEqualStrings("match_all_candidate_collect_limit", profile.sort_rejection_detail);
     try std.testing.expectEqualStrings("", profile.sort_rejection_field.slice());
 
     logNativeSortPlanRejection(
@@ -3446,6 +3446,19 @@ fn sortResultProfile(
         resetLastSortRejectionDiagnostic();
         break :blk null;
     };
+    const budget_rejected = profile.budget_rejection_reason.len > 0;
+    const sort_rejection_reason = if (rejection) |item|
+        item.reason
+    else if (budget_rejected)
+        "candidate_budget_exceeded"
+    else
+        "";
+    const sort_rejection_detail = if (rejection) |item|
+        item.detail
+    else if (budget_rejected)
+        profile.budget_rejection_reason
+    else
+        "";
     return .{
         .plan = sortExecutionPlanKindName(plan.kind),
         .exactness = sortPlanExactnessName(sortExecutionPlanExactness(plan)),
@@ -3494,8 +3507,8 @@ fn sortResultProfile(
         .distributed_shard_count = profile.distributed_shard_count,
         .distributed_shard_window = profile.distributed_shard_window,
         .budget_rejection_reason = profile.budget_rejection_reason,
-        .sort_rejection_reason = if (rejection) |item| item.reason else "",
-        .sort_rejection_detail = if (rejection) |item| item.detail else "",
+        .sort_rejection_reason = sort_rejection_reason,
+        .sort_rejection_detail = sort_rejection_detail,
         .sort_rejection_field = if (rejection) |item| types.SortProfileField.init(item.field) else .{},
     };
 }

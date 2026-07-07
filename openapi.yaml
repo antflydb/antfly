@@ -12587,25 +12587,25 @@ components:
         sort_rejection_reason:
           type: string
           description: >
-            Stable exact-sort rejection reason. Known values include
+            Stable public exact-sort rejection reason. Known values include
 
-            `unmapped_sort_field`, `non_sortable_sort_field`,
+            `unmapped_field`, `non_sortable_field`,
 
-            `missing_doc_values_coverage`,
+            `unsupported_sort_field`, `mixed_field_type`,
 
-            `missing_native_filter_coverage`, `invalid_cursor_arity`,
+            `field_not_sort_ready`, `filter_not_queryable`,
 
-            `invalid_cursor_type`, `invalid_sort_tuple`,
+            `invalid_cursor_arity`, `invalid_cursor_type`,
 
-            `approximate_candidate_source`, `candidate_budget_exceeded`,
+            `invalid_sort_tuple`, `approximate_candidate_source`,
 
-            `missing_runtime_mapping`, `invalid_doc_value_type`,
+            `candidate_budget_exceeded`, `missing_null_policy`,
 
-            `missing_null_policy`, `non_score_bearing_source`,
+            `non_score_bearing_source`, `invalid_score_value`,
 
-            `invalid_score_value`, `count_only_ordered_page`,
+            `count_only_ordered_page`, `stored_json_sort_disabled`,
 
-            `stored_json_sort_disabled`, `unsupported_exact_sort`, and
+            `unsupported_exact_sort`, and
 
             `distributed_merge_unsupported`.
         sort_rejection_detail:
@@ -12639,9 +12639,11 @@ components:
 
             `sort_tuple_arity`, `invalid_doc_value_type`,
 
-            `incomplete_sort_tuple`, `mixed_sort_value_domain`,
+            `missing_runtime_mapping`, `incomplete_sort_tuple`,
 
-            `unsorted_shard_window`, `unsorted_component_window`,
+            `mixed_sort_value_domain`, `unsorted_shard_window`,
+
+            `unsorted_component_window`,
 
             `non_numeric_score`, `missing_score`, `non_finite_score`,
 
