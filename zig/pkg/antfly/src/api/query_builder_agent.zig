@@ -5573,7 +5573,7 @@ fn queryBuilderSortFieldFromString(
         desc = false;
         field = std.mem.trim(u8, field[0 .. field.len - 4], " \t\r\n");
     }
-    if (!queryBuilderFieldAllowed(constraints, fields, field)) return null;
+    if (!queryBuilderSortFieldAllowed(constraints, fields, field)) return null;
     return .{ .field = try alloc.dupe(u8, field), .desc = desc };
 }
 
@@ -5586,7 +5586,7 @@ fn queryBuilderSortFieldFromObject(
     const raw_field = object.get("field") orelse object.get("name") orelse return null;
     const field = queryBuilderStringValue(raw_field) orelse return null;
     const trimmed = std.mem.trim(u8, field, " \t\r\n");
-    if (!queryBuilderFieldAllowed(constraints, fields, trimmed)) return null;
+    if (!queryBuilderSortFieldAllowed(constraints, fields, trimmed)) return null;
 
     var desc: ?bool = null;
     if (object.get("desc")) |raw_desc| {
@@ -5597,6 +5597,15 @@ fn queryBuilderSortFieldFromObject(
         desc = queryBuilderSortDirection(raw_order);
     }
     return .{ .field = try alloc.dupe(u8, trimmed), .desc = desc };
+}
+
+fn queryBuilderSortFieldAllowed(
+    constraints: ?std.json.Value,
+    fields: []const []const u8,
+    field: []const u8,
+) bool {
+    if (metadataSortFieldIsReserved(field)) return true;
+    return queryBuilderFieldAllowed(constraints, fields, field);
 }
 
 fn queryBuilderSortDirection(value: std.json.Value) ?bool {
@@ -9468,6 +9477,29 @@ test "query builder filters projection and sort constraints by allowed fields" {
     try std.testing.expectEqual(@as(usize, 1), query_request.order_by.?.len);
     try std.testing.expectEqualStrings("title", query_request.order_by.?[0].field);
     try std.testing.expectEqual(false, query_request.order_by.?[0].desc.?);
+}
+
+test "query builder preserves reserved sort fields outside allowed document fields" {
+    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"order_by":["_score desc","_id"],"allowed_fields":["body"]}
+    , .{});
+    defer constraints_tree.deinit();
+
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const result = try buildQueryBuilderResponse(arena_impl.allocator(), .{
+        .intent = "find raft architecture",
+        .schema_fields = &.{ "body", "created_at" },
+        .mode = "full_text",
+        .constraints = constraints_tree.value,
+    }, null);
+
+    const query_request = result.query_request.?;
+    try std.testing.expectEqual(@as(usize, 2), query_request.order_by.?.len);
+    try std.testing.expectEqualStrings("_score", query_request.order_by.?[0].field);
+    try std.testing.expectEqual(true, query_request.order_by.?[0].desc.?);
+    try std.testing.expectEqualStrings("_id", query_request.order_by.?[1].field);
+    try std.testing.expectEqual(false, query_request.order_by.?[1].desc.?);
 }
 
 test "query builder applies search cursor only when sort is present" {
