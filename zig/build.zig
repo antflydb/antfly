@@ -2838,6 +2838,7 @@ pub fn build(b: *std.Build) void {
         "partial coverage embeddings readiness counts skipped source units",
         "partial coverage embeddings readiness does not mask pending enrichment",
         "api http public sort capability gate validates mapped sortable fields",
+        "api http public sort capability gate fails closed for uncovered observed dynamic fields",
         "metadata.table generated field capabilities include schema dynamic templates",
         "metadata.table status exposes stable field capabilities",
         "metadata.table status promotes schema capability when runtime coverage is complete",

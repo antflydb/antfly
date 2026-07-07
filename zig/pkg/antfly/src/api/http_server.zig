@@ -11253,6 +11253,30 @@ test "api http public sort capability gate fails closed for uncovered observed d
     try std.testing.expectEqualStrings("price", diagnostic.field);
     try std.testing.expectEqualStrings("missing_doc_values_coverage", diagnostic.reason);
     try std.testing.expectEqualStrings("observed_declared", diagnostic.detail);
+
+    const declared_other_index = storage_schema.observedDynamicFieldCapability(null, "price", .{
+        .field_type = .numeric,
+        .doc_values = true,
+        .sortable = true,
+        .analyzer = "keyword",
+    });
+    const declared_other_index_set = table_reads.ObservedDynamicFieldCapabilitySet{
+        .index_name = @constCast("full_text_index_v1"),
+        .field_capabilities = @constCast((&[_]storage_schema.FieldCapability{declared_other_index})[0..]),
+    };
+    try validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .order_by = &price_order,
+        .primary_text_index_name = "full_text_index_v0",
+    }, runtime_schema, &.{ covered_set, declared_other_index_set });
+
+    db_mod.resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedExactSort, validatePublicQuerySortCapabilitiesAgainstRuntime(.{
+        .order_by = &price_order,
+    }, runtime_schema, &.{ covered_set, declared_other_index_set }));
+    diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("price", diagnostic.field);
+    try std.testing.expectEqualStrings("missing_doc_values_coverage", diagnostic.reason);
+    try std.testing.expectEqualStrings("observed_declared", diagnostic.detail);
 }
 
 test "api http server serves extension catalog reads" {
