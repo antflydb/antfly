@@ -13228,7 +13228,6 @@ fn sortAndPageMatchAllOrdinalDocValueCandidatesAlloc(
     var total_hits: u32 = 0;
     for (constraints.filter_doc_nums, 0..) |ordinal, i| {
         if (i % 1024 == 0) try checkSearchRequestDeadline(effective_req);
-        if (containsDocNum(constraints.exclude_doc_nums, ordinal)) continue;
         const doc_num = ordinal_to_text_doc_id.get(ordinal) orelse {
             logNativeSortPlanRejection(
                 "*",
@@ -13238,6 +13237,11 @@ fn sortAndPageMatchAllOrdinalDocValueCandidatesAlloc(
             return error.UnsupportedQueryRequest;
         };
         const stored = snapshot.storedDoc(doc_num) orelse return error.StoredDocMissing;
+        const candidate = MatchAllCandidate{
+            .id = @constCast(stored.id),
+            .ordinal = ordinal,
+        };
+        if (!matchAllCandidateAllowed(candidate, constraints)) continue;
         if (executor.is_expired_key) |is_expired| {
             if (try is_expired(executor.ctx, alloc, stored.id)) continue;
         }
@@ -13349,7 +13353,6 @@ fn visibleMatchAllOrdinalDocValueCandidateCount(
     var visible_count: usize = 0;
     for (constraints.filter_doc_nums, 0..) |ordinal, i| {
         if (i % 1024 == 0) try checkSearchRequestDeadline(req);
-        if (containsDocNum(constraints.exclude_doc_nums, ordinal)) continue;
         const doc_num = ordinal_to_text_doc_id.get(ordinal) orelse {
             logNativeSortPlanRejection(
                 "*",
@@ -13359,6 +13362,11 @@ fn visibleMatchAllOrdinalDocValueCandidateCount(
             return error.UnsupportedQueryRequest;
         };
         const stored = snapshot.storedDoc(doc_num) orelse return error.StoredDocMissing;
+        const candidate = MatchAllCandidate{
+            .id = @constCast(stored.id),
+            .ordinal = ordinal,
+        };
+        if (!matchAllCandidateAllowed(candidate, constraints)) continue;
         if (executor.is_expired_key) |is_expired| {
             if (try is_expired(executor.ctx, alloc, stored.id)) continue;
         }
@@ -13635,8 +13643,7 @@ pub fn searchMatchAll(
         }
         if (native_constraints.positive_filter and
             native_constraints.filter_doc_nums.len > 0 and
-            native_constraints.filter_doc_ids.len == 0 and
-            native_constraints.exclude_doc_ids.len == 0)
+            native_constraints.filter_doc_ids.len == 0)
         {
             return try sortAndPageMatchAllOrdinalDocValueCandidatesAlloc(
                 alloc,
@@ -16556,6 +16563,68 @@ test "match_all native doc values sort consumes selective ordinal candidates dir
     try std.testing.expectEqual(@as(u64, 1), before_profile.cursor_rejected_count);
     try std.testing.expectEqual(@as(u64, 1), before_profile.selected_count);
     try std.testing.expectEqual(@as(usize, 1), before_profile.window_len);
+
+    const exclude_doc_ids = [_][]const u8{"doc:d"};
+    var exclude_id_page = try searchMatchAll(alloc, .{
+        .index_name = "ft",
+        .resolved_doc_filter = &filter,
+        .exclude_doc_ids = &exclude_doc_ids,
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 10,
+    }, .{
+        .ctx = &harness,
+        .collect_candidates = Harness.collectCandidates,
+        .collect_candidates_stream = Harness.streamCandidates,
+        .text_index_entry = Harness.textIndexEntry,
+        .load_projected_document = Harness.loadProjectedDocument,
+        .load_stored = testUnexpectedLoadStoredCallback,
+    });
+    defer exclude_id_page.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), harness.collect_count);
+    try std.testing.expectEqual(@as(usize, 0), harness.stream_count);
+    try std.testing.expectEqual(@as(u32, 1), exclude_id_page.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), exclude_id_page.hits.len);
+    try std.testing.expectEqualStrings("doc:a", exclude_id_page.hits[0].id);
+    const exclude_id_profile = exclude_id_page.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", exclude_id_profile.plan);
+    try std.testing.expectEqualStrings("native_filter", exclude_id_profile.candidate_source);
+    try std.testing.expectEqualStrings("doc_nums", exclude_id_profile.native_filter_mode);
+    try std.testing.expectEqual(@as(u64, 3), exclude_id_profile.native_filter_candidate_count);
+    try std.testing.expectEqual(@as(u64, 2), exclude_id_profile.native_filter_exclusion_count);
+    try std.testing.expectEqual(@as(u64, 1), exclude_id_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 1), exclude_id_profile.selected_count);
+    try std.testing.expectEqual(@as(u64, 1), exclude_id_profile.native_doc_value_hit_count);
+
+    var exclude_id_zero_limit = try searchMatchAll(alloc, .{
+        .index_name = "ft",
+        .resolved_doc_filter = &filter,
+        .exclude_doc_ids = &exclude_doc_ids,
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 0,
+    }, .{
+        .ctx = &harness,
+        .collect_candidates = Harness.collectCandidates,
+        .collect_candidates_stream = Harness.streamCandidates,
+        .text_index_entry = Harness.textIndexEntry,
+        .load_projected_document = Harness.loadProjectedDocument,
+        .load_stored = testUnexpectedLoadStoredCallback,
+    });
+    defer exclude_id_zero_limit.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), harness.collect_count);
+    try std.testing.expectEqual(@as(usize, 0), harness.stream_count);
+    try std.testing.expectEqual(@as(u32, 1), exclude_id_zero_limit.total_hits);
+    try std.testing.expectEqual(@as(usize, 0), exclude_id_zero_limit.hits.len);
+    const zero_profile = exclude_id_zero_limit.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", zero_profile.plan);
+    try std.testing.expectEqual(@as(u64, 1), zero_profile.candidate_count);
+    try std.testing.expectEqual(@as(usize, 0), zero_profile.window_capacity);
+    try std.testing.expectEqual(@as(usize, 0), zero_profile.window_len);
 }
 
 test "required native sort does not fall back to stored json on doc value miss" {
