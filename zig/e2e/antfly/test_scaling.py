@@ -1290,6 +1290,14 @@ def _wait_node_shutdown_phase(
     timeout_s: float = 60.0,
 ) -> dict[str, Any] | None:
     def status_matches() -> dict[str, Any] | None:
+        # Shutdown convergence (drain debt clearing, then post-finalize cleanup to
+        # "not_found") is driven by the metadata reconcile loop. A reallocation
+        # request is a reconcile wake signal, so nudge it each poll to keep the loop
+        # advancing under load instead of waiting on the next unforced periodic pass.
+        try:
+            cluster.trigger_reallocate()
+        except (AssertionError, requests.RequestException):
+            pass
         try:
             response = requests.get(f"{cluster.metadata_urls[0]}/internal/v1/nodes/{node_id}/shutdown", timeout=10)
             response.raise_for_status()
@@ -1370,6 +1378,15 @@ def test_autoscaling_drains_data_node_and_replaces_placements(
     cluster.request_node_shutdown(node_to_drain)
 
     def drained_and_replaced() -> dict[str, Any] | None:
+        # Reallocation off a draining node is request-driven (a ReallocationRequest
+        # record consumed by the metadata control loop). Nudge it on every poll like
+        # the other placement-progress helpers do, so the drain makes deterministic
+        # progress instead of relying on an unforced background pass that can lag past
+        # the timeout on a loaded runner.
+        try:
+            cluster.trigger_reallocate()
+        except (AssertionError, requests.RequestException):
+            return None
         snapshots = _all_metadata_snapshots(cluster)
         if snapshots is None:
             return None
