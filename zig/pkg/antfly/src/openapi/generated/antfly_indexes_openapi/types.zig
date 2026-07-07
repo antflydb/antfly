@@ -279,6 +279,39 @@ pub const EdgeTypeConfig = struct {
     required_metadata: ?[]const []const u8 = null,
 };
 
+/// Unified configuration for embeddings indexes. When sparse is true, creates a sparse vector index (SPLADE inverted index). When sparse is false (default), creates a dense vector index (HNSW). For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected.
+pub const EmbeddingsIndexConfig = struct {
+    /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
+    external: ?bool = null,
+    /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense (HNSW) vector index.
+    sparse: ?bool = null,
+    /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
+    dimension: ?i64 = null,
+    /// Field to extract embeddings from (managed indexes only; not allowed when external=true)
+    field: ?[]const u8 = null,
+    /// Generated embedding artifact name consumed by this vector index. Use with a matching embedding enrichment for artifact-backed managed embeddings.
+    embedding_name: ?[]const u8 = null,
+    /// Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source.
+    source_artifact_name: ?[]const u8 = null,
+    /// Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
+    template: ?[]const u8 = null,
+    distance_metric: ?DistanceMetric = null,
+    /// Whether to use in-memory only storage (dense only)
+    mem_only: ?bool = null,
+    /// Configuration for the embeddings plugin (managed indexes only; not allowed when external=true)
+    embedder: ?antfly_embeddings_openapi.EmbedderConfig = null,
+    /// Configuration for the summarizer plugin (dense managed indexes only)
+    summarizer: ?antfly_generating_openapi.GeneratorConfig = null,
+    /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before indexing. (dense managed indexes only)
+    chunker: ?antfly_chunking_openapi.ChunkerConfig = null,
+    /// Default number of results to return from search (sparse only)
+    top_k: ?i64 = null,
+    /// Minimum weight threshold for sparse vector entries (sparse only)
+    min_weight: ?f32 = null,
+    /// Number of documents per posting list chunk (sparse only)
+    chunk_size: ?i64 = null,
+};
+
 /// Discriminator for the index stats variant.
 pub const EmbeddingsIndexStatsIndexType = enum {
     embeddings,
@@ -385,6 +418,33 @@ pub const EmbeddingsIndexStats = struct {
     resolution: ?std.json.Value = null,
     /// Artifact promotion replay diagnostics.
     promotion: ?std.json.Value = null,
+};
+
+/// Inline managed enrichment definition. Enrichments materialize generated artifacts before indexing and may target source rows or previously generated artifact streams.
+pub const EnrichmentConfig = struct {
+    /// Stable generated artifact name.
+    name: []const u8,
+    kind: EnrichmentKind,
+    /// Source field to read from the source document or source artifact payload.
+    field: ?[]const u8 = null,
+    /// Optional template for generated text input.
+    template: ?[]const u8 = null,
+    /// Existing artifact stream this enrichment consumes. Chunk enrichments may consume asset artifacts; embedding enrichments may consume chunk artifacts.
+    source_artifact_name: ?[]const u8 = null,
+    /// Expected embedding dimension for embedding enrichments.
+    expected_dims: ?i64 = null,
+    /// Chunk size for chunk enrichments.
+    chunk_size: ?i64 = null,
+    /// Chunk overlap for chunk enrichments.
+    chunk_overlap: ?i64 = null,
+    /// Serialized chunker configuration for chunk enrichments.
+    chunker_json: ?[]const u8 = null,
+    /// When true on a chunk or asset enrichment, route generated text into the table's default full-text index.
+    full_text_index: ?bool = null,
+    /// Produced asset content type for asset enrichments.
+    content_type: ?[]const u8 = null,
+    /// Serialized asset producer configuration.
+    producer_json: ?[]const u8 = null,
 };
 
 /// Managed generated artifact kind.
@@ -515,6 +575,18 @@ pub const FullTextIndexStats = struct {
     promotion: ?std.json.Value = null,
 };
 
+/// Configuration for graph index type
+pub const GraphIndexConfig = struct {
+    /// Configuration for generating node summaries (enables tree navigation in Retrieval Agent)
+    summarizer: ?antfly_generating_openapi.GeneratorConfig = null,
+    /// Handlebars template for generating summarizer input text. Uses document fields as template variables. Same pattern as EmbeddingsConfig template.
+    template: ?[]const u8 = null,
+    /// List of edge types with their configurations
+    edge_types: ?[]const EdgeTypeConfig = null,
+    /// Maximum number of edges per document (0 = unlimited)
+    max_edges_per_document: ?i64 = null,
+};
+
 /// Discriminator for the index stats variant.
 pub const GraphIndexStatsIndexType = enum {
     graph,
@@ -611,6 +683,84 @@ pub const GraphIndexStats = struct {
     algebraic_graph: ?std.json.Value = null,
 };
 
+/// Defines how to select start/target nodes for graph queries
+pub const GraphNodeSelector = struct {
+    /// Explicit list of node keys
+    keys: ?[]const []const u8 = null,
+    /// Reference to search results to use as nodes: - "$full_text_results" - use full-text search results - "$embeddings_results.index_name" - use vector search results from specific index
+    result_ref: ?[]const u8 = null,
+    /// Maximum number of nodes to select from the referenced results
+    limit: ?i64 = null,
+    /// Filter which nodes to use as start/target
+    node_filter: ?NodeFilter = null,
+};
+
+/// Declarative graph query to execute after full-text/vector searches
+pub const GraphQuery = struct {
+    type: GraphQueryType,
+    /// Graph index name (must be graph type)
+    index_name: []const u8,
+    /// Starting node(s) for the query
+    start_nodes: ?GraphNodeSelector = null,
+    /// Target nodes (for pathfinding only)
+    target_nodes: ?GraphNodeSelector = null,
+    /// Traversal/pathfinding parameters
+    params: ?GraphQueryParams = null,
+    /// Pattern steps for pattern query type
+    pattern: ?[]const PatternStep = null,
+    /// Which aliases to return from pattern query (empty = all)
+    return_aliases: ?[]const []const u8 = null,
+    /// Fetch full documents for graph results
+    include_documents: ?bool = null,
+    /// Include edge details for each node
+    include_edges: ?bool = null,
+    /// Which fields to return from documents
+    fields: ?[]const []const u8 = null,
+};
+
+/// Parameters for graph traversal and pathfinding
+pub const GraphQueryParams = struct {
+    /// Filter by edge types
+    edge_types: ?[]const []const u8 = null,
+    direction: ?EdgeDirection = null,
+    /// Maximum traversal depth
+    max_depth: ?i64 = null,
+    /// Minimum edge weight
+    min_weight: ?f64 = null,
+    /// Maximum edge weight
+    max_weight: ?f64 = null,
+    /// Maximum number of results (traversal)
+    max_results: ?i64 = null,
+    /// Remove duplicate nodes (traversal)
+    deduplicate_nodes: ?bool = null,
+    /// Include path information (traversal)
+    include_paths: ?bool = null,
+    weight_mode: ?PathWeightMode = null,
+    /// Number of paths to find (k-shortest-paths)
+    k: ?i64 = null,
+    /// Filter which nodes to visit during traversal
+    node_filter: ?NodeFilter = null,
+    /// Graph algorithm to run (e.g., 'pagerank', 'betweenness')
+    algorithm: ?[]const u8 = null,
+    /// Parameters for the graph algorithm
+    algorithm_params: ?std.json.Value = null,
+};
+
+/// Results of a graph query
+pub const GraphQueryResult = struct {
+    type: GraphQueryType,
+    /// Result nodes
+    nodes: ?[]const GraphResultNode = null,
+    /// Result paths (for pathfinding queries)
+    paths: ?[]const Path = null,
+    /// Pattern matches (for pattern queries)
+    matches: ?[]const PatternMatch = null,
+    /// Total number of results
+    total: i64,
+    /// Query execution time
+    took: ?i64 = null,
+};
+
 /// Type of graph query to execute
 pub const GraphQueryType = enum {
     traverse,
@@ -646,355 +796,6 @@ pub const GraphQueryType = enum {
     }
 };
 
-/// The type of the index.
-pub const IndexType = enum {
-    full_text,
-    embeddings,
-    graph,
-    algebraic,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .full_text => "full_text",
-            .embeddings => "embeddings",
-            .graph => "graph",
-            .algebraic => "algebraic",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "full_text", .full_text },
-            .{ "embeddings", .embeddings },
-            .{ "graph", .graph },
-            .{ "algebraic", .algebraic },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Merge strategy for combining results from the semantic_search and full_text_search. rrf: Reciprocal Rank Fusion - combines scores using reciprocal rank formula rsf: Relative Score Fusion - normalizes scores by min/max within a window and combines weighted scores failover: Use full_text_search if embedding generation fails
-pub const MergeStrategy = enum {
-    rrf,
-    rsf,
-    failover,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .rrf => "rrf",
-            .rsf => "rsf",
-            .failover => "failover",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "rrf", .rrf },
-            .{ "rsf", .rsf },
-            .{ "failover", .failover },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Filter nodes during graph traversal using existing query primitives
-pub const NodeFilter = struct {
-    /// Antfly query to filter nodes (same syntax as search filter_query)
-    filter_query: ?std.json.Value = null,
-    /// Filter by key prefix
-    filter_prefix: ?[]const u8 = null,
-};
-
-pub const PathEdge = struct {
-    source: ?[]const u8 = null,
-    target: ?[]const u8 = null,
-    type: ?[]const u8 = null,
-    weight: ?f64 = null,
-    metadata: ?std.json.Value = null,
-};
-
-/// Algorithm for path finding: - min_hops: Shortest path by hop count (breadth-first search, ignores weights) - max_weight: Path with maximum product of edge weights (strongest connection chain) - min_weight: Path with minimum sum of edge weights (lowest cost route)
-pub const PathFindWeightMode = enum {
-    min_hops,
-    max_weight,
-    min_weight,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .min_hops => "min_hops",
-            .max_weight => "max_weight",
-            .min_weight => "min_weight",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "min_hops", .min_hops },
-            .{ "max_weight", .max_weight },
-            .{ "min_weight", .min_weight },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Path weighting algorithm for pathfinding: - min_hops: Minimize number of edges - min_weight: Minimize sum of edge weights - max_weight: Maximize product of edge weights
-pub const PathWeightMode = enum {
-    min_hops,
-    min_weight,
-    max_weight,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .min_hops => "min_hops",
-            .min_weight => "min_weight",
-            .max_weight => "max_weight",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "min_hops", .min_hops },
-            .{ "min_weight", .min_weight },
-            .{ "max_weight", .max_weight },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Configuration for pruning search results based on score quality. Helps filter out low-relevance results in RAG pipelines by detecting score gaps or deviations from top results.
-pub const Pruner = struct {
-    /// Keep only results with score >= max_score * min_score_ratio. For example, 0.5 keeps results scoring at least half of the top result. Applied after fusion scoring.
-    min_score_ratio: ?f64 = null,
-    /// Stop returning results when the gap between consecutive scores exceeds this percentage of the total score range (max - min). Detects "elbows" in score distributions regardless of score scale. For example, 30.0 stops when a gap spans 30% of the score range.
-    max_score_gap_percent: ?f64 = null,
-    /// Hard minimum score threshold. Results with scores below this value are excluded regardless of other pruning settings.
-    min_absolute_score: ?f64 = null,
-    /// Only keep results that appear in multiple indexes (both full-text and vector search). Useful for increasing precision by requiring agreement between different retrieval methods.
-    require_multi_index: ?bool = null,
-    /// Keep results within N standard deviations below the mean score. For example, 1.0 keeps results with score >= mean - 1*stddev. Useful for statistical outlier detection in result sets.
-    std_dev_threshold: ?f64 = null,
-};
-
-/// Sort direction for a single field. true = descending, false = ascending.
-pub const SortDirection = bool;
-
-/// A single sort field with direction.
-pub const SortField = struct {
-    /// The field name to sort by.
-    field: []const u8,
-    /// Sort direction. true = descending, false = ascending.
-    desc: ?bool = null,
-};
-
-/// Unified configuration for embeddings indexes. When sparse is true, creates a sparse vector index (SPLADE inverted index). When sparse is false (default), creates a dense vector index (HNSW). For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected.
-pub const EmbeddingsIndexConfig = struct {
-    /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
-    external: ?bool = null,
-    /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense (HNSW) vector index.
-    sparse: ?bool = null,
-    /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
-    dimension: ?i64 = null,
-    /// Field to extract embeddings from (managed indexes only; not allowed when external=true)
-    field: ?[]const u8 = null,
-    /// Generated embedding artifact name consumed by this vector index. Use with a matching embedding enrichment for artifact-backed managed embeddings.
-    embedding_name: ?[]const u8 = null,
-    /// Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source.
-    source_artifact_name: ?[]const u8 = null,
-    /// Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
-    template: ?[]const u8 = null,
-    distance_metric: ?DistanceMetric = null,
-    /// Whether to use in-memory only storage (dense only)
-    mem_only: ?bool = null,
-    /// Configuration for the embeddings plugin (managed indexes only; not allowed when external=true)
-    embedder: ?antfly_embeddings_openapi.EmbedderConfig = null,
-    /// Configuration for the summarizer plugin (dense managed indexes only)
-    summarizer: ?antfly_generating_openapi.GeneratorConfig = null,
-    /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before indexing. (dense managed indexes only)
-    chunker: ?antfly_chunking_openapi.ChunkerConfig = null,
-    /// Default number of results to return from search (sparse only)
-    top_k: ?i64 = null,
-    /// Minimum weight threshold for sparse vector entries (sparse only)
-    min_weight: ?f32 = null,
-    /// Number of documents per posting list chunk (sparse only)
-    chunk_size: ?i64 = null,
-};
-
-/// A single result from graph traversal
-pub const TraversalResult = struct {
-    /// Base64-encoded document key
-    key: []const u8,
-    /// Document data (if loaded)
-    document: ?std.json.Value = null,
-    /// Distance from start node (0 = start node)
-    depth: i64,
-    /// Sequence of keys from start to this node (if include_paths=true)
-    path: ?[]const []const u8 = null,
-    /// Sequence of edges from start to this node (if include_paths=true)
-    path_edges: ?[]const Edge = null,
-    /// Product of edge weights along the path
-    total_weight: ?f64 = null,
-};
-
-/// Edge constraints in a pattern step
-pub const PatternEdgeStep = struct {
-    /// Edge types to traverse (empty = any)
-    types: ?[]const []const u8 = null,
-    direction: ?EdgeDirection = null,
-    /// Minimum number of hops (1 = direct edge)
-    min_hops: ?i64 = null,
-    /// Maximum number of hops (>1 = variable-length path)
-    max_hops: ?i64 = null,
-    /// Minimum edge weight filter
-    min_weight: ?f64 = null,
-    /// Maximum edge weight filter
-    max_weight: ?f64 = null,
-};
-
-/// Rules for graph traversal
-pub const TraversalRules = struct {
-    /// Filter edges by type (empty = all types)
-    edge_types: ?[]const []const u8 = null,
-    /// Minimum edge weight filter
-    min_weight: ?f64 = null,
-    /// Maximum edge weight filter
-    max_weight: ?f64 = null,
-    direction: ?EdgeDirection = null,
-    /// Maximum traversal depth (0 = unlimited)
-    max_depth: ?i64 = null,
-    /// Maximum results to return (0 = unlimited)
-    max_results: ?i64 = null,
-    /// Include path information in results
-    include_paths: ?bool = null,
-    /// Visit each node only once
-    deduplicate_nodes: ?bool = null,
-};
-
-/// Configuration for graph index type
-pub const GraphIndexConfig = struct {
-    /// Configuration for generating node summaries (enables tree navigation in Retrieval Agent)
-    summarizer: ?antfly_generating_openapi.GeneratorConfig = null,
-    /// Handlebars template for generating summarizer input text. Uses document fields as template variables. Same pattern as EmbeddingsConfig template.
-    template: ?[]const u8 = null,
-    /// List of edge types with their configurations
-    edge_types: ?[]const EdgeTypeConfig = null,
-    /// Maximum number of edges per document (0 = unlimited)
-    max_edges_per_document: ?i64 = null,
-};
-
-/// Inline managed enrichment definition. Enrichments materialize generated artifacts before indexing and may target source rows or previously generated artifact streams.
-pub const EnrichmentConfig = struct {
-    /// Stable generated artifact name.
-    name: []const u8,
-    kind: EnrichmentKind,
-    /// Source field to read from the source document or source artifact payload.
-    field: ?[]const u8 = null,
-    /// Optional template for generated text input.
-    template: ?[]const u8 = null,
-    /// Existing artifact stream this enrichment consumes. Chunk enrichments may consume asset artifacts; embedding enrichments may consume chunk artifacts.
-    source_artifact_name: ?[]const u8 = null,
-    /// Expected embedding dimension for embedding enrichments.
-    expected_dims: ?i64 = null,
-    /// Chunk size for chunk enrichments.
-    chunk_size: ?i64 = null,
-    /// Chunk overlap for chunk enrichments.
-    chunk_overlap: ?i64 = null,
-    /// Serialized chunker configuration for chunk enrichments.
-    chunker_json: ?[]const u8 = null,
-    /// When true on a chunk or asset enrichment, route generated text into the table's default full-text index.
-    full_text_index: ?bool = null,
-    /// Produced asset content type for asset enrichments.
-    content_type: ?[]const u8 = null,
-    /// Serialized asset producer configuration.
-    producer_json: ?[]const u8 = null,
-};
-
-/// Statistics for an index
-pub const IndexStats = union(enum) {
-    full_text_index_stats: FullTextIndexStats,
-    embeddings_index_stats: EmbeddingsIndexStats,
-    graph_index_stats: GraphIndexStats,
-    algebraic_index_stats: AlgebraicIndexStats,
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
-        return try jsonParseFromValue(allocator, value, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("index_type") orelse return error.MissingField;
-        const disc_str = switch (disc_val) {
-            .string => |s| s,
-            else => return error.UnexpectedToken,
-        };
-        if (std.mem.eql(u8, disc_str, "full_text")) {
-            return .{ .full_text_index_stats = try std.json.parseFromValueLeaky(FullTextIndexStats, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "embeddings")) {
-            return .{ .embeddings_index_stats = try std.json.parseFromValueLeaky(EmbeddingsIndexStats, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "graph")) {
-            return .{ .graph_index_stats = try std.json.parseFromValueLeaky(GraphIndexStats, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "algebraic")) {
-            return .{ .algebraic_index_stats = try std.json.parseFromValueLeaky(AlgebraicIndexStats, allocator, source, options) };
-        }
-        return error.UnexpectedToken;
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        switch (self) {
-            .full_text_index_stats => |v| try jw.write(v),
-            .embeddings_index_stats => |v| try jw.write(v),
-            .graph_index_stats => |v| try jw.write(v),
-            .algebraic_index_stats => |v| try jw.write(v),
-        }
-    }
-};
-
-/// Configuration for result fusion when combining multiple search indexes.
-pub const MergeConfig = struct {
-    strategy: ?MergeStrategy = null,
-    /// Named weights keyed by index name. `full_text` for the full-text search index; embedding index names for vector indexes. Unspecified indexes default to 1.0. Applied in both RRF and RSF.
-    weights: ?std.json.ArrayHashMap(f64) = null,
-    /// RSF normalization window size. Defaults to `limit`.
-    window_size: ?i64 = null,
-    /// RRF k constant (1/(k+rank)). Defaults to 60.0.
-    rank_constant: ?f64 = null,
-};
-
-/// Defines how to select start/target nodes for graph queries
-pub const GraphNodeSelector = struct {
-    /// Explicit list of node keys
-    keys: ?[]const []const u8 = null,
-    /// Reference to search results to use as nodes: - "$full_text_results" - use full-text search results - "$embeddings_results.index_name" - use vector search results from specific index
-    result_ref: ?[]const u8 = null,
-    /// Maximum number of nodes to select from the referenced results
-    limit: ?i64 = null,
-    /// Filter which nodes to use as start/target
-    node_filter: ?NodeFilter = null,
-};
-
 /// A node in graph query results
 pub const GraphResultNode = struct {
     /// Document key
@@ -1015,67 +816,6 @@ pub const GraphResultNode = struct {
     evidence: ?std.json.Value = null,
     /// Connected edges (when include_edges=true)
     edges: ?[]const Edge = null,
-};
-
-pub const Path = struct {
-    /// Ordered list of node keys (base64-encoded)
-    nodes: ?[]const []const u8 = null,
-    edges: ?[]const PathEdge = null,
-    total_weight: ?f64 = null,
-    length: ?i64 = null,
-};
-
-pub const PathFindRequest = struct {
-    /// Source node key (base64-encoded)
-    source: []const u8,
-    /// Target node key (base64-encoded)
-    target: []const u8,
-    /// Filter by specific edge types
-    edge_types: ?[]const []const u8 = null,
-    max_depth: ?i64 = null,
-    weight_mode: ?PathFindWeightMode = null,
-    k: ?i64 = null,
-    min_weight: ?f64 = null,
-    max_weight: ?f64 = null,
-    direction: ?EdgeDirection = null,
-};
-
-/// Parameters for graph traversal and pathfinding
-pub const GraphQueryParams = struct {
-    /// Filter by edge types
-    edge_types: ?[]const []const u8 = null,
-    direction: ?EdgeDirection = null,
-    /// Maximum traversal depth
-    max_depth: ?i64 = null,
-    /// Minimum edge weight
-    min_weight: ?f64 = null,
-    /// Maximum edge weight
-    max_weight: ?f64 = null,
-    /// Maximum number of results (traversal)
-    max_results: ?i64 = null,
-    /// Remove duplicate nodes (traversal)
-    deduplicate_nodes: ?bool = null,
-    /// Include path information (traversal)
-    include_paths: ?bool = null,
-    weight_mode: ?PathWeightMode = null,
-    /// Number of paths to find (k-shortest-paths)
-    k: ?i64 = null,
-    /// Filter which nodes to visit during traversal
-    node_filter: ?NodeFilter = null,
-    /// Graph algorithm to run (e.g., 'pagerank', 'betweenness')
-    algorithm: ?[]const u8 = null,
-    /// Parameters for the graph algorithm
-    algorithm_params: ?std.json.Value = null,
-};
-
-/// A step in a graph pattern query
-pub const PatternStep = struct {
-    /// Name for this node (reuse alias for cycle detection)
-    alias: ?[]const u8 = null,
-    /// Filter constraints for nodes at this step
-    node_filter: ?NodeFilter = null,
-    /// Edge to traverse to reach this step (null for first step)
-    edge: ?PatternEdgeStep = null,
 };
 
 /// Configuration for an index
@@ -1219,12 +959,159 @@ pub const IndexConfig = struct {
     }
 };
 
-/// A single match from a pattern query
-pub const PatternMatch = struct {
-    /// Map of alias to matched node
-    bindings: ?std.json.ArrayHashMap(GraphResultNode) = null,
-    /// Edges traversed in this match
-    path: ?[]const PathEdge = null,
+/// Statistics for an index
+pub const IndexStats = union(enum) {
+    full_text_index_stats: FullTextIndexStats,
+    embeddings_index_stats: EmbeddingsIndexStats,
+    graph_index_stats: GraphIndexStats,
+    algebraic_index_stats: AlgebraicIndexStats,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("index_type") orelse return error.MissingField;
+        const disc_str = switch (disc_val) {
+            .string => |s| s,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "full_text")) {
+            return .{ .full_text_index_stats = try std.json.parseFromValueLeaky(FullTextIndexStats, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "embeddings")) {
+            return .{ .embeddings_index_stats = try std.json.parseFromValueLeaky(EmbeddingsIndexStats, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "graph")) {
+            return .{ .graph_index_stats = try std.json.parseFromValueLeaky(GraphIndexStats, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "algebraic")) {
+            return .{ .algebraic_index_stats = try std.json.parseFromValueLeaky(AlgebraicIndexStats, allocator, source, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .full_text_index_stats => |v| try jw.write(v),
+            .embeddings_index_stats => |v| try jw.write(v),
+            .graph_index_stats => |v| try jw.write(v),
+            .algebraic_index_stats => |v| try jw.write(v),
+        }
+    }
+};
+
+/// The type of the index.
+pub const IndexType = enum {
+    full_text,
+    embeddings,
+    graph,
+    algebraic,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .full_text => "full_text",
+            .embeddings => "embeddings",
+            .graph => "graph",
+            .algebraic => "algebraic",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "full_text", .full_text },
+            .{ "embeddings", .embeddings },
+            .{ "graph", .graph },
+            .{ "algebraic", .algebraic },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Configuration for result fusion when combining multiple search indexes.
+pub const MergeConfig = struct {
+    strategy: ?MergeStrategy = null,
+    /// Named weights keyed by index name. `full_text` for the full-text search index; embedding index names for vector indexes. Unspecified indexes default to 1.0. Applied in both RRF and RSF.
+    weights: ?std.json.ArrayHashMap(f64) = null,
+    /// RSF normalization window size. Defaults to `limit`.
+    window_size: ?i64 = null,
+    /// RRF k constant (1/(k+rank)). Defaults to 60.0.
+    rank_constant: ?f64 = null,
+};
+
+/// Merge strategy for combining results from the semantic_search and full_text_search. rrf: Reciprocal Rank Fusion - combines scores using reciprocal rank formula rsf: Relative Score Fusion - normalizes scores by min/max within a window and combines weighted scores failover: Use full_text_search if embedding generation fails
+pub const MergeStrategy = enum {
+    rrf,
+    rsf,
+    failover,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .rrf => "rrf",
+            .rsf => "rsf",
+            .failover => "failover",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "rrf", .rrf },
+            .{ "rsf", .rsf },
+            .{ "failover", .failover },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Filter nodes during graph traversal using existing query primitives
+pub const NodeFilter = struct {
+    /// Antfly query to filter nodes (same syntax as search filter_query)
+    filter_query: ?std.json.Value = null,
+    /// Filter by key prefix
+    filter_prefix: ?[]const u8 = null,
+};
+
+pub const Path = struct {
+    /// Ordered list of node keys (base64-encoded)
+    nodes: ?[]const []const u8 = null,
+    edges: ?[]const PathEdge = null,
+    total_weight: ?f64 = null,
+    length: ?i64 = null,
+};
+
+pub const PathEdge = struct {
+    source: ?[]const u8 = null,
+    target: ?[]const u8 = null,
+    type: ?[]const u8 = null,
+    weight: ?f64 = null,
+    metadata: ?std.json.Value = null,
+};
+
+pub const PathFindRequest = struct {
+    /// Source node key (base64-encoded)
+    source: []const u8,
+    /// Target node key (base64-encoded)
+    target: []const u8,
+    /// Filter by specific edge types
+    edge_types: ?[]const []const u8 = null,
+    max_depth: ?i64 = null,
+    weight_mode: ?PathFindWeightMode = null,
+    k: ?i64 = null,
+    min_weight: ?f64 = null,
+    max_weight: ?f64 = null,
+    direction: ?EdgeDirection = null,
 };
 
 pub const PathFindResult = struct {
@@ -1236,40 +1123,153 @@ pub const PathFindResult = struct {
     search_time_ms: ?f64 = null,
 };
 
-/// Declarative graph query to execute after full-text/vector searches
-pub const GraphQuery = struct {
-    type: GraphQueryType,
-    /// Graph index name (must be graph type)
-    index_name: []const u8,
-    /// Starting node(s) for the query
-    start_nodes: ?GraphNodeSelector = null,
-    /// Target nodes (for pathfinding only)
-    target_nodes: ?GraphNodeSelector = null,
-    /// Traversal/pathfinding parameters
-    params: ?GraphQueryParams = null,
-    /// Pattern steps for pattern query type
-    pattern: ?[]const PatternStep = null,
-    /// Which aliases to return from pattern query (empty = all)
-    return_aliases: ?[]const []const u8 = null,
-    /// Fetch full documents for graph results
-    include_documents: ?bool = null,
-    /// Include edge details for each node
-    include_edges: ?bool = null,
-    /// Which fields to return from documents
-    fields: ?[]const []const u8 = null,
+/// Algorithm for path finding: - min_hops: Shortest path by hop count (breadth-first search, ignores weights) - max_weight: Path with maximum product of edge weights (strongest connection chain) - min_weight: Path with minimum sum of edge weights (lowest cost route)
+pub const PathFindWeightMode = enum {
+    min_hops,
+    max_weight,
+    min_weight,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .min_hops => "min_hops",
+            .max_weight => "max_weight",
+            .min_weight => "min_weight",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "min_hops", .min_hops },
+            .{ "max_weight", .max_weight },
+            .{ "min_weight", .min_weight },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
-/// Results of a graph query
-pub const GraphQueryResult = struct {
-    type: GraphQueryType,
-    /// Result nodes
-    nodes: ?[]const GraphResultNode = null,
-    /// Result paths (for pathfinding queries)
-    paths: ?[]const Path = null,
-    /// Pattern matches (for pattern queries)
-    matches: ?[]const PatternMatch = null,
-    /// Total number of results
-    total: i64,
-    /// Query execution time
-    took: ?i64 = null,
+/// Path weighting algorithm for pathfinding: - min_hops: Minimize number of edges - min_weight: Minimize sum of edge weights - max_weight: Maximize product of edge weights
+pub const PathWeightMode = enum {
+    min_hops,
+    min_weight,
+    max_weight,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .min_hops => "min_hops",
+            .min_weight => "min_weight",
+            .max_weight => "max_weight",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "min_hops", .min_hops },
+            .{ "min_weight", .min_weight },
+            .{ "max_weight", .max_weight },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Edge constraints in a pattern step
+pub const PatternEdgeStep = struct {
+    /// Edge types to traverse (empty = any)
+    types: ?[]const []const u8 = null,
+    direction: ?EdgeDirection = null,
+    /// Minimum number of hops (1 = direct edge)
+    min_hops: ?i64 = null,
+    /// Maximum number of hops (>1 = variable-length path)
+    max_hops: ?i64 = null,
+    /// Minimum edge weight filter
+    min_weight: ?f64 = null,
+    /// Maximum edge weight filter
+    max_weight: ?f64 = null,
+};
+
+/// A single match from a pattern query
+pub const PatternMatch = struct {
+    /// Map of alias to matched node
+    bindings: ?std.json.ArrayHashMap(GraphResultNode) = null,
+    /// Edges traversed in this match
+    path: ?[]const PathEdge = null,
+};
+
+/// A step in a graph pattern query
+pub const PatternStep = struct {
+    /// Name for this node (reuse alias for cycle detection)
+    alias: ?[]const u8 = null,
+    /// Filter constraints for nodes at this step
+    node_filter: ?NodeFilter = null,
+    /// Edge to traverse to reach this step (null for first step)
+    edge: ?PatternEdgeStep = null,
+};
+
+/// Configuration for pruning search results based on score quality. Helps filter out low-relevance results in RAG pipelines by detecting score gaps or deviations from top results.
+pub const Pruner = struct {
+    /// Keep only results with score >= max_score * min_score_ratio. For example, 0.5 keeps results scoring at least half of the top result. Applied after fusion scoring.
+    min_score_ratio: ?f64 = null,
+    /// Stop returning results when the gap between consecutive scores exceeds this percentage of the total score range (max - min). Detects "elbows" in score distributions regardless of score scale. For example, 30.0 stops when a gap spans 30% of the score range.
+    max_score_gap_percent: ?f64 = null,
+    /// Hard minimum score threshold. Results with scores below this value are excluded regardless of other pruning settings.
+    min_absolute_score: ?f64 = null,
+    /// Only keep results that appear in multiple indexes (both full-text and vector search). Useful for increasing precision by requiring agreement between different retrieval methods.
+    require_multi_index: ?bool = null,
+    /// Keep results within N standard deviations below the mean score. For example, 1.0 keeps results with score >= mean - 1*stddev. Useful for statistical outlier detection in result sets.
+    std_dev_threshold: ?f64 = null,
+};
+
+/// Sort direction for a single field. true = descending, false = ascending.
+pub const SortDirection = bool;
+
+/// A single sort field with direction.
+pub const SortField = struct {
+    /// The field name to sort by.
+    field: []const u8,
+    /// Sort direction. true = descending, false = ascending.
+    desc: ?bool = null,
+};
+
+/// A single result from graph traversal
+pub const TraversalResult = struct {
+    /// Base64-encoded document key
+    key: []const u8,
+    /// Document data (if loaded)
+    document: ?std.json.Value = null,
+    /// Distance from start node (0 = start node)
+    depth: i64,
+    /// Sequence of keys from start to this node (if include_paths=true)
+    path: ?[]const []const u8 = null,
+    /// Sequence of edges from start to this node (if include_paths=true)
+    path_edges: ?[]const Edge = null,
+    /// Product of edge weights along the path
+    total_weight: ?f64 = null,
+};
+
+/// Rules for graph traversal
+pub const TraversalRules = struct {
+    /// Filter edges by type (empty = all types)
+    edge_types: ?[]const []const u8 = null,
+    /// Minimum edge weight filter
+    min_weight: ?f64 = null,
+    /// Maximum edge weight filter
+    max_weight: ?f64 = null,
+    direction: ?EdgeDirection = null,
+    /// Maximum traversal depth (0 = unlimited)
+    max_depth: ?i64 = null,
+    /// Maximum results to return (0 = unlimited)
+    max_results: ?i64 = null,
+    /// Include path information in results
+    include_paths: ?bool = null,
+    /// Visit each node only once
+    deduplicate_nodes: ?bool = null,
 };

@@ -5,6 +5,10 @@ ZIG_BUILD_FLAGS ?=
 UV ?= uv
 SCRIPTS_PY := $(UV) run --project ../scripts --locked python
 INFERENCE_BIN ?= ./zig-out/bin/antfly
+OPENAPI_CODEGEN_SOURCES := build.zig $(wildcard lib/openapi/src/*.zig)
+OPENAPI_CODEGEN_CACHE_KEY := $(shell cat $(OPENAPI_CODEGEN_SOURCES) | shasum | cut -d ' ' -f 1)
+OPENAPI_CODEGEN_CACHE_DIR ?= .zig-cache/openapi-generate-$(OPENAPI_CODEGEN_CACHE_KEY)
+OPENAPI_ZIG_BUILD := $(ZIG) build --cache-dir $(OPENAPI_CODEGEN_CACHE_DIR)
 
 # ====================================================================================
 # Build
@@ -60,11 +64,11 @@ generated-check: openapi-check snowball-check cabi-header-check ## Check all che
 
 openapi-generate:
 	$(SCRIPTS_PY) ../scripts/join_public_openapi.py openapi.yaml
-	$(ZIG) build regen-openapi
+	$(OPENAPI_ZIG_BUILD) regen-openapi
 
 openapi-check:
 	$(SCRIPTS_PY) ../scripts/join_public_openapi.py --compare openapi.yaml
-	$(ZIG) build regen-openapi
+	$(OPENAPI_ZIG_BUILD) regen-openapi
 	test -z "$$(git status --porcelain -- ../openapi.yaml pkg/antfly/src/openapi/generated pkg/inference/src/api/generated)"
 
 snowball-generate:

@@ -94,6 +94,31 @@ pub const OpenAITTSConfig = struct {
     base_url: ?[]const u8 = null,
 };
 
+/// Unified configuration for an STT provider. Select the provider type and configure provider-specific settings. **Supported Providers:** - `openai` - OpenAI Whisper (whisper-1) - `vertex` - Google Cloud Speech-to-Text (Vertex AI) - `antfly` - Antfly inference service (Whisper, Wav2Vec2, HuBERT) **Example:** ```yaml provider: antfly api_url: "http://localhost:8080" model: openai/whisper-base ```
+pub const STTConfig = struct {
+    /// Whisper model to use.
+    model: ?[]const u8 = null,
+    /// OpenAI API key. Falls back to OPENAI_API_KEY environment variable.
+    api_key: ?[]const u8 = null,
+    /// API base URL. Falls back to OPENAI_BASE_URL environment variable.
+    base_url: ?[]const u8 = null,
+    /// Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location.
+    location: ?[]const u8 = null,
+    /// Path to service account JSON key file.
+    credentials_path: ?[]const u8 = null,
+    /// Default language code (e.g., 'en-US', 'es-ES').
+    language_code: ?[]const u8 = null,
+    /// Enable automatic punctuation.
+    enable_automatic_punctuation: ?bool = null,
+    /// Use enhanced models for better accuracy (costs more).
+    use_enhanced: ?bool = null,
+    /// Inference API URL. Falls back to ANTFLY_INFERENCE_URL environment variable.
+    api_url: ?[]const u8 = null,
+    provider: STTProvider,
+};
+
 /// The STT provider to use.
 pub const STTProvider = enum {
     openai,
@@ -123,9 +148,69 @@ pub const STTProvider = enum {
     }
 };
 
+/// Request to transcribe audio to text.
+pub const STTRequest = struct {
+    /// URL to audio file. Supports http://, https://, or s3:// URIs.
+    url: []const u8,
+    /// Optional S3 credentials for s3:// URLs. Falls back to server-configured defaults.
+    s3_credentials: ?antfly_s3_openapi.Credentials = null,
+    format: ?AudioFormat = null,
+    /// ISO 639-1 language code (e.g., 'en', 'es'). Leave empty for auto-detection.
+    language: ?[]const u8 = null,
+    /// Include word-level timestamps.
+    timestamps: ?bool = null,
+    /// Enable speaker diarization.
+    diarization: ?bool = null,
+};
+
+/// Response from speech transcription.
+pub const STTResponse = struct {
+    /// Full transcribed text.
+    text: ?[]const u8 = null,
+    /// Detected or specified language code.
+    language: ?[]const u8 = null,
+    /// Duration of audio in milliseconds.
+    duration_ms: ?i64 = null,
+    segments: ?[]const TranscriptSegment = null,
+    speakers: ?[]const Speaker = null,
+};
+
 pub const Speaker = struct {
     id: ?[]const u8 = null,
     label: ?[]const u8 = null,
+};
+
+/// Unified configuration for a TTS provider. Select the provider type and configure provider-specific settings. **Supported Providers:** - `openai` - OpenAI TTS (tts-1, tts-1-hd) - `vertex` - Google Cloud Text-to-Speech (Vertex AI) - `elevenlabs` - ElevenLabs premium voices **Example:** ```yaml provider: openai model: tts-1-hd voice: nova ```
+pub const TTSConfig = struct {
+    /// TTS model to use. tts-1 is faster, tts-1-hd has higher quality.
+    model: ?[]const u8 = null,
+    /// OpenAI API key. Falls back to OPENAI_API_KEY environment variable.
+    api_key: ?[]const u8 = null,
+    /// Default voice to use.
+    voice: ?[]const u8 = null,
+    /// API base URL. Falls back to OPENAI_BASE_URL environment variable.
+    base_url: ?[]const u8 = null,
+    /// Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location.
+    location: ?[]const u8 = null,
+    /// Path to service account JSON key file.
+    credentials_path: ?[]const u8 = null,
+    /// Default language code (e.g., 'en-US', 'es-ES').
+    language_code: ?[]const u8 = null,
+    /// Default voice name (e.g., 'en-US-Neural2-A').
+    voice_name: ?[]const u8 = null,
+    /// Default ElevenLabs voice ID.
+    voice_id: ?[]const u8 = null,
+    /// TTS model to use.
+    model_id: ?[]const u8 = null,
+    /// Voice stability (0.0-1.0). Higher = more consistent.
+    stability: ?f64 = null,
+    /// Similarity boost (0.0-1.0). Higher = more similar to original voice.
+    similarity_boost: ?f64 = null,
+    /// Speaking style exaggeration (0.0-1.0). Only for v2 models.
+    style: ?f64 = null,
+    provider: TTSProvider,
 };
 
 /// The TTS provider to use.
@@ -155,6 +240,40 @@ pub const TTSProvider = enum {
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
+};
+
+/// Request to synthesize speech from text.
+pub const TTSRequest = struct {
+    /// Text to convert to speech.
+    text: []const u8,
+    /// Voice ID to use.
+    voice: ?[]const u8 = null,
+    format: ?AudioFormat = null,
+    /// Playback speed multiplier.
+    speed: ?f64 = null,
+    /// Optional S3 URI to write audio output (s3://bucket/key).
+    s3_output: ?[]const u8 = null,
+    /// Optional S3 credentials. Falls back to server-configured defaults.
+    s3_credentials: ?antfly_s3_openapi.Credentials = null,
+};
+
+/// Response from speech synthesis.
+pub const TTSResponse = struct {
+    format: ?AudioFormat = null,
+    /// Duration of synthesized audio in milliseconds.
+    duration_ms: ?i64 = null,
+    /// Number of characters processed.
+    characters_used: ?i64 = null,
+    /// S3 URI where audio was written (if s3_output was specified).
+    s3_url: ?[]const u8 = null,
+};
+
+pub const TranscriptSegment = struct {
+    text: ?[]const u8 = null,
+    start_ms: ?i64 = null,
+    end_ms: ?i64 = null,
+    speaker: ?[]const u8 = null,
+    words: ?[]const WordTimestamp = null,
 };
 
 /// Configuration for Google Cloud Speech-to-Text provider (Vertex AI). Uses Application Default Credentials (ADC) for authentication. **Features:** Streaming, speaker diarization, automatic punctuation **Docs:** https://cloud.google.com/speech-to-text/docs
@@ -207,123 +326,4 @@ pub const WordTimestamp = struct {
     word: ?[]const u8 = null,
     start_ms: ?i64 = null,
     end_ms: ?i64 = null,
-};
-
-/// Request to transcribe audio to text.
-pub const STTRequest = struct {
-    /// URL to audio file. Supports http://, https://, or s3:// URIs.
-    url: []const u8,
-    /// Optional S3 credentials for s3:// URLs. Falls back to server-configured defaults.
-    s3_credentials: ?antfly_s3_openapi.Credentials = null,
-    format: ?AudioFormat = null,
-    /// ISO 639-1 language code (e.g., 'en', 'es'). Leave empty for auto-detection.
-    language: ?[]const u8 = null,
-    /// Include word-level timestamps.
-    timestamps: ?bool = null,
-    /// Enable speaker diarization.
-    diarization: ?bool = null,
-};
-
-/// Request to synthesize speech from text.
-pub const TTSRequest = struct {
-    /// Text to convert to speech.
-    text: []const u8,
-    /// Voice ID to use.
-    voice: ?[]const u8 = null,
-    format: ?AudioFormat = null,
-    /// Playback speed multiplier.
-    speed: ?f64 = null,
-    /// Optional S3 URI to write audio output (s3://bucket/key).
-    s3_output: ?[]const u8 = null,
-    /// Optional S3 credentials. Falls back to server-configured defaults.
-    s3_credentials: ?antfly_s3_openapi.Credentials = null,
-};
-
-/// Response from speech synthesis.
-pub const TTSResponse = struct {
-    format: ?AudioFormat = null,
-    /// Duration of synthesized audio in milliseconds.
-    duration_ms: ?i64 = null,
-    /// Number of characters processed.
-    characters_used: ?i64 = null,
-    /// S3 URI where audio was written (if s3_output was specified).
-    s3_url: ?[]const u8 = null,
-};
-
-/// Unified configuration for an STT provider. Select the provider type and configure provider-specific settings. **Supported Providers:** - `openai` - OpenAI Whisper (whisper-1) - `vertex` - Google Cloud Speech-to-Text (Vertex AI) - `antfly` - Antfly inference service (Whisper, Wav2Vec2, HuBERT) **Example:** ```yaml provider: antfly api_url: "http://localhost:8080" model: openai/whisper-base ```
-pub const STTConfig = struct {
-    /// Whisper model to use.
-    model: ?[]const u8 = null,
-    /// OpenAI API key. Falls back to OPENAI_API_KEY environment variable.
-    api_key: ?[]const u8 = null,
-    /// API base URL. Falls back to OPENAI_BASE_URL environment variable.
-    base_url: ?[]const u8 = null,
-    /// Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
-    project_id: ?[]const u8 = null,
-    /// Google Cloud location.
-    location: ?[]const u8 = null,
-    /// Path to service account JSON key file.
-    credentials_path: ?[]const u8 = null,
-    /// Default language code (e.g., 'en-US', 'es-ES').
-    language_code: ?[]const u8 = null,
-    /// Enable automatic punctuation.
-    enable_automatic_punctuation: ?bool = null,
-    /// Use enhanced models for better accuracy (costs more).
-    use_enhanced: ?bool = null,
-    /// Inference API URL. Falls back to ANTFLY_INFERENCE_URL environment variable.
-    api_url: ?[]const u8 = null,
-    provider: STTProvider,
-};
-
-/// Unified configuration for a TTS provider. Select the provider type and configure provider-specific settings. **Supported Providers:** - `openai` - OpenAI TTS (tts-1, tts-1-hd) - `vertex` - Google Cloud Text-to-Speech (Vertex AI) - `elevenlabs` - ElevenLabs premium voices **Example:** ```yaml provider: openai model: tts-1-hd voice: nova ```
-pub const TTSConfig = struct {
-    /// TTS model to use. tts-1 is faster, tts-1-hd has higher quality.
-    model: ?[]const u8 = null,
-    /// OpenAI API key. Falls back to OPENAI_API_KEY environment variable.
-    api_key: ?[]const u8 = null,
-    /// Default voice to use.
-    voice: ?[]const u8 = null,
-    /// API base URL. Falls back to OPENAI_BASE_URL environment variable.
-    base_url: ?[]const u8 = null,
-    /// Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
-    project_id: ?[]const u8 = null,
-    /// Google Cloud location.
-    location: ?[]const u8 = null,
-    /// Path to service account JSON key file.
-    credentials_path: ?[]const u8 = null,
-    /// Default language code (e.g., 'en-US', 'es-ES').
-    language_code: ?[]const u8 = null,
-    /// Default voice name (e.g., 'en-US-Neural2-A').
-    voice_name: ?[]const u8 = null,
-    /// Default ElevenLabs voice ID.
-    voice_id: ?[]const u8 = null,
-    /// TTS model to use.
-    model_id: ?[]const u8 = null,
-    /// Voice stability (0.0-1.0). Higher = more consistent.
-    stability: ?f64 = null,
-    /// Similarity boost (0.0-1.0). Higher = more similar to original voice.
-    similarity_boost: ?f64 = null,
-    /// Speaking style exaggeration (0.0-1.0). Only for v2 models.
-    style: ?f64 = null,
-    provider: TTSProvider,
-};
-
-pub const TranscriptSegment = struct {
-    text: ?[]const u8 = null,
-    start_ms: ?i64 = null,
-    end_ms: ?i64 = null,
-    speaker: ?[]const u8 = null,
-    words: ?[]const WordTimestamp = null,
-};
-
-/// Response from speech transcription.
-pub const STTResponse = struct {
-    /// Full transcribed text.
-    text: ?[]const u8 = null,
-    /// Detected or specified language code.
-    language: ?[]const u8 = null,
-    /// Duration of audio in milliseconds.
-    duration_ms: ?i64 = null,
-    segments: ?[]const TranscriptSegment = null,
-    speakers: ?[]const Speaker = null,
 };

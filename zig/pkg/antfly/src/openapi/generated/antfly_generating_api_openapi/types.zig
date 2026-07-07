@@ -62,6 +62,20 @@ pub const ChatToolName = enum {
     }
 };
 
+/// Configuration for retrieval agent tools. If `enabled_tools` is empty/omitted, retrieval agents default to all retrieval tools available for the request. Explicit retrieval policies should use semantic_search for vector retrieval. For models that don't support native tool calling (e.g., Ollama), a prompt-based fallback is used with structured output parsing.
+pub const ChatToolsConfig = struct {
+    /// List of tools to enable. If empty, retrieval agents default to all retrieval tools available for the request.
+    enabled_tools: ?[]const ChatToolName = null,
+    /// Inline web search provider configuration. Prefer web_search_connection for configured production agents; inline config remains useful for CLI/dev requests. See specs/openapi/antfly/websearch.yaml for provider-specific options.
+    web_search_config: ?antfly_websearch_openapi.WebSearchConfig = null,
+    /// Name of a configured connections.<id> resource with kind web_search. Request-level tool options may reduce scope, but cannot expand the connection's configured capabilities or policy.
+    web_search_connection: ?[]const u8 = null,
+    /// URL fetching configuration. See specs/openapi/antfly/websearch.yaml for available options and security controls.
+    fetch_config: ?antfly_websearch_openapi.FetchConfig = null,
+    /// Maximum number of tool call iterations per turn. Prevents infinite loops in tool execution.
+    max_tool_iterations: ?i64 = null,
+};
+
 /// A request for clarification from the user
 pub const ClarificationRequest = struct {
     /// The clarifying question to ask the user
@@ -72,6 +86,57 @@ pub const ClarificationRequest = struct {
     required: ?bool = null,
 };
 
+/// Configuration for the classification step. This step analyzes the query, selects the optimal retrieval strategy, and generates semantic transformations.
+pub const ClassificationStepConfig = struct {
+    /// Enable query classification and strategy selection
+    enabled: ?bool = null,
+    /// Generator to use for classification. If not specified, uses the default summarizer.
+    generator: ?GeneratorConfig = null,
+    /// Chain of generators to try in order. Mutually exclusive with 'generator'.
+    chain: ?[]const ChainLink = null,
+    /// Include pre-retrieval reasoning explaining query analysis and strategy selection
+    with_reasoning: ?bool = null,
+    /// Override LLM strategy selection. If not set, the LLM chooses optimal strategy.
+    force_strategy: ?QueryStrategy = null,
+    /// Override semantic query mode selection.
+    force_semantic_mode: ?SemanticQueryMode = null,
+    /// Number of alternative query phrasings to generate
+    multi_phrase_count: ?i64 = null,
+};
+
+/// Query classification and transformation result combining all query enhancements including strategy selection and semantic optimization
+pub const ClassificationTransformationResult = struct {
+    route_type: RouteType,
+    strategy: QueryStrategy,
+    semantic_mode: SemanticQueryMode,
+    /// Clarified query with added context for answer generation (human-readable)
+    improved_query: []const u8,
+    /// Optimized query for vector/semantic search. Content style depends on semantic_mode: keywords for 'rewrite', hypothetical answer for 'hypothetical'
+    semantic_query: []const u8,
+    /// Broader background query for context (only present when strategy is 'step_back')
+    step_back_query: ?[]const u8 = null,
+    /// Decomposed sub-questions (only present when strategy is 'decompose')
+    sub_questions: ?[]const []const u8 = null,
+    /// Alternative phrasings of the query for expanded retrieval coverage
+    multi_phrases: ?[]const []const u8 = null,
+    /// Pre-retrieval reasoning explaining query analysis and strategy selection (only present when with_classification_reasoning is enabled)
+    reasoning: ?[]const u8 = null,
+    /// Classification confidence (0.0 to 1.0)
+    confidence: f32,
+};
+
+/// Configuration for confidence assessment. Evaluates answer quality and resource relevance. Can use a model calibrated for scoring tasks.
+pub const ConfidenceStepConfig = struct {
+    /// Enable confidence scoring
+    enabled: ?bool = null,
+    /// Generator for confidence assessment. If not specified, uses the answer step's generator.
+    generator: ?GeneratorConfig = null,
+    /// Chain of generators to try in order. Mutually exclusive with 'generator'.
+    chain: ?[]const ChainLink = null,
+    /// Custom guidance for confidence assessment approach
+    context: ?[]const u8 = null,
+};
+
 /// A filter specification to apply to search queries
 pub const FilterSpec = struct {
     /// Field name to filter on
@@ -80,6 +145,20 @@ pub const FilterSpec = struct {
     operator: []const u8,
     /// Filter value (string, number, boolean, or array for range/in operators)
     value: std.json.Value,
+};
+
+/// Configuration for generating follow-up questions. Uses a separate generator call which can use a cheaper/faster model.
+pub const FollowupStepConfig = struct {
+    /// Enable follow-up question generation
+    enabled: ?bool = null,
+    /// Generator for follow-up questions. If not specified, uses the answer step's generator.
+    generator: ?GeneratorConfig = null,
+    /// Chain of generators to try in order. Mutually exclusive with 'generator'.
+    chain: ?[]const ChainLink = null,
+    /// Number of follow-up questions to generate
+    count: ?i64 = null,
+    /// Custom guidance for follow-up question focus and style
+    context: ?[]const u8 = null,
 };
 
 /// Result of a generate operation. Formatted as markdown by default with inline resource references using [resource_id <id>] or [resource_id <id1>, <id2>] format.
@@ -106,6 +185,20 @@ pub const GenerationResult = struct {
     generation: []const u8,
     /// Suggested follow-up questions
     followup_questions: ?[]const []const u8 = null,
+};
+
+/// Configuration for the generation step. This step generates the final response from retrieved documents using the reasoning as context.
+pub const GenerationStepConfig = struct {
+    /// Enable generation from retrieved documents
+    enabled: ?bool = null,
+    /// Generator to use for generation. If not specified, uses the default summarizer.
+    generator: ?GeneratorConfig = null,
+    /// Chain of generators to try in order. Mutually exclusive with 'generator'.
+    chain: ?[]const ChainLink = null,
+    /// Custom system prompt for answer generation
+    system_prompt: ?[]const u8 = null,
+    /// Custom guidance for generation tone, detail level, and style
+    generation_context: ?[]const u8 = null,
 };
 
 pub const GeneratorConfig = antfly_generating_openapi.GeneratorConfig;
@@ -201,96 +294,3 @@ pub const SemanticQueryMode = enum {
 pub const ToolCall = antfly_generating_openapi.ToolCall;
 
 pub const ToolCallFunction = antfly_generating_openapi.ToolCallFunction;
-
-/// Configuration for retrieval agent tools. If `enabled_tools` is empty/omitted, retrieval agents default to all retrieval tools available for the request. Explicit retrieval policies should use semantic_search for vector retrieval. For models that don't support native tool calling (e.g., Ollama), a prompt-based fallback is used with structured output parsing.
-pub const ChatToolsConfig = struct {
-    /// List of tools to enable. If empty, retrieval agents default to all retrieval tools available for the request.
-    enabled_tools: ?[]const ChatToolName = null,
-    /// Inline web search provider configuration. Prefer web_search_connection for configured production agents; inline config remains useful for CLI/dev requests. See specs/openapi/antfly/websearch.yaml for provider-specific options.
-    web_search_config: ?antfly_websearch_openapi.WebSearchConfig = null,
-    /// Name of a configured connections.<id> resource with kind web_search. Request-level tool options may reduce scope, but cannot expand the connection's configured capabilities or policy.
-    web_search_connection: ?[]const u8 = null,
-    /// URL fetching configuration. See specs/openapi/antfly/websearch.yaml for available options and security controls.
-    fetch_config: ?antfly_websearch_openapi.FetchConfig = null,
-    /// Maximum number of tool call iterations per turn. Prevents infinite loops in tool execution.
-    max_tool_iterations: ?i64 = null,
-};
-
-/// Configuration for confidence assessment. Evaluates answer quality and resource relevance. Can use a model calibrated for scoring tasks.
-pub const ConfidenceStepConfig = struct {
-    /// Enable confidence scoring
-    enabled: ?bool = null,
-    /// Generator for confidence assessment. If not specified, uses the answer step's generator.
-    generator: ?GeneratorConfig = null,
-    /// Chain of generators to try in order. Mutually exclusive with 'generator'.
-    chain: ?[]const ChainLink = null,
-    /// Custom guidance for confidence assessment approach
-    context: ?[]const u8 = null,
-};
-
-/// Configuration for generating follow-up questions. Uses a separate generator call which can use a cheaper/faster model.
-pub const FollowupStepConfig = struct {
-    /// Enable follow-up question generation
-    enabled: ?bool = null,
-    /// Generator for follow-up questions. If not specified, uses the answer step's generator.
-    generator: ?GeneratorConfig = null,
-    /// Chain of generators to try in order. Mutually exclusive with 'generator'.
-    chain: ?[]const ChainLink = null,
-    /// Number of follow-up questions to generate
-    count: ?i64 = null,
-    /// Custom guidance for follow-up question focus and style
-    context: ?[]const u8 = null,
-};
-
-/// Configuration for the generation step. This step generates the final response from retrieved documents using the reasoning as context.
-pub const GenerationStepConfig = struct {
-    /// Enable generation from retrieved documents
-    enabled: ?bool = null,
-    /// Generator to use for generation. If not specified, uses the default summarizer.
-    generator: ?GeneratorConfig = null,
-    /// Chain of generators to try in order. Mutually exclusive with 'generator'.
-    chain: ?[]const ChainLink = null,
-    /// Custom system prompt for answer generation
-    system_prompt: ?[]const u8 = null,
-    /// Custom guidance for generation tone, detail level, and style
-    generation_context: ?[]const u8 = null,
-};
-
-/// Configuration for the classification step. This step analyzes the query, selects the optimal retrieval strategy, and generates semantic transformations.
-pub const ClassificationStepConfig = struct {
-    /// Enable query classification and strategy selection
-    enabled: ?bool = null,
-    /// Generator to use for classification. If not specified, uses the default summarizer.
-    generator: ?GeneratorConfig = null,
-    /// Chain of generators to try in order. Mutually exclusive with 'generator'.
-    chain: ?[]const ChainLink = null,
-    /// Include pre-retrieval reasoning explaining query analysis and strategy selection
-    with_reasoning: ?bool = null,
-    /// Override LLM strategy selection. If not set, the LLM chooses optimal strategy.
-    force_strategy: ?QueryStrategy = null,
-    /// Override semantic query mode selection.
-    force_semantic_mode: ?SemanticQueryMode = null,
-    /// Number of alternative query phrasings to generate
-    multi_phrase_count: ?i64 = null,
-};
-
-/// Query classification and transformation result combining all query enhancements including strategy selection and semantic optimization
-pub const ClassificationTransformationResult = struct {
-    route_type: RouteType,
-    strategy: QueryStrategy,
-    semantic_mode: SemanticQueryMode,
-    /// Clarified query with added context for answer generation (human-readable)
-    improved_query: []const u8,
-    /// Optimized query for vector/semantic search. Content style depends on semantic_mode: keywords for 'rewrite', hypothetical answer for 'hypothetical'
-    semantic_query: []const u8,
-    /// Broader background query for context (only present when strategy is 'step_back')
-    step_back_query: ?[]const u8 = null,
-    /// Decomposed sub-questions (only present when strategy is 'decompose')
-    sub_questions: ?[]const []const u8 = null,
-    /// Alternative phrasings of the query for expanded retrieval coverage
-    multi_phrases: ?[]const []const u8 = null,
-    /// Pre-retrieval reasoning explaining query analysis and strategy selection (only present when with_classification_reasoning is enabled)
-    reasoning: ?[]const u8 = null,
-    /// Classification confidence (0.0 to 1.0)
-    confidence: f32,
-};

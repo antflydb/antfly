@@ -3,6 +3,46 @@
 
 const std = @import("std");
 
+/// Public metadata for an API key (secrets are never returned after creation).
+pub const ApiKey = struct {
+    /// Unique identifier for the API key.
+    key_id: []const u8,
+    /// Human-readable name for the API key.
+    name: []const u8,
+    /// Owner of the API key.
+    username: []const u8,
+    /// Optional permission scoping. If empty, inherits owner's full permissions.
+    permissions: ?[]const Permission = null,
+    /// Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing.
+    row_filter: ?std.json.ArrayHashMap(std.json.Value) = null,
+    /// When the API key was created.
+    created_at: []const u8,
+    /// When the API key expires. Null means never.
+    expires_at: ?[]const u8 = null,
+};
+
+/// API key creation response including the cleartext secret (shown once).
+pub const ApiKeyWithSecret = struct {
+    /// Unique identifier for the API key.
+    key_id: []const u8,
+    /// Human-readable name for the API key.
+    name: []const u8,
+    /// Owner of the API key.
+    username: []const u8,
+    /// Optional permission scoping. If empty, inherits owner's full permissions.
+    permissions: ?[]const Permission = null,
+    /// Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing.
+    row_filter: ?std.json.ArrayHashMap(std.json.Value) = null,
+    /// When the API key was created.
+    created_at: []const u8,
+    /// When the API key expires. Null means never.
+    expires_at: ?[]const u8 = null,
+    /// Cleartext secret for the API key. Store securely — it cannot be retrieved again.
+    key_secret: []const u8,
+    /// Pre-encoded credential ready for the Authorization header: base64(key_id:key_secret).
+    encoded: []const u8,
+};
+
 pub const AuthSubject = struct {
     /// Casbin subject name.
     subject: []const u8,
@@ -10,8 +50,37 @@ pub const AuthSubject = struct {
     kind: []const u8,
 };
 
+/// Request to create a new API key.
+pub const CreateApiKeyRequest = struct {
+    /// Human-readable name for the API key.
+    name: []const u8,
+    /// Duration until expiration (e.g., '720h' for 30 days). Empty means never.
+    expires_in: ?[]const u8 = null,
+    /// Optional permission scoping. Each permission must be a subset of the creator's permissions.
+    permissions: ?[]const Permission = null,
+    /// Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing.
+    row_filter: ?std.json.ArrayHashMap(std.json.Value) = null,
+};
+
+pub const CreateUserRequest = struct {
+    /// Username for the new user. If provided in the path, this field can be omitted or must match the path parameter.
+    username: ?[]const u8 = null,
+    password: []const u8,
+    /// Optional list of initial permissions for the user.
+    initial_policies: ?[]const Permission = null,
+    /// Auth metadata available to stored row-filter policies.
+    metadata: ?std.json.ArrayHashMap(std.json.Value) = null,
+};
+
 pub const Error = struct {
     @"error": []const u8,
+};
+
+pub const Permission = struct {
+    /// Resource name (e.g., table name, target username, or '*' for global).
+    resource: []const u8,
+    resource_type: ResourceType,
+    type: PermissionType,
 };
 
 /// Type of permission.
@@ -99,73 +168,4 @@ pub const User = struct {
     password_hash: []const u8,
     /// Server-side auth metadata available to stored row-filter policies through $auth metadata paths.
     metadata: ?std.json.ArrayHashMap(std.json.Value) = null,
-};
-
-pub const Permission = struct {
-    /// Resource name (e.g., table name, target username, or '*' for global).
-    resource: []const u8,
-    resource_type: ResourceType,
-    type: PermissionType,
-};
-
-/// Public metadata for an API key (secrets are never returned after creation).
-pub const ApiKey = struct {
-    /// Unique identifier for the API key.
-    key_id: []const u8,
-    /// Human-readable name for the API key.
-    name: []const u8,
-    /// Owner of the API key.
-    username: []const u8,
-    /// Optional permission scoping. If empty, inherits owner's full permissions.
-    permissions: ?[]const Permission = null,
-    /// Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing.
-    row_filter: ?std.json.ArrayHashMap(std.json.Value) = null,
-    /// When the API key was created.
-    created_at: []const u8,
-    /// When the API key expires. Null means never.
-    expires_at: ?[]const u8 = null,
-};
-
-/// Request to create a new API key.
-pub const CreateApiKeyRequest = struct {
-    /// Human-readable name for the API key.
-    name: []const u8,
-    /// Duration until expiration (e.g., '720h' for 30 days). Empty means never.
-    expires_in: ?[]const u8 = null,
-    /// Optional permission scoping. Each permission must be a subset of the creator's permissions.
-    permissions: ?[]const Permission = null,
-    /// Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing.
-    row_filter: ?std.json.ArrayHashMap(std.json.Value) = null,
-};
-
-pub const CreateUserRequest = struct {
-    /// Username for the new user. If provided in the path, this field can be omitted or must match the path parameter.
-    username: ?[]const u8 = null,
-    password: []const u8,
-    /// Optional list of initial permissions for the user.
-    initial_policies: ?[]const Permission = null,
-    /// Auth metadata available to stored row-filter policies.
-    metadata: ?std.json.ArrayHashMap(std.json.Value) = null,
-};
-
-/// API key creation response including the cleartext secret (shown once).
-pub const ApiKeyWithSecret = struct {
-    /// Unique identifier for the API key.
-    key_id: []const u8,
-    /// Human-readable name for the API key.
-    name: []const u8,
-    /// Owner of the API key.
-    username: []const u8,
-    /// Optional permission scoping. If empty, inherits owner's full permissions.
-    permissions: ?[]const Permission = null,
-    /// Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing.
-    row_filter: ?std.json.ArrayHashMap(std.json.Value) = null,
-    /// When the API key was created.
-    created_at: []const u8,
-    /// When the API key expires. Null means never.
-    expires_at: ?[]const u8 = null,
-    /// Cleartext secret for the API key. Store securely — it cannot be retrieved again.
-    key_secret: []const u8,
-    /// Pre-encoded credential ready for the Authorization header: base64(key_id:key_secret).
-    encoded: []const u8,
 };

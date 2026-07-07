@@ -12,6 +12,22 @@ pub const AgentDecision = struct {
     approved: ?bool = null,
 };
 
+pub const AgentQuestion = struct {
+    /// Stable question identifier for client-carried continuation
+    id: []const u8,
+    kind: AgentQuestionKind,
+    /// The clarifying question to ask the user
+    question: []const u8,
+    /// Why clarification is needed
+    reason: ?[]const u8 = null,
+    /// Optional list of choices for the user
+    options: ?[]const []const u8 = null,
+    /// Suggested default answer when the server has a preferred choice
+    default_answer: ?[]const u8 = null,
+    /// High-level result areas affected by this decision
+    affects: ?[]const []const u8 = null,
+};
+
 /// UI rendering/answer handling hint for a bounded agent question
 pub const AgentQuestionKind = enum {
     confirm,
@@ -82,6 +98,24 @@ pub const AgentStatus = enum {
     }
 };
 
+/// A step in the shared bounded-agent execution trace
+pub const AgentStep = struct {
+    /// Unique step ID for correlation and tracing
+    id: ?[]const u8 = null,
+    kind: ?AgentStepKind = null,
+    /// Stable step name used for correlation across JSON and SSE surfaces
+    name: []const u8,
+    /// What action was taken
+    action: []const u8,
+    status: ?AgentStepStatus = null,
+    /// Error details when status is "error"
+    error_message: ?[]const u8 = null,
+    /// Server-side execution time in milliseconds
+    duration_ms: ?i64 = null,
+    /// Additional details about the step
+    details: ?std.json.Value = null,
+};
+
 /// Shared bounded-agent step category
 pub const AgentStepKind = enum {
     tool_call,
@@ -149,6 +183,29 @@ pub const AgentStepStatus = enum {
     }
 };
 
+pub const AggregationBucket = struct {
+    /// Bucket key (term, range name, date, etc.)
+    key: []const u8,
+    /// Formatted key for display (e.g., formatted dates)
+    key_as_string: ?[]const u8 = null,
+    /// Number of documents in this bucket
+    doc_count: i64,
+    /// Lower bound for range buckets
+    from: ?f32 = null,
+    /// Upper bound for range buckets
+    to: ?f32 = null,
+    /// Formatted lower bound
+    from_as_string: ?[]const u8 = null,
+    /// Formatted upper bound
+    to_as_string: ?[]const u8 = null,
+    /// Significance score (for significant_terms)
+    score: ?f32 = null,
+    /// Background count (for significant_terms)
+    bg_count: ?i64 = null,
+    /// Results of nested sub-aggregations
+    sub_aggregations: ?std.json.ArrayHashMap(AggregationResult) = null,
+};
+
 pub const AggregationDateRange = struct {
     /// Name of the date range bucket
     name: []const u8,
@@ -165,6 +222,65 @@ pub const AggregationRange = struct {
     from: ?f32 = null,
     /// Upper bound (exclusive)
     to: ?f32 = null,
+};
+
+pub const AggregationRequest = struct {
+    type: AggregationType,
+    /// Field to aggregate on. Required unless `fields` is supplied for a multi-field terms aggregation.
+    field: ?[]const u8 = null,
+    /// Ordered field list for multi-field terms aggregations. Bucket keys are returned as JSON arrays in the same order.
+    fields: ?[]const []const u8 = null,
+    /// Maximum number of buckets to return (for bucketing aggregations)
+    size: ?i64 = null,
+    /// Ranges for range aggregations
+    ranges: ?[]const AggregationRange = null,
+    /// Date ranges for date_range aggregations
+    date_ranges: ?[]const AggregationDateRange = null,
+    /// Fixed interval for histogram aggregations
+    interval: ?f32 = null,
+    /// Calendar-aware interval for date_histogram aggregations
+    calendar_interval: ?std.json.Value = null,
+    /// Origin for geohash_grid aggregation (format: "lat,lon") Example: "37.7749,-122.4194"
+    origin: ?[]const u8 = null,
+    /// Geohash precision (1-12) for geohash_grid aggregations
+    precision: ?i64 = null,
+    /// Distance ranges for geo_distance aggregations
+    distance_ranges: ?[]const DistanceRange = null,
+    /// Distance unit for geo_distance aggregations
+    unit: ?std.json.Value = null,
+    /// Minimum document count for a bucket to be included
+    min_doc_count: ?i64 = null,
+    /// Background filter for significant_terms aggregations
+    background_filter: ?std.json.Value = null,
+    /// Significance algorithm for significant_terms aggregations
+    algorithm: ?std.json.Value = null,
+    /// Algebraic join descriptor for bounded cross-table aggregation planning
+    algebraic_join: ?AlgebraicAggregationJoin = null,
+    /// Nested sub-aggregations
+    sub_aggregations: ?std.json.ArrayHashMap(AggregationRequest) = null,
+};
+
+pub const AggregationResult = struct {
+    /// Single value for metric aggregations (sum, avg, min, max, count, cardinality)
+    value: ?f32 = null,
+    /// Document count for stats aggregations
+    count: ?i64 = null,
+    /// Minimum value for stats aggregations
+    min: ?f32 = null,
+    /// Maximum value for stats aggregations
+    max: ?f32 = null,
+    /// Sum for stats aggregations
+    sum: ?f32 = null,
+    /// Sum of squares for stats aggregations
+    sum_of_squares: ?f32 = null,
+    /// Average for stats aggregations
+    avg: ?f32 = null,
+    /// Standard deviation for stats aggregations
+    std_deviation: ?f32 = null,
+    /// Variance for stats aggregations
+    variance: ?f32 = null,
+    /// Buckets for bucketing aggregations (terms, range, histogram, etc.)
+    buckets: ?[]const AggregationBucket = null,
 };
 
 /// Type of aggregation to compute: - Metrics: sum, avg, min, max, count, sumsquares, stats, cardinality - Bucketing: terms, range, date_range, histogram, date_histogram - Geo: geohash_grid, geo_distance - Analytics: significant_terms
@@ -380,6 +496,76 @@ pub const AnalysesResult = struct {
     tsne: ?[]const f32 = null,
 };
 
+/// DEPRECATED: Use RetrievalAgentRequest instead. Request for the answer agent. Accepts the old request format and internally delegates to the retrieval agent.
+pub const AnswerAgentRequest = struct {
+    /// User's natural language query
+    query: []const u8,
+    /// Queries to execute. Each query specifies its own table.
+    queries: []const QueryRequest,
+    /// DEPRECATED: Use stream on RetrievalAgentRequest instead. Enable SSE streaming vs JSON response.
+    with_streaming: ?bool = null,
+    /// Generator for LLM calls
+    generator: ?GeneratorConfig = null,
+    /// Chain of generators
+    chain: ?[]const ChainLink = null,
+    /// Domain-specific knowledge for the agent
+    agent_knowledge: ?[]const u8 = null,
+    /// Maximum tokens for document context
+    max_context_tokens: ?i64 = null,
+    /// Tokens to reserve for overhead
+    reserve_tokens: ?i64 = null,
+    /// Step configuration
+    steps: ?AnswerAgentSteps = null,
+    /// DEPRECATED: Use steps.eval on RetrievalAgentRequest instead. Evaluation configuration (moved to steps.eval in new API).
+    eval: ?EvalConfig = null,
+    /// DEPRECATED: Omit steps.generation on RetrievalAgentRequest instead. If true, skip the generation step.
+    without_generation: ?bool = null,
+};
+
+/// DEPRECATED: Use RetrievalAgentResult instead. Result from the answer agent.
+pub const AnswerAgentResult = struct {
+    /// DEPRECATED: Use generation on RetrievalAgentResult instead. Generated answer in markdown format.
+    answer: ?[]const u8 = null,
+    /// DEPRECATED: Use generation_confidence on RetrievalAgentResult instead. Confidence in the generated answer.
+    answer_confidence: ?f32 = null,
+    /// Relevance of retrieved documents to the query
+    context_relevance: ?f32 = null,
+    /// DEPRECATED: Use classification on RetrievalAgentResult instead. Query classification and transformation result.
+    classification_transformation: ?ClassificationTransformationResult = null,
+    /// DEPRECATED: Use hits on RetrievalAgentResult instead. Query results grouped by table.
+    query_results: ?[]const QueryResult = null,
+    /// Suggested follow-up questions
+    followup_questions: ?[]const []const u8 = null,
+    /// Evaluation results
+    eval_result: ?EvalResult = null,
+};
+
+/// DEPRECATED: Use RetrievalAgentSteps instead. Configuration for the answer agent's pipeline steps.
+pub const AnswerAgentSteps = struct {
+    /// Configuration for query classification and transformation.
+    classification: ?ClassificationStepConfig = null,
+    /// DEPRECATED: Use steps.generation on RetrievalAgentRequest instead. Configuration for answer generation from retrieved documents.
+    answer: ?GenerationStepConfig = null,
+    /// Configuration for generating follow-up questions.
+    followup: ?FollowupStepConfig = null,
+    /// Configuration for confidence assessment.
+    confidence: ?ConfidenceStepConfig = null,
+};
+
+/// Configuration for the Antfly inference chunking provider. Antfly inference is a centralized HTTP service that provides chunking with multi-tier caching. The model name maps to ONNX model directory names (similar to how Ollama works). **Chunking Models:** - fixed: Simple fixed-size chunking by token count (built-in, no ONNX required) - Any other name will attempt to load from models/chunkers/{name}/ directory **Caching:** - L1: Memory cache with 2-minute TTL - L2: Persistent Pebble database - Singleflight deduplication for concurrent identical requests
+pub const AntflyChunkerConfig = struct {
+    /// Maximum number of chunks to generate per document.
+    max_chunks: ?i64 = null,
+    /// Confidence threshold for model-based chunking (0.0-1.0).
+    threshold: ?f32 = null,
+    text: ?TextChunkOptions = null,
+    audio: ?AudioChunkOptions = null,
+    /// The URL of the Inference API endpoint (e.g., 'http://localhost:8080'). Can also be set via ANTFLY_INFERENCE_URL environment variable.
+    api_url: ?[]const u8 = null,
+    /// The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/.
+    model: []const u8,
+};
+
 /// Configuration for the Antfly inference embedding provider. Antfly inference is Antfly's built-in ML service for local embeddings using ONNX models. It provides embedding generation with multi-tier caching (memory + persistent). **Features:** - Local ONNX-based embedding generation - L1 memory cache with configurable TTL - L2 persistent Pebble database cache - Singleflight deduplication for concurrent identical requests **Example Models:** bge-base-en-v1.5 (768 dims), all-MiniLM-L6-v2 (384 dims) Models are loaded from the `models/embedders/{name}/` directory.
 pub const AntflyEmbedderConfig = struct {
     /// The embedding model name (maps to models/embedders/{name}/ directory).
@@ -543,6 +729,46 @@ pub const AnthropicGeneratorConfig = struct {
     top_k: ?i64 = null,
 };
 
+/// Public metadata for an API key (secrets are never returned after creation).
+pub const ApiKey = struct {
+    /// Unique identifier for the API key.
+    key_id: []const u8,
+    /// Human-readable name for the API key.
+    name: []const u8,
+    /// Owner of the API key.
+    username: []const u8,
+    /// Optional permission scoping. If empty, inherits owner's full permissions.
+    permissions: ?[]const Permission = null,
+    /// Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing.
+    row_filter: ?std.json.ArrayHashMap(std.json.Value) = null,
+    /// When the API key was created.
+    created_at: []const u8,
+    /// When the API key expires. Null means never.
+    expires_at: ?[]const u8 = null,
+};
+
+/// API key creation response including the cleartext secret (shown once).
+pub const ApiKeyWithSecret = struct {
+    /// Unique identifier for the API key.
+    key_id: []const u8,
+    /// Human-readable name for the API key.
+    name: []const u8,
+    /// Owner of the API key.
+    username: []const u8,
+    /// Optional permission scoping. If empty, inherits owner's full permissions.
+    permissions: ?[]const Permission = null,
+    /// Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing.
+    row_filter: ?std.json.ArrayHashMap(std.json.Value) = null,
+    /// When the API key was created.
+    created_at: []const u8,
+    /// When the API key expires. Null means never.
+    expires_at: ?[]const u8 = null,
+    /// Cleartext secret for the API key. Store securely — it cannot be retrieved again.
+    key_secret: []const u8,
+    /// Pre-encoded credential ready for the Authorization header: base64(key_id:key_secret).
+    encoded: []const u8,
+};
+
 /// Kind of stored artifact tracked by the repair queue.
 pub const ArtifactRepairKind = enum {
     embedding,
@@ -640,6 +866,11 @@ pub const BackupInfo = struct {
     format: ?[]const u8 = null,
 };
 
+pub const BackupListResponse = struct {
+    /// List of available backups
+    backups: []const BackupInfo,
+};
+
 pub const BackupRequest = struct {
     /// Unique identifier for this backup. Used to reference the backup for restore operations. Choose a meaningful name that includes date/version information.
     backup_id: []const u8,
@@ -647,6 +878,17 @@ pub const BackupRequest = struct {
     location: []const u8,
     /// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
     format: ?[]const u8 = null,
+};
+
+/// Batch insert, delete, and transform operations in a single request. **Atomicity**: - **Single shard**: Operations are atomic within shard boundaries - **Multiple shards**: Uses distributed 2-phase commit (2PC) for atomic cross-shard writes **How distributed transactions work**: 1. Metadata server allocates HLC timestamp and selects coordinator shard 2. Coordinator writes transaction record, participants write intents 3. After all intents succeed, coordinator commits transaction 4. Participants are notified asynchronously to resolve intents 5. Recovery loop ensures notifications complete even after coordinator failure **Performance**: - Single-shard batches: < 5ms latency - Cross-shard transactions: ~20ms latency - Intent resolution: < 30 seconds worst-case (via recovery loop) **Guarantees**: - All writes succeed or all fail (atomicity across all shards) - Coordinator failure is recoverable (new leader resumes notifications) - Idempotent resolution (duplicate notifications are safe) **Benefits**: - Reduces network overhead compared to individual requests - More efficient indexing (updates are batched) - Automatic distributed transactions when operations span shards The inserts are upserts - existing keys are overwritten, new keys are created.
+pub const BatchRequest = struct {
+    /// Map of document IDs to document objects. Each key is the unique identifier for the document. Best practices: - Use consistent key naming schemes (e.g., "user:123", "article:456") - Key length affects storage and performance - keep them reasonably short - Keys are sorted lexicographically, so choose prefixes that support range scans
+    inserts: ?std.json.ArrayHashMap(std.json.Value) = null,
+    /// Array of document IDs to delete. Documents are removed from all indexes. Notes: - Non-existent keys are silently ignored - Deletions are processed before inserts in the same batch - Keys are permanently removed from storage and indexes
+    deletes: ?[]const []const u8 = null,
+    /// Array of transform operations for in-place document updates using MongoDB-style operators. Transform operations allow you to modify documents without read-modify-write races: - Operations are applied atomically on the server - Multiple operations per document are applied in sequence - Supports numeric operations ($inc, $mul), array operations ($push, $pull), and more Common use cases: - Increment counters (views, likes, votes) - Update timestamps ($currentDate) - Manage arrays (add/remove tags, items) - Update nested fields without overwriting the entire document
+    transforms: ?[]const Transform = null,
+    sync_level: ?SyncLevel = null,
 };
 
 pub const BatchResponse = struct {
@@ -694,8 +936,61 @@ pub const BedrockGeneratorConfig = struct {
     top_k: ?i64 = null,
 };
 
+pub const BoolFieldQuery = struct {
+    bool: bool,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
+};
+
+pub const BooleanQuery = struct {
+    must: ?ConjunctionQuery = null,
+    should: ?DisjunctionQuery = null,
+    must_not: ?DisjunctionQuery = null,
+    filter: ?Query = null,
+    boost: ?Boost = null,
+};
+
 /// A floating-point number used to decrease or increase the relevance scores of a query.
 pub const Boost = f64;
+
+/// Configuration for Brave Search API. Brave Search provides privacy-focused search with its own independent index. **Setup:** 1. Sign up at https://brave.com/search/api/ 2. Get API key from dashboard **Docs:** https://api.search.brave.com/app/documentation
+pub const BraveSearchConfig = struct {
+    provider: WebSearchProvider,
+    /// Provider API key or secret reference. Prefer named web_search connections for production use.
+    api_key: ?[]const u8 = null,
+    /// Provider endpoint override when applicable
+    endpoint: ?[]const u8 = null,
+    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+    location: ?[]const u8 = null,
+    /// Agent Search data store ID for provider vertex.
+    data_store: ?[]const u8 = null,
+    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
+    serving_config: ?[]const u8 = null,
+    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+    credentials_path: ?[]const u8 = null,
+    /// Maximum number of search results to return
+    max_results: ?i64 = null,
+    /// Request timeout in milliseconds
+    timeout_ms: ?i64 = null,
+    /// Enable safe search filtering
+    safe_search: ?bool = null,
+    /// Preferred language for results (e.g., 'en', 'es', 'fr')
+    language: ?[]const u8 = null,
+    /// Preferred region for results (e.g., 'us', 'uk', 'de')
+    region: ?[]const u8 = null,
+    /// Ask the provider to return extracted page content when supported
+    include_content: ?bool = null,
+    /// Ask the provider to return highlighted passages when supported
+    include_highlights: ?bool = null,
+    /// Freshness filter: pd=day, pw=week, pm=month, py=year
+    freshness: ?[]const u8 = null,
+    /// Include text decorations (bold, italic markers)
+    text_decorations: ?bool = null,
+    /// Enable spellcheck suggestions
+    spellcheck: ?bool = null,
+};
 
 pub const ByteRange = []const []const u8;
 
@@ -738,6 +1033,11 @@ pub const CalendarInterval = enum {
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
+};
+
+pub const Capability = struct {
+    name: CapabilityName,
+    scope: ?[]const u8 = null,
 };
 
 /// Capability identifier. Capability names may use colon-delimited namespaces such as read:table.
@@ -801,6 +1101,30 @@ pub const ChainCondition = enum {
         return map.get(s) orelse error.UnexpectedToken;
     }
 };
+
+/// A single link in a generator chain with optional retry and condition
+pub const ChainLink = struct {
+    generator: GeneratorConfig,
+    /// Retry configuration for this generator
+    retry: ?RetryConfig = null,
+    /// When to try the next generator in chain
+    condition: ?ChainCondition = null,
+};
+
+/// OpenAI-compatible message in a generation/chat conversation.
+pub const ChatMessage = struct {
+    role: ChatMessageRole,
+    content: ?ChatMessageContent = null,
+    /// Tool calls made by the assistant (only for role=assistant).
+    tool_calls: ?[]const ToolCall = null,
+    /// ID of the tool call this message responds to (only for role=tool).
+    tool_call_id: ?[]const u8 = null,
+    /// Optional tool name for tool messages when model templates need it.
+    name: ?[]const u8 = null,
+};
+
+/// Message content. Supports two formats: - Simple string: "Hello, how are you?" - Array of content parts: [{"type": "text", "text": "Hello"}]
+pub const ChatMessageContent = std.json.Value;
 
 /// Role of the message sender in a generation/chat conversation
 pub const ChatMessageRole = enum {
@@ -881,6 +1205,49 @@ pub const ChatToolName = enum {
     }
 };
 
+/// Configuration for retrieval agent tools. If `enabled_tools` is empty/omitted, retrieval agents default to all retrieval tools available for the request. Explicit retrieval policies should use semantic_search for vector retrieval. For models that don't support native tool calling (e.g., Ollama), a prompt-based fallback is used with structured output parsing.
+pub const ChatToolsConfig = struct {
+    /// List of tools to enable. If empty, retrieval agents default to all retrieval tools available for the request.
+    enabled_tools: ?[]const ChatToolName = null,
+    /// Inline web search provider configuration. Prefer web_search_connection for configured production agents; inline config remains useful for CLI/dev requests. See specs/openapi/antfly/websearch.yaml for provider-specific options.
+    web_search_config: ?WebSearchConfig = null,
+    /// Name of a configured connections.<id> resource with kind web_search. Request-level tool options may reduce scope, but cannot expand the connection's configured capabilities or policy.
+    web_search_connection: ?[]const u8 = null,
+    /// URL fetching configuration. See specs/openapi/antfly/websearch.yaml for available options and security controls.
+    fetch_config: ?FetchConfig = null,
+    /// Maximum number of tool call iterations per turn. Prevents infinite loops in tool execution.
+    max_tool_iterations: ?i64 = null,
+};
+
+/// Per-request configuration for chunking. All fields are optional - zero/omitted values use chunker defaults.
+pub const ChunkOptions = struct {
+    /// Maximum number of chunks to generate per document.
+    max_chunks: ?i64 = null,
+    /// Confidence threshold for model-based chunking (0.0-1.0).
+    threshold: ?f32 = null,
+    text: ?TextChunkOptions = null,
+    audio: ?AudioChunkOptions = null,
+};
+
+/// A unified configuration for a chunking provider.
+pub const ChunkerConfig = struct {
+    /// Maximum number of chunks to generate per document.
+    max_chunks: ?i64 = null,
+    /// Confidence threshold for model-based chunking (0.0-1.0).
+    threshold: ?f32 = null,
+    text: ?TextChunkOptions = null,
+    audio: ?AudioChunkOptions = null,
+    /// The URL of the Inference API endpoint (e.g., 'http://localhost:8080'). Can also be set via ANTFLY_INFERENCE_URL environment variable.
+    api_url: ?[]const u8 = null,
+    /// The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/.
+    model: ?[]const u8 = null,
+    provider: ChunkerProvider,
+    /// Controls whether chunk data is persisted to storage. When false (default), chunks are generated in memory and only embeddings are stored. When true, both chunks and embeddings are stored.
+    store_chunks: ?bool = null,
+    /// Configuration for full-text indexing of chunks in Bleve. When present (even if empty), chunks will be stored with :cft: suffix and indexed in Bleve's _chunks field. When absent, chunks use :c: suffix and are only used for vector embeddings.
+    full_text_index: ?std.json.Value = null,
+};
+
 /// The chunking provider to use.
 pub const ChunkerProvider = enum {
     mock,
@@ -907,6 +1274,45 @@ pub const ChunkerProvider = enum {
     }
 };
 
+/// Configuration for the classification step. This step analyzes the query, selects the optimal retrieval strategy, and generates semantic transformations.
+pub const ClassificationStepConfig = struct {
+    /// Enable query classification and strategy selection
+    enabled: ?bool = null,
+    /// Generator to use for classification. If not specified, uses the default summarizer.
+    generator: ?GeneratorConfig = null,
+    /// Chain of generators to try in order. Mutually exclusive with 'generator'.
+    chain: ?[]const ChainLink = null,
+    /// Include pre-retrieval reasoning explaining query analysis and strategy selection
+    with_reasoning: ?bool = null,
+    /// Override LLM strategy selection. If not set, the LLM chooses optimal strategy.
+    force_strategy: ?QueryStrategy = null,
+    /// Override semantic query mode selection.
+    force_semantic_mode: ?SemanticQueryMode = null,
+    /// Number of alternative query phrasings to generate
+    multi_phrase_count: ?i64 = null,
+};
+
+/// Query classification and transformation result combining all query enhancements including strategy selection and semantic optimization
+pub const ClassificationTransformationResult = struct {
+    route_type: RouteType,
+    strategy: QueryStrategy,
+    semantic_mode: SemanticQueryMode,
+    /// Clarified query with added context for answer generation (human-readable)
+    improved_query: []const u8,
+    /// Optimized query for vector/semantic search. Content style depends on semantic_mode: keywords for 'rewrite', hypothetical answer for 'hypothetical'
+    semantic_query: []const u8,
+    /// Broader background query for context (only present when strategy is 'step_back')
+    step_back_query: ?[]const u8 = null,
+    /// Decomposed sub-questions (only present when strategy is 'decompose')
+    sub_questions: ?[]const []const u8 = null,
+    /// Alternative phrasings of the query for expanded retrieval coverage
+    multi_phrases: ?[]const []const u8 = null,
+    /// Pre-retrieval reasoning explaining query analysis and strategy selection (only present when with_classification_reasoning is enabled)
+    reasoning: ?[]const u8 = null,
+    /// Classification confidence (0.0 to 1.0)
+    confidence: f32,
+};
+
 pub const ClusterBackupRequest = struct {
     /// Unique identifier for this backup. Used to reference the backup for restore operations. Choose a meaningful name that includes date/version information.
     backup_id: []const u8,
@@ -916,6 +1322,15 @@ pub const ClusterBackupRequest = struct {
     format: ?[]const u8 = null,
     /// Optional list of tables to backup. If omitted, all tables are backed up.
     table_names: ?[]const []const u8 = null,
+};
+
+pub const ClusterBackupResponse = struct {
+    /// The backup identifier
+    backup_id: []const u8,
+    /// Status of each table backup
+    tables: []const TableBackupStatus,
+    /// Overall backup status
+    status: []const u8,
 };
 
 pub const ClusterDataGroupStatus = struct {
@@ -981,6 +1396,14 @@ pub const ClusterDataReplicaStatus = struct {
     peer_node_ids: ?[]const i64 = null,
 };
 
+/// Typed Zig status view for table data topology and range placement.
+pub const ClusterDataStatus = struct {
+    nodes: ?[]const ClusterDataNodeStatus = null,
+    ranges: ?[]const ClusterDataRangeStatus = null,
+    replicas: ?[]const ClusterDataReplicaStatus = null,
+    groups: ?[]const ClusterDataGroupStatus = null,
+};
+
 /// Overall health status of the cluster
 pub const ClusterHealth = enum {
     unknown,
@@ -1027,6 +1450,36 @@ pub const ClusterRestoreRequest = struct {
     restore_mode: ?[]const u8 = null,
 };
 
+pub const ClusterRestoreResponse = struct {
+    /// Status of each table restore
+    tables: []const TableRestoreStatus,
+    /// Overall restore status
+    status: []const u8,
+};
+
+pub const ClusterStatus = struct {
+    health: ClusterHealth,
+    /// Optional message providing details about the health status
+    message: ?[]const u8 = null,
+    /// Indicates whether authentication is enabled for the cluster
+    auth_enabled: ?bool = null,
+    /// Indicates whether the cluster is running in single-node swarm mode
+    swarm_mode: ?bool = null,
+    secret_store: ?SecretStoreStatus = null,
+};
+
+pub const ClusterTopology = struct {
+    health: ClusterHealth,
+    /// Optional message providing details about the health status
+    message: ?[]const u8 = null,
+    /// Indicates whether authentication is enabled for the cluster
+    auth_enabled: ?bool = null,
+    /// Indicates whether the cluster is running in single-node swarm mode
+    swarm_mode: ?bool = null,
+    secret_store: ?SecretStoreStatus = null,
+    data: ClusterDataStatus,
+};
+
 /// Configuration for the Cohere embedding provider. API key via `api_key` field or `COHERE_API_KEY` environment variable. **Example Models:** embed-english-v3.0 (default, 1024 dims), embed-multilingual-v3.0 **Docs:** https://docs.cohere.com/reference/embed
 pub const CohereEmbedderConfig = struct {
     /// The name of the Cohere embedding model to use.
@@ -1071,8 +1524,25 @@ pub const CohereRerankerConfig = struct {
     max_chunks_per_doc: ?i64 = null,
 };
 
+/// Configuration for confidence assessment. Evaluates answer quality and resource relevance. Can use a model calibrated for scoring tasks.
+pub const ConfidenceStepConfig = struct {
+    /// Enable confidence scoring
+    enabled: ?bool = null,
+    /// Generator for confidence assessment. If not specified, uses the answer step's generator.
+    generator: ?GeneratorConfig = null,
+    /// Chain of generators to try in order. Mutually exclusive with 'generator'.
+    chain: ?[]const ChainLink = null,
+    /// Custom guidance for confidence assessment approach
+    context: ?[]const u8 = null,
+};
+
 pub const ConfigureExtensionRequest = struct {
     config_json: []const u8,
+};
+
+pub const ConjunctionQuery = struct {
+    conjuncts: []const Query,
+    boost: ?Boost = null,
 };
 
 pub const ConnectedModel = struct {
@@ -1139,6 +1609,29 @@ pub const ConnectedModelType = enum {
     }
 };
 
+pub const Connection = struct {
+    /// Stable resource identifier for this connection. Config-derived connections synthesize this from the source config path.
+    id: []const u8,
+    /// Human-readable short name for this connection instance.
+    name: []const u8,
+    /// Optional display name for UIs.
+    display_name: ?[]const u8 = null,
+    /// Provider token for connection kinds that have a provider-level service identity, such as web_search.
+    provider: ?[]const u8 = null,
+    kind: ConnectionKind,
+    status: ConnectionStatus,
+    /// Failure detail when status is "error".
+    @"error": ?[]const u8 = null,
+    /// Namespaced actions and workflow uses this connection supports, such as models.embed, content.fetch, objects.read, or cdc.read_stream.
+    capabilities: []const []const u8,
+    /// Where this connection was configured, e.g. "config:embedders/openai-small" or "table:docs/index:body_vec".
+    sources: ?[]const []const u8 = null,
+    inference: ?InferenceConnection = null,
+    web_search: ?WebSearchConnection = null,
+    external_io: ?ExternalIoConnection = null,
+    cdc: ?CdcConnection = null,
+};
+
 /// Kind of external connection configured on this node.
 pub const ConnectionKind = enum {
     inference,
@@ -1203,6 +1696,101 @@ pub const ConnectionStatus = enum {
     }
 };
 
+pub const ConnectionsResponse = struct {
+    connections: []const Connection,
+};
+
+/// A content part for multimodal input (text, image URL, or inline media).
+pub const ContentPart = union(enum) {
+    media_content_part: *MediaContentPart,
+    image_url_content_part: *ImageURLContentPart,
+    text_content_part: *TextContentPart,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        if (objectHasAnyKey(source.object, &.{
+            "type",
+            "data",
+            "mime_type",
+        })) {
+            if (try parseStructuralVariant(MediaContentPart, allocator, source, options)) |parsed| return .{ .media_content_part = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "type",
+            "image_url",
+        })) {
+            if (try parseStructuralVariant(ImageURLContentPart, allocator, source, options)) |parsed| return .{ .image_url_content_part = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "type",
+            "text",
+        })) {
+            if (try parseStructuralVariant(TextContentPart, allocator, source, options)) |parsed| return .{ .text_content_part = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .media_content_part => |v| try jw.write(v.*),
+            .image_url_content_part => |v| try jw.write(v.*),
+            .text_content_part => |v| try jw.write(v.*),
+        }
+    }
+};
+
+/// Request to create a new API key.
+pub const CreateApiKeyRequest = struct {
+    /// Human-readable name for the API key.
+    name: []const u8,
+    /// Duration until expiration (e.g., '720h' for 30 days). Empty means never.
+    expires_in: ?[]const u8 = null,
+    /// Optional permission scoping. Each permission must be a subset of the creator's permissions.
+    permissions: ?[]const Permission = null,
+    /// Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing.
+    row_filter: ?std.json.ArrayHashMap(std.json.Value) = null,
+};
+
+pub const CreateTableRequest = struct {
+    /// Number of shards to create for the table. Data is partitioned across shards based on key ranges. **Sizing Guidelines:** - Small datasets (<100K docs): 1-3 shards - Medium datasets (100K-1M docs): 3-10 shards - Large datasets (>1M docs): 10+ shards More shards enable better parallelism but increase overhead. Choose based on expected data size and query patterns. **When to Add More Shards:** Antfly supports **online shard reallocation** without downtime. Add more shards when: - Individual shards exceed size thresholds (configurable) - Query latency increases due to large shard size - Need better parallelism for write-heavy workloads Use the internal `/reallocate` endpoint to trigger automatic shard splitting: ```bash POST /internal/v1/reallocate ``` This enqueues a reallocation request that the leader processes asynchronously, splitting large shards and redistributing data without service interruption. **Advantages over Elasticsearch:** - Automatic shard splitting (no manual reindexing required) - Online operation (no downtime) - Transparent to applications (keys remain accessible during reallocation)
+    num_shards: ?i64 = null,
+    /// Optional human-readable description of the table and its purpose. Useful for documentation and team collaboration.
+    description: ?[]const u8 = null,
+    /// Map of index name to index configuration. Indexes enable different query capabilities: - Full-text indexes for BM25 search - Vector indexes for semantic similarity - Multimodal indexes for images/audio/video You can add multiple indexes to support different query patterns.
+    indexes: ?std.json.ArrayHashMap(IndexConfig) = null,
+    /// Optional schema definition specifying field types, primary key, and TTL configuration. While optional, defining a schema provides type safety, optimized indexing, and better search performance. **Schema Features:** - **Field Types**: Define document structure using JSON Schema with `x-antfly-types` extensions - **Document TTL**: Configure automatic expiration via `ttl_duration` and optional `ttl_field` - **Primary Keys**: Specify unique identifier fields - **Validation**: Enforce schema constraints on writes **TTL Example:** ```json { "ttl_duration": "7d", "ttl_field": "_timestamp", "document_schemas": {...} } ``` See the Table Management documentation for comprehensive TTL configuration and use cases.
+    schema: ?TableSchema = null,
+    /// PostgreSQL CDC replication sources. Streams INSERT/UPDATE/DELETE changes from PostgreSQL tables into this Antfly table via logical replication. Multiple sources can feed into a single table (e.g., `users` + `scores` → Antfly `users`). Each source uses `on_update`/`on_delete` transforms to control how PG events map to Antfly document operations. Requires `wal_level=logical` on the PostgreSQL source.
+    replication_sources: ?[]const ReplicationSource = null,
+};
+
+pub const CreateUserRequest = struct {
+    /// Username for the new user. If provided in the path, this field can be omitted or must match the path parameter.
+    username: ?[]const u8 = null,
+    password: []const u8,
+    /// Optional list of initial permissions for the user.
+    initial_policies: ?[]const Permission = null,
+    /// Auth metadata available to stored row-filter policies.
+    metadata: ?std.json.ArrayHashMap(std.json.Value) = null,
+};
+
 pub const Credentials = struct {
     /// S3-compatible endpoint (e.g., 's3.amazonaws.com' or 'localhost:9000' for MinIO)
     endpoint: ?[]const u8 = null,
@@ -1214,6 +1802,14 @@ pub const Credentials = struct {
     secret_access_key: ?[]const u8 = null,
     /// Optional AWS session token for temporary credentials. Supports keystore syntax for secret lookup.
     session_token: ?[]const u8 = null,
+};
+
+pub const DataShapeDecl = struct {
+    name: ExtensionIdentifier,
+    kind: DataShapeKind,
+    version: ?[]const u8 = null,
+    /// JSON object encoded as a string until the public shape language is finalized.
+    schema_json: ?[]const u8 = null,
 };
 
 pub const DataShapeKind = enum {
@@ -1251,6 +1847,22 @@ pub const DataShapeKind = enum {
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
+};
+
+pub const DateRangeStringQuery = struct {
+    start: ?[]const u8 = null,
+    end: ?[]const u8 = null,
+    inclusive_start: ?bool = null,
+    inclusive_end: ?bool = null,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
+    datetime_parser: ?[]const u8 = null,
+};
+
+pub const DisjunctionQuery = struct {
+    disjuncts: []const Query,
+    boost: ?Boost = null,
+    min: ?f64 = null,
 };
 
 /// Distance metric for the vector index (dense only). Use "cosine" for models trained with cosine similarity (e.g. CLIP, OpenAI). Use "inner_product" for models trained with dot product similarity. Use "l2_squared" (default) for models trained with Euclidean distance.
@@ -1326,6 +1938,11 @@ pub const DistanceUnit = enum {
     }
 };
 
+pub const DocIdQuery = struct {
+    ids: []const []const u8,
+    boost: ?Boost = null,
+};
+
 /// Parsed child-range descriptor from a derived document artifact manifest.
 pub const DocumentArtifactChildRange = struct {
     /// Stable range identifier within the artifact manifest generation.
@@ -1358,11 +1975,115 @@ pub const DocumentArtifactChildRange = struct {
     text_bytes: ?i64 = null,
 };
 
+/// Inspection view for a derived document artifact produced from a source table row. The typed fields form the stable summary contract. The embedded manifest/state JSON fields are optional raw detail intended for admin/debug inspection so producers can evolve their internal unit schema without changing this route contract.
+pub const DocumentArtifactManifest = struct {
+    /// Stable identity of the source document.
+    document_id: []const u8,
+    /// Name of the derived artifact.
+    artifact_name: []const u8,
+    /// Stable identity of this artifact under the document.
+    artifact_id: []const u8,
+    /// Version of the opaque manifest payload schema.
+    manifest_version: i64,
+    /// Monotonic generation for the current artifact state.
+    generation: i64,
+    /// Source URL or source identifier used to derive this artifact.
+    source_url: []const u8,
+    /// Fingerprint of the source bytes and extractor configuration.
+    source_fingerprint: []const u8,
+    /// Effective source content type selected during extraction.
+    content_type: []const u8,
+    /// Producer route selected for the source content.
+    route_type: []const u8,
+    /// Reason extraction was skipped, when the source type is unsupported.
+    unsupported_reason: ?[]const u8 = null,
+    /// Number of extracted document units.
+    unit_count: i64,
+    /// Number of indexable chunks derived from the units.
+    chunk_count: i64,
+    /// Parsed child range descriptors for this artifact generation.
+    child_ranges: []const DocumentArtifactChildRange,
+    /// Number of storage child ranges used by this artifact.
+    child_range_count: i64,
+    /// Current materialization or merge status.
+    merge_status: []const u8,
+    /// Previous artifact generation used by the current merge plan.
+    merge_from_generation: i64,
+    /// Target artifact generation produced by the current merge plan.
+    merge_to_generation: i64,
+    /// Granularity used when computing merge-plan operations.
+    merge_operation_granularity: []const u8,
+    /// Number of merge operations recorded for this artifact.
+    merge_operation_count: i64,
+    /// Last extraction or materialization error code, when the current artifact generation failed.
+    last_error_code: ?[]const u8 = null,
+    /// Human-readable last extraction or materialization error summary, when available.
+    last_error_message: ?[]const u8 = null,
+    /// Opaque JSON manifest for the artifact units and provenance. Present only for raw detail responses.
+    manifest_json: ?[]const u8 = null,
+    /// Optional opaque JSON state for incremental processing. Present only for raw detail responses.
+    state_json: ?[]const u8 = null,
+};
+
+/// Available derived document artifact manifests for a source document.
+pub const DocumentArtifactManifestList = struct {
+    /// Stable identity of the source document.
+    document_id: []const u8,
+    artifacts: []const DocumentArtifactManifest,
+};
+
 pub const DocumentArtifactReprocessFailure = struct {
     /// Source document key that failed during reprocessing.
     key: []const u8,
     /// Stable error code for the failed document reprocess attempt.
     error_code: []const u8,
+};
+
+pub const DocumentArtifactReprocessJob = struct {
+    /// Server-assigned durable repair job identifier.
+    job_id: i64,
+    /// Monotonic execution attempt token for the current running pass.
+    attempt_id: i64,
+    /// Table containing the source documents being repaired.
+    table_name: []const u8,
+    /// Name of the derived artifact being repaired.
+    artifact_name: []const u8,
+    /// Lifecycle phase of the repair job.
+    phase: []const u8,
+    /// User-facing completion status derived from the phase and remaining cursors.
+    reprocess_status: []const u8,
+    /// Original exclusive lower bound for the job.
+    from_key: []const u8,
+    /// Original inclusive upper bound for the job, or empty for the end of the table/range.
+    to_key: []const u8,
+    /// Current per-shard bounded pass limit.
+    limit: i64,
+    /// Single-shard continuation key when no shard cursors are present.
+    next_key: ?[]const u8 = null,
+    /// Cumulative source rows scanned by completed passes.
+    scanned: i64,
+    /// Cumulative source rows whose artifact was reprocessed.
+    reprocessed: i64,
+    /// Cumulative source rows skipped by completed passes.
+    skipped: i64,
+    /// Cumulative source rows that failed during completed passes.
+    failed: i64,
+    /// Number of shard-local continuations still pending.
+    pending_shards: i64,
+    /// Failures from the most recent completed pass.
+    failures: []const DocumentArtifactReprocessFailure,
+    /// Per-shard continuation cursors to resume on the next advance operation.
+    shard_cursors: []const DocumentArtifactReprocessShardCursor,
+    /// Last terminal or transient job error, when available.
+    last_error: ?[]const u8 = null,
+    /// Whether cancellation has been requested for a running pass. Running passes finish at a bounded reprocess boundary before the job transitions to cancelled.
+    cancel_requested: bool,
+    /// Unix epoch milliseconds when the job was created.
+    created_at_millis: i64,
+    /// Unix epoch milliseconds when the job was last updated.
+    last_updated_at_millis: i64,
+    /// Unix epoch milliseconds after which the retained job status may be removed.
+    expires_at_millis: i64,
 };
 
 /// Request to create a durable table artifact reprocess job.
@@ -1399,6 +2120,44 @@ pub const DocumentArtifactReprocessShardCursor = struct {
     limit: i64,
 };
 
+/// Bounded request for reprocessing a derived artifact across source rows in key order.
+pub const DocumentArtifactTableReprocessRequest = struct {
+    /// Exclusive lower bound source document key. Use the prior response next_key to continue.
+    from_key: ?[]const u8 = null,
+    /// Inclusive upper bound source document key, or empty for the end of the table/range.
+    to_key: ?[]const u8 = null,
+    /// Maximum source rows to scan per shard-local repair pass. Zero uses the server default.
+    limit: ?i64 = null,
+    /// Per-shard continuation cursors returned by a prior response. When present, distributed repair resumes exactly these shard-local cursors instead of resolving a fresh global key span.
+    shard_cursors: ?[]const DocumentArtifactReprocessShardCursor = null,
+};
+
+pub const DocumentArtifactTableReprocessResponse = struct {
+    /// Indicates that reprocessing was accepted.
+    reprocess: []const u8,
+    /// Completion state for this bounded pass. `in_progress` means the caller should persist the returned cursor(s) and schedule another pass; `complete` means no continuation cursor remains.
+    reprocess_status: []const u8,
+    /// Name of the derived artifact that was reprocessed.
+    artifact_name: []const u8,
+    /// Number of source rows scanned by this bounded pass.
+    scanned: i64,
+    /// Number of source rows whose artifact was reprocessed.
+    reprocessed: i64,
+    /// Number of scanned source rows that no longer had a reprocessable source document.
+    skipped: i64,
+    /// Number of scanned source rows that failed before recording a normal artifact manifest.
+    failed: i64,
+    /// Effective scan limit used by the bounded pass.
+    limit: i64,
+    /// Source key cursor for the next bounded pass, when more rows may remain.
+    next_key: ?[]const u8 = null,
+    /// Number of shard-local continuations still pending after this pass. For single-shard callers this is 1 when only `next_key` remains and 0 when complete.
+    pending_shards: i64,
+    failures: []const DocumentArtifactReprocessFailure,
+    /// Per-shard continuation cursors for distributed repairs. Durable background repair jobs should persist and resume these independently instead of collapsing progress into a single global cursor.
+    shard_cursors: []const DocumentArtifactReprocessShardCursor,
+};
+
 /// Defines the structure of a document type
 pub const DocumentSchema = struct {
     /// A description of the document type.
@@ -1410,6 +2169,28 @@ pub const DocumentSchema = struct {
 pub const DropExtensionRequest = struct {
     mode: ?[]const u8 = null,
     dry_run: ?bool = null,
+};
+
+pub const DropExtensionResponse = struct {
+    dropped: ExtensionIdentifier,
+    dry_run: bool,
+};
+
+/// A rule for mapping dynamically detected fields. Templates are checked in order and the first matching template's mapping is used.
+pub const DynamicTemplate = struct {
+    /// Optional identifier for the template (useful for debugging)
+    name: ?[]const u8 = null,
+    /// Glob pattern for field name (last path element). Supports * and ** wildcards. Example: "*_text" matches "title_text", "body_text"
+    match: ?[]const u8 = null,
+    /// Exclusion pattern for field name. If it matches, the template is skipped. Example: "skip_*" would exclude fields like "skip_this"
+    unmatch: ?[]const u8 = null,
+    /// Glob pattern for the full dotted path. Supports ** for matching multiple segments. Example: "metadata.**" matches "metadata.author", "metadata.tags.primary"
+    path_match: ?[]const u8 = null,
+    /// Path exclusion pattern. If it matches the full path, the template is skipped.
+    path_unmatch: ?[]const u8 = null,
+    /// Filter by detected JSON type
+    match_mapping_type: ?[]const u8 = null,
+    mapping: ?TemplateFieldMapping = null,
 };
 
 /// A typed, weighted connection between documents
@@ -1477,6 +2258,47 @@ pub const EdgeTypeConfig = struct {
     required_metadata: ?[]const []const u8 = null,
 };
 
+pub const EdgesResponse = struct {
+    edges: ?[]const Edge = null,
+    /// Total number of edges returned
+    count: ?i64 = null,
+};
+
+/// A unified configuration for an embedding provider. Embedders can be configured with templates to customize how documents are converted to text before embedding. Templates use Handlebars syntax and support various built-in helpers. **Template System:** - **Syntax**: Handlebars templating (https://handlebarsjs.com/guide/) - **Caching**: Templates are automatically cached with configurable TTL (default: 5 minutes) - **Context**: Templates receive the full document as context **Built-in Helpers:** 1. **scrubHtml** - Remove script/style tags and extract clean text from HTML ```handlebars {{scrubHtml html_content}} ``` - Removes `<script>` and `<style>` tags - Adds newlines after block elements (p, div, h1-h6, li, etc.) - Returns plain text with preserved readability 2. **eq** - Equality comparison for conditionals ```handlebars {{#if (eq status "active")}}Active user{{/if}} {{#if (eq @key "special")}}Special field{{/if}} ``` 3. **media** - GenKit dotprompt media directive for multimodal content ```handlebars {{media url=imageDataURI}} {{media url=this.image_url}} {{media url="https://example.com/image.jpg"}} {{media url="s3://endpoint/bucket/image.png"}} {{media url="file:///path/to/image.jpg"}} ``` **Supported URL Schemes:** - `data:` - Base64 encoded data URIs (e.g., `data:image/jpeg;base64,...`) - `http://` / `https://` - Web URLs with automatic content type detection - `file://` - Local filesystem paths - `s3://` - S3-compatible storage (format: `s3://endpoint/bucket/key`) **Automatic Content Processing:** - **Images**: Downloaded, resized (if needed), converted to data URIs - **PDFs**: Text extracted or first page rendered as image - **HTML**: Readable text extracted using Mozilla Readability **Security Controls:** Downloads are protected by content security settings (see Configuration Reference): - Allowed host whitelist - Private IP blocking (prevents SSRF attacks) - Download size limits (default: 100MB) - Download timeouts (default: 30s) - Image dimension limits (default: 2048px, auto-resized) See: https://antfly.io/docs/configuration#security--cors 4. **encodeToon** - Encode data in TOON format (Token-Oriented Object Notation) ```handlebars {{encodeToon this.fields}} {{encodeToon this.fields lengthMarker=false indent=4}} {{encodeToon this.fields delimiter="\t"}} ``` **What is TOON?** TOON is a compact, human-readable format designed for passing structured data to LLMs. It provides **30-60% token reduction** compared to JSON while maintaining high LLM comprehension accuracy. **Key Features:** - Compact syntax using `:` for key-value pairs - Array length markers: `tags[#3]: ai,search,ml` - Tabular format for uniform data structures - Optimized for LLM parsing and understanding - Maintains human readability **Benefits:** - **Lower API costs** - Reduced token usage means lower LLM API costs - **Faster responses** - Less tokens to process - **More context** - Fit more documents within token limits **Options:** - `lengthMarker` (bool): Add # prefix to array counts like `[#3]` (default: true) - `indent` (int): Indentation spacing for nested objects (default: 2) - `delimiter` (string): Field separator for tabular arrays (default: none, use `"\t"` for tabs) **Example output:** ``` title: Introduction to Vector Search author: Jane Doe tags[#3]: ai,search,ml metadata: edition: 2 pages: 450 ``` **Default in RAG:** TOON is the default format for document rendering in RAG queries. **References:** - TOON Specification: https://github.com/toon-format/toon - Go Implementation: https://github.com/alpkeskin/gotoon **Template Examples:** Document with metadata: ```handlebars Title: {{metadata.title}} Date: {{metadata.date}} Tags: {{#each metadata.tags}}{{this}}, {{/each}} {{content}} ``` HTML content extraction: ```handlebars Product: {{name}} Description: {{scrubHtml description_html}} Price: ${{price}} ``` Multimodal with image: ```handlebars Product: {{title}} {{media url=image}} Description: {{description}} ``` Conditional formatting: ```handlebars {{title}} {{#if author}}By: {{author}}{{/if}} {{#if (eq category "premium")}}⭐ Premium Content{{/if}} {{body}} ``` **Environment Variables:** - `GEMINI_API_KEY` - API key for Google AI - `OPENAI_API_KEY` - API key for OpenAI - `OPENAI_BASE_URL` - Base URL for OpenAI-compatible APIs - `OLLAMA_HOST` - Ollama server URL (e.g., http://localhost:11434) **Importing Pre-computed Embeddings:** You can import existing embeddings (from OpenAI, Cohere, or any provider), but only for indexes configured with `external: true`. External indexes accept vectors written directly through the document `_embeddings` field and do not generate prompts from `field` or `template`. **Steps:** 1. Create an embeddings index with `external: true` 2. For dense indexes, set the index `dimension` 3. Write documents with `_embeddings: { "<indexName>": [...<embedding>...] }` **Example:** ```json { "title": "My Document", "content": "Document text...", "_embeddings": { "my_vector_index": [0.1, 0.2, 0.3, ...] } } ``` **Delete Behavior:** - Use `"_embeddings": { "<indexName>": null }` to delete a stored external vector - Omitting `_embeddings[<indexName>]` leaves the existing vector unchanged **Use Cases:** - Migrating from another vector database with existing embeddings - Using embeddings generated by external systems - Importing pre-computed OpenAI, Cohere, or other provider embeddings - Batch processing embeddings offline before ingestion
+pub const EmbedderConfig = struct {
+    /// The Google Cloud project ID (optional for Gemini API, required for Vertex AI).
+    project_id: ?[]const u8 = null,
+    /// The Google Cloud location (e.g., 'us-central1'). Required for Vertex AI, optional for Gemini API.
+    location: ?[]const u8 = null,
+    /// The name of the embedding model to use.
+    model: ?[]const u8 = null,
+    /// The dimension of the embedding vector (768, 1536, or 3072 recommended).
+    dimension: ?i64 = null,
+    /// The Google API key. Can also be set via GEMINI_API_KEY environment variable.
+    api_key: ?[]const u8 = null,
+    /// The URL of the Google API endpoint (optional, uses default if not specified).
+    url: ?[]const u8 = null,
+    /// Path to service account JSON key file. Alternative to ADC for non-GCP environments.
+    credentials_path: ?[]const u8 = null,
+    /// Output dimension for the embedding (uses MRL for dimension reduction). Recommended: 256, 512, 1024, 1536, or 3072.
+    dimensions: ?i64 = null,
+    /// The AWS region for the Bedrock service (e.g., 'us-east-1').
+    region: ?[]const u8 = null,
+    /// Cohere Bedrock input type, such as search_document, search_query, classification, or clustering.
+    input_type: ?[]const u8 = null,
+    /// Cohere Bedrock truncate behavior.
+    truncate: ?[]const u8 = null,
+    /// Whether to strip new lines from the input text before embedding.
+    strip_new_lines: ?bool = null,
+    /// The batch size for embedding requests to optimize throughput.
+    batch_size: ?i64 = null,
+    /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
+    api_url: ?[]const u8 = null,
+    provider: EmbedderProvider,
+    /// Declare that this model supports non-text content (images, audio, video, PDFs), even if the model isn't in Antfly's built-in model registry yet. When `true`, Antfly treats the model as multimodal and will send binary content (images, audio, etc.) to the provider instead of extracting text. The provider's API is still responsible for accepting the content — this flag just tells Antfly not to strip it. Not needed for models already in the registry (e.g., `multimodalembedding`, `gemini-embedding-2-preview`, `clip-*`, `clipclap`). **Example:** ```json { "provider": "vertex", "model": "some-future-multimodal-model", "multimodal": true } ```
+    multimodal: ?bool = null,
+};
+
 /// The embedding provider to use.
 pub const EmbedderProvider = enum {
     gemini,
@@ -1525,6 +2347,39 @@ pub const EmbedderProvider = enum {
 };
 
 pub const Embedding = std.json.Value;
+
+/// Unified configuration for embeddings indexes. When sparse is true, creates a sparse vector index (SPLADE inverted index). When sparse is false (default), creates a dense vector index (HNSW). For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected.
+pub const EmbeddingsIndexConfig = struct {
+    /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
+    external: ?bool = null,
+    /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense (HNSW) vector index.
+    sparse: ?bool = null,
+    /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
+    dimension: ?i64 = null,
+    /// Field to extract embeddings from (managed indexes only; not allowed when external=true)
+    field: ?[]const u8 = null,
+    /// Generated embedding artifact name consumed by this vector index. Use with a matching embedding enrichment for artifact-backed managed embeddings.
+    embedding_name: ?[]const u8 = null,
+    /// Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source.
+    source_artifact_name: ?[]const u8 = null,
+    /// Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
+    template: ?[]const u8 = null,
+    distance_metric: ?DistanceMetric = null,
+    /// Whether to use in-memory only storage (dense only)
+    mem_only: ?bool = null,
+    /// Configuration for the embeddings plugin (managed indexes only; not allowed when external=true)
+    embedder: ?EmbedderConfig = null,
+    /// Configuration for the summarizer plugin (dense managed indexes only)
+    summarizer: ?GeneratorConfig = null,
+    /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before indexing. (dense managed indexes only)
+    chunker: ?ChunkerConfig = null,
+    /// Default number of results to return from search (sparse only)
+    top_k: ?i64 = null,
+    /// Minimum weight threshold for sparse vector entries (sparse only)
+    min_weight: ?f32 = null,
+    /// Number of documents per posting list chunk (sparse only)
+    chunk_size: ?i64 = null,
+};
 
 /// Discriminator for the index stats variant.
 pub const EmbeddingsIndexStatsIndexType = enum {
@@ -1634,6 +2489,33 @@ pub const EmbeddingsIndexStats = struct {
     promotion: ?std.json.Value = null,
 };
 
+/// Inline managed enrichment definition. Enrichments materialize generated artifacts before indexing and may target source rows or previously generated artifact streams.
+pub const EnrichmentConfig = struct {
+    /// Stable generated artifact name.
+    name: []const u8,
+    kind: EnrichmentKind,
+    /// Source field to read from the source document or source artifact payload.
+    field: ?[]const u8 = null,
+    /// Optional template for generated text input.
+    template: ?[]const u8 = null,
+    /// Existing artifact stream this enrichment consumes. Chunk enrichments may consume asset artifacts; embedding enrichments may consume chunk artifacts.
+    source_artifact_name: ?[]const u8 = null,
+    /// Expected embedding dimension for embedding enrichments.
+    expected_dims: ?i64 = null,
+    /// Chunk size for chunk enrichments.
+    chunk_size: ?i64 = null,
+    /// Chunk overlap for chunk enrichments.
+    chunk_overlap: ?i64 = null,
+    /// Serialized chunker configuration for chunk enrichments.
+    chunker_json: ?[]const u8 = null,
+    /// When true on a chunk or asset enrichment, route generated text into the table's default full-text index.
+    full_text_index: ?bool = null,
+    /// Produced asset content type for asset enrichments.
+    content_type: ?[]const u8 = null,
+    /// Serialized asset producer configuration.
+    producer_json: ?[]const u8 = null,
+};
+
 /// Managed generated artifact kind.
 pub const EnrichmentKind = enum {
     chunk,
@@ -1667,6 +2549,18 @@ pub const Error = struct {
     @"error": []const u8,
 };
 
+/// Configuration for inline evaluation of query results. Add to RetrievalAgentRequest, QueryRequest, or other evaluation-capable request schemas.
+pub const EvalConfig = struct {
+    /// List of evaluators to run
+    evaluators: ?[]const EvaluatorName = null,
+    /// LLM configuration for judge-based evaluators. Falls back to default if not specified.
+    judge: ?GeneratorConfig = null,
+    /// Ground truth data for retrieval metrics
+    ground_truth: ?GroundTruth = null,
+    /// Evaluation options (k, thresholds, etc.)
+    options: ?EvalOptions = null,
+};
+
 /// Options for evaluation behavior
 pub const EvalOptions = struct {
     /// K value for @K metrics (precision@k, recall@k, ndcg@k)
@@ -1675,6 +2569,44 @@ pub const EvalOptions = struct {
     pass_threshold: ?f32 = null,
     /// Timeout for evaluation in seconds
     timeout_seconds: ?i64 = null,
+};
+
+/// Standalone evaluation request for POST /eval endpoint. Useful for testing evaluators without running a query.
+pub const EvalRequest = struct {
+    /// List of evaluators to run
+    evaluators: []const EvaluatorName,
+    /// LLM configuration for judge-based evaluators
+    judge: ?GeneratorConfig = null,
+    /// Ground truth data
+    ground_truth: ?GroundTruth = null,
+    /// Evaluation options
+    options: ?EvalOptions = null,
+    /// Original query/input to evaluate
+    query: ?[]const u8 = null,
+    /// Generated output to evaluate (optional for retrieval-only)
+    output: ?[]const u8 = null,
+    /// Retrieved documents/context
+    context: ?[]const std.json.Value = null,
+    /// IDs of retrieved documents (for retrieval metrics)
+    retrieved_ids: ?[]const []const u8 = null,
+};
+
+/// Complete evaluation result
+pub const EvalResult = struct {
+    /// Scores organized by category
+    scores: ?EvalScores = null,
+    /// Aggregate statistics
+    summary: ?EvalSummary = null,
+    /// Total evaluation duration in milliseconds
+    duration_ms: ?i64 = null,
+};
+
+/// Scores organized by category
+pub const EvalScores = struct {
+    /// Retrieval metric scores (recall, precision, ndcg, etc.)
+    retrieval: ?std.json.ArrayHashMap(EvaluatorScore) = null,
+    /// Generation quality scores (faithfulness, relevance, etc.)
+    generation: ?std.json.ArrayHashMap(EvaluatorScore) = null,
 };
 
 /// Aggregate statistics across all evaluators
@@ -1760,6 +2692,51 @@ pub const EvaluatorScore = struct {
     metadata: ?std.json.Value = null,
 };
 
+/// Configuration for Exa neural/semantic web search. Exa is optimized for semantic web search, highlights, and retrieved page contents for RAG and agent workflows. **Setup:** 1. Sign up at https://exa.ai 2. Get API key from dashboard **Docs:** https://docs.exa.ai
+pub const ExaSearchConfig = struct {
+    provider: WebSearchProvider,
+    /// Provider API key or secret reference. Prefer named web_search connections for production use.
+    api_key: ?[]const u8 = null,
+    /// Provider endpoint override when applicable
+    endpoint: ?[]const u8 = null,
+    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+    location: ?[]const u8 = null,
+    /// Agent Search data store ID for provider vertex.
+    data_store: ?[]const u8 = null,
+    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
+    serving_config: ?[]const u8 = null,
+    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+    credentials_path: ?[]const u8 = null,
+    /// Maximum number of search results to return
+    max_results: ?i64 = null,
+    /// Request timeout in milliseconds
+    timeout_ms: ?i64 = null,
+    /// Enable safe search filtering
+    safe_search: ?bool = null,
+    /// Preferred language for results (e.g., 'en', 'es', 'fr')
+    language: ?[]const u8 = null,
+    /// Preferred region for results (e.g., 'us', 'uk', 'de')
+    region: ?[]const u8 = null,
+    /// Ask the provider to return extracted page content when supported
+    include_content: ?bool = null,
+    /// Ask the provider to return highlighted passages when supported
+    include_highlights: ?bool = null,
+    /// Search mode to request from Exa
+    search_type: ?[]const u8 = null,
+    /// Provider-specific result count override
+    num_results: ?i64 = null,
+    /// ISO date/time lower bound for published date filtering
+    start_published_date: ?[]const u8 = null,
+    /// ISO date/time upper bound for published date filtering
+    end_published_date: ?[]const u8 = null,
+    /// Only include results from these domains
+    include_domains: ?[]const []const u8 = null,
+    /// Exclude results from these domains
+    exclude_domains: ?[]const []const u8 = null,
+};
+
 pub const ExactSortError = struct {
     /// Stable error class.
     @"error": []const u8,
@@ -1784,6 +2761,26 @@ pub const ExtensionError = struct {
 
 /// Path-safe extension or package identifier.
 pub const ExtensionIdentifier = []const u8;
+
+pub const ExtensionMember = struct {
+    extension_name: ExtensionIdentifier,
+    scope: ExtensionScope,
+    object_kind: ExtensionObjectKind,
+    object_name: ExtensionIdentifier,
+    table_name: ?[]const u8 = null,
+    shape_kind: ?DataShapeKind = null,
+    shape_name: ?[]const u8 = null,
+    shape_version: ?[]const u8 = null,
+    owner_metadata_json: ?[]const u8 = null,
+};
+
+pub const ExtensionObjectDecl = struct {
+    kind: ExtensionObjectKind,
+    name: ExtensionIdentifier,
+    shape: ?[]const u8 = null,
+    table_name: ?[]const u8 = null,
+    config_json: ?[]const u8 = null,
+};
 
 pub const ExtensionObjectKind = enum {
     data_shape,
@@ -1870,6 +2867,12 @@ pub const ExtensionObjectKind = enum {
     }
 };
 
+pub const ExtensionScope = struct {
+    kind: ExtensionScopeKind,
+    /// Required when kind is table.
+    table_name: ?[]const u8 = null,
+};
+
 pub const ExtensionScopeKind = enum {
     cluster,
     table,
@@ -1896,6 +2899,18 @@ pub const ExtensionScopeKind = enum {
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
+};
+
+pub const ExternalIoConnection = struct {
+    protocol: ExternalIoProtocol,
+    /// Custom endpoint URL when configured.
+    endpoint: ?[]const u8 = null,
+    /// Buckets this connection is configured for.
+    buckets: ?[]const []const u8 = null,
+    /// Key prefix when configured.
+    prefix: ?[]const u8 = null,
+    /// Hosts or base URLs this connection applies to.
+    hosts: ?[]const []const u8 = null,
 };
 
 /// External IO transport protocol.
@@ -1950,11 +2965,41 @@ pub const ExtractionEntity = struct {
     score: ?f32 = null,
 };
 
+pub const ExtractionInput = struct {
+    id: ?[]const u8 = null,
+    content: ChatMessageContent,
+    tokens: ?[]const ExtractionToken = null,
+    metadata: ?std.json.Value = null,
+};
+
+pub const ExtractionObject = struct {
+    id: ?[]const u8 = null,
+    entities: ?[]const ExtractionEntity = null,
+    relations: ?[]const ExtractionRelation = null,
+    classifications: ?[]const ExtractionClassification = null,
+    structures: ?std.json.Value = null,
+};
+
+pub const ExtractionOptions = struct {
+    threshold: ?f32 = null,
+    flat_ner: ?bool = null,
+    include_confidence: ?bool = null,
+    include_spans: ?bool = null,
+    reader: ?ExtractionReaderOptions = null,
+};
+
 pub const ExtractionReaderOptions = struct {
     provider: ?[]const u8 = null,
     model: ?[]const u8 = null,
     url: ?[]const u8 = null,
     api_url: ?[]const u8 = null,
+};
+
+pub const ExtractionRelation = struct {
+    type: []const u8,
+    source: ?ExtractionRelationEndpoint = null,
+    target: ?ExtractionRelationEndpoint = null,
+    score: ?f32 = null,
 };
 
 pub const ExtractionRelationEndpoint = struct {
@@ -1968,7 +3013,32 @@ pub const ExtractionRelationSchema = struct {
     target: ?[]const u8 = null,
 };
 
+pub const ExtractionRequest = struct {
+    model: []const u8,
+    inputs: []const ExtractionInput,
+    schema: ExtractionSchema,
+    options: ?ExtractionOptions = null,
+};
+
+pub const ExtractionResponse = struct {
+    object: []const u8,
+    model: []const u8,
+    data: []const ExtractionObject,
+    usage: ?std.json.Value = null,
+};
+
+pub const ExtractionSchema = struct {
+    entities: ?[]const []const u8 = null,
+    relations: ?[]const ExtractionRelationSchema = null,
+    classifications: ?[]const ExtractionClassificationSchema = null,
+    structures: ?std.json.ArrayHashMap(ExtractionStructureSchema) = null,
+};
+
 pub const ExtractionStructureField = std.json.Value;
+
+pub const ExtractionStructureSchema = struct {
+    fields: ?std.json.ArrayHashMap(ExtractionStructureField) = null,
+};
 
 pub const ExtractionToken = struct {
     text: []const u8,
@@ -1979,6 +3049,56 @@ pub const FailedOperation = struct {
     id: ?[]const u8 = null,
     operation: ?[]const u8 = null,
     @"error": ?[]const u8 = null,
+};
+
+/// Configuration for URL content fetching. Uses go/pkg/antfly/lib/scraping for downloading and processing. Supports: - HTTP/HTTPS URLs with security validation - HTML pages (extracts readable text via go-readability) - PDF files (extracts text) - Images (returns as data URIs) - Plain text files - S3 URLs (requires s3_credentials) Security features (from go/pkg/antfly/lib/scraping.ContentSecurityConfig): - Allowed host whitelist - Private IP blocking (SSRF prevention) - Download size limits - Timeout controls
+pub const FetchConfig = struct {
+    /// S3 credentials for fetching S3 URLs. If not set, uses package-level defaults.
+    s3_credentials: ?Credentials = null,
+    /// Maximum content length in characters (truncated if exceeded)
+    max_content_length: ?i64 = null,
+    /// Whitelist of allowed hostnames for fetching. If empty, all hosts are allowed (except private IPs). Example: ["docs.example.com", "api.example.com"]
+    allowed_hosts: ?[]const []const u8 = null,
+    /// Block requests to private IP ranges (SSRF prevention). Blocked: 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+    block_private_ips: ?bool = null,
+    /// Maximum download size in bytes (default: 100MB)
+    max_download_size_bytes: ?i64 = null,
+    /// Download timeout in seconds
+    timeout_seconds: ?i64 = null,
+};
+
+/// Public field capability derived from Antfly schema mappings and observed dynamic field metadata.
+pub const FieldCapability = struct {
+    /// Mapping or dynamic-template name, when applicable.
+    name: ?[]const u8 = null,
+    /// Concrete query field path when known. Pattern-only dynamic templates may omit this.
+    field: ?[]const u8 = null,
+    /// Dynamic-template path_match pattern, when applicable.
+    path_pattern: ?[]const u8 = null,
+    /// Dynamic-template match pattern, when applicable.
+    field_pattern: ?[]const u8 = null,
+    /// Dynamic-template match_mapping_type, when applicable.
+    match_mapping_type: ?[]const u8 = null,
+    /// Physical emitted field name for schema-derived text fields, when different from the logical path.
+    emitted_name: ?[]const u8 = null,
+    /// Document schema that produced this capability, when applicable.
+    document_schema: ?[]const u8 = null,
+    type: AntflyType,
+    /// Query modes supported by this concrete field variant. These modes are derived from Antfly field types such as `text`, `keyword`, `datetime`, `geopoint`, and `search_as_you_type`; they are not separate schema toggles.
+    query_modes: []const []const u8,
+    sortable: bool,
+    /// Capability source, such as reserved, document_schema, dynamic_template, or observed_dynamic.
+    provenance: []const u8,
+    /// Current missing/null handling policy for this field.
+    missing_null_policy: []const u8,
+    /// Operational lifecycle state for exact sort use. Queryable fields are accepted by public exact sort; accelerated fields are queryable and participate in the configured index_sort tuple.
+    sort_lifecycle_state: []const u8,
+    /// Analyzer name for text/searchable fields, when applicable.
+    analyzer: ?[]const u8 = null,
+    /// Zero-based position in the table index_sort tuple when this field participates.
+    index_sort_position: ?i64 = null,
+    /// Sort direction in the table index_sort tuple when this field participates.
+    index_sort_order: ?[]const u8 = null,
 };
 
 /// Statistics about a specific field.
@@ -2005,6 +3125,20 @@ pub const FilterSpec = struct {
     value: std.json.Value,
 };
 
+/// Configuration for generating follow-up questions. Uses a separate generator call which can use a cheaper/faster model.
+pub const FollowupStepConfig = struct {
+    /// Enable follow-up question generation
+    enabled: ?bool = null,
+    /// Generator for follow-up questions. If not specified, uses the answer step's generator.
+    generator: ?GeneratorConfig = null,
+    /// Chain of generators to try in order. Mutually exclusive with 'generator'.
+    chain: ?[]const ChainLink = null,
+    /// Number of follow-up questions to generate
+    count: ?i64 = null,
+    /// Custom guidance for follow-up question focus and style
+    context: ?[]const u8 = null,
+};
+
 pub const ForeignColumn = struct {
     /// Column name in the foreign table.
     name: []const u8,
@@ -2012,6 +3146,17 @@ pub const ForeignColumn = struct {
     type: []const u8,
     /// Whether the column allows NULL values.
     nullable: ?bool = null,
+};
+
+pub const ForeignSource = struct {
+    /// Type of the foreign data source. Currently only "postgres" is supported.
+    type: []const u8,
+    /// Data source name (connection string) for the foreign database. Supports `${secret:key_name}` references that resolve from the Antfly keystore or environment variables.
+    dsn: []const u8,
+    /// Name of the table or view in the foreign PostgreSQL database to query.
+    postgres_table: []const u8,
+    /// Optional column definitions for the foreign table. If omitted, columns are auto-discovered from `information_schema.columns` on first query.
+    columns: ?[]const ForeignColumn = null,
 };
 
 pub const FullTextIndexConfig = struct {
@@ -2116,6 +3261,65 @@ pub const FullTextIndexStats = struct {
 /// The fuzziness of the query. Can be an integer or "auto".
 pub const Fuzziness = std.json.Value;
 
+pub const FuzzyQuery = struct {
+    term: []const u8,
+    prefix_length: ?i32 = null,
+    fuzziness: ?Fuzziness = null,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
+};
+
+/// Configuration for the generation step. This step generates the final response from retrieved documents using the reasoning as context.
+pub const GenerationStepConfig = struct {
+    /// Enable generation from retrieved documents
+    enabled: ?bool = null,
+    /// Generator to use for generation. If not specified, uses the default summarizer.
+    generator: ?GeneratorConfig = null,
+    /// Chain of generators to try in order. Mutually exclusive with 'generator'.
+    chain: ?[]const ChainLink = null,
+    /// Custom system prompt for answer generation
+    system_prompt: ?[]const u8 = null,
+    /// Custom guidance for generation tone, detail level, and style
+    generation_context: ?[]const u8 = null,
+};
+
+/// A unified configuration for a generative AI provider.
+pub const GeneratorConfig = struct {
+    /// The Google Cloud project ID.
+    project_id: ?[]const u8 = null,
+    /// The Google Cloud location (e.g., 'us-central1').
+    location: ?[]const u8 = null,
+    /// The name of the generative model to use.
+    model: ?[]const u8 = null,
+    /// Controls randomness in generation (0.0-2.0).
+    temperature: ?f32 = null,
+    /// Maximum number of tokens to generate.
+    max_tokens: ?i64 = null,
+    /// Nucleus sampling parameter.
+    top_p: ?f32 = null,
+    /// Top-k sampling parameter.
+    top_k: ?i64 = null,
+    /// The Google API key.
+    api_key: ?[]const u8 = null,
+    /// The URL of the Google API endpoint.
+    url: ?[]const u8 = null,
+    /// Path to service account JSON key file.
+    credentials_path: ?[]const u8 = null,
+    /// HTTP response timeout in seconds for Ollama API calls.
+    timeout: ?i64 = null,
+    /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
+    api_url: ?[]const u8 = null,
+    /// Penalty for token frequency (-2.0 to 2.0).
+    frequency_penalty: ?f32 = null,
+    /// Penalty for token presence (-2.0 to 2.0).
+    presence_penalty: ?f32 = null,
+    /// Array of model identifiers for fallback routing. Either model or models must be provided.
+    models: ?[]const []const u8 = null,
+    /// The AWS region for the Bedrock service.
+    region: ?[]const u8 = null,
+    provider: GeneratorProvider,
+};
+
 /// The generative AI provider to use.
 pub const GeneratorProvider = enum {
     gemini,
@@ -2166,6 +3370,35 @@ pub const GeneratorProvider = enum {
     }
 };
 
+/// Geographic bounding box filter. The public query shape uses scalar latitude and longitude bounds to match structured filter_query.geo_bbox. Longitude ranges may cross the antimeridian by specifying a western/min longitude that is greater than the eastern/max longitude; for example, min_lon 179.5 and max_lon -179.5 matches points near +/-180 degrees longitude. Latitude bounds must be ordered with min_lat <= max_lat.
+pub const GeoBoundingBoxQuery = struct {
+    /// Field or path containing geo_point values.
+    field: []const u8,
+    /// Southern latitude bound.
+    min_lat: f64,
+    /// Western longitude bound. If greater than max_lon, the box crosses the antimeridian.
+    min_lon: f64,
+    /// Northern latitude bound. Must be greater than or equal to min_lat.
+    max_lat: f64,
+    /// Eastern longitude bound. May be less than min_lon for antimeridian-wrapped boxes.
+    max_lon: f64,
+    boost: ?Boost = null,
+};
+
+pub const GeoBoundingPolygonQuery = struct {
+    polygon_points: []const GeoPoint,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
+};
+
+pub const GeoDistanceQuery = struct {
+    /// [lon, lat]
+    location: []const f64,
+    distance: []const u8,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
+};
+
 pub const GeoPoint = struct {
     lon: ?f64 = null,
     lat: ?f64 = null,
@@ -2175,6 +3408,17 @@ pub const GeoPoint = struct {
 pub const GeoShape = struct {
     type: []const u8,
     coordinates: []const std.json.Value,
+};
+
+pub const GeoShapeGeometry = struct {
+    shape: GeoShape,
+    relation: []const u8,
+};
+
+pub const GeoShapeQuery = struct {
+    geometry: GeoShapeGeometry,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
 };
 
 /// Configuration for the Google AI (Gemini) embedding provider. API key via `api_key` field or `GEMINI_API_KEY` environment variable. **Example Models:** gemini-embedding-001 (default, 3072 dims) **Docs:** https://ai.google.dev/gemini-api/docs/embeddings
@@ -2213,6 +3457,18 @@ pub const GoogleGeneratorConfig = struct {
     api_key: ?[]const u8 = null,
     /// The URL of the Google API endpoint.
     url: ?[]const u8 = null,
+};
+
+/// Configuration for graph index type
+pub const GraphIndexConfig = struct {
+    /// Configuration for generating node summaries (enables tree navigation in Retrieval Agent)
+    summarizer: ?GeneratorConfig = null,
+    /// Handlebars template for generating summarizer input text. Uses document fields as template variables. Same pattern as EmbeddingsConfig template.
+    template: ?[]const u8 = null,
+    /// List of edge types with their configurations
+    edge_types: ?[]const EdgeTypeConfig = null,
+    /// Maximum number of edges per document (0 = unlimited)
+    max_edges_per_document: ?i64 = null,
 };
 
 /// Discriminator for the index stats variant.
@@ -2311,6 +3567,84 @@ pub const GraphIndexStats = struct {
     algebraic_graph: ?std.json.Value = null,
 };
 
+/// Defines how to select start/target nodes for graph queries
+pub const GraphNodeSelector = struct {
+    /// Explicit list of node keys
+    keys: ?[]const []const u8 = null,
+    /// Reference to search results to use as nodes: - "$full_text_results" - use full-text search results - "$embeddings_results.index_name" - use vector search results from specific index
+    result_ref: ?[]const u8 = null,
+    /// Maximum number of nodes to select from the referenced results
+    limit: ?i64 = null,
+    /// Filter which nodes to use as start/target
+    node_filter: ?NodeFilter = null,
+};
+
+/// Declarative graph query to execute after full-text/vector searches
+pub const GraphQuery = struct {
+    type: GraphQueryType,
+    /// Graph index name (must be graph type)
+    index_name: []const u8,
+    /// Starting node(s) for the query
+    start_nodes: ?GraphNodeSelector = null,
+    /// Target nodes (for pathfinding only)
+    target_nodes: ?GraphNodeSelector = null,
+    /// Traversal/pathfinding parameters
+    params: ?GraphQueryParams = null,
+    /// Pattern steps for pattern query type
+    pattern: ?[]const PatternStep = null,
+    /// Which aliases to return from pattern query (empty = all)
+    return_aliases: ?[]const []const u8 = null,
+    /// Fetch full documents for graph results
+    include_documents: ?bool = null,
+    /// Include edge details for each node
+    include_edges: ?bool = null,
+    /// Which fields to return from documents
+    fields: ?[]const []const u8 = null,
+};
+
+/// Parameters for graph traversal and pathfinding
+pub const GraphQueryParams = struct {
+    /// Filter by edge types
+    edge_types: ?[]const []const u8 = null,
+    direction: ?EdgeDirection = null,
+    /// Maximum traversal depth
+    max_depth: ?i64 = null,
+    /// Minimum edge weight
+    min_weight: ?f64 = null,
+    /// Maximum edge weight
+    max_weight: ?f64 = null,
+    /// Maximum number of results (traversal)
+    max_results: ?i64 = null,
+    /// Remove duplicate nodes (traversal)
+    deduplicate_nodes: ?bool = null,
+    /// Include path information (traversal)
+    include_paths: ?bool = null,
+    weight_mode: ?PathWeightMode = null,
+    /// Number of paths to find (k-shortest-paths)
+    k: ?i64 = null,
+    /// Filter which nodes to visit during traversal
+    node_filter: ?NodeFilter = null,
+    /// Graph algorithm to run (e.g., 'pagerank', 'betweenness')
+    algorithm: ?[]const u8 = null,
+    /// Parameters for the graph algorithm
+    algorithm_params: ?std.json.Value = null,
+};
+
+/// Results of a graph query
+pub const GraphQueryResult = struct {
+    type: GraphQueryType,
+    /// Result nodes
+    nodes: ?[]const GraphResultNode = null,
+    /// Result paths (for pathfinding queries)
+    paths: ?[]const Path = null,
+    /// Pattern matches (for pattern queries)
+    matches: ?[]const PatternMatch = null,
+    /// Total number of results
+    total: i64,
+    /// Query execution time
+    took: ?i64 = null,
+};
+
 /// Type of graph query to execute
 pub const GraphQueryType = enum {
     traverse,
@@ -2346,6 +3680,28 @@ pub const GraphQueryType = enum {
     }
 };
 
+/// A node in graph query results
+pub const GraphResultNode = struct {
+    /// Document key
+    key: []const u8,
+    /// Distance from start node
+    depth: ?i64 = null,
+    /// Weighted distance
+    distance: ?f64 = null,
+    /// Full document (if include_documents=true)
+    document: ?std.json.Value = null,
+    /// Keys in path from start to this node
+    path: ?[]const []const u8 = null,
+    /// Edges in path from start to this node
+    path_edges: ?[]const PathEdge = null,
+    /// Algebraic provenance labels folded into this result, when requested by an algebraic graph executor
+    provenance: ?[]const []const u8 = null,
+    /// Parsed evidence envelope for provenance labels and edge metadata
+    evidence: ?std.json.Value = null,
+    /// Connected edges (when include_edges=true)
+    edges: ?[]const Edge = null,
+};
+
 /// Ground truth data for evaluation
 pub const GroundTruth = struct {
     /// Document IDs known to be relevant (for retrieval metrics)
@@ -2354,16 +3710,219 @@ pub const GroundTruth = struct {
     expectations: ?[]const u8 = null,
 };
 
+pub const IPRangeQuery = struct {
+    cidr: []const u8,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
+};
+
 /// Image URL or data URI.
 pub const ImageURL = struct {
     /// URL or data URI (data:image/png;base64,...).
     url: []const u8,
 };
 
+/// Image content in OpenAI-compatible format.
+pub const ImageURLContentPart = struct {
+    type: []const u8,
+    image_url: ImageURL,
+};
+
 /// Explains why the agent stopped before completion. Present when status is "incomplete".
 pub const IncompleteDetails = struct {
     /// Why the agent stopped: - max_internal_iterations: Hit the configured max_internal_iterations limit - max_tokens: LLM output was truncated - no_tools: No tools were available for agentic mode - clarification_required: The agent needs a user decision before it can continue
     reason: []const u8,
+};
+
+/// Configuration for an index
+pub const IndexConfig = struct {
+    /// Name of the index
+    name: []const u8,
+    /// Optional description of the index and its purpose
+    description: ?[]const u8 = null,
+    type: IndexType,
+    /// Version of the index implementation. Defaults to 0.
+    version: ?i64 = null,
+    /// Inline managed enrichment definitions required by this index. Enrichments are table-level generated artifacts such as chunks, asset-derived document units, or embeddings over an artifact stream.
+    enrichments: ?[]const EnrichmentConfig = null,
+    /// Whether to use memory-only storage
+    mem_only: ?bool = null,
+    /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
+    external: ?bool = null,
+    /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense (HNSW) vector index.
+    sparse: ?bool = null,
+    /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
+    dimension: ?i64 = null,
+    /// Field to extract embeddings from (managed indexes only; not allowed when external=true)
+    field: ?[]const u8 = null,
+    /// Generated embedding artifact name consumed by this vector index. Use with a matching embedding enrichment for artifact-backed managed embeddings.
+    embedding_name: ?[]const u8 = null,
+    /// Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source.
+    source_artifact_name: ?[]const u8 = null,
+    /// Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
+    template: ?[]const u8 = null,
+    distance_metric: ?DistanceMetric = null,
+    /// Configuration for the embeddings plugin (managed indexes only; not allowed when external=true)
+    embedder: ?EmbedderConfig = null,
+    /// Configuration for the summarizer plugin (dense managed indexes only)
+    summarizer: ?GeneratorConfig = null,
+    /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before indexing. (dense managed indexes only)
+    chunker: ?ChunkerConfig = null,
+    /// Default number of results to return from search (sparse only)
+    top_k: ?i64 = null,
+    /// Minimum weight threshold for sparse vector entries (sparse only)
+    min_weight: ?f32 = null,
+    /// Number of documents per posting list chunk (sparse only)
+    chunk_size: ?i64 = null,
+    /// List of edge types with their configurations
+    edge_types: ?[]const EdgeTypeConfig = null,
+    /// Maximum number of edges per document (0 = unlimited)
+    max_edges_per_document: ?i64 = null,
+    /// When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API.
+    derive_from_schema: ?bool = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.version) |value| {
+            try jw.objectField("version");
+            try jw.write(value);
+        }
+        if (self.enrichments) |value| {
+            try jw.objectField("enrichments");
+            try jw.write(value);
+        }
+        if (self.mem_only) |value| {
+            try jw.objectField("mem_only");
+            try jw.write(value);
+        }
+        if (self.external) |value| {
+            try jw.objectField("external");
+            try jw.write(value);
+        }
+        if (self.sparse) |value| {
+            try jw.objectField("sparse");
+            try jw.write(value);
+        }
+        if (self.dimension) |value| {
+            try jw.objectField("dimension");
+            try jw.write(value);
+        }
+        if (self.field) |value| {
+            try jw.objectField("field");
+            try jw.write(value);
+        }
+        if (self.embedding_name) |value| {
+            try jw.objectField("embedding_name");
+            try jw.write(value);
+        }
+        if (self.source_artifact_name) |value| {
+            try jw.objectField("source_artifact_name");
+            try jw.write(value);
+        }
+        if (self.template) |value| {
+            try jw.objectField("template");
+            try jw.write(value);
+        }
+        if (self.distance_metric) |value| {
+            try jw.objectField("distance_metric");
+            try jw.write(value);
+        }
+        if (self.embedder) |value| {
+            try jw.objectField("embedder");
+            try jw.write(value);
+        }
+        if (self.summarizer) |value| {
+            try jw.objectField("summarizer");
+            try jw.write(value);
+        }
+        if (self.chunker) |value| {
+            try jw.objectField("chunker");
+            try jw.write(value);
+        }
+        if (self.top_k) |value| {
+            try jw.objectField("top_k");
+            try jw.write(value);
+        }
+        if (self.min_weight) |value| {
+            try jw.objectField("min_weight");
+            try jw.write(value);
+        }
+        if (self.chunk_size) |value| {
+            try jw.objectField("chunk_size");
+            try jw.write(value);
+        }
+        if (self.edge_types) |value| {
+            try jw.objectField("edge_types");
+            try jw.write(value);
+        }
+        if (self.max_edges_per_document) |value| {
+            try jw.objectField("max_edges_per_document");
+            try jw.write(value);
+        }
+        if (self.derive_from_schema) |value| {
+            try jw.objectField("derive_from_schema");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Statistics for an index
+pub const IndexStats = union(enum) {
+    full_text_index_stats: FullTextIndexStats,
+    embeddings_index_stats: EmbeddingsIndexStats,
+    graph_index_stats: GraphIndexStats,
+    algebraic_index_stats: AlgebraicIndexStats,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("index_type") orelse return error.MissingField;
+        const disc_str = switch (disc_val) {
+            .string => |s| s,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "full_text")) {
+            return .{ .full_text_index_stats = try std.json.parseFromValueLeaky(FullTextIndexStats, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "embeddings")) {
+            return .{ .embeddings_index_stats = try std.json.parseFromValueLeaky(EmbeddingsIndexStats, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "graph")) {
+            return .{ .graph_index_stats = try std.json.parseFromValueLeaky(GraphIndexStats, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "algebraic")) {
+            return .{ .algebraic_index_stats = try std.json.parseFromValueLeaky(AlgebraicIndexStats, allocator, source, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .full_text_index_stats => |v| try jw.write(v),
+            .embeddings_index_stats => |v| try jw.write(v),
+            .graph_index_stats => |v| try jw.write(v),
+            .algebraic_index_stats => |v| try jw.write(v),
+        }
+    }
+};
+
+pub const IndexStatus = struct {
+    shard_status: std.json.ArrayHashMap(IndexStats),
+    config: IndexConfig,
+    status: IndexStats,
 };
 
 /// The type of the index.
@@ -2396,6 +3955,15 @@ pub const IndexType = enum {
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
+};
+
+/// Audio chunking configuration for inference, including VAD options.
+pub const InferenceAudioChunkConfig = struct {
+    /// Window duration in milliseconds for fixed-window audio chunking (default: 30000).
+    window_duration_ms: ?i64 = null,
+    /// Overlap duration in milliseconds between audio chunks (default: 0).
+    overlap_duration_ms: ?i64 = null,
+    vad: ?VADOptions = null,
 };
 
 /// Backend priority entry for model loading. Use `backend` or `backend:device`, where device defaults to `auto`. Backends: - `native` - Native CPU backend - `onnx` - ONNX Runtime backend - `metal` - Apple Metal backend - `cuda` - NVIDIA CUDA backend - `xla` - PJRT/XLA compiled backend - `webgpu` or `wasm` - Wasm/WebGPU backend in Wasm builds Devices: - `auto` - Auto-detect best available (default) - `cuda` - NVIDIA CUDA GPU - `tpu` - Google TPU (used by XLA) - `cpu` - Force CPU only
@@ -2431,6 +3999,202 @@ pub const InferenceBinaryContent = struct {
     frame_delay_ms: ?i64 = null,
 };
 
+pub const InferenceChatMessage = struct {
+    role: InferenceRole,
+    content: ?ChatMessageContent = null,
+    /// Tool calls made by the assistant (only for role=assistant)
+    tool_calls: ?[]const ToolCall = null,
+    /// ID of the tool call this message is responding to (only for role=tool)
+    tool_call_id: ?[]const u8 = null,
+};
+
+/// A chunk of content. Text chunks have mime_type text/plain.
+pub const InferenceChunk = struct {
+    /// The chunk text content
+    text: ?[]const u8 = null,
+    /// Character position in original text where chunk starts
+    start_char: ?i64 = null,
+    /// Character position in original text where chunk ends (exclusive)
+    end_char: ?i64 = null,
+    /// Base64-encoded binary data (valid WAV, PNG, etc.)
+    data: ?[]const u8 = null,
+    /// Audio: window start time in milliseconds
+    start_time_ms: ?f32 = null,
+    /// Audio: window end time in milliseconds
+    end_time_ms: ?f32 = null,
+    /// Animation: frame number
+    frame_index: ?i64 = null,
+    /// Animation: display delay in milliseconds
+    frame_delay_ms: ?i64 = null,
+    /// Sequence number of the chunk (0, 1, 2, ...)
+    id: i64,
+    /// MIME type: text/plain, audio/wav, image/png, etc.
+    mime_type: []const u8,
+};
+
+/// Configuration for chunking requests to Antfly inference. Combines shared text options with inference-specific audio/VAD options.
+pub const InferenceChunkConfig = struct {
+    /// The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/.
+    model: ?[]const u8 = null,
+    /// Maximum number of chunks to generate per document.
+    max_chunks: ?i64 = null,
+    /// Confidence threshold for model-based chunking (0.0-1.0). Used by ONNX text models and VAD audio models.
+    threshold: ?f32 = null,
+    text: ?TextChunkOptions = null,
+    audio: ?InferenceAudioChunkConfig = null,
+};
+
+/// Content part supported by chunking requests.
+pub const InferenceChunkContentPart = union(enum) {
+    media_content_part: *MediaContentPart,
+    text_content_part: *TextContentPart,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        if (objectHasAnyKey(source.object, &.{
+            "type",
+            "data",
+            "mime_type",
+        })) {
+            if (try parseStructuralVariant(MediaContentPart, allocator, source, options)) |parsed| return .{ .media_content_part = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "type",
+            "text",
+        })) {
+            if (try parseStructuralVariant(TextContentPart, allocator, source, options)) |parsed| return .{ .text_content_part = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .media_content_part => |v| try jw.write(v.*),
+            .text_content_part => |v| try jw.write(v.*),
+        }
+    }
+};
+
+/// A chunk result object. Text chunks have mime_type text/plain.
+pub const InferenceChunkObject = struct {
+    /// The chunk text content
+    text: ?[]const u8 = null,
+    /// Character position in original text where chunk starts
+    start_char: ?i64 = null,
+    /// Character position in original text where chunk ends (exclusive)
+    end_char: ?i64 = null,
+    /// Base64-encoded binary data (valid WAV, PNG, etc.)
+    data: ?[]const u8 = null,
+    /// Audio: window start time in milliseconds
+    start_time_ms: ?f32 = null,
+    /// Audio: window end time in milliseconds
+    end_time_ms: ?f32 = null,
+    /// Animation: frame number
+    frame_index: ?i64 = null,
+    /// Animation: display delay in milliseconds
+    frame_delay_ms: ?i64 = null,
+    /// Sequence number of the chunk (0, 1, 2, ...)
+    id: ?i64 = null,
+    /// MIME type: text/plain, audio/wav, image/png, etc.
+    mime_type: ?[]const u8 = null,
+    object: []const u8,
+    /// Position of this chunk object in the response data array.
+    index: i64,
+};
+
+pub const InferenceChunkRequest = struct {
+    /// Input content to chunk. Supports two formats: - Text string: `"This is a long document..."` - ContentPart: `{"type": "media", "data": "<base64>", "mime_type": "audio/wav"}` - ContentPart: `{"type": "text", "text": "..."}`
+    input: std.json.Value,
+    config: ?InferenceChunkConfig = null,
+};
+
+pub const InferenceChunkResponse = struct {
+    /// Object type, always "list"
+    object: []const u8,
+    /// Array of chunk objects
+    data: []const InferenceChunkObject,
+    /// Chunking model actually used (may differ from requested if fallback occurred)
+    model: []const u8,
+    usage: InferenceGenerateUsage,
+    /// Whether result was served from cache
+    cache_hit: bool,
+};
+
+pub const InferenceConfig = struct {
+    /// URL of the Antfly inference embedding/chunking service
+    api_url: []const u8,
+    /// API key used when calling an authenticated shared Antfly inference API.
+    api_key: ?[]const u8 = null,
+    /// Base directory containing model subdirectories. Antfly inference auto-discovers models from: - `{models_dir}/embedders/` - Embedding models (ONNX) - `{models_dir}/chunkers/` - Chunking models (ONNX) - `{models_dir}/rerankers/` - Reranking models (ONNX) - `{models_dir}/recognizers/` - Recognition models (ONNX) - `{models_dir}/rewriters/` - Seq2Seq rewriter models (ONNX) Defaults to ~/.antfly/inference/models (set via viper). If not set, only built-in fixed chunking is available.
+    models_dir: ?[]const u8 = null,
+    /// Base directory containing Traditional ML predictor subdirectories. The `/ml/v1/*` API auto-discovers predictors from `{ml_dir}/{name}/tabular_model.json`. Defaults to ~/.antfly/inference/ml.
+    ml_dir: ?[]const u8 = null,
+    /// Security settings for downloading content from URLs (e.g., images for CLIP models). Controls allowed hosts, private IP blocking, download limits, and timeouts.
+    content_security: ?InferenceContentSecurityConfig = null,
+    /// S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
+    s3_credentials: ?InferenceCredentials = null,
+    /// How long to keep models loaded in memory after last use (Ollama-compatible). Models are automatically unloaded after this duration of inactivity. Use Go duration format: "5m" (5 minutes), "1h" (1 hour), "0" (eager loading). Defaults to "5m" (lazy loading) like Ollama. Set to "0" to explicitly enable eager loading where all models are loaded at startup and never unloaded.
+    keep_alive: ?[]const u8 = null,
+    /// Maximum total models loaded across all registry types (embedders, rerankers, generators, chunkers, etc.). When the limit is reached, the least-recently-used idle model from any registry is evicted to make room. Set to 0 for unlimited (default).
+    max_loaded_models: ?i64 = null,
+    /// Number of concurrent inference pipelines per model. Each pipeline loads a copy of the model, so higher values use more memory but allow more concurrent requests. Note: pool_size multiplies per-model memory independently of max_loaded_models.
+    pool_size: ?i64 = null,
+    /// Backend priority order for model loading with optional device specifiers. Format: `backend` or `backend:device` where device defaults to `auto`. Antfly inference tries entries in order and uses the first available backend+device combination that supports the model. **Examples**: - `["native", "onnx", "xla"]` - Try backends with auto device detection - `["cuda", "onnx:cuda", "xla:tpu", "native"]` - Prefer GPU, fall back to CPU
+    backend_priority: ?[]const InferenceBackendPriorityEntry = null,
+    /// Maximum number of concurrent inference requests allowed. Additional requests will be queued up to max_queue_size. Set to 0 for unlimited (default).
+    max_concurrent_requests: ?i64 = null,
+    /// Maximum number of requests to queue when max_concurrent_requests is reached. When the queue is full, new requests receive 503 Service Unavailable with Retry-After header. Set to 0 for unlimited queue (default). Only effective when max_concurrent_requests > 0.
+    max_queue_size: ?i64 = null,
+    /// Maximum time to wait for a request to complete, including queue wait time. Use Go duration format: "30s", "1m", "0" (no timeout, default). Requests exceeding this timeout receive 504 Gateway Timeout.
+    request_timeout: ?[]const u8 = null,
+    /// Models to preload and warm at startup. Generators run a tiny generation request so native/Metal weights, KV setup, and kernels use the same budgeted path as request-time generation. Other model kinds use the best available warm path for that kind.
+    preload: ?[]const InferenceModelRef = null,
+    /// Maximum memory (in MB) to use for loaded models. When this limit is approached, least recently used models are unloaded. Set to 0 for unlimited (default). This is an advisory limit - actual memory usage depends on model sizes and may temporarily exceed this value. Works alongside max_loaded_models for fine-grained control.
+    max_memory_mb: ?i64 = null,
+    /// Per-model loading strategy overrides. Maps model names to their loading strategy. Models not in this map use the default strategy based on keep_alive: - If keep_alive>0 (default "5m"): lazy loading (load on demand, unload after idle) - If keep_alive="0": eager loading (load at startup, never unload) When a model has strategy "eager" in this map: - It is loaded at startup through the same startup warmup path - It is never unloaded, even when keep_alive>0 (pinned in memory) This allows mixing eager and lazy models in the same pool.
+    model_strategies: ?std.json.ArrayHashMap([]const u8) = null,
+    /// Whether the dashboard should show model download commands. Defaults to true for standalone/swarm mode. Set to false in managed deployments (e.g., Kubernetes operator) where models are managed externally.
+    allow_downloads: ?bool = null,
+    log: ?InferenceschemasConfig = null,
+};
+
+pub const InferenceConnection = struct {
+    provider: InferenceProviderType,
+    /// Resolved endpoint URL when applicable.
+    url: ?[]const u8 = null,
+    /// Cloud region (Bedrock).
+    region: ?[]const u8 = null,
+    /// Google Cloud project (Vertex).
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location (Vertex).
+    location: ?[]const u8 = null,
+    /// Named registry entries from node config that resolve to this provider instance.
+    names: ?[]const []const u8 = null,
+    /// Model types this instance is configured for.
+    configured_model_types: ?[]const ConnectedModelType = null,
+    /// Models reported by the provider, grouped by model type. Keys are pluralized ConnectedModelType values ("embedders", "generators", "rerankers", "chunkers", "recognizers", "classifiers", "rewriters", "readers", "transcribers", "extractors") plus "other" for models the provider's listing API does not classify by task. Populated only when the request includes the "models" expansion.
+    models: ?std.json.ArrayHashMap([]const ConnectedModel) = null,
+};
+
+pub const InferenceContentPart = ContentPart;
+
 pub const InferenceContentSecurityConfig = struct {
     /// Whitelist of allowed hostnames/IPs for link downloads. If empty, all hosts are allowed (except private IPs if block_private_ips is true).
     allowed_hosts: ?[]const []const u8 = null,
@@ -2459,6 +4223,43 @@ pub const InferenceCredentials = struct {
     secret_access_key: ?[]const u8 = null,
     /// Optional AWS session token for temporary credentials. Supports keystore syntax for secret lookup.
     session_token: ?[]const u8 = null,
+};
+
+/// OpenAI-compatible embedding request with inference multimodal content-part extension
+pub const InferenceEmbedRequest = struct {
+    /// Model name to use for embedding generation
+    model: []const u8,
+    /// Input content to embed. Supports: - a single string - an array of strings - an array of OpenAI-style content parts for multimodal embedding
+    input: std.json.Value,
+    /// Encoding format for the embeddings (only "float" supported)
+    encoding_format: ?[]const u8 = null,
+    /// Optional truncation size for dense embeddings. Must be a positive integer no larger than the model embedding size. Not supported for sparse models.
+    dimensions: ?i64 = null,
+    /// Optional embedding task type using Google embedding task-type names. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix.
+    task_type: ?[]const u8 = null,
+    /// Deprecated compatibility alias for task_type. search_query/query map to RETRIEVAL_QUERY; search_document/document map to RETRIEVAL_DOCUMENT; classification and clustering map to their Google task_type equivalents.
+    input_type: ?[]const u8 = null,
+};
+
+/// OpenAI-compatible embedding response with a polymorphic `embedding` field for dense or sparse vectors
+pub const InferenceEmbedResponse = struct {
+    /// Object type, always "list"
+    object: []const u8,
+    /// List of embedding objects
+    data: []const InferenceEmbeddingObject,
+    /// Model used for embedding generation
+    model: []const u8,
+    usage: InferenceEmbeddingUsage,
+};
+
+/// A single embedding result
+pub const InferenceEmbeddingObject = struct {
+    /// Object type, always "embedding"
+    object: []const u8,
+    /// Dense float vector for dense models, or a sparse vector object for sparse-capable models
+    embedding: ?std.json.Value = null,
+    /// Index of the input this embedding corresponds to
+    index: i64,
 };
 
 /// Token usage information
@@ -2521,6 +4322,39 @@ pub const InferenceFunctionDefinition = struct {
     strict: ?bool = null,
 };
 
+pub const InferenceGenerateChoice = struct {
+    /// Index of this choice in the list
+    index: i64,
+    message: InferenceGenerateMessage,
+    finish_reason: InferenceFinishReason,
+    /// Log probability information (not supported, always null)
+    logprobs: ?std.json.Value = null,
+};
+
+/// Streaming generation chunk (SSE event data)
+pub const InferenceGenerateChunk = struct {
+    id: []const u8,
+    object: []const u8,
+    created: i64,
+    model: []const u8,
+    choices: []const InferenceGenerateChunkChoice,
+};
+
+pub const InferenceGenerateChunkChoice = struct {
+    index: i64,
+    delta: InferenceGenerateDelta,
+    finish_reason: ?InferenceFinishReason = null,
+};
+
+/// Delta content for streaming
+pub const InferenceGenerateDelta = struct {
+    role: ?InferenceRole = null,
+    /// Token content delta
+    content: ?[]const u8 = null,
+    /// Tool call deltas for streaming tool calls
+    tool_calls: ?[]const InferenceToolCallDelta = null,
+};
+
 pub const InferenceGenerateJsonSchemaConfig = struct {
     /// Schema name
     name: ?[]const u8 = null,
@@ -2528,6 +4362,82 @@ pub const InferenceGenerateJsonSchemaConfig = struct {
     strict: ?bool = null,
     /// JSON Schema object
     schema: ?std.json.Value = null,
+};
+
+pub const InferenceGenerateMessage = struct {
+    role: InferenceRole,
+    /// The generated message content (null when tool_calls is present)
+    content: ?[]const u8 = null,
+    /// Tool calls made by the model (only present when finish_reason is tool_calls)
+    tool_calls: ?[]const ToolCall = null,
+};
+
+pub const InferenceGenerateRequest = struct {
+    /// Name of the generator model from models_dir/generators/
+    model: []const u8,
+    /// Conversation messages (OpenAI-compatible format)
+    messages: []const InferenceChatMessage,
+    /// Maximum tokens to generate
+    max_tokens: ?i64 = null,
+    /// Sampling temperature (0.0 = deterministic, higher = more random)
+    temperature: ?f32 = null,
+    /// Nucleus sampling probability
+    top_p: ?f32 = null,
+    /// Top-k sampling (inference extension, not in OpenAI API)
+    top_k: ?i64 = null,
+    /// If true, partial message deltas will be sent as SSE events
+    stream: ?bool = null,
+    /// List of tools (functions) the model can call. Only supported by models with tool_call_format configured.
+    tools: ?[]const InferenceTool = null,
+    /// Min-p sampling threshold. Filters tokens where p < min_p * max_p. Simpler alternative to top_p.
+    min_p: ?f32 = null,
+    /// Repetition penalty factor applied to previously generated tokens (1.0 = disabled, >1.0 penalizes, <1.0 encourages)
+    repetition_penalty: ?f32 = null,
+    /// Additive penalty based on token frequency in context (logit -= frequency_penalty * count)
+    frequency_penalty: ?f32 = null,
+    /// Additive penalty for tokens that appeared at all in context (logit -= presence_penalty if count > 0)
+    presence_penalty: ?f32 = null,
+    /// Structured output control. OpenAI-compatible entry point for requesting JSON output. `{"type":"json_object"}` is supported directly. `{"type":"json_schema"}` is compiled into a native constrained-decoding grammar on the native backend and is rejected on ONNX backends.
+    response_format: ?InferenceGenerateResponseFormat = null,
+    /// inference-native grammar override. When set, this takes precedence over `response_format`. Grammar-constrained decoding is currently native-backend only.
+    grammar: ?[]const u8 = null,
+    /// inference-native speculative decoding extension. Path or model identifier for a smaller draft model.
+    draft_model: ?[]const u8 = null,
+    /// inference-native speculative decoding extension. Number of draft tokens proposed per verification round.
+    speculative_k: ?i64 = null,
+    /// inference-native KV cache quantization format. Lower precision reduces memory usage but may affect generation quality. Default auto-selects based on backend (f16 for GPU, f32 for CPU).
+    cache_dtype: ?[]const u8 = null,
+    /// inference-native KV cache compaction ratio applied after prefill via Attention Matching. Selects a subset of keys and fits new values via OLS to preserve attention behavior. 0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction.
+    cache_compaction_ratio: ?f32 = null,
+    backend: ?InferenceModelBackend = null,
+    /// inference-native graph execution mode. `eager` keeps the direct runtime path when possible. `compiled` runs inference graph planning, partitioning, and backend executor attachment.
+    mode: ?[]const u8 = null,
+    /// inference-native compiled graph target. `partitioned` attaches compiled executors to eligible graph partitions. `whole-model` requests a compiled backend only when it can own the full traced graph shape.
+    compiled_target: ?[]const u8 = null,
+    /// Controls how the model uses tools
+    tool_choice: ?InferenceToolChoice = null,
+};
+
+/// OpenAI-compatible chat completion response
+pub const InferenceGenerateResponse = struct {
+    /// A unique identifier for the chat completion
+    id: []const u8,
+    /// The object type, always "chat.completion"
+    object: []const u8,
+    /// Unix timestamp (seconds) when the completion was created
+    created: i64,
+    /// Model used for generation
+    model: []const u8,
+    /// List of completion choices (currently always 1)
+    choices: []const InferenceGenerateChoice,
+    usage: InferenceGenerateUsage,
+};
+
+pub const InferenceGenerateResponseFormat = struct {
+    /// Structured output mode
+    type: []const u8,
+    /// Optional schema payload for `type=json_schema`. Enforced during native constrained decoding and validated after generation.
+    json_schema: ?InferenceGenerateJsonSchemaConfig = null,
 };
 
 pub const InferenceGenerateUsage = struct {
@@ -2538,6 +4448,10 @@ pub const InferenceGenerateUsage = struct {
     /// Total tokens used (prompt + completion)
     total_tokens: i64,
 };
+
+pub const InferenceImageURL = ImageURL;
+
+pub const InferenceImageURLContentPart = ImageURLContentPart;
 
 /// Logging verbosity level
 pub const InferenceLevel = enum {
@@ -2570,6 +4484,8 @@ pub const InferenceLevel = enum {
         return map.get(s) orelse error.UnexpectedToken;
     }
 };
+
+pub const InferenceMediaContentPart = MediaContentPart;
 
 /// Optional backend preference for model loading or request execution. `auto` keeps the node default behavior. `xla` selects the PJRT/XLA backend and may require a PJRT plugin path via `ANTFLY_INFERENCE_XLA_PLUGIN`, `ANTFLY_INFERENCE_PJRT_PLUGIN`, `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`. `webgpu` selects the Wasm/WebGPU backend in Wasm builds; pair it with `mode: "compiled"` on generation requests to request WebGPU graph partition execution.
 pub const InferenceModelBackend = enum {
@@ -2734,11 +4650,71 @@ pub const InferenceModelQuantization = enum {
     }
 };
 
+/// Model reference used by startup preload and model-loading configuration.
+pub const InferenceModelRef = struct {
+    kind: InferenceModelKind,
+    /// Model name to resolve within the registry for the selected kind, usually in `<owner>/<repo>` format.
+    name: []const u8,
+    backend: ?InferenceModelBackend = null,
+    format: ?InferenceModelFormat = null,
+    quantization: ?InferenceModelQuantization = null,
+};
+
+pub const InferenceModelsResponse = struct {
+    /// OpenAI-compatible response object type.
+    object: []const u8,
+    /// OpenAI-compatible flat model list for generation/embedding models.
+    data: []const std.json.Value,
+    /// Whether clients should show model download commands.
+    allow_downloads: bool,
+    backends: InferenceBackendRuntimes,
+    /// Available chunking models (always includes "fixed")
+    chunkers: std.json.ArrayHashMap(InferenceModelInfo),
+    /// Available reranking models
+    rerankers: std.json.ArrayHashMap(InferenceModelInfo),
+    /// Available zero-shot classification models
+    classifiers: std.json.ArrayHashMap(InferenceModelInfo),
+    /// Available embedding models from models_dir/embedders/
+    embedders: std.json.ArrayHashMap(InferenceModelInfo),
+    /// Available extractor models (models with 'extraction' capability)
+    extractors: std.json.ArrayHashMap(InferenceModelInfo),
+    /// Available generator/LLM models from models_dir/generators/
+    generators: std.json.ArrayHashMap(InferenceModelInfo),
+    /// Available recognizer models from models_dir/recognizers/
+    recognizers: std.json.ArrayHashMap(InferenceModelInfo),
+    /// Available Seq2Seq rewriter models from models_dir/rewriters/
+    rewriters: std.json.ArrayHashMap(InferenceModelInfo),
+    /// Available reader/OCR models from models_dir/readers/
+    readers: std.json.ArrayHashMap(InferenceModelInfo),
+    /// Available transcriber/speech-to-text models from models_dir/transcribers/
+    transcribers: std.json.ArrayHashMap(InferenceModelInfo),
+};
+
 pub const InferencePredictRequest = struct {
     /// Predictor name from the model catalog.
     model: []const u8,
     /// Batch of feature vectors. Max 10000 rows.
     input: []const []const f32,
+};
+
+pub const InferencePredictResponse = struct {
+    model: []const u8,
+    task: InferencePredictorTask,
+    /// Per-row prediction arrays. Length equals the model's `num_outputs` (1 for regression / binary, `num_classes` for multiclass).
+    predictions: []const []const f32,
+};
+
+/// Traditional ML predictor metadata.
+pub const InferencePredictorInfo = struct {
+    task: InferencePredictorTask,
+    /// Number of feature columns expected by the predictor.
+    num_features: i64,
+    /// Number of output values emitted per input row.
+    num_outputs: i64,
+    /// Optional feature names in input order.
+    feature_names: ?[]const []const u8 = null,
+    /// Source framework used to produce the predictor IR.
+    source_framework: ?[]const u8 = null,
 };
 
 /// Task type for tabular predictors.
@@ -2771,6 +4747,13 @@ pub const InferencePredictorTask = enum {
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
+};
+
+pub const InferencePredictorsResponse = struct {
+    /// Response object type.
+    object: []const u8,
+    /// Traditional ML predictors keyed by predictor name.
+    predictors: std.json.ArrayHashMap(InferencePredictorInfo),
 };
 
 /// Inference provider type for a connection.
@@ -2823,6 +4806,63 @@ pub const InferenceProviderType = enum {
     }
 };
 
+pub const InferenceReadObject = struct {
+    /// Extracted text from the image
+    text: []const u8,
+    /// Structured fields extracted by document understanding models (Donut, Florence-2). Fields are flattened with dot notation for nested structures. Only present for models that output structured data.
+    fields: ?std.json.ArrayHashMap([]const u8) = null,
+    /// Individual text regions with bounding boxes and recognized text. Populated by multi-stage OCR models (Surya, PaddleOCR).
+    regions: ?[]const InferenceTextRegion = null,
+    object: []const u8,
+    /// Original input image index.
+    index: i64,
+};
+
+pub const InferenceReadRequest = struct {
+    /// Name of reader model from models_dir/readers/
+    model: []const u8,
+    /// Images to read text from. Supports: - Data URIs: `data:image/png;base64,...` - URLs (if content_security allows)
+    images: []const InferenceImageURL,
+    /// Optional task prompt for document understanding models. - TrOCR: Not used (pure OCR) - Donut CORD: "<s_cord-v2>" for receipt parsing - Donut DocVQA: "<s_docvqa><s_question>What is the total?</s_question><s_answer>" - Florence-2: "<OCR>" for OCR, "<CAPTION>" for captioning - Pix2Struct: "What type of document is this?" - Moondream: "Describe this image."
+    prompt: ?[]const u8 = null,
+    /// Maximum tokens to generate
+    max_tokens: ?i64 = null,
+};
+
+pub const InferenceReadResponse = struct {
+    /// Object type, always "list"
+    object: []const u8,
+    /// Read result objects, one per input image.
+    data: []const InferenceReadObject,
+    /// Name of model used for reading
+    model: []const u8,
+    usage: InferenceGenerateUsage,
+};
+
+pub const InferenceReadResult = struct {
+    /// Extracted text from the image
+    text: []const u8,
+    /// Structured fields extracted by document understanding models (Donut, Florence-2). Fields are flattened with dot notation for nested structures. Only present for models that output structured data.
+    fields: ?std.json.ArrayHashMap([]const u8) = null,
+    /// Individual text regions with bounding boxes and recognized text. Populated by multi-stage OCR models (Surya, PaddleOCR).
+    regions: ?[]const InferenceTextRegion = null,
+};
+
+pub const InferenceRerankMultimodalDocument = struct {
+    /// Optional caller-provided document identifier
+    id: ?[]const u8 = null,
+    content: ChatMessageContent,
+};
+
+pub const InferenceRerankMultimodalRequest = struct {
+    /// Name of multimodal reranking model from models_dir/rerankers/
+    model: []const u8,
+    /// Text query for relevance scoring
+    query: []const u8,
+    /// Documents expressed as text and image content parts
+    documents: []const InferenceRerankMultimodalDocument,
+};
+
 pub const InferenceRerankObject = struct {
     object: []const u8,
     /// Original prompt index.
@@ -2840,6 +4880,16 @@ pub const InferenceRerankRequest = struct {
     prompts: []const []const u8,
 };
 
+pub const InferenceRerankResponse = struct {
+    /// Object type, always "list"
+    object: []const u8,
+    /// Rerank score objects, one per input prompt.
+    data: []const InferenceRerankObject,
+    /// Name of model used for reranking
+    model: []const u8,
+    usage: InferenceGenerateUsage,
+};
+
 pub const InferenceRewriteObject = struct {
     object: []const u8,
     /// Original input text index.
@@ -2854,6 +4904,18 @@ pub const InferenceRewriteRequest = struct {
     /// Input texts to rewrite/transform
     inputs: []const []const u8,
 };
+
+pub const InferenceRewriteResponse = struct {
+    /// Object type, always "list"
+    object: []const u8,
+    /// Rewritten text objects, one per input.
+    data: []const InferenceRewriteObject,
+    /// Name of model used for rewriting
+    model: []const u8,
+    usage: InferenceGenerateUsage,
+};
+
+pub const InferenceRole = ChatMessageRole;
 
 /// A sparse vector with parallel index/value arrays, sorted by index ascending
 pub const InferenceSparseVector = struct {
@@ -2905,6 +4967,8 @@ pub const InferenceTextContent = struct {
     end_char: i64,
 };
 
+pub const InferenceTextContentPart = TextContentPart;
+
 pub const InferenceTextRegion = struct {
     /// Recognized text within the region
     text: []const u8,
@@ -2914,6 +4978,24 @@ pub const InferenceTextRegion = struct {
     confidence: ?f64 = null,
     /// Semantic label from layout analysis (e.g., text, title, table)
     label: ?[]const u8 = null,
+};
+
+/// A tool (function) that the model can call
+pub const InferenceTool = struct {
+    /// The type of tool (currently only "function" is supported)
+    type: []const u8,
+    function: InferenceFunctionDefinition,
+};
+
+/// Incremental tool call data for streaming
+pub const InferenceToolCallDelta = struct {
+    /// Index of the tool call in the array
+    index: ?i64 = null,
+    /// Unique identifier (only in first delta for this index)
+    id: ?[]const u8 = null,
+    /// The type of tool call (only in first delta)
+    type: ?[]const u8 = null,
+    function: ?InferenceToolCallFunctionDelta = null,
 };
 
 /// Incremental function call data for streaming
@@ -2944,6 +5026,88 @@ pub const InferenceTranscribeRequest = struct {
     audio: []const u8,
     /// Force specific language for transcription (optional, model-dependent)
     language: ?[]const u8 = null,
+};
+
+pub const InferenceTranscribeResponse = struct {
+    /// Object type, always "list"
+    object: []const u8,
+    /// Transcription result objects.
+    data: []const InferenceTranscribeObject,
+    /// Name of model used for transcription
+    model: []const u8,
+    usage: InferenceGenerateUsage,
+};
+
+/// Logging configuration for inference services
+pub const InferenceschemasConfig = struct {
+    level: ?InferenceLevel = null,
+    style: ?InferenceStyle = null,
+};
+
+pub const InstallExtensionRequest = struct {
+    version: ?[]const u8 = null,
+    scope: ExtensionScope,
+    config_json: ?[]const u8 = null,
+    grants: ?[]const Capability = null,
+    dry_run: ?bool = null,
+};
+
+pub const InstallManifest = struct {
+    scopes_supported: []const ExtensionScopeKind,
+    shapes: ?[]const DataShapeDecl = null,
+    objects: ?[]const ExtensionObjectDecl = null,
+    runtimes: ?[]const RuntimeDecl = null,
+    config_schema_json: ?[]const u8 = null,
+};
+
+pub const InstalledExtension = struct {
+    name: ExtensionIdentifier,
+    package_name: ExtensionIdentifier,
+    package_version: []const u8,
+    package_digest: []const u8,
+    scope: ExtensionScope,
+    config_json: ?[]const u8 = null,
+    granted_capabilities: ?[]const Capability = null,
+    installed_at_epoch_ms: ?i64 = null,
+    status: []const u8,
+};
+
+/// Configuration for joining data from another table. Supports inner, left, and right joins with automatic strategy selection.
+pub const JoinClause = struct {
+    /// Name of the table to join with.
+    right_table: []const u8,
+    /// Type of join to perform. Defaults to "inner".
+    join_type: ?JoinType = null,
+    /// Join condition specifying which fields to match.
+    on: JoinCondition,
+    /// Optional filters to apply to the right table before joining. Use to reduce the amount of data being joined.
+    right_filters: ?JoinFilters = null,
+    /// Fields to include from the right table in the result. If not specified, all fields from the right table are included. Fields are prefixed with the right table name in the result.
+    right_fields: ?[]const []const u8 = null,
+    /// Optional hint for which join strategy to use. If not specified, the planner automatically selects based on table statistics.
+    strategy_hint: ?JoinStrategy = null,
+    /// Optional nested join for multi-way joins. The nested join operates on the result of the current join.
+    nested_join: ?std.json.Value = null,
+};
+
+/// Condition for matching rows between tables.
+pub const JoinCondition = struct {
+    /// Field from the left (primary) table to match on.
+    left_field: []const u8,
+    /// Field from the right (joined) table to match on.
+    right_field: []const u8,
+    /// Comparison operator. Defaults to "eq" (equality).
+    operator: ?JoinOperator = null,
+};
+
+/// Filters to apply to a table before joining.
+pub const JoinFilters = struct {
+    /// Antfly query to filter rows before joining.
+    filter_query: ?std.json.Value = null,
+    /// Key prefix filter for the table.
+    filter_prefix: ?[]const u8 = null,
+    /// Maximum number of rows to include from this table.
+    limit: ?i64 = null,
 };
 
 /// Comparison operator for join condition: - `eq`: Equal (default) - `neq`: Not equal - `lt`: Less than - `lte`: Less than or equal - `gt`: Greater than - `gte`: Greater than or equal
@@ -2982,6 +5146,24 @@ pub const JoinOperator = enum {
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
+};
+
+/// Join execution statistics.
+pub const JoinProfile = struct {
+    /// The join strategy that was used.
+    strategy_used: ?JoinStrategy = null,
+    /// Number of rows scanned from the left table.
+    left_rows_scanned: ?i64 = null,
+    /// Number of rows scanned from the right table.
+    right_rows_scanned: ?i64 = null,
+    /// Number of rows that matched the join condition.
+    rows_matched: ?i64 = null,
+    /// Number of left rows without a match (for left/full joins).
+    rows_unmatched_left: ?i64 = null,
+    /// Number of right rows without a match (for right/full joins).
+    rows_unmatched_right: ?i64 = null,
+    /// Time spent executing the join in milliseconds.
+    duration_ms: ?i64 = null,
 };
 
 /// Strategy for executing the join: - `broadcast`: Broadcast small table to all shards of large table. Best for dimension tables < 10MB. O(small_table) memory per shard. - `index_lookup`: Use batch key lookups via indexes. Best for selective joins with indexed join keys. Low memory overhead. - `shuffle`: Hash-partition both tables by join key. Best for large-large table joins. Requires data movement.
@@ -3077,6 +5259,75 @@ pub const LinearMergePageStatus = enum {
     }
 };
 
+/// Linear merge operation for syncing sorted records from external sources. Use this to keep Antfly in sync with an external database or data source. Requests may be sent as plain JSON or gzip-compressed JSON (`Content-Encoding: gzip`). Request bodies are limited to 64 MiB after decompression. Requests that exceed this limit return HTTP 413. **How it works:** 1. Send sorted records from your external source 2. Server upserts records that exist in your batch 3. Server deletes Antfly records in the key range that are absent from your batch 4. If stopped at shard boundary, use next_cursor for next request **WARNING:** Not safe for concurrent operations with overlapping key ranges.
+pub const LinearMergeRequest = struct {
+    /// Map of resource ID to resource object: {"resource_id_1": {...}, "resource_id_2": {...}} Requirements: - The server processes keys in lexicographic order - Use consistent key naming (e.g., all start with same prefix) This format avoids duplicate IDs and matches Antfly's batch write interface.
+    records: std.json.Value,
+    /// ID of last record from previous merge request. - First request: Use empty string "" - Subsequent requests: Use next_cursor from previous response - Defines lower bound of key range to process This enables pagination for large datasets.
+    last_merged_id: ?[]const u8 = null,
+    /// If true, returns what would be deleted without making changes. Use cases: - Validate sync behavior before committing - Check which records will be removed - Test key range boundaries Response includes deleted_ids array when dry_run=true.
+    dry_run: ?bool = null,
+    sync_level: ?SyncLevel = null,
+};
+
+pub const LinearMergeResult = struct {
+    status: LinearMergePageStatus,
+    /// Records inserted or updated (0 if dry_run=true)
+    upserted: i64,
+    /// Records skipped because content hash matched (unchanged)
+    skipped: i64,
+    /// Records deleted or would be deleted (if dry_run=true)
+    deleted: i64,
+    /// IDs that were deleted (or would be deleted if dry_run=true). Only included if dry_run=true.
+    deleted_ids: ?[]const []const u8 = null,
+    failed: ?[]const FailedOperation = null,
+    /// ID of last record in this batch (use for next request)
+    next_cursor: []const u8,
+    key_range: ?KeyRange = null,
+    /// Total number of keys scanned from Antfly during range query
+    keys_scanned: ?i64 = null,
+    /// Additional information (e.g., "stopped at shard boundary", "dry run - no changes made")
+    message: ?[]const u8 = null,
+    took: ?i64 = null,
+};
+
+/// Configuration for Linkup Search API. Linkup is useful for web search, source retrieval, and structured research workflows. **Setup:** 1. Sign up at https://linkup.so 2. Get API key from dashboard **Docs:** https://docs.linkup.so
+pub const LinkupSearchConfig = struct {
+    provider: WebSearchProvider,
+    /// Provider API key or secret reference. Prefer named web_search connections for production use.
+    api_key: ?[]const u8 = null,
+    /// Provider endpoint override when applicable
+    endpoint: ?[]const u8 = null,
+    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+    location: ?[]const u8 = null,
+    /// Agent Search data store ID for provider vertex.
+    data_store: ?[]const u8 = null,
+    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
+    serving_config: ?[]const u8 = null,
+    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+    credentials_path: ?[]const u8 = null,
+    /// Maximum number of search results to return
+    max_results: ?i64 = null,
+    /// Request timeout in milliseconds
+    timeout_ms: ?i64 = null,
+    /// Enable safe search filtering
+    safe_search: ?bool = null,
+    /// Preferred language for results (e.g., 'en', 'es', 'fr')
+    language: ?[]const u8 = null,
+    /// Preferred region for results (e.g., 'us', 'uk', 'de')
+    region: ?[]const u8 = null,
+    /// Ask the provider to return extracted page content when supported
+    include_content: ?bool = null,
+    /// Ask the provider to return highlighted passages when supported
+    include_highlights: ?bool = null,
+    /// Search depth to request from Linkup
+    depth: ?[]const u8 = null,
+    /// Linkup response shape to request
+    output_type: ?[]const u8 = null,
+};
+
 /// Compact LSM backend operational status. Detailed low-level counters are available through metrics.
 pub const LsmStorageStatus = struct {
     run_count: ?i64 = null,
@@ -3167,6 +5418,34 @@ pub const LsmStorageStatus = struct {
     direct_bulk_ingest_fallback_below_threshold_count: ?i64 = null,
 };
 
+pub const MatchAllQuery = struct {
+    match_all: std.json.Value,
+    boost: ?Boost = null,
+};
+
+pub const MatchNoneQuery = struct {
+    match_none: std.json.Value,
+    boost: ?Boost = null,
+};
+
+pub const MatchPhraseQuery = struct {
+    match_phrase: []const u8,
+    field: ?[]const u8 = null,
+    analyzer: ?[]const u8 = null,
+    boost: ?Boost = null,
+    fuzziness: ?Fuzziness = null,
+};
+
+pub const MatchQuery = struct {
+    match: []const u8,
+    field: ?[]const u8 = null,
+    analyzer: ?[]const u8 = null,
+    boost: ?Boost = null,
+    prefix_length: ?i32 = null,
+    fuzziness: ?Fuzziness = null,
+    operator: ?[]const u8 = null,
+};
+
 /// Inline binary media content (audio, image, etc.).
 pub const MediaContentPart = struct {
     type: []const u8,
@@ -3174,6 +5453,29 @@ pub const MediaContentPart = struct {
     data: []const u8,
     /// MIME type (audio/wav, image/gif, image/png, etc.).
     mime_type: []const u8,
+};
+
+/// Configuration for result fusion when combining multiple search indexes.
+pub const MergeConfig = struct {
+    strategy: ?MergeStrategy = null,
+    /// Named weights keyed by index name. `full_text` for the full-text search index; embedding index names for vector indexes. Unspecified indexes default to 1.0. Applied in both RRF and RSF.
+    weights: ?std.json.ArrayHashMap(f64) = null,
+    /// RSF normalization window size. Defaults to `limit`.
+    window_size: ?i64 = null,
+    /// RRF k constant (1/(k+rank)). Defaults to 60.0.
+    rank_constant: ?f64 = null,
+};
+
+/// Result merge statistics for hybrid search.
+pub const MergeProfile = struct {
+    /// Merge strategy that was used.
+    strategy: ?MergeStrategy = null,
+    /// Number of hits from full-text search before merge.
+    full_text_hits: ?i64 = null,
+    /// Number of hits from semantic search before merge.
+    semantic_hits: ?i64 = null,
+    /// Time spent merging results in milliseconds.
+    duration_ms: ?i64 = null,
 };
 
 /// Merge strategy for combining results from the semantic_search and full_text_search. rrf: Reciprocal Rank Fusion - combines scores using reciprocal rank formula rsf: Relative Score Fusion - normalizes scores by min/max within a window and combines weighted scores failover: Use full_text_search if embedding generation fails
@@ -3205,12 +5507,52 @@ pub const MergeStrategy = enum {
     }
 };
 
+/// Cross-table batch operations in a single atomic transaction. Groups batch operations by table name. All operations across all tables are committed atomically using distributed 2-phase commit (2PC). **Atomicity**: Either all operations across all tables succeed, or none do. This enables use cases like transferring a record from one table to another, or maintaining referential integrity across tables.
+pub const MultiBatchRequest = struct {
+    /// Map of table names to batch operations for that table. Each entry follows the same format as a single-table BatchRequest.
+    tables: std.json.ArrayHashMap(BatchRequest),
+    sync_level: ?SyncLevel = null,
+};
+
+/// Response for a cross-table batch operation. Contains per-table results.
+pub const MultiBatchResponse = struct {
+    /// Per-table batch results
+    tables: ?std.json.ArrayHashMap(BatchResponse) = null,
+};
+
+pub const MultiMatchBody = struct {
+    query: []const u8,
+    fields: []const []const u8,
+    type: []const u8,
+    boost: ?Boost = null,
+};
+
+pub const MultiMatchQuery = struct {
+    multi_match: MultiMatchBody,
+};
+
+pub const MultiPhraseQuery = struct {
+    terms: []const []const []const u8,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
+    fuzziness: ?Fuzziness = null,
+};
+
 /// Filter nodes during graph traversal using existing query primitives
 pub const NodeFilter = struct {
     /// Antfly query to filter nodes (same syntax as search filter_query)
     filter_query: ?std.json.Value = null,
     /// Filter by key prefix
     filter_prefix: ?[]const u8 = null,
+};
+
+pub const NumericRangeQuery = struct {
+    min: ?f64 = null,
+    max: ?f64 = null,
+    inclusive_min: ?bool = null,
+    inclusive_max: ?bool = null,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
 };
 
 /// Configuration for the Ollama embedding provider. Local embeddings for privacy and offline use. URL via `url` field or `OLLAMA_HOST` env var. **Example Models:** nomic-embed-text (768 dims), mxbai-embed-large (1024 dims), all-minilm (384 dims) **Docs:** https://ollama.com/search?c=embedding
@@ -3315,6 +5657,12 @@ pub const PackageArtifact = struct {
     digest: ?[]const u8 = null,
 };
 
+pub const PackageDependency = struct {
+    name: ExtensionIdentifier,
+    version_requirement: ?[]const u8 = null,
+    optional: ?bool = null,
+};
+
 pub const PackageKind = enum {
     extension,
 
@@ -3337,12 +5685,62 @@ pub const PackageKind = enum {
     }
 };
 
+pub const PackageManifest = struct {
+    manifest_api_version: []const u8,
+    name: ExtensionIdentifier,
+    version: []const u8,
+    kind: PackageKind,
+    description: ?[]const u8 = null,
+    digest: []const u8,
+    antfly_min_version: ?[]const u8 = null,
+    antfly_max_version: ?[]const u8 = null,
+    trusted: ?bool = null,
+    relocatable: ?bool = null,
+    capabilities_requested: ?[]const Capability = null,
+    dependencies: ?[]const PackageDependency = null,
+    artifacts: ?[]const PackageArtifact = null,
+    install: InstallManifest,
+    updates: ?[]const UpdateManifestRef = null,
+};
+
+pub const Path = struct {
+    /// Ordered list of node keys (base64-encoded)
+    nodes: ?[]const []const u8 = null,
+    edges: ?[]const PathEdge = null,
+    total_weight: ?f64 = null,
+    length: ?i64 = null,
+};
+
 pub const PathEdge = struct {
     source: ?[]const u8 = null,
     target: ?[]const u8 = null,
     type: ?[]const u8 = null,
     weight: ?f64 = null,
     metadata: ?std.json.Value = null,
+};
+
+pub const PathFindRequest = struct {
+    /// Source node key (base64-encoded)
+    source: []const u8,
+    /// Target node key (base64-encoded)
+    target: []const u8,
+    /// Filter by specific edge types
+    edge_types: ?[]const []const u8 = null,
+    max_depth: ?i64 = null,
+    weight_mode: ?PathFindWeightMode = null,
+    k: ?i64 = null,
+    min_weight: ?f64 = null,
+    max_weight: ?f64 = null,
+    direction: ?EdgeDirection = null,
+};
+
+pub const PathFindResult = struct {
+    paths: ?[]const Path = null,
+    source: ?[]const u8 = null,
+    target: ?[]const u8 = null,
+    weight_mode: ?PathFindWeightMode = null,
+    paths_found: ?i64 = null,
+    search_time_ms: ?f64 = null,
 };
 
 /// Algorithm for path finding: - min_hops: Shortest path by hop count (breadth-first search, ignores weights) - max_weight: Path with maximum product of edge weights (strongest connection chain) - min_weight: Path with minimum sum of edge weights (lowest cost route)
@@ -3403,6 +5801,46 @@ pub const PathWeightMode = enum {
     }
 };
 
+/// Edge constraints in a pattern step
+pub const PatternEdgeStep = struct {
+    /// Edge types to traverse (empty = any)
+    types: ?[]const []const u8 = null,
+    direction: ?EdgeDirection = null,
+    /// Minimum number of hops (1 = direct edge)
+    min_hops: ?i64 = null,
+    /// Maximum number of hops (>1 = variable-length path)
+    max_hops: ?i64 = null,
+    /// Minimum edge weight filter
+    min_weight: ?f64 = null,
+    /// Maximum edge weight filter
+    max_weight: ?f64 = null,
+};
+
+/// A single match from a pattern query
+pub const PatternMatch = struct {
+    /// Map of alias to matched node
+    bindings: ?std.json.ArrayHashMap(GraphResultNode) = null,
+    /// Edges traversed in this match
+    path: ?[]const PathEdge = null,
+};
+
+/// A step in a graph pattern query
+pub const PatternStep = struct {
+    /// Name for this node (reuse alias for cycle detection)
+    alias: ?[]const u8 = null,
+    /// Filter constraints for nodes at this step
+    node_filter: ?NodeFilter = null,
+    /// Edge to traverse to reach this step (null for first step)
+    edge: ?PatternEdgeStep = null,
+};
+
+pub const Permission = struct {
+    /// Resource name (e.g., table name, target username, or '*' for global).
+    resource: []const u8,
+    resource_type: ResourceType,
+    type: PermissionType,
+};
+
 /// Type of permission.
 pub const PermissionType = enum {
     read,
@@ -3432,6 +5870,19 @@ pub const PermissionType = enum {
     }
 };
 
+pub const PhraseQuery = struct {
+    terms: []const []const u8,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
+    fuzziness: ?Fuzziness = null,
+};
+
+pub const PrefixQuery = struct {
+    prefix: []const u8,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
+};
+
 /// Statistics from token-based document pruning
 pub const PruneStats = struct {
     /// Number of resources kept after pruning
@@ -3456,4145 +5907,6 @@ pub const Pruner = struct {
     require_multi_index: ?bool = null,
     /// Keep results within N standard deviations below the mean score. For example, 1.0 keeps results with score >= mean - 1*stddev. Useful for statistical outlier detection in result sets.
     std_dev_threshold: ?f64 = null,
-};
-
-/// A single query result hit
-pub const QueryHit = struct {
-    /// ID of the record.
-    _id: []const u8,
-    /// Relevance score of the hit.
-    _score: f32,
-    /// Scores partitioned by index when using RRF search.
-    _index_scores: ?std.json.Value = null,
-    _source: ?std.json.Value = null,
-    /// Stable ancestry envelope for derived document hierarchy hits. Present when the hit is a derived unit/chunk/embedding artifact or when a source-level rollup includes child chunks. Standard fields include `level`, `parent_doc_key`, optional `parent_unit_id`, `artifact`, `chunks`, and `ancestors` with response-local or requested DB-backed source/unit context when available.
-    hierarchy: ?std.json.Value = null,
-    /// Sort key values for this hit. Pass as search_after or search_before to paginate to the next/previous page. Values preserve their JSON types. Present for ordered result pages, including cursor-only requests whose effective order is `_id` ascending.
-    _sort: ?[]const std.json.Value = null,
-};
-
-/// Total hit count metadata.
-pub const QueryHitsTotal = struct {
-    /// Hit count value.
-    value: i64,
-    /// Whether value is exact or a lower bound.
-    relation: []const u8,
-};
-
-/// Strategy for query transformation and retrieval: - simple: Direct query with multi-phrase expansion. Best for straightforward factual queries. - decompose: Break complex queries into sub-questions, retrieve for each. Best for multi-part questions. - step_back: Generate broader background query first, then specific query. Best for questions needing context. - hyde: Generate hypothetical answer document, embed that for retrieval. Best for abstract/conceptual questions.
-pub const QueryStrategy = enum {
-    simple,
-    decompose,
-    step_back,
-    hyde,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .simple => "simple",
-            .decompose => "decompose",
-            .step_back => "step_back",
-            .hyde => "hyde",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "simple", .simple },
-            .{ "decompose", .decompose },
-            .{ "step_back", .step_back },
-            .{ "hyde", .hyde },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Repair subsystem to inspect or run.
-pub const RepairTarget = enum {
-    artifact,
-    index,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .artifact => "artifact",
-            .index => "index",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "artifact", .artifact },
-            .{ "index", .index },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Action hint for this replication source when remediation is recommended. Present only in GET table detail responses.
-pub const ReplicationSourceActionHint = struct {
-    /// Recommended action (e.g., "reseed_exact_cutover").
-    action: ?[]const u8 = null,
-    /// Human-readable reason for the recommendation.
-    reason: ?[]const u8 = null,
-    /// API path to trigger a reseed exact cutover, if applicable.
-    reseed_exact_cutover_path: ?[]const u8 = null,
-};
-
-/// Runtime status of this replication source. Present only in GET table detail responses, not in create/update requests.
-pub const ReplicationSourceStatus = struct {
-    source_kind: ?[]const u8 = null,
-    external_table: ?[]const u8 = null,
-    cutover_mode: ?[]const u8 = null,
-    slot_name: ?[]const u8 = null,
-    publication_name: ?[]const u8 = null,
-    phase: ?[]const u8 = null,
-    checkpoint: ?[]const u8 = null,
-    snapshot_offset: ?i64 = null,
-    prepared_checkpoint: ?[]const u8 = null,
-    stream_checkpoint: ?[]const u8 = null,
-    last_error: ?[]const u8 = null,
-    failure_class: ?[]const u8 = null,
-    lag_records: ?i64 = null,
-    lag_millis: ?i64 = null,
-    consecutive_failures: ?i64 = null,
-    last_source_commit_at_ms: ?i64 = null,
-    last_success_at_ms: ?i64 = null,
-    last_change_applied_at_ms: ?i64 = null,
-    updated_at_ms: ?i64 = null,
-};
-
-pub const ReplicationTransformOp = struct {
-    /// Transform operation. Standard ops: `$set`, `$unset`, `$inc`, `$push`, `$pull`, `$addToSet`, `$pop`, `$mul`, `$min`, `$max`, `$currentDate`, `$rename`. Replication-specific: `$merge` (flatten JSONB into top-level fields), `$delete_document` (delete entire Antfly doc, `on_delete` only).
-    op: []const u8,
-    /// Antfly document field path. Required for `$set`, `$unset`, etc.
-    path: ?[]const u8 = null,
-    /// Value for the operation. Can be a literal (string, number, boolean) or a `{{column}}` reference to a PG column value. Use `{{col.key}}` to navigate into decoded JSONB columns.
-    value: ?std.json.Value = null,
-};
-
-/// Reranking execution statistics.
-pub const RerankerProfile = struct {
-    /// Reranker model that was used.
-    model: ?[]const u8 = null,
-    /// Number of documents that were reranked.
-    documents_reranked: ?i64 = null,
-    /// Time spent reranking in milliseconds.
-    duration_ms: ?i64 = null,
-};
-
-/// The reranking provider to use.
-pub const RerankerProvider = enum {
-    antfly,
-    ollama,
-    cohere,
-    vertex,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .antfly => "antfly",
-            .ollama => "ollama",
-            .cohere => "cohere",
-            .vertex => "vertex",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "antfly", .antfly },
-            .{ "ollama", .ollama },
-            .{ "cohere", .cohere },
-            .{ "vertex", .vertex },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Type of the resource, e.g., table, user, or global ('*').
-pub const ResourceType = enum {
-    table,
-    user,
-    @"*",
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .table => "table",
-            .user => "user",
-            .@"*" => "*",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "table", .table },
-            .{ "user", .user },
-            .{ "*", .@"*" },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Strategy for document retrieval: - semantic: Vector similarity search using embeddings - bm25: Full-text search using BM25 scoring - metadata: Structured query on document fields - tree: Iterative tree navigation with summarization - graph: Relationship-based traversal - hybrid: Combine multiple strategies with RRF or rerank
-pub const RetrievalStrategy = enum {
-    semantic,
-    bm25,
-    metadata,
-    tree,
-    graph,
-    hybrid,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .semantic => "semantic",
-            .bm25 => "bm25",
-            .metadata => "metadata",
-            .tree => "tree",
-            .graph => "graph",
-            .hybrid => "hybrid",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "semantic", .semantic },
-            .{ "bm25", .bm25 },
-            .{ "metadata", .metadata },
-            .{ "tree", .tree },
-            .{ "graph", .graph },
-            .{ "hybrid", .hybrid },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Retry configuration for generator calls
-pub const RetryConfig = struct {
-    /// Maximum number of retry attempts
-    max_attempts: ?i64 = null,
-    /// Initial backoff delay in milliseconds
-    initial_backoff_ms: ?i64 = null,
-    /// Multiplier for exponential backoff
-    backoff_multiplier: ?f32 = null,
-    /// Maximum backoff delay in milliseconds
-    max_backoff_ms: ?i64 = null,
-};
-
-pub const RoleAssignment = struct {
-    /// Role or group subject to assign, usually prefixed with role: or group:.
-    role: []const u8,
-};
-
-/// Classification of query type: question (specific factual query) or search (exploratory query)
-pub const RouteType = enum {
-    question,
-    search,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .question => "question",
-            .search => "search",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "question", .question },
-            .{ "search", .search },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// A row filter policy for a user on a specific table.
-pub const RowFilterEntry = struct {
-    /// Table name (or '*' for all tables).
-    table: []const u8,
-    /// Antfly query JSON that documents must match to be visible.
-    filter: std.json.ArrayHashMap(std.json.Value),
-};
-
-/// Emitted when an error occurs during retrieval
-pub const SSEError = struct {
-    /// Error message
-    @"error": []const u8,
-};
-
-/// SSE event types emitted by the retrieval agent streaming endpoint
-pub const SSEEvent = enum {
-    step_started,
-    step_progress,
-    step_completed,
-    classification,
-    reasoning,
-    generation,
-    followup,
-    hit,
-    tool_mode,
-    eval,
-    @"error",
-    done,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .step_started => "step_started",
-            .step_progress => "step_progress",
-            .step_completed => "step_completed",
-            .classification => "classification",
-            .reasoning => "reasoning",
-            .generation => "generation",
-            .followup => "followup",
-            .hit => "hit",
-            .tool_mode => "tool_mode",
-            .eval => "eval",
-            .@"error" => "error",
-            .done => "done",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "step_started", .step_started },
-            .{ "step_progress", .step_progress },
-            .{ "step_completed", .step_completed },
-            .{ "classification", .classification },
-            .{ "reasoning", .reasoning },
-            .{ "generation", .generation },
-            .{ "followup", .followup },
-            .{ "hit", .hit },
-            .{ "tool_mode", .tool_mode },
-            .{ "eval", .eval },
-            .{ "error", .@"error" },
-            .{ "done", .done },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Emitted to report progress within a running step. The `name` field identifies which step this progress belongs to. Additional properties vary by step type (e.g., tree_search includes depth, num_nodes, sufficient, etc.).
-pub const SSEStepProgress = struct {
-    /// Name of the step this progress belongs to
-    name: []const u8,
-};
-
-/// Emitted when the agent selects a tool-calling mode
-pub const SSEToolMode = struct {
-    /// Tool calling mode selected
-    mode: []const u8,
-    /// Number of tools available (present for native mode)
-    tools_count: ?i64 = null,
-};
-
-/// Source of the secret configuration
-pub const SecretStatus = enum {
-    configured_keystore,
-    configured_env,
-    configured_both,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .configured_keystore => "configured_keystore",
-            .configured_env => "configured_env",
-            .configured_both => "configured_both",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "configured_keystore", .configured_keystore },
-            .{ "configured_env", .configured_env },
-            .{ "configured_both", .configured_both },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Non-secret status for the local secrets file store, when one is available.
-pub const SecretStoreStatus = struct {
-    /// Whether Antfly is serving a last-known-good secrets snapshot after a failed refresh.
-    stale: ?bool = null,
-};
-
-pub const SecretWriteRequest = struct {
-    /// Secret value (stored encrypted, never returned)
-    value: []const u8,
-};
-
-/// Mode for semantic query generation: - rewrite: Transform query into expanded keywords/concepts optimized for vector search (Level 2 optimization) - hypothetical: Generate a hypothetical answer that would appear in relevant documents (HyDE - Level 3 optimization)
-pub const SemanticQueryMode = enum {
-    rewrite,
-    hypothetical,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .rewrite => "rewrite",
-            .hypothetical => "hypothetical",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "rewrite", .rewrite },
-            .{ "hypothetical", .hypothetical },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Shard-level execution statistics.
-pub const ShardsProfile = struct {
-    /// Total shards targeted by the query.
-    total: ?i64 = null,
-    /// Shards that returned results successfully.
-    successful: ?i64 = null,
-    /// Shards that failed during execution.
-    failed: ?i64 = null,
-};
-
-/// Algorithm for computing term significance: - jlh: JLH algorithm (default) - mutual_information: Mutual Information - chi_squared: Chi-squared test - percentage: Simple percentage comparison
-pub const SignificanceAlgorithm = enum {
-    jlh,
-    mutual_information,
-    chi_squared,
-    percentage,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .jlh => "jlh",
-            .mutual_information => "mutual_information",
-            .chi_squared => "chi_squared",
-            .percentage => "percentage",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "jlh", .jlh },
-            .{ "mutual_information", .mutual_information },
-            .{ "chi_squared", .chi_squared },
-            .{ "percentage", .percentage },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Sort direction for a single field. true = descending, false = ascending.
-pub const SortDirection = bool;
-
-/// A single sort field with direction.
-pub const SortField = struct {
-    /// The field name to sort by.
-    field: []const u8,
-    /// Sort direction. true = descending, false = ascending.
-    desc: ?bool = null,
-};
-
-pub const SuccessMessage = struct {
-    message: ?[]const u8 = null,
-};
-
-/// Synchronization level for batch operations: - "propose": Wait for Raft proposal acceptance (fastest, default) - "write": Wait for Pebble KV write - "full_text": Wait for full-text index WAL write - "enrichments": Pre-compute enrichments before Raft proposal (synchronous enrichment generation) - "full_index": Wait for all index writes to complete (full-text + enrichments + vector indexes)
-pub const SyncLevel = enum {
-    propose,
-    write,
-    full_text,
-    enrichments,
-    full_index,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .propose => "propose",
-            .write => "write",
-            .full_text => "full_text",
-            .enrichments => "enrichments",
-            .full_index => "full_index",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "propose", .propose },
-            .{ "write", .write },
-            .{ "full_text", .full_text },
-            .{ "enrichments", .enrichments },
-            .{ "full_index", .full_index },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-pub const TableBackupStatus = struct {
-    /// Table name
-    name: []const u8,
-    /// Backup status for this table
-    status: []const u8,
-    /// Error message if backup failed
-    @"error": ?[]const u8 = null,
-};
-
-/// Result of one bounded table repair pass.
-pub const TableRepairRunResult = struct {
-    /// Number of repair records attempted by this pass.
-    scanned: i64,
-    /// Number of table groups touched by this bounded repair pass.
-    groups_scanned: i64,
-    /// Number of artifacts whose source was reprocessed.
-    reprocessed: i64,
-    /// Number of repair records cleared because the artifact became readable.
-    repaired: i64,
-    /// Number of repair records whose source document no longer exists.
-    missing_source_docs: i64,
-    /// Number of supported repair attempts that failed.
-    failed: i64,
-    /// Number of repair records skipped because no automated repair exists for the selected target.
-    unsupported: i64,
-    /// Number of attempted repair records that remained queued after this pass.
-    unresolved: i64,
-    /// Number of selected repair records or indexes skipped because another repair pass already owns them.
-    in_progress: i64,
-    /// Number of indexes rebuilt by this pass when target is index.
-    indexes_rebuilt: i64,
-    /// Number of selected indexes that were already degraded or quarantined before repair.
-    indexes_degraded: i64,
-    /// Effective repair limit.
-    limit: i64,
-    /// Opaque cursor for the next artifact repair pass when has_more is true. Index repair currently repairs one named index per request and does not return a continuation cursor.
-    next_cursor: ?[]const u8 = null,
-    /// Whether another repair scan page is available via next_cursor.
-    has_more: bool,
-    /// Whether repair debt remains after this bounded pass. If true and next_cursor is absent, rerun repair from the beginning after addressing failed or unsupported records.
-    debt_remaining: bool,
-};
-
-pub const TableRestoreStatus = struct {
-    /// Table name
-    name: []const u8,
-    /// Restore status for this table
-    status: []const u8,
-    /// Error message if restore failed
-    @"error": ?[]const u8 = null,
-};
-
-/// Options specific to text chunking.
-pub const TextChunkOptions = struct {
-    /// Target number of tokens per chunk.
-    target_tokens: ?i64 = null,
-    /// Number of tokens to overlap between consecutive chunks. Helps maintain context across chunk boundaries. Only used by fixed-size chunkers.
-    overlap_tokens: ?i64 = null,
-    /// Separator string for splitting (e.g., '\n\n' for paragraphs). Only used by fixed-size chunkers.
-    separator: ?[]const u8 = null,
-};
-
-/// Text content for multimodal input.
-pub const TextContentPart = struct {
-    type: []const u8,
-    /// Text content.
-    text: []const u8,
-};
-
-/// The function called by a model tool call.
-pub const ToolCallFunction = struct {
-    /// Function name.
-    name: []const u8,
-    /// JSON string of function arguments.
-    arguments: []const u8,
-};
-
-pub const TransactionBeginResponse = struct {
-    transaction_id: []const u8,
-    begin_timestamp: i64,
-    sync_level: []const u8,
-};
-
-/// A key that was read as part of an OCC transaction, along with the version observed at read time. Used to detect conflicts at commit time.
-pub const TransactionReadItem = struct {
-    /// Table name the key belongs to
-    table: []const u8,
-    /// Document key that was read
-    key: []const u8,
-    /// Version token observed at read time (from X-Antfly-Version header). Use "0" to assert the key did not exist at read time.
-    version: []const u8,
-};
-
-pub const TransactionSavepointResponse = struct {
-    status: []const u8,
-    transaction_id: []const u8,
-    savepoint_id: i64,
-};
-
-pub const TransactionSessionCleanupResponse = struct {
-    removed: ?i64 = null,
-    cutoff_ns: ?i64 = null,
-};
-
-pub const TransactionSessionReadSnapshot = struct {
-    table: ?[]const u8 = null,
-    key: ?[]const u8 = null,
-    version: ?i64 = null,
-    document: ?std.json.Value = null,
-};
-
-pub const TransactionSessionStatus = struct {
-    transaction_id: []const u8,
-    owner_node_id: i64,
-    begin_timestamp: i64,
-    last_touched_timestamp: i64,
-    lease_expires_at: i64,
-    lease_state: []const u8,
-    sync_level: []const u8,
-    staged_table_count: i64,
-    staged_read_count: i64,
-    staged_write_count: i64,
-    staged_delete_count: i64,
-    read_snapshot_count: i64,
-    savepoint_count: i64,
-    savepoint_limit: ?i64 = null,
-    remaining_savepoints: ?i64 = null,
-    durable: bool,
-};
-
-pub const TransactionSessionTableDetail = struct {
-    table: ?[]const u8 = null,
-    staged_read_count: ?i64 = null,
-    staged_write_count: ?i64 = null,
-    staged_delete_count: ?i64 = null,
-    staged_predicate_count: ?i64 = null,
-};
-
-pub const TransactionStageDeleteRequest = struct {
-    table: []const u8,
-    key: []const u8,
-};
-
-pub const TransactionStageReadRequest = struct {
-    table: []const u8,
-    key: []const u8,
-    version: []const u8,
-};
-
-pub const TransactionStageReadSnapshot = struct {
-    table: []const u8,
-    key: []const u8,
-    version: []const u8,
-    document: ?std.json.Value,
-};
-
-pub const TransactionStageWriteRequest = struct {
-    table: []const u8,
-    key: []const u8,
-    document: std.json.Value,
-};
-
-pub const TransactionStatusResponse = struct {
-    status: []const u8,
-    transaction_id: []const u8,
-};
-
-/// MongoDB-style update operator
-pub const TransformOpType = enum {
-    @"$set",
-    @"$set_on_insert",
-    @"$unset",
-    @"$inc",
-    @"$push",
-    @"$pull",
-    @"$add_to_set",
-    @"$pop",
-    @"$mul",
-    @"$min",
-    @"$max",
-    @"$current_date",
-    @"$rename",
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .@"$set" => "$set",
-            .@"$set_on_insert" => "$setOnInsert",
-            .@"$unset" => "$unset",
-            .@"$inc" => "$inc",
-            .@"$push" => "$push",
-            .@"$pull" => "$pull",
-            .@"$add_to_set" => "$addToSet",
-            .@"$pop" => "$pop",
-            .@"$mul" => "$mul",
-            .@"$min" => "$min",
-            .@"$max" => "$max",
-            .@"$current_date" => "$currentDate",
-            .@"$rename" => "$rename",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "$set", .@"$set" },
-            .{ "$setOnInsert", .@"$set_on_insert" },
-            .{ "$unset", .@"$unset" },
-            .{ "$inc", .@"$inc" },
-            .{ "$push", .@"$push" },
-            .{ "$pull", .@"$pull" },
-            .{ "$addToSet", .@"$add_to_set" },
-            .{ "$pop", .@"$pop" },
-            .{ "$mul", .@"$mul" },
-            .{ "$min", .@"$min" },
-            .{ "$max", .@"$max" },
-            .{ "$currentDate", .@"$current_date" },
-            .{ "$rename", .@"$rename" },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Configuration for tree search strategy. Tree search navigates hierarchical document structures by evaluating summaries at each level.
-pub const TreeSearchConfig = struct {
-    /// Name of the graph index to use for tree navigation
-    index: []const u8,
-    /// Starting nodes for tree search: - "$roots" - Query for root nodes (nodes with no parents) - Comma-separated explicit node IDs When omitted and combined with a QueryRequest in a RetrievalQueryRequest, the query results are used as start nodes.
-    start_nodes: ?[]const u8 = null,
-    /// Maximum depth to traverse in the tree
-    max_depth: ?i64 = null,
-    /// Number of branches to explore at each level
-    beam_width: ?i64 = null,
-};
-
-pub const UpdateExtensionRequest = struct {
-    target_version: ?[]const u8 = null,
-    dry_run: ?bool = null,
-};
-
-pub const UpdateManifestRef = struct {
-    from_version: []const u8,
-    to_version: []const u8,
-    path: []const u8,
-    digest: ?[]const u8 = null,
-};
-
-pub const UpdatePasswordRequest = struct {
-    new_password: []const u8,
-};
-
-pub const User = struct {
-    username: []const u8,
-    /// Base64 encoded password hash. Exposing this is a security risk.
-    password_hash: []const u8,
-    /// Server-side auth metadata available to stored row-filter policies through $auth metadata paths.
-    metadata: ?std.json.ArrayHashMap(std.json.Value) = null,
-};
-
-/// Options for Voice Activity Detection (VAD) based audio segmentation.
-pub const VADOptions = struct {
-    /// Minimum silence duration (ms) to split speech segments. Gaps shorter than this are merged. Higher values produce longer, fewer segments. Default: 300.
-    min_silence_duration_ms: ?i64 = null,
-    /// Minimum speech duration (ms) for a segment to be kept. Shorter segments are discarded. Default: 250.
-    min_speech_duration_ms: ?i64 = null,
-    /// Padding (ms) added before and after detected speech. Default: 30.
-    speech_pad_ms: ?i64 = null,
-    /// Maximum segment duration (ms). Segments longer than this are split. Useful for Whisper-compatible chunking. Default: 30000.
-    max_segment_duration_ms: ?i64 = null,
-};
-
-/// Configuration for Google Cloud Vertex AI embedding models (enterprise-grade). Uses Application Default Credentials (ADC) for authentication. Requires IAM role `roles/aiplatform.user`. **Example Models:** gemini-embedding-001 (default, 3072 dims), multimodalembedding (images/audio/video) **Docs:** https://cloud.google.com/vertex-ai/generative-ai/docs/embeddings/get-text-embeddings
-pub const VertexEmbedderConfig = struct {
-    /// The name of the Vertex AI embedding model to use.
-    model: []const u8,
-    /// Google Cloud project ID. Can also be set via GOOGLE_CLOUD_PROJECT environment variable.
-    project_id: ?[]const u8 = null,
-    /// Google Cloud region for Vertex AI API (e.g., 'us-central1', 'europe-west1'). Can also be set via GOOGLE_CLOUD_LOCATION. Defaults to 'us-central1'.
-    location: ?[]const u8 = null,
-    /// Path to service account JSON key file. Alternative to ADC for non-GCP environments.
-    credentials_path: ?[]const u8 = null,
-    /// The dimension of the embedding vector (768, 1536, or 3072 for gemini-embedding-001; 128-1408 for multimodalembedding).
-    dimension: ?i64 = null,
-};
-
-/// Configuration for Google Cloud Vertex AI generative models.
-pub const VertexGeneratorConfig = struct {
-    /// The name of the Vertex AI model to use.
-    model: []const u8,
-    /// Google Cloud project ID.
-    project_id: ?[]const u8 = null,
-    /// Google Cloud region for Vertex AI API.
-    location: ?[]const u8 = null,
-    /// Path to service account JSON key file.
-    credentials_path: ?[]const u8 = null,
-    /// Controls randomness in generation (0.0-2.0).
-    temperature: ?f32 = null,
-    /// Maximum number of tokens to generate in the response.
-    max_tokens: ?i64 = null,
-    /// Nucleus sampling parameter (0.0-1.0).
-    top_p: ?f32 = null,
-    /// Top-k sampling parameter.
-    top_k: ?i64 = null,
-};
-
-/// Configuration for the Google Vertex AI Ranking API. Uses Application Default Credentials (ADC) or explicit credentials path. **Prerequisites:** - Enable Discovery Engine API: `gcloud services enable discoveryengine.googleapis.com` - Grant IAM role: `roles/discoveryengine.admin` (includes `discoveryengine.rankingConfigs.rank` permission) **Models:** semantic-ranker-default@latest (default), semantic-ranker-fast-004 **Docs:** https://cloud.google.com/generative-ai-app-builder/docs/ranking **IAM:** https://cloud.google.com/generative-ai-app-builder/docs/access-control
-pub const VertexRerankerConfig = struct {
-    /// The ranking model to use.
-    model: []const u8,
-    /// Google Cloud project ID. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
-    project_id: ?[]const u8 = null,
-    /// Path to service account JSON file. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS environment variable.
-    credentials_path: ?[]const u8 = null,
-    /// Maximum number of records to return. If not specified, returns all documents with scores.
-    top_n: ?i64 = null,
-};
-
-pub const WebSearchConnection = struct {
-    /// Provider-specific service flavor, such as agent_search for provider vertex.
-    service: ?[]const u8 = null,
-    /// Maximum ranked results this connection is configured to return.
-    max_results: ?i64 = null,
-    /// Provider request timeout in milliseconds.
-    timeout_ms: ?i64 = null,
-    /// Whether safe-search filtering is requested.
-    safe_search: ?bool = null,
-    /// Preferred result language.
-    language: ?[]const u8 = null,
-    /// Preferred result region.
-    region: ?[]const u8 = null,
-    /// Whether extracted content is requested when supported.
-    include_content: ?bool = null,
-    /// Whether highlighted passages are requested when supported.
-    include_highlights: ?bool = null,
-    /// Provider endpoint override when configured.
-    endpoint: ?[]const u8 = null,
-    /// Google Cloud project for provider vertex.
-    project_id: ?[]const u8 = null,
-    /// Google Cloud location for provider vertex.
-    location: ?[]const u8 = null,
-    /// Agent Search data store ID for provider vertex.
-    data_store: ?[]const u8 = null,
-    /// Agent Search serving config ID for provider vertex.
-    serving_config: ?[]const u8 = null,
-    /// Domain allowlist when configured.
-    include_domains: ?[]const []const u8 = null,
-    /// Domain denylist when configured.
-    exclude_domains: ?[]const []const u8 = null,
-    /// True when required credentials/config are present. Secret values are never returned.
-    configured: ?bool = null,
-};
-
-/// The web search provider to use. - **exa**: Exa neural/semantic web search API - **serper**: Serper.dev Google Search API (simpler setup) - **tavily**: Tavily AI Search API (optimized for RAG) - **brave**: Brave Search API - **you**: You.com Search API for agent and research workflows - **linkup**: Linkup Search API for web search and content retrieval - **vertex**: Google Cloud Agent Search / Vertex AI Search
-pub const WebSearchProvider = enum {
-    exa,
-    serper,
-    tavily,
-    brave,
-    you,
-    linkup,
-    vertex,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .exa => "exa",
-            .serper => "serper",
-            .tavily => "tavily",
-            .brave => "brave",
-            .you => "you",
-            .linkup => "linkup",
-            .vertex => "vertex",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "exa", .exa },
-            .{ "serper", .serper },
-            .{ "tavily", .tavily },
-            .{ "brave", .brave },
-            .{ "you", .you },
-            .{ "linkup", .linkup },
-            .{ "vertex", .vertex },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-pub const AgentQuestion = struct {
-    /// Stable question identifier for client-carried continuation
-    id: []const u8,
-    kind: AgentQuestionKind,
-    /// The clarifying question to ask the user
-    question: []const u8,
-    /// Why clarification is needed
-    reason: ?[]const u8 = null,
-    /// Optional list of choices for the user
-    options: ?[]const []const u8 = null,
-    /// Suggested default answer when the server has a preferred choice
-    default_answer: ?[]const u8 = null,
-    /// High-level result areas affected by this decision
-    affects: ?[]const []const u8 = null,
-};
-
-/// Emitted when a pipeline step begins execution
-pub const SSEStepStarted = struct {
-    /// Unique step ID for correlating with step_completed
-    id: []const u8,
-    kind: ?AgentStepKind = null,
-    /// Stable step name used for correlation across JSON and SSE surfaces
-    name: []const u8,
-    /// Human-readable description of the action being taken
-    action: []const u8,
-};
-
-/// A step in the shared bounded-agent execution trace
-pub const AgentStep = struct {
-    /// Unique step ID for correlation and tracing
-    id: ?[]const u8 = null,
-    kind: ?AgentStepKind = null,
-    /// Stable step name used for correlation across JSON and SSE surfaces
-    name: []const u8,
-    /// What action was taken
-    action: []const u8,
-    status: ?AgentStepStatus = null,
-    /// Error details when status is "error"
-    error_message: ?[]const u8 = null,
-    /// Server-side execution time in milliseconds
-    duration_ms: ?i64 = null,
-    /// Additional details about the step
-    details: ?std.json.Value = null,
-};
-
-/// Public field capability derived from Antfly schema mappings and observed dynamic field metadata.
-pub const FieldCapability = struct {
-    /// Mapping or dynamic-template name, when applicable.
-    name: ?[]const u8 = null,
-    /// Concrete query field path when known. Pattern-only dynamic templates may omit this.
-    field: ?[]const u8 = null,
-    /// Dynamic-template path_match pattern, when applicable.
-    path_pattern: ?[]const u8 = null,
-    /// Dynamic-template match pattern, when applicable.
-    field_pattern: ?[]const u8 = null,
-    /// Dynamic-template match_mapping_type, when applicable.
-    match_mapping_type: ?[]const u8 = null,
-    /// Physical emitted field name for schema-derived text fields, when different from the logical path.
-    emitted_name: ?[]const u8 = null,
-    /// Document schema that produced this capability, when applicable.
-    document_schema: ?[]const u8 = null,
-    type: AntflyType,
-    /// Query modes supported by this concrete field variant. These modes are derived from Antfly field types such as `text`, `keyword`, `datetime`, `geopoint`, and `search_as_you_type`; they are not separate schema toggles.
-    query_modes: []const []const u8,
-    sortable: bool,
-    /// Capability source, such as reserved, document_schema, dynamic_template, or observed_dynamic.
-    provenance: []const u8,
-    /// Current missing/null handling policy for this field.
-    missing_null_policy: []const u8,
-    /// Operational lifecycle state for exact sort use. Queryable fields are accepted by public exact sort; accelerated fields are queryable and participate in the configured index_sort tuple.
-    sort_lifecycle_state: []const u8,
-    /// Analyzer name for text/searchable fields, when applicable.
-    analyzer: ?[]const u8 = null,
-    /// Zero-based position in the table index_sort tuple when this field participates.
-    index_sort_position: ?i64 = null,
-    /// Sort direction in the table index_sort tuple when this field participates.
-    index_sort_order: ?[]const u8 = null,
-};
-
-/// Field mapping to apply when a dynamic template matches
-pub const TemplateFieldMapping = struct {
-    type: ?AntflyType2 = null,
-    /// Analyzer name (e.g., "standard", "keyword", "en", "html_analyzer"). Used for text fields to control tokenization and normalization.
-    analyzer: ?[]const u8 = null,
-    /// Whether to index the field (default true)
-    index: ?bool = null,
-    /// Whether to store the field value (default false)
-    store: ?bool = null,
-    /// Whether to include in the _all field for cross-field search
-    include_in_all: ?bool = null,
-    /// Whether this scalar field can be used in order_by. When true, Antfly derives the internal typed doc-value structures required for exact sorting; users should not configure doc_values directly.
-    sortable: ?bool = null,
-    /// Missing/null sort policy for this mapped field. The current production policy rejects missing or null native sort values so sorted cursors remain replayable JSON scalar tuples.
-    missing_null_policy: ?[]const u8 = null,
-};
-
-/// Durable table repair debt. Artifact targets include exact source and artifact identifiers; index targets include the affected index and repair status.
-pub const TableRepairIssue = struct {
-    artifact_kind: ArtifactRepairKind,
-    /// Index whose replay or derived state observed the artifact problem.
-    index_name: []const u8,
-    /// Source or derived document key whose artifact is missing or unreadable.
-    doc_key: []const u8,
-    /// Parent source document key for chunk-derived artifacts.
-    parent_doc_key: ?[]const u8 = null,
-    /// Unit identifier for unit-scoped artifacts, when applicable.
-    unit_id: ?[]const u8 = null,
-    /// Source artifact stream used to produce this artifact, when applicable.
-    source_artifact_name: ?[]const u8 = null,
-    /// Derived artifact name that must be reprocessed or made readable.
-    artifact_name: []const u8,
-    /// Hex-encoded internal artifact storage key, when known.
-    artifact_key: ?[]const u8 = null,
-    /// Chunk ordinal for chunk-derived artifacts.
-    chunk_id: ?i64 = null,
-    /// Whether this artifact kind currently has an automated repair reprocessor.
-    repairable: bool,
-    /// Stable reason code when repairable is false.
-    unsupported_reason: ?[]const u8 = null,
-    /// Derived replay sequence that observed the issue.
-    sequence: i64,
-    reason: ArtifactRepairReason,
-    /// Number of repair attempts made for this issue.
-    attempts: i64,
-    /// Monotonic timestamp when this issue was first recorded.
-    first_seen_ns: i64,
-    /// Monotonic timestamp when this issue was last observed or attempted.
-    last_seen_ns: i64,
-    /// Last stable repair error code, when a repair attempt failed.
-    last_error: ?[]const u8 = null,
-};
-
-pub const BackupListResponse = struct {
-    /// List of available backups
-    backups: []const BackupInfo,
-};
-
-pub const RestoreRequest = struct {
-    /// Unique identifier for this backup. Used to reference the backup for restore operations. Choose a meaningful name that includes date/version information.
-    backup_id: []const u8,
-    /// Storage location for the backup. Supports multiple backends: - Local filesystem: `file:///path/to/backup` - Amazon S3: `s3://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata for the specified table.
-    location: []const u8,
-    /// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
-    format: ?[]const u8 = null,
-};
-
-/// Response for a cross-table batch operation. Contains per-table results.
-pub const MultiBatchResponse = struct {
-    /// Per-table batch results
-    tables: ?std.json.ArrayHashMap(BatchResponse) = null,
-};
-
-/// Result of an OCC transaction commit attempt.
-pub const TransactionCommitResponse = struct {
-    /// Whether the transaction was committed or aborted due to a conflict
-    status: []const u8,
-    /// Details about the conflict that caused an abort (only present when status is "aborted")
-    conflict: ?std.json.Value = null,
-    /// Per-table batch results (only present when status is "committed")
-    tables: ?std.json.ArrayHashMap(BatchResponse) = null,
-};
-
-pub const BoolFieldQuery = struct {
-    bool: bool,
-    field: ?[]const u8 = null,
-    boost: ?Boost = null,
-};
-
-pub const DateRangeStringQuery = struct {
-    start: ?[]const u8 = null,
-    end: ?[]const u8 = null,
-    inclusive_start: ?bool = null,
-    inclusive_end: ?bool = null,
-    field: ?[]const u8 = null,
-    boost: ?Boost = null,
-    datetime_parser: ?[]const u8 = null,
-};
-
-pub const DocIdQuery = struct {
-    ids: []const []const u8,
-    boost: ?Boost = null,
-};
-
-/// Geographic bounding box filter. The public query shape uses scalar latitude and longitude bounds to match structured filter_query.geo_bbox. Longitude ranges may cross the antimeridian by specifying a western/min longitude that is greater than the eastern/max longitude; for example, min_lon 179.5 and max_lon -179.5 matches points near +/-180 degrees longitude. Latitude bounds must be ordered with min_lat <= max_lat.
-pub const GeoBoundingBoxQuery = struct {
-    /// Field or path containing geo_point values.
-    field: []const u8,
-    /// Southern latitude bound.
-    min_lat: f64,
-    /// Western longitude bound. If greater than max_lon, the box crosses the antimeridian.
-    min_lon: f64,
-    /// Northern latitude bound. Must be greater than or equal to min_lat.
-    max_lat: f64,
-    /// Eastern longitude bound. May be less than min_lon for antimeridian-wrapped boxes.
-    max_lon: f64,
-    boost: ?Boost = null,
-};
-
-pub const GeoDistanceQuery = struct {
-    /// [lon, lat]
-    location: []const f64,
-    distance: []const u8,
-    field: ?[]const u8 = null,
-    boost: ?Boost = null,
-};
-
-pub const IPRangeQuery = struct {
-    cidr: []const u8,
-    field: ?[]const u8 = null,
-    boost: ?Boost = null,
-};
-
-pub const MatchAllQuery = struct {
-    match_all: std.json.Value,
-    boost: ?Boost = null,
-};
-
-pub const MatchNoneQuery = struct {
-    match_none: std.json.Value,
-    boost: ?Boost = null,
-};
-
-pub const MultiMatchBody = struct {
-    query: []const u8,
-    fields: []const []const u8,
-    type: []const u8,
-    boost: ?Boost = null,
-};
-
-pub const NumericRangeQuery = struct {
-    min: ?f64 = null,
-    max: ?f64 = null,
-    inclusive_min: ?bool = null,
-    inclusive_max: ?bool = null,
-    field: ?[]const u8 = null,
-    boost: ?Boost = null,
-};
-
-pub const PrefixQuery = struct {
-    prefix: []const u8,
-    field: ?[]const u8 = null,
-    boost: ?Boost = null,
-};
-
-pub const QueryStringQuery = struct {
-    query: []const u8,
-    boost: ?Boost = null,
-};
-
-pub const RegexpQuery = struct {
-    regexp: []const u8,
-    field: ?[]const u8 = null,
-    boost: ?Boost = null,
-};
-
-pub const TermQuery = struct {
-    term: []const u8,
-    field: ?[]const u8 = null,
-    boost: ?Boost = null,
-};
-
-pub const TermRangeQuery = struct {
-    min: ?[]const u8 = null,
-    max: ?[]const u8 = null,
-    inclusive_min: ?bool = null,
-    inclusive_max: ?bool = null,
-    field: ?[]const u8 = null,
-    boost: ?Boost = null,
-};
-
-pub const WildcardQuery = struct {
-    wildcard: []const u8,
-    field: ?[]const u8 = null,
-    boost: ?Boost = null,
-};
-
-pub const ShardConfig = struct {
-    byte_range: ByteRange,
-};
-
-pub const Capability = struct {
-    name: CapabilityName,
-    scope: ?[]const u8 = null,
-};
-
-pub const InferenceRole = ChatMessageRole;
-
-/// Typed Zig status view for table data topology and range placement.
-pub const ClusterDataStatus = struct {
-    nodes: ?[]const ClusterDataNodeStatus = null,
-    ranges: ?[]const ClusterDataRangeStatus = null,
-    replicas: ?[]const ClusterDataReplicaStatus = null,
-    groups: ?[]const ClusterDataGroupStatus = null,
-};
-
-/// Configuration for URL content fetching. Uses go/pkg/antfly/lib/scraping for downloading and processing. Supports: - HTTP/HTTPS URLs with security validation - HTML pages (extracts readable text via go-readability) - PDF files (extracts text) - Images (returns as data URIs) - Plain text files - S3 URLs (requires s3_credentials) Security features (from go/pkg/antfly/lib/scraping.ContentSecurityConfig): - Allowed host whitelist - Private IP blocking (SSRF prevention) - Download size limits - Timeout controls
-pub const FetchConfig = struct {
-    /// S3 credentials for fetching S3 URLs. If not set, uses package-level defaults.
-    s3_credentials: ?Credentials = null,
-    /// Maximum content length in characters (truncated if exceeded)
-    max_content_length: ?i64 = null,
-    /// Whitelist of allowed hostnames for fetching. If empty, all hosts are allowed (except private IPs). Example: ["docs.example.com", "api.example.com"]
-    allowed_hosts: ?[]const []const u8 = null,
-    /// Block requests to private IP ranges (SSRF prevention). Blocked: 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
-    block_private_ips: ?bool = null,
-    /// Maximum download size in bytes (default: 100MB)
-    max_download_size_bytes: ?i64 = null,
-    /// Download timeout in seconds
-    timeout_seconds: ?i64 = null,
-};
-
-/// Inspection view for a derived document artifact produced from a source table row. The typed fields form the stable summary contract. The embedded manifest/state JSON fields are optional raw detail intended for admin/debug inspection so producers can evolve their internal unit schema without changing this route contract.
-pub const DocumentArtifactManifest = struct {
-    /// Stable identity of the source document.
-    document_id: []const u8,
-    /// Name of the derived artifact.
-    artifact_name: []const u8,
-    /// Stable identity of this artifact under the document.
-    artifact_id: []const u8,
-    /// Version of the opaque manifest payload schema.
-    manifest_version: i64,
-    /// Monotonic generation for the current artifact state.
-    generation: i64,
-    /// Source URL or source identifier used to derive this artifact.
-    source_url: []const u8,
-    /// Fingerprint of the source bytes and extractor configuration.
-    source_fingerprint: []const u8,
-    /// Effective source content type selected during extraction.
-    content_type: []const u8,
-    /// Producer route selected for the source content.
-    route_type: []const u8,
-    /// Reason extraction was skipped, when the source type is unsupported.
-    unsupported_reason: ?[]const u8 = null,
-    /// Number of extracted document units.
-    unit_count: i64,
-    /// Number of indexable chunks derived from the units.
-    chunk_count: i64,
-    /// Parsed child range descriptors for this artifact generation.
-    child_ranges: []const DocumentArtifactChildRange,
-    /// Number of storage child ranges used by this artifact.
-    child_range_count: i64,
-    /// Current materialization or merge status.
-    merge_status: []const u8,
-    /// Previous artifact generation used by the current merge plan.
-    merge_from_generation: i64,
-    /// Target artifact generation produced by the current merge plan.
-    merge_to_generation: i64,
-    /// Granularity used when computing merge-plan operations.
-    merge_operation_granularity: []const u8,
-    /// Number of merge operations recorded for this artifact.
-    merge_operation_count: i64,
-    /// Last extraction or materialization error code, when the current artifact generation failed.
-    last_error_code: ?[]const u8 = null,
-    /// Human-readable last extraction or materialization error summary, when available.
-    last_error_message: ?[]const u8 = null,
-    /// Opaque JSON manifest for the artifact units and provenance. Present only for raw detail responses.
-    manifest_json: ?[]const u8 = null,
-    /// Optional opaque JSON state for incremental processing. Present only for raw detail responses.
-    state_json: ?[]const u8 = null,
-};
-
-pub const DocumentArtifactReprocessJob = struct {
-    /// Server-assigned durable repair job identifier.
-    job_id: i64,
-    /// Monotonic execution attempt token for the current running pass.
-    attempt_id: i64,
-    /// Table containing the source documents being repaired.
-    table_name: []const u8,
-    /// Name of the derived artifact being repaired.
-    artifact_name: []const u8,
-    /// Lifecycle phase of the repair job.
-    phase: []const u8,
-    /// User-facing completion status derived from the phase and remaining cursors.
-    reprocess_status: []const u8,
-    /// Original exclusive lower bound for the job.
-    from_key: []const u8,
-    /// Original inclusive upper bound for the job, or empty for the end of the table/range.
-    to_key: []const u8,
-    /// Current per-shard bounded pass limit.
-    limit: i64,
-    /// Single-shard continuation key when no shard cursors are present.
-    next_key: ?[]const u8 = null,
-    /// Cumulative source rows scanned by completed passes.
-    scanned: i64,
-    /// Cumulative source rows whose artifact was reprocessed.
-    reprocessed: i64,
-    /// Cumulative source rows skipped by completed passes.
-    skipped: i64,
-    /// Cumulative source rows that failed during completed passes.
-    failed: i64,
-    /// Number of shard-local continuations still pending.
-    pending_shards: i64,
-    /// Failures from the most recent completed pass.
-    failures: []const DocumentArtifactReprocessFailure,
-    /// Per-shard continuation cursors to resume on the next advance operation.
-    shard_cursors: []const DocumentArtifactReprocessShardCursor,
-    /// Last terminal or transient job error, when available.
-    last_error: ?[]const u8 = null,
-    /// Whether cancellation has been requested for a running pass. Running passes finish at a bounded reprocess boundary before the job transitions to cancelled.
-    cancel_requested: bool,
-    /// Unix epoch milliseconds when the job was created.
-    created_at_millis: i64,
-    /// Unix epoch milliseconds when the job was last updated.
-    last_updated_at_millis: i64,
-    /// Unix epoch milliseconds after which the retained job status may be removed.
-    expires_at_millis: i64,
-};
-
-/// Bounded request for reprocessing a derived artifact across source rows in key order.
-pub const DocumentArtifactTableReprocessRequest = struct {
-    /// Exclusive lower bound source document key. Use the prior response next_key to continue.
-    from_key: ?[]const u8 = null,
-    /// Inclusive upper bound source document key, or empty for the end of the table/range.
-    to_key: ?[]const u8 = null,
-    /// Maximum source rows to scan per shard-local repair pass. Zero uses the server default.
-    limit: ?i64 = null,
-    /// Per-shard continuation cursors returned by a prior response. When present, distributed repair resumes exactly these shard-local cursors instead of resolving a fresh global key span.
-    shard_cursors: ?[]const DocumentArtifactReprocessShardCursor = null,
-};
-
-pub const DocumentArtifactTableReprocessResponse = struct {
-    /// Indicates that reprocessing was accepted.
-    reprocess: []const u8,
-    /// Completion state for this bounded pass. `in_progress` means the caller should persist the returned cursor(s) and schedule another pass; `complete` means no continuation cursor remains.
-    reprocess_status: []const u8,
-    /// Name of the derived artifact that was reprocessed.
-    artifact_name: []const u8,
-    /// Number of source rows scanned by this bounded pass.
-    scanned: i64,
-    /// Number of source rows whose artifact was reprocessed.
-    reprocessed: i64,
-    /// Number of scanned source rows that no longer had a reprocessable source document.
-    skipped: i64,
-    /// Number of scanned source rows that failed before recording a normal artifact manifest.
-    failed: i64,
-    /// Effective scan limit used by the bounded pass.
-    limit: i64,
-    /// Source key cursor for the next bounded pass, when more rows may remain.
-    next_key: ?[]const u8 = null,
-    /// Number of shard-local continuations still pending after this pass. For single-shard callers this is 1 when only `next_key` remains and 0 when complete.
-    pending_shards: i64,
-    failures: []const DocumentArtifactReprocessFailure,
-    /// Per-shard continuation cursors for distributed repairs. Durable background repair jobs should persist and resume these independently instead of collapsing progress into a single global cursor.
-    shard_cursors: []const DocumentArtifactReprocessShardCursor,
-};
-
-pub const EdgesResponse = struct {
-    edges: ?[]const Edge = null,
-    /// Total number of edges returned
-    count: ?i64 = null,
-};
-
-/// A single result from graph traversal
-pub const TraversalResult = struct {
-    /// Base64-encoded document key
-    key: []const u8,
-    /// Document data (if loaded)
-    document: ?std.json.Value = null,
-    /// Distance from start node (0 = start node)
-    depth: i64,
-    /// Sequence of keys from start to this node (if include_paths=true)
-    path: ?[]const []const u8 = null,
-    /// Sequence of edges from start to this node (if include_paths=true)
-    path_edges: ?[]const Edge = null,
-    /// Product of edge weights along the path
-    total_weight: ?f64 = null,
-};
-
-/// Edge constraints in a pattern step
-pub const PatternEdgeStep = struct {
-    /// Edge types to traverse (empty = any)
-    types: ?[]const []const u8 = null,
-    direction: ?EdgeDirection = null,
-    /// Minimum number of hops (1 = direct edge)
-    min_hops: ?i64 = null,
-    /// Maximum number of hops (>1 = variable-length path)
-    max_hops: ?i64 = null,
-    /// Minimum edge weight filter
-    min_weight: ?f64 = null,
-    /// Maximum edge weight filter
-    max_weight: ?f64 = null,
-};
-
-/// Rules for graph traversal
-pub const TraversalRules = struct {
-    /// Filter edges by type (empty = all types)
-    edge_types: ?[]const []const u8 = null,
-    /// Minimum edge weight filter
-    min_weight: ?f64 = null,
-    /// Maximum edge weight filter
-    max_weight: ?f64 = null,
-    direction: ?EdgeDirection = null,
-    /// Maximum traversal depth (0 = unlimited)
-    max_depth: ?i64 = null,
-    /// Maximum results to return (0 = unlimited)
-    max_results: ?i64 = null,
-    /// Include path information in results
-    include_paths: ?bool = null,
-    /// Visit each node only once
-    deduplicate_nodes: ?bool = null,
-};
-
-/// Inline managed enrichment definition. Enrichments materialize generated artifacts before indexing and may target source rows or previously generated artifact streams.
-pub const EnrichmentConfig = struct {
-    /// Stable generated artifact name.
-    name: []const u8,
-    kind: EnrichmentKind,
-    /// Source field to read from the source document or source artifact payload.
-    field: ?[]const u8 = null,
-    /// Optional template for generated text input.
-    template: ?[]const u8 = null,
-    /// Existing artifact stream this enrichment consumes. Chunk enrichments may consume asset artifacts; embedding enrichments may consume chunk artifacts.
-    source_artifact_name: ?[]const u8 = null,
-    /// Expected embedding dimension for embedding enrichments.
-    expected_dims: ?i64 = null,
-    /// Chunk size for chunk enrichments.
-    chunk_size: ?i64 = null,
-    /// Chunk overlap for chunk enrichments.
-    chunk_overlap: ?i64 = null,
-    /// Serialized chunker configuration for chunk enrichments.
-    chunker_json: ?[]const u8 = null,
-    /// When true on a chunk or asset enrichment, route generated text into the table's default full-text index.
-    full_text_index: ?bool = null,
-    /// Produced asset content type for asset enrichments.
-    content_type: ?[]const u8 = null,
-    /// Serialized asset producer configuration.
-    producer_json: ?[]const u8 = null,
-};
-
-/// Scores organized by category
-pub const EvalScores = struct {
-    /// Retrieval metric scores (recall, precision, ndcg, etc.)
-    retrieval: ?std.json.ArrayHashMap(EvaluatorScore) = null,
-    /// Generation quality scores (faithfulness, relevance, etc.)
-    generation: ?std.json.ArrayHashMap(EvaluatorScore) = null,
-};
-
-pub const DataShapeDecl = struct {
-    name: ExtensionIdentifier,
-    kind: DataShapeKind,
-    version: ?[]const u8 = null,
-    /// JSON object encoded as a string until the public shape language is finalized.
-    schema_json: ?[]const u8 = null,
-};
-
-pub const DropExtensionResponse = struct {
-    dropped: ExtensionIdentifier,
-    dry_run: bool,
-};
-
-pub const PackageDependency = struct {
-    name: ExtensionIdentifier,
-    version_requirement: ?[]const u8 = null,
-    optional: ?bool = null,
-};
-
-pub const RuntimeDecl = struct {
-    name: ExtensionIdentifier,
-    mode: ?[]const u8 = null,
-    artifact: ?[]const u8 = null,
-    config_json: ?[]const u8 = null,
-};
-
-pub const ExtensionObjectDecl = struct {
-    kind: ExtensionObjectKind,
-    name: ExtensionIdentifier,
-    shape: ?[]const u8 = null,
-    table_name: ?[]const u8 = null,
-    config_json: ?[]const u8 = null,
-};
-
-pub const ExtensionScope = struct {
-    kind: ExtensionScopeKind,
-    /// Required when kind is table.
-    table_name: ?[]const u8 = null,
-};
-
-pub const ExternalIoConnection = struct {
-    protocol: ExternalIoProtocol,
-    /// Custom endpoint URL when configured.
-    endpoint: ?[]const u8 = null,
-    /// Buckets this connection is configured for.
-    buckets: ?[]const []const u8 = null,
-    /// Key prefix when configured.
-    prefix: ?[]const u8 = null,
-    /// Hosts or base URLs this connection applies to.
-    hosts: ?[]const []const u8 = null,
-};
-
-pub const ExtractionOptions = struct {
-    threshold: ?f32 = null,
-    flat_ner: ?bool = null,
-    include_confidence: ?bool = null,
-    include_spans: ?bool = null,
-    reader: ?ExtractionReaderOptions = null,
-};
-
-pub const ExtractionRelation = struct {
-    type: []const u8,
-    source: ?ExtractionRelationEndpoint = null,
-    target: ?ExtractionRelationEndpoint = null,
-    score: ?f32 = null,
-};
-
-pub const ExtractionStructureSchema = struct {
-    fields: ?std.json.ArrayHashMap(ExtractionStructureField) = null,
-};
-
-/// Statistics about a table used for query planning.
-pub const TableStatistics = struct {
-    /// Approximate number of rows in the table.
-    row_count: ?i64 = null,
-    /// Approximate size of the table in bytes.
-    size_bytes: ?i64 = null,
-    /// Per-field statistics for query optimization.
-    field_stats: ?std.json.ArrayHashMap(FieldStatistics) = null,
-    /// When these statistics were last computed.
-    last_updated: ?[]const u8 = null,
-};
-
-pub const ForeignSource = struct {
-    /// Type of the foreign data source. Currently only "postgres" is supported.
-    type: []const u8,
-    /// Data source name (connection string) for the foreign database. Supports `${secret:key_name}` references that resolve from the Antfly keystore or environment variables.
-    dsn: []const u8,
-    /// Name of the table or view in the foreign PostgreSQL database to query.
-    postgres_table: []const u8,
-    /// Optional column definitions for the foreign table. If omitted, columns are auto-discovered from `information_schema.columns` on first query.
-    columns: ?[]const ForeignColumn = null,
-};
-
-pub const FuzzyQuery = struct {
-    term: []const u8,
-    prefix_length: ?i32 = null,
-    fuzziness: ?Fuzziness = null,
-    field: ?[]const u8 = null,
-    boost: ?Boost = null,
-};
-
-pub const MatchPhraseQuery = struct {
-    match_phrase: []const u8,
-    field: ?[]const u8 = null,
-    analyzer: ?[]const u8 = null,
-    boost: ?Boost = null,
-    fuzziness: ?Fuzziness = null,
-};
-
-pub const MatchQuery = struct {
-    match: []const u8,
-    field: ?[]const u8 = null,
-    analyzer: ?[]const u8 = null,
-    boost: ?Boost = null,
-    prefix_length: ?i32 = null,
-    fuzziness: ?Fuzziness = null,
-    operator: ?[]const u8 = null,
-};
-
-pub const MultiPhraseQuery = struct {
-    terms: []const []const []const u8,
-    field: ?[]const u8 = null,
-    boost: ?Boost = null,
-    fuzziness: ?Fuzziness = null,
-};
-
-pub const PhraseQuery = struct {
-    terms: []const []const u8,
-    field: ?[]const u8 = null,
-    boost: ?Boost = null,
-    fuzziness: ?Fuzziness = null,
-};
-
-pub const GeoBoundingPolygonQuery = struct {
-    polygon_points: []const GeoPoint,
-    field: ?[]const u8 = null,
-    boost: ?Boost = null,
-};
-
-pub const GeoShapeGeometry = struct {
-    shape: GeoShape,
-    relation: []const u8,
-};
-
-/// Statistics for an index
-pub const IndexStats = union(enum) {
-    full_text_index_stats: FullTextIndexStats,
-    embeddings_index_stats: EmbeddingsIndexStats,
-    graph_index_stats: GraphIndexStats,
-    algebraic_index_stats: AlgebraicIndexStats,
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
-        return try jsonParseFromValue(allocator, value, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("index_type") orelse return error.MissingField;
-        const disc_str = switch (disc_val) {
-            .string => |s| s,
-            else => return error.UnexpectedToken,
-        };
-        if (std.mem.eql(u8, disc_str, "full_text")) {
-            return .{ .full_text_index_stats = try std.json.parseFromValueLeaky(FullTextIndexStats, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "embeddings")) {
-            return .{ .embeddings_index_stats = try std.json.parseFromValueLeaky(EmbeddingsIndexStats, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "graph")) {
-            return .{ .graph_index_stats = try std.json.parseFromValueLeaky(GraphIndexStats, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "algebraic")) {
-            return .{ .algebraic_index_stats = try std.json.parseFromValueLeaky(AlgebraicIndexStats, allocator, source, options) };
-        }
-        return error.UnexpectedToken;
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        switch (self) {
-            .full_text_index_stats => |v| try jw.write(v),
-            .embeddings_index_stats => |v| try jw.write(v),
-            .graph_index_stats => |v| try jw.write(v),
-            .algebraic_index_stats => |v| try jw.write(v),
-        }
-    }
-};
-
-/// Image content in OpenAI-compatible format.
-pub const ImageURLContentPart = struct {
-    type: []const u8,
-    image_url: ImageURL,
-};
-
-pub const InferenceImageURL = ImageURL;
-
-/// A tool (function) that the model can call
-pub const InferenceTool = struct {
-    /// The type of tool (currently only "function" is supported)
-    type: []const u8,
-    function: InferenceFunctionDefinition,
-};
-
-pub const InferenceGenerateResponseFormat = struct {
-    /// Structured output mode
-    type: []const u8,
-    /// Optional schema payload for `type=json_schema`. Enforced during native constrained decoding and validated after generation.
-    json_schema: ?InferenceGenerateJsonSchemaConfig = null,
-};
-
-pub const InferenceModelsResponse = struct {
-    /// OpenAI-compatible response object type.
-    object: []const u8,
-    /// OpenAI-compatible flat model list for generation/embedding models.
-    data: []const std.json.Value,
-    /// Whether clients should show model download commands.
-    allow_downloads: bool,
-    backends: InferenceBackendRuntimes,
-    /// Available chunking models (always includes "fixed")
-    chunkers: std.json.ArrayHashMap(InferenceModelInfo),
-    /// Available reranking models
-    rerankers: std.json.ArrayHashMap(InferenceModelInfo),
-    /// Available zero-shot classification models
-    classifiers: std.json.ArrayHashMap(InferenceModelInfo),
-    /// Available embedding models from models_dir/embedders/
-    embedders: std.json.ArrayHashMap(InferenceModelInfo),
-    /// Available extractor models (models with 'extraction' capability)
-    extractors: std.json.ArrayHashMap(InferenceModelInfo),
-    /// Available generator/LLM models from models_dir/generators/
-    generators: std.json.ArrayHashMap(InferenceModelInfo),
-    /// Available recognizer models from models_dir/recognizers/
-    recognizers: std.json.ArrayHashMap(InferenceModelInfo),
-    /// Available Seq2Seq rewriter models from models_dir/rewriters/
-    rewriters: std.json.ArrayHashMap(InferenceModelInfo),
-    /// Available reader/OCR models from models_dir/readers/
-    readers: std.json.ArrayHashMap(InferenceModelInfo),
-    /// Available transcriber/speech-to-text models from models_dir/transcribers/
-    transcribers: std.json.ArrayHashMap(InferenceModelInfo),
-};
-
-/// Model reference used by startup preload and model-loading configuration.
-pub const InferenceModelRef = struct {
-    kind: InferenceModelKind,
-    /// Model name to resolve within the registry for the selected kind, usually in `<owner>/<repo>` format.
-    name: []const u8,
-    backend: ?InferenceModelBackend = null,
-    format: ?InferenceModelFormat = null,
-    quantization: ?InferenceModelQuantization = null,
-};
-
-pub const InferencePredictResponse = struct {
-    model: []const u8,
-    task: InferencePredictorTask,
-    /// Per-row prediction arrays. Length equals the model's `num_outputs` (1 for regression / binary, `num_classes` for multiclass).
-    predictions: []const []const f32,
-};
-
-/// Traditional ML predictor metadata.
-pub const InferencePredictorInfo = struct {
-    task: InferencePredictorTask,
-    /// Number of feature columns expected by the predictor.
-    num_features: i64,
-    /// Number of output values emitted per input row.
-    num_outputs: i64,
-    /// Optional feature names in input order.
-    feature_names: ?[]const []const u8 = null,
-    /// Source framework used to produce the predictor IR.
-    source_framework: ?[]const u8 = null,
-};
-
-pub const InferenceConnection = struct {
-    provider: InferenceProviderType,
-    /// Resolved endpoint URL when applicable.
-    url: ?[]const u8 = null,
-    /// Cloud region (Bedrock).
-    region: ?[]const u8 = null,
-    /// Google Cloud project (Vertex).
-    project_id: ?[]const u8 = null,
-    /// Google Cloud location (Vertex).
-    location: ?[]const u8 = null,
-    /// Named registry entries from node config that resolve to this provider instance.
-    names: ?[]const []const u8 = null,
-    /// Model types this instance is configured for.
-    configured_model_types: ?[]const ConnectedModelType = null,
-    /// Models reported by the provider, grouped by model type. Keys are pluralized ConnectedModelType values ("embedders", "generators", "rerankers", "chunkers", "recognizers", "classifiers", "rewriters", "readers", "transcribers", "extractors") plus "other" for models the provider's listing API does not classify by task. Populated only when the request includes the "models" expansion.
-    models: ?std.json.ArrayHashMap([]const ConnectedModel) = null,
-};
-
-pub const InferenceRerankResponse = struct {
-    /// Object type, always "list"
-    object: []const u8,
-    /// Rerank score objects, one per input prompt.
-    data: []const InferenceRerankObject,
-    /// Name of model used for reranking
-    model: []const u8,
-    usage: InferenceGenerateUsage,
-};
-
-pub const InferenceRewriteResponse = struct {
-    /// Object type, always "list"
-    object: []const u8,
-    /// Rewritten text objects, one per input.
-    data: []const InferenceRewriteObject,
-    /// Name of model used for rewriting
-    model: []const u8,
-    usage: InferenceGenerateUsage,
-};
-
-/// A single embedding result
-pub const InferenceEmbeddingObject = struct {
-    /// Object type, always "embedding"
-    object: []const u8,
-    /// Dense float vector for dense models, or a sparse vector object for sparse-capable models
-    embedding: ?std.json.Value = null,
-    /// Index of the input this embedding corresponds to
-    index: i64,
-};
-
-/// Logging configuration for inference services
-pub const InferenceschemasConfig = struct {
-    level: ?InferenceLevel = null,
-    style: ?InferenceStyle = null,
-};
-
-/// A chunk of content. Text chunks have mime_type text/plain.
-pub const InferenceChunk = struct {
-    /// The chunk text content
-    text: ?[]const u8 = null,
-    /// Character position in original text where chunk starts
-    start_char: ?i64 = null,
-    /// Character position in original text where chunk ends (exclusive)
-    end_char: ?i64 = null,
-    /// Base64-encoded binary data (valid WAV, PNG, etc.)
-    data: ?[]const u8 = null,
-    /// Audio: window start time in milliseconds
-    start_time_ms: ?f32 = null,
-    /// Audio: window end time in milliseconds
-    end_time_ms: ?f32 = null,
-    /// Animation: frame number
-    frame_index: ?i64 = null,
-    /// Animation: display delay in milliseconds
-    frame_delay_ms: ?i64 = null,
-    /// Sequence number of the chunk (0, 1, 2, ...)
-    id: i64,
-    /// MIME type: text/plain, audio/wav, image/png, etc.
-    mime_type: []const u8,
-};
-
-pub const InferenceReadResult = struct {
-    /// Extracted text from the image
-    text: []const u8,
-    /// Structured fields extracted by document understanding models (Donut, Florence-2). Fields are flattened with dot notation for nested structures. Only present for models that output structured data.
-    fields: ?std.json.ArrayHashMap([]const u8) = null,
-    /// Individual text regions with bounding boxes and recognized text. Populated by multi-stage OCR models (Surya, PaddleOCR).
-    regions: ?[]const InferenceTextRegion = null,
-};
-
-/// Incremental tool call data for streaming
-pub const InferenceToolCallDelta = struct {
-    /// Index of the tool call in the array
-    index: ?i64 = null,
-    /// Unique identifier (only in first delta for this index)
-    id: ?[]const u8 = null,
-    /// The type of tool call (only in first delta)
-    type: ?[]const u8 = null,
-    function: ?InferenceToolCallFunctionDelta = null,
-};
-
-pub const InferenceTranscribeResponse = struct {
-    /// Object type, always "list"
-    object: []const u8,
-    /// Transcription result objects.
-    data: []const InferenceTranscribeObject,
-    /// Name of model used for transcription
-    model: []const u8,
-    usage: InferenceGenerateUsage,
-};
-
-/// Condition for matching rows between tables.
-pub const JoinCondition = struct {
-    /// Field from the left (primary) table to match on.
-    left_field: []const u8,
-    /// Field from the right (joined) table to match on.
-    right_field: []const u8,
-    /// Comparison operator. Defaults to "eq" (equality).
-    operator: ?JoinOperator = null,
-};
-
-/// Join execution statistics.
-pub const JoinProfile = struct {
-    /// The join strategy that was used.
-    strategy_used: ?JoinStrategy = null,
-    /// Number of rows scanned from the left table.
-    left_rows_scanned: ?i64 = null,
-    /// Number of rows scanned from the right table.
-    right_rows_scanned: ?i64 = null,
-    /// Number of rows that matched the join condition.
-    rows_matched: ?i64 = null,
-    /// Number of left rows without a match (for left/full joins).
-    rows_unmatched_left: ?i64 = null,
-    /// Number of right rows without a match (for right/full joins).
-    rows_unmatched_right: ?i64 = null,
-    /// Time spent executing the join in milliseconds.
-    duration_ms: ?i64 = null,
-};
-
-pub const LinearMergeResult = struct {
-    status: LinearMergePageStatus,
-    /// Records inserted or updated (0 if dry_run=true)
-    upserted: i64,
-    /// Records skipped because content hash matched (unchanged)
-    skipped: i64,
-    /// Records deleted or would be deleted (if dry_run=true)
-    deleted: i64,
-    /// IDs that were deleted (or would be deleted if dry_run=true). Only included if dry_run=true.
-    deleted_ids: ?[]const []const u8 = null,
-    failed: ?[]const FailedOperation = null,
-    /// ID of last record in this batch (use for next request)
-    next_cursor: []const u8,
-    key_range: ?KeyRange = null,
-    /// Total number of keys scanned from Antfly during range query
-    keys_scanned: ?i64 = null,
-    /// Additional information (e.g., "stopped at shard boundary", "dry run - no changes made")
-    message: ?[]const u8 = null,
-    took: ?i64 = null,
-};
-
-pub const StorageStatus = struct {
-    /// Disk usage in bytes.
-    disk_usage: ?i64 = null,
-    /// Whether the table has received data.
-    empty: ?bool = null,
-    lsm: ?LsmStorageStatus = null,
-};
-
-pub const InferenceMediaContentPart = MediaContentPart;
-
-/// Configuration for result fusion when combining multiple search indexes.
-pub const MergeConfig = struct {
-    strategy: ?MergeStrategy = null,
-    /// Named weights keyed by index name. `full_text` for the full-text search index; embedding index names for vector indexes. Unspecified indexes default to 1.0. Applied in both RRF and RSF.
-    weights: ?std.json.ArrayHashMap(f64) = null,
-    /// RSF normalization window size. Defaults to `limit`.
-    window_size: ?i64 = null,
-    /// RRF k constant (1/(k+rank)). Defaults to 60.0.
-    rank_constant: ?f64 = null,
-};
-
-/// Result merge statistics for hybrid search.
-pub const MergeProfile = struct {
-    /// Merge strategy that was used.
-    strategy: ?MergeStrategy = null,
-    /// Number of hits from full-text search before merge.
-    full_text_hits: ?i64 = null,
-    /// Number of hits from semantic search before merge.
-    semantic_hits: ?i64 = null,
-    /// Time spent merging results in milliseconds.
-    duration_ms: ?i64 = null,
-};
-
-/// Defines how to select start/target nodes for graph queries
-pub const GraphNodeSelector = struct {
-    /// Explicit list of node keys
-    keys: ?[]const []const u8 = null,
-    /// Reference to search results to use as nodes: - "$full_text_results" - use full-text search results - "$embeddings_results.index_name" - use vector search results from specific index
-    result_ref: ?[]const u8 = null,
-    /// Maximum number of nodes to select from the referenced results
-    limit: ?i64 = null,
-    /// Filter which nodes to use as start/target
-    node_filter: ?NodeFilter = null,
-};
-
-/// A node in graph query results
-pub const GraphResultNode = struct {
-    /// Document key
-    key: []const u8,
-    /// Distance from start node
-    depth: ?i64 = null,
-    /// Weighted distance
-    distance: ?f64 = null,
-    /// Full document (if include_documents=true)
-    document: ?std.json.Value = null,
-    /// Keys in path from start to this node
-    path: ?[]const []const u8 = null,
-    /// Edges in path from start to this node
-    path_edges: ?[]const PathEdge = null,
-    /// Algebraic provenance labels folded into this result, when requested by an algebraic graph executor
-    provenance: ?[]const []const u8 = null,
-    /// Parsed evidence envelope for provenance labels and edge metadata
-    evidence: ?std.json.Value = null,
-    /// Connected edges (when include_edges=true)
-    edges: ?[]const Edge = null,
-};
-
-pub const Path = struct {
-    /// Ordered list of node keys (base64-encoded)
-    nodes: ?[]const []const u8 = null,
-    edges: ?[]const PathEdge = null,
-    total_weight: ?f64 = null,
-    length: ?i64 = null,
-};
-
-pub const PathFindRequest = struct {
-    /// Source node key (base64-encoded)
-    source: []const u8,
-    /// Target node key (base64-encoded)
-    target: []const u8,
-    /// Filter by specific edge types
-    edge_types: ?[]const []const u8 = null,
-    max_depth: ?i64 = null,
-    weight_mode: ?PathFindWeightMode = null,
-    k: ?i64 = null,
-    min_weight: ?f64 = null,
-    max_weight: ?f64 = null,
-    direction: ?EdgeDirection = null,
-};
-
-/// Parameters for graph traversal and pathfinding
-pub const GraphQueryParams = struct {
-    /// Filter by edge types
-    edge_types: ?[]const []const u8 = null,
-    direction: ?EdgeDirection = null,
-    /// Maximum traversal depth
-    max_depth: ?i64 = null,
-    /// Minimum edge weight
-    min_weight: ?f64 = null,
-    /// Maximum edge weight
-    max_weight: ?f64 = null,
-    /// Maximum number of results (traversal)
-    max_results: ?i64 = null,
-    /// Remove duplicate nodes (traversal)
-    deduplicate_nodes: ?bool = null,
-    /// Include path information (traversal)
-    include_paths: ?bool = null,
-    weight_mode: ?PathWeightMode = null,
-    /// Number of paths to find (k-shortest-paths)
-    k: ?i64 = null,
-    /// Filter which nodes to visit during traversal
-    node_filter: ?NodeFilter = null,
-    /// Graph algorithm to run (e.g., 'pagerank', 'betweenness')
-    algorithm: ?[]const u8 = null,
-    /// Parameters for the graph algorithm
-    algorithm_params: ?std.json.Value = null,
-};
-
-/// Token usage and resource statistics from the retrieval agent execution
-pub const RetrievalAgentUsage = struct {
-    /// Total input tokens across all LLM calls
-    input_tokens: ?i64 = null,
-    /// Total output tokens across all LLM calls
-    output_tokens: ?i64 = null,
-    /// Sum of input + output tokens
-    total_tokens: ?i64 = null,
-    /// Input tokens served from cache
-    cached_input_tokens: ?i64 = null,
-    /// Number of LLM invocations made
-    llm_calls: ?i64 = null,
-    /// Total resources found across all search queries
-    resources_retrieved: ?i64 = null,
-    /// Token pruning statistics, present when max_context_tokens was configured
-    prune_stats: ?PruneStats = null,
-};
-
-/// A list of query hits.
-pub const QueryHits = struct {
-    /// Total number of hits available and whether it is exact.
-    total: ?QueryHitsTotal = null,
-    hits: ?[]const QueryHit = null,
-    /// Maximum score of the results.
-    max_score: ?f32 = null,
-};
-
-/// Bounded request to list table repair issues.
-pub const RepairIssueListRequest = struct {
-    /// Repair subsystem to list. `artifact` lists durable artifact queue records; `index` lists index repair candidates derived from index status and artifact debt.
-    target: ?RepairTarget = null,
-    kind: ?ArtifactRepairKind = null,
-    /// Restrict results to one index name.
-    index: ?[]const u8 = null,
-    /// Opaque cursor returned by a prior response.
-    cursor: ?[]const u8 = null,
-    /// Maximum repair records to return.
-    limit: ?i64 = null,
-};
-
-/// Bounded request to run a table repair pass.
-pub const RepairRunRequest = struct {
-    target: ?RepairTarget = null,
-    kind: ?ArtifactRepairKind = null,
-    /// Restrict repair attempts to one index name.
-    index: ?[]const u8 = null,
-    /// Opaque cursor returned by a prior repair response.
-    cursor: ?[]const u8 = null,
-    /// Force a named index rebuild even when no repair debt is currently recorded. Only applies to target=index.
-    force: ?bool = null,
-    /// Maximum artifact repair records to attempt. For target=index, any positive value permits one named index repair.
-    limit: ?i64 = null,
-};
-
-/// Starts a durable table repair job. The job advances in bounded passes using the same repair request shape as runTableRepair.
-pub const TableRepairJobStartRequest = struct {
-    target: ?RepairTarget = null,
-    kind: ?ArtifactRepairKind = null,
-    /// Restrict repair attempts to one index name.
-    index: ?[]const u8 = null,
-    /// Opaque cursor returned by a prior repair response.
-    cursor: ?[]const u8 = null,
-    /// Force a named index rebuild even when no repair debt is currently recorded. Only applies to target=index.
-    force: ?bool = null,
-    /// Maximum artifact repair records to attempt per pass. For target=index, any positive value permits one named index repair.
-    limit: ?i64 = null,
-    /// When true, the server immediately attempts the first bounded repair pass before returning the job.
-    advance: ?bool = null,
-};
-
-pub const Permission = struct {
-    /// Resource name (e.g., table name, target username, or '*' for global).
-    resource: []const u8,
-    resource_type: ResourceType,
-    type: PermissionType,
-};
-
-pub const SecretEntry = struct {
-    /// Secret name (e.g., openai.api_key)
-    key: []const u8,
-    status: SecretStatus,
-    /// Corresponding environment variable name (e.g., OPENAI_API_KEY)
-    env_var: ?[]const u8 = null,
-    created_at: ?[]const u8 = null,
-    updated_at: ?[]const u8 = null,
-};
-
-pub const ClusterStatus = struct {
-    health: ClusterHealth,
-    /// Optional message providing details about the health status
-    message: ?[]const u8 = null,
-    /// Indicates whether authentication is enabled for the cluster
-    auth_enabled: ?bool = null,
-    /// Indicates whether the cluster is running in single-node swarm mode
-    swarm_mode: ?bool = null,
-    secret_store: ?SecretStoreStatus = null,
-};
-
-/// Query classification and transformation result combining all query enhancements including strategy selection and semantic optimization
-pub const ClassificationTransformationResult = struct {
-    route_type: RouteType,
-    strategy: QueryStrategy,
-    semantic_mode: SemanticQueryMode,
-    /// Clarified query with added context for answer generation (human-readable)
-    improved_query: []const u8,
-    /// Optimized query for vector/semantic search. Content style depends on semantic_mode: keywords for 'rewrite', hypothetical answer for 'hypothetical'
-    semantic_query: []const u8,
-    /// Broader background query for context (only present when strategy is 'step_back')
-    step_back_query: ?[]const u8 = null,
-    /// Decomposed sub-questions (only present when strategy is 'decompose')
-    sub_questions: ?[]const []const u8 = null,
-    /// Alternative phrasings of the query for expanded retrieval coverage
-    multi_phrases: ?[]const []const u8 = null,
-    /// Pre-retrieval reasoning explaining query analysis and strategy selection (only present when with_classification_reasoning is enabled)
-    reasoning: ?[]const u8 = null,
-    /// Classification confidence (0.0 to 1.0)
-    confidence: f32,
-};
-
-/// Sort execution profile. The fields below are the stable public diagnostic surface; profiling responses may include additional implementation counters. Additional properties may include low-level implementation details such as doc-value load timings, stored-source loads, collector/window internals, cost-model inputs, native-filter modes, and index-sort availability flags; treat those properties as diagnostic and not as a frozen SDK contract.
-pub const SortProfile = struct {
-    /// Stable physical sort plan name. Known values include `none`, `id_only`, `id_seek`, `sorted_segment_seek`, `native_doc_values_top_n`, `score_top_k`, `distributed_k_way_merge`, `stored_json_debug`, and `unsupported_exact_sort`. Public exact sort requests must not silently move from native plans to `stored_json_debug`; missing native coverage is reported through the rejection fields instead.
-    plan: ?[]const u8 = null,
-    /// Requested order fields, including the implicit _id tie-breaker when applicable.
-    order_by: ?[]const SortField = null,
-    /// Cursor mode for this request.
-    cursor: ?[]const u8 = null,
-    /// Exactness class for the selected plan. Known values include `none`, `exact`, `bounded_exact`, `approximate`, and `unsupported`.
-    exactness: ?[]const u8 = null,
-    /// Sort execution primitive used by the selected plan. Known values include `none`, `candidate_collector`, `primary_key_scan`, `sorted_segment_scan`, `score_top_k`, `doc_values_collector`, `distributed_merge`, `stored_json_debug`, and `unsupported`.
-    source: ?[]const u8 = null,
-    /// Exact candidate source consumed by the selected sort primitive.
-    candidate_source: ?[]const u8 = null,
-    /// Cursor support level for the selected plan. Known values include `none`, `comparator`, `segment_seek`, `distributed_seek`, and `unsupported`.
-    cursor_support: ?[]const u8 = null,
-    /// Stored source load strategy. Known values include `none`, `source_free`, `projected_source_after_page`, `stored_source_required`, and `unsupported`.
-    source_load: ?[]const u8 = null,
-    /// Distributed sort behavior. Known values include `none`, `shard_local_only`, `coordinator_merge`, and `unsupported`.
-    distributed_behavior: ?[]const u8 = null,
-    /// Stable reason the planner selected this sort plan. Known values include `none`, `unsupported_exact_sort`, `distributed_k_way_merge`, `stored_json_debug`, `id_candidate_order`, `id_primary_key_seek`, `score_top_k`, `index_sort_sorted_segment_seek`, `sorted_segment_seek`, `doc_values_collector`, `index_sort_unavailable_doc_values_collector`, `caller_selected_doc_values_collector`, and `selective_filter_doc_values_collector`.
-    selection_reason: ?[]const u8 = null,
-    /// Whether exact execution required native typed sort values.
-    require_native: ?bool = null,
-    /// Conservative lifecycle state for the requested sort path. Queryable fields are accepted by public exact sort; accelerated fields are queryable and have an index_sort-compatible physical path.
-    sort_lifecycle_state: ?[]const u8 = null,
-    /// Native typed doc-values coverage status for mapped sort fields. Known values include `covered`, `identity_metadata`, `schema_declared`, `observed_declared`, and `not_declared`.
-    native_doc_values_coverage: ?[]const u8 = null,
-    /// Physical index_sort coverage status for the requested order. Known values include `request_mismatch`, `no_live_segments`, `missing_segment_index_sort`, `covered_without_bounds`, and `covered_with_bounds`.
-    index_sort_coverage: ?[]const u8 = null,
-    /// Candidate documents considered by sort execution.
-    candidate_count: ?i64 = null,
-    /// Candidates rejected by cursor comparison.
-    cursor_rejected_count: ?i64 = null,
-    /// Hits selected for the returned page.
-    selected_count: ?i64 = null,
-    /// Total sort execution time in microseconds.
-    total_us: ?i64 = null,
-    /// Shards participating in distributed sort execution.
-    distributed_shard_count: ?i64 = null,
-    /// Stable budget rejection reason. Known values include `text_exact_late_visibility_totals`, `text_field_sort_candidate_window`, `match_all_candidate_collect_limit`, `match_all_exact_candidate_window`, `sorted_segment_scan_window`, and `distributed_merge_shard_window`.
-    budget_rejection_reason: ?[]const u8 = null,
-    /// Stable public exact-sort rejection reason. Known values include `unmapped_field`, `non_sortable_field`, `unsupported_sort_field`, `mixed_field_type`, `field_not_sort_ready`, `filter_not_queryable`, `invalid_cursor_arity`, `invalid_cursor_type`, `invalid_sort_tuple`, `approximate_candidate_source`, `candidate_budget_exceeded`, `missing_null_policy`, `non_score_bearing_source`, `invalid_score_value`, `count_only_ordered_page`, `stored_json_sort_disabled`, `unsupported_exact_sort`, and `distributed_merge_unsupported`.
-    sort_rejection_reason: ?[]const u8 = null,
-    /// Stable rejection detail. Known exact-sort details include `unmapped_sort_field`, `unmapped_field`, `non_sortable_sort_field`, `non_scalar_field`, `non_sortable_field`, `mixed_field_type`, `missing_doc_values_section`, `malformed_doc_values_section`, `doc_values_kind_mismatch`, `sparse_live_doc_values`, `invalid_doc_value_doc_id`, `duplicate_doc_value_doc_id`, `unsupported_doc_values_type`, `missing_doc_values_coverage`, `missing_doc_values_capability`, `schema_declared`, `observed_declared`, `not_declared`, `missing_doc_values`, `non_sortable`, `declared`, `text_search_only`, `mixed`, `missing_native_filter_coverage`, `invalid_cursor_arity`, `invalid_cursor_type`, `invalid_sort_tuple`, `sort_tuple_arity`, `invalid_doc_value_type`, `missing_runtime_mapping`, `incomplete_sort_tuple`, `mixed_sort_value_domain`, `unsorted_shard_window`, `unsorted_component_window`, `non_numeric_score`, `missing_score`, `non_finite_score`, `score_sort_tuple_mismatch`, `non_score_bearing_source`, `id_tiebreaker_mismatch`, `approximate_candidate_source`, `count_only_ordered_page`, `native_sort_loader_unavailable`, `sorted_segment_executor_unavailable`, `primary_key_stream_unavailable`, `native_candidate_stream_unavailable`, `candidate_stream_unavailable`, `incompatible_sort_plan`, `sorted_segment_bounds_unavailable`, `filter_query_json_unresolved`, `exclusion_query_json_unresolved`, `text_index_entry_unavailable`, `doc_ordinal_projection_unavailable`, `component_sort_profile_missing`, `unsupported_composed_sort_source`, `stored_json_sort_disabled`, `distributed_merge_unsupported`, `distributed_merge_plan_required`, `distributed_shard_window_incomplete`, `distributed_shard_cursor_window_invalid`, and `distributed_merge_shard_window`.
-    sort_rejection_detail: ?[]const u8 = null,
-    /// Sort field associated with the rejection when safe to expose.
-    sort_rejection_field: ?[]const u8 = null,
-};
-
-/// Linear merge operation for syncing sorted records from external sources. Use this to keep Antfly in sync with an external database or data source. Requests may be sent as plain JSON or gzip-compressed JSON (`Content-Encoding: gzip`). Request bodies are limited to 64 MiB after decompression. Requests that exceed this limit return HTTP 413. **How it works:** 1. Send sorted records from your external source 2. Server upserts records that exist in your batch 3. Server deletes Antfly records in the key range that are absent from your batch 4. If stopped at shard boundary, use next_cursor for next request **WARNING:** Not safe for concurrent operations with overlapping key ranges.
-pub const LinearMergeRequest = struct {
-    /// Map of resource ID to resource object: {"resource_id_1": {...}, "resource_id_2": {...}} Requirements: - The server processes keys in lexicographic order - Use consistent key naming (e.g., all start with same prefix) This format avoids duplicate IDs and matches Antfly's batch write interface.
-    records: std.json.Value,
-    /// ID of last record from previous merge request. - First request: Use empty string "" - Subsequent requests: Use next_cursor from previous response - Defines lower bound of key range to process This enables pagination for large datasets.
-    last_merged_id: ?[]const u8 = null,
-    /// If true, returns what would be deleted without making changes. Use cases: - Validate sync behavior before committing - Check which records will be removed - Test key range boundaries Response includes deleted_ids array when dry_run=true.
-    dry_run: ?bool = null,
-    sync_level: ?SyncLevel = null,
-};
-
-pub const TransactionBeginRequest = struct {
-    sync_level: ?SyncLevel = null,
-};
-
-pub const ClusterBackupResponse = struct {
-    /// The backup identifier
-    backup_id: []const u8,
-    /// Status of each table backup
-    tables: []const TableBackupStatus,
-    /// Overall backup status
-    status: []const u8,
-};
-
-/// Durable table repair job state.
-pub const TableRepairJob = struct {
-    /// Server-assigned durable repair job identifier.
-    job_id: i64,
-    /// Monotonic execution attempt token for the current running pass.
-    attempt_id: i64,
-    /// Table being repaired.
-    table_name: []const u8,
-    /// Lifecycle phase of the repair job.
-    phase: []const u8,
-    /// User-facing repair progress state. `debt_remaining` means the bounded job stopped because unsupported or failed debt still requires operator action.
-    repair_status: []const u8,
-    target: RepairTarget,
-    kind: ?ArtifactRepairKind = null,
-    /// Index name when the job is restricted to one index.
-    index: ?[]const u8 = null,
-    /// Opaque continuation cursor for the next bounded repair pass.
-    cursor: ?[]const u8 = null,
-    /// Effective per-pass repair limit.
-    limit: i64,
-    /// Whether the job forces a named index rebuild.
-    force: bool,
-    result: TableRepairRunResult,
-    /// Last stable job-level error code.
-    last_error: ?[]const u8 = null,
-    /// Whether cancellation has been requested for a running pass. Running passes finish at a bounded repair boundary before the job transitions to cancelled.
-    cancel_requested: bool,
-    /// Unix epoch milliseconds when the job was created.
-    created_at_millis: i64,
-    /// Unix epoch milliseconds when the job state was last updated.
-    last_updated_at_millis: i64,
-    /// Unix epoch milliseconds when the job is eligible for cleanup.
-    expires_at_millis: i64,
-};
-
-/// Response for a bounded table repair pass.
-pub const TableRepairRunResponse = struct {
-    /// Table whose repair queue was processed.
-    table: []const u8,
-    target: RepairTarget,
-    /// Effective repair limit.
-    limit: i64,
-    result: TableRepairRunResult,
-};
-
-pub const ClusterRestoreResponse = struct {
-    /// Status of each table restore
-    tables: []const TableRestoreStatus,
-    /// Overall restore status
-    status: []const u8,
-};
-
-/// Per-request configuration for chunking. All fields are optional - zero/omitted values use chunker defaults.
-pub const ChunkOptions = struct {
-    /// Maximum number of chunks to generate per document.
-    max_chunks: ?i64 = null,
-    /// Confidence threshold for model-based chunking (0.0-1.0).
-    threshold: ?f32 = null,
-    text: ?TextChunkOptions = null,
-    audio: ?AudioChunkOptions = null,
-};
-
-pub const InferenceTextContentPart = TextContentPart;
-
-/// OpenAI-compatible assistant tool call.
-pub const ToolCall = struct {
-    /// Tool call identifier.
-    id: []const u8,
-    type: []const u8,
-    function: ToolCallFunction,
-};
-
-pub const TransactionSessionListResponse = struct {
-    session_count: ?i64 = null,
-    lease_held_count: ?i64 = null,
-    lease_expired_count: ?i64 = null,
-    sessions: ?[]const TransactionSessionStatus = null,
-};
-
-pub const TransactionSessionDetailsResponse = struct {
-    transaction_id: []const u8,
-    owner_node_id: i64,
-    begin_timestamp: i64,
-    last_touched_timestamp: i64,
-    lease_expires_at: i64,
-    lease_state: []const u8,
-    sync_level: []const u8,
-    staged_table_count: i64,
-    staged_read_count: i64,
-    staged_write_count: i64,
-    staged_delete_count: i64,
-    read_snapshot_count: i64,
-    savepoint_count: i64,
-    savepoint_limit: ?i64 = null,
-    remaining_savepoints: ?i64 = null,
-    durable: bool,
-    tables: ?[]const TransactionSessionTableDetail = null,
-    read_snapshots: ?[]const TransactionSessionReadSnapshot = null,
-    savepoint_ids: ?[]const i64 = null,
-};
-
-pub const TransactionStageReadResponse = struct {
-    status: []const u8,
-    transaction_id: []const u8,
-    snapshot: TransactionStageReadSnapshot,
-};
-
-pub const TransformOp = struct {
-    op: TransformOpType,
-    /// JSONPath to field (e.g., "$.user.name", "$.tags", or "user.name")
-    path: []const u8,
-    /// Value for operation (not required for $unset, $currentDate). Type depends on operator (number for $inc/$mul, any for $set/$setOnInsert, etc.)
-    value: ?std.json.Value = null,
-};
-
-/// Audio chunking configuration for inference, including VAD options.
-pub const InferenceAudioChunkConfig = struct {
-    /// Window duration in milliseconds for fixed-window audio chunking (default: 30000).
-    window_duration_ms: ?i64 = null,
-    /// Overlap duration in milliseconds between audio chunks (default: 0).
-    overlap_duration_ms: ?i64 = null,
-    vad: ?VADOptions = null,
-};
-
-/// A unified configuration for an embedding provider. Embedders can be configured with templates to customize how documents are converted to text before embedding. Templates use Handlebars syntax and support various built-in helpers. **Template System:** - **Syntax**: Handlebars templating (https://handlebarsjs.com/guide/) - **Caching**: Templates are automatically cached with configurable TTL (default: 5 minutes) - **Context**: Templates receive the full document as context **Built-in Helpers:** 1. **scrubHtml** - Remove script/style tags and extract clean text from HTML ```handlebars {{scrubHtml html_content}} ``` - Removes `<script>` and `<style>` tags - Adds newlines after block elements (p, div, h1-h6, li, etc.) - Returns plain text with preserved readability 2. **eq** - Equality comparison for conditionals ```handlebars {{#if (eq status "active")}}Active user{{/if}} {{#if (eq @key "special")}}Special field{{/if}} ``` 3. **media** - GenKit dotprompt media directive for multimodal content ```handlebars {{media url=imageDataURI}} {{media url=this.image_url}} {{media url="https://example.com/image.jpg"}} {{media url="s3://endpoint/bucket/image.png"}} {{media url="file:///path/to/image.jpg"}} ``` **Supported URL Schemes:** - `data:` - Base64 encoded data URIs (e.g., `data:image/jpeg;base64,...`) - `http://` / `https://` - Web URLs with automatic content type detection - `file://` - Local filesystem paths - `s3://` - S3-compatible storage (format: `s3://endpoint/bucket/key`) **Automatic Content Processing:** - **Images**: Downloaded, resized (if needed), converted to data URIs - **PDFs**: Text extracted or first page rendered as image - **HTML**: Readable text extracted using Mozilla Readability **Security Controls:** Downloads are protected by content security settings (see Configuration Reference): - Allowed host whitelist - Private IP blocking (prevents SSRF attacks) - Download size limits (default: 100MB) - Download timeouts (default: 30s) - Image dimension limits (default: 2048px, auto-resized) See: https://antfly.io/docs/configuration#security--cors 4. **encodeToon** - Encode data in TOON format (Token-Oriented Object Notation) ```handlebars {{encodeToon this.fields}} {{encodeToon this.fields lengthMarker=false indent=4}} {{encodeToon this.fields delimiter="\t"}} ``` **What is TOON?** TOON is a compact, human-readable format designed for passing structured data to LLMs. It provides **30-60% token reduction** compared to JSON while maintaining high LLM comprehension accuracy. **Key Features:** - Compact syntax using `:` for key-value pairs - Array length markers: `tags[#3]: ai,search,ml` - Tabular format for uniform data structures - Optimized for LLM parsing and understanding - Maintains human readability **Benefits:** - **Lower API costs** - Reduced token usage means lower LLM API costs - **Faster responses** - Less tokens to process - **More context** - Fit more documents within token limits **Options:** - `lengthMarker` (bool): Add # prefix to array counts like `[#3]` (default: true) - `indent` (int): Indentation spacing for nested objects (default: 2) - `delimiter` (string): Field separator for tabular arrays (default: none, use `"\t"` for tabs) **Example output:** ``` title: Introduction to Vector Search author: Jane Doe tags[#3]: ai,search,ml metadata: edition: 2 pages: 450 ``` **Default in RAG:** TOON is the default format for document rendering in RAG queries. **References:** - TOON Specification: https://github.com/toon-format/toon - Go Implementation: https://github.com/alpkeskin/gotoon **Template Examples:** Document with metadata: ```handlebars Title: {{metadata.title}} Date: {{metadata.date}} Tags: {{#each metadata.tags}}{{this}}, {{/each}} {{content}} ``` HTML content extraction: ```handlebars Product: {{name}} Description: {{scrubHtml description_html}} Price: ${{price}} ``` Multimodal with image: ```handlebars Product: {{title}} {{media url=image}} Description: {{description}} ``` Conditional formatting: ```handlebars {{title}} {{#if author}}By: {{author}}{{/if}} {{#if (eq category "premium")}}⭐ Premium Content{{/if}} {{body}} ``` **Environment Variables:** - `GEMINI_API_KEY` - API key for Google AI - `OPENAI_API_KEY` - API key for OpenAI - `OPENAI_BASE_URL` - Base URL for OpenAI-compatible APIs - `OLLAMA_HOST` - Ollama server URL (e.g., http://localhost:11434) **Importing Pre-computed Embeddings:** You can import existing embeddings (from OpenAI, Cohere, or any provider), but only for indexes configured with `external: true`. External indexes accept vectors written directly through the document `_embeddings` field and do not generate prompts from `field` or `template`. **Steps:** 1. Create an embeddings index with `external: true` 2. For dense indexes, set the index `dimension` 3. Write documents with `_embeddings: { "<indexName>": [...<embedding>...] }` **Example:** ```json { "title": "My Document", "content": "Document text...", "_embeddings": { "my_vector_index": [0.1, 0.2, 0.3, ...] } } ``` **Delete Behavior:** - Use `"_embeddings": { "<indexName>": null }` to delete a stored external vector - Omitting `_embeddings[<indexName>]` leaves the existing vector unchanged **Use Cases:** - Migrating from another vector database with existing embeddings - Using embeddings generated by external systems - Importing pre-computed OpenAI, Cohere, or other provider embeddings - Batch processing embeddings offline before ingestion
-pub const EmbedderConfig = struct {
-    /// The Google Cloud project ID (optional for Gemini API, required for Vertex AI).
-    project_id: ?[]const u8 = null,
-    /// The Google Cloud location (e.g., 'us-central1'). Required for Vertex AI, optional for Gemini API.
-    location: ?[]const u8 = null,
-    /// The name of the embedding model to use.
-    model: ?[]const u8 = null,
-    /// The dimension of the embedding vector (768, 1536, or 3072 recommended).
-    dimension: ?i64 = null,
-    /// The Google API key. Can also be set via GEMINI_API_KEY environment variable.
-    api_key: ?[]const u8 = null,
-    /// The URL of the Google API endpoint (optional, uses default if not specified).
-    url: ?[]const u8 = null,
-    /// Path to service account JSON key file. Alternative to ADC for non-GCP environments.
-    credentials_path: ?[]const u8 = null,
-    /// Output dimension for the embedding (uses MRL for dimension reduction). Recommended: 256, 512, 1024, 1536, or 3072.
-    dimensions: ?i64 = null,
-    /// The AWS region for the Bedrock service (e.g., 'us-east-1').
-    region: ?[]const u8 = null,
-    /// Cohere Bedrock input type, such as search_document, search_query, classification, or clustering.
-    input_type: ?[]const u8 = null,
-    /// Cohere Bedrock truncate behavior.
-    truncate: ?[]const u8 = null,
-    /// Whether to strip new lines from the input text before embedding.
-    strip_new_lines: ?bool = null,
-    /// The batch size for embedding requests to optimize throughput.
-    batch_size: ?i64 = null,
-    /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
-    api_url: ?[]const u8 = null,
-    provider: EmbedderProvider,
-    /// Declare that this model supports non-text content (images, audio, video, PDFs), even if the model isn't in Antfly's built-in model registry yet. When `true`, Antfly treats the model as multimodal and will send binary content (images, audio, etc.) to the provider instead of extracting text. The provider's API is still responsible for accepting the content — this flag just tells Antfly not to strip it. Not needed for models already in the registry (e.g., `multimodalembedding`, `gemini-embedding-2-preview`, `clip-*`, `clipclap`). **Example:** ```json { "provider": "vertex", "model": "some-future-multimodal-model", "multimodal": true } ```
-    multimodal: ?bool = null,
-};
-
-/// A unified configuration for a generative AI provider.
-pub const GeneratorConfig = struct {
-    /// The Google Cloud project ID.
-    project_id: ?[]const u8 = null,
-    /// The Google Cloud location (e.g., 'us-central1').
-    location: ?[]const u8 = null,
-    /// The name of the generative model to use.
-    model: ?[]const u8 = null,
-    /// Controls randomness in generation (0.0-2.0).
-    temperature: ?f32 = null,
-    /// Maximum number of tokens to generate.
-    max_tokens: ?i64 = null,
-    /// Nucleus sampling parameter.
-    top_p: ?f32 = null,
-    /// Top-k sampling parameter.
-    top_k: ?i64 = null,
-    /// The Google API key.
-    api_key: ?[]const u8 = null,
-    /// The URL of the Google API endpoint.
-    url: ?[]const u8 = null,
-    /// Path to service account JSON key file.
-    credentials_path: ?[]const u8 = null,
-    /// HTTP response timeout in seconds for Ollama API calls.
-    timeout: ?i64 = null,
-    /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
-    api_url: ?[]const u8 = null,
-    /// Penalty for token frequency (-2.0 to 2.0).
-    frequency_penalty: ?f32 = null,
-    /// Penalty for token presence (-2.0 to 2.0).
-    presence_penalty: ?f32 = null,
-    /// Array of model identifiers for fallback routing. Either model or models must be provided.
-    models: ?[]const []const u8 = null,
-    /// The AWS region for the Bedrock service.
-    region: ?[]const u8 = null,
-    provider: GeneratorProvider,
-};
-
-/// A unified configuration for a reranking provider.
-pub const RerankerConfig = struct {
-    provider: RerankerProvider,
-    /// Field name to extract from documents for reranking.
-    field: ?[]const u8 = null,
-    /// Handlebars template to render document text for reranking.
-    template: ?[]const u8 = null,
-    /// The name of the reranking model (e.g., cross-encoder model name).
-    model: ?[]const u8 = null,
-    /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
-    url: ?[]const u8 = null,
-    /// The Cohere API key. Can also be set via COHERE_API_KEY environment variable.
-    api_key: ?[]const u8 = null,
-    /// Number of most relevant documents to return. If not specified, returns all documents with scores.
-    top_n: ?i64 = null,
-    /// Maximum number of chunks per document for long document handling.
-    max_chunks_per_doc: ?i64 = null,
-    /// Google Cloud project ID. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
-    project_id: ?[]const u8 = null,
-    /// Path to service account JSON file. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS environment variable.
-    credentials_path: ?[]const u8 = null,
-};
-
-/// A unified configuration for web search providers. Each provider has specific configuration requirements. Use the appropriate provider-specific config or set common options at the top level. **Environment Variables (fallbacks):** - EXA_API_KEY - SERPER_API_KEY - TAVILY_API_KEY - BRAVE_API_KEY - YOU_API_KEY - LINKUP_API_KEY - GOOGLE_APPLICATION_CREDENTIALS, GOOGLE_CLOUD_PROJECT, GOOGLE_CLOUD_LOCATION
-pub const WebSearchConfig = struct {
-    provider: WebSearchProvider,
-    /// Provider API key or secret reference. Prefer named web_search connections for production use.
-    api_key: ?[]const u8 = null,
-    /// Provider endpoint override when applicable
-    endpoint: ?[]const u8 = null,
-    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
-    project_id: ?[]const u8 = null,
-    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
-    location: ?[]const u8 = null,
-    /// Agent Search data store ID for provider vertex.
-    data_store: ?[]const u8 = null,
-    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
-    serving_config: ?[]const u8 = null,
-    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
-    credentials_path: ?[]const u8 = null,
-    /// Maximum number of search results to return
-    max_results: ?i64 = null,
-    /// Request timeout in milliseconds
-    timeout_ms: ?i64 = null,
-    /// Enable safe search filtering
-    safe_search: ?bool = null,
-    /// Preferred language for results (e.g., 'en', 'es', 'fr')
-    language: ?[]const u8 = null,
-    /// Preferred region for results (e.g., 'us', 'uk', 'de')
-    region: ?[]const u8 = null,
-    /// Ask the provider to return extracted page content when supported
-    include_content: ?bool = null,
-    /// Ask the provider to return highlighted passages when supported
-    include_highlights: ?bool = null,
-};
-
-pub const SSEStepCompleted = AgentStep;
-
-/// A rule for mapping dynamically detected fields. Templates are checked in order and the first matching template's mapping is used.
-pub const DynamicTemplate = struct {
-    /// Optional identifier for the template (useful for debugging)
-    name: ?[]const u8 = null,
-    /// Glob pattern for field name (last path element). Supports * and ** wildcards. Example: "*_text" matches "title_text", "body_text"
-    match: ?[]const u8 = null,
-    /// Exclusion pattern for field name. If it matches, the template is skipped. Example: "skip_*" would exclude fields like "skip_this"
-    unmatch: ?[]const u8 = null,
-    /// Glob pattern for the full dotted path. Supports ** for matching multiple segments. Example: "metadata.**" matches "metadata.author", "metadata.tags.primary"
-    path_match: ?[]const u8 = null,
-    /// Path exclusion pattern. If it matches the full path, the template is skipped.
-    path_unmatch: ?[]const u8 = null,
-    /// Filter by detected JSON type
-    match_mapping_type: ?[]const u8 = null,
-    mapping: ?TemplateFieldMapping = null,
-};
-
-/// Bounded page of table repair issues.
-pub const TableRepairIssueList = struct {
-    /// Table whose repair queue was listed.
-    table: []const u8,
-    target: RepairTarget,
-    /// Effective page limit.
-    limit: i64,
-    /// Number of repair records scanned while building this page.
-    scanned: i64,
-    /// Number of table groups touched while building this page.
-    groups_scanned: i64,
-    /// Whether another page is available.
-    has_more: bool,
-    /// Opaque cursor for the next page when has_more is true.
-    next_cursor: ?[]const u8 = null,
-    issues: []const TableRepairIssue,
-};
-
-pub const TransactionSessionCommitResponse = struct {
-    /// Whether the transaction was committed or aborted due to a conflict
-    status: []const u8,
-    /// Details about the conflict that caused an abort (only present when status is "aborted")
-    conflict: ?std.json.Value = null,
-    /// Per-table batch results (only present when status is "committed")
-    tables: ?std.json.ArrayHashMap(BatchResponse) = null,
-    transaction_id: []const u8,
-};
-
-pub const MultiMatchQuery = struct {
-    multi_match: MultiMatchBody,
-};
-
-pub const ClusterTopology = struct {
-    health: ClusterHealth,
-    /// Optional message providing details about the health status
-    message: ?[]const u8 = null,
-    /// Indicates whether authentication is enabled for the cluster
-    auth_enabled: ?bool = null,
-    /// Indicates whether the cluster is running in single-node swarm mode
-    swarm_mode: ?bool = null,
-    secret_store: ?SecretStoreStatus = null,
-    data: ClusterDataStatus,
-};
-
-/// Available derived document artifact manifests for a source document.
-pub const DocumentArtifactManifestList = struct {
-    /// Stable identity of the source document.
-    document_id: []const u8,
-    artifacts: []const DocumentArtifactManifest,
-};
-
-pub const TraverseResponse = struct {
-    results: ?[]const TraversalResult = null,
-    /// Total number of results
-    count: ?i64 = null,
-};
-
-/// A step in a graph pattern query
-pub const PatternStep = struct {
-    /// Name for this node (reuse alias for cycle detection)
-    alias: ?[]const u8 = null,
-    /// Filter constraints for nodes at this step
-    node_filter: ?NodeFilter = null,
-    /// Edge to traverse to reach this step (null for first step)
-    edge: ?PatternEdgeStep = null,
-};
-
-/// Table-level generated artifact enrichments configured for a table.
-pub const TableArtifactEnrichmentList = struct {
-    /// Table containing the configured artifact enrichments.
-    table_name: []const u8,
-    artifacts: []const EnrichmentConfig,
-};
-
-/// Complete evaluation result
-pub const EvalResult = struct {
-    /// Scores organized by category
-    scores: ?EvalScores = null,
-    /// Aggregate statistics
-    summary: ?EvalSummary = null,
-    /// Total evaluation duration in milliseconds
-    duration_ms: ?i64 = null,
-};
-
-pub const InstallManifest = struct {
-    scopes_supported: []const ExtensionScopeKind,
-    shapes: ?[]const DataShapeDecl = null,
-    objects: ?[]const ExtensionObjectDecl = null,
-    runtimes: ?[]const RuntimeDecl = null,
-    config_schema_json: ?[]const u8 = null,
-};
-
-pub const ExtensionMember = struct {
-    extension_name: ExtensionIdentifier,
-    scope: ExtensionScope,
-    object_kind: ExtensionObjectKind,
-    object_name: ExtensionIdentifier,
-    table_name: ?[]const u8 = null,
-    shape_kind: ?DataShapeKind = null,
-    shape_name: ?[]const u8 = null,
-    shape_version: ?[]const u8 = null,
-    owner_metadata_json: ?[]const u8 = null,
-};
-
-pub const InstallExtensionRequest = struct {
-    version: ?[]const u8 = null,
-    scope: ExtensionScope,
-    config_json: ?[]const u8 = null,
-    grants: ?[]const Capability = null,
-    dry_run: ?bool = null,
-};
-
-pub const InstalledExtension = struct {
-    name: ExtensionIdentifier,
-    package_name: ExtensionIdentifier,
-    package_version: []const u8,
-    package_digest: []const u8,
-    scope: ExtensionScope,
-    config_json: ?[]const u8 = null,
-    granted_capabilities: ?[]const Capability = null,
-    installed_at_epoch_ms: ?i64 = null,
-    status: []const u8,
-};
-
-pub const ExtractionObject = struct {
-    id: ?[]const u8 = null,
-    entities: ?[]const ExtractionEntity = null,
-    relations: ?[]const ExtractionRelation = null,
-    classifications: ?[]const ExtractionClassification = null,
-    structures: ?std.json.Value = null,
-};
-
-pub const ExtractionSchema = struct {
-    entities: ?[]const []const u8 = null,
-    relations: ?[]const ExtractionRelationSchema = null,
-    classifications: ?[]const ExtractionClassificationSchema = null,
-    structures: ?std.json.ArrayHashMap(ExtractionStructureSchema) = null,
-};
-
-pub const GeoShapeQuery = struct {
-    geometry: GeoShapeGeometry,
-    field: ?[]const u8 = null,
-    boost: ?Boost = null,
-};
-
-/// A content part for multimodal input (text, image URL, or inline media).
-pub const ContentPart = union(enum) {
-    media_content_part: *MediaContentPart,
-    image_url_content_part: *ImageURLContentPart,
-    text_content_part: *TextContentPart,
-
-    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => return null,
-        };
-        const value = try allocator.create(T);
-        value.* = parsed;
-        return value;
-    }
-
-    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
-        inline for (keys) |key| {
-            if (object.contains(key)) return true;
-        }
-        return false;
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        if (source != .object) return error.UnexpectedToken;
-        if (objectHasAnyKey(source.object, &.{
-            "type",
-            "data",
-            "mime_type",
-        })) {
-            if (try parseStructuralVariant(MediaContentPart, allocator, source, options)) |parsed| return .{ .media_content_part = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
-            "type",
-            "image_url",
-        })) {
-            if (try parseStructuralVariant(ImageURLContentPart, allocator, source, options)) |parsed| return .{ .image_url_content_part = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
-            "type",
-            "text",
-        })) {
-            if (try parseStructuralVariant(TextContentPart, allocator, source, options)) |parsed| return .{ .text_content_part = parsed };
-        }
-        return error.UnexpectedToken;
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        switch (self) {
-            .media_content_part => |v| try jw.write(v.*),
-            .image_url_content_part => |v| try jw.write(v.*),
-            .text_content_part => |v| try jw.write(v.*),
-        }
-    }
-};
-
-pub const InferenceImageURLContentPart = ImageURLContentPart;
-
-pub const InferenceReadRequest = struct {
-    /// Name of reader model from models_dir/readers/
-    model: []const u8,
-    /// Images to read text from. Supports: - Data URIs: `data:image/png;base64,...` - URLs (if content_security allows)
-    images: []const InferenceImageURL,
-    /// Optional task prompt for document understanding models. - TrOCR: Not used (pure OCR) - Donut CORD: "<s_cord-v2>" for receipt parsing - Donut DocVQA: "<s_docvqa><s_question>What is the total?</s_question><s_answer>" - Florence-2: "<OCR>" for OCR, "<CAPTION>" for captioning - Pix2Struct: "What type of document is this?" - Moondream: "Describe this image."
-    prompt: ?[]const u8 = null,
-    /// Maximum tokens to generate
-    max_tokens: ?i64 = null,
-};
-
-pub const InferencePredictorsResponse = struct {
-    /// Response object type.
-    object: []const u8,
-    /// Traditional ML predictors keyed by predictor name.
-    predictors: std.json.ArrayHashMap(InferencePredictorInfo),
-};
-
-pub const Connection = struct {
-    /// Stable resource identifier for this connection. Config-derived connections synthesize this from the source config path.
-    id: []const u8,
-    /// Human-readable short name for this connection instance.
-    name: []const u8,
-    /// Optional display name for UIs.
-    display_name: ?[]const u8 = null,
-    /// Provider token for connection kinds that have a provider-level service identity, such as web_search.
-    provider: ?[]const u8 = null,
-    kind: ConnectionKind,
-    status: ConnectionStatus,
-    /// Failure detail when status is "error".
-    @"error": ?[]const u8 = null,
-    /// Namespaced actions and workflow uses this connection supports, such as models.embed, content.fetch, objects.read, or cdc.read_stream.
-    capabilities: []const []const u8,
-    /// Where this connection was configured, e.g. "config:embedders/openai-small" or "table:docs/index:body_vec".
-    sources: ?[]const []const u8 = null,
-    inference: ?InferenceConnection = null,
-    web_search: ?WebSearchConnection = null,
-    external_io: ?ExternalIoConnection = null,
-    cdc: ?CdcConnection = null,
-};
-
-/// OpenAI-compatible embedding response with a polymorphic `embedding` field for dense or sparse vectors
-pub const InferenceEmbedResponse = struct {
-    /// Object type, always "list"
-    object: []const u8,
-    /// List of embedding objects
-    data: []const InferenceEmbeddingObject,
-    /// Model used for embedding generation
-    model: []const u8,
-    usage: InferenceEmbeddingUsage,
-};
-
-pub const InferenceConfig = struct {
-    /// URL of the Antfly inference embedding/chunking service
-    api_url: []const u8,
-    /// API key used when calling an authenticated shared Antfly inference API.
-    api_key: ?[]const u8 = null,
-    /// Base directory containing model subdirectories. Antfly inference auto-discovers models from: - `{models_dir}/embedders/` - Embedding models (ONNX) - `{models_dir}/chunkers/` - Chunking models (ONNX) - `{models_dir}/rerankers/` - Reranking models (ONNX) - `{models_dir}/recognizers/` - Recognition models (ONNX) - `{models_dir}/rewriters/` - Seq2Seq rewriter models (ONNX) Defaults to ~/.antfly/inference/models (set via viper). If not set, only built-in fixed chunking is available.
-    models_dir: ?[]const u8 = null,
-    /// Base directory containing Traditional ML predictor subdirectories. The `/ml/v1/*` API auto-discovers predictors from `{ml_dir}/{name}/tabular_model.json`. Defaults to ~/.antfly/inference/ml.
-    ml_dir: ?[]const u8 = null,
-    /// Security settings for downloading content from URLs (e.g., images for CLIP models). Controls allowed hosts, private IP blocking, download limits, and timeouts.
-    content_security: ?InferenceContentSecurityConfig = null,
-    /// S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
-    s3_credentials: ?InferenceCredentials = null,
-    /// How long to keep models loaded in memory after last use (Ollama-compatible). Models are automatically unloaded after this duration of inactivity. Use Go duration format: "5m" (5 minutes), "1h" (1 hour), "0" (eager loading). Defaults to "5m" (lazy loading) like Ollama. Set to "0" to explicitly enable eager loading where all models are loaded at startup and never unloaded.
-    keep_alive: ?[]const u8 = null,
-    /// Maximum total models loaded across all registry types (embedders, rerankers, generators, chunkers, etc.). When the limit is reached, the least-recently-used idle model from any registry is evicted to make room. Set to 0 for unlimited (default).
-    max_loaded_models: ?i64 = null,
-    /// Number of concurrent inference pipelines per model. Each pipeline loads a copy of the model, so higher values use more memory but allow more concurrent requests. Note: pool_size multiplies per-model memory independently of max_loaded_models.
-    pool_size: ?i64 = null,
-    /// Backend priority order for model loading with optional device specifiers. Format: `backend` or `backend:device` where device defaults to `auto`. Antfly inference tries entries in order and uses the first available backend+device combination that supports the model. **Examples**: - `["native", "onnx", "xla"]` - Try backends with auto device detection - `["cuda", "onnx:cuda", "xla:tpu", "native"]` - Prefer GPU, fall back to CPU
-    backend_priority: ?[]const InferenceBackendPriorityEntry = null,
-    /// Maximum number of concurrent inference requests allowed. Additional requests will be queued up to max_queue_size. Set to 0 for unlimited (default).
-    max_concurrent_requests: ?i64 = null,
-    /// Maximum number of requests to queue when max_concurrent_requests is reached. When the queue is full, new requests receive 503 Service Unavailable with Retry-After header. Set to 0 for unlimited queue (default). Only effective when max_concurrent_requests > 0.
-    max_queue_size: ?i64 = null,
-    /// Maximum time to wait for a request to complete, including queue wait time. Use Go duration format: "30s", "1m", "0" (no timeout, default). Requests exceeding this timeout receive 504 Gateway Timeout.
-    request_timeout: ?[]const u8 = null,
-    /// Models to preload and warm at startup. Generators run a tiny generation request so native/Metal weights, KV setup, and kernels use the same budgeted path as request-time generation. Other model kinds use the best available warm path for that kind.
-    preload: ?[]const InferenceModelRef = null,
-    /// Maximum memory (in MB) to use for loaded models. When this limit is approached, least recently used models are unloaded. Set to 0 for unlimited (default). This is an advisory limit - actual memory usage depends on model sizes and may temporarily exceed this value. Works alongside max_loaded_models for fine-grained control.
-    max_memory_mb: ?i64 = null,
-    /// Per-model loading strategy overrides. Maps model names to their loading strategy. Models not in this map use the default strategy based on keep_alive: - If keep_alive>0 (default "5m"): lazy loading (load on demand, unload after idle) - If keep_alive="0": eager loading (load at startup, never unload) When a model has strategy "eager" in this map: - It is loaded at startup through the same startup warmup path - It is never unloaded, even when keep_alive>0 (pinned in memory) This allows mixing eager and lazy models in the same pool.
-    model_strategies: ?std.json.ArrayHashMap([]const u8) = null,
-    /// Whether the dashboard should show model download commands. Defaults to true for standalone/swarm mode. Set to false in managed deployments (e.g., Kubernetes operator) where models are managed externally.
-    allow_downloads: ?bool = null,
-    log: ?InferenceschemasConfig = null,
-};
-
-/// A chunk result object. Text chunks have mime_type text/plain.
-pub const InferenceChunkObject = struct {
-    /// The chunk text content
-    text: ?[]const u8 = null,
-    /// Character position in original text where chunk starts
-    start_char: ?i64 = null,
-    /// Character position in original text where chunk ends (exclusive)
-    end_char: ?i64 = null,
-    /// Base64-encoded binary data (valid WAV, PNG, etc.)
-    data: ?[]const u8 = null,
-    /// Audio: window start time in milliseconds
-    start_time_ms: ?f32 = null,
-    /// Audio: window end time in milliseconds
-    end_time_ms: ?f32 = null,
-    /// Animation: frame number
-    frame_index: ?i64 = null,
-    /// Animation: display delay in milliseconds
-    frame_delay_ms: ?i64 = null,
-    /// Sequence number of the chunk (0, 1, 2, ...)
-    id: ?i64 = null,
-    /// MIME type: text/plain, audio/wav, image/png, etc.
-    mime_type: ?[]const u8 = null,
-    object: []const u8,
-    /// Position of this chunk object in the response data array.
-    index: i64,
-};
-
-pub const InferenceReadObject = struct {
-    /// Extracted text from the image
-    text: []const u8,
-    /// Structured fields extracted by document understanding models (Donut, Florence-2). Fields are flattened with dot notation for nested structures. Only present for models that output structured data.
-    fields: ?std.json.ArrayHashMap([]const u8) = null,
-    /// Individual text regions with bounding boxes and recognized text. Populated by multi-stage OCR models (Surya, PaddleOCR).
-    regions: ?[]const InferenceTextRegion = null,
-    object: []const u8,
-    /// Original input image index.
-    index: i64,
-};
-
-/// Delta content for streaming
-pub const InferenceGenerateDelta = struct {
-    role: ?InferenceRole = null,
-    /// Token content delta
-    content: ?[]const u8 = null,
-    /// Tool call deltas for streaming tool calls
-    tool_calls: ?[]const InferenceToolCallDelta = null,
-};
-
-/// A single match from a pattern query
-pub const PatternMatch = struct {
-    /// Map of alias to matched node
-    bindings: ?std.json.ArrayHashMap(GraphResultNode) = null,
-    /// Edges traversed in this match
-    path: ?[]const PathEdge = null,
-};
-
-pub const PathFindResult = struct {
-    paths: ?[]const Path = null,
-    source: ?[]const u8 = null,
-    target: ?[]const u8 = null,
-    weight_mode: ?PathFindWeightMode = null,
-    paths_found: ?i64 = null,
-    search_time_ms: ?f64 = null,
-};
-
-/// Public metadata for an API key (secrets are never returned after creation).
-pub const ApiKey = struct {
-    /// Unique identifier for the API key.
-    key_id: []const u8,
-    /// Human-readable name for the API key.
-    name: []const u8,
-    /// Owner of the API key.
-    username: []const u8,
-    /// Optional permission scoping. If empty, inherits owner's full permissions.
-    permissions: ?[]const Permission = null,
-    /// Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing.
-    row_filter: ?std.json.ArrayHashMap(std.json.Value) = null,
-    /// When the API key was created.
-    created_at: []const u8,
-    /// When the API key expires. Null means never.
-    expires_at: ?[]const u8 = null,
-};
-
-/// Request to create a new API key.
-pub const CreateApiKeyRequest = struct {
-    /// Human-readable name for the API key.
-    name: []const u8,
-    /// Duration until expiration (e.g., '720h' for 30 days). Empty means never.
-    expires_in: ?[]const u8 = null,
-    /// Optional permission scoping. Each permission must be a subset of the creator's permissions.
-    permissions: ?[]const Permission = null,
-    /// Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing.
-    row_filter: ?std.json.ArrayHashMap(std.json.Value) = null,
-};
-
-pub const CreateUserRequest = struct {
-    /// Username for the new user. If provided in the path, this field can be omitted or must match the path parameter.
-    username: ?[]const u8 = null,
-    password: []const u8,
-    /// Optional list of initial permissions for the user.
-    initial_policies: ?[]const Permission = null,
-    /// Auth metadata available to stored row-filter policies.
-    metadata: ?std.json.ArrayHashMap(std.json.Value) = null,
-};
-
-pub const SecretList = struct {
-    secrets: []const SecretEntry,
-};
-
-/// Detailed execution profiling for a query. Present in the response when the request sets `profile: true`.
-pub const QueryProfile = struct {
-    /// Shard-level execution statistics.
-    shards: ?ShardsProfile = null,
-    /// Join execution statistics (present when query used a join).
-    join: ?JoinProfile = null,
-    /// Reranking statistics (present when a reranker was used).
-    reranker: ?RerankerProfile = null,
-    /// Result merge statistics (present for hybrid search).
-    merge: ?MergeProfile = null,
-    /// Sort execution statistics (present when the query used ordered page options and profiling was enabled).
-    sort: ?SortProfile = null,
-};
-
-/// Configuration for the Antfly inference chunking provider. Antfly inference is a centralized HTTP service that provides chunking with multi-tier caching. The model name maps to ONNX model directory names (similar to how Ollama works). **Chunking Models:** - fixed: Simple fixed-size chunking by token count (built-in, no ONNX required) - Any other name will attempt to load from models/chunkers/{name}/ directory **Caching:** - L1: Memory cache with 2-minute TTL - L2: Persistent Pebble database - Singleflight deduplication for concurrent identical requests
-pub const AntflyChunkerConfig = struct {
-    /// Maximum number of chunks to generate per document.
-    max_chunks: ?i64 = null,
-    /// Confidence threshold for model-based chunking (0.0-1.0).
-    threshold: ?f32 = null,
-    text: ?TextChunkOptions = null,
-    audio: ?AudioChunkOptions = null,
-    /// The URL of the Inference API endpoint (e.g., 'http://localhost:8080'). Can also be set via ANTFLY_INFERENCE_URL environment variable.
-    api_url: ?[]const u8 = null,
-    /// The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/.
-    model: []const u8,
-};
-
-pub const InferenceGenerateMessage = struct {
-    role: InferenceRole,
-    /// The generated message content (null when tool_calls is present)
-    content: ?[]const u8 = null,
-    /// Tool calls made by the model (only present when finish_reason is tool_calls)
-    tool_calls: ?[]const ToolCall = null,
-};
-
-/// In-place document transformation using MongoDB-style operators. Transforms are applied atomically at the storage layer, eliminating read-modify-write races. **Important:** Transform results are NOT validated against the table schema. This improves performance but means it's possible to create invalid documents. Use with care and ensure your operations maintain schema compliance.
-pub const Transform = struct {
-    /// Document key (must be a string, not an object like inserts)
-    key: []const u8,
-    /// List of operations to apply in sequence
-    operations: []const TransformOp,
-    /// If true, create document if it doesn't exist (like MongoDB upsert)
-    upsert: ?bool = null,
-};
-
-/// Configuration for chunking requests to Antfly inference. Combines shared text options with inference-specific audio/VAD options.
-pub const InferenceChunkConfig = struct {
-    /// The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/.
-    model: ?[]const u8 = null,
-    /// Maximum number of chunks to generate per document.
-    max_chunks: ?i64 = null,
-    /// Confidence threshold for model-based chunking (0.0-1.0). Used by ONNX text models and VAD audio models.
-    threshold: ?f32 = null,
-    text: ?TextChunkOptions = null,
-    audio: ?InferenceAudioChunkConfig = null,
-};
-
-/// A single link in a generator chain with optional retry and condition
-pub const ChainLink = struct {
-    generator: GeneratorConfig,
-    /// Retry configuration for this generator
-    retry: ?RetryConfig = null,
-    /// When to try the next generator in chain
-    condition: ?ChainCondition = null,
-};
-
-/// Configuration for inline evaluation of query results. Add to RetrievalAgentRequest, QueryRequest, or other evaluation-capable request schemas.
-pub const EvalConfig = struct {
-    /// List of evaluators to run
-    evaluators: ?[]const EvaluatorName = null,
-    /// LLM configuration for judge-based evaluators. Falls back to default if not specified.
-    judge: ?GeneratorConfig = null,
-    /// Ground truth data for retrieval metrics
-    ground_truth: ?GroundTruth = null,
-    /// Evaluation options (k, thresholds, etc.)
-    options: ?EvalOptions = null,
-};
-
-/// Standalone evaluation request for POST /eval endpoint. Useful for testing evaluators without running a query.
-pub const EvalRequest = struct {
-    /// List of evaluators to run
-    evaluators: []const EvaluatorName,
-    /// LLM configuration for judge-based evaluators
-    judge: ?GeneratorConfig = null,
-    /// Ground truth data
-    ground_truth: ?GroundTruth = null,
-    /// Evaluation options
-    options: ?EvalOptions = null,
-    /// Original query/input to evaluate
-    query: ?[]const u8 = null,
-    /// Generated output to evaluate (optional for retrieval-only)
-    output: ?[]const u8 = null,
-    /// Retrieved documents/context
-    context: ?[]const std.json.Value = null,
-    /// IDs of retrieved documents (for retrieval metrics)
-    retrieved_ids: ?[]const []const u8 = null,
-};
-
-/// Configuration for graph index type
-pub const GraphIndexConfig = struct {
-    /// Configuration for generating node summaries (enables tree navigation in Retrieval Agent)
-    summarizer: ?GeneratorConfig = null,
-    /// Handlebars template for generating summarizer input text. Uses document fields as template variables. Same pattern as EmbeddingsConfig template.
-    template: ?[]const u8 = null,
-    /// List of edge types with their configurations
-    edge_types: ?[]const EdgeTypeConfig = null,
-    /// Maximum number of edges per document (0 = unlimited)
-    max_edges_per_document: ?i64 = null,
-};
-
-pub const QueryBuilderRequest = struct {
-    /// Correlation identifier for a bounded agent interaction. In Phase 1 this is echoed back to the client but does not imply server-side session persistence.
-    session_id: ?[]const u8 = null,
-    /// Structured answers provided by the user as part of client-carried continuation.
-    decisions: ?[]const AgentDecision = null,
-    /// If true, the agent may return clarification questions when needed.
-    interactive: ?bool = null,
-    /// Additive bounded-agent field for the query builder. Phase 1 remains a single-pass generation flow, but this field is echoed in result accounting.
-    max_internal_iterations: ?i64 = null,
-    /// Maximum number of clarification turns the agent may request from the user.
-    max_user_clarifications: ?i64 = null,
-    /// Force a user-facing decision after this many unresolved internal passes.
-    require_decision_after: ?i64 = null,
-    /// Optional example documents to help the query builder infer field shapes and representative values. When omitted and the table has data but no schema, the server samples up to one document automatically.
-    example_documents: ?[]const std.json.Value = null,
-    /// Name of the table to build query for. If provided, uses table schema for field context.
-    table: ?[]const u8 = null,
-    /// Natural language description of the search intent
-    intent: []const u8,
-    /// List of searchable field names to consider. Overrides table schema if provided.
-    schema_fields: ?[]const []const u8 = null,
-    /// Optional strategy hint for the coordinator. Suggested values are `auto`, `full_text`, `semantic`, `hybrid`, `filter`, `tree`, and `graph`. Unknown values are accepted for forward compatibility and may fall back to `auto`.
-    mode: ?[]const u8 = null,
-    /// Preferred output artifact. Suggested values are `query_request`, `bleve`, and `filter_query`. The compatibility `query` field is still returned for existing clients.
-    output: ?[]const u8 = null,
-    /// Optional execution constraints for the coordinator, such as `limit`, `allowed_fields`, `prefer_indexes`, and `require_executable`.
-    constraints: ?std.json.Value = null,
-    generator: ?GeneratorConfig = null,
-};
-
-/// Configuration for Brave Search API. Brave Search provides privacy-focused search with its own independent index. **Setup:** 1. Sign up at https://brave.com/search/api/ 2. Get API key from dashboard **Docs:** https://api.search.brave.com/app/documentation
-pub const BraveSearchConfig = struct {
-    provider: WebSearchProvider,
-    /// Provider API key or secret reference. Prefer named web_search connections for production use.
-    api_key: ?[]const u8 = null,
-    /// Provider endpoint override when applicable
-    endpoint: ?[]const u8 = null,
-    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
-    project_id: ?[]const u8 = null,
-    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
-    location: ?[]const u8 = null,
-    /// Agent Search data store ID for provider vertex.
-    data_store: ?[]const u8 = null,
-    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
-    serving_config: ?[]const u8 = null,
-    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
-    credentials_path: ?[]const u8 = null,
-    /// Maximum number of search results to return
-    max_results: ?i64 = null,
-    /// Request timeout in milliseconds
-    timeout_ms: ?i64 = null,
-    /// Enable safe search filtering
-    safe_search: ?bool = null,
-    /// Preferred language for results (e.g., 'en', 'es', 'fr')
-    language: ?[]const u8 = null,
-    /// Preferred region for results (e.g., 'us', 'uk', 'de')
-    region: ?[]const u8 = null,
-    /// Ask the provider to return extracted page content when supported
-    include_content: ?bool = null,
-    /// Ask the provider to return highlighted passages when supported
-    include_highlights: ?bool = null,
-    /// Freshness filter: pd=day, pw=week, pm=month, py=year
-    freshness: ?[]const u8 = null,
-    /// Include text decorations (bold, italic markers)
-    text_decorations: ?bool = null,
-    /// Enable spellcheck suggestions
-    spellcheck: ?bool = null,
-};
-
-/// Configuration for retrieval agent tools. If `enabled_tools` is empty/omitted, retrieval agents default to all retrieval tools available for the request. Explicit retrieval policies should use semantic_search for vector retrieval. For models that don't support native tool calling (e.g., Ollama), a prompt-based fallback is used with structured output parsing.
-pub const ChatToolsConfig = struct {
-    /// List of tools to enable. If empty, retrieval agents default to all retrieval tools available for the request.
-    enabled_tools: ?[]const ChatToolName = null,
-    /// Inline web search provider configuration. Prefer web_search_connection for configured production agents; inline config remains useful for CLI/dev requests. See specs/openapi/antfly/websearch.yaml for provider-specific options.
-    web_search_config: ?WebSearchConfig = null,
-    /// Name of a configured connections.<id> resource with kind web_search. Request-level tool options may reduce scope, but cannot expand the connection's configured capabilities or policy.
-    web_search_connection: ?[]const u8 = null,
-    /// URL fetching configuration. See specs/openapi/antfly/websearch.yaml for available options and security controls.
-    fetch_config: ?FetchConfig = null,
-    /// Maximum number of tool call iterations per turn. Prevents infinite loops in tool execution.
-    max_tool_iterations: ?i64 = null,
-};
-
-/// Configuration for Exa neural/semantic web search. Exa is optimized for semantic web search, highlights, and retrieved page contents for RAG and agent workflows. **Setup:** 1. Sign up at https://exa.ai 2. Get API key from dashboard **Docs:** https://docs.exa.ai
-pub const ExaSearchConfig = struct {
-    provider: WebSearchProvider,
-    /// Provider API key or secret reference. Prefer named web_search connections for production use.
-    api_key: ?[]const u8 = null,
-    /// Provider endpoint override when applicable
-    endpoint: ?[]const u8 = null,
-    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
-    project_id: ?[]const u8 = null,
-    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
-    location: ?[]const u8 = null,
-    /// Agent Search data store ID for provider vertex.
-    data_store: ?[]const u8 = null,
-    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
-    serving_config: ?[]const u8 = null,
-    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
-    credentials_path: ?[]const u8 = null,
-    /// Maximum number of search results to return
-    max_results: ?i64 = null,
-    /// Request timeout in milliseconds
-    timeout_ms: ?i64 = null,
-    /// Enable safe search filtering
-    safe_search: ?bool = null,
-    /// Preferred language for results (e.g., 'en', 'es', 'fr')
-    language: ?[]const u8 = null,
-    /// Preferred region for results (e.g., 'us', 'uk', 'de')
-    region: ?[]const u8 = null,
-    /// Ask the provider to return extracted page content when supported
-    include_content: ?bool = null,
-    /// Ask the provider to return highlighted passages when supported
-    include_highlights: ?bool = null,
-    /// Search mode to request from Exa
-    search_type: ?[]const u8 = null,
-    /// Provider-specific result count override
-    num_results: ?i64 = null,
-    /// ISO date/time lower bound for published date filtering
-    start_published_date: ?[]const u8 = null,
-    /// ISO date/time upper bound for published date filtering
-    end_published_date: ?[]const u8 = null,
-    /// Only include results from these domains
-    include_domains: ?[]const []const u8 = null,
-    /// Exclude results from these domains
-    exclude_domains: ?[]const []const u8 = null,
-};
-
-/// Configuration for Linkup Search API. Linkup is useful for web search, source retrieval, and structured research workflows. **Setup:** 1. Sign up at https://linkup.so 2. Get API key from dashboard **Docs:** https://docs.linkup.so
-pub const LinkupSearchConfig = struct {
-    provider: WebSearchProvider,
-    /// Provider API key or secret reference. Prefer named web_search connections for production use.
-    api_key: ?[]const u8 = null,
-    /// Provider endpoint override when applicable
-    endpoint: ?[]const u8 = null,
-    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
-    project_id: ?[]const u8 = null,
-    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
-    location: ?[]const u8 = null,
-    /// Agent Search data store ID for provider vertex.
-    data_store: ?[]const u8 = null,
-    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
-    serving_config: ?[]const u8 = null,
-    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
-    credentials_path: ?[]const u8 = null,
-    /// Maximum number of search results to return
-    max_results: ?i64 = null,
-    /// Request timeout in milliseconds
-    timeout_ms: ?i64 = null,
-    /// Enable safe search filtering
-    safe_search: ?bool = null,
-    /// Preferred language for results (e.g., 'en', 'es', 'fr')
-    language: ?[]const u8 = null,
-    /// Preferred region for results (e.g., 'us', 'uk', 'de')
-    region: ?[]const u8 = null,
-    /// Ask the provider to return extracted page content when supported
-    include_content: ?bool = null,
-    /// Ask the provider to return highlighted passages when supported
-    include_highlights: ?bool = null,
-    /// Search depth to request from Linkup
-    depth: ?[]const u8 = null,
-    /// Linkup response shape to request
-    output_type: ?[]const u8 = null,
-};
-
-/// Configuration for Serper.dev Google Search API. Serper provides a simpler alternative to Google Custom Search with competitive pricing and easy setup. **Setup:** 1. Sign up at https://serper.dev 2. Get API key from dashboard **Docs:** https://serper.dev/docs
-pub const SerperSearchConfig = struct {
-    provider: WebSearchProvider,
-    /// Provider API key or secret reference. Prefer named web_search connections for production use.
-    api_key: ?[]const u8 = null,
-    /// Provider endpoint override when applicable
-    endpoint: ?[]const u8 = null,
-    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
-    project_id: ?[]const u8 = null,
-    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
-    location: ?[]const u8 = null,
-    /// Agent Search data store ID for provider vertex.
-    data_store: ?[]const u8 = null,
-    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
-    serving_config: ?[]const u8 = null,
-    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
-    credentials_path: ?[]const u8 = null,
-    /// Maximum number of search results to return
-    max_results: ?i64 = null,
-    /// Request timeout in milliseconds
-    timeout_ms: ?i64 = null,
-    /// Enable safe search filtering
-    safe_search: ?bool = null,
-    /// Preferred language for results (e.g., 'en', 'es', 'fr')
-    language: ?[]const u8 = null,
-    /// Preferred region for results (e.g., 'us', 'uk', 'de')
-    region: ?[]const u8 = null,
-    /// Ask the provider to return extracted page content when supported
-    include_content: ?bool = null,
-    /// Ask the provider to return highlighted passages when supported
-    include_highlights: ?bool = null,
-    /// Type of search to perform
-    search_type: ?[]const u8 = null,
-    /// Time period filter: d=day, w=week, m=month, y=year
-    time_period: ?[]const u8 = null,
-};
-
-/// Configuration for Tavily AI Search API. Tavily is optimized for RAG and AI applications, providing pre-processed results with summaries and relevance scoring. **Setup:** 1. Sign up at https://tavily.com 2. Get API key from dashboard **Docs:** https://docs.tavily.com
-pub const TavilySearchConfig = struct {
-    provider: WebSearchProvider,
-    /// Provider API key or secret reference. Prefer named web_search connections for production use.
-    api_key: ?[]const u8 = null,
-    /// Provider endpoint override when applicable
-    endpoint: ?[]const u8 = null,
-    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
-    project_id: ?[]const u8 = null,
-    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
-    location: ?[]const u8 = null,
-    /// Agent Search data store ID for provider vertex.
-    data_store: ?[]const u8 = null,
-    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
-    serving_config: ?[]const u8 = null,
-    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
-    credentials_path: ?[]const u8 = null,
-    /// Maximum number of search results to return
-    max_results: ?i64 = null,
-    /// Request timeout in milliseconds
-    timeout_ms: ?i64 = null,
-    /// Enable safe search filtering
-    safe_search: ?bool = null,
-    /// Preferred language for results (e.g., 'en', 'es', 'fr')
-    language: ?[]const u8 = null,
-    /// Preferred region for results (e.g., 'us', 'uk', 'de')
-    region: ?[]const u8 = null,
-    /// Ask the provider to return extracted page content when supported
-    include_content: ?bool = null,
-    /// Ask the provider to return highlighted passages when supported
-    include_highlights: ?bool = null,
-    /// Search depth: - basic: Fast search with standard results - advanced: Deeper search with more comprehensive results
-    search_depth: ?[]const u8 = null,
-    /// Include AI-generated answer summary
-    include_answer: ?bool = null,
-    /// Include raw HTML content of pages
-    include_raw_content: ?bool = null,
-    /// Only include results from these domains
-    include_domains: ?[]const []const u8 = null,
-    /// Exclude results from these domains
-    exclude_domains: ?[]const []const u8 = null,
-};
-
-/// Configuration for Google Cloud Agent Search / Vertex AI Search. Use this for bounded Google Cloud search over configured data stores or verified websites. The provider token is `vertex` to match Antfly's existing Google Cloud provider convention. **Setup:** 1. Enable Discovery Engine API in Google Cloud 2. Create an Agent Search app/data store 3. Grant service account access to query the serving config **Docs:** https://cloud.google.com/generative-ai-app-builder/docs
-pub const VertexSearchConfig = struct {
-    provider: WebSearchProvider,
-    /// Provider API key or secret reference. Prefer named web_search connections for production use.
-    api_key: ?[]const u8 = null,
-    /// Provider endpoint override when applicable
-    endpoint: ?[]const u8 = null,
-    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
-    project_id: ?[]const u8 = null,
-    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
-    location: ?[]const u8 = null,
-    /// Agent Search data store ID for provider vertex.
-    data_store: ?[]const u8 = null,
-    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
-    serving_config: ?[]const u8 = null,
-    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
-    credentials_path: ?[]const u8 = null,
-    /// Maximum number of search results to return
-    max_results: ?i64 = null,
-    /// Request timeout in milliseconds
-    timeout_ms: ?i64 = null,
-    /// Enable safe search filtering
-    safe_search: ?bool = null,
-    /// Preferred language for results (e.g., 'en', 'es', 'fr')
-    language: ?[]const u8 = null,
-    /// Preferred region for results (e.g., 'us', 'uk', 'de')
-    region: ?[]const u8 = null,
-    /// Ask the provider to return extracted page content when supported
-    include_content: ?bool = null,
-    /// Ask the provider to return highlighted passages when supported
-    include_highlights: ?bool = null,
-    /// Google Cloud search service flavor
-    service: ?[]const u8 = null,
-};
-
-/// Configuration for You.com Search API. You.com is useful for agentic search and research-oriented result retrieval. **Setup:** 1. Sign up for You.com API access 2. Get API key from dashboard **Docs:** https://api.you.com
-pub const YouSearchConfig = struct {
-    provider: WebSearchProvider,
-    /// Provider API key or secret reference. Prefer named web_search connections for production use.
-    api_key: ?[]const u8 = null,
-    /// Provider endpoint override when applicable
-    endpoint: ?[]const u8 = null,
-    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
-    project_id: ?[]const u8 = null,
-    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
-    location: ?[]const u8 = null,
-    /// Agent Search data store ID for provider vertex.
-    data_store: ?[]const u8 = null,
-    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
-    serving_config: ?[]const u8 = null,
-    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
-    credentials_path: ?[]const u8 = null,
-    /// Maximum number of search results to return
-    max_results: ?i64 = null,
-    /// Request timeout in milliseconds
-    timeout_ms: ?i64 = null,
-    /// Enable safe search filtering
-    safe_search: ?bool = null,
-    /// Preferred language for results (e.g., 'en', 'es', 'fr')
-    language: ?[]const u8 = null,
-    /// Preferred region for results (e.g., 'us', 'uk', 'de')
-    region: ?[]const u8 = null,
-    /// Ask the provider to return extracted page content when supported
-    include_content: ?bool = null,
-    /// Ask the provider to return highlighted passages when supported
-    include_highlights: ?bool = null,
-};
-
-/// Schema definition for a table with multiple document types
-pub const TableSchema = struct {
-    /// Version of the schema. Used for migrations.
-    version: ?i64 = null,
-    /// Default type to use from the document_types.
-    default_type: ?[]const u8 = null,
-    /// Whether to enforce that documents must match one of the provided document types. If false, documents not matching any type will be accepted but not indexed.
-    enforce_types: ?bool = null,
-    /// A map of type names to their document json schemas.
-    document_schemas: ?std.json.ArrayHashMap(DocumentSchema) = null,
-    /// The field containing the timestamp for TTL expiration (optional). Defaults to "_timestamp" if ttl_duration is specified but ttl_field is not.
-    ttl_field: ?[]const u8 = null,
-    /// The duration after which documents should expire, based on the ttl_field timestamp (optional). Uses Go duration format (e.g., '24h', '7d', '168h').
-    ttl_duration: ?[]const u8 = null,
-    /// Rules for mapping dynamically detected fields. When a document contains fields that don't have explicit mappings and dynamic mapping is enabled, templates are evaluated in order to determine how those fields should be indexed.
-    dynamic_templates: ?[]const DynamicTemplate = null,
-};
-
-/// Declarative graph query to execute after full-text/vector searches
-pub const GraphQuery = struct {
-    type: GraphQueryType,
-    /// Graph index name (must be graph type)
-    index_name: []const u8,
-    /// Starting node(s) for the query
-    start_nodes: ?GraphNodeSelector = null,
-    /// Target nodes (for pathfinding only)
-    target_nodes: ?GraphNodeSelector = null,
-    /// Traversal/pathfinding parameters
-    params: ?GraphQueryParams = null,
-    /// Pattern steps for pattern query type
-    pattern: ?[]const PatternStep = null,
-    /// Which aliases to return from pattern query (empty = all)
-    return_aliases: ?[]const []const u8 = null,
-    /// Fetch full documents for graph results
-    include_documents: ?bool = null,
-    /// Include edge details for each node
-    include_edges: ?bool = null,
-    /// Which fields to return from documents
-    fields: ?[]const []const u8 = null,
-};
-
-pub const PackageManifest = struct {
-    manifest_api_version: []const u8,
-    name: ExtensionIdentifier,
-    version: []const u8,
-    kind: PackageKind,
-    description: ?[]const u8 = null,
-    digest: []const u8,
-    antfly_min_version: ?[]const u8 = null,
-    antfly_max_version: ?[]const u8 = null,
-    trusted: ?bool = null,
-    relocatable: ?bool = null,
-    capabilities_requested: ?[]const Capability = null,
-    dependencies: ?[]const PackageDependency = null,
-    artifacts: ?[]const PackageArtifact = null,
-    install: InstallManifest,
-    updates: ?[]const UpdateManifestRef = null,
-};
-
-pub const ExtractionResponse = struct {
-    object: []const u8,
-    model: []const u8,
-    data: []const ExtractionObject,
-    usage: ?std.json.Value = null,
-};
-
-/// Message content. Supports two formats: - Simple string: "Hello, how are you?" - Array of content parts: [{"type": "text", "text": "Hello"}]
-pub const ChatMessageContent = std.json.Value;
-
-pub const InferenceContentPart = ContentPart;
-
-/// OpenAI-compatible embedding request with inference multimodal content-part extension
-pub const InferenceEmbedRequest = struct {
-    /// Model name to use for embedding generation
-    model: []const u8,
-    /// Input content to embed. Supports: - a single string - an array of strings - an array of OpenAI-style content parts for multimodal embedding
-    input: std.json.Value,
-    /// Encoding format for the embeddings (only "float" supported)
-    encoding_format: ?[]const u8 = null,
-    /// Optional truncation size for dense embeddings. Must be a positive integer no larger than the model embedding size. Not supported for sparse models.
-    dimensions: ?i64 = null,
-    /// Optional embedding task type using Google embedding task-type names. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix.
-    task_type: ?[]const u8 = null,
-    /// Deprecated compatibility alias for task_type. search_query/query map to RETRIEVAL_QUERY; search_document/document map to RETRIEVAL_DOCUMENT; classification and clustering map to their Google task_type equivalents.
-    input_type: ?[]const u8 = null,
-};
-
-pub const ConnectionsResponse = struct {
-    connections: []const Connection,
-};
-
-pub const InferenceChunkResponse = struct {
-    /// Object type, always "list"
-    object: []const u8,
-    /// Array of chunk objects
-    data: []const InferenceChunkObject,
-    /// Chunking model actually used (may differ from requested if fallback occurred)
-    model: []const u8,
-    usage: InferenceGenerateUsage,
-    /// Whether result was served from cache
-    cache_hit: bool,
-};
-
-pub const InferenceReadResponse = struct {
-    /// Object type, always "list"
-    object: []const u8,
-    /// Read result objects, one per input image.
-    data: []const InferenceReadObject,
-    /// Name of model used for reading
-    model: []const u8,
-    usage: InferenceGenerateUsage,
-};
-
-pub const InferenceGenerateChunkChoice = struct {
-    index: i64,
-    delta: InferenceGenerateDelta,
-    finish_reason: ?InferenceFinishReason = null,
-};
-
-/// Results of a graph query
-pub const GraphQueryResult = struct {
-    type: GraphQueryType,
-    /// Result nodes
-    nodes: ?[]const GraphResultNode = null,
-    /// Result paths (for pathfinding queries)
-    paths: ?[]const Path = null,
-    /// Pattern matches (for pattern queries)
-    matches: ?[]const PatternMatch = null,
-    /// Total number of results
-    total: i64,
-    /// Query execution time
-    took: ?i64 = null,
-};
-
-/// API key creation response including the cleartext secret (shown once).
-pub const ApiKeyWithSecret = struct {
-    /// Unique identifier for the API key.
-    key_id: []const u8,
-    /// Human-readable name for the API key.
-    name: []const u8,
-    /// Owner of the API key.
-    username: []const u8,
-    /// Optional permission scoping. If empty, inherits owner's full permissions.
-    permissions: ?[]const Permission = null,
-    /// Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing.
-    row_filter: ?std.json.ArrayHashMap(std.json.Value) = null,
-    /// When the API key was created.
-    created_at: []const u8,
-    /// When the API key expires. Null means never.
-    expires_at: ?[]const u8 = null,
-    /// Cleartext secret for the API key. Store securely — it cannot be retrieved again.
-    key_secret: []const u8,
-    /// Pre-encoded credential ready for the Authorization header: base64(key_id:key_secret).
-    encoded: []const u8,
-};
-
-/// A unified configuration for a chunking provider.
-pub const ChunkerConfig = struct {
-    /// Maximum number of chunks to generate per document.
-    max_chunks: ?i64 = null,
-    /// Confidence threshold for model-based chunking (0.0-1.0).
-    threshold: ?f32 = null,
-    text: ?TextChunkOptions = null,
-    audio: ?AudioChunkOptions = null,
-    /// The URL of the Inference API endpoint (e.g., 'http://localhost:8080'). Can also be set via ANTFLY_INFERENCE_URL environment variable.
-    api_url: ?[]const u8 = null,
-    /// The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/.
-    model: ?[]const u8 = null,
-    provider: ChunkerProvider,
-    /// Controls whether chunk data is persisted to storage. When false (default), chunks are generated in memory and only embeddings are stored. When true, both chunks and embeddings are stored.
-    store_chunks: ?bool = null,
-    /// Configuration for full-text indexing of chunks in Bleve. When present (even if empty), chunks will be stored with :cft: suffix and indexed in Bleve's _chunks field. When absent, chunks use :c: suffix and are only used for vector embeddings.
-    full_text_index: ?std.json.Value = null,
-};
-
-pub const InferenceGenerateChoice = struct {
-    /// Index of this choice in the list
-    index: i64,
-    message: InferenceGenerateMessage,
-    finish_reason: InferenceFinishReason,
-    /// Log probability information (not supported, always null)
-    logprobs: ?std.json.Value = null,
-};
-
-/// Batch insert, delete, and transform operations in a single request. **Atomicity**: - **Single shard**: Operations are atomic within shard boundaries - **Multiple shards**: Uses distributed 2-phase commit (2PC) for atomic cross-shard writes **How distributed transactions work**: 1. Metadata server allocates HLC timestamp and selects coordinator shard 2. Coordinator writes transaction record, participants write intents 3. After all intents succeed, coordinator commits transaction 4. Participants are notified asynchronously to resolve intents 5. Recovery loop ensures notifications complete even after coordinator failure **Performance**: - Single-shard batches: < 5ms latency - Cross-shard transactions: ~20ms latency - Intent resolution: < 30 seconds worst-case (via recovery loop) **Guarantees**: - All writes succeed or all fail (atomicity across all shards) - Coordinator failure is recoverable (new leader resumes notifications) - Idempotent resolution (duplicate notifications are safe) **Benefits**: - Reduces network overhead compared to individual requests - More efficient indexing (updates are batched) - Automatic distributed transactions when operations span shards The inserts are upserts - existing keys are overwritten, new keys are created.
-pub const BatchRequest = struct {
-    /// Map of document IDs to document objects. Each key is the unique identifier for the document. Best practices: - Use consistent key naming schemes (e.g., "user:123", "article:456") - Key length affects storage and performance - keep them reasonably short - Keys are sorted lexicographically, so choose prefixes that support range scans
-    inserts: ?std.json.ArrayHashMap(std.json.Value) = null,
-    /// Array of document IDs to delete. Documents are removed from all indexes. Notes: - Non-existent keys are silently ignored - Deletions are processed before inserts in the same batch - Keys are permanently removed from storage and indexes
-    deletes: ?[]const []const u8 = null,
-    /// Array of transform operations for in-place document updates using MongoDB-style operators. Transform operations allow you to modify documents without read-modify-write races: - Operations are applied atomically on the server - Multiple operations per document are applied in sequence - Supports numeric operations ($inc, $mul), array operations ($push, $pull), and more Common use cases: - Increment counters (views, likes, votes) - Update timestamps ($currentDate) - Manage arrays (add/remove tags, items) - Update nested fields without overwriting the entire document
-    transforms: ?[]const Transform = null,
-    sync_level: ?SyncLevel = null,
-};
-
-pub const InferenceChunkRequest = struct {
-    /// Input content to chunk. Supports two formats: - Text string: `"This is a long document..."` - ContentPart: `{"type": "media", "data": "<base64>", "mime_type": "audio/wav"}` - ContentPart: `{"type": "text", "text": "..."}`
-    input: ?std.json.Value = null,
-    config: ?InferenceChunkConfig = null,
-};
-
-/// Configuration for the classification step. This step analyzes the query, selects the optimal retrieval strategy, and generates semantic transformations.
-pub const ClassificationStepConfig = struct {
-    /// Enable query classification and strategy selection
-    enabled: ?bool = null,
-    /// Generator to use for classification. If not specified, uses the default summarizer.
-    generator: ?GeneratorConfig = null,
-    /// Chain of generators to try in order. Mutually exclusive with 'generator'.
-    chain: ?[]const ChainLink = null,
-    /// Include pre-retrieval reasoning explaining query analysis and strategy selection
-    with_reasoning: ?bool = null,
-    /// Override LLM strategy selection. If not set, the LLM chooses optimal strategy.
-    force_strategy: ?QueryStrategy = null,
-    /// Override semantic query mode selection.
-    force_semantic_mode: ?SemanticQueryMode = null,
-    /// Number of alternative query phrasings to generate
-    multi_phrase_count: ?i64 = null,
-};
-
-/// Configuration for confidence assessment. Evaluates answer quality and resource relevance. Can use a model calibrated for scoring tasks.
-pub const ConfidenceStepConfig = struct {
-    /// Enable confidence scoring
-    enabled: ?bool = null,
-    /// Generator for confidence assessment. If not specified, uses the answer step's generator.
-    generator: ?GeneratorConfig = null,
-    /// Chain of generators to try in order. Mutually exclusive with 'generator'.
-    chain: ?[]const ChainLink = null,
-    /// Custom guidance for confidence assessment approach
-    context: ?[]const u8 = null,
-};
-
-/// Configuration for generating follow-up questions. Uses a separate generator call which can use a cheaper/faster model.
-pub const FollowupStepConfig = struct {
-    /// Enable follow-up question generation
-    enabled: ?bool = null,
-    /// Generator for follow-up questions. If not specified, uses the answer step's generator.
-    generator: ?GeneratorConfig = null,
-    /// Chain of generators to try in order. Mutually exclusive with 'generator'.
-    chain: ?[]const ChainLink = null,
-    /// Number of follow-up questions to generate
-    count: ?i64 = null,
-    /// Custom guidance for follow-up question focus and style
-    context: ?[]const u8 = null,
-};
-
-/// Configuration for the generation step. This step generates the final response from retrieved documents using the reasoning as context.
-pub const GenerationStepConfig = struct {
-    /// Enable generation from retrieved documents
-    enabled: ?bool = null,
-    /// Generator to use for generation. If not specified, uses the default summarizer.
-    generator: ?GeneratorConfig = null,
-    /// Chain of generators to try in order. Mutually exclusive with 'generator'.
-    chain: ?[]const ChainLink = null,
-    /// Custom system prompt for answer generation
-    system_prompt: ?[]const u8 = null,
-    /// Custom guidance for generation tone, detail level, and style
-    generation_context: ?[]const u8 = null,
-};
-
-/// Configuration for the retrieval step. Retrieval tools are constrained by the top-level request tools policy when both are present.
-pub const RetrievalStepConfig = struct {
-    /// Tool configuration for the retrieval step. When set, this narrows the top-level tools policy for retrieval execution.
-    tools: ?ChatToolsConfig = null,
-};
-
-/// Describes an in-progress schema migration. The table serves reads from read_schema while rebuilding full-text indexes for the new schema.
-pub const TableMigration = struct {
-    state: []const u8,
-    read_schema: TableSchema,
-};
-
-/// OpenAI-compatible message in a generation/chat conversation.
-pub const ChatMessage = struct {
-    role: ChatMessageRole,
-    content: ?ChatMessageContent = null,
-    /// Tool calls made by the assistant (only for role=assistant).
-    tool_calls: ?[]const ToolCall = null,
-    /// ID of the tool call this message responds to (only for role=tool).
-    tool_call_id: ?[]const u8 = null,
-    /// Optional tool name for tool messages when model templates need it.
-    name: ?[]const u8 = null,
-};
-
-pub const ExtractionInput = struct {
-    id: ?[]const u8 = null,
-    content: ChatMessageContent,
-    tokens: ?[]const ExtractionToken = null,
-    metadata: ?std.json.Value = null,
-};
-
-pub const InferenceChatMessage = struct {
-    role: InferenceRole,
-    content: ?ChatMessageContent = null,
-    /// Tool calls made by the assistant (only for role=assistant)
-    tool_calls: ?[]const ToolCall = null,
-    /// ID of the tool call this message is responding to (only for role=tool)
-    tool_call_id: ?[]const u8 = null,
-};
-
-pub const InferenceRerankMultimodalDocument = struct {
-    /// Optional caller-provided document identifier
-    id: ?[]const u8 = null,
-    content: ChatMessageContent,
-};
-
-/// Streaming generation chunk (SSE event data)
-pub const InferenceGenerateChunk = struct {
-    id: []const u8,
-    object: []const u8,
-    created: i64,
-    model: []const u8,
-    choices: []const InferenceGenerateChunkChoice,
-};
-
-/// Unified configuration for embeddings indexes. When sparse is true, creates a sparse vector index (SPLADE inverted index). When sparse is false (default), creates a dense vector index (HNSW). For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected.
-pub const EmbeddingsIndexConfig = struct {
-    /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
-    external: ?bool = null,
-    /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense (HNSW) vector index.
-    sparse: ?bool = null,
-    /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
-    dimension: ?i64 = null,
-    /// Field to extract embeddings from (managed indexes only; not allowed when external=true)
-    field: ?[]const u8 = null,
-    /// Generated embedding artifact name consumed by this vector index. Use with a matching embedding enrichment for artifact-backed managed embeddings.
-    embedding_name: ?[]const u8 = null,
-    /// Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source.
-    source_artifact_name: ?[]const u8 = null,
-    /// Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
-    template: ?[]const u8 = null,
-    distance_metric: ?DistanceMetric = null,
-    /// Whether to use in-memory only storage (dense only)
-    mem_only: ?bool = null,
-    /// Configuration for the embeddings plugin (managed indexes only; not allowed when external=true)
-    embedder: ?EmbedderConfig = null,
-    /// Configuration for the summarizer plugin (dense managed indexes only)
-    summarizer: ?GeneratorConfig = null,
-    /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before indexing. (dense managed indexes only)
-    chunker: ?ChunkerConfig = null,
-    /// Default number of results to return from search (sparse only)
-    top_k: ?i64 = null,
-    /// Minimum weight threshold for sparse vector entries (sparse only)
-    min_weight: ?f32 = null,
-    /// Number of documents per posting list chunk (sparse only)
-    chunk_size: ?i64 = null,
-};
-
-/// OpenAI-compatible chat completion response
-pub const InferenceGenerateResponse = struct {
-    /// A unique identifier for the chat completion
-    id: []const u8,
-    /// The object type, always "chat.completion"
-    object: []const u8,
-    /// Unix timestamp (seconds) when the completion was created
-    created: i64,
-    /// Model used for generation
-    model: []const u8,
-    /// List of completion choices (currently always 1)
-    choices: []const InferenceGenerateChoice,
-    usage: InferenceGenerateUsage,
-};
-
-/// Cross-table batch operations in a single atomic transaction. Groups batch operations by table name. All operations across all tables are committed atomically using distributed 2-phase commit (2PC). **Atomicity**: Either all operations across all tables succeed, or none do. This enables use cases like transferring a record from one table to another, or maintaining referential integrity across tables.
-pub const MultiBatchRequest = struct {
-    /// Map of table names to batch operations for that table. Each entry follows the same format as a single-table BatchRequest.
-    tables: std.json.ArrayHashMap(BatchRequest),
-    sync_level: ?SyncLevel = null,
-};
-
-/// Stateless OCC (Optimistic Concurrency Control) transaction commit request. The client reads documents (capturing version tokens from the X-Antfly-Version response header on lookups), computes writes locally, then submits everything in this single commit request. The server validates that all read versions still match before executing writes atomically via 2PC. **No server-side state**: There is no "begin" endpoint. The client manages its own read set and submits the full transaction in one request.
-pub const TransactionCommitRequest = struct {
-    /// Set of keys that were read during the transaction, with their observed versions. The server verifies these versions still match before committing writes.
-    read_set: []const TransactionReadItem,
-    /// Write set: map of table names to batch operations, same format as MultiBatchRequest.tables.
-    tables: std.json.ArrayHashMap(BatchRequest),
-    sync_level: ?SyncLevel = null,
-};
-
-/// DEPRECATED: Use RetrievalAgentSteps instead. Configuration for the answer agent's pipeline steps.
-pub const AnswerAgentSteps = struct {
-    /// Configuration for query classification and transformation.
-    classification: ?ClassificationStepConfig = null,
-    /// DEPRECATED: Use steps.generation on RetrievalAgentRequest instead. Configuration for answer generation from retrieved documents.
-    answer: ?GenerationStepConfig = null,
-    /// Configuration for generating follow-up questions.
-    followup: ?FollowupStepConfig = null,
-    /// Configuration for confidence assessment.
-    confidence: ?ConfidenceStepConfig = null,
-};
-
-/// Configuration for the retrieval agent's pipeline steps and tool-use behavior. Each step can have its own generator (or chain of generators) and step-specific options. If a step is not configured, it is skipped (retrieval always runs).
-pub const RetrievalAgentSteps = struct {
-    /// Configuration for query classification and transformation. When set, runs classification before retrieval to select the optimal strategy (simple/decompose/step_back/hyde) and transform the query.
-    classification: ?ClassificationStepConfig = null,
-    /// Configuration for retrieval tool execution. Retrieval-step tools narrow the top-level tools policy when both are provided.
-    retrieval: ?RetrievalStepConfig = null,
-    /// Configuration for generation from retrieved documents. When set, generates a response with citations after retrieval completes.
-    generation: ?GenerationStepConfig = null,
-    /// Configuration for generating follow-up questions. Requires steps.generation to be set.
-    followup: ?FollowupStepConfig = null,
-    /// Configuration for confidence assessment of the generated response. Requires steps.generation to be set.
-    confidence: ?ConfidenceStepConfig = null,
-    /// Configuration for inline evaluation. Runs evaluators on retrieved documents and/or generated response. Requires steps.generation for generation-quality evaluators (faithfulness, completeness, etc.).
-    eval: ?EvalConfig = null,
-};
-
-/// Result from the retrieval agent
-pub const RetrievalAgentResult = struct {
-    /// Unique response ID for logging and tracing
-    id: ?[]const u8 = null,
-    /// LLM model used for generation
-    model: ?[]const u8 = null,
-    /// Unix timestamp (seconds) when the response was created
-    created_at: ?i64 = null,
-    /// Current status of the bounded agent execution
-    status: AgentStatus,
-    /// Present when status is "incomplete" — explains why
-    incomplete_details: ?IncompleteDetails = null,
-    /// Token usage and resource statistics from this execution
-    usage: ?RetrievalAgentUsage = null,
-    /// Retrieved query hits
-    hits: []const QueryHit,
-    /// Shared bounded-agent execution trace for this retrieval run.
-    steps: ?[]const AgentStep = null,
-    /// Primary strategy that was used (optional in agentic mode)
-    strategy_used: ?RetrievalStrategy = null,
-    /// Correlation identifier for client-carried continuation.
-    session_id: ?[]const u8 = null,
-    /// Current internal iteration count for this bounded session.
-    iteration: ?i64 = null,
-    /// Number of user clarification turns already consumed in this session.
-    clarification_count: ?i64 = null,
-    /// Remaining internal reasoning/tool-use iterations for this session.
-    remaining_internal_iterations: ?i64 = null,
-    /// Remaining clarification turns allowed for this session.
-    remaining_user_clarifications: ?i64 = null,
-    /// Clarification questions exposed in the shared bounded-agent envelope.
-    questions: ?[]const AgentQuestion = null,
-    /// Filters that were applied during retrieval
-    applied_filters: ?[]const FilterSpec = null,
-    /// Total number of tool calls made during retrieval
-    tool_calls_made: ?i64 = null,
-    /// Optional conversational context including tool calls and responses. Decisions remain the authoritative continuation input for bounded agent interactions.
-    messages: ?[]const ChatMessage = null,
-    /// Query classification and transformation result. Present when steps.classification was configured. Includes strategy, semantic_query, sub_questions (decompose), step_back_query, and reasoning.
-    classification: ?ClassificationTransformationResult = null,
-    /// Generated response in markdown format. Present when steps.generation was configured.
-    generation: ?[]const u8 = null,
-    /// Confidence in the generated response (requires steps.confidence)
-    generation_confidence: ?f32 = null,
-    /// Relevance of retrieved documents to the query (requires steps.confidence)
-    context_relevance: ?f32 = null,
-    /// Suggested follow-up questions (requires steps.followup)
-    followup_questions: ?[]const []const u8 = null,
-    /// Evaluation results when steps.eval was configured
-    eval_result: ?EvalResult = null,
-};
-
-pub const ExtractionRequest = struct {
-    model: []const u8,
-    inputs: []const ExtractionInput,
-    schema: ExtractionSchema,
-    options: ?ExtractionOptions = null,
-};
-
-pub const InferenceGenerateRequest = struct {
-    /// Name of the generator model from models_dir/generators/
-    model: []const u8,
-    /// Conversation messages (OpenAI-compatible format)
-    messages: []const InferenceChatMessage,
-    /// Maximum tokens to generate
-    max_tokens: ?i64 = null,
-    /// Sampling temperature (0.0 = deterministic, higher = more random)
-    temperature: ?f32 = null,
-    /// Nucleus sampling probability
-    top_p: ?f32 = null,
-    /// Top-k sampling (inference extension, not in OpenAI API)
-    top_k: ?i64 = null,
-    /// If true, partial message deltas will be sent as SSE events
-    stream: ?bool = null,
-    /// List of tools (functions) the model can call. Only supported by models with tool_call_format configured.
-    tools: ?[]const InferenceTool = null,
-    /// Min-p sampling threshold. Filters tokens where p < min_p * max_p. Simpler alternative to top_p.
-    min_p: ?f32 = null,
-    /// Repetition penalty factor applied to previously generated tokens (1.0 = disabled, >1.0 penalizes, <1.0 encourages)
-    repetition_penalty: ?f32 = null,
-    /// Additive penalty based on token frequency in context (logit -= frequency_penalty * count)
-    frequency_penalty: ?f32 = null,
-    /// Additive penalty for tokens that appeared at all in context (logit -= presence_penalty if count > 0)
-    presence_penalty: ?f32 = null,
-    /// Structured output control. OpenAI-compatible entry point for requesting JSON output. `{"type":"json_object"}` is supported directly. `{"type":"json_schema"}` is compiled into a native constrained-decoding grammar on the native backend and is rejected on ONNX backends.
-    response_format: ?InferenceGenerateResponseFormat = null,
-    /// inference-native grammar override. When set, this takes precedence over `response_format`. Grammar-constrained decoding is currently native-backend only.
-    grammar: ?[]const u8 = null,
-    /// inference-native speculative decoding extension. Path or model identifier for a smaller draft model.
-    draft_model: ?[]const u8 = null,
-    /// inference-native speculative decoding extension. Number of draft tokens proposed per verification round.
-    speculative_k: ?i64 = null,
-    /// inference-native KV cache quantization format. Lower precision reduces memory usage but may affect generation quality. Default auto-selects based on backend (f16 for GPU, f32 for CPU).
-    cache_dtype: ?[]const u8 = null,
-    /// inference-native KV cache compaction ratio applied after prefill via Attention Matching. Selects a subset of keys and fits new values via OLS to preserve attention behavior. 0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction.
-    cache_compaction_ratio: ?f32 = null,
-    backend: ?InferenceModelBackend = null,
-    /// inference-native graph execution mode. `eager` keeps the direct runtime path when possible. `compiled` runs inference graph planning, partitioning, and backend executor attachment.
-    mode: ?[]const u8 = null,
-    /// inference-native compiled graph target. `partitioned` attaches compiled executors to eligible graph partitions. `whole-model` requests a compiled backend only when it can own the full traced graph shape.
-    compiled_target: ?[]const u8 = null,
-    /// Controls how the model uses tools
-    tool_choice: ?InferenceToolChoice = null,
-};
-
-pub const InferenceRerankMultimodalRequest = struct {
-    /// Name of multimodal reranking model from models_dir/rerankers/
-    model: []const u8,
-    /// Text query for relevance scoring
-    query: []const u8,
-    /// Documents expressed as text and image content parts
-    documents: []const InferenceRerankMultimodalDocument,
-};
-
-/// Configuration for an index
-pub const IndexConfig = struct {
-    /// Name of the index
-    name: []const u8,
-    /// Optional description of the index and its purpose
-    description: ?[]const u8 = null,
-    type: IndexType,
-    /// Version of the index implementation. Defaults to 0.
-    version: ?i64 = null,
-    /// Inline managed enrichment definitions required by this index. Enrichments are table-level generated artifacts such as chunks, asset-derived document units, or embeddings over an artifact stream.
-    enrichments: ?[]const EnrichmentConfig = null,
-    /// Whether to use memory-only storage
-    mem_only: ?bool = null,
-    /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
-    external: ?bool = null,
-    /// When true, creates a sparse (SPLADE) inverted index. When false (default), creates a dense (HNSW) vector index.
-    sparse: ?bool = null,
-    /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
-    dimension: ?i64 = null,
-    /// Field to extract embeddings from (managed indexes only; not allowed when external=true)
-    field: ?[]const u8 = null,
-    /// Generated embedding artifact name consumed by this vector index. Use with a matching embedding enrichment for artifact-backed managed embeddings.
-    embedding_name: ?[]const u8 = null,
-    /// Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source.
-    source_artifact_name: ?[]const u8 = null,
-    /// Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
-    template: ?[]const u8 = null,
-    distance_metric: ?DistanceMetric = null,
-    /// Configuration for the embeddings plugin (managed indexes only; not allowed when external=true)
-    embedder: ?EmbedderConfig = null,
-    /// Configuration for the summarizer plugin (dense managed indexes only)
-    summarizer: ?GeneratorConfig = null,
-    /// Configuration for the chunking plugin. When specified, documents are automatically chunked at write time before indexing. (dense managed indexes only)
-    chunker: ?ChunkerConfig = null,
-    /// Default number of results to return from search (sparse only)
-    top_k: ?i64 = null,
-    /// Minimum weight threshold for sparse vector entries (sparse only)
-    min_weight: ?f32 = null,
-    /// Number of documents per posting list chunk (sparse only)
-    chunk_size: ?i64 = null,
-    /// List of edge types with their configurations
-    edge_types: ?[]const EdgeTypeConfig = null,
-    /// Maximum number of edges per document (0 = unlimited)
-    max_edges_per_document: ?i64 = null,
-    /// When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API.
-    derive_from_schema: ?bool = null,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("name");
-        try jw.write(self.name);
-        if (self.description) |value| {
-            try jw.objectField("description");
-            try jw.write(value);
-        }
-        try jw.objectField("type");
-        try jw.write(self.type);
-        if (self.version) |value| {
-            try jw.objectField("version");
-            try jw.write(value);
-        }
-        if (self.enrichments) |value| {
-            try jw.objectField("enrichments");
-            try jw.write(value);
-        }
-        if (self.mem_only) |value| {
-            try jw.objectField("mem_only");
-            try jw.write(value);
-        }
-        if (self.external) |value| {
-            try jw.objectField("external");
-            try jw.write(value);
-        }
-        if (self.sparse) |value| {
-            try jw.objectField("sparse");
-            try jw.write(value);
-        }
-        if (self.dimension) |value| {
-            try jw.objectField("dimension");
-            try jw.write(value);
-        }
-        if (self.field) |value| {
-            try jw.objectField("field");
-            try jw.write(value);
-        }
-        if (self.embedding_name) |value| {
-            try jw.objectField("embedding_name");
-            try jw.write(value);
-        }
-        if (self.source_artifact_name) |value| {
-            try jw.objectField("source_artifact_name");
-            try jw.write(value);
-        }
-        if (self.template) |value| {
-            try jw.objectField("template");
-            try jw.write(value);
-        }
-        if (self.distance_metric) |value| {
-            try jw.objectField("distance_metric");
-            try jw.write(value);
-        }
-        if (self.embedder) |value| {
-            try jw.objectField("embedder");
-            try jw.write(value);
-        }
-        if (self.summarizer) |value| {
-            try jw.objectField("summarizer");
-            try jw.write(value);
-        }
-        if (self.chunker) |value| {
-            try jw.objectField("chunker");
-            try jw.write(value);
-        }
-        if (self.top_k) |value| {
-            try jw.objectField("top_k");
-            try jw.write(value);
-        }
-        if (self.min_weight) |value| {
-            try jw.objectField("min_weight");
-            try jw.write(value);
-        }
-        if (self.chunk_size) |value| {
-            try jw.objectField("chunk_size");
-            try jw.write(value);
-        }
-        if (self.edge_types) |value| {
-            try jw.objectField("edge_types");
-            try jw.write(value);
-        }
-        if (self.max_edges_per_document) |value| {
-            try jw.objectField("max_edges_per_document");
-            try jw.write(value);
-        }
-        if (self.derive_from_schema) |value| {
-            try jw.objectField("derive_from_schema");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
-pub const IndexStatus = struct {
-    shard_status: std.json.ArrayHashMap(IndexStats),
-    config: IndexConfig,
-    status: IndexStats,
-};
-
-pub const AggregationBucket = struct {
-    /// Bucket key (term, range name, date, etc.)
-    key: []const u8,
-    /// Formatted key for display (e.g., formatted dates)
-    key_as_string: ?[]const u8 = null,
-    /// Number of documents in this bucket
-    doc_count: i64,
-    /// Lower bound for range buckets
-    from: ?f32 = null,
-    /// Upper bound for range buckets
-    to: ?f32 = null,
-    /// Formatted lower bound
-    from_as_string: ?[]const u8 = null,
-    /// Formatted upper bound
-    to_as_string: ?[]const u8 = null,
-    /// Significance score (for significant_terms)
-    score: ?f32 = null,
-    /// Background count (for significant_terms)
-    bg_count: ?i64 = null,
-    /// Results of nested sub-aggregations
-    sub_aggregations: ?std.json.ArrayHashMap(AggregationResult) = null,
-};
-
-pub const AggregationRequest = struct {
-    type: AggregationType,
-    /// Field to aggregate on. Required unless `fields` is supplied for a multi-field terms aggregation.
-    field: ?[]const u8 = null,
-    /// Ordered field list for multi-field terms aggregations. Bucket keys are returned as JSON arrays in the same order.
-    fields: ?[]const []const u8 = null,
-    /// Maximum number of buckets to return (for bucketing aggregations)
-    size: ?i64 = null,
-    /// Ranges for range aggregations
-    ranges: ?[]const AggregationRange = null,
-    /// Date ranges for date_range aggregations
-    date_ranges: ?[]const AggregationDateRange = null,
-    /// Fixed interval for histogram aggregations
-    interval: ?f32 = null,
-    /// Calendar-aware interval for date_histogram aggregations
-    calendar_interval: ?std.json.Value = null,
-    /// Origin for geohash_grid aggregation (format: "lat,lon") Example: "37.7749,-122.4194"
-    origin: ?[]const u8 = null,
-    /// Geohash precision (1-12) for geohash_grid aggregations
-    precision: ?i64 = null,
-    /// Distance ranges for geo_distance aggregations
-    distance_ranges: ?[]const DistanceRange = null,
-    /// Distance unit for geo_distance aggregations
-    unit: ?std.json.Value = null,
-    /// Minimum document count for a bucket to be included
-    min_doc_count: ?i64 = null,
-    /// Background filter for significant_terms aggregations
-    background_filter: ?std.json.Value = null,
-    /// Significance algorithm for significant_terms aggregations
-    algorithm: ?std.json.Value = null,
-    /// Algebraic join descriptor for bounded cross-table aggregation planning
-    algebraic_join: ?AlgebraicAggregationJoin = null,
-    /// Nested sub-aggregations
-    sub_aggregations: ?std.json.ArrayHashMap(AggregationRequest) = null,
-};
-
-pub const AggregationResult = struct {
-    /// Single value for metric aggregations (sum, avg, min, max, count, cardinality)
-    value: ?f32 = null,
-    /// Document count for stats aggregations
-    count: ?i64 = null,
-    /// Minimum value for stats aggregations
-    min: ?f32 = null,
-    /// Maximum value for stats aggregations
-    max: ?f32 = null,
-    /// Sum for stats aggregations
-    sum: ?f32 = null,
-    /// Sum of squares for stats aggregations
-    sum_of_squares: ?f32 = null,
-    /// Average for stats aggregations
-    avg: ?f32 = null,
-    /// Standard deviation for stats aggregations
-    std_deviation: ?f32 = null,
-    /// Variance for stats aggregations
-    variance: ?f32 = null,
-    /// Buckets for bucketing aggregations (terms, range, histogram, etc.)
-    buckets: ?[]const AggregationBucket = null,
-};
-
-/// DEPRECATED: Use RetrievalAgentRequest instead. Request for the answer agent. Accepts the old request format and internally delegates to the retrieval agent.
-pub const AnswerAgentRequest = struct {
-    /// User's natural language query
-    query: []const u8,
-    /// Queries to execute. Each query specifies its own table.
-    queries: []const QueryRequest,
-    /// DEPRECATED: Use stream on RetrievalAgentRequest instead. Enable SSE streaming vs JSON response.
-    with_streaming: ?bool = null,
-    /// Generator for LLM calls
-    generator: ?GeneratorConfig = null,
-    /// Chain of generators
-    chain: ?[]const ChainLink = null,
-    /// Domain-specific knowledge for the agent
-    agent_knowledge: ?[]const u8 = null,
-    /// Maximum tokens for document context
-    max_context_tokens: ?i64 = null,
-    /// Tokens to reserve for overhead
-    reserve_tokens: ?i64 = null,
-    /// Step configuration
-    steps: ?AnswerAgentSteps = null,
-    /// DEPRECATED: Use steps.eval on RetrievalAgentRequest instead. Evaluation configuration (moved to steps.eval in new API).
-    eval: ?EvalConfig = null,
-    /// DEPRECATED: Omit steps.generation on RetrievalAgentRequest instead. If true, skip the generation step.
-    without_generation: ?bool = null,
-};
-
-/// DEPRECATED: Use RetrievalAgentResult instead. Result from the answer agent.
-pub const AnswerAgentResult = struct {
-    /// DEPRECATED: Use generation on RetrievalAgentResult instead. Generated answer in markdown format.
-    answer: ?[]const u8 = null,
-    /// DEPRECATED: Use generation_confidence on RetrievalAgentResult instead. Confidence in the generated answer.
-    answer_confidence: ?f32 = null,
-    /// Relevance of retrieved documents to the query
-    context_relevance: ?f32 = null,
-    /// DEPRECATED: Use classification on RetrievalAgentResult instead. Query classification and transformation result.
-    classification_transformation: ?ClassificationTransformationResult = null,
-    /// DEPRECATED: Use hits on RetrievalAgentResult instead. Query results grouped by table.
-    query_results: ?[]const QueryResult = null,
-    /// Suggested follow-up questions
-    followup_questions: ?[]const []const u8 = null,
-    /// Evaluation results
-    eval_result: ?EvalResult = null,
-};
-
-pub const BooleanQuery = struct {
-    must: ?ConjunctionQuery = null,
-    should: ?DisjunctionQuery = null,
-    must_not: ?DisjunctionQuery = null,
-    filter: ?Query = null,
-    boost: ?Boost = null,
-};
-
-pub const ConjunctionQuery = struct {
-    conjuncts: []const Query,
-    boost: ?Boost = null,
-};
-
-pub const CreateTableRequest = struct {
-    /// Number of shards to create for the table. Data is partitioned across shards based on key ranges. **Sizing Guidelines:** - Small datasets (<100K docs): 1-3 shards - Medium datasets (100K-1M docs): 3-10 shards - Large datasets (>1M docs): 10+ shards More shards enable better parallelism but increase overhead. Choose based on expected data size and query patterns. **When to Add More Shards:** Antfly supports **online shard reallocation** without downtime. Add more shards when: - Individual shards exceed size thresholds (configurable) - Query latency increases due to large shard size - Need better parallelism for write-heavy workloads Use the internal `/reallocate` endpoint to trigger automatic shard splitting: ```bash POST /internal/v1/reallocate ``` This enqueues a reallocation request that the leader processes asynchronously, splitting large shards and redistributing data without service interruption. **Advantages over Elasticsearch:** - Automatic shard splitting (no manual reindexing required) - Online operation (no downtime) - Transparent to applications (keys remain accessible during reallocation)
-    num_shards: ?i64 = null,
-    /// Optional human-readable description of the table and its purpose. Useful for documentation and team collaboration.
-    description: ?[]const u8 = null,
-    /// Map of index name to index configuration. Indexes enable different query capabilities: - Full-text indexes for BM25 search - Vector indexes for semantic similarity - Multimodal indexes for images/audio/video You can add multiple indexes to support different query patterns.
-    indexes: ?std.json.ArrayHashMap(IndexConfig) = null,
-    /// Optional schema definition specifying field types, primary key, and TTL configuration. While optional, defining a schema provides type safety, optimized indexing, and better search performance. **Schema Features:** - **Field Types**: Define document structure using JSON Schema with `x-antfly-types` extensions - **Document TTL**: Configure automatic expiration via `ttl_duration` and optional `ttl_field` - **Primary Keys**: Specify unique identifier fields - **Validation**: Enforce schema constraints on writes **TTL Example:** ```json { "ttl_duration": "7d", "ttl_field": "_timestamp", "document_schemas": {...} } ``` See the Table Management documentation for comprehensive TTL configuration and use cases.
-    schema: ?TableSchema = null,
-    /// PostgreSQL CDC replication sources. Streams INSERT/UPDATE/DELETE changes from PostgreSQL tables into this Antfly table via logical replication. Multiple sources can feed into a single table (e.g., `users` + `scores` → Antfly `users`). Each source uses `on_update`/`on_delete` transforms to control how PG events map to Antfly document operations. Requires `wal_level=logical` on the PostgreSQL source.
-    replication_sources: ?[]const ReplicationSource = null,
-};
-
-pub const DisjunctionQuery = struct {
-    disjuncts: []const Query,
-    boost: ?Boost = null,
-    min: ?f64 = null,
-};
-
-/// Configuration for joining data from another table. Supports inner, left, and right joins with automatic strategy selection.
-pub const JoinClause = struct {
-    /// Name of the table to join with.
-    right_table: []const u8,
-    /// Type of join to perform. Defaults to "inner".
-    join_type: ?JoinType = null,
-    /// Join condition specifying which fields to match.
-    on: JoinCondition,
-    /// Optional filters to apply to the right table before joining. Use to reduce the amount of data being joined.
-    right_filters: ?JoinFilters = null,
-    /// Fields to include from the right table in the result. If not specified, all fields from the right table are included. Fields are prefixed with the right table name in the result.
-    right_fields: ?[]const []const u8 = null,
-    /// Optional hint for which join strategy to use. If not specified, the planner automatically selects based on table statistics.
-    strategy_hint: ?JoinStrategy = null,
-    /// Optional nested join for multi-way joins. The nested join operates on the result of the current join.
-    nested_join: ?std.json.Value = null,
-};
-
-/// Filters to apply to a table before joining.
-pub const JoinFilters = struct {
-    /// Antfly query to filter rows before joining.
-    filter_query: ?std.json.Value = null,
-    /// Key prefix filter for the table.
-    filter_prefix: ?[]const u8 = null,
-    /// Maximum number of rows to include from this table.
-    limit: ?i64 = null,
 };
 
 pub const Query = union(enum) {
@@ -7837,6 +6149,36 @@ pub const Query = union(enum) {
     }
 };
 
+pub const QueryBuilderRequest = struct {
+    /// Correlation identifier for a bounded agent interaction. In Phase 1 this is echoed back to the client but does not imply server-side session persistence.
+    session_id: ?[]const u8 = null,
+    /// Structured answers provided by the user as part of client-carried continuation.
+    decisions: ?[]const AgentDecision = null,
+    /// If true, the agent may return clarification questions when needed.
+    interactive: ?bool = null,
+    /// Additive bounded-agent field for the query builder. Phase 1 remains a single-pass generation flow, but this field is echoed in result accounting.
+    max_internal_iterations: ?i64 = null,
+    /// Maximum number of clarification turns the agent may request from the user.
+    max_user_clarifications: ?i64 = null,
+    /// Force a user-facing decision after this many unresolved internal passes.
+    require_decision_after: ?i64 = null,
+    /// Optional example documents to help the query builder infer field shapes and representative values. When omitted and the table has data but no schema, the server samples up to one document automatically.
+    example_documents: ?[]const std.json.Value = null,
+    /// Name of the table to build query for. If provided, uses table schema for field context.
+    table: ?[]const u8 = null,
+    /// Natural language description of the search intent
+    intent: []const u8,
+    /// List of searchable field names to consider. Overrides table schema if provided.
+    schema_fields: ?[]const []const u8 = null,
+    /// Optional strategy hint for the coordinator. Suggested values are `auto`, `full_text`, `semantic`, `hybrid`, `filter`, `tree`, and `graph`. Unknown values are accepted for forward compatibility and may fall back to `auto`.
+    mode: ?[]const u8 = null,
+    /// Preferred output artifact. Suggested values are `query_request`, `bleve`, and `filter_query`. The compatibility `query` field is still returned for existing clients.
+    output: ?[]const u8 = null,
+    /// Optional execution constraints for the coordinator, such as `limit`, `allowed_fields`, `prefer_indexes`, and `require_executable`.
+    constraints: ?std.json.Value = null,
+    generator: ?GeneratorConfig = null,
+};
+
 pub const QueryBuilderResult = struct {
     /// Correlation identifier for client-carried continuation.
     session_id: ?[]const u8 = null,
@@ -7870,6 +6212,52 @@ pub const QueryBuilderResult = struct {
     confidence: ?f64 = null,
     /// Any issues, limitations, or assumptions made when generating the query
     warnings: ?[]const []const u8 = null,
+};
+
+/// A single query result hit
+pub const QueryHit = struct {
+    /// ID of the record.
+    _id: []const u8,
+    /// Relevance score of the hit.
+    _score: f32,
+    /// Scores partitioned by index when using RRF search.
+    _index_scores: ?std.json.Value = null,
+    _source: ?std.json.Value = null,
+    /// Stable ancestry envelope for derived document hierarchy hits. Present when the hit is a derived unit/chunk/embedding artifact or when a source-level rollup includes child chunks. Standard fields include `level`, `parent_doc_key`, optional `parent_unit_id`, `artifact`, `chunks`, and `ancestors` with response-local or requested DB-backed source/unit context when available.
+    hierarchy: ?std.json.Value = null,
+    /// Sort key values for this hit. Pass as search_after or search_before to paginate to the next/previous page. Values preserve their JSON types. Present for ordered result pages, including cursor-only requests whose effective order is `_id` ascending.
+    _sort: ?[]const std.json.Value = null,
+};
+
+/// A list of query hits.
+pub const QueryHits = struct {
+    /// Total number of hits available and whether it is exact.
+    total: ?QueryHitsTotal = null,
+    hits: ?[]const QueryHit = null,
+    /// Maximum score of the results.
+    max_score: ?f32 = null,
+};
+
+/// Total hit count metadata.
+pub const QueryHitsTotal = struct {
+    /// Hit count value.
+    value: i64,
+    /// Whether value is exact or a lower bound.
+    relation: []const u8,
+};
+
+/// Detailed execution profiling for a query. Present in the response when the request sets `profile: true`.
+pub const QueryProfile = struct {
+    /// Shard-level execution statistics.
+    shards: ?ShardsProfile = null,
+    /// Join execution statistics (present when query used a join).
+    join: ?JoinProfile = null,
+    /// Reranking statistics (present when a reranker was used).
+    reranker: ?RerankerProfile = null,
+    /// Result merge statistics (present for hybrid search).
+    merge: ?MergeProfile = null,
+    /// Sort execution statistics (present when the query used ordered page options and profiling was enabled).
+    sort: ?SortProfile = null,
 };
 
 pub const QueryRequest = struct {
@@ -7964,6 +6352,102 @@ pub const QueryResult = struct {
     table: ?[]const u8 = null,
 };
 
+/// Strategy for query transformation and retrieval: - simple: Direct query with multi-phrase expansion. Best for straightforward factual queries. - decompose: Break complex queries into sub-questions, retrieve for each. Best for multi-part questions. - step_back: Generate broader background query first, then specific query. Best for questions needing context. - hyde: Generate hypothetical answer document, embed that for retrieval. Best for abstract/conceptual questions.
+pub const QueryStrategy = enum {
+    simple,
+    decompose,
+    step_back,
+    hyde,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .simple => "simple",
+            .decompose => "decompose",
+            .step_back => "step_back",
+            .hyde => "hyde",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "simple", .simple },
+            .{ "decompose", .decompose },
+            .{ "step_back", .step_back },
+            .{ "hyde", .hyde },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const QueryStringQuery = struct {
+    query: []const u8,
+    boost: ?Boost = null,
+};
+
+pub const RegexpQuery = struct {
+    regexp: []const u8,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
+};
+
+/// Bounded request to list table repair issues.
+pub const RepairIssueListRequest = struct {
+    /// Repair subsystem to list. `artifact` lists durable artifact queue records; `index` lists index repair candidates derived from index status and artifact debt.
+    target: ?RepairTarget = null,
+    kind: ?ArtifactRepairKind = null,
+    /// Restrict results to one index name.
+    index: ?[]const u8 = null,
+    /// Opaque cursor returned by a prior response.
+    cursor: ?[]const u8 = null,
+    /// Maximum repair records to return.
+    limit: ?i64 = null,
+};
+
+/// Bounded request to run a table repair pass.
+pub const RepairRunRequest = struct {
+    target: ?RepairTarget = null,
+    kind: ?ArtifactRepairKind = null,
+    /// Restrict repair attempts to one index name.
+    index: ?[]const u8 = null,
+    /// Opaque cursor returned by a prior repair response.
+    cursor: ?[]const u8 = null,
+    /// Force a named index rebuild even when no repair debt is currently recorded. Only applies to target=index.
+    force: ?bool = null,
+    /// Maximum artifact repair records to attempt. For target=index, any positive value permits one named index repair.
+    limit: ?i64 = null,
+};
+
+/// Repair subsystem to inspect or run.
+pub const RepairTarget = enum {
+    artifact,
+    index,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .artifact => "artifact",
+            .index => "index",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "artifact", .artifact },
+            .{ "index", .index },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const ReplicationRoute = struct {
     /// Name of the Antfly table to write matching rows to. The table must already exist.
     target_table: []const u8,
@@ -8002,6 +6486,151 @@ pub const ReplicationSource = struct {
     require_exact_cutover: ?bool = null,
     status: ?ReplicationSourceStatus = null,
     action_hint: ?ReplicationSourceActionHint = null,
+};
+
+/// Action hint for this replication source when remediation is recommended. Present only in GET table detail responses.
+pub const ReplicationSourceActionHint = struct {
+    /// Recommended action (e.g., "reseed_exact_cutover").
+    action: ?[]const u8 = null,
+    /// Human-readable reason for the recommendation.
+    reason: ?[]const u8 = null,
+    /// API path to trigger a reseed exact cutover, if applicable.
+    reseed_exact_cutover_path: ?[]const u8 = null,
+};
+
+/// Runtime status of this replication source. Present only in GET table detail responses, not in create/update requests.
+pub const ReplicationSourceStatus = struct {
+    source_kind: ?[]const u8 = null,
+    external_table: ?[]const u8 = null,
+    cutover_mode: ?[]const u8 = null,
+    slot_name: ?[]const u8 = null,
+    publication_name: ?[]const u8 = null,
+    phase: ?[]const u8 = null,
+    checkpoint: ?[]const u8 = null,
+    snapshot_offset: ?i64 = null,
+    prepared_checkpoint: ?[]const u8 = null,
+    stream_checkpoint: ?[]const u8 = null,
+    last_error: ?[]const u8 = null,
+    failure_class: ?[]const u8 = null,
+    lag_records: ?i64 = null,
+    lag_millis: ?i64 = null,
+    consecutive_failures: ?i64 = null,
+    last_source_commit_at_ms: ?i64 = null,
+    last_success_at_ms: ?i64 = null,
+    last_change_applied_at_ms: ?i64 = null,
+    updated_at_ms: ?i64 = null,
+};
+
+pub const ReplicationTransformOp = struct {
+    /// Transform operation. Standard ops: `$set`, `$unset`, `$inc`, `$push`, `$pull`, `$addToSet`, `$pop`, `$mul`, `$min`, `$max`, `$currentDate`, `$rename`. Replication-specific: `$merge` (flatten JSONB into top-level fields), `$delete_document` (delete entire Antfly doc, `on_delete` only).
+    op: []const u8,
+    /// Antfly document field path. Required for `$set`, `$unset`, etc.
+    path: ?[]const u8 = null,
+    /// Value for the operation. Can be a literal (string, number, boolean) or a `{{column}}` reference to a PG column value. Use `{{col.key}}` to navigate into decoded JSONB columns.
+    value: ?std.json.Value = null,
+};
+
+/// A unified configuration for a reranking provider.
+pub const RerankerConfig = struct {
+    provider: RerankerProvider,
+    /// Field name to extract from documents for reranking.
+    field: ?[]const u8 = null,
+    /// Handlebars template to render document text for reranking.
+    template: ?[]const u8 = null,
+    /// The name of the reranking model (e.g., cross-encoder model name).
+    model: ?[]const u8 = null,
+    /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
+    url: ?[]const u8 = null,
+    /// The Cohere API key. Can also be set via COHERE_API_KEY environment variable.
+    api_key: ?[]const u8 = null,
+    /// Number of most relevant documents to return. If not specified, returns all documents with scores.
+    top_n: ?i64 = null,
+    /// Maximum number of chunks per document for long document handling.
+    max_chunks_per_doc: ?i64 = null,
+    /// Google Cloud project ID. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
+    project_id: ?[]const u8 = null,
+    /// Path to service account JSON file. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS environment variable.
+    credentials_path: ?[]const u8 = null,
+};
+
+/// Reranking execution statistics.
+pub const RerankerProfile = struct {
+    /// Reranker model that was used.
+    model: ?[]const u8 = null,
+    /// Number of documents that were reranked.
+    documents_reranked: ?i64 = null,
+    /// Time spent reranking in milliseconds.
+    duration_ms: ?i64 = null,
+};
+
+/// The reranking provider to use.
+pub const RerankerProvider = enum {
+    antfly,
+    ollama,
+    cohere,
+    vertex,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .antfly => "antfly",
+            .ollama => "ollama",
+            .cohere => "cohere",
+            .vertex => "vertex",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "antfly", .antfly },
+            .{ "ollama", .ollama },
+            .{ "cohere", .cohere },
+            .{ "vertex", .vertex },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Type of the resource, e.g., table, user, or global ('*').
+pub const ResourceType = enum {
+    table,
+    user,
+    @"*",
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .table => "table",
+            .user => "user",
+            .@"*" => "*",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "table", .table },
+            .{ "user", .user },
+            .{ "*", .@"*" },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const RestoreRequest = struct {
+    /// Unique identifier for this backup. Used to reference the backup for restore operations. Choose a meaningful name that includes date/version information.
+    backup_id: []const u8,
+    /// Storage location for the backup. Supports multiple backends: - Local filesystem: `file:///path/to/backup` - Amazon S3: `s3://bucket-name/path/to/backup` The backup includes all table data, indexes, and metadata for the specified table.
+    location: []const u8,
+    /// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
+    format: ?[]const u8 = null,
 };
 
 /// Request for the retrieval agent. Queries define which tables and indexes to search, each as a QueryRequest with optional tree search configuration. **Pipeline mode** (default, max_internal_iterations=0): Queries are executed directly without an LLM tool-calling loop. **Agentic mode** (max_internal_iterations > 0): The LLM decides which tools to call, using the queries to determine available tables and indexes.
@@ -8044,6 +6673,92 @@ pub const RetrievalAgentRequest = struct {
     steps: ?RetrievalAgentSteps = null,
     /// Handlebars template for rendering documents in the generation prompt. Default uses TOON format for token efficiency. Requires steps.generation to be set.
     document_renderer: ?[]const u8 = null,
+};
+
+/// Result from the retrieval agent
+pub const RetrievalAgentResult = struct {
+    /// Unique response ID for logging and tracing
+    id: ?[]const u8 = null,
+    /// LLM model used for generation
+    model: ?[]const u8 = null,
+    /// Unix timestamp (seconds) when the response was created
+    created_at: ?i64 = null,
+    /// Current status of the bounded agent execution
+    status: AgentStatus,
+    /// Present when status is "incomplete" — explains why
+    incomplete_details: ?IncompleteDetails = null,
+    /// Token usage and resource statistics from this execution
+    usage: ?RetrievalAgentUsage = null,
+    /// Retrieved query hits
+    hits: []const QueryHit,
+    /// Shared bounded-agent execution trace for this retrieval run.
+    steps: ?[]const AgentStep = null,
+    /// Primary strategy that was used (optional in agentic mode)
+    strategy_used: ?RetrievalStrategy = null,
+    /// Correlation identifier for client-carried continuation.
+    session_id: ?[]const u8 = null,
+    /// Current internal iteration count for this bounded session.
+    iteration: ?i64 = null,
+    /// Number of user clarification turns already consumed in this session.
+    clarification_count: ?i64 = null,
+    /// Remaining internal reasoning/tool-use iterations for this session.
+    remaining_internal_iterations: ?i64 = null,
+    /// Remaining clarification turns allowed for this session.
+    remaining_user_clarifications: ?i64 = null,
+    /// Clarification questions exposed in the shared bounded-agent envelope.
+    questions: ?[]const AgentQuestion = null,
+    /// Filters that were applied during retrieval
+    applied_filters: ?[]const FilterSpec = null,
+    /// Total number of tool calls made during retrieval
+    tool_calls_made: ?i64 = null,
+    /// Optional conversational context including tool calls and responses. Decisions remain the authoritative continuation input for bounded agent interactions.
+    messages: ?[]const ChatMessage = null,
+    /// Query classification and transformation result. Present when steps.classification was configured. Includes strategy, semantic_query, sub_questions (decompose), step_back_query, and reasoning.
+    classification: ?ClassificationTransformationResult = null,
+    /// Generated response in markdown format. Present when steps.generation was configured.
+    generation: ?[]const u8 = null,
+    /// Confidence in the generated response (requires steps.confidence)
+    generation_confidence: ?f32 = null,
+    /// Relevance of retrieved documents to the query (requires steps.confidence)
+    context_relevance: ?f32 = null,
+    /// Suggested follow-up questions (requires steps.followup)
+    followup_questions: ?[]const []const u8 = null,
+    /// Evaluation results when steps.eval was configured
+    eval_result: ?EvalResult = null,
+};
+
+/// Configuration for the retrieval agent's pipeline steps and tool-use behavior. Each step can have its own generator (or chain of generators) and step-specific options. If a step is not configured, it is skipped (retrieval always runs).
+pub const RetrievalAgentSteps = struct {
+    /// Configuration for query classification and transformation. When set, runs classification before retrieval to select the optimal strategy (simple/decompose/step_back/hyde) and transform the query.
+    classification: ?ClassificationStepConfig = null,
+    /// Configuration for retrieval tool execution. Retrieval-step tools narrow the top-level tools policy when both are provided.
+    retrieval: ?RetrievalStepConfig = null,
+    /// Configuration for generation from retrieved documents. When set, generates a response with citations after retrieval completes.
+    generation: ?GenerationStepConfig = null,
+    /// Configuration for generating follow-up questions. Requires steps.generation to be set.
+    followup: ?FollowupStepConfig = null,
+    /// Configuration for confidence assessment of the generated response. Requires steps.generation to be set.
+    confidence: ?ConfidenceStepConfig = null,
+    /// Configuration for inline evaluation. Runs evaluators on retrieved documents and/or generated response. Requires steps.generation for generation-quality evaluators (faithfulness, completeness, etc.).
+    eval: ?EvalConfig = null,
+};
+
+/// Token usage and resource statistics from the retrieval agent execution
+pub const RetrievalAgentUsage = struct {
+    /// Total input tokens across all LLM calls
+    input_tokens: ?i64 = null,
+    /// Total output tokens across all LLM calls
+    output_tokens: ?i64 = null,
+    /// Sum of input + output tokens
+    total_tokens: ?i64 = null,
+    /// Input tokens served from cache
+    cached_input_tokens: ?i64 = null,
+    /// Number of LLM invocations made
+    llm_calls: ?i64 = null,
+    /// Total resources found across all search queries
+    resources_retrieved: ?i64 = null,
+    /// Token pruning statistics, present when max_context_tokens was configured
+    prune_stats: ?PruneStats = null,
 };
 
 /// A query in the retrieval pipeline. Extends QueryRequest with an optional tree search configuration. Each query specifies its own table. When both search fields (semantic_search, full_text_search) and tree_search are provided, the search results are used as start nodes for tree navigation.
@@ -8115,6 +6830,197 @@ pub const RetrievalQueryRequest = struct {
     tree_search: ?TreeSearchConfig = null,
 };
 
+/// Configuration for the retrieval step. Retrieval tools are constrained by the top-level request tools policy when both are present.
+pub const RetrievalStepConfig = struct {
+    /// Tool configuration for the retrieval step. When set, this narrows the top-level tools policy for retrieval execution.
+    tools: ?ChatToolsConfig = null,
+};
+
+/// Strategy for document retrieval: - semantic: Vector similarity search using embeddings - bm25: Full-text search using BM25 scoring - metadata: Structured query on document fields - tree: Iterative tree navigation with summarization - graph: Relationship-based traversal - hybrid: Combine multiple strategies with RRF or rerank
+pub const RetrievalStrategy = enum {
+    semantic,
+    bm25,
+    metadata,
+    tree,
+    graph,
+    hybrid,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .semantic => "semantic",
+            .bm25 => "bm25",
+            .metadata => "metadata",
+            .tree => "tree",
+            .graph => "graph",
+            .hybrid => "hybrid",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "semantic", .semantic },
+            .{ "bm25", .bm25 },
+            .{ "metadata", .metadata },
+            .{ "tree", .tree },
+            .{ "graph", .graph },
+            .{ "hybrid", .hybrid },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Retry configuration for generator calls
+pub const RetryConfig = struct {
+    /// Maximum number of retry attempts
+    max_attempts: ?i64 = null,
+    /// Initial backoff delay in milliseconds
+    initial_backoff_ms: ?i64 = null,
+    /// Multiplier for exponential backoff
+    backoff_multiplier: ?f32 = null,
+    /// Maximum backoff delay in milliseconds
+    max_backoff_ms: ?i64 = null,
+};
+
+pub const RoleAssignment = struct {
+    /// Role or group subject to assign, usually prefixed with role: or group:.
+    role: []const u8,
+};
+
+/// Classification of query type: question (specific factual query) or search (exploratory query)
+pub const RouteType = enum {
+    question,
+    search,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .question => "question",
+            .search => "search",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "question", .question },
+            .{ "search", .search },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// A row filter policy for a user on a specific table.
+pub const RowFilterEntry = struct {
+    /// Table name (or '*' for all tables).
+    table: []const u8,
+    /// Antfly query JSON that documents must match to be visible.
+    filter: std.json.ArrayHashMap(std.json.Value),
+};
+
+pub const RuntimeDecl = struct {
+    name: ExtensionIdentifier,
+    mode: ?[]const u8 = null,
+    artifact: ?[]const u8 = null,
+    config_json: ?[]const u8 = null,
+};
+
+/// Emitted when an error occurs during retrieval
+pub const SSEError = struct {
+    /// Error message
+    @"error": []const u8,
+};
+
+/// SSE event types emitted by the retrieval agent streaming endpoint
+pub const SSEEvent = enum {
+    step_started,
+    step_progress,
+    step_completed,
+    classification,
+    reasoning,
+    generation,
+    followup,
+    hit,
+    tool_mode,
+    eval,
+    @"error",
+    done,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .step_started => "step_started",
+            .step_progress => "step_progress",
+            .step_completed => "step_completed",
+            .classification => "classification",
+            .reasoning => "reasoning",
+            .generation => "generation",
+            .followup => "followup",
+            .hit => "hit",
+            .tool_mode => "tool_mode",
+            .eval => "eval",
+            .@"error" => "error",
+            .done => "done",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "step_started", .step_started },
+            .{ "step_progress", .step_progress },
+            .{ "step_completed", .step_completed },
+            .{ "classification", .classification },
+            .{ "reasoning", .reasoning },
+            .{ "generation", .generation },
+            .{ "followup", .followup },
+            .{ "hit", .hit },
+            .{ "tool_mode", .tool_mode },
+            .{ "eval", .eval },
+            .{ "error", .@"error" },
+            .{ "done", .done },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const SSEStepCompleted = AgentStep;
+
+/// Emitted to report progress within a running step. The `name` field identifies which step this progress belongs to. Additional properties vary by step type (e.g., tree_search includes depth, num_nodes, sufficient, etc.).
+pub const SSEStepProgress = struct {
+    /// Name of the step this progress belongs to
+    name: []const u8,
+};
+
+/// Emitted when a pipeline step begins execution
+pub const SSEStepStarted = struct {
+    /// Unique step ID for correlating with step_completed
+    id: []const u8,
+    kind: ?AgentStepKind = null,
+    /// Stable step name used for correlation across JSON and SSE surfaces
+    name: []const u8,
+    /// Human-readable description of the action being taken
+    action: []const u8,
+};
+
+/// Emitted when the agent selects a tool-calling mode
+pub const SSEToolMode = struct {
+    /// Tool calling mode selected
+    mode: []const u8,
+    /// Number of tools available (present for native mode)
+    tools_count: ?i64 = null,
+};
+
 /// Request to scan keys in a table within a key range. If no range is specified, scans all keys in the table.
 pub const ScanKeysRequest = struct {
     /// Start of the key range to scan (exclusive by default). Can be a full key or a prefix. If not specified, starts from the beginning of the table.
@@ -8133,6 +7039,277 @@ pub const ScanKeysRequest = struct {
     limit: ?i64 = null,
 };
 
+pub const SecretEntry = struct {
+    /// Secret name (e.g., openai.api_key)
+    key: []const u8,
+    status: SecretStatus,
+    /// Corresponding environment variable name (e.g., OPENAI_API_KEY)
+    env_var: ?[]const u8 = null,
+    created_at: ?[]const u8 = null,
+    updated_at: ?[]const u8 = null,
+};
+
+pub const SecretList = struct {
+    secrets: []const SecretEntry,
+};
+
+/// Source of the secret configuration
+pub const SecretStatus = enum {
+    configured_keystore,
+    configured_env,
+    configured_both,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .configured_keystore => "configured_keystore",
+            .configured_env => "configured_env",
+            .configured_both => "configured_both",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "configured_keystore", .configured_keystore },
+            .{ "configured_env", .configured_env },
+            .{ "configured_both", .configured_both },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Non-secret status for the local secrets file store, when one is available.
+pub const SecretStoreStatus = struct {
+    /// Whether Antfly is serving a last-known-good secrets snapshot after a failed refresh.
+    stale: ?bool = null,
+};
+
+pub const SecretWriteRequest = struct {
+    /// Secret value (stored encrypted, never returned)
+    value: []const u8,
+};
+
+/// Mode for semantic query generation: - rewrite: Transform query into expanded keywords/concepts optimized for vector search (Level 2 optimization) - hypothetical: Generate a hypothetical answer that would appear in relevant documents (HyDE - Level 3 optimization)
+pub const SemanticQueryMode = enum {
+    rewrite,
+    hypothetical,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .rewrite => "rewrite",
+            .hypothetical => "hypothetical",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "rewrite", .rewrite },
+            .{ "hypothetical", .hypothetical },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Configuration for Serper.dev Google Search API. Serper provides a simpler alternative to Google Custom Search with competitive pricing and easy setup. **Setup:** 1. Sign up at https://serper.dev 2. Get API key from dashboard **Docs:** https://serper.dev/docs
+pub const SerperSearchConfig = struct {
+    provider: WebSearchProvider,
+    /// Provider API key or secret reference. Prefer named web_search connections for production use.
+    api_key: ?[]const u8 = null,
+    /// Provider endpoint override when applicable
+    endpoint: ?[]const u8 = null,
+    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+    location: ?[]const u8 = null,
+    /// Agent Search data store ID for provider vertex.
+    data_store: ?[]const u8 = null,
+    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
+    serving_config: ?[]const u8 = null,
+    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+    credentials_path: ?[]const u8 = null,
+    /// Maximum number of search results to return
+    max_results: ?i64 = null,
+    /// Request timeout in milliseconds
+    timeout_ms: ?i64 = null,
+    /// Enable safe search filtering
+    safe_search: ?bool = null,
+    /// Preferred language for results (e.g., 'en', 'es', 'fr')
+    language: ?[]const u8 = null,
+    /// Preferred region for results (e.g., 'us', 'uk', 'de')
+    region: ?[]const u8 = null,
+    /// Ask the provider to return extracted page content when supported
+    include_content: ?bool = null,
+    /// Ask the provider to return highlighted passages when supported
+    include_highlights: ?bool = null,
+    /// Type of search to perform
+    search_type: ?[]const u8 = null,
+    /// Time period filter: d=day, w=week, m=month, y=year
+    time_period: ?[]const u8 = null,
+};
+
+pub const ShardConfig = struct {
+    byte_range: ByteRange,
+};
+
+/// Shard-level execution statistics.
+pub const ShardsProfile = struct {
+    /// Total shards targeted by the query.
+    total: ?i64 = null,
+    /// Shards that returned results successfully.
+    successful: ?i64 = null,
+    /// Shards that failed during execution.
+    failed: ?i64 = null,
+};
+
+/// Algorithm for computing term significance: - jlh: JLH algorithm (default) - mutual_information: Mutual Information - chi_squared: Chi-squared test - percentage: Simple percentage comparison
+pub const SignificanceAlgorithm = enum {
+    jlh,
+    mutual_information,
+    chi_squared,
+    percentage,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .jlh => "jlh",
+            .mutual_information => "mutual_information",
+            .chi_squared => "chi_squared",
+            .percentage => "percentage",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "jlh", .jlh },
+            .{ "mutual_information", .mutual_information },
+            .{ "chi_squared", .chi_squared },
+            .{ "percentage", .percentage },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Sort direction for a single field. true = descending, false = ascending.
+pub const SortDirection = bool;
+
+/// A single sort field with direction.
+pub const SortField = struct {
+    /// The field name to sort by.
+    field: []const u8,
+    /// Sort direction. true = descending, false = ascending.
+    desc: ?bool = null,
+};
+
+/// Sort execution profile. The fields below are the stable public diagnostic surface; profiling responses may include additional implementation counters. Additional properties may include low-level implementation details such as doc-value load timings, stored-source loads, collector/window internals, cost-model inputs, native-filter modes, and index-sort availability flags; treat those properties as diagnostic and not as a frozen SDK contract.
+pub const SortProfile = struct {
+    /// Stable physical sort plan name. Known values include `none`, `id_only`, `id_seek`, `sorted_segment_seek`, `native_doc_values_top_n`, `score_top_k`, `distributed_k_way_merge`, `stored_json_debug`, and `unsupported_exact_sort`. Public exact sort requests must not silently move from native plans to `stored_json_debug`; missing native coverage is reported through the rejection fields instead.
+    plan: ?[]const u8 = null,
+    /// Requested order fields, including the implicit _id tie-breaker when applicable.
+    order_by: ?[]const SortField = null,
+    /// Cursor mode for this request.
+    cursor: ?[]const u8 = null,
+    /// Exactness class for the selected plan. Known values include `none`, `exact`, `bounded_exact`, `approximate`, and `unsupported`.
+    exactness: ?[]const u8 = null,
+    /// Sort execution primitive used by the selected plan. Known values include `none`, `candidate_collector`, `primary_key_scan`, `sorted_segment_scan`, `score_top_k`, `doc_values_collector`, `distributed_merge`, `stored_json_debug`, and `unsupported`.
+    source: ?[]const u8 = null,
+    /// Exact candidate source consumed by the selected sort primitive.
+    candidate_source: ?[]const u8 = null,
+    /// Cursor support level for the selected plan. Known values include `none`, `comparator`, `segment_seek`, `distributed_seek`, and `unsupported`.
+    cursor_support: ?[]const u8 = null,
+    /// Stored source load strategy. Known values include `none`, `source_free`, `projected_source_after_page`, `stored_source_required`, and `unsupported`.
+    source_load: ?[]const u8 = null,
+    /// Distributed sort behavior. Known values include `none`, `shard_local_only`, `coordinator_merge`, and `unsupported`.
+    distributed_behavior: ?[]const u8 = null,
+    /// Stable reason the planner selected this sort plan. Known values include `none`, `unsupported_exact_sort`, `distributed_k_way_merge`, `stored_json_debug`, `id_candidate_order`, `id_primary_key_seek`, `score_top_k`, `index_sort_sorted_segment_seek`, `sorted_segment_seek`, `doc_values_collector`, `index_sort_unavailable_doc_values_collector`, `caller_selected_doc_values_collector`, and `selective_filter_doc_values_collector`.
+    selection_reason: ?[]const u8 = null,
+    /// Whether exact execution required native typed sort values.
+    require_native: ?bool = null,
+    /// Conservative lifecycle state for the requested sort path. Queryable fields are accepted by public exact sort; accelerated fields are queryable and have an index_sort-compatible physical path.
+    sort_lifecycle_state: ?[]const u8 = null,
+    /// Native typed doc-values coverage status for mapped sort fields. Known values include `covered`, `identity_metadata`, `schema_declared`, `observed_declared`, and `not_declared`.
+    native_doc_values_coverage: ?[]const u8 = null,
+    /// Physical index_sort coverage status for the requested order. Known values include `request_mismatch`, `no_live_segments`, `missing_segment_index_sort`, `covered_without_bounds`, and `covered_with_bounds`.
+    index_sort_coverage: ?[]const u8 = null,
+    /// Candidate documents considered by sort execution.
+    candidate_count: ?i64 = null,
+    /// Candidates rejected by cursor comparison.
+    cursor_rejected_count: ?i64 = null,
+    /// Hits selected for the returned page.
+    selected_count: ?i64 = null,
+    /// Total sort execution time in microseconds.
+    total_us: ?i64 = null,
+    /// Shards participating in distributed sort execution.
+    distributed_shard_count: ?i64 = null,
+    /// Stable budget rejection reason. Known values include `text_exact_late_visibility_totals`, `text_field_sort_candidate_window`, `match_all_candidate_collect_limit`, `match_all_exact_candidate_window`, `sorted_segment_scan_window`, and `distributed_merge_shard_window`.
+    budget_rejection_reason: ?[]const u8 = null,
+    /// Stable public exact-sort rejection reason. Known values include `unmapped_field`, `non_sortable_field`, `unsupported_sort_field`, `mixed_field_type`, `field_not_sort_ready`, `filter_not_queryable`, `invalid_cursor_arity`, `invalid_cursor_type`, `invalid_sort_tuple`, `approximate_candidate_source`, `candidate_budget_exceeded`, `missing_null_policy`, `non_score_bearing_source`, `invalid_score_value`, `count_only_ordered_page`, `stored_json_sort_disabled`, `unsupported_exact_sort`, and `distributed_merge_unsupported`.
+    sort_rejection_reason: ?[]const u8 = null,
+    /// Stable rejection detail. Known exact-sort details include `unmapped_sort_field`, `unmapped_field`, `non_sortable_sort_field`, `non_scalar_field`, `non_sortable_field`, `mixed_field_type`, `missing_doc_values_section`, `malformed_doc_values_section`, `doc_values_kind_mismatch`, `sparse_live_doc_values`, `invalid_doc_value_doc_id`, `duplicate_doc_value_doc_id`, `unsupported_doc_values_type`, `missing_doc_values_coverage`, `missing_doc_values_capability`, `schema_declared`, `observed_declared`, `not_declared`, `missing_doc_values`, `non_sortable`, `declared`, `text_search_only`, `mixed`, `missing_native_filter_coverage`, `invalid_cursor_arity`, `invalid_cursor_type`, `invalid_sort_tuple`, `sort_tuple_arity`, `invalid_doc_value_type`, `missing_runtime_mapping`, `incomplete_sort_tuple`, `mixed_sort_value_domain`, `unsorted_shard_window`, `unsorted_component_window`, `non_numeric_score`, `missing_score`, `non_finite_score`, `score_sort_tuple_mismatch`, `non_score_bearing_source`, `id_tiebreaker_mismatch`, `approximate_candidate_source`, `count_only_ordered_page`, `native_sort_loader_unavailable`, `sorted_segment_executor_unavailable`, `primary_key_stream_unavailable`, `native_candidate_stream_unavailable`, `candidate_stream_unavailable`, `incompatible_sort_plan`, `sorted_segment_bounds_unavailable`, `filter_query_json_unresolved`, `exclusion_query_json_unresolved`, `text_index_entry_unavailable`, `doc_ordinal_projection_unavailable`, `component_sort_profile_missing`, `unsupported_composed_sort_source`, `stored_json_sort_disabled`, `distributed_merge_unsupported`, `distributed_merge_plan_required`, `distributed_shard_window_incomplete`, `distributed_shard_cursor_window_invalid`, and `distributed_merge_shard_window`.
+    sort_rejection_detail: ?[]const u8 = null,
+    /// Sort field associated with the rejection when safe to expose.
+    sort_rejection_field: ?[]const u8 = null,
+};
+
+pub const StorageStatus = struct {
+    /// Disk usage in bytes.
+    disk_usage: ?i64 = null,
+    /// Whether the table has received data.
+    empty: ?bool = null,
+    lsm: ?LsmStorageStatus = null,
+};
+
+pub const SuccessMessage = struct {
+    message: ?[]const u8 = null,
+};
+
+/// Synchronization level for batch operations: - "propose": Wait for Raft proposal acceptance (fastest, default) - "write": Wait for Pebble KV write - "full_text": Wait for full-text index WAL write - "enrichments": Pre-compute enrichments before Raft proposal (synchronous enrichment generation) - "full_index": Wait for all index writes to complete (full-text + enrichments + vector indexes)
+pub const SyncLevel = enum {
+    propose,
+    write,
+    full_text,
+    enrichments,
+    full_index,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .propose => "propose",
+            .write => "write",
+            .full_text => "full_text",
+            .enrichments => "enrichments",
+            .full_index => "full_index",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "propose", .propose },
+            .{ "write", .write },
+            .{ "full_text", .full_text },
+            .{ "enrichments", .enrichments },
+            .{ "full_index", .full_index },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const Table = struct {
     name: []const u8,
     /// Optional description of the table.
@@ -8146,6 +7323,216 @@ pub const Table = struct {
     replication_sources: ?[]const ReplicationSource = null,
     /// Effective runtime field capabilities for this table. Clients can use this to discover concrete field variants and their supported query modes, such as full_text, exact, range, geo, and autocomplete. Public exact field sort is supported only for `_id` or scalar fields marked sortable whose sort lifecycle is queryable or accelerated.
     field_capabilities: ?[]const FieldCapability = null,
+};
+
+/// Table-level generated artifact enrichments configured for a table.
+pub const TableArtifactEnrichmentList = struct {
+    /// Table containing the configured artifact enrichments.
+    table_name: []const u8,
+    artifacts: []const EnrichmentConfig,
+};
+
+pub const TableBackupStatus = struct {
+    /// Table name
+    name: []const u8,
+    /// Backup status for this table
+    status: []const u8,
+    /// Error message if backup failed
+    @"error": ?[]const u8 = null,
+};
+
+/// Describes an in-progress schema migration. The table serves reads from read_schema while rebuilding full-text indexes for the new schema.
+pub const TableMigration = struct {
+    state: []const u8,
+    read_schema: TableSchema,
+};
+
+/// Durable table repair debt. Artifact targets include exact source and artifact identifiers; index targets include the affected index and repair status.
+pub const TableRepairIssue = struct {
+    artifact_kind: ArtifactRepairKind,
+    /// Index whose replay or derived state observed the artifact problem.
+    index_name: []const u8,
+    /// Source or derived document key whose artifact is missing or unreadable.
+    doc_key: []const u8,
+    /// Parent source document key for chunk-derived artifacts.
+    parent_doc_key: ?[]const u8 = null,
+    /// Unit identifier for unit-scoped artifacts, when applicable.
+    unit_id: ?[]const u8 = null,
+    /// Source artifact stream used to produce this artifact, when applicable.
+    source_artifact_name: ?[]const u8 = null,
+    /// Derived artifact name that must be reprocessed or made readable.
+    artifact_name: []const u8,
+    /// Hex-encoded internal artifact storage key, when known.
+    artifact_key: ?[]const u8 = null,
+    /// Chunk ordinal for chunk-derived artifacts.
+    chunk_id: ?i64 = null,
+    /// Whether this artifact kind currently has an automated repair reprocessor.
+    repairable: bool,
+    /// Stable reason code when repairable is false.
+    unsupported_reason: ?[]const u8 = null,
+    /// Derived replay sequence that observed the issue.
+    sequence: i64,
+    reason: ArtifactRepairReason,
+    /// Number of repair attempts made for this issue.
+    attempts: i64,
+    /// Monotonic timestamp when this issue was first recorded.
+    first_seen_ns: i64,
+    /// Monotonic timestamp when this issue was last observed or attempted.
+    last_seen_ns: i64,
+    /// Last stable repair error code, when a repair attempt failed.
+    last_error: ?[]const u8 = null,
+};
+
+/// Bounded page of table repair issues.
+pub const TableRepairIssueList = struct {
+    /// Table whose repair queue was listed.
+    table: []const u8,
+    target: RepairTarget,
+    /// Effective page limit.
+    limit: i64,
+    /// Number of repair records scanned while building this page.
+    scanned: i64,
+    /// Number of table groups touched while building this page.
+    groups_scanned: i64,
+    /// Whether another page is available.
+    has_more: bool,
+    /// Opaque cursor for the next page when has_more is true.
+    next_cursor: ?[]const u8 = null,
+    issues: []const TableRepairIssue,
+};
+
+/// Durable table repair job state.
+pub const TableRepairJob = struct {
+    /// Server-assigned durable repair job identifier.
+    job_id: i64,
+    /// Monotonic execution attempt token for the current running pass.
+    attempt_id: i64,
+    /// Table being repaired.
+    table_name: []const u8,
+    /// Lifecycle phase of the repair job.
+    phase: []const u8,
+    /// User-facing repair progress state. `debt_remaining` means the bounded job stopped because unsupported or failed debt still requires operator action.
+    repair_status: []const u8,
+    target: RepairTarget,
+    kind: ?ArtifactRepairKind = null,
+    /// Index name when the job is restricted to one index.
+    index: ?[]const u8 = null,
+    /// Opaque continuation cursor for the next bounded repair pass.
+    cursor: ?[]const u8 = null,
+    /// Effective per-pass repair limit.
+    limit: i64,
+    /// Whether the job forces a named index rebuild.
+    force: bool,
+    result: TableRepairRunResult,
+    /// Last stable job-level error code.
+    last_error: ?[]const u8 = null,
+    /// Whether cancellation has been requested for a running pass. Running passes finish at a bounded repair boundary before the job transitions to cancelled.
+    cancel_requested: bool,
+    /// Unix epoch milliseconds when the job was created.
+    created_at_millis: i64,
+    /// Unix epoch milliseconds when the job state was last updated.
+    last_updated_at_millis: i64,
+    /// Unix epoch milliseconds when the job is eligible for cleanup.
+    expires_at_millis: i64,
+};
+
+/// Starts a durable table repair job. The job advances in bounded passes using the same repair request shape as runTableRepair.
+pub const TableRepairJobStartRequest = struct {
+    target: ?RepairTarget = null,
+    kind: ?ArtifactRepairKind = null,
+    /// Restrict repair attempts to one index name.
+    index: ?[]const u8 = null,
+    /// Opaque cursor returned by a prior repair response.
+    cursor: ?[]const u8 = null,
+    /// Force a named index rebuild even when no repair debt is currently recorded. Only applies to target=index.
+    force: ?bool = null,
+    /// Maximum artifact repair records to attempt per pass. For target=index, any positive value permits one named index repair.
+    limit: ?i64 = null,
+    /// When true, the server immediately attempts the first bounded repair pass before returning the job.
+    advance: ?bool = null,
+};
+
+/// Response for a bounded table repair pass.
+pub const TableRepairRunResponse = struct {
+    /// Table whose repair queue was processed.
+    table: []const u8,
+    target: RepairTarget,
+    /// Effective repair limit.
+    limit: i64,
+    result: TableRepairRunResult,
+};
+
+/// Result of one bounded table repair pass.
+pub const TableRepairRunResult = struct {
+    /// Number of repair records attempted by this pass.
+    scanned: i64,
+    /// Number of table groups touched by this bounded repair pass.
+    groups_scanned: i64,
+    /// Number of artifacts whose source was reprocessed.
+    reprocessed: i64,
+    /// Number of repair records cleared because the artifact became readable.
+    repaired: i64,
+    /// Number of repair records whose source document no longer exists.
+    missing_source_docs: i64,
+    /// Number of supported repair attempts that failed.
+    failed: i64,
+    /// Number of repair records skipped because no automated repair exists for the selected target.
+    unsupported: i64,
+    /// Number of attempted repair records that remained queued after this pass.
+    unresolved: i64,
+    /// Number of selected repair records or indexes skipped because another repair pass already owns them.
+    in_progress: i64,
+    /// Number of indexes rebuilt by this pass when target is index.
+    indexes_rebuilt: i64,
+    /// Number of selected indexes that were already degraded or quarantined before repair.
+    indexes_degraded: i64,
+    /// Effective repair limit.
+    limit: i64,
+    /// Opaque cursor for the next artifact repair pass when has_more is true. Index repair currently repairs one named index per request and does not return a continuation cursor.
+    next_cursor: ?[]const u8 = null,
+    /// Whether another repair scan page is available via next_cursor.
+    has_more: bool,
+    /// Whether repair debt remains after this bounded pass. If true and next_cursor is absent, rerun repair from the beginning after addressing failed or unsupported records.
+    debt_remaining: bool,
+};
+
+pub const TableRestoreStatus = struct {
+    /// Table name
+    name: []const u8,
+    /// Restore status for this table
+    status: []const u8,
+    /// Error message if restore failed
+    @"error": ?[]const u8 = null,
+};
+
+/// Schema definition for a table with multiple document types
+pub const TableSchema = struct {
+    /// Version of the schema. Used for migrations.
+    version: ?i64 = null,
+    /// Default type to use from the document_types.
+    default_type: ?[]const u8 = null,
+    /// Whether to enforce that documents must match one of the provided document types. If false, documents not matching any type will be accepted but not indexed.
+    enforce_types: ?bool = null,
+    /// A map of type names to their document json schemas.
+    document_schemas: ?std.json.ArrayHashMap(DocumentSchema) = null,
+    /// The field containing the timestamp for TTL expiration (optional). Defaults to "_timestamp" if ttl_duration is specified but ttl_field is not.
+    ttl_field: ?[]const u8 = null,
+    /// The duration after which documents should expire, based on the ttl_field timestamp (optional). Uses Go duration format (e.g., '24h', '7d', '168h').
+    ttl_duration: ?[]const u8 = null,
+    /// Rules for mapping dynamically detected fields. When a document contains fields that don't have explicit mappings and dynamic mapping is enabled, templates are evaluated in order to determine how those fields should be indexed.
+    dynamic_templates: ?[]const DynamicTemplate = null,
+};
+
+/// Statistics about a table used for query planning.
+pub const TableStatistics = struct {
+    /// Approximate number of rows in the table.
+    row_count: ?i64 = null,
+    /// Approximate size of the table in bytes.
+    size_bytes: ?i64 = null,
+    /// Per-field statistics for query optimization.
+    field_stats: ?std.json.ArrayHashMap(FieldStatistics) = null,
+    /// When these statistics were last computed.
+    last_updated: ?[]const u8 = null,
 };
 
 pub const TableStatus = struct {
@@ -8164,4 +7551,665 @@ pub const TableStatus = struct {
     storage_status: StorageStatus,
     /// Table-level generated artifact enrichments registered outside a specific index.
     artifact_enrichments: ?[]const EnrichmentConfig = null,
+};
+
+/// Configuration for Tavily AI Search API. Tavily is optimized for RAG and AI applications, providing pre-processed results with summaries and relevance scoring. **Setup:** 1. Sign up at https://tavily.com 2. Get API key from dashboard **Docs:** https://docs.tavily.com
+pub const TavilySearchConfig = struct {
+    provider: WebSearchProvider,
+    /// Provider API key or secret reference. Prefer named web_search connections for production use.
+    api_key: ?[]const u8 = null,
+    /// Provider endpoint override when applicable
+    endpoint: ?[]const u8 = null,
+    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+    location: ?[]const u8 = null,
+    /// Agent Search data store ID for provider vertex.
+    data_store: ?[]const u8 = null,
+    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
+    serving_config: ?[]const u8 = null,
+    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+    credentials_path: ?[]const u8 = null,
+    /// Maximum number of search results to return
+    max_results: ?i64 = null,
+    /// Request timeout in milliseconds
+    timeout_ms: ?i64 = null,
+    /// Enable safe search filtering
+    safe_search: ?bool = null,
+    /// Preferred language for results (e.g., 'en', 'es', 'fr')
+    language: ?[]const u8 = null,
+    /// Preferred region for results (e.g., 'us', 'uk', 'de')
+    region: ?[]const u8 = null,
+    /// Ask the provider to return extracted page content when supported
+    include_content: ?bool = null,
+    /// Ask the provider to return highlighted passages when supported
+    include_highlights: ?bool = null,
+    /// Search depth: - basic: Fast search with standard results - advanced: Deeper search with more comprehensive results
+    search_depth: ?[]const u8 = null,
+    /// Include AI-generated answer summary
+    include_answer: ?bool = null,
+    /// Include raw HTML content of pages
+    include_raw_content: ?bool = null,
+    /// Only include results from these domains
+    include_domains: ?[]const []const u8 = null,
+    /// Exclude results from these domains
+    exclude_domains: ?[]const []const u8 = null,
+};
+
+/// Field mapping to apply when a dynamic template matches
+pub const TemplateFieldMapping = struct {
+    type: ?AntflyType2 = null,
+    /// Analyzer name (e.g., "standard", "keyword", "en", "html_analyzer"). Used for text fields to control tokenization and normalization.
+    analyzer: ?[]const u8 = null,
+    /// Whether to index the field (default true)
+    index: ?bool = null,
+    /// Whether to store the field value (default false)
+    store: ?bool = null,
+    /// Whether to include in the _all field for cross-field search
+    include_in_all: ?bool = null,
+    /// Whether this scalar field can be used in order_by. When true, Antfly derives the internal typed doc-value structures required for exact sorting; users should not configure doc_values directly.
+    sortable: ?bool = null,
+    /// Missing/null sort policy for this mapped field. The current production policy rejects missing or null native sort values so sorted cursors remain replayable JSON scalar tuples.
+    missing_null_policy: ?[]const u8 = null,
+};
+
+pub const TermQuery = struct {
+    term: []const u8,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
+};
+
+pub const TermRangeQuery = struct {
+    min: ?[]const u8 = null,
+    max: ?[]const u8 = null,
+    inclusive_min: ?bool = null,
+    inclusive_max: ?bool = null,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
+};
+
+/// Options specific to text chunking.
+pub const TextChunkOptions = struct {
+    /// Target number of tokens per chunk.
+    target_tokens: ?i64 = null,
+    /// Number of tokens to overlap between consecutive chunks. Helps maintain context across chunk boundaries. Only used by fixed-size chunkers.
+    overlap_tokens: ?i64 = null,
+    /// Separator string for splitting (e.g., '\n\n' for paragraphs). Only used by fixed-size chunkers.
+    separator: ?[]const u8 = null,
+};
+
+/// Text content for multimodal input.
+pub const TextContentPart = struct {
+    type: []const u8,
+    /// Text content.
+    text: []const u8,
+};
+
+/// OpenAI-compatible assistant tool call.
+pub const ToolCall = struct {
+    /// Tool call identifier.
+    id: []const u8,
+    type: []const u8,
+    function: ToolCallFunction,
+};
+
+/// The function called by a model tool call.
+pub const ToolCallFunction = struct {
+    /// Function name.
+    name: []const u8,
+    /// JSON string of function arguments.
+    arguments: []const u8,
+};
+
+pub const TransactionBeginRequest = struct {
+    sync_level: ?SyncLevel = null,
+};
+
+pub const TransactionBeginResponse = struct {
+    transaction_id: []const u8,
+    begin_timestamp: i64,
+    sync_level: []const u8,
+};
+
+/// Stateless OCC (Optimistic Concurrency Control) transaction commit request. The client reads documents (capturing version tokens from the X-Antfly-Version response header on lookups), computes writes locally, then submits everything in this single commit request. The server validates that all read versions still match before executing writes atomically via 2PC. **No server-side state**: There is no "begin" endpoint. The client manages its own read set and submits the full transaction in one request.
+pub const TransactionCommitRequest = struct {
+    /// Set of keys that were read during the transaction, with their observed versions. The server verifies these versions still match before committing writes.
+    read_set: []const TransactionReadItem,
+    /// Write set: map of table names to batch operations, same format as MultiBatchRequest.tables.
+    tables: std.json.ArrayHashMap(BatchRequest),
+    sync_level: ?SyncLevel = null,
+};
+
+/// Result of an OCC transaction commit attempt.
+pub const TransactionCommitResponse = struct {
+    /// Whether the transaction was committed or aborted due to a conflict
+    status: []const u8,
+    /// Details about the conflict that caused an abort (only present when status is "aborted")
+    conflict: ?std.json.Value = null,
+    /// Per-table batch results (only present when status is "committed")
+    tables: ?std.json.ArrayHashMap(BatchResponse) = null,
+};
+
+/// A key that was read as part of an OCC transaction, along with the version observed at read time. Used to detect conflicts at commit time.
+pub const TransactionReadItem = struct {
+    /// Table name the key belongs to
+    table: []const u8,
+    /// Document key that was read
+    key: []const u8,
+    /// Version token observed at read time (from X-Antfly-Version header). Use "0" to assert the key did not exist at read time.
+    version: []const u8,
+};
+
+pub const TransactionSavepointResponse = struct {
+    status: []const u8,
+    transaction_id: []const u8,
+    savepoint_id: i64,
+};
+
+pub const TransactionSessionCleanupResponse = struct {
+    removed: ?i64 = null,
+    cutoff_ns: ?i64 = null,
+};
+
+pub const TransactionSessionCommitResponse = struct {
+    /// Whether the transaction was committed or aborted due to a conflict
+    status: []const u8,
+    /// Details about the conflict that caused an abort (only present when status is "aborted")
+    conflict: ?std.json.Value = null,
+    /// Per-table batch results (only present when status is "committed")
+    tables: ?std.json.ArrayHashMap(BatchResponse) = null,
+    transaction_id: []const u8,
+};
+
+pub const TransactionSessionDetailsResponse = struct {
+    transaction_id: []const u8,
+    owner_node_id: i64,
+    begin_timestamp: i64,
+    last_touched_timestamp: i64,
+    lease_expires_at: i64,
+    lease_state: []const u8,
+    sync_level: []const u8,
+    staged_table_count: i64,
+    staged_read_count: i64,
+    staged_write_count: i64,
+    staged_delete_count: i64,
+    read_snapshot_count: i64,
+    savepoint_count: i64,
+    savepoint_limit: ?i64 = null,
+    remaining_savepoints: ?i64 = null,
+    durable: bool,
+    tables: ?[]const TransactionSessionTableDetail = null,
+    read_snapshots: ?[]const TransactionSessionReadSnapshot = null,
+    savepoint_ids: ?[]const i64 = null,
+};
+
+pub const TransactionSessionListResponse = struct {
+    session_count: ?i64 = null,
+    lease_held_count: ?i64 = null,
+    lease_expired_count: ?i64 = null,
+    sessions: ?[]const TransactionSessionStatus = null,
+};
+
+pub const TransactionSessionReadSnapshot = struct {
+    table: ?[]const u8 = null,
+    key: ?[]const u8 = null,
+    version: ?i64 = null,
+    document: ?std.json.Value = null,
+};
+
+pub const TransactionSessionStatus = struct {
+    transaction_id: []const u8,
+    owner_node_id: i64,
+    begin_timestamp: i64,
+    last_touched_timestamp: i64,
+    lease_expires_at: i64,
+    lease_state: []const u8,
+    sync_level: []const u8,
+    staged_table_count: i64,
+    staged_read_count: i64,
+    staged_write_count: i64,
+    staged_delete_count: i64,
+    read_snapshot_count: i64,
+    savepoint_count: i64,
+    savepoint_limit: ?i64 = null,
+    remaining_savepoints: ?i64 = null,
+    durable: bool,
+};
+
+pub const TransactionSessionTableDetail = struct {
+    table: ?[]const u8 = null,
+    staged_read_count: ?i64 = null,
+    staged_write_count: ?i64 = null,
+    staged_delete_count: ?i64 = null,
+    staged_predicate_count: ?i64 = null,
+};
+
+pub const TransactionStageDeleteRequest = struct {
+    table: []const u8,
+    key: []const u8,
+};
+
+pub const TransactionStageReadRequest = struct {
+    table: []const u8,
+    key: []const u8,
+    version: []const u8,
+};
+
+pub const TransactionStageReadResponse = struct {
+    status: []const u8,
+    transaction_id: []const u8,
+    snapshot: TransactionStageReadSnapshot,
+};
+
+pub const TransactionStageReadSnapshot = struct {
+    table: []const u8,
+    key: []const u8,
+    version: []const u8,
+    document: ?std.json.Value,
+};
+
+pub const TransactionStageWriteRequest = struct {
+    table: []const u8,
+    key: []const u8,
+    document: std.json.Value,
+};
+
+pub const TransactionStatusResponse = struct {
+    status: []const u8,
+    transaction_id: []const u8,
+};
+
+/// In-place document transformation using MongoDB-style operators. Transforms are applied atomically at the storage layer, eliminating read-modify-write races. **Important:** Transform results are NOT validated against the table schema. This improves performance but means it's possible to create invalid documents. Use with care and ensure your operations maintain schema compliance.
+pub const Transform = struct {
+    /// Document key (must be a string, not an object like inserts)
+    key: []const u8,
+    /// List of operations to apply in sequence
+    operations: []const TransformOp,
+    /// If true, create document if it doesn't exist (like MongoDB upsert)
+    upsert: ?bool = null,
+};
+
+pub const TransformOp = struct {
+    op: TransformOpType,
+    /// JSONPath to field (e.g., "$.user.name", "$.tags", or "user.name")
+    path: []const u8,
+    /// Value for operation (not required for $unset, $currentDate). Type depends on operator (number for $inc/$mul, any for $set/$setOnInsert, etc.)
+    value: ?std.json.Value = null,
+};
+
+/// MongoDB-style update operator
+pub const TransformOpType = enum {
+    @"$set",
+    @"$set_on_insert",
+    @"$unset",
+    @"$inc",
+    @"$push",
+    @"$pull",
+    @"$add_to_set",
+    @"$pop",
+    @"$mul",
+    @"$min",
+    @"$max",
+    @"$current_date",
+    @"$rename",
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .@"$set" => "$set",
+            .@"$set_on_insert" => "$setOnInsert",
+            .@"$unset" => "$unset",
+            .@"$inc" => "$inc",
+            .@"$push" => "$push",
+            .@"$pull" => "$pull",
+            .@"$add_to_set" => "$addToSet",
+            .@"$pop" => "$pop",
+            .@"$mul" => "$mul",
+            .@"$min" => "$min",
+            .@"$max" => "$max",
+            .@"$current_date" => "$currentDate",
+            .@"$rename" => "$rename",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "$set", .@"$set" },
+            .{ "$setOnInsert", .@"$set_on_insert" },
+            .{ "$unset", .@"$unset" },
+            .{ "$inc", .@"$inc" },
+            .{ "$push", .@"$push" },
+            .{ "$pull", .@"$pull" },
+            .{ "$addToSet", .@"$add_to_set" },
+            .{ "$pop", .@"$pop" },
+            .{ "$mul", .@"$mul" },
+            .{ "$min", .@"$min" },
+            .{ "$max", .@"$max" },
+            .{ "$currentDate", .@"$current_date" },
+            .{ "$rename", .@"$rename" },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// A single result from graph traversal
+pub const TraversalResult = struct {
+    /// Base64-encoded document key
+    key: []const u8,
+    /// Document data (if loaded)
+    document: ?std.json.Value = null,
+    /// Distance from start node (0 = start node)
+    depth: i64,
+    /// Sequence of keys from start to this node (if include_paths=true)
+    path: ?[]const []const u8 = null,
+    /// Sequence of edges from start to this node (if include_paths=true)
+    path_edges: ?[]const Edge = null,
+    /// Product of edge weights along the path
+    total_weight: ?f64 = null,
+};
+
+/// Rules for graph traversal
+pub const TraversalRules = struct {
+    /// Filter edges by type (empty = all types)
+    edge_types: ?[]const []const u8 = null,
+    /// Minimum edge weight filter
+    min_weight: ?f64 = null,
+    /// Maximum edge weight filter
+    max_weight: ?f64 = null,
+    direction: ?EdgeDirection = null,
+    /// Maximum traversal depth (0 = unlimited)
+    max_depth: ?i64 = null,
+    /// Maximum results to return (0 = unlimited)
+    max_results: ?i64 = null,
+    /// Include path information in results
+    include_paths: ?bool = null,
+    /// Visit each node only once
+    deduplicate_nodes: ?bool = null,
+};
+
+pub const TraverseResponse = struct {
+    results: ?[]const TraversalResult = null,
+    /// Total number of results
+    count: ?i64 = null,
+};
+
+/// Configuration for tree search strategy. Tree search navigates hierarchical document structures by evaluating summaries at each level.
+pub const TreeSearchConfig = struct {
+    /// Name of the graph index to use for tree navigation
+    index: []const u8,
+    /// Starting nodes for tree search: - "$roots" - Query for root nodes (nodes with no parents) - Comma-separated explicit node IDs When omitted and combined with a QueryRequest in a RetrievalQueryRequest, the query results are used as start nodes.
+    start_nodes: ?[]const u8 = null,
+    /// Maximum depth to traverse in the tree
+    max_depth: ?i64 = null,
+    /// Number of branches to explore at each level
+    beam_width: ?i64 = null,
+};
+
+pub const UpdateExtensionRequest = struct {
+    target_version: ?[]const u8 = null,
+    dry_run: ?bool = null,
+};
+
+pub const UpdateManifestRef = struct {
+    from_version: []const u8,
+    to_version: []const u8,
+    path: []const u8,
+    digest: ?[]const u8 = null,
+};
+
+pub const UpdatePasswordRequest = struct {
+    new_password: []const u8,
+};
+
+pub const User = struct {
+    username: []const u8,
+    /// Base64 encoded password hash. Exposing this is a security risk.
+    password_hash: []const u8,
+    /// Server-side auth metadata available to stored row-filter policies through $auth metadata paths.
+    metadata: ?std.json.ArrayHashMap(std.json.Value) = null,
+};
+
+/// Options for Voice Activity Detection (VAD) based audio segmentation.
+pub const VADOptions = struct {
+    /// Minimum silence duration (ms) to split speech segments. Gaps shorter than this are merged. Higher values produce longer, fewer segments. Default: 300.
+    min_silence_duration_ms: ?i64 = null,
+    /// Minimum speech duration (ms) for a segment to be kept. Shorter segments are discarded. Default: 250.
+    min_speech_duration_ms: ?i64 = null,
+    /// Padding (ms) added before and after detected speech. Default: 30.
+    speech_pad_ms: ?i64 = null,
+    /// Maximum segment duration (ms). Segments longer than this are split. Useful for Whisper-compatible chunking. Default: 30000.
+    max_segment_duration_ms: ?i64 = null,
+};
+
+/// Configuration for Google Cloud Vertex AI embedding models (enterprise-grade). Uses Application Default Credentials (ADC) for authentication. Requires IAM role `roles/aiplatform.user`. **Example Models:** gemini-embedding-001 (default, 3072 dims), multimodalembedding (images/audio/video) **Docs:** https://cloud.google.com/vertex-ai/generative-ai/docs/embeddings/get-text-embeddings
+pub const VertexEmbedderConfig = struct {
+    /// The name of the Vertex AI embedding model to use.
+    model: []const u8,
+    /// Google Cloud project ID. Can also be set via GOOGLE_CLOUD_PROJECT environment variable.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud region for Vertex AI API (e.g., 'us-central1', 'europe-west1'). Can also be set via GOOGLE_CLOUD_LOCATION. Defaults to 'us-central1'.
+    location: ?[]const u8 = null,
+    /// Path to service account JSON key file. Alternative to ADC for non-GCP environments.
+    credentials_path: ?[]const u8 = null,
+    /// The dimension of the embedding vector (768, 1536, or 3072 for gemini-embedding-001; 128-1408 for multimodalembedding).
+    dimension: ?i64 = null,
+};
+
+/// Configuration for Google Cloud Vertex AI generative models.
+pub const VertexGeneratorConfig = struct {
+    /// The name of the Vertex AI model to use.
+    model: []const u8,
+    /// Google Cloud project ID.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud region for Vertex AI API.
+    location: ?[]const u8 = null,
+    /// Path to service account JSON key file.
+    credentials_path: ?[]const u8 = null,
+    /// Controls randomness in generation (0.0-2.0).
+    temperature: ?f32 = null,
+    /// Maximum number of tokens to generate in the response.
+    max_tokens: ?i64 = null,
+    /// Nucleus sampling parameter (0.0-1.0).
+    top_p: ?f32 = null,
+    /// Top-k sampling parameter.
+    top_k: ?i64 = null,
+};
+
+/// Configuration for the Google Vertex AI Ranking API. Uses Application Default Credentials (ADC) or explicit credentials path. **Prerequisites:** - Enable Discovery Engine API: `gcloud services enable discoveryengine.googleapis.com` - Grant IAM role: `roles/discoveryengine.admin` (includes `discoveryengine.rankingConfigs.rank` permission) **Models:** semantic-ranker-default@latest (default), semantic-ranker-fast-004 **Docs:** https://cloud.google.com/generative-ai-app-builder/docs/ranking **IAM:** https://cloud.google.com/generative-ai-app-builder/docs/access-control
+pub const VertexRerankerConfig = struct {
+    /// The ranking model to use.
+    model: []const u8,
+    /// Google Cloud project ID. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
+    project_id: ?[]const u8 = null,
+    /// Path to service account JSON file. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS environment variable.
+    credentials_path: ?[]const u8 = null,
+    /// Maximum number of records to return. If not specified, returns all documents with scores.
+    top_n: ?i64 = null,
+};
+
+/// Configuration for Google Cloud Agent Search / Vertex AI Search. Use this for bounded Google Cloud search over configured data stores or verified websites. The provider token is `vertex` to match Antfly's existing Google Cloud provider convention. **Setup:** 1. Enable Discovery Engine API in Google Cloud 2. Create an Agent Search app/data store 3. Grant service account access to query the serving config **Docs:** https://cloud.google.com/generative-ai-app-builder/docs
+pub const VertexSearchConfig = struct {
+    provider: WebSearchProvider,
+    /// Provider API key or secret reference. Prefer named web_search connections for production use.
+    api_key: ?[]const u8 = null,
+    /// Provider endpoint override when applicable
+    endpoint: ?[]const u8 = null,
+    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+    location: ?[]const u8 = null,
+    /// Agent Search data store ID for provider vertex.
+    data_store: ?[]const u8 = null,
+    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
+    serving_config: ?[]const u8 = null,
+    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+    credentials_path: ?[]const u8 = null,
+    /// Maximum number of search results to return
+    max_results: ?i64 = null,
+    /// Request timeout in milliseconds
+    timeout_ms: ?i64 = null,
+    /// Enable safe search filtering
+    safe_search: ?bool = null,
+    /// Preferred language for results (e.g., 'en', 'es', 'fr')
+    language: ?[]const u8 = null,
+    /// Preferred region for results (e.g., 'us', 'uk', 'de')
+    region: ?[]const u8 = null,
+    /// Ask the provider to return extracted page content when supported
+    include_content: ?bool = null,
+    /// Ask the provider to return highlighted passages when supported
+    include_highlights: ?bool = null,
+    /// Google Cloud search service flavor
+    service: ?[]const u8 = null,
+};
+
+/// A unified configuration for web search providers. Each provider has specific configuration requirements. Use the appropriate provider-specific config or set common options at the top level. **Environment Variables (fallbacks):** - EXA_API_KEY - SERPER_API_KEY - TAVILY_API_KEY - BRAVE_API_KEY - YOU_API_KEY - LINKUP_API_KEY - GOOGLE_APPLICATION_CREDENTIALS, GOOGLE_CLOUD_PROJECT, GOOGLE_CLOUD_LOCATION
+pub const WebSearchConfig = struct {
+    provider: WebSearchProvider,
+    /// Provider API key or secret reference. Prefer named web_search connections for production use.
+    api_key: ?[]const u8 = null,
+    /// Provider endpoint override when applicable
+    endpoint: ?[]const u8 = null,
+    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+    location: ?[]const u8 = null,
+    /// Agent Search data store ID for provider vertex.
+    data_store: ?[]const u8 = null,
+    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
+    serving_config: ?[]const u8 = null,
+    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+    credentials_path: ?[]const u8 = null,
+    /// Maximum number of search results to return
+    max_results: ?i64 = null,
+    /// Request timeout in milliseconds
+    timeout_ms: ?i64 = null,
+    /// Enable safe search filtering
+    safe_search: ?bool = null,
+    /// Preferred language for results (e.g., 'en', 'es', 'fr')
+    language: ?[]const u8 = null,
+    /// Preferred region for results (e.g., 'us', 'uk', 'de')
+    region: ?[]const u8 = null,
+    /// Ask the provider to return extracted page content when supported
+    include_content: ?bool = null,
+    /// Ask the provider to return highlighted passages when supported
+    include_highlights: ?bool = null,
+};
+
+pub const WebSearchConnection = struct {
+    /// Provider-specific service flavor, such as agent_search for provider vertex.
+    service: ?[]const u8 = null,
+    /// Maximum ranked results this connection is configured to return.
+    max_results: ?i64 = null,
+    /// Provider request timeout in milliseconds.
+    timeout_ms: ?i64 = null,
+    /// Whether safe-search filtering is requested.
+    safe_search: ?bool = null,
+    /// Preferred result language.
+    language: ?[]const u8 = null,
+    /// Preferred result region.
+    region: ?[]const u8 = null,
+    /// Whether extracted content is requested when supported.
+    include_content: ?bool = null,
+    /// Whether highlighted passages are requested when supported.
+    include_highlights: ?bool = null,
+    /// Provider endpoint override when configured.
+    endpoint: ?[]const u8 = null,
+    /// Google Cloud project for provider vertex.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for provider vertex.
+    location: ?[]const u8 = null,
+    /// Agent Search data store ID for provider vertex.
+    data_store: ?[]const u8 = null,
+    /// Agent Search serving config ID for provider vertex.
+    serving_config: ?[]const u8 = null,
+    /// Domain allowlist when configured.
+    include_domains: ?[]const []const u8 = null,
+    /// Domain denylist when configured.
+    exclude_domains: ?[]const []const u8 = null,
+    /// True when required credentials/config are present. Secret values are never returned.
+    configured: ?bool = null,
+};
+
+/// The web search provider to use. - **exa**: Exa neural/semantic web search API - **serper**: Serper.dev Google Search API (simpler setup) - **tavily**: Tavily AI Search API (optimized for RAG) - **brave**: Brave Search API - **you**: You.com Search API for agent and research workflows - **linkup**: Linkup Search API for web search and content retrieval - **vertex**: Google Cloud Agent Search / Vertex AI Search
+pub const WebSearchProvider = enum {
+    exa,
+    serper,
+    tavily,
+    brave,
+    you,
+    linkup,
+    vertex,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .exa => "exa",
+            .serper => "serper",
+            .tavily => "tavily",
+            .brave => "brave",
+            .you => "you",
+            .linkup => "linkup",
+            .vertex => "vertex",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "exa", .exa },
+            .{ "serper", .serper },
+            .{ "tavily", .tavily },
+            .{ "brave", .brave },
+            .{ "you", .you },
+            .{ "linkup", .linkup },
+            .{ "vertex", .vertex },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const WildcardQuery = struct {
+    wildcard: []const u8,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
+};
+
+/// Configuration for You.com Search API. You.com is useful for agentic search and research-oriented result retrieval. **Setup:** 1. Sign up for You.com API access 2. Get API key from dashboard **Docs:** https://api.you.com
+pub const YouSearchConfig = struct {
+    provider: WebSearchProvider,
+    /// Provider API key or secret reference. Prefer named web_search connections for production use.
+    api_key: ?[]const u8 = null,
+    /// Provider endpoint override when applicable
+    endpoint: ?[]const u8 = null,
+    /// Google Cloud project ID for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT.
+    project_id: ?[]const u8 = null,
+    /// Google Cloud location for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_LOCATION, then global.
+    location: ?[]const u8 = null,
+    /// Agent Search data store ID for provider vertex.
+    data_store: ?[]const u8 = null,
+    /// Agent Search serving config ID for provider vertex. Defaults to default_config.
+    serving_config: ?[]const u8 = null,
+    /// Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC.
+    credentials_path: ?[]const u8 = null,
+    /// Maximum number of search results to return
+    max_results: ?i64 = null,
+    /// Request timeout in milliseconds
+    timeout_ms: ?i64 = null,
+    /// Enable safe search filtering
+    safe_search: ?bool = null,
+    /// Preferred language for results (e.g., 'en', 'es', 'fr')
+    language: ?[]const u8 = null,
+    /// Preferred region for results (e.g., 'us', 'uk', 'de')
+    region: ?[]const u8 = null,
+    /// Ask the provider to return extracted page content when supported
+    include_content: ?bool = null,
+    /// Ask the provider to return highlighted passages when supported
+    include_highlights: ?bool = null,
 };

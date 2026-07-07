@@ -31,6 +31,29 @@ pub const OllamaRerankerConfig = struct {
     url: ?[]const u8 = null,
 };
 
+/// A unified configuration for a reranking provider.
+pub const RerankerConfig = struct {
+    provider: RerankerProvider,
+    /// Field name to extract from documents for reranking.
+    field: ?[]const u8 = null,
+    /// Handlebars template to render document text for reranking.
+    template: ?[]const u8 = null,
+    /// The name of the reranking model (e.g., cross-encoder model name).
+    model: ?[]const u8 = null,
+    /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
+    url: ?[]const u8 = null,
+    /// The Cohere API key. Can also be set via COHERE_API_KEY environment variable.
+    api_key: ?[]const u8 = null,
+    /// Number of most relevant documents to return. If not specified, returns all documents with scores.
+    top_n: ?i64 = null,
+    /// Maximum number of chunks per document for long document handling.
+    max_chunks_per_doc: ?i64 = null,
+    /// Google Cloud project ID. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
+    project_id: ?[]const u8 = null,
+    /// Path to service account JSON file. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS environment variable.
+    credentials_path: ?[]const u8 = null,
+};
+
 /// The reranking provider to use.
 pub const RerankerProvider = enum {
     antfly,
@@ -73,27 +96,4 @@ pub const VertexRerankerConfig = struct {
     credentials_path: ?[]const u8 = null,
     /// Maximum number of records to return. If not specified, returns all documents with scores.
     top_n: ?i64 = null,
-};
-
-/// A unified configuration for a reranking provider.
-pub const RerankerConfig = struct {
-    provider: RerankerProvider,
-    /// Field name to extract from documents for reranking.
-    field: ?[]const u8 = null,
-    /// Handlebars template to render document text for reranking.
-    template: ?[]const u8 = null,
-    /// The name of the reranking model (e.g., cross-encoder model name).
-    model: ?[]const u8 = null,
-    /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
-    url: ?[]const u8 = null,
-    /// The Cohere API key. Can also be set via COHERE_API_KEY environment variable.
-    api_key: ?[]const u8 = null,
-    /// Number of most relevant documents to return. If not specified, returns all documents with scores.
-    top_n: ?i64 = null,
-    /// Maximum number of chunks per document for long document handling.
-    max_chunks_per_doc: ?i64 = null,
-    /// Google Cloud project ID. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_CLOUD_PROJECT environment variable.
-    project_id: ?[]const u8 = null,
-    /// Path to service account JSON file. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS environment variable.
-    credentials_path: ?[]const u8 = null,
 };

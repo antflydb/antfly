@@ -3,8 +3,21 @@
 
 const std = @import("std");
 
+pub const HACreateReplicationSlotRequest = struct {
+    slot_name: HASlotName,
+    /// Optional LSN to initialize the slot at. Defaults to the current primary LSN.
+    initial_lsn: ?i64 = null,
+};
+
 /// Stable HA node or slot identifier. Identifiers are 1-128 ASCII bytes and may contain letters, digits, `_`, `-`, `.`, and `:`.
 pub const HAIdentifier = []const u8;
+
+pub const HAIdentifySystemResponse = struct {
+    identity: HAIdentity,
+    current_lsn: i64,
+    next_lsn: i64,
+    record_format_version: i64,
+};
 
 pub const HAIdentity = struct {
     cluster_id: i64,
@@ -88,28 +101,12 @@ pub const HARecordKind = enum {
     }
 };
 
-/// Stable standby replication slot name.
-pub const HASlotName = []const u8;
-
-pub const HAIdentifySystemResponse = struct {
-    identity: HAIdentity,
-    current_lsn: i64,
-    next_lsn: i64,
-    record_format_version: i64,
-};
-
 pub const HAReplicationFrame = struct {
     lsn: i64,
     kind: HARecordKind,
     payload_codec: HAPayloadCodec,
     /// Base64-encoded complete replication record envelope.
     encoded: []const u8,
-};
-
-pub const HACreateReplicationSlotRequest = struct {
-    slot_name: HASlotName,
-    /// Optional LSN to initialize the slot at. Defaults to the current primary LSN.
-    initial_lsn: ?i64 = null,
 };
 
 pub const HAReplicationSlotResponse = struct {
@@ -125,6 +122,9 @@ pub const HAReplicationSlotResponse = struct {
     current_lsn: i64,
 };
 
+/// Stable standby replication slot name.
+pub const HASlotName = []const u8;
+
 pub const HAStandbyStatusUpdateRequest = struct {
     slot_name: HASlotName,
     timeline_id: i64,
@@ -132,6 +132,19 @@ pub const HAStandbyStatusUpdateRequest = struct {
     applied_lsn: i64,
     /// Optional safe-read boundary. Defaults to applied_lsn.
     safe_read_lsn: ?i64 = null,
+};
+
+pub const HAStandbyStatusUpdateResponse = struct {
+    slot_name: HASlotName,
+    timeline_id: i64,
+    restart_lsn: i64,
+    received_lsn: i64,
+    applied_lsn: i64,
+    safe_read_lsn: i64,
+    active: bool,
+    reseed_required: bool,
+    last_error: ?[]const u8 = null,
+    current_lsn: i64,
 };
 
 pub const HAStartReplicationRequest = struct {
@@ -155,17 +168,4 @@ pub const HAStartReplicationResponse = struct {
     end_of_wal: bool,
     encoded_bytes: i64,
     records: []const HAReplicationFrame,
-};
-
-pub const HAStandbyStatusUpdateResponse = struct {
-    slot_name: HASlotName,
-    timeline_id: i64,
-    restart_lsn: i64,
-    received_lsn: i64,
-    applied_lsn: i64,
-    safe_read_lsn: i64,
-    active: bool,
-    reseed_required: bool,
-    last_error: ?[]const u8 = null,
-    current_lsn: i64,
 };

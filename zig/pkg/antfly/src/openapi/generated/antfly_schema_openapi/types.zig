@@ -67,23 +67,6 @@ pub const DocumentSchema = struct {
     schema: ?std.json.Value = null,
 };
 
-/// Field mapping to apply when a dynamic template matches
-pub const TemplateFieldMapping = struct {
-    type: ?AntflyType = null,
-    /// Analyzer name (e.g., "standard", "keyword", "en", "html_analyzer"). Used for text fields to control tokenization and normalization.
-    analyzer: ?[]const u8 = null,
-    /// Whether to index the field (default true)
-    index: ?bool = null,
-    /// Whether to store the field value (default false)
-    store: ?bool = null,
-    /// Whether to include in the _all field for cross-field search
-    include_in_all: ?bool = null,
-    /// Whether this scalar field can be used in order_by. When true, Antfly derives the internal typed doc-value structures required for exact sorting; users should not configure doc_values directly.
-    sortable: ?bool = null,
-    /// Missing/null sort policy for this mapped field. The current production policy rejects missing or null native sort values so sorted cursors remain replayable JSON scalar tuples.
-    missing_null_policy: ?[]const u8 = null,
-};
-
 /// A rule for mapping dynamically detected fields. Templates are checked in order and the first matching template's mapping is used.
 pub const DynamicTemplate = struct {
     /// Optional identifier for the template (useful for debugging)
@@ -117,4 +100,21 @@ pub const TableSchema = struct {
     ttl_duration: ?[]const u8 = null,
     /// Rules for mapping dynamically detected fields. When a document contains fields that don't have explicit mappings and dynamic mapping is enabled, templates are evaluated in order to determine how those fields should be indexed.
     dynamic_templates: ?[]const DynamicTemplate = null,
+};
+
+/// Field mapping to apply when a dynamic template matches
+pub const TemplateFieldMapping = struct {
+    type: ?AntflyType = null,
+    /// Analyzer name (e.g., "standard", "keyword", "en", "html_analyzer"). Used for text fields to control tokenization and normalization.
+    analyzer: ?[]const u8 = null,
+    /// Whether to index the field (default true)
+    index: ?bool = null,
+    /// Whether to store the field value (default false)
+    store: ?bool = null,
+    /// Whether to include in the _all field for cross-field search
+    include_in_all: ?bool = null,
+    /// Whether this scalar field can be used in order_by. When true, Antfly derives the internal typed doc-value structures required for exact sorting; users should not configure doc_values directly.
+    sortable: ?bool = null,
+    /// Missing/null sort policy for this mapped field. The current production policy rejects missing or null native sort values so sorted cursors remain replayable JSON scalar tuples.
+    missing_null_policy: ?[]const u8 = null,
 };

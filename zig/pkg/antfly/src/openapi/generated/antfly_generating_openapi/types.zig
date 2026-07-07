@@ -87,6 +87,30 @@ pub const ChainCondition = enum {
     }
 };
 
+/// A single link in a generator chain with optional retry and condition
+pub const ChainLink = struct {
+    generator: GeneratorConfig,
+    /// Retry configuration for this generator
+    retry: ?RetryConfig = null,
+    /// When to try the next generator in chain
+    condition: ?ChainCondition = null,
+};
+
+/// OpenAI-compatible message in a generation/chat conversation.
+pub const ChatMessage = struct {
+    role: ChatMessageRole,
+    content: ?ChatMessageContent = null,
+    /// Tool calls made by the assistant (only for role=assistant).
+    tool_calls: ?[]const ToolCall = null,
+    /// ID of the tool call this message responds to (only for role=tool).
+    tool_call_id: ?[]const u8 = null,
+    /// Optional tool name for tool messages when model templates need it.
+    name: ?[]const u8 = null,
+};
+
+/// Message content. Supports two formats: - Simple string: "Hello, how are you?" - Array of content parts: [{"type": "text", "text": "Hello"}]
+pub const ChatMessageContent = std.json.Value;
+
 /// Role of the message sender in a generation/chat conversation
 pub const ChatMessageRole = enum {
     user,
@@ -137,6 +161,99 @@ pub const CohereGeneratorConfig = struct {
     frequency_penalty: ?f32 = null,
     /// Penalty for token presence (0.0-1.0).
     presence_penalty: ?f32 = null,
+};
+
+/// A content part for multimodal input (text, image URL, or inline media).
+pub const ContentPart = union(enum) {
+    media_content_part: *MediaContentPart,
+    image_url_content_part: *ImageURLContentPart,
+    text_content_part: *TextContentPart,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        if (objectHasAnyKey(source.object, &.{
+            "type",
+            "data",
+            "mime_type",
+        })) {
+            if (try parseStructuralVariant(MediaContentPart, allocator, source, options)) |parsed| return .{ .media_content_part = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "type",
+            "image_url",
+        })) {
+            if (try parseStructuralVariant(ImageURLContentPart, allocator, source, options)) |parsed| return .{ .image_url_content_part = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "type",
+            "text",
+        })) {
+            if (try parseStructuralVariant(TextContentPart, allocator, source, options)) |parsed| return .{ .text_content_part = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .media_content_part => |v| try jw.write(v.*),
+            .image_url_content_part => |v| try jw.write(v.*),
+            .text_content_part => |v| try jw.write(v.*),
+        }
+    }
+};
+
+/// A unified configuration for a generative AI provider.
+pub const GeneratorConfig = struct {
+    /// The Google Cloud project ID.
+    project_id: ?[]const u8 = null,
+    /// The Google Cloud location (e.g., 'us-central1').
+    location: ?[]const u8 = null,
+    /// The name of the generative model to use.
+    model: ?[]const u8 = null,
+    /// Controls randomness in generation (0.0-2.0).
+    temperature: ?f32 = null,
+    /// Maximum number of tokens to generate.
+    max_tokens: ?i64 = null,
+    /// Nucleus sampling parameter.
+    top_p: ?f32 = null,
+    /// Top-k sampling parameter.
+    top_k: ?i64 = null,
+    /// The Google API key.
+    api_key: ?[]const u8 = null,
+    /// The URL of the Google API endpoint.
+    url: ?[]const u8 = null,
+    /// Path to service account JSON key file.
+    credentials_path: ?[]const u8 = null,
+    /// HTTP response timeout in seconds for Ollama API calls.
+    timeout: ?i64 = null,
+    /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
+    api_url: ?[]const u8 = null,
+    /// Penalty for token frequency (-2.0 to 2.0).
+    frequency_penalty: ?f32 = null,
+    /// Penalty for token presence (-2.0 to 2.0).
+    presence_penalty: ?f32 = null,
+    /// Array of model identifiers for fallback routing. Either model or models must be provided.
+    models: ?[]const []const u8 = null,
+    /// The AWS region for the Bedrock service.
+    region: ?[]const u8 = null,
+    provider: GeneratorProvider,
 };
 
 /// The generative AI provider to use.
@@ -215,6 +332,12 @@ pub const GoogleGeneratorConfig = struct {
 pub const ImageURL = struct {
     /// URL or data URI (data:image/png;base64,...).
     url: []const u8,
+};
+
+/// Image content in OpenAI-compatible format.
+pub const ImageURLContentPart = struct {
+    type: []const u8,
+    image_url: ImageURL,
 };
 
 /// Inline binary media content (audio, image, etc.).
@@ -303,6 +426,14 @@ pub const TextContentPart = struct {
     text: []const u8,
 };
 
+/// OpenAI-compatible assistant tool call.
+pub const ToolCall = struct {
+    /// Tool call identifier.
+    id: []const u8,
+    type: []const u8,
+    function: ToolCallFunction,
+};
+
 /// The function called by a model tool call.
 pub const ToolCallFunction = struct {
     /// Function name.
@@ -329,135 +460,4 @@ pub const VertexGeneratorConfig = struct {
     top_p: ?f32 = null,
     /// Top-k sampling parameter.
     top_k: ?i64 = null,
-};
-
-/// Image content in OpenAI-compatible format.
-pub const ImageURLContentPart = struct {
-    type: []const u8,
-    image_url: ImageURL,
-};
-
-/// OpenAI-compatible assistant tool call.
-pub const ToolCall = struct {
-    /// Tool call identifier.
-    id: []const u8,
-    type: []const u8,
-    function: ToolCallFunction,
-};
-
-/// A unified configuration for a generative AI provider.
-pub const GeneratorConfig = struct {
-    /// The Google Cloud project ID.
-    project_id: ?[]const u8 = null,
-    /// The Google Cloud location (e.g., 'us-central1').
-    location: ?[]const u8 = null,
-    /// The name of the generative model to use.
-    model: ?[]const u8 = null,
-    /// Controls randomness in generation (0.0-2.0).
-    temperature: ?f32 = null,
-    /// Maximum number of tokens to generate.
-    max_tokens: ?i64 = null,
-    /// Nucleus sampling parameter.
-    top_p: ?f32 = null,
-    /// Top-k sampling parameter.
-    top_k: ?i64 = null,
-    /// The Google API key.
-    api_key: ?[]const u8 = null,
-    /// The URL of the Google API endpoint.
-    url: ?[]const u8 = null,
-    /// Path to service account JSON key file.
-    credentials_path: ?[]const u8 = null,
-    /// HTTP response timeout in seconds for Ollama API calls.
-    timeout: ?i64 = null,
-    /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
-    api_url: ?[]const u8 = null,
-    /// Penalty for token frequency (-2.0 to 2.0).
-    frequency_penalty: ?f32 = null,
-    /// Penalty for token presence (-2.0 to 2.0).
-    presence_penalty: ?f32 = null,
-    /// Array of model identifiers for fallback routing. Either model or models must be provided.
-    models: ?[]const []const u8 = null,
-    /// The AWS region for the Bedrock service.
-    region: ?[]const u8 = null,
-    provider: GeneratorProvider,
-};
-
-/// A content part for multimodal input (text, image URL, or inline media).
-pub const ContentPart = union(enum) {
-    media_content_part: *MediaContentPart,
-    image_url_content_part: *ImageURLContentPart,
-    text_content_part: *TextContentPart,
-
-    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => return null,
-        };
-        const value = try allocator.create(T);
-        value.* = parsed;
-        return value;
-    }
-
-    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
-        inline for (keys) |key| {
-            if (object.contains(key)) return true;
-        }
-        return false;
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        if (source != .object) return error.UnexpectedToken;
-        if (objectHasAnyKey(source.object, &.{
-            "type",
-            "data",
-            "mime_type",
-        })) {
-            if (try parseStructuralVariant(MediaContentPart, allocator, source, options)) |parsed| return .{ .media_content_part = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
-            "type",
-            "image_url",
-        })) {
-            if (try parseStructuralVariant(ImageURLContentPart, allocator, source, options)) |parsed| return .{ .image_url_content_part = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
-            "type",
-            "text",
-        })) {
-            if (try parseStructuralVariant(TextContentPart, allocator, source, options)) |parsed| return .{ .text_content_part = parsed };
-        }
-        return error.UnexpectedToken;
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        switch (self) {
-            .media_content_part => |v| try jw.write(v.*),
-            .image_url_content_part => |v| try jw.write(v.*),
-            .text_content_part => |v| try jw.write(v.*),
-        }
-    }
-};
-
-/// A single link in a generator chain with optional retry and condition
-pub const ChainLink = struct {
-    generator: GeneratorConfig,
-    /// Retry configuration for this generator
-    retry: ?RetryConfig = null,
-    /// When to try the next generator in chain
-    condition: ?ChainCondition = null,
-};
-
-/// Message content. Supports two formats: - Simple string: "Hello, how are you?" - Array of content parts: [{"type": "text", "text": "Hello"}]
-pub const ChatMessageContent = std.json.Value;
-
-/// OpenAI-compatible message in a generation/chat conversation.
-pub const ChatMessage = struct {
-    role: ChatMessageRole,
-    content: ?ChatMessageContent = null,
-    /// Tool calls made by the assistant (only for role=assistant).
-    tool_calls: ?[]const ToolCall = null,
-    /// ID of the tool call this message responds to (only for role=tool).
-    tool_call_id: ?[]const u8 = null,
-    /// Optional tool name for tool messages when model templates need it.
-    name: ?[]const u8 = null,
 };

@@ -214,6 +214,7 @@ pub const InferenceBinaryContent = types.InferenceBinaryContent;
 pub const InferenceChatMessage = types.InferenceChatMessage;
 pub const InferenceChunk = types.InferenceChunk;
 pub const InferenceChunkConfig = types.InferenceChunkConfig;
+pub const InferenceChunkContentPart = types.InferenceChunkContentPart;
 pub const InferenceChunkObject = types.InferenceChunkObject;
 pub const InferenceChunkRequest = types.InferenceChunkRequest;
 pub const InferenceChunkResponse = types.InferenceChunkResponse;

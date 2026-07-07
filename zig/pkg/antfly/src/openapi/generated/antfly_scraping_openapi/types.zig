@@ -30,14 +30,6 @@ pub const HTTPCredentialConfig = struct {
     security: ?ContentSecurityConfig = null,
 };
 
-/// S3 credential with optional bucket patterns and security overrides.
-pub const S3CredentialConfig = struct {
-    /// Glob patterns for bucket names this credential handles. When a URL matches a pattern, this credential is auto-selected.
-    buckets: ?[]const []const u8 = null,
-    /// Security overrides for this credential.
-    security: ?ContentSecurityConfig = null,
-};
-
 /// Configuration for remote content fetching (remotePDF, remoteMedia, remoteText templates). Consolidates S3 credentials and security settings separate from backup storage. **Credential Resolution Order:** 1. Explicit `credentials="name"` parameter in template 2. First credential where `buckets` glob pattern matches URL's bucket 3. `default_s3` credential 4. Legacy fallback: `storage.s3` credentials (backward compatibility)
 pub const RemoteContentConfig = struct {
     /// Global security defaults for remote content operations.
@@ -48,4 +40,12 @@ pub const RemoteContentConfig = struct {
     s3: ?std.json.ArrayHashMap(S3CredentialConfig) = null,
     /// Named HTTP credentials for authenticated endpoints.
     http: ?std.json.ArrayHashMap(HTTPCredentialConfig) = null,
+};
+
+/// S3 credential with optional bucket patterns and security overrides.
+pub const S3CredentialConfig = struct {
+    /// Glob patterns for bucket names this credential handles. When a URL matches a pattern, this credential is auto-selected.
+    buckets: ?[]const []const u8 = null,
+    /// Security overrides for this credential.
+    security: ?ContentSecurityConfig = null,
 };

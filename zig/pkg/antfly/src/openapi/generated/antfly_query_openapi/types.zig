@@ -3,26 +3,25 @@
 
 const std = @import("std");
 
-/// A floating-point number used to decrease or increase the relevance scores of a query.
-pub const Boost = f64;
-
-/// The fuzziness of the query. Can be an integer or "auto".
-pub const Fuzziness = std.json.Value;
-
-pub const GeoPoint = struct {
-    lon: ?f64 = null,
-    lat: ?f64 = null,
-};
-
-/// A GeoJSON shape object. This is a simplified representation.
-pub const GeoShape = struct {
-    type: []const u8,
-    coordinates: []const std.json.Value,
-};
-
 pub const BoolFieldQuery = struct {
     bool: bool,
     field: ?[]const u8 = null,
+    boost: ?Boost = null,
+};
+
+pub const BooleanQuery = struct {
+    must: ?ConjunctionQuery = null,
+    should: ?DisjunctionQuery = null,
+    must_not: ?DisjunctionQuery = null,
+    filter: ?Query = null,
+    boost: ?Boost = null,
+};
+
+/// A floating-point number used to decrease or increase the relevance scores of a query.
+pub const Boost = f64;
+
+pub const ConjunctionQuery = struct {
+    conjuncts: []const Query,
     boost: ?Boost = null,
 };
 
@@ -36,8 +35,25 @@ pub const DateRangeStringQuery = struct {
     datetime_parser: ?[]const u8 = null,
 };
 
+pub const DisjunctionQuery = struct {
+    disjuncts: []const Query,
+    boost: ?Boost = null,
+    min: ?f64 = null,
+};
+
 pub const DocIdQuery = struct {
     ids: []const []const u8,
+    boost: ?Boost = null,
+};
+
+/// The fuzziness of the query. Can be an integer or "auto".
+pub const Fuzziness = std.json.Value;
+
+pub const FuzzyQuery = struct {
+    term: []const u8,
+    prefix_length: ?i32 = null,
+    fuzziness: ?Fuzziness = null,
+    field: ?[]const u8 = null,
     boost: ?Boost = null,
 };
 
@@ -56,10 +72,38 @@ pub const GeoBoundingBoxQuery = struct {
     boost: ?Boost = null,
 };
 
+pub const GeoBoundingPolygonQuery = struct {
+    polygon_points: []const GeoPoint,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
+};
+
 pub const GeoDistanceQuery = struct {
     /// [lon, lat]
     location: []const f64,
     distance: []const u8,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
+};
+
+pub const GeoPoint = struct {
+    lon: ?f64 = null,
+    lat: ?f64 = null,
+};
+
+/// A GeoJSON shape object. This is a simplified representation.
+pub const GeoShape = struct {
+    type: []const u8,
+    coordinates: []const std.json.Value,
+};
+
+pub const GeoShapeGeometry = struct {
+    shape: GeoShape,
+    relation: []const u8,
+};
+
+pub const GeoShapeQuery = struct {
+    geometry: GeoShapeGeometry,
     field: ?[]const u8 = null,
     boost: ?Boost = null,
 };
@@ -77,68 +121,6 @@ pub const MatchAllQuery = struct {
 
 pub const MatchNoneQuery = struct {
     match_none: std.json.Value,
-    boost: ?Boost = null,
-};
-
-pub const MultiMatchBody = struct {
-    query: []const u8,
-    fields: []const []const u8,
-    type: []const u8,
-    boost: ?Boost = null,
-};
-
-pub const NumericRangeQuery = struct {
-    min: ?f64 = null,
-    max: ?f64 = null,
-    inclusive_min: ?bool = null,
-    inclusive_max: ?bool = null,
-    field: ?[]const u8 = null,
-    boost: ?Boost = null,
-};
-
-pub const PrefixQuery = struct {
-    prefix: []const u8,
-    field: ?[]const u8 = null,
-    boost: ?Boost = null,
-};
-
-pub const QueryStringQuery = struct {
-    query: []const u8,
-    boost: ?Boost = null,
-};
-
-pub const RegexpQuery = struct {
-    regexp: []const u8,
-    field: ?[]const u8 = null,
-    boost: ?Boost = null,
-};
-
-pub const TermQuery = struct {
-    term: []const u8,
-    field: ?[]const u8 = null,
-    boost: ?Boost = null,
-};
-
-pub const TermRangeQuery = struct {
-    min: ?[]const u8 = null,
-    max: ?[]const u8 = null,
-    inclusive_min: ?bool = null,
-    inclusive_max: ?bool = null,
-    field: ?[]const u8 = null,
-    boost: ?Boost = null,
-};
-
-pub const WildcardQuery = struct {
-    wildcard: []const u8,
-    field: ?[]const u8 = null,
-    boost: ?Boost = null,
-};
-
-pub const FuzzyQuery = struct {
-    term: []const u8,
-    prefix_length: ?i32 = null,
-    fuzziness: ?Fuzziness = null,
-    field: ?[]const u8 = null,
     boost: ?Boost = null,
 };
 
@@ -160,11 +142,31 @@ pub const MatchQuery = struct {
     operator: ?[]const u8 = null,
 };
 
+pub const MultiMatchBody = struct {
+    query: []const u8,
+    fields: []const []const u8,
+    type: []const u8,
+    boost: ?Boost = null,
+};
+
+pub const MultiMatchQuery = struct {
+    multi_match: MultiMatchBody,
+};
+
 pub const MultiPhraseQuery = struct {
     terms: []const []const []const u8,
     field: ?[]const u8 = null,
     boost: ?Boost = null,
     fuzziness: ?Fuzziness = null,
+};
+
+pub const NumericRangeQuery = struct {
+    min: ?f64 = null,
+    max: ?f64 = null,
+    inclusive_min: ?bool = null,
+    inclusive_max: ?bool = null,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
 };
 
 pub const PhraseQuery = struct {
@@ -174,44 +176,10 @@ pub const PhraseQuery = struct {
     fuzziness: ?Fuzziness = null,
 };
 
-pub const GeoBoundingPolygonQuery = struct {
-    polygon_points: []const GeoPoint,
+pub const PrefixQuery = struct {
+    prefix: []const u8,
     field: ?[]const u8 = null,
     boost: ?Boost = null,
-};
-
-pub const GeoShapeGeometry = struct {
-    shape: GeoShape,
-    relation: []const u8,
-};
-
-pub const MultiMatchQuery = struct {
-    multi_match: MultiMatchBody,
-};
-
-pub const GeoShapeQuery = struct {
-    geometry: GeoShapeGeometry,
-    field: ?[]const u8 = null,
-    boost: ?Boost = null,
-};
-
-pub const BooleanQuery = struct {
-    must: ?ConjunctionQuery = null,
-    should: ?DisjunctionQuery = null,
-    must_not: ?DisjunctionQuery = null,
-    filter: ?Query = null,
-    boost: ?Boost = null,
-};
-
-pub const ConjunctionQuery = struct {
-    conjuncts: []const Query,
-    boost: ?Boost = null,
-};
-
-pub const DisjunctionQuery = struct {
-    disjuncts: []const Query,
-    boost: ?Boost = null,
-    min: ?f64 = null,
 };
 
 pub const Query = union(enum) {
@@ -452,4 +420,36 @@ pub const Query = union(enum) {
             .wildcard_query => |v| try jw.write(v.*),
         }
     }
+};
+
+pub const QueryStringQuery = struct {
+    query: []const u8,
+    boost: ?Boost = null,
+};
+
+pub const RegexpQuery = struct {
+    regexp: []const u8,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
+};
+
+pub const TermQuery = struct {
+    term: []const u8,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
+};
+
+pub const TermRangeQuery = struct {
+    min: ?[]const u8 = null,
+    max: ?[]const u8 = null,
+    inclusive_min: ?bool = null,
+    inclusive_max: ?bool = null,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
+};
+
+pub const WildcardQuery = struct {
+    wildcard: []const u8,
+    field: ?[]const u8 = null,
+    boost: ?Boost = null,
 };
