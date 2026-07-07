@@ -88,6 +88,27 @@ pub const PublicExactSortRejection = struct {
     detail: []const u8,
 };
 
+const public_exact_sort_reasons = [_][]const u8{
+    "unmapped_field",
+    "non_sortable_field",
+    "unsupported_sort_field",
+    "mixed_field_type",
+    "field_not_sort_ready",
+    "filter_not_queryable",
+    "invalid_cursor_arity",
+    "invalid_cursor_type",
+    "invalid_sort_tuple",
+    "approximate_candidate_source",
+    "candidate_budget_exceeded",
+    "missing_null_policy",
+    "non_score_bearing_source",
+    "invalid_score_value",
+    "count_only_ordered_page",
+    "stored_json_sort_disabled",
+    "unsupported_exact_sort",
+    "distributed_merge_unsupported",
+};
+
 pub fn publicExactSortRejection(reason: []const u8, detail: []const u8) PublicExactSortRejection {
     const public_reason = publicExactSortReason(reason, detail);
     return .{
@@ -116,18 +137,10 @@ pub fn publicExactSortReason(reason: []const u8, detail: []const u8) []const u8 
 }
 
 fn publicExactSortReasonIsStable(reason: []const u8) bool {
-    return std.mem.eql(u8, reason, "invalid_cursor_arity") or
-        std.mem.eql(u8, reason, "invalid_cursor_type") or
-        std.mem.eql(u8, reason, "invalid_sort_tuple") or
-        std.mem.eql(u8, reason, "approximate_candidate_source") or
-        std.mem.eql(u8, reason, "candidate_budget_exceeded") or
-        std.mem.eql(u8, reason, "missing_null_policy") or
-        std.mem.eql(u8, reason, "non_score_bearing_source") or
-        std.mem.eql(u8, reason, "invalid_score_value") or
-        std.mem.eql(u8, reason, "count_only_ordered_page") or
-        std.mem.eql(u8, reason, "stored_json_sort_disabled") or
-        std.mem.eql(u8, reason, "unsupported_exact_sort") or
-        std.mem.eql(u8, reason, "distributed_merge_unsupported");
+    for (public_exact_sort_reasons) |stable_reason| {
+        if (std.mem.eql(u8, reason, stable_reason)) return true;
+    }
+    return false;
 }
 
 fn publicExactSortDetail(public_reason: []const u8, detail: []const u8) []const u8 {
@@ -155,6 +168,16 @@ fn expectPublicExactSortRejectionMappingForTest() !void {
     const count_only = publicExactSortRejection("unsupported_exact_sort", "count_only_ordered_page");
     try std.testing.expectEqualStrings("count_only_ordered_page", count_only.reason);
     try std.testing.expectEqualStrings("count_only_ordered_page", count_only.detail);
+
+    for (public_exact_sort_reasons) |stable_reason| {
+        const direct = publicExactSortRejection(stable_reason, "internal_detail");
+        try std.testing.expectEqualStrings(stable_reason, direct.reason);
+        try std.testing.expectEqualStrings(stable_reason, direct.detail);
+
+        const promoted = publicExactSortRejection("unsupported_exact_sort", stable_reason);
+        try std.testing.expectEqualStrings(stable_reason, promoted.reason);
+        try std.testing.expectEqualStrings(stable_reason, promoted.detail);
+    }
 
     const unknown_internal = publicExactSortRejection("missing_private_planner_state", "private_detail");
     try std.testing.expectEqualStrings("unsupported_exact_sort", unknown_internal.reason);
