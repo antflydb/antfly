@@ -3,6 +3,12 @@
 
 const std = @import("std");
 
+/// Indicates that a thread is active.
+pub const ActiveStatus = struct {
+    /// Status discriminator that is always `active`.
+    type: []const u8,
+};
+
 pub const AddUploadPartRequest = struct {
     /// The chunk of bytes for this Part.
     data: []const u8,
@@ -24,6 +30,179 @@ pub const AdminApiKey = struct {
     created_at: i64,
     last_used_at: std.json.Value,
     owner: std.json.Value,
+};
+
+pub const ApplyPatchCallOutputStatus = enum {
+    completed,
+    failed,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .completed => "completed",
+            .failed => "failed",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "completed", .completed },
+            .{ "failed", .failed },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Outcome values reported for apply_patch tool call outputs.
+pub const ApplyPatchCallOutputStatusParam = enum {
+    completed,
+    failed,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .completed => "completed",
+            .failed => "failed",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "completed", .completed },
+            .{ "failed", .failed },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const ApplyPatchCallStatus = enum {
+    in_progress,
+    completed,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .in_progress => "in_progress",
+            .completed => "completed",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "in_progress", .in_progress },
+            .{ "completed", .completed },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Status values reported for apply_patch tool calls.
+pub const ApplyPatchCallStatusParam = enum {
+    in_progress,
+    completed,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .in_progress => "in_progress",
+            .completed => "completed",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "in_progress", .in_progress },
+            .{ "completed", .completed },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Instruction describing how to create a file via the apply_patch tool.
+pub const ApplyPatchCreateFileOperation = struct {
+    /// Create a new file with the provided diff.
+    type: []const u8,
+    /// Path of the file to create.
+    path: []const u8,
+    /// Diff to apply.
+    diff: []const u8,
+};
+
+/// Instruction for creating a new file via the apply_patch tool.
+pub const ApplyPatchCreateFileOperationParam = struct {
+    /// The operation type. Always `create_file`.
+    type: []const u8,
+    /// Path of the file to create relative to the workspace root.
+    path: []const u8,
+    /// Unified diff content to apply when creating the file.
+    diff: []const u8,
+};
+
+/// Instruction describing how to delete a file via the apply_patch tool.
+pub const ApplyPatchDeleteFileOperation = struct {
+    /// Delete the specified file.
+    type: []const u8,
+    /// Path of the file to delete.
+    path: []const u8,
+};
+
+/// Instruction for deleting an existing file via the apply_patch tool.
+pub const ApplyPatchDeleteFileOperationParam = struct {
+    /// The operation type. Always `delete_file`.
+    type: []const u8,
+    /// Path of the file to delete relative to the workspace root.
+    path: []const u8,
+};
+
+/// Allows the assistant to create, delete, or update files using unified diffs.
+pub const ApplyPatchToolParam = struct {
+    /// The type of the tool. Always `apply_patch`.
+    type: []const u8,
+};
+
+/// Instruction describing how to update a file via the apply_patch tool.
+pub const ApplyPatchUpdateFileOperation = struct {
+    /// Update an existing file with the provided diff.
+    type: []const u8,
+    /// Path of the file to update.
+    path: []const u8,
+    /// Diff to apply.
+    diff: []const u8,
+};
+
+/// Instruction for updating an existing file via the apply_patch tool.
+pub const ApplyPatchUpdateFileOperationParam = struct {
+    /// The operation type. Always `update_file`.
+    type: []const u8,
+    /// Path of the file to update relative to the workspace root.
+    path: []const u8,
+    /// Unified diff content to apply to the existing file.
+    diff: []const u8,
+};
+
+pub const ApproximateLocation = struct {
+    /// The type of location approximation. Always `approximate`.
+    type: []const u8,
+    country: ?std.json.Value = null,
+    region: ?std.json.Value = null,
+    city: ?std.json.Value = null,
+    timezone: ?std.json.Value = null,
 };
 
 /// Detailed information about a role assignment entry returned when listing assignments.
@@ -212,6 +391,31 @@ pub const AssistantsNamedToolChoice = struct {
     /// The type of the tool. If type is `function`, the function name must be set
     type: []const u8,
     function: ?std.json.Value = null,
+};
+
+pub const AttachmentType = enum {
+    image,
+    file,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .image => "image",
+            .file => "file",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "image", .image },
+            .{ "file", .file },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// The format of the output, in one of these options: `json`, `text`, `srt`, `verbose_json`, `vtt`, or `diarized_json`. For `gpt-4o-transcribe` and `gpt-4o-mini-transcribe`, the only supported format is `json`. For `gpt-4o-transcribe-diarize`, the supported formats are `json`, `text`, and `diarized_json`, with `diarized_json` required to receive speaker annotations.
@@ -454,6 +658,12 @@ pub const AutoChunkingStrategyRequestParam = struct {
     type: []const u8,
 };
 
+/// Controls whether ChatKit automatically generates thread titles.
+pub const AutomaticThreadTitlingParam = struct {
+    /// Enable automatic thread title generation. Defaults to true.
+    enabled: ?bool = null,
+};
+
 /// The expiration policy for the output and/or error file that are generated for a batch.
 pub const BatchFileExpirationAfter = struct {
     /// Anchor timestamp after which the expiration policy applies. Supported anchors: `created_at`. Note that the anchor is the file creation time, not the time the batch is created.
@@ -639,11 +849,154 @@ pub const ChatCompletionTokenLogprob = struct {
     top_logprobs: []const std.json.Value,
 };
 
+/// Automatic thread title preferences for the session.
+pub const ChatSessionAutomaticThreadTitling = struct {
+    /// Whether automatic thread titling is enabled.
+    enabled: bool,
+};
+
+/// Upload permissions and limits applied to the session.
+pub const ChatSessionFileUpload = struct {
+    /// Indicates if uploads are enabled for the session.
+    enabled: bool,
+    max_file_size: std.json.Value,
+    max_files: std.json.Value,
+};
+
+/// History retention preferences returned for the session.
+pub const ChatSessionHistory = struct {
+    /// Indicates if chat history is persisted for the session.
+    enabled: bool,
+    recent_threads: std.json.Value,
+};
+
+/// Active per-minute request limit for the session.
+pub const ChatSessionRateLimits = struct {
+    /// Maximum allowed requests per one-minute window.
+    max_requests_per_1_minute: i64,
+};
+
+pub const ChatSessionStatus = enum {
+    active,
+    expired,
+    cancelled,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .active => "active",
+            .expired => "expired",
+            .cancelled => "cancelled",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "active", .active },
+            .{ "expired", .expired },
+            .{ "cancelled", .cancelled },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Controls diagnostic tracing during the session.
+pub const ChatkitWorkflowTracing = struct {
+    /// Indicates whether tracing is enabled.
+    enabled: bool,
+};
+
+pub const ClickButtonType = enum {
+    left,
+    right,
+    wheel,
+    back,
+    forward,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .left => "left",
+            .right => "right",
+            .wheel => "wheel",
+            .back => "back",
+            .forward => "forward",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "left", .left },
+            .{ "right", .right },
+            .{ "wheel", .wheel },
+            .{ "back", .back },
+            .{ "forward", .forward },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const ClientToolCallStatus = enum {
+    in_progress,
+    completed,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .in_progress => "in_progress",
+            .completed => "completed",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "in_progress", .in_progress },
+            .{ "completed", .completed },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Indicates that a thread has been closed.
+pub const ClosedStatus = struct {
+    /// Status discriminator that is always `closed`.
+    type: []const u8,
+    reason: std.json.Value,
+};
+
 /// The output of a code interpreter tool call that is a file.
 pub const CodeInterpreterFileOutput = struct {
     /// The type of the code interpreter file output. Always `files`.
     type: []const u8,
     files: []const std.json.Value,
+};
+
+/// The image output from the code interpreter.
+pub const CodeInterpreterOutputImage = struct {
+    /// The type of the output. Always `image`.
+    type: []const u8,
+    /// The URL of the image output from the code interpreter.
+    url: []const u8,
+};
+
+/// The logs output from the code interpreter.
+pub const CodeInterpreterOutputLogs = struct {
+    /// The type of the output. Always `logs`.
+    type: []const u8,
+    /// The logs output from the code interpreter.
+    logs: []const u8,
 };
 
 /// The output of a code interpreter tool call that is text.
@@ -652,6 +1005,27 @@ pub const CodeInterpreterTextOutput = struct {
     type: []const u8,
     /// The logs of the code interpreter tool call.
     logs: []const u8,
+};
+
+/// A compaction item generated by the [`v1/responses/compact` API](/docs/api-reference/responses/compact).
+pub const CompactionBody = struct {
+    /// The type of the item. Always `compaction`.
+    type: []const u8,
+    /// The unique ID of the compaction item.
+    id: []const u8,
+    /// The encrypted content that was produced by compaction.
+    encrypted_content: []const u8,
+    /// The identifier of the actor that created the item.
+    created_by: ?[]const u8 = null,
+};
+
+/// A compaction item generated by the [`v1/responses/compact` API](/docs/api-reference/responses/compact).
+pub const CompactionSummaryItemParam = struct {
+    id: ?std.json.Value = null,
+    /// The type of the item. Always `compaction`.
+    type: []const u8,
+    /// The encrypted content of the compaction summary.
+    encrypted_content: []const u8,
 };
 
 /// A filter used to compare a specified attribute key to a given value using a defined comparison operation.
@@ -685,6 +1059,76 @@ pub const CompletionUsage = struct {
     prompt_tokens_details: ?std.json.Value = null,
 };
 
+pub const ComputerCallOutputStatus = enum {
+    completed,
+    incomplete,
+    failed,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .completed => "completed",
+            .incomplete => "incomplete",
+            .failed => "failed",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "completed", .completed },
+            .{ "incomplete", .incomplete },
+            .{ "failed", .failed },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// A pending safety check for the computer call.
+pub const ComputerCallSafetyCheckParam = struct {
+    /// The ID of the pending safety check.
+    id: []const u8,
+    code: ?std.json.Value = null,
+    message: ?std.json.Value = null,
+};
+
+pub const ComputerEnvironment = enum {
+    windows,
+    mac,
+    linux,
+    ubuntu,
+    browser,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .windows => "windows",
+            .mac => "mac",
+            .linux => "linux",
+            .ubuntu => "ubuntu",
+            .browser => "browser",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "windows", .windows },
+            .{ "mac", .mac },
+            .{ "linux", .linux },
+            .{ "ubuntu", .ubuntu },
+            .{ "browser", .browser },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// A computer screenshot image used with the computer use tool.
 pub const ComputerScreenshotImage = struct {
     /// Specifies the event type. For a computer screenshot, this property is always set to `computer_screenshot`.
@@ -693,6 +1137,28 @@ pub const ComputerScreenshotImage = struct {
     image_url: ?[]const u8 = null,
     /// The identifier of an uploaded file that contains the screenshot.
     file_id: ?[]const u8 = null,
+};
+
+/// A tool that controls a virtual computer. Learn more about the [computer tool](https://platform.openai.com/docs/guides/tools-computer-use).
+pub const ComputerTool = struct {
+    /// The type of the computer tool. Always `computer`.
+    type: []const u8,
+};
+
+/// A citation for a container file used to generate a model response.
+pub const ContainerFileCitationBody = struct {
+    /// The type of the container file citation. Always `container_file_citation`.
+    type: []const u8,
+    /// The ID of the container file.
+    container_id: []const u8,
+    /// The ID of the file.
+    file_id: []const u8,
+    /// The index of the first character of the container file citation in the message.
+    start_index: i64,
+    /// The index of the last character of the container file citation in the message.
+    end_index: i64,
+    /// The filename of the container file cited.
+    filename: []const u8,
 };
 
 pub const ContainerFileResource = struct {
@@ -710,6 +1176,65 @@ pub const ContainerFileResource = struct {
     path: []const u8,
     /// Source of the file (e.g., `user`, `assistant`).
     source: []const u8,
+};
+
+pub const ContainerMemoryLimit = enum {
+    @"1g",
+    @"4g",
+    @"16g",
+    @"64g",
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .@"1g" => "1g",
+            .@"4g" => "4g",
+            .@"16g" => "16g",
+            .@"64g" => "64g",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "1g", .@"1g" },
+            .{ "4g", .@"4g" },
+            .{ "16g", .@"16g" },
+            .{ "64g", .@"64g" },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const ContainerNetworkPolicyDisabledParam = struct {
+    /// Disable outbound network access. Always `disabled`.
+    type: []const u8,
+};
+
+pub const ContainerNetworkPolicyDomainSecretParam = struct {
+    /// The domain associated with the secret.
+    domain: []const u8,
+    /// The name of the secret to inject for the domain.
+    name: []const u8,
+    /// The secret value to inject for the domain.
+    value: []const u8,
+};
+
+pub const ContainerReferenceParam = struct {
+    /// References a container created with the /v1/containers endpoint
+    type: []const u8,
+    /// The ID of the referenced container.
+    container_id: []const u8,
+};
+
+/// Represents a container created with /v1/containers.
+pub const ContainerReferenceResource = struct {
+    /// The environment type. Always `container_reference`.
+    type: []const u8,
+    container_id: []const u8,
 };
 
 pub const ContainerResource = struct {
@@ -731,6 +1256,43 @@ pub const ContainerResource = struct {
     memory_limit: ?[]const u8 = null,
     /// Network access policy for the container.
     network_policy: ?std.json.Value = null,
+};
+
+pub const ContextManagementParam = struct {
+    /// The context management entry type. Currently only 'compaction' is supported.
+    type: []const u8,
+    compact_threshold: ?std.json.Value = null,
+};
+
+/// The conversation that this response belonged to. Input items and output items from this response were automatically added to this conversation.
+pub const Conversation2 = struct {
+    /// The unique ID of the conversation that this response was associated with.
+    id: []const u8,
+};
+
+/// The conversation that this response belongs to.
+pub const ConversationParam2 = struct {
+    /// The unique ID of the conversation.
+    id: []const u8,
+};
+
+pub const ConversationResource = struct {
+    /// The unique ID of the conversation.
+    id: []const u8,
+    /// The object type, which is always `conversation`.
+    object: []const u8,
+    /// Set of 16 key-value pairs that can be attached to an object. This can be useful for storing additional information about the object in a structured format, and querying for objects via API or the dashboard. Keys are strings with a maximum length of 64 characters. Values are strings with a maximum length of 512 characters.
+    metadata: std.json.Value,
+    /// The time at which the conversation was created, measured in seconds since the Unix epoch.
+    created_at: i64,
+};
+
+/// An x/y coordinate pair, e.g. `{ x: 100, y: 200 }`.
+pub const CoordParam = struct {
+    /// The x-coordinate.
+    x: i64,
+    /// The y-coordinate.
+    y: i64,
 };
 
 /// The aggregated costs details of the specific time bucket.
@@ -837,6 +1399,18 @@ pub const CreateModerationResponse = struct {
     results: []const std.json.Value,
 };
 
+/// Uploads a skill either as a directory (multipart `files[]`) or as a single zip file.
+pub const CreateSkillBody = struct {
+    files: std.json.Value,
+};
+
+/// Uploads a new immutable version of a skill.
+pub const CreateSkillVersionBody = struct {
+    files: std.json.Value,
+    /// Whether to set this version as the default.
+    default: ?bool = null,
+};
+
 pub const CreateTranslationRequest = struct {
     /// The audio file object (not file name) translate, in one of these formats: flac, mp3, mp4, mpeg, mpga, m4a, ogg, wav, or webm.
     file: []const u8,
@@ -852,6 +1426,20 @@ pub const CreateTranslationRequest = struct {
 
 pub const CreateTranslationResponseJson = struct {
     text: []const u8,
+};
+
+/// Parameters for creating a character from an uploaded video.
+pub const CreateVideoCharacterBody = struct {
+    /// Video file used to create a character.
+    video: []const u8,
+    /// Display name for this API character.
+    name: []const u8,
+};
+
+/// Parameters for remixing an existing generated video.
+pub const CreateVideoRemixBody = struct {
+    /// Updated text prompt that directs the remix generation.
+    prompt: []const u8,
 };
 
 pub const CreateVoiceConsentRequest = struct {
@@ -870,6 +1458,12 @@ pub const CreateVoiceRequest = struct {
     audio_sample: []const u8,
     /// The consent recording ID (for example, `cons_1234`).
     consent: []const u8,
+};
+
+/// Unconstrained free-form text.
+pub const CustomTextFormatParam = struct {
+    /// Unconstrained text format. Always `text`.
+    type: []const u8,
 };
 
 /// A call to a custom tool created by the model.
@@ -954,6 +1548,12 @@ pub const DeleteVectorStoreResponse = struct {
     object: []const u8,
 };
 
+pub const DeletedConversationResource = struct {
+    object: []const u8,
+    deleted: bool,
+    id: []const u8,
+};
+
 /// Confirmation payload returned after unassigning a role.
 pub const DeletedRoleAssignmentResource = struct {
     /// Identifier for the deleted assignment, such as `group.role.deleted` or `user.role.deleted`.
@@ -962,10 +1562,94 @@ pub const DeletedRoleAssignmentResource = struct {
     deleted: bool,
 };
 
+pub const DeletedSkillResource = struct {
+    object: []const u8,
+    deleted: bool,
+    id: []const u8,
+};
+
+pub const DeletedSkillVersionResource = struct {
+    object: []const u8,
+    deleted: bool,
+    id: []const u8,
+    /// The deleted skill version.
+    version: []const u8,
+};
+
+/// Confirmation payload returned after deleting a thread.
+pub const DeletedThreadResource = struct {
+    /// Identifier of the deleted thread.
+    id: []const u8,
+    /// Type discriminator that is always `chatkit.thread.deleted`.
+    object: []const u8,
+    /// Indicates that the thread has been deleted.
+    deleted: bool,
+};
+
+/// Confirmation payload returned after deleting a video.
+pub const DeletedVideoResource = struct {
+    /// The object type that signals the deletion response.
+    object: []const u8,
+    /// Indicates that the video resource was deleted.
+    deleted: bool,
+    /// Identifier of the deleted video.
+    id: []const u8,
+};
+
+pub const DetailEnum = enum {
+    low,
+    high,
+    auto,
+    original,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .low => "low",
+            .high => "high",
+            .auto => "auto",
+            .original => "original",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "low", .low },
+            .{ "high", .high },
+            .{ "auto", .auto },
+            .{ "original", .original },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Occurs when a stream ends.
 pub const DoneEvent = struct {
     event: []const u8,
     data: []const u8,
+};
+
+/// A double click action.
+pub const DoubleClickAction = struct {
+    /// Specifies the event type. For a double click action, this property is always set to `double_click`.
+    type: []const u8,
+    /// The x-coordinate where the double click occurred.
+    x: i64,
+    /// The y-coordinate where the double click occurred.
+    y: i64,
+    keys: std.json.Value,
+};
+
+/// An x/y coordinate pair, e.g. `{ x: 100, y: 200 }`.
+pub const DragPoint = struct {
+    /// The x-coordinate.
+    x: i64,
+    /// The y-coordinate.
+    y: i64,
 };
 
 /// Represents an embedding vector returned by embedding endpoint.
@@ -978,11 +1662,21 @@ pub const Embedding = struct {
     object: []const u8,
 };
 
+pub const EmptyModelParam = struct {};
+
 pub const Error = struct {
     code: std.json.Value,
     message: []const u8,
     param: std.json.Value,
     type: []const u8,
+};
+
+/// An error that occurred while generating the response.
+pub const Error2 = struct {
+    /// A machine-readable error code that was returned.
+    code: []const u8,
+    /// A human-readable description of the error that was returned.
+    message: []const u8,
 };
 
 /// An object representing an error response from the Eval API.
@@ -1050,6 +1744,34 @@ pub const EvalRunOutputItemResult = struct {
     sample: ?std.json.Value = null,
 };
 
+/// Controls when the session expires relative to an anchor timestamp.
+pub const ExpiresAfterParam = struct {
+    /// Base timestamp used to calculate expiration. Currently fixed to `created_at`.
+    anchor: []const u8,
+    /// Number of seconds after the anchor when the session expires.
+    seconds: i64,
+};
+
+/// Attachment source referenced by an annotation.
+pub const FileAnnotationSource = struct {
+    /// Type discriminator that is always `file`.
+    type: []const u8,
+    /// Filename referenced by the annotation.
+    filename: []const u8,
+};
+
+/// A citation to a file.
+pub const FileCitationBody = struct {
+    /// The type of the file citation. Always `file_citation`.
+    type: []const u8,
+    /// The ID of the file.
+    file_id: []const u8,
+    /// The index of the file in the list of files.
+    index: i64,
+    /// The filename of the file cited.
+    filename: []const u8,
+};
+
 /// The expiration policy for a file. By default, files with `purpose=batch` expire after 30 days and all other files are persisted until they are manually deleted.
 pub const FileExpirationAfter = struct {
     /// Anchor timestamp after which the expiration policy applies. Supported anchors: `created_at`.
@@ -1092,6 +1814,16 @@ pub const FileSearchRanker = enum {
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
+};
+
+/// Controls whether users can upload files.
+pub const FileUploadParam = struct {
+    /// Enable uploads for this session. Defaults to false.
+    enabled: ?bool = null,
+    /// Maximum size in megabytes for each uploaded file. Defaults to 512 MB, which is the maximum allowable size.
+    max_file_size: ?i64 = null,
+    /// Maximum number of files that can be uploaded to the session. Defaults to 10.
+    max_files: ?i64 = null,
 };
 
 /// The hyperparameters used for the DPO fine-tuning job.
@@ -1189,8 +1921,177 @@ pub const FineTuningJobEvent = struct {
     data: ?std.json.Value = null,
 };
 
+pub const FunctionCallItemStatus = enum {
+    in_progress,
+    completed,
+    incomplete,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .in_progress => "in_progress",
+            .completed => "completed",
+            .incomplete => "incomplete",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "in_progress", .in_progress },
+            .{ "completed", .completed },
+            .{ "incomplete", .incomplete },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const FunctionCallOutputStatusEnum = enum {
+    in_progress,
+    completed,
+    incomplete,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .in_progress => "in_progress",
+            .completed => "completed",
+            .incomplete => "incomplete",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "in_progress", .in_progress },
+            .{ "completed", .completed },
+            .{ "incomplete", .incomplete },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const FunctionCallStatus = enum {
+    in_progress,
+    completed,
+    incomplete,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .in_progress => "in_progress",
+            .completed => "completed",
+            .incomplete => "incomplete",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "in_progress", .in_progress },
+            .{ "completed", .completed },
+            .{ "incomplete", .incomplete },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// The parameters the functions accepts, described as a JSON Schema object. See the [guide](/docs/guides/function-calling) for examples, and the [JSON Schema reference](https://json-schema.org/understanding-json-schema/) for documentation about the format. Omitting `parameters` defines a function with an empty parameter list.
 pub const FunctionParameters = struct {};
+
+/// Execute a shell command.
+pub const FunctionShellAction = struct {
+    commands: []const []const u8,
+    timeout_ms: std.json.Value,
+    max_output_length: std.json.Value,
+};
+
+/// Commands and limits describing how to run the shell tool call.
+pub const FunctionShellActionParam = struct {
+    /// Ordered shell commands for the execution environment to run.
+    commands: []const []const u8,
+    timeout_ms: ?std.json.Value = null,
+    max_output_length: ?std.json.Value = null,
+};
+
+/// Status values reported for shell tool calls.
+pub const FunctionShellCallItemStatus = enum {
+    in_progress,
+    completed,
+    incomplete,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .in_progress => "in_progress",
+            .completed => "completed",
+            .incomplete => "incomplete",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "in_progress", .in_progress },
+            .{ "completed", .completed },
+            .{ "incomplete", .incomplete },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Indicates that the shell commands finished and returned an exit code.
+pub const FunctionShellCallOutputExitOutcome = struct {
+    /// The outcome type. Always `exit`.
+    type: []const u8,
+    /// Exit code from the shell process.
+    exit_code: i64,
+};
+
+/// Indicates that the shell commands finished and returned an exit code.
+pub const FunctionShellCallOutputExitOutcomeParam = struct {
+    /// The outcome type. Always `exit`.
+    type: []const u8,
+    /// The exit code returned by the shell process.
+    exit_code: i64,
+};
+
+/// Indicates that the shell call exceeded its configured time limit.
+pub const FunctionShellCallOutputTimeoutOutcome = struct {
+    /// The outcome type. Always `timeout`.
+    type: []const u8,
+};
+
+/// Indicates that the shell call exceeded its configured time limit.
+pub const FunctionShellCallOutputTimeoutOutcomeParam = struct {
+    /// The outcome type. Always `timeout`.
+    type: []const u8,
+};
+
+/// Defines a function in your own code the model can choose to call. Learn more about [function calling](https://platform.openai.com/docs/guides/function-calling).
+pub const FunctionTool = struct {
+    /// The type of the function tool. Always `function`.
+    type: []const u8,
+    /// The name of the function to call.
+    name: []const u8,
+    description: ?std.json.Value = null,
+    parameters: std.json.Value,
+    strict: std.json.Value,
+    /// Whether this function is deferred and loaded via tool search.
+    defer_loading: ?bool = null,
+};
 
 /// A tool call to run a function. See the [function calling guide](/docs/guides/function-calling) for more information.
 pub const FunctionToolCall = struct {
@@ -1248,6 +2149,31 @@ pub const GraderTextSimilarity = struct {
     reference: []const u8,
     /// The evaluation metric to use. One of `cosine`, `fuzzy_match`, `bleu`, `gleu`, `meteor`, `rouge_1`, `rouge_2`, `rouge_3`, `rouge_4`, `rouge_5`, or `rouge_l`.
     evaluation_metric: []const u8,
+};
+
+pub const GrammarSyntax1 = enum {
+    lark,
+    regex,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .lark => "lark",
+            .regex => "regex",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "lark", .lark },
+            .{ "regex", .regex },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// Summary information about a group returned in role assignment responses.
@@ -1316,6 +2242,21 @@ pub const GroupUserDeletedResource = struct {
     deleted: bool,
 };
 
+/// Controls how much historical context is retained for the session.
+pub const HistoryParam = struct {
+    /// Enables chat users to access previous ChatKit threads. Defaults to true.
+    enabled: ?bool = null,
+    /// Number of recent ChatKit threads users have access to. Defaults to unlimited when unset.
+    recent_threads: ?i64 = null,
+};
+
+pub const HybridSearchOptions = struct {
+    /// The weight of the embedding in the reciprocal ranking fusion.
+    embedding_weight: f64,
+    /// The weight of the text in the reciprocal ranking fusion.
+    text_weight: f64,
+};
+
 /// Represents the content or the URL of an image generated by the OpenAI API.
 pub const Image = struct {
     /// The base64-encoded JSON of the generated image. Returned by default for the GPT image models, and only present if `response_format` is set to `b64_json` for `dall-e-2` and `dall-e-3`.
@@ -1324,6 +2265,37 @@ pub const Image = struct {
     url: ?[]const u8 = null,
     /// For `dall-e-3` only, the revised prompt that was used to generate the image.
     revised_prompt: ?[]const u8 = null,
+};
+
+pub const ImageDetail = enum {
+    low,
+    high,
+    auto,
+    original,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .low => "low",
+            .high => "high",
+            .auto => "auto",
+            .original => "original",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "low", .low },
+            .{ "high", .high },
+            .{ "auto", .auto },
+            .{ "original", .original },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// Emitted when a partial image is available during image editing streaming.
@@ -1344,6 +2316,50 @@ pub const ImageEditPartialImageEvent = struct {
     output_format: []const u8,
     /// 0-based index for the partial image (streaming).
     partial_image_index: i64,
+};
+
+pub const ImageGenActionEnum = enum {
+    generate,
+    edit,
+    auto,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .generate => "generate",
+            .edit => "edit",
+            .auto => "auto",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "generate", .generate },
+            .{ "edit", .edit },
+            .{ "auto", .auto },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// The input tokens detailed information for the image generation.
+pub const ImageGenInputUsageDetails = struct {
+    /// The number of text tokens in the input prompt.
+    text_tokens: i64,
+    /// The number of image tokens in the input prompt.
+    image_tokens: i64,
+};
+
+/// The output token details for the image generation.
+pub const ImageGenOutputTokensDetails = struct {
+    /// The number of image output tokens generated by the model.
+    image_tokens: i64,
+    /// The number of text output tokens generated by the model.
+    text_tokens: i64,
 };
 
 /// Emitted when a partial image is available during image generation streaming.
@@ -1398,6 +2414,12 @@ pub const ImageRefParam = struct {
     }
 };
 
+pub const ImageRefParam2 = struct {
+    /// A fully qualified URL or base64-encoded data URL.
+    image_url: ?[]const u8 = null,
+    file_id: ?[]const u8 = null,
+};
+
 /// For the GPT image models only, the token usage information for the image generation.
 pub const ImagesUsage = struct {
     /// The total number of tokens (images and text) used for the image generation.
@@ -1410,11 +2432,130 @@ pub const ImagesUsage = struct {
     input_tokens_details: std.json.Value,
 };
 
+/// Specify additional output data to include in the model response. Currently supported values are: - `web_search_call.action.sources`: Include the sources of the web search tool call. - `code_interpreter_call.outputs`: Includes the outputs of python code execution in code interpreter tool call items. - `computer_call_output.output.image_url`: Include image urls from the computer call output. - `file_search_call.results`: Include the search results of the file search tool call. - `message.input_image.image_url`: Include image urls from the input message. - `message.output_text.logprobs`: Include logprobs with assistant messages. - `reasoning.encrypted_content`: Includes an encrypted version of reasoning tokens in reasoning item outputs. This enables reasoning items to be used in multi-turn conversations when using the Responses API statelessly (like when the `store` parameter is set to `false`, or when an organization is enrolled in the zero data retention program).
+pub const IncludeEnum = enum {
+    file_search_call_results,
+    web_search_call_results,
+    web_search_call_action_sources,
+    message_input_image_image_url,
+    computer_call_output_output_image_url,
+    code_interpreter_call_outputs,
+    reasoning_encrypted_content,
+    message_output_text_logprobs,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .file_search_call_results => "file_search_call.results",
+            .web_search_call_results => "web_search_call.results",
+            .web_search_call_action_sources => "web_search_call.action.sources",
+            .message_input_image_image_url => "message.input_image.image_url",
+            .computer_call_output_output_image_url => "computer_call_output.output.image_url",
+            .code_interpreter_call_outputs => "code_interpreter_call.outputs",
+            .reasoning_encrypted_content => "reasoning.encrypted_content",
+            .message_output_text_logprobs => "message.output_text.logprobs",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "file_search_call.results", .file_search_call_results },
+            .{ "web_search_call.results", .web_search_call_results },
+            .{ "web_search_call.action.sources", .web_search_call_action_sources },
+            .{ "message.input_image.image_url", .message_input_image_image_url },
+            .{ "computer_call_output.output.image_url", .computer_call_output_output_image_url },
+            .{ "code_interpreter_call.outputs", .code_interpreter_call_outputs },
+            .{ "reasoning.encrypted_content", .reasoning_encrypted_content },
+            .{ "message.output_text.logprobs", .message_output_text_logprobs },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Inline skill payload
+pub const InlineSkillSourceParam = struct {
+    /// The type of the inline skill source. Must be `base64`.
+    type: []const u8,
+    /// The media type of the inline skill payload. Must be `application/zip`.
+    media_type: []const u8,
+    /// Base64-encoded skill zip bundle.
+    data: []const u8,
+};
+
 /// An audio input to the model.
 pub const InputAudio = struct {
     /// The type of the input item. Always `input_audio`.
     type: []const u8,
     input_audio: std.json.Value,
+};
+
+/// Control how much effort the model will exert to match the style and features, especially facial features, of input images. This parameter is only supported for `gpt-image-1` and `gpt-image-1.5` and later models, unsupported for `gpt-image-1-mini`. Supports `high` and `low`. Defaults to `low`.
+pub const InputFidelity = enum {
+    high,
+    low,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .high => "high",
+            .low => "low",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "high", .high },
+            .{ "low", .low },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// A file input to the model.
+pub const InputFileContent = struct {
+    /// The type of the input item. Always `input_file`.
+    type: []const u8,
+    file_id: ?std.json.Value = null,
+    /// The name of the file to be sent to the model.
+    filename: ?[]const u8 = null,
+    /// The content of the file to be sent to the model.
+    file_data: ?[]const u8 = null,
+    /// The URL of the file to be sent to the model.
+    file_url: ?[]const u8 = null,
+};
+
+/// A file input to the model.
+pub const InputFileContentParam = struct {
+    /// The type of the input item. Always `input_file`.
+    type: []const u8,
+    file_id: ?std.json.Value = null,
+    filename: ?std.json.Value = null,
+    file_data: ?std.json.Value = null,
+    file_url: ?std.json.Value = null,
+};
+
+/// A text input to the model.
+pub const InputTextContent = struct {
+    /// The type of the input item. Always `input_text`.
+    type: []const u8,
+    /// The text input to the model.
+    text: []const u8,
+};
+
+/// A text input to the model.
+pub const InputTextContentParam = struct {
+    /// The type of the input item. Always `input_text`.
+    type: []const u8,
+    /// The text input to the model.
+    text: []const u8,
 };
 
 /// Represents an individual `invite` to the organization.
@@ -1463,6 +2604,96 @@ pub const InviteRequest = struct {
     projects: ?[]const std.json.Value = null,
 };
 
+/// An internal identifier for an item to reference.
+pub const ItemReferenceParam = struct {
+    type: ?std.json.Value = null,
+    /// The ID of the item to reference.
+    id: []const u8,
+};
+
+/// A collection of keypresses the model would like to perform.
+pub const KeyPressAction = struct {
+    /// Specifies the event type. For a keypress action, this property is always set to `keypress`.
+    type: []const u8,
+    /// The combination of keys the model is requesting to be pressed. This is an array of strings, each representing a key.
+    keys: []const []const u8,
+};
+
+/// Represents the use of a local environment to perform shell actions.
+pub const LocalEnvironmentResource = struct {
+    /// The environment type. Always `local`.
+    type: []const u8,
+};
+
+pub const LocalShellCallOutputStatusEnum = enum {
+    in_progress,
+    completed,
+    incomplete,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .in_progress => "in_progress",
+            .completed => "completed",
+            .incomplete => "incomplete",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "in_progress", .in_progress },
+            .{ "completed", .completed },
+            .{ "incomplete", .incomplete },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const LocalShellCallStatus = enum {
+    in_progress,
+    completed,
+    incomplete,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .in_progress => "in_progress",
+            .completed => "completed",
+            .incomplete => "incomplete",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "in_progress", .in_progress },
+            .{ "completed", .completed },
+            .{ "incomplete", .incomplete },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Execute a shell command on the server.
+pub const LocalShellExecAction = struct {
+    /// The type of the local shell action. Always `exec`.
+    type: []const u8,
+    /// The command to run.
+    command: []const []const u8,
+    timeout_ms: ?std.json.Value = null,
+    working_directory: ?std.json.Value = null,
+    /// Environment variables to set for the command.
+    env: std.json.ArrayHashMap([]const u8),
+    user: ?std.json.Value = null,
+};
+
 /// The output of a local shell tool call.
 pub const LocalShellToolCallOutput = struct {
     /// The type of the local shell tool call output. Always `local_shell_call_output`.
@@ -1472,6 +2703,28 @@ pub const LocalShellToolCallOutput = struct {
     /// A JSON string of the output of the local shell tool call.
     output: []const u8,
     status: ?std.json.Value = null,
+};
+
+/// A tool that allows the model to execute shell commands in a local environment.
+pub const LocalShellToolParam = struct {
+    /// The type of the local shell tool. Always `local_shell`.
+    type: []const u8,
+};
+
+pub const LocalSkillParam = struct {
+    /// The name of the skill.
+    name: []const u8,
+    /// The description of the skill.
+    description: []const u8,
+    /// The path to the directory containing the skill.
+    path: []const u8,
+};
+
+/// Indicates that a thread is locked and cannot accept new input.
+pub const LockedStatus = struct {
+    /// Status discriminator that is always `locked`.
+    type: []const u8,
+    reason: std.json.Value,
 };
 
 /// A log probability object.
@@ -1531,6 +2784,40 @@ pub const MCPListToolsTool = struct {
     /// The JSON schema describing the tool's input.
     input_schema: std.json.Value,
     annotations: ?std.json.Value = null,
+};
+
+pub const MCPToolCallStatus = enum {
+    in_progress,
+    completed,
+    incomplete,
+    calling,
+    failed,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .in_progress => "in_progress",
+            .completed => "completed",
+            .incomplete => "incomplete",
+            .calling => "calling",
+            .failed => "failed",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "in_progress", .in_progress },
+            .{ "completed", .completed },
+            .{ "incomplete", .incomplete },
+            .{ "calling", .calling },
+            .{ "failed", .failed },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// A filter object to specify which tools are allowed.
@@ -1671,6 +2958,77 @@ pub const MessageRequestContentTextObject = struct {
     text: []const u8,
 };
 
+pub const MessageRole = enum {
+    unknown,
+    user,
+    assistant,
+    system,
+    critic,
+    discriminator,
+    developer,
+    tool,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .unknown => "unknown",
+            .user => "user",
+            .assistant => "assistant",
+            .system => "system",
+            .critic => "critic",
+            .discriminator => "discriminator",
+            .developer => "developer",
+            .tool => "tool",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "unknown", .unknown },
+            .{ "user", .user },
+            .{ "assistant", .assistant },
+            .{ "system", .system },
+            .{ "critic", .critic },
+            .{ "discriminator", .discriminator },
+            .{ "developer", .developer },
+            .{ "tool", .tool },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const MessageStatus = enum {
+    in_progress,
+    completed,
+    incomplete,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .in_progress => "in_progress",
+            .completed => "completed",
+            .incomplete => "incomplete",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "in_progress", .in_progress },
+            .{ "completed", .completed },
+            .{ "incomplete", .incomplete },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const Metadata = std.json.Value;
 
 /// Describes an OpenAI model offering that can be used with the API.
@@ -1690,6 +3048,17 @@ pub const ModelIdsShared = std.json.Value;
 pub const ModifyCertificateRequest = struct {
     /// The updated name for the certificate
     name: []const u8,
+};
+
+/// A mouse move action.
+pub const MoveParam = struct {
+    /// Specifies the event type. For a move action, this property is always set to `move`.
+    type: []const u8,
+    /// The x-coordinate to move to.
+    x: i64,
+    /// The y-coordinate to move to.
+    y: i64,
+    keys: ?std.json.Value = null,
 };
 
 /// Type of noise reduction. `near_field` is for close-talking microphones such as headphones, `far_field` is for far-field microphones such as laptop or conference room microphones.
@@ -1738,6 +3107,31 @@ pub const OpenAIFile = struct {
     status: []const u8,
     /// Deprecated. For details on why a fine-tuning training file failed validation, see the `error` field on `fine_tuning.job`.
     status_details: ?[]const u8 = null,
+};
+
+pub const OrderEnum = enum {
+    asc,
+    desc,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .asc => "asc",
+            .desc => "desc",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "asc", .asc },
+            .{ "desc", .desc },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// This is returned when the chunking strategy is unknown. Typically, this is because the file was indexed before the `chunking_strategy` concept was introduced in the API.
@@ -1945,6 +3339,37 @@ pub const PublicUpdateOrganizationRoleBody = struct {
     description: ?std.json.Value = null,
     /// New name for the role.
     role_name: ?std.json.Value = null,
+};
+
+pub const RankerVersionType = enum {
+    auto,
+    default_2024_11_15,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .auto => "auto",
+            .default_2024_11_15 => "default-2024-11-15",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "auto", .auto },
+            .{ "default-2024-11-15", .default_2024_11_15 },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Controls request rate limits for the session.
+pub const RateLimitsParam = struct {
+    /// Maximum number of requests allowed per minute for the session. Defaults to 10.
+    max_requests_per_1_minute: ?i64 = null,
 };
 
 pub const RealtimeAudioFormats = std.json.Value;
@@ -3153,6 +4578,22 @@ pub const RealtimeTurnDetection = std.json.Value;
 
 pub const ReasoningEffort = std.json.Value;
 
+/// Reasoning text from the model.
+pub const ReasoningTextContent = struct {
+    /// The type of the reasoning text. Always `reasoning_text`.
+    type: []const u8,
+    /// The reasoning text from the model.
+    text: []const u8,
+};
+
+/// A refusal from the model.
+pub const RefusalContent = struct {
+    /// The type of the refusal. Always `refusal`.
+    type: []const u8,
+    /// The refusal explanation from the model.
+    refusal: []const u8,
+};
+
 /// Emitted when there is a partial audio response.
 pub const ResponseAudioDeltaEvent = struct {
     /// The type of the event. Always `response.audio.delta`.
@@ -3961,7 +5402,142 @@ pub const RunToolCallObject = struct {
     function: std.json.Value,
 };
 
+/// A screenshot action.
+pub const ScreenshotParam = struct {
+    /// Specifies the event type. For a screenshot action, this property is always set to `screenshot`.
+    type: []const u8,
+};
+
+/// A scroll action.
+pub const ScrollParam = struct {
+    /// Specifies the event type. For a scroll action, this property is always set to `scroll`.
+    type: []const u8,
+    /// The x-coordinate where the scroll occurred.
+    x: i64,
+    /// The y-coordinate where the scroll occurred.
+    y: i64,
+    /// The horizontal scroll distance.
+    scroll_x: i64,
+    /// The vertical scroll distance.
+    scroll_y: i64,
+    keys: ?std.json.Value = null,
+};
+
+pub const SearchContentType = enum {
+    text,
+    image,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .text => "text",
+            .image => "image",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "text", .text },
+            .{ "image", .image },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const SearchContextSize = enum {
+    low,
+    medium,
+    high,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .low => "low",
+            .medium => "medium",
+            .high => "high",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "low", .low },
+            .{ "medium", .medium },
+            .{ "high", .high },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const ServiceTier = std.json.Value;
+
+/// Updates the default version pointer for a skill.
+pub const SetDefaultSkillVersionBody = struct {
+    /// The skill version number to set as default.
+    default_version: []const u8,
+};
+
+pub const SkillReferenceParam = struct {
+    /// References a skill created with the /v1/skills endpoint.
+    type: []const u8,
+    /// The ID of the referenced skill.
+    skill_id: []const u8,
+    /// Optional skill version. Use a positive integer or 'latest'. Omit for default.
+    version: ?[]const u8 = null,
+};
+
+pub const SkillResource = struct {
+    /// Unique identifier for the skill.
+    id: []const u8,
+    /// The object type, which is `skill`.
+    object: []const u8,
+    /// Name of the skill.
+    name: []const u8,
+    /// Description of the skill.
+    description: []const u8,
+    /// Unix timestamp (seconds) for when the skill was created.
+    created_at: i64,
+    /// Default version for the skill.
+    default_version: []const u8,
+    /// Latest version for the skill.
+    latest_version: []const u8,
+};
+
+pub const SkillVersionResource = struct {
+    /// The object type, which is `skill.version`.
+    object: []const u8,
+    /// Unique identifier for the skill version.
+    id: []const u8,
+    /// Identifier of the skill for this version.
+    skill_id: []const u8,
+    /// Version number for this skill.
+    version: []const u8,
+    /// Unix timestamp (seconds) for when the version was created.
+    created_at: i64,
+    /// Name of the skill version.
+    name: []const u8,
+    /// Description of the skill version.
+    description: []const u8,
+};
+
+/// Forces the model to call the apply_patch tool when executing a tool call.
+pub const SpecificApplyPatchParam = struct {
+    /// The tool to call. Always `apply_patch`.
+    type: []const u8,
+};
+
+/// Forces the model to call the shell tool when a tool call is required.
+pub const SpecificFunctionShellParam = struct {
+    /// The tool to call. Always `shell`.
+    type: []const u8,
+};
 
 /// Emitted for each chunk of audio data generated during speech synthesis.
 pub const SpeechAudioDeltaEvent = struct {
@@ -3995,8 +5571,58 @@ pub const SubmitToolOutputsRunRequest = struct {
     stream: ?std.json.Value = null,
 };
 
+/// A summary text from the model.
+pub const SummaryTextContent = struct {
+    /// The type of the object. Always `summary_text`.
+    type: []const u8,
+    /// A summary of the reasoning output from the model so far.
+    text: []const u8,
+};
+
+pub const TaskType = enum {
+    custom,
+    thought,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .custom => "custom",
+            .thought => "thought",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "custom", .custom },
+            .{ "thought", .thought },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// A text content.
+pub const TextContent = struct {
+    type: []const u8,
+    text: []const u8,
+};
+
 pub const ToggleCertificatesRequest = struct {
     certificate_ids: []const []const u8,
+};
+
+pub const TokenCountsResource = struct {
+    object: []const u8,
+    input_tokens: i64,
+};
+
+/// Tool selection that the assistant should honor when executing the item.
+pub const ToolChoice = struct {
+    /// Identifier of the requested tool.
+    id: []const u8,
 };
 
 /// Constrains the tools available to the model to a pre-defined set.
@@ -4067,6 +5693,38 @@ pub const ToolChoiceOptions = enum {
 pub const ToolChoiceTypes = struct {
     /// The type of hosted tool the model should to use. Learn more about [built-in tools](/docs/guides/tools). Allowed values are: - `file_search` - `web_search_preview` - `computer` - `computer_use_preview` - `computer_use` - `code_interpreter` - `image_generation`
     type: []const u8,
+};
+
+pub const ToolSearchExecutionType = enum {
+    server,
+    client,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .server => "server",
+            .client => "client",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "server", .server },
+            .{ "client", .client },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// The top log probability of a token.
+pub const TopLogProb = struct {
+    token: []const u8,
+    logprob: f64,
+    bytes: []const i64,
 };
 
 /// Emitted when there is an additional text delta. This is also the first event emitted when the transcription starts. Only emitted when you [create a transcription](/docs/api-reference/audio/create-transcription) with the `Stream` parameter set to `true`.
@@ -4189,11 +5847,44 @@ pub const TranscriptionWord = struct {
     end: f32,
 };
 
+pub const TruncationEnum = enum {
+    auto,
+    disabled,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .auto => "auto",
+            .disabled => "disabled",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "auto", .auto },
+            .{ "disabled", .disabled },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Controls for how a thread will be truncated prior to the run. Use this to control the initial context window of the run.
 pub const TruncationObject = struct {
     /// The truncation strategy to use for the thread. The default is `auto`. If set to `last_messages`, the thread will be truncated to the n most recent messages in the thread. When set to `auto`, messages in the middle of the thread will be dropped to fit the context length of the model, `max_prompt_tokens`.
     type: []const u8,
     last_messages: ?std.json.Value = null,
+};
+
+/// An action to type in text.
+pub const TypeParam = struct {
+    /// Specifies the event type. For a type action, this property is always set to `type`.
+    type: []const u8,
+    /// The text to type.
+    text: []const u8,
 };
 
 /// Request payload for updating the details of an existing group.
@@ -4224,6 +5915,28 @@ pub const UploadPart = struct {
     upload_id: []const u8,
     /// The object type, which is always `upload.part`.
     object: []const u8,
+};
+
+/// URL backing an annotation entry.
+pub const UrlAnnotationSource = struct {
+    /// Type discriminator that is always `url`.
+    type: []const u8,
+    /// URL referenced by the annotation.
+    url: []const u8,
+};
+
+/// A citation for a web resource used to generate a model response.
+pub const UrlCitationBody = struct {
+    /// The type of the URL citation. Always `url_citation`.
+    type: []const u8,
+    /// The URL of the web resource.
+    url: []const u8,
+    /// The index of the first character of the URL citation in the message.
+    start_index: i64,
+    /// The index of the last character of the URL citation in the message.
+    end_index: i64,
+    /// The title of the web resource.
+    title: []const u8,
 };
 
 /// The aggregated audio speeches usage details of the specific time bucket.
@@ -4354,6 +6067,22 @@ pub const UserDeleteResponse = struct {
     deleted: bool,
 };
 
+/// Text block that a user contributed to the thread.
+pub const UserMessageInputText = struct {
+    /// Type discriminator that is always `input_text`.
+    type: []const u8,
+    /// Plain-text content supplied by the user.
+    text: []const u8,
+};
+
+/// Quoted snippet that the user referenced in their message.
+pub const UserMessageQuotedText = struct {
+    /// Type discriminator that is always `quoted_text`.
+    type: []const u8,
+    /// Quoted text content.
+    text: []const u8,
+};
+
 pub const UserRoleUpdateRequest = struct {
     /// `owner` or `reader`
     role: []const u8,
@@ -4415,6 +6144,139 @@ pub const VectorStoreSearchResultContentObject = struct {
 
 pub const Verbosity = std.json.Value;
 
+pub const VideoCharacterResource = struct {
+    id: std.json.Value,
+    name: std.json.Value,
+    /// Unix timestamp (in seconds) when the character was created.
+    created_at: i64,
+};
+
+pub const VideoContentVariant = enum {
+    video,
+    thumbnail,
+    spritesheet,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .video => "video",
+            .thumbnail => "thumbnail",
+            .spritesheet => "spritesheet",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "video", .video },
+            .{ "thumbnail", .thumbnail },
+            .{ "spritesheet", .spritesheet },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const VideoModel = std.json.Value;
+
+/// Reference to the completed video.
+pub const VideoReferenceInputParam = struct {
+    /// The identifier of the completed video.
+    id: []const u8,
+};
+
+pub const VideoSeconds = enum {
+    @"4",
+    @"8",
+    @"12",
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .@"4" => "4",
+            .@"8" => "8",
+            .@"12" => "12",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "4", .@"4" },
+            .{ "8", .@"8" },
+            .{ "12", .@"12" },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const VideoSize = enum {
+    @"720x1280",
+    @"1280x720",
+    @"1024x1792",
+    @"1792x1024",
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .@"720x1280" => "720x1280",
+            .@"1280x720" => "1280x720",
+            .@"1024x1792" => "1024x1792",
+            .@"1792x1024" => "1792x1024",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "720x1280", .@"720x1280" },
+            .{ "1280x720", .@"1280x720" },
+            .{ "1024x1792", .@"1024x1792" },
+            .{ "1792x1024", .@"1792x1024" },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const VideoStatus = enum {
+    queued,
+    in_progress,
+    completed,
+    failed,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .queued => "queued",
+            .in_progress => "in_progress",
+            .completed => "completed",
+            .failed => "failed",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "queued", .queued },
+            .{ "in_progress", .in_progress },
+            .{ "completed", .completed },
+            .{ "failed", .failed },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const VoiceConsentDeletedResource = struct {
     /// The consent recording identifier.
     id: []const u8,
@@ -4448,6 +6310,12 @@ pub const VoiceResource = struct {
     name: []const u8,
     /// The Unix timestamp (in seconds) for when the voice was created.
     created_at: i64,
+};
+
+/// A wait action.
+pub const WaitParam = struct {
+    /// Specifies the event type. For a wait action, this property is always set to `wait`.
+    type: []const u8,
 };
 
 /// Action type "find_in_page": Searches for a pattern within a loaded page.
@@ -4733,1792 +6601,6 @@ pub const WebhookResponseIncomplete = struct {
     type: []const u8,
 };
 
-pub const SkillReferenceParam = struct {
-    /// References a skill created with the /v1/skills endpoint.
-    type: []const u8,
-    /// The ID of the referenced skill.
-    skill_id: []const u8,
-    /// Optional skill version. Use a positive integer or 'latest'. Omit for default.
-    version: ?[]const u8 = null,
-};
-
-/// Inline skill payload
-pub const InlineSkillSourceParam = struct {
-    /// The type of the inline skill source. Must be `base64`.
-    type: []const u8,
-    /// The media type of the inline skill payload. Must be `application/zip`.
-    media_type: []const u8,
-    /// Base64-encoded skill zip bundle.
-    data: []const u8,
-};
-
-pub const ContainerNetworkPolicyDisabledParam = struct {
-    /// Disable outbound network access. Always `disabled`.
-    type: []const u8,
-};
-
-pub const ContainerNetworkPolicyDomainSecretParam = struct {
-    /// The domain associated with the secret.
-    domain: []const u8,
-    /// The name of the secret to inject for the domain.
-    name: []const u8,
-    /// The secret value to inject for the domain.
-    value: []const u8,
-};
-
-/// Specify additional output data to include in the model response. Currently supported values are: - `web_search_call.action.sources`: Include the sources of the web search tool call. - `code_interpreter_call.outputs`: Includes the outputs of python code execution in code interpreter tool call items. - `computer_call_output.output.image_url`: Include image urls from the computer call output. - `file_search_call.results`: Include the search results of the file search tool call. - `message.input_image.image_url`: Include image urls from the input message. - `message.output_text.logprobs`: Include logprobs with assistant messages. - `reasoning.encrypted_content`: Includes an encrypted version of reasoning tokens in reasoning item outputs. This enables reasoning items to be used in multi-turn conversations when using the Responses API statelessly (like when the `store` parameter is set to `false`, or when an organization is enrolled in the zero data retention program).
-pub const IncludeEnum = enum {
-    file_search_call_results,
-    web_search_call_results,
-    web_search_call_action_sources,
-    message_input_image_image_url,
-    computer_call_output_output_image_url,
-    code_interpreter_call_outputs,
-    reasoning_encrypted_content,
-    message_output_text_logprobs,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .file_search_call_results => "file_search_call.results",
-            .web_search_call_results => "web_search_call.results",
-            .web_search_call_action_sources => "web_search_call.action.sources",
-            .message_input_image_image_url => "message.input_image.image_url",
-            .computer_call_output_output_image_url => "computer_call_output.output.image_url",
-            .code_interpreter_call_outputs => "code_interpreter_call.outputs",
-            .reasoning_encrypted_content => "reasoning.encrypted_content",
-            .message_output_text_logprobs => "message.output_text.logprobs",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "file_search_call.results", .file_search_call_results },
-            .{ "web_search_call.results", .web_search_call_results },
-            .{ "web_search_call.action.sources", .web_search_call_action_sources },
-            .{ "message.input_image.image_url", .message_input_image_image_url },
-            .{ "computer_call_output.output.image_url", .computer_call_output_output_image_url },
-            .{ "code_interpreter_call.outputs", .code_interpreter_call_outputs },
-            .{ "reasoning.encrypted_content", .reasoning_encrypted_content },
-            .{ "message.output_text.logprobs", .message_output_text_logprobs },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-pub const MessageStatus = enum {
-    in_progress,
-    completed,
-    incomplete,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .in_progress => "in_progress",
-            .completed => "completed",
-            .incomplete => "incomplete",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "in_progress", .in_progress },
-            .{ "completed", .completed },
-            .{ "incomplete", .incomplete },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-pub const MessageRole = enum {
-    unknown,
-    user,
-    assistant,
-    system,
-    critic,
-    discriminator,
-    developer,
-    tool,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .unknown => "unknown",
-            .user => "user",
-            .assistant => "assistant",
-            .system => "system",
-            .critic => "critic",
-            .discriminator => "discriminator",
-            .developer => "developer",
-            .tool => "tool",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "unknown", .unknown },
-            .{ "user", .user },
-            .{ "assistant", .assistant },
-            .{ "system", .system },
-            .{ "critic", .critic },
-            .{ "discriminator", .discriminator },
-            .{ "developer", .developer },
-            .{ "tool", .tool },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// A text input to the model.
-pub const InputTextContent = struct {
-    /// The type of the input item. Always `input_text`.
-    type: []const u8,
-    /// The text input to the model.
-    text: []const u8,
-};
-
-/// A citation to a file.
-pub const FileCitationBody = struct {
-    /// The type of the file citation. Always `file_citation`.
-    type: []const u8,
-    /// The ID of the file.
-    file_id: []const u8,
-    /// The index of the file in the list of files.
-    index: i64,
-    /// The filename of the file cited.
-    filename: []const u8,
-};
-
-/// A citation for a web resource used to generate a model response.
-pub const UrlCitationBody = struct {
-    /// The type of the URL citation. Always `url_citation`.
-    type: []const u8,
-    /// The URL of the web resource.
-    url: []const u8,
-    /// The index of the first character of the URL citation in the message.
-    start_index: i64,
-    /// The index of the last character of the URL citation in the message.
-    end_index: i64,
-    /// The title of the web resource.
-    title: []const u8,
-};
-
-/// A citation for a container file used to generate a model response.
-pub const ContainerFileCitationBody = struct {
-    /// The type of the container file citation. Always `container_file_citation`.
-    type: []const u8,
-    /// The ID of the container file.
-    container_id: []const u8,
-    /// The ID of the file.
-    file_id: []const u8,
-    /// The index of the first character of the container file citation in the message.
-    start_index: i64,
-    /// The index of the last character of the container file citation in the message.
-    end_index: i64,
-    /// The filename of the container file cited.
-    filename: []const u8,
-};
-
-/// The top log probability of a token.
-pub const TopLogProb = struct {
-    token: []const u8,
-    logprob: f64,
-    bytes: []const i64,
-};
-
-/// A text content.
-pub const TextContent = struct {
-    type: []const u8,
-    text: []const u8,
-};
-
-/// A summary text from the model.
-pub const SummaryTextContent = struct {
-    /// The type of the object. Always `summary_text`.
-    type: []const u8,
-    /// A summary of the reasoning output from the model so far.
-    text: []const u8,
-};
-
-/// Reasoning text from the model.
-pub const ReasoningTextContent = struct {
-    /// The type of the reasoning text. Always `reasoning_text`.
-    type: []const u8,
-    /// The reasoning text from the model.
-    text: []const u8,
-};
-
-/// A refusal from the model.
-pub const RefusalContent = struct {
-    /// The type of the refusal. Always `refusal`.
-    type: []const u8,
-    /// The refusal explanation from the model.
-    refusal: []const u8,
-};
-
-pub const ImageDetail = enum {
-    low,
-    high,
-    auto,
-    original,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .low => "low",
-            .high => "high",
-            .auto => "auto",
-            .original => "original",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "low", .low },
-            .{ "high", .high },
-            .{ "auto", .auto },
-            .{ "original", .original },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// A file input to the model.
-pub const InputFileContent = struct {
-    /// The type of the input item. Always `input_file`.
-    type: []const u8,
-    file_id: ?std.json.Value = null,
-    /// The name of the file to be sent to the model.
-    filename: ?[]const u8 = null,
-    /// The content of the file to be sent to the model.
-    file_data: ?[]const u8 = null,
-    /// The URL of the file to be sent to the model.
-    file_url: ?[]const u8 = null,
-};
-
-pub const FunctionCallStatus = enum {
-    in_progress,
-    completed,
-    incomplete,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .in_progress => "in_progress",
-            .completed => "completed",
-            .incomplete => "incomplete",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "in_progress", .in_progress },
-            .{ "completed", .completed },
-            .{ "incomplete", .incomplete },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-pub const FunctionCallOutputStatusEnum = enum {
-    in_progress,
-    completed,
-    incomplete,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .in_progress => "in_progress",
-            .completed => "completed",
-            .incomplete => "incomplete",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "in_progress", .in_progress },
-            .{ "completed", .completed },
-            .{ "incomplete", .incomplete },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-pub const ClickButtonType = enum {
-    left,
-    right,
-    wheel,
-    back,
-    forward,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .left => "left",
-            .right => "right",
-            .wheel => "wheel",
-            .back => "back",
-            .forward => "forward",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "left", .left },
-            .{ "right", .right },
-            .{ "wheel", .wheel },
-            .{ "back", .back },
-            .{ "forward", .forward },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// A double click action.
-pub const DoubleClickAction = struct {
-    /// Specifies the event type. For a double click action, this property is always set to `double_click`.
-    type: []const u8,
-    /// The x-coordinate where the double click occurred.
-    x: i64,
-    /// The y-coordinate where the double click occurred.
-    y: i64,
-    keys: std.json.Value,
-};
-
-/// An x/y coordinate pair, e.g. `{ x: 100, y: 200 }`.
-pub const CoordParam = struct {
-    /// The x-coordinate.
-    x: i64,
-    /// The y-coordinate.
-    y: i64,
-};
-
-/// A collection of keypresses the model would like to perform.
-pub const KeyPressAction = struct {
-    /// Specifies the event type. For a keypress action, this property is always set to `keypress`.
-    type: []const u8,
-    /// The combination of keys the model is requesting to be pressed. This is an array of strings, each representing a key.
-    keys: []const []const u8,
-};
-
-/// A mouse move action.
-pub const MoveParam = struct {
-    /// Specifies the event type. For a move action, this property is always set to `move`.
-    type: []const u8,
-    /// The x-coordinate to move to.
-    x: i64,
-    /// The y-coordinate to move to.
-    y: i64,
-    keys: ?std.json.Value = null,
-};
-
-/// A screenshot action.
-pub const ScreenshotParam = struct {
-    /// Specifies the event type. For a screenshot action, this property is always set to `screenshot`.
-    type: []const u8,
-};
-
-/// A scroll action.
-pub const ScrollParam = struct {
-    /// Specifies the event type. For a scroll action, this property is always set to `scroll`.
-    type: []const u8,
-    /// The x-coordinate where the scroll occurred.
-    x: i64,
-    /// The y-coordinate where the scroll occurred.
-    y: i64,
-    /// The horizontal scroll distance.
-    scroll_x: i64,
-    /// The vertical scroll distance.
-    scroll_y: i64,
-    keys: ?std.json.Value = null,
-};
-
-/// An action to type in text.
-pub const TypeParam = struct {
-    /// Specifies the event type. For a type action, this property is always set to `type`.
-    type: []const u8,
-    /// The text to type.
-    text: []const u8,
-};
-
-/// A wait action.
-pub const WaitParam = struct {
-    /// Specifies the event type. For a wait action, this property is always set to `wait`.
-    type: []const u8,
-};
-
-/// A pending safety check for the computer call.
-pub const ComputerCallSafetyCheckParam = struct {
-    /// The ID of the pending safety check.
-    id: []const u8,
-    code: ?std.json.Value = null,
-    message: ?std.json.Value = null,
-};
-
-pub const ComputerCallOutputStatus = enum {
-    completed,
-    incomplete,
-    failed,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .completed => "completed",
-            .incomplete => "incomplete",
-            .failed => "failed",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "completed", .completed },
-            .{ "incomplete", .incomplete },
-            .{ "failed", .failed },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-pub const ToolSearchExecutionType = enum {
-    server,
-    client,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .server => "server",
-            .client => "client",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "server", .server },
-            .{ "client", .client },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Defines a function in your own code the model can choose to call. Learn more about [function calling](https://platform.openai.com/docs/guides/function-calling).
-pub const FunctionTool = struct {
-    /// The type of the function tool. Always `function`.
-    type: []const u8,
-    /// The name of the function to call.
-    name: []const u8,
-    description: ?std.json.Value = null,
-    parameters: std.json.Value,
-    strict: std.json.Value,
-    /// Whether this function is deferred and loaded via tool search.
-    defer_loading: ?bool = null,
-};
-
-pub const RankerVersionType = enum {
-    auto,
-    default_2024_11_15,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .auto => "auto",
-            .default_2024_11_15 => "default-2024-11-15",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "auto", .auto },
-            .{ "default-2024-11-15", .default_2024_11_15 },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-pub const HybridSearchOptions = struct {
-    /// The weight of the embedding in the reciprocal ranking fusion.
-    embedding_weight: f64,
-    /// The weight of the text in the reciprocal ranking fusion.
-    text_weight: f64,
-};
-
-/// A tool that controls a virtual computer. Learn more about the [computer tool](https://platform.openai.com/docs/guides/tools-computer-use).
-pub const ComputerTool = struct {
-    /// The type of the computer tool. Always `computer`.
-    type: []const u8,
-};
-
-pub const ComputerEnvironment = enum {
-    windows,
-    mac,
-    linux,
-    ubuntu,
-    browser,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .windows => "windows",
-            .mac => "mac",
-            .linux => "linux",
-            .ubuntu => "ubuntu",
-            .browser => "browser",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "windows", .windows },
-            .{ "mac", .mac },
-            .{ "linux", .linux },
-            .{ "ubuntu", .ubuntu },
-            .{ "browser", .browser },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-pub const ContainerMemoryLimit = enum {
-    @"1g",
-    @"4g",
-    @"16g",
-    @"64g",
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .@"1g" => "1g",
-            .@"4g" => "4g",
-            .@"16g" => "16g",
-            .@"64g" => "64g",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "1g", .@"1g" },
-            .{ "4g", .@"4g" },
-            .{ "16g", .@"16g" },
-            .{ "64g", .@"64g" },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Control how much effort the model will exert to match the style and features, especially facial features, of input images. This parameter is only supported for `gpt-image-1` and `gpt-image-1.5` and later models, unsupported for `gpt-image-1-mini`. Supports `high` and `low`. Defaults to `low`.
-pub const InputFidelity = enum {
-    high,
-    low,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .high => "high",
-            .low => "low",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "high", .high },
-            .{ "low", .low },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-pub const ImageGenActionEnum = enum {
-    generate,
-    edit,
-    auto,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .generate => "generate",
-            .edit => "edit",
-            .auto => "auto",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "generate", .generate },
-            .{ "edit", .edit },
-            .{ "auto", .auto },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// A tool that allows the model to execute shell commands in a local environment.
-pub const LocalShellToolParam = struct {
-    /// The type of the local shell tool. Always `local_shell`.
-    type: []const u8,
-};
-
-pub const LocalSkillParam = struct {
-    /// The name of the skill.
-    name: []const u8,
-    /// The description of the skill.
-    description: []const u8,
-    /// The path to the directory containing the skill.
-    path: []const u8,
-};
-
-pub const ContainerReferenceParam = struct {
-    /// References a container created with the /v1/containers endpoint
-    type: []const u8,
-    /// The ID of the referenced container.
-    container_id: []const u8,
-};
-
-/// Unconstrained free-form text.
-pub const CustomTextFormatParam = struct {
-    /// Unconstrained text format. Always `text`.
-    type: []const u8,
-};
-
-pub const GrammarSyntax1 = enum {
-    lark,
-    regex,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .lark => "lark",
-            .regex => "regex",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "lark", .lark },
-            .{ "regex", .regex },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-pub const EmptyModelParam = struct {};
-
-pub const ApproximateLocation = struct {
-    /// The type of location approximation. Always `approximate`.
-    type: []const u8,
-    country: ?std.json.Value = null,
-    region: ?std.json.Value = null,
-    city: ?std.json.Value = null,
-    timezone: ?std.json.Value = null,
-};
-
-pub const SearchContextSize = enum {
-    low,
-    medium,
-    high,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .low => "low",
-            .medium => "medium",
-            .high => "high",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "low", .low },
-            .{ "medium", .medium },
-            .{ "high", .high },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-pub const SearchContentType = enum {
-    text,
-    image,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .text => "text",
-            .image => "image",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "text", .text },
-            .{ "image", .image },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Allows the assistant to create, delete, or update files using unified diffs.
-pub const ApplyPatchToolParam = struct {
-    /// The type of the tool. Always `apply_patch`.
-    type: []const u8,
-};
-
-/// A compaction item generated by the [`v1/responses/compact` API](/docs/api-reference/responses/compact).
-pub const CompactionBody = struct {
-    /// The type of the item. Always `compaction`.
-    type: []const u8,
-    /// The unique ID of the compaction item.
-    id: []const u8,
-    /// The encrypted content that was produced by compaction.
-    encrypted_content: []const u8,
-    /// The identifier of the actor that created the item.
-    created_by: ?[]const u8 = null,
-};
-
-/// The logs output from the code interpreter.
-pub const CodeInterpreterOutputLogs = struct {
-    /// The type of the output. Always `logs`.
-    type: []const u8,
-    /// The logs output from the code interpreter.
-    logs: []const u8,
-};
-
-/// The image output from the code interpreter.
-pub const CodeInterpreterOutputImage = struct {
-    /// The type of the output. Always `image`.
-    type: []const u8,
-    /// The URL of the image output from the code interpreter.
-    url: []const u8,
-};
-
-/// Execute a shell command on the server.
-pub const LocalShellExecAction = struct {
-    /// The type of the local shell action. Always `exec`.
-    type: []const u8,
-    /// The command to run.
-    command: []const []const u8,
-    timeout_ms: ?std.json.Value = null,
-    working_directory: ?std.json.Value = null,
-    /// Environment variables to set for the command.
-    env: std.json.ArrayHashMap([]const u8),
-    user: ?std.json.Value = null,
-};
-
-/// Execute a shell command.
-pub const FunctionShellAction = struct {
-    commands: []const []const u8,
-    timeout_ms: std.json.Value,
-    max_output_length: std.json.Value,
-};
-
-pub const LocalShellCallStatus = enum {
-    in_progress,
-    completed,
-    incomplete,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .in_progress => "in_progress",
-            .completed => "completed",
-            .incomplete => "incomplete",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "in_progress", .in_progress },
-            .{ "completed", .completed },
-            .{ "incomplete", .incomplete },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Represents the use of a local environment to perform shell actions.
-pub const LocalEnvironmentResource = struct {
-    /// The environment type. Always `local`.
-    type: []const u8,
-};
-
-/// Represents a container created with /v1/containers.
-pub const ContainerReferenceResource = struct {
-    /// The environment type. Always `container_reference`.
-    type: []const u8,
-    container_id: []const u8,
-};
-
-pub const LocalShellCallOutputStatusEnum = enum {
-    in_progress,
-    completed,
-    incomplete,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .in_progress => "in_progress",
-            .completed => "completed",
-            .incomplete => "incomplete",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "in_progress", .in_progress },
-            .{ "completed", .completed },
-            .{ "incomplete", .incomplete },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Indicates that the shell call exceeded its configured time limit.
-pub const FunctionShellCallOutputTimeoutOutcome = struct {
-    /// The outcome type. Always `timeout`.
-    type: []const u8,
-};
-
-/// Indicates that the shell commands finished and returned an exit code.
-pub const FunctionShellCallOutputExitOutcome = struct {
-    /// The outcome type. Always `exit`.
-    type: []const u8,
-    /// Exit code from the shell process.
-    exit_code: i64,
-};
-
-pub const ApplyPatchCallStatus = enum {
-    in_progress,
-    completed,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .in_progress => "in_progress",
-            .completed => "completed",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "in_progress", .in_progress },
-            .{ "completed", .completed },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Instruction describing how to create a file via the apply_patch tool.
-pub const ApplyPatchCreateFileOperation = struct {
-    /// Create a new file with the provided diff.
-    type: []const u8,
-    /// Path of the file to create.
-    path: []const u8,
-    /// Diff to apply.
-    diff: []const u8,
-};
-
-/// Instruction describing how to delete a file via the apply_patch tool.
-pub const ApplyPatchDeleteFileOperation = struct {
-    /// Delete the specified file.
-    type: []const u8,
-    /// Path of the file to delete.
-    path: []const u8,
-};
-
-/// Instruction describing how to update a file via the apply_patch tool.
-pub const ApplyPatchUpdateFileOperation = struct {
-    /// Update an existing file with the provided diff.
-    type: []const u8,
-    /// Path of the file to update.
-    path: []const u8,
-    /// Diff to apply.
-    diff: []const u8,
-};
-
-pub const ApplyPatchCallOutputStatus = enum {
-    completed,
-    failed,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .completed => "completed",
-            .failed => "failed",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "completed", .completed },
-            .{ "failed", .failed },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-pub const MCPToolCallStatus = enum {
-    in_progress,
-    completed,
-    incomplete,
-    calling,
-    failed,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .in_progress => "in_progress",
-            .completed => "completed",
-            .incomplete => "incomplete",
-            .calling => "calling",
-            .failed => "failed",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "in_progress", .in_progress },
-            .{ "completed", .completed },
-            .{ "incomplete", .incomplete },
-            .{ "calling", .calling },
-            .{ "failed", .failed },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-pub const DetailEnum = enum {
-    low,
-    high,
-    auto,
-    original,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .low => "low",
-            .high => "high",
-            .auto => "auto",
-            .original => "original",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "low", .low },
-            .{ "high", .high },
-            .{ "auto", .auto },
-            .{ "original", .original },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-pub const FunctionCallItemStatus = enum {
-    in_progress,
-    completed,
-    incomplete,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .in_progress => "in_progress",
-            .completed => "completed",
-            .incomplete => "incomplete",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "in_progress", .in_progress },
-            .{ "completed", .completed },
-            .{ "incomplete", .incomplete },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// A text input to the model.
-pub const InputTextContentParam = struct {
-    /// The type of the input item. Always `input_text`.
-    type: []const u8,
-    /// The text input to the model.
-    text: []const u8,
-};
-
-/// A file input to the model.
-pub const InputFileContentParam = struct {
-    /// The type of the input item. Always `input_file`.
-    type: []const u8,
-    file_id: ?std.json.Value = null,
-    filename: ?std.json.Value = null,
-    file_data: ?std.json.Value = null,
-    file_url: ?std.json.Value = null,
-};
-
-/// A compaction item generated by the [`v1/responses/compact` API](/docs/api-reference/responses/compact).
-pub const CompactionSummaryItemParam = struct {
-    id: ?std.json.Value = null,
-    /// The type of the item. Always `compaction`.
-    type: []const u8,
-    /// The encrypted content of the compaction summary.
-    encrypted_content: []const u8,
-};
-
-/// Commands and limits describing how to run the shell tool call.
-pub const FunctionShellActionParam = struct {
-    /// Ordered shell commands for the execution environment to run.
-    commands: []const []const u8,
-    timeout_ms: ?std.json.Value = null,
-    max_output_length: ?std.json.Value = null,
-};
-
-/// Status values reported for shell tool calls.
-pub const FunctionShellCallItemStatus = enum {
-    in_progress,
-    completed,
-    incomplete,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .in_progress => "in_progress",
-            .completed => "completed",
-            .incomplete => "incomplete",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "in_progress", .in_progress },
-            .{ "completed", .completed },
-            .{ "incomplete", .incomplete },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Indicates that the shell call exceeded its configured time limit.
-pub const FunctionShellCallOutputTimeoutOutcomeParam = struct {
-    /// The outcome type. Always `timeout`.
-    type: []const u8,
-};
-
-/// Indicates that the shell commands finished and returned an exit code.
-pub const FunctionShellCallOutputExitOutcomeParam = struct {
-    /// The outcome type. Always `exit`.
-    type: []const u8,
-    /// The exit code returned by the shell process.
-    exit_code: i64,
-};
-
-/// Status values reported for apply_patch tool calls.
-pub const ApplyPatchCallStatusParam = enum {
-    in_progress,
-    completed,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .in_progress => "in_progress",
-            .completed => "completed",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "in_progress", .in_progress },
-            .{ "completed", .completed },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Instruction for creating a new file via the apply_patch tool.
-pub const ApplyPatchCreateFileOperationParam = struct {
-    /// The operation type. Always `create_file`.
-    type: []const u8,
-    /// Path of the file to create relative to the workspace root.
-    path: []const u8,
-    /// Unified diff content to apply when creating the file.
-    diff: []const u8,
-};
-
-/// Instruction for deleting an existing file via the apply_patch tool.
-pub const ApplyPatchDeleteFileOperationParam = struct {
-    /// The operation type. Always `delete_file`.
-    type: []const u8,
-    /// Path of the file to delete relative to the workspace root.
-    path: []const u8,
-};
-
-/// Instruction for updating an existing file via the apply_patch tool.
-pub const ApplyPatchUpdateFileOperationParam = struct {
-    /// The operation type. Always `update_file`.
-    type: []const u8,
-    /// Path of the file to update relative to the workspace root.
-    path: []const u8,
-    /// Unified diff content to apply to the existing file.
-    diff: []const u8,
-};
-
-/// Outcome values reported for apply_patch tool call outputs.
-pub const ApplyPatchCallOutputStatusParam = enum {
-    completed,
-    failed,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .completed => "completed",
-            .failed => "failed",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "completed", .completed },
-            .{ "failed", .failed },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// An internal identifier for an item to reference.
-pub const ItemReferenceParam = struct {
-    type: ?std.json.Value = null,
-    /// The ID of the item to reference.
-    id: []const u8,
-};
-
-pub const ConversationResource = struct {
-    /// The unique ID of the conversation.
-    id: []const u8,
-    /// The object type, which is always `conversation`.
-    object: []const u8,
-    /// Set of 16 key-value pairs that can be attached to an object. This can be useful for storing additional information about the object in a structured format, and querying for objects via API or the dashboard. Keys are strings with a maximum length of 64 characters. Values are strings with a maximum length of 512 characters.
-    metadata: std.json.Value,
-    /// The time at which the conversation was created, measured in seconds since the Unix epoch.
-    created_at: i64,
-};
-
-/// The output token details for the image generation.
-pub const ImageGenOutputTokensDetails = struct {
-    /// The number of image output tokens generated by the model.
-    image_tokens: i64,
-    /// The number of text output tokens generated by the model.
-    text_tokens: i64,
-};
-
-/// The input tokens detailed information for the image generation.
-pub const ImageGenInputUsageDetails = struct {
-    /// The number of text tokens in the input prompt.
-    text_tokens: i64,
-    /// The number of image tokens in the input prompt.
-    image_tokens: i64,
-};
-
-/// Forces the model to call the apply_patch tool when executing a tool call.
-pub const SpecificApplyPatchParam = struct {
-    /// The tool to call. Always `apply_patch`.
-    type: []const u8,
-};
-
-/// Forces the model to call the shell tool when a tool call is required.
-pub const SpecificFunctionShellParam = struct {
-    /// The tool to call. Always `shell`.
-    type: []const u8,
-};
-
-/// The conversation that this response belongs to.
-pub const ConversationParam2 = struct {
-    /// The unique ID of the conversation.
-    id: []const u8,
-};
-
-pub const ContextManagementParam = struct {
-    /// The context management entry type. Currently only 'compaction' is supported.
-    type: []const u8,
-    compact_threshold: ?std.json.Value = null,
-};
-
-/// The conversation that this response belonged to. Input items and output items from this response were automatically added to this conversation.
-pub const Conversation2 = struct {
-    /// The unique ID of the conversation that this response was associated with.
-    id: []const u8,
-};
-
-pub const DeletedConversationResource = struct {
-    object: []const u8,
-    deleted: bool,
-    id: []const u8,
-};
-
-pub const OrderEnum = enum {
-    asc,
-    desc,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .asc => "asc",
-            .desc => "desc",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "asc", .asc },
-            .{ "desc", .desc },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-pub const VideoModel = std.json.Value;
-
-pub const VideoStatus = enum {
-    queued,
-    in_progress,
-    completed,
-    failed,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .queued => "queued",
-            .in_progress => "in_progress",
-            .completed => "completed",
-            .failed => "failed",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "queued", .queued },
-            .{ "in_progress", .in_progress },
-            .{ "completed", .completed },
-            .{ "failed", .failed },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-pub const VideoSize = enum {
-    @"720x1280",
-    @"1280x720",
-    @"1024x1792",
-    @"1792x1024",
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .@"720x1280" => "720x1280",
-            .@"1280x720" => "1280x720",
-            .@"1024x1792" => "1024x1792",
-            .@"1792x1024" => "1792x1024",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "720x1280", .@"720x1280" },
-            .{ "1280x720", .@"1280x720" },
-            .{ "1024x1792", .@"1024x1792" },
-            .{ "1792x1024", .@"1792x1024" },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// An error that occurred while generating the response.
-pub const Error2 = struct {
-    /// A machine-readable error code that was returned.
-    code: []const u8,
-    /// A human-readable description of the error that was returned.
-    message: []const u8,
-};
-
-pub const ImageRefParam2 = struct {
-    /// A fully qualified URL or base64-encoded data URL.
-    image_url: ?[]const u8 = null,
-    file_id: ?[]const u8 = null,
-};
-
-pub const VideoSeconds = enum {
-    @"4",
-    @"8",
-    @"12",
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .@"4" => "4",
-            .@"8" => "8",
-            .@"12" => "12",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "4", .@"4" },
-            .{ "8", .@"8" },
-            .{ "12", .@"12" },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Parameters for creating a character from an uploaded video.
-pub const CreateVideoCharacterBody = struct {
-    /// Video file used to create a character.
-    video: []const u8,
-    /// Display name for this API character.
-    name: []const u8,
-};
-
-pub const VideoCharacterResource = struct {
-    id: std.json.Value,
-    name: std.json.Value,
-    /// Unix timestamp (in seconds) when the character was created.
-    created_at: i64,
-};
-
-/// Reference to the completed video.
-pub const VideoReferenceInputParam = struct {
-    /// The identifier of the completed video.
-    id: []const u8,
-};
-
-/// Confirmation payload returned after deleting a video.
-pub const DeletedVideoResource = struct {
-    /// The object type that signals the deletion response.
-    object: []const u8,
-    /// Indicates that the video resource was deleted.
-    deleted: bool,
-    /// Identifier of the deleted video.
-    id: []const u8,
-};
-
-pub const VideoContentVariant = enum {
-    video,
-    thumbnail,
-    spritesheet,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .video => "video",
-            .thumbnail => "thumbnail",
-            .spritesheet => "spritesheet",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "video", .video },
-            .{ "thumbnail", .thumbnail },
-            .{ "spritesheet", .spritesheet },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Parameters for remixing an existing generated video.
-pub const CreateVideoRemixBody = struct {
-    /// Updated text prompt that directs the remix generation.
-    prompt: []const u8,
-};
-
-pub const TruncationEnum = enum {
-    auto,
-    disabled,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .auto => "auto",
-            .disabled => "disabled",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "auto", .auto },
-            .{ "disabled", .disabled },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-pub const TokenCountsResource = struct {
-    object: []const u8,
-    input_tokens: i64,
-};
-
-pub const SkillResource = struct {
-    /// Unique identifier for the skill.
-    id: []const u8,
-    /// The object type, which is `skill`.
-    object: []const u8,
-    /// Name of the skill.
-    name: []const u8,
-    /// Description of the skill.
-    description: []const u8,
-    /// Unix timestamp (seconds) for when the skill was created.
-    created_at: i64,
-    /// Default version for the skill.
-    default_version: []const u8,
-    /// Latest version for the skill.
-    latest_version: []const u8,
-};
-
-/// Uploads a skill either as a directory (multipart `files[]`) or as a single zip file.
-pub const CreateSkillBody = struct {
-    files: std.json.Value,
-};
-
-/// Updates the default version pointer for a skill.
-pub const SetDefaultSkillVersionBody = struct {
-    /// The skill version number to set as default.
-    default_version: []const u8,
-};
-
-pub const DeletedSkillResource = struct {
-    object: []const u8,
-    deleted: bool,
-    id: []const u8,
-};
-
-pub const SkillVersionResource = struct {
-    /// The object type, which is `skill.version`.
-    object: []const u8,
-    /// Unique identifier for the skill version.
-    id: []const u8,
-    /// Identifier of the skill for this version.
-    skill_id: []const u8,
-    /// Version number for this skill.
-    version: []const u8,
-    /// Unix timestamp (seconds) for when the version was created.
-    created_at: i64,
-    /// Name of the skill version.
-    name: []const u8,
-    /// Description of the skill version.
-    description: []const u8,
-};
-
-/// Uploads a new immutable version of a skill.
-pub const CreateSkillVersionBody = struct {
-    files: std.json.Value,
-    /// Whether to set this version as the default.
-    default: ?bool = null,
-};
-
-pub const DeletedSkillVersionResource = struct {
-    object: []const u8,
-    deleted: bool,
-    id: []const u8,
-    /// The deleted skill version.
-    version: []const u8,
-};
-
-/// Controls diagnostic tracing during the session.
-pub const ChatkitWorkflowTracing = struct {
-    /// Indicates whether tracing is enabled.
-    enabled: bool,
-};
-
-/// Active per-minute request limit for the session.
-pub const ChatSessionRateLimits = struct {
-    /// Maximum allowed requests per one-minute window.
-    max_requests_per_1_minute: i64,
-};
-
-pub const ChatSessionStatus = enum {
-    active,
-    expired,
-    cancelled,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .active => "active",
-            .expired => "expired",
-            .cancelled => "cancelled",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "active", .active },
-            .{ "expired", .expired },
-            .{ "cancelled", .cancelled },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Automatic thread title preferences for the session.
-pub const ChatSessionAutomaticThreadTitling = struct {
-    /// Whether automatic thread titling is enabled.
-    enabled: bool,
-};
-
-/// Upload permissions and limits applied to the session.
-pub const ChatSessionFileUpload = struct {
-    /// Indicates if uploads are enabled for the session.
-    enabled: bool,
-    max_file_size: std.json.Value,
-    max_files: std.json.Value,
-};
-
-/// History retention preferences returned for the session.
-pub const ChatSessionHistory = struct {
-    /// Indicates if chat history is persisted for the session.
-    enabled: bool,
-    recent_threads: std.json.Value,
-};
-
-/// Controls diagnostic tracing during the session.
-pub const WorkflowTracingParam = struct {
-    /// Whether tracing is enabled during the session. Defaults to true.
-    enabled: ?bool = null,
-};
-
-/// Controls when the session expires relative to an anchor timestamp.
-pub const ExpiresAfterParam = struct {
-    /// Base timestamp used to calculate expiration. Currently fixed to `created_at`.
-    anchor: []const u8,
-    /// Number of seconds after the anchor when the session expires.
-    seconds: i64,
-};
-
-/// Controls request rate limits for the session.
-pub const RateLimitsParam = struct {
-    /// Maximum number of requests allowed per minute for the session. Defaults to 10.
-    max_requests_per_1_minute: ?i64 = null,
-};
-
-/// Controls whether ChatKit automatically generates thread titles.
-pub const AutomaticThreadTitlingParam = struct {
-    /// Enable automatic thread title generation. Defaults to true.
-    enabled: ?bool = null,
-};
-
-/// Controls whether users can upload files.
-pub const FileUploadParam = struct {
-    /// Enable uploads for this session. Defaults to false.
-    enabled: ?bool = null,
-    /// Maximum size in megabytes for each uploaded file. Defaults to 512 MB, which is the maximum allowable size.
-    max_file_size: ?i64 = null,
-    /// Maximum number of files that can be uploaded to the session. Defaults to 10.
-    max_files: ?i64 = null,
-};
-
-/// Controls how much historical context is retained for the session.
-pub const HistoryParam = struct {
-    /// Enables chat users to access previous ChatKit threads. Defaults to true.
-    enabled: ?bool = null,
-    /// Number of recent ChatKit threads users have access to. Defaults to unlimited when unset.
-    recent_threads: ?i64 = null,
-};
-
-/// Text block that a user contributed to the thread.
-pub const UserMessageInputText = struct {
-    /// Type discriminator that is always `input_text`.
-    type: []const u8,
-    /// Plain-text content supplied by the user.
-    text: []const u8,
-};
-
-/// Quoted snippet that the user referenced in their message.
-pub const UserMessageQuotedText = struct {
-    /// Type discriminator that is always `quoted_text`.
-    type: []const u8,
-    /// Quoted text content.
-    text: []const u8,
-};
-
-pub const AttachmentType = enum {
-    image,
-    file,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .image => "image",
-            .file => "file",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "image", .image },
-            .{ "file", .file },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Tool selection that the assistant should honor when executing the item.
-pub const ToolChoice = struct {
-    /// Identifier of the requested tool.
-    id: []const u8,
-};
-
-/// Attachment source referenced by an annotation.
-pub const FileAnnotationSource = struct {
-    /// Type discriminator that is always `file`.
-    type: []const u8,
-    /// Filename referenced by the annotation.
-    filename: []const u8,
-};
-
-/// URL backing an annotation entry.
-pub const UrlAnnotationSource = struct {
-    /// Type discriminator that is always `url`.
-    type: []const u8,
-    /// URL referenced by the annotation.
-    url: []const u8,
-};
-
 /// Thread item that renders a widget payload.
 pub const WidgetMessageItem = struct {
     /// Identifier of the thread item.
@@ -6535,92 +6617,10 @@ pub const WidgetMessageItem = struct {
     widget: []const u8,
 };
 
-pub const ClientToolCallStatus = enum {
-    in_progress,
-    completed,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .in_progress => "in_progress",
-            .completed => "completed",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "in_progress", .in_progress },
-            .{ "completed", .completed },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-pub const TaskType = enum {
-    custom,
-    thought,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .custom => "custom",
-            .thought => "thought",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "custom", .custom },
-            .{ "thought", .thought },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Indicates that a thread is active.
-pub const ActiveStatus = struct {
-    /// Status discriminator that is always `active`.
-    type: []const u8,
-};
-
-/// Indicates that a thread is locked and cannot accept new input.
-pub const LockedStatus = struct {
-    /// Status discriminator that is always `locked`.
-    type: []const u8,
-    reason: std.json.Value,
-};
-
-/// Indicates that a thread has been closed.
-pub const ClosedStatus = struct {
-    /// Status discriminator that is always `closed`.
-    type: []const u8,
-    reason: std.json.Value,
-};
-
-/// Confirmation payload returned after deleting a thread.
-pub const DeletedThreadResource = struct {
-    /// Identifier of the deleted thread.
-    id: []const u8,
-    /// Type discriminator that is always `chatkit.thread.deleted`.
-    object: []const u8,
-    /// Indicates that the thread has been deleted.
-    deleted: bool,
-};
-
-/// An x/y coordinate pair, e.g. `{ x: 100, y: 200 }`.
-pub const DragPoint = struct {
-    /// The x-coordinate.
-    x: i64,
-    /// The y-coordinate.
-    y: i64,
+/// Controls diagnostic tracing during the session.
+pub const WorkflowTracingParam = struct {
+    /// Whether tracing is enabled during the session. Defaults to true.
+    enabled: ?bool = null,
 };
 
 pub const ApiKeyList = struct {
@@ -6629,6 +6629,88 @@ pub const ApiKeyList = struct {
     has_more: ?bool = null,
     first_id: ?[]const u8 = null,
     last_id: ?[]const u8 = null,
+};
+
+/// The output emitted by an apply patch tool call.
+pub const ApplyPatchToolCallOutput = struct {
+    /// The type of the item. Always `apply_patch_call_output`.
+    type: []const u8,
+    /// The unique ID of the apply patch tool call output. Populated when this item is returned via API.
+    id: []const u8,
+    /// The unique ID of the apply patch tool call generated by the model.
+    call_id: []const u8,
+    /// The status of the apply patch tool call output. One of `completed` or `failed`.
+    status: ApplyPatchCallOutputStatus,
+    output: ?std.json.Value = null,
+    /// The ID of the entity that created this tool call output.
+    created_by: ?[]const u8 = null,
+};
+
+/// The streamed output emitted by an apply patch tool call.
+pub const ApplyPatchToolCallOutputItemParam = struct {
+    /// The type of the item. Always `apply_patch_call_output`.
+    type: []const u8,
+    id: ?std.json.Value = null,
+    /// The unique ID of the apply patch tool call generated by the model.
+    call_id: []const u8,
+    /// The status of the apply patch tool call output. One of `completed` or `failed`.
+    status: ApplyPatchCallOutputStatusParam,
+    output: ?std.json.Value = null,
+};
+
+/// A tool call that applies file diffs by creating, deleting, or updating files.
+pub const ApplyPatchToolCall = struct {
+    /// The type of the item. Always `apply_patch_call`.
+    type: []const u8,
+    /// The unique ID of the apply patch tool call. Populated when this item is returned via API.
+    id: []const u8,
+    /// The unique ID of the apply patch tool call generated by the model.
+    call_id: []const u8,
+    /// The status of the apply patch tool call. One of `in_progress` or `completed`.
+    status: ApplyPatchCallStatus,
+    /// One of the create_file, delete_file, or update_file operations applied via apply_patch.
+    operation: std.json.Value,
+    /// The ID of the entity that created this tool call.
+    created_by: ?[]const u8 = null,
+};
+
+/// One of the create_file, delete_file, or update_file operations supplied to the apply_patch tool.
+pub const ApplyPatchOperationParam = union(enum) {
+    apply_patch_create_file_operation_param: ApplyPatchCreateFileOperationParam,
+    apply_patch_delete_file_operation_param: ApplyPatchDeleteFileOperationParam,
+    apply_patch_update_file_operation_param: ApplyPatchUpdateFileOperationParam,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_str = switch (disc_val) {
+            .string => |s| s,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "ApplyPatchCreateFileOperationParam")) {
+            return .{ .apply_patch_create_file_operation_param = try std.json.parseFromValueLeaky(ApplyPatchCreateFileOperationParam, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ApplyPatchDeleteFileOperationParam")) {
+            return .{ .apply_patch_delete_file_operation_param = try std.json.parseFromValueLeaky(ApplyPatchDeleteFileOperationParam, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ApplyPatchUpdateFileOperationParam")) {
+            return .{ .apply_patch_update_file_operation_param = try std.json.parseFromValueLeaky(ApplyPatchUpdateFileOperationParam, allocator, source, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .apply_patch_create_file_operation_param => |v| try jw.write(v),
+            .apply_patch_delete_file_operation_param => |v| try jw.write(v),
+            .apply_patch_update_file_operation_param => |v| try jw.write(v),
+        }
+    }
 };
 
 /// Paginated list of roles assigned to a principal.
@@ -6645,6 +6727,19 @@ pub const RoleListResource = struct {
 
 /// Controls which (if any) tool is called by the model. `none` means the model will not call any tools and instead generates a message. `auto` is the default value and means the model can pick between generating a message or calling one or more tools. `required` means the model must call one or more tools before responding to the user. Specifying a particular tool like `{"type": "file_search"}` or `{"type": "function", "function": {"name": "my_function"}}` forces the model to call that tool.
 pub const AssistantsApiToolChoiceOption = std.json.Value;
+
+/// Attachment metadata included on thread items.
+pub const Attachment = struct {
+    /// Attachment discriminator.
+    type: AttachmentType,
+    /// Identifier for the attachment.
+    id: []const u8,
+    /// Original display name for the attachment.
+    name: []const u8,
+    /// MIME type of the attachment.
+    mime_type: []const u8,
+    preview_url: std.json.Value,
+};
 
 /// A new Realtime transcription session configuration. When a session is created on the server via REST API, the session object also contains an ephemeral key. Default TTL for keys is 10 minutes. This property is not present when a session is updated via the WebSocket API.
 pub const RealtimeTranscriptionSessionCreateResponse = struct {
@@ -6753,12 +6848,12 @@ pub const ChatCompletionRequestSystemMessageContentPart = union(enum) {
     chat_completion_request_message_content_part_text: *ChatCompletionRequestMessageContentPartText,
 
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValue(T, allocator, source, options) catch |err| switch (err) {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return null,
         };
         const value = try allocator.create(T);
-        value.* = parsed.value;
+        value.* = parsed;
         return value;
     }
 
@@ -6791,12 +6886,12 @@ pub const ChatCompletionRequestToolMessageContentPart = union(enum) {
     chat_completion_request_message_content_part_text: *ChatCompletionRequestMessageContentPartText,
 
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValue(T, allocator, source, options) catch |err| switch (err) {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return null,
         };
         const value = try allocator.create(T);
-        value.* = parsed.value;
+        value.* = parsed;
         return value;
     }
 
@@ -6832,12 +6927,12 @@ pub const ChatCompletionRequestUserMessageContentPart = union(enum) {
     chat_completion_request_message_content_part_text: *ChatCompletionRequestMessageContentPartText,
 
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValue(T, allocator, source, options) catch |err| switch (err) {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return null,
         };
         const value = try allocator.create(T);
-        value.* = parsed.value;
+        value.* = parsed;
         return value;
     }
 
@@ -6895,6 +6990,76 @@ pub const PredictionContent = struct {
     content: std.json.Value,
 };
 
+/// ChatKit configuration for the session.
+pub const ChatSessionChatkitConfiguration = struct {
+    /// Automatic thread titling preferences.
+    automatic_thread_titling: ChatSessionAutomaticThreadTitling,
+    /// Upload settings for the session.
+    file_upload: ChatSessionFileUpload,
+    /// History retention configuration.
+    history: ChatSessionHistory,
+};
+
+/// Workflow metadata and state returned for the session.
+pub const ChatkitWorkflow = struct {
+    /// Identifier of the workflow backing the session.
+    id: []const u8,
+    version: std.json.Value,
+    state_variables: std.json.Value,
+    /// Tracing settings applied to the workflow.
+    tracing: ChatkitWorkflowTracing,
+};
+
+/// A click action.
+pub const ClickParam = struct {
+    /// Specifies the event type. For a click action, this property is always `click`.
+    type: []const u8,
+    /// Indicates which mouse button was pressed during the click. One of `left`, `right`, `wheel`, `back`, or `forward`.
+    button: ClickButtonType,
+    /// The x-coordinate where the click occurred.
+    x: i64,
+    /// The y-coordinate where the click occurred.
+    y: i64,
+    keys: ?std.json.Value = null,
+};
+
+/// Record of a client side tool invocation initiated by the assistant.
+pub const ClientToolCallItem = struct {
+    /// Identifier of the thread item.
+    id: []const u8,
+    /// Type discriminator that is always `chatkit.thread_item`.
+    object: []const u8,
+    /// Unix timestamp (in seconds) for when the item was created.
+    created_at: i64,
+    /// Identifier of the parent thread.
+    thread_id: []const u8,
+    /// Type discriminator that is always `chatkit.client_tool_call`.
+    type: []const u8,
+    /// Execution status for the tool call.
+    status: ClientToolCallStatus,
+    /// Identifier for the client tool call.
+    call_id: []const u8,
+    /// Tool name that was invoked.
+    name: []const u8,
+    /// JSON-encoded arguments that were sent to the tool.
+    arguments: []const u8,
+    output: std.json.Value,
+};
+
+/// A tool call to run code.
+pub const CodeInterpreterToolCall = struct {
+    /// The type of the code interpreter tool call. Always `code_interpreter_call`.
+    type: []const u8,
+    /// The unique ID of the code interpreter tool call.
+    id: []const u8,
+    /// The status of the code interpreter tool call. Valid values are `in_progress`, `completed`, `incomplete`, `interpreting`, and `failed`.
+    status: []const u8,
+    /// The ID of the container used to run the code.
+    container_id: []const u8,
+    code: std.json.Value,
+    outputs: std.json.Value,
+};
+
 /// Combine multiple filters using `and` or `or`.
 pub const CompoundFilter = struct {
     /// Type of operation: `and` or `or`.
@@ -6920,6 +7085,33 @@ pub const CreateCompletionResponse = struct {
     usage: ?CompletionUsage = null,
 };
 
+/// A tool that controls a virtual computer. Learn more about the [computer tool](https://platform.openai.com/docs/guides/tools-computer-use).
+pub const ComputerUsePreviewTool = struct {
+    /// The type of the computer use tool. Always `computer_use_preview`.
+    type: []const u8,
+    /// The type of computer environment to control.
+    environment: ComputerEnvironment,
+    /// The width of the computer display.
+    display_width: i64,
+    /// The height of the computer display.
+    display_height: i64,
+};
+
+/// The output of a computer tool call.
+pub const ComputerToolCallOutput = struct {
+    /// The type of the computer tool call output. Always `computer_call_output`.
+    type: []const u8,
+    /// The ID of the computer tool call output.
+    id: ?[]const u8 = null,
+    /// The ID of the computer tool call that produced the output.
+    call_id: []const u8,
+    /// The safety checks reported by the API that have been acknowledged by the developer.
+    acknowledged_safety_checks: ?[]const ComputerCallSafetyCheckParam = null,
+    output: ComputerScreenshotImage,
+    /// The status of the message input. One of `in_progress`, `completed`, or `incomplete`. Populated when input items are returned via API.
+    status: ?[]const u8 = null,
+};
+
 pub const ContainerFileListResource = struct {
     /// The type of object returned, must be 'list'.
     object: []const u8,
@@ -6931,6 +7123,15 @@ pub const ContainerFileListResource = struct {
     last_id: []const u8,
     /// Whether there are more files available.
     has_more: bool,
+};
+
+pub const ContainerNetworkPolicyAllowlistParam = struct {
+    /// Allow outbound network access only to specified domains. Always `allowlist`.
+    type: []const u8,
+    /// A list of allowed domains when type is `allowlist`.
+    allowed_domains: []const []const u8,
+    /// Optional domain-scoped secrets for allowlisted domains.
+    domain_secrets: ?[]const ContainerNetworkPolicyDomainSecretParam = null,
 };
 
 pub const ContainerListResource = struct {
@@ -6946,6 +7147,33 @@ pub const ContainerListResource = struct {
     has_more: bool,
 };
 
+/// The conversation that this response belongs to. Items from this conversation are prepended to `input_items` for this response request. Input items and output items from this response are automatically added to this conversation after this response completes.
+pub const ConversationParam = std.json.Value;
+
+/// A drag action.
+pub const DragParam = struct {
+    /// Specifies the event type. For a drag action, this property is always set to `drag`.
+    type: []const u8,
+    /// An array of coordinates representing the path of the drag action. Coordinates will appear as an array of objects, eg ``` [ { x: 100, y: 200 }, { x: 200, y: 300 } ] ```
+    path: []const CoordParam,
+    keys: ?std.json.Value = null,
+};
+
+pub const DeletedConversation = struct {
+    object: []const u8,
+    deleted: bool,
+    id: []const u8,
+};
+
+/// An image input to the model. Learn about [image inputs](/docs/guides/vision)
+pub const InputImageContentParamAutoParam = struct {
+    /// The type of the input item. Always `input_image`.
+    type: []const u8,
+    image_url: ?std.json.Value = null,
+    file_id: ?std.json.Value = null,
+    detail: ?std.json.Value = null,
+};
+
 pub const CreateEmbeddingResponse = struct {
     /// The list of embeddings generated by the model.
     data: []const Embedding,
@@ -6955,6 +7183,16 @@ pub const CreateEmbeddingResponse = struct {
     object: []const u8,
     /// The usage information for the request.
     usage: std.json.Value,
+};
+
+pub const FunctionToolParam = struct {
+    name: []const u8,
+    description: ?std.json.Value = null,
+    parameters: ?std.json.Value = null,
+    strict: ?std.json.Value = null,
+    type: []const u8,
+    /// Whether this function should be deferred and discovered via tool search.
+    defer_loading: ?bool = null,
 };
 
 /// Occurs when an [error](/docs/guides/error-codes#api-errors) occurs. This can happen due to an internal server error or a timeout.
@@ -6997,6 +7235,14 @@ pub const EvalRunOutputItem = struct {
     results: []const EvalRunOutputItemResult,
     /// A sample containing the input and output of the evaluation run.
     sample: std.json.Value,
+};
+
+/// Annotation that references an uploaded file.
+pub const FileAnnotation = struct {
+    /// Type discriminator that is always `file` for this annotation.
+    type: []const u8,
+    /// File attachment referenced by the annotation.
+    source: FileAnnotationSource,
 };
 
 pub const CreateFileRequest = struct {
@@ -7065,6 +7311,37 @@ pub const ListFineTuningJobEventsResponse = struct {
     has_more: bool,
 };
 
+/// The output of a computer tool call.
+pub const ComputerCallOutputItemParam = struct {
+    id: ?std.json.Value = null,
+    /// The ID of the computer tool call that produced the output.
+    call_id: []const u8,
+    /// The type of the computer tool call output. Always `computer_call_output`.
+    type: []const u8,
+    output: ComputerScreenshotImage,
+    acknowledged_safety_checks: ?std.json.Value = null,
+    status: ?std.json.Value = null,
+};
+
+pub const CustomToolCallResource = struct {
+    /// The type of the custom tool call. Always `custom_tool_call`.
+    type: []const u8,
+    /// The unique ID of the custom tool call in the OpenAI platform.
+    id: ?[]const u8 = null,
+    /// An identifier used to map this custom tool call to a tool call output.
+    call_id: []const u8,
+    /// The namespace of the custom tool being called.
+    namespace: ?[]const u8 = null,
+    /// The name of the custom tool being called.
+    name: []const u8,
+    /// The input for the custom tool call generated by the model.
+    input: []const u8,
+    /// The status of the item. One of `in_progress`, `completed`, or `incomplete`. Populated when items are returned via API.
+    status: FunctionCallStatus,
+    /// The identifier of the actor that created the item.
+    created_by: ?[]const u8 = null,
+};
+
 pub const ChatCompletionFunctions = struct {
     /// A description of what the function does, used by the model to choose when and how to call the function.
     description: ?[]const u8 = null,
@@ -7080,6 +7357,71 @@ pub const FunctionObject = struct {
     name: []const u8,
     parameters: ?FunctionParameters = null,
     strict: ?std.json.Value = null,
+};
+
+/// The content of a shell tool call output that was emitted.
+pub const FunctionShellCallOutputContent = struct {
+    /// The standard output that was captured.
+    stdout: []const u8,
+    /// The standard error output that was captured.
+    stderr: []const u8,
+    /// Represents either an exit outcome (with an exit code) or a timeout outcome for a shell call output chunk.
+    outcome: std.json.Value,
+    /// The identifier of the actor that created the item.
+    created_by: ?[]const u8 = null,
+};
+
+/// The exit or timeout outcome associated with this shell call.
+pub const FunctionShellCallOutputOutcomeParam = union(enum) {
+    function_shell_call_output_timeout_outcome_param: FunctionShellCallOutputTimeoutOutcomeParam,
+    function_shell_call_output_exit_outcome_param: FunctionShellCallOutputExitOutcomeParam,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_str = switch (disc_val) {
+            .string => |s| s,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "FunctionShellCallOutputTimeoutOutcomeParam")) {
+            return .{ .function_shell_call_output_timeout_outcome_param = try std.json.parseFromValueLeaky(FunctionShellCallOutputTimeoutOutcomeParam, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionShellCallOutputExitOutcomeParam")) {
+            return .{ .function_shell_call_output_exit_outcome_param = try std.json.parseFromValueLeaky(FunctionShellCallOutputExitOutcomeParam, allocator, source, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .function_shell_call_output_timeout_outcome_param => |v| try jw.write(v),
+            .function_shell_call_output_exit_outcome_param => |v| try jw.write(v),
+        }
+    }
+};
+
+pub const FunctionToolCallResource = struct {
+    /// The unique ID of the function tool call.
+    id: ?[]const u8 = null,
+    /// The type of the function tool call. Always `function_call`.
+    type: []const u8,
+    /// The unique ID of the function tool call generated by the model.
+    call_id: []const u8,
+    /// The namespace of the function to run.
+    namespace: ?[]const u8 = null,
+    /// The name of the function to run.
+    name: []const u8,
+    /// A JSON string of the arguments to pass to the function.
+    arguments: []const u8,
+    /// The status of the item. One of `in_progress`, `completed`, or `incomplete`. Populated when items are returned via API.
+    status: ?[]const u8 = null,
+    /// The identifier of the actor that created the item.
+    created_by: ?[]const u8 = null,
 };
 
 pub const EvalGraderPython = struct {
@@ -7123,6 +7465,16 @@ pub const EvalGraderTextSimilarity = struct {
     pass_threshold: f64,
 };
 
+/// A grammar defined by the user.
+pub const CustomGrammarFormatParam = struct {
+    /// Grammar format. Always `grammar`.
+    type: []const u8,
+    /// The syntax of the grammar definition. One of `lark` or `regex`.
+    syntax: GrammarSyntax1,
+    /// The grammar definition.
+    definition: []const u8,
+};
+
 /// Paginated list of organization groups.
 pub const GroupListResource = struct {
     /// Always `list`.
@@ -7133,6 +7485,48 @@ pub const GroupListResource = struct {
     has_more: bool,
     /// Cursor to fetch the next page of results, or `null` if there are no more results.
     next: std.json.Value,
+};
+
+/// Optional per-session configuration settings for ChatKit behavior.
+pub const ChatkitConfigurationParam = struct {
+    /// Configuration for automatic thread titling. When omitted, automatic thread titling is enabled by default.
+    automatic_thread_titling: ?AutomaticThreadTitlingParam = null,
+    /// Configuration for upload enablement and limits. When omitted, uploads are disabled by default (max_files 10, max_file_size 512 MB).
+    file_upload: ?FileUploadParam = null,
+    /// Configuration for chat history retention. When omitted, history is enabled by default with no limit on recent_threads (null).
+    history: ?HistoryParam = null,
+};
+
+/// A screenshot of a computer.
+pub const ComputerScreenshotContent = struct {
+    /// Specifies the event type. For a computer screenshot, this property is always set to `computer_screenshot`.
+    type: []const u8,
+    image_url: std.json.Value,
+    file_id: std.json.Value,
+    /// The detail level of the screenshot image to be sent to the model. One of `high`, `low`, `auto`, or `original`. Defaults to `auto`.
+    detail: ImageDetail,
+};
+
+/// An image input to the model. Learn about [image inputs](/docs/guides/vision).
+pub const InputImageContent = struct {
+    /// The type of the input item. Always `input_image`.
+    type: []const u8,
+    image_url: ?std.json.Value = null,
+    file_id: ?std.json.Value = null,
+    /// The detail level of the image to be sent to the model. One of `high`, `low`, `auto`, or `original`. Defaults to `auto`.
+    detail: ImageDetail,
+};
+
+/// For `gpt-image-1` only, the token usage information for the image generation.
+pub const ImageGenUsage = struct {
+    /// The number of tokens (images and text) in the input prompt.
+    input_tokens: i64,
+    /// The total number of tokens (images and text) used for the image generation.
+    total_tokens: i64,
+    /// The number of output tokens generated by the model.
+    output_tokens: i64,
+    output_tokens_details: ?ImageGenOutputTokensDetails = null,
+    input_tokens_details: ImageGenInputUsageDetails,
 };
 
 /// Emitted when image editing has completed and the final image is available.
@@ -7173,6 +7567,46 @@ pub const ImageGenCompletedEvent = struct {
     usage: ImagesUsage,
 };
 
+pub const InlineSkillParam = struct {
+    /// Defines an inline skill for this request.
+    type: []const u8,
+    /// The name of the skill.
+    name: []const u8,
+    /// The description of the skill.
+    description: []const u8,
+    /// Inline skill payload
+    source: InlineSkillSourceParam,
+};
+
+/// A tool that generates images using the GPT image models.
+pub const ImageGenTool = struct {
+    /// The type of the image generation tool. Always `image_generation`.
+    type: []const u8,
+    model: ?std.json.Value = null,
+    /// The quality of the generated image. One of `low`, `medium`, `high`, or `auto`. Default: `auto`.
+    quality: ?[]const u8 = null,
+    /// The size of the generated image. One of `1024x1024`, `1024x1536`, `1536x1024`, or `auto`. Default: `auto`.
+    size: ?[]const u8 = null,
+    /// The output format of the generated image. One of `png`, `webp`, or `jpeg`. Default: `png`.
+    output_format: ?[]const u8 = null,
+    /// Compression level for the output image. Default: 100.
+    output_compression: ?i64 = null,
+    /// Moderation level for the generated image. Default: `auto`.
+    moderation: ?[]const u8 = null,
+    /// Background type for the generated image. One of `transparent`, `opaque`, or `auto`. Default: `auto`.
+    background: ?[]const u8 = null,
+    input_fidelity: ?std.json.Value = null,
+    /// Optional mask for inpainting. Contains `image_url` (string, optional) and `file_id` (string, optional).
+    input_image_mask: ?std.json.Value = null,
+    /// Number of partial images to generate in streaming mode, from 0 (default value) to 3.
+    partial_images: ?i64 = null,
+    /// Whether to generate a new image or edit an existing image. Default: `auto`.
+    action: ?ImageGenActionEnum = null,
+};
+
+/// A single content item: input text, output text, input image, or input audio.
+pub const EvalItemContentItem = std.json.Value;
+
 pub const InviteListResponse = struct {
     /// The object type, which is always `list`
     object: []const u8,
@@ -7183,6 +7617,58 @@ pub const InviteListResponse = struct {
     last_id: ?[]const u8 = null,
     /// The `has_more` property is used for pagination to indicate there are additional results.
     has_more: ?bool = null,
+};
+
+/// A tool call that executes one or more shell commands in a managed environment.
+pub const FunctionShellCall = struct {
+    /// The type of the item. Always `shell_call`.
+    type: []const u8,
+    /// The unique ID of the shell tool call. Populated when this item is returned via API.
+    id: []const u8,
+    /// The unique ID of the shell tool call generated by the model.
+    call_id: []const u8,
+    /// The shell commands and limits that describe how to run the tool call.
+    action: FunctionShellAction,
+    /// The status of the shell call. One of `in_progress`, `completed`, or `incomplete`.
+    status: LocalShellCallStatus,
+    environment: std.json.Value,
+    /// The ID of the entity that created this tool call.
+    created_by: ?[]const u8 = null,
+};
+
+/// A tool call to run a command on the local shell.
+pub const LocalShellToolCall = struct {
+    /// The type of the local shell call. Always `local_shell_call`.
+    type: []const u8,
+    /// The unique ID of the local shell call.
+    id: []const u8,
+    /// The unique ID of the local shell tool call generated by the model.
+    call_id: []const u8,
+    action: LocalShellExecAction,
+    /// The status of the local shell call.
+    status: []const u8,
+};
+
+pub const LocalEnvironmentParam = struct {
+    /// Use a local computer environment.
+    type: []const u8,
+    /// An optional list of skills.
+    skills: ?[]const LocalSkillParam = null,
+};
+
+/// Represents a ChatKit thread and its current status.
+pub const ThreadResource = struct {
+    /// Identifier of the thread.
+    id: []const u8,
+    /// Type discriminator that is always `chatkit.thread`.
+    object: []const u8,
+    /// Unix timestamp (in seconds) for when the thread was created.
+    created_at: i64,
+    title: std.json.Value,
+    /// Current status for the thread. Defaults to `active` for newly created threads.
+    status: std.json.Value,
+    /// Free-form string that identifies your end user who owns the thread.
+    user: []const u8,
 };
 
 /// Returned when the text value of an input audio transcription content part is updated.
@@ -7238,6 +7724,25 @@ pub const RealtimeMCPListTools = struct {
     server_label: []const u8,
     /// The tools available on the server.
     tools: []const MCPListToolsTool,
+};
+
+/// An invocation of a tool on an MCP server.
+pub const MCPToolCall = struct {
+    /// The type of the item. Always `mcp_call`.
+    type: []const u8,
+    /// The unique ID of the tool call.
+    id: []const u8,
+    /// The label of the MCP server running the tool.
+    server_label: []const u8,
+    /// The name of the tool that was run.
+    name: []const u8,
+    /// A JSON string of the arguments passed to the tool.
+    arguments: []const u8,
+    output: ?std.json.Value = null,
+    @"error": ?std.json.Value = null,
+    /// The status of the tool call. One of `in_progress`, `completed`, `incomplete`, `calling`, or `failed`.
+    status: ?MCPToolCallStatus = null,
+    approval_request_id: ?std.json.Value = null,
 };
 
 /// Give the model access to additional tools via remote Model Context Protocol (MCP) servers. [Learn more about MCP](/docs/guides/tools-remote-mcp).
@@ -7438,6 +7943,37 @@ pub const Upload = struct {
     file: ?std.json.Value = null,
 };
 
+pub const CreateImageEditRequest = struct {
+    /// The image(s) to edit. Must be a supported image file or an array of images. For the GPT image models (`gpt-image-1`, `gpt-image-1-mini`, and `gpt-image-1.5`), each image should be a `png`, `webp`, or `jpg` file less than 50MB. You can provide up to 16 images. `chatgpt-image-latest` follows the same input constraints as GPT image models. For `dall-e-2`, you can only provide one image, and it should be a square `png` file less than 4MB.
+    image: std.json.Value,
+    /// A text description of the desired image(s). The maximum length is 1000 characters for `dall-e-2`, and 32000 characters for the GPT image models.
+    prompt: []const u8,
+    /// An additional image whose fully transparent areas (e.g. where alpha is zero) indicate where `image` should be edited. If there are multiple images provided, the mask will be applied on the first image. Must be a valid PNG file, less than 4MB, and have the same dimensions as `image`.
+    mask: ?[]const u8 = null,
+    /// Allows to set transparency for the background of the generated image(s). This parameter is only supported for the GPT image models. Must be one of `transparent`, `opaque` or `auto` (default value). When `auto` is used, the model will automatically determine the best background for the image. If `transparent`, the output format needs to support transparency, so it should be set to either `png` (default value) or `webp`.
+    background: ?[]const u8 = null,
+    /// The model to use for image generation. Defaults to `gpt-image-1.5`.
+    model: ?std.json.Value = null,
+    /// The number of images to generate. Must be between 1 and 10.
+    n: ?i64 = null,
+    /// The size of the generated images. Must be one of `1024x1024`, `1536x1024` (landscape), `1024x1536` (portrait), or `auto` (default value) for the GPT image models, and one of `256x256`, `512x512`, or `1024x1024` for `dall-e-2`.
+    size: ?[]const u8 = null,
+    /// The format in which the generated images are returned. Must be one of `url` or `b64_json`. URLs are only valid for 60 minutes after the image has been generated. This parameter is only supported for `dall-e-2` (default is `url` for `dall-e-2`), as GPT image models always return base64-encoded images.
+    response_format: ?[]const u8 = null,
+    /// The format in which the generated images are returned. This parameter is only supported for the GPT image models. Must be one of `png`, `jpeg`, or `webp`. The default value is `png`.
+    output_format: ?[]const u8 = null,
+    /// The compression level (0-100%) for the generated images. This parameter is only supported for the GPT image models with the `webp` or `jpeg` output formats, and defaults to 100.
+    output_compression: ?i64 = null,
+    /// A unique identifier representing your end-user, which can help OpenAI to monitor and detect abuse. [Learn more](/docs/guides/safety-best-practices#end-user-ids).
+    user: ?[]const u8 = null,
+    input_fidelity: ?std.json.Value = null,
+    /// Edit the image in streaming mode. Defaults to `false`. See the [Image generation guide](/docs/guides/image-generation) for more information.
+    stream: ?bool = null,
+    partial_images: ?PartialImages = null,
+    /// The quality of the image that will be generated for GPT image models. Defaults to `auto`.
+    quality: ?[]const u8 = null,
+};
+
 pub const CreateImageRequest = struct {
     /// A text description of the desired image(s). The maximum length is 32000 characters for the GPT image models, 1000 characters for `dall-e-2` and 4000 characters for `dall-e-3`.
     prompt: []const u8,
@@ -7569,6 +8105,15 @@ pub const ProjectUserListResponse = struct {
     first_id: []const u8,
     last_id: []const u8,
     has_more: bool,
+};
+
+pub const RankingOptions = struct {
+    /// The ranker to use for the file search.
+    ranker: ?RankerVersionType = null,
+    /// The score threshold for the file search, a number between 0 and 1. Numbers closer to 1 will attempt to return only the most relevant results, but may return fewer results.
+    score_threshold: ?f64 = null,
+    /// Weights that control how reciprocal rank fusion balances semantic embedding matches versus sparse keyword matches when hybrid search is enabled.
+    hybrid_search: ?HybridSearchOptions = null,
 };
 
 /// A Realtime transcription session configuration object.
@@ -7737,6 +8282,16 @@ pub const RunStepDetailsToolCallsCodeObject = struct {
     code_interpreter: std.json.Value,
 };
 
+/// This tool searches the web for relevant results to use in a response. Learn more about the [web search tool](https://platform.openai.com/docs/guides/tools-web-search).
+pub const WebSearchPreviewTool = struct {
+    /// The type of the web search tool. One of `web_search_preview` or `web_search_preview_2025_03_11`.
+    type: []const u8,
+    user_location: ?std.json.Value = null,
+    /// High level guidance for the amount of context window space to use for the search. One of `low`, `medium`, or `high`. `medium` is the default.
+    search_context_size: ?SearchContextSize = null,
+    search_content_types: ?[]const SearchContentType = null,
+};
+
 pub const ModelResponseProperties = struct {
     metadata: ?Metadata = null,
     top_logprobs: ?std.json.Value = null,
@@ -7750,6 +8305,28 @@ pub const ModelResponseProperties = struct {
     prompt_cache_key: ?[]const u8 = null,
     service_tier: ?ServiceTier = null,
     prompt_cache_retention: ?std.json.Value = null,
+};
+
+pub const SkillListResource = struct {
+    /// The type of object returned, must be `list`.
+    object: []const u8,
+    /// A list of items
+    data: []const SkillResource,
+    first_id: std.json.Value,
+    last_id: std.json.Value,
+    /// Whether there are more items available.
+    has_more: bool,
+};
+
+pub const SkillVersionListResource = struct {
+    /// The type of object returned, must be `list`.
+    object: []const u8,
+    /// A list of items
+    data: []const SkillVersionResource,
+    first_id: std.json.Value,
+    last_id: std.json.Value,
+    /// Whether there are more items available.
+    has_more: bool,
 };
 
 pub const CreateSpeechResponseStreamEvent = std.json.Value;
@@ -7802,6 +8379,102 @@ pub const CreateCompletionRequest = struct {
     top_p: ?f64 = null,
     /// A unique identifier representing your end-user, which can help OpenAI to monitor and detect abuse. [Learn more](/docs/guides/safety-best-practices#end-user-ids).
     user: ?[]const u8 = null,
+};
+
+/// A description of the chain of thought used by a reasoning model while generating a response. Be sure to include these items in your `input` to the Responses API for subsequent turns of a conversation if you are manually [managing context](/docs/guides/conversation-state).
+pub const ReasoningItem = struct {
+    /// The type of the object. Always `reasoning`.
+    type: []const u8,
+    /// The unique identifier of the reasoning content.
+    id: []const u8,
+    encrypted_content: ?std.json.Value = null,
+    /// Reasoning summary content.
+    summary: []const SummaryTextContent,
+    /// Reasoning text content.
+    content: ?[]const ReasoningTextContent = null,
+    /// The status of the item. One of `in_progress`, `completed`, or `incomplete`. Populated when items are returned via API.
+    status: ?[]const u8 = null,
+};
+
+/// Task entry that appears within a TaskGroup.
+pub const TaskGroupTask = struct {
+    /// Subtype for the grouped task.
+    type: TaskType,
+    heading: std.json.Value,
+    summary: std.json.Value,
+};
+
+/// Task emitted by the workflow to show progress and status updates.
+pub const TaskItem = struct {
+    /// Identifier of the thread item.
+    id: []const u8,
+    /// Type discriminator that is always `chatkit.thread_item`.
+    object: []const u8,
+    /// Unix timestamp (in seconds) for when the item was created.
+    created_at: i64,
+    /// Identifier of the parent thread.
+    thread_id: []const u8,
+    /// Type discriminator that is always `chatkit.task`.
+    type: []const u8,
+    /// Subtype for the task.
+    task_type: TaskType,
+    heading: std.json.Value,
+    summary: std.json.Value,
+};
+
+/// Model and tool overrides applied when generating the assistant response.
+pub const InferenceOptions = struct {
+    tool_choice: std.json.Value,
+    model: std.json.Value,
+};
+
+/// How the model should select which tool (or tools) to use when generating a response. See the `tools` parameter to see how to specify which tools the model can call.
+pub const ToolChoiceParam = std.json.Value;
+
+pub const ToolSearchCall = struct {
+    /// The type of the item. Always `tool_search_call`.
+    type: []const u8,
+    /// The unique ID of the tool search call item.
+    id: []const u8,
+    call_id: std.json.Value,
+    /// Whether tool search was executed by the server or by the client.
+    execution: ToolSearchExecutionType,
+    /// Arguments used for the tool search call.
+    arguments: std.json.Value,
+    /// The status of the tool search call item that was recorded.
+    status: FunctionCallStatus,
+    /// The identifier of the actor that created the item.
+    created_by: ?[]const u8 = null,
+};
+
+pub const ToolSearchCallItemParam = struct {
+    id: ?std.json.Value = null,
+    call_id: ?std.json.Value = null,
+    /// The item type. Always `tool_search_call`.
+    type: []const u8,
+    /// Whether tool search was executed by the server or by the client.
+    execution: ?ToolSearchExecutionType = null,
+    /// The arguments supplied to the tool search call.
+    arguments: EmptyModelParam,
+    status: ?std.json.Value = null,
+};
+
+/// Hosted or BYOT tool search configuration for deferred tools.
+pub const ToolSearchToolParam = struct {
+    /// The type of the tool. Always `tool_search`.
+    type: []const u8,
+    /// Whether tool search is executed by the server or by the client.
+    execution: ?ToolSearchExecutionType = null,
+    description: ?std.json.Value = null,
+    parameters: ?std.json.Value = null,
+};
+
+/// The log probability of a token.
+pub const LogProb = struct {
+    token: []const u8,
+    logprob: f64,
+    bytes: []const i64,
+    top_logprobs: []const TopLogProb,
 };
 
 /// Represents a transcription response returned by model, based on the provided input.
@@ -7897,6 +8570,58 @@ pub const CreateTranscriptionResponseVerboseJson = struct {
     /// Segments of the transcribed text and their corresponding details.
     segments: ?[]const TranscriptionSegment = null,
     usage: ?TranscriptTextUsageDuration = null,
+};
+
+/// Annotation that references a URL.
+pub const UrlAnnotation = struct {
+    /// Type discriminator that is always `url` for this annotation.
+    type: []const u8,
+    /// URL referenced by the annotation.
+    source: UrlAnnotationSource,
+};
+
+/// An annotation that applies to a span of output text.
+pub const Annotation = union(enum) {
+    file_citation_body: FileCitationBody,
+    url_citation_body: UrlCitationBody,
+    container_file_citation_body: ContainerFileCitationBody,
+    file_path: FilePath,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_str = switch (disc_val) {
+            .string => |s| s,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "FileCitationBody")) {
+            return .{ .file_citation_body = try std.json.parseFromValueLeaky(FileCitationBody, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "UrlCitationBody")) {
+            return .{ .url_citation_body = try std.json.parseFromValueLeaky(UrlCitationBody, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ContainerFileCitationBody")) {
+            return .{ .container_file_citation_body = try std.json.parseFromValueLeaky(ContainerFileCitationBody, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FilePath")) {
+            return .{ .file_path = try std.json.parseFromValueLeaky(FilePath, allocator, source, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .file_citation_body => |v| try jw.write(v),
+            .url_citation_body => |v| try jw.write(v),
+            .container_file_citation_body => |v| try jw.write(v),
+            .file_path => |v| try jw.write(v),
+        }
+    }
 };
 
 pub const UsageTimeBucket = struct {
@@ -8018,6 +8743,92 @@ pub const VectorStoreSearchResultItem = struct {
     content: []const VectorStoreSearchResultContentObject,
 };
 
+/// JSON parameters for editing an existing generated video.
+pub const CreateVideoEditJsonBody = struct {
+    /// Reference to the completed video to edit.
+    video: VideoReferenceInputParam,
+    /// Text prompt that describes how to edit the source video.
+    prompt: []const u8,
+};
+
+/// Parameters for editing an existing generated video.
+pub const CreateVideoEditMultipartBody = struct {
+    video: std.json.Value,
+    /// Text prompt that describes how to edit the source video.
+    prompt: []const u8,
+};
+
+/// JSON parameters for extending an existing generated video.
+pub const CreateVideoExtendJsonBody = struct {
+    /// Reference to the completed video to extend.
+    video: VideoReferenceInputParam,
+    /// Updated text prompt that directs the extension generation.
+    prompt: []const u8,
+    /// Length of the newly generated extension segment in seconds (allowed values: 4, 8, 12, 16, 20).
+    seconds: VideoSeconds,
+};
+
+/// Multipart parameters for extending an existing generated video.
+pub const CreateVideoExtendMultipartBody = struct {
+    video: std.json.Value,
+    /// Updated text prompt that directs the extension generation.
+    prompt: []const u8,
+    /// Length of the newly generated extension segment in seconds (allowed values: 4, 8, 12, 16, 20).
+    seconds: VideoSeconds,
+};
+
+/// JSON parameters for creating a new video generation job.
+pub const CreateVideoJsonBody = struct {
+    /// The video generation model to use (allowed values: sora-2, sora-2-pro). Defaults to `sora-2`.
+    model: ?VideoModel = null,
+    /// Text prompt that describes the video to generate.
+    prompt: []const u8,
+    /// Optional reference object that guides generation. Provide exactly one of `image_url` or `file_id`.
+    input_reference: ?ImageRefParam2 = null,
+    /// Clip duration in seconds (allowed values: 4, 8, 12). Defaults to 4 seconds.
+    seconds: ?VideoSeconds = null,
+    /// Output resolution formatted as width x height (allowed values: 720x1280, 1280x720, 1024x1792, 1792x1024). Defaults to 720x1280.
+    size: ?VideoSize = null,
+};
+
+/// Multipart parameters for creating a new video generation job.
+pub const CreateVideoMultipartBody = struct {
+    /// The video generation model to use (allowed values: sora-2, sora-2-pro). Defaults to `sora-2`.
+    model: ?VideoModel = null,
+    /// Text prompt that describes the video to generate.
+    prompt: []const u8,
+    input_reference: ?std.json.Value = null,
+    /// Clip duration in seconds (allowed values: 4, 8, 12). Defaults to 4 seconds.
+    seconds: ?VideoSeconds = null,
+    /// Output resolution formatted as width x height (allowed values: 720x1280, 1280x720, 1024x1792, 1792x1024). Defaults to 720x1280.
+    size: ?VideoSize = null,
+};
+
+/// Structured information describing a generated video job.
+pub const VideoResource = struct {
+    /// Unique identifier for the video job.
+    id: []const u8,
+    /// The object type, which is always `video`.
+    object: []const u8,
+    /// The video generation model that produced the job.
+    model: VideoModel,
+    /// Current lifecycle status of the video job.
+    status: VideoStatus,
+    /// Approximate completion percentage for the generation task.
+    progress: i64,
+    /// Unix timestamp (seconds) for when the job was created.
+    created_at: i64,
+    completed_at: std.json.Value,
+    expires_at: std.json.Value,
+    prompt: std.json.Value,
+    /// The resolution of the generated video.
+    size: VideoSize,
+    /// Duration of the generated clip in seconds. For extensions, this is the stitched total duration.
+    seconds: []const u8,
+    remixed_from_video_id: std.json.Value,
+    @"error": std.json.Value,
+};
+
 pub const VoiceConsentListResource = struct {
     object: []const u8,
     data: []const VoiceConsentResource,
@@ -8081,708 +8892,6 @@ pub const WebSearchTool = struct {
     search_context_size: ?[]const u8 = null,
 };
 
-pub const InlineSkillParam = struct {
-    /// Defines an inline skill for this request.
-    type: []const u8,
-    /// The name of the skill.
-    name: []const u8,
-    /// The description of the skill.
-    description: []const u8,
-    /// Inline skill payload
-    source: InlineSkillSourceParam,
-};
-
-pub const ContainerNetworkPolicyAllowlistParam = struct {
-    /// Allow outbound network access only to specified domains. Always `allowlist`.
-    type: []const u8,
-    /// A list of allowed domains when type is `allowlist`.
-    allowed_domains: []const []const u8,
-    /// Optional domain-scoped secrets for allowlisted domains.
-    domain_secrets: ?[]const ContainerNetworkPolicyDomainSecretParam = null,
-};
-
-/// A single content item: input text, output text, input image, or input audio.
-pub const EvalItemContentItem = std.json.Value;
-
-/// An annotation that applies to a span of output text.
-pub const Annotation = union(enum) {
-    file_citation_body: FileCitationBody,
-    url_citation_body: UrlCitationBody,
-    container_file_citation_body: ContainerFileCitationBody,
-    file_path: FilePath,
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
-        return try jsonParseFromValue(allocator, value, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
-        const disc_str = switch (disc_val) {
-            .string => |s| s,
-            else => return error.UnexpectedToken,
-        };
-        if (std.mem.eql(u8, disc_str, "FileCitationBody")) {
-            return .{ .file_citation_body = try std.json.parseFromValueLeaky(FileCitationBody, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "UrlCitationBody")) {
-            return .{ .url_citation_body = try std.json.parseFromValueLeaky(UrlCitationBody, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "ContainerFileCitationBody")) {
-            return .{ .container_file_citation_body = try std.json.parseFromValueLeaky(ContainerFileCitationBody, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "FilePath")) {
-            return .{ .file_path = try std.json.parseFromValueLeaky(FilePath, allocator, source, options) };
-        }
-        return error.UnexpectedToken;
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        switch (self) {
-            .file_citation_body => |v| try jw.write(v),
-            .url_citation_body => |v| try jw.write(v),
-            .container_file_citation_body => |v| try jw.write(v),
-            .file_path => |v| try jw.write(v),
-        }
-    }
-};
-
-/// The log probability of a token.
-pub const LogProb = struct {
-    token: []const u8,
-    logprob: f64,
-    bytes: []const i64,
-    top_logprobs: []const TopLogProb,
-};
-
-/// A description of the chain of thought used by a reasoning model while generating a response. Be sure to include these items in your `input` to the Responses API for subsequent turns of a conversation if you are manually [managing context](/docs/guides/conversation-state).
-pub const ReasoningItem = struct {
-    /// The type of the object. Always `reasoning`.
-    type: []const u8,
-    /// The unique identifier of the reasoning content.
-    id: []const u8,
-    encrypted_content: ?std.json.Value = null,
-    /// Reasoning summary content.
-    summary: []const SummaryTextContent,
-    /// Reasoning text content.
-    content: ?[]const ReasoningTextContent = null,
-    /// The status of the item. One of `in_progress`, `completed`, or `incomplete`. Populated when items are returned via API.
-    status: ?[]const u8 = null,
-};
-
-/// An image input to the model. Learn about [image inputs](/docs/guides/vision).
-pub const InputImageContent = struct {
-    /// The type of the input item. Always `input_image`.
-    type: []const u8,
-    image_url: ?std.json.Value = null,
-    file_id: ?std.json.Value = null,
-    /// The detail level of the image to be sent to the model. One of `high`, `low`, `auto`, or `original`. Defaults to `auto`.
-    detail: ImageDetail,
-};
-
-/// A screenshot of a computer.
-pub const ComputerScreenshotContent = struct {
-    /// Specifies the event type. For a computer screenshot, this property is always set to `computer_screenshot`.
-    type: []const u8,
-    image_url: std.json.Value,
-    file_id: std.json.Value,
-    /// The detail level of the screenshot image to be sent to the model. One of `high`, `low`, `auto`, or `original`. Defaults to `auto`.
-    detail: ImageDetail,
-};
-
-pub const CustomToolCallResource = struct {
-    /// The type of the custom tool call. Always `custom_tool_call`.
-    type: []const u8,
-    /// The unique ID of the custom tool call in the OpenAI platform.
-    id: ?[]const u8 = null,
-    /// An identifier used to map this custom tool call to a tool call output.
-    call_id: []const u8,
-    /// The namespace of the custom tool being called.
-    namespace: ?[]const u8 = null,
-    /// The name of the custom tool being called.
-    name: []const u8,
-    /// The input for the custom tool call generated by the model.
-    input: []const u8,
-    /// The status of the item. One of `in_progress`, `completed`, or `incomplete`. Populated when items are returned via API.
-    status: FunctionCallStatus,
-    /// The identifier of the actor that created the item.
-    created_by: ?[]const u8 = null,
-};
-
-pub const FunctionToolCallResource = struct {
-    /// The unique ID of the function tool call.
-    id: ?[]const u8 = null,
-    /// The type of the function tool call. Always `function_call`.
-    type: []const u8,
-    /// The unique ID of the function tool call generated by the model.
-    call_id: []const u8,
-    /// The namespace of the function to run.
-    namespace: ?[]const u8 = null,
-    /// The name of the function to run.
-    name: []const u8,
-    /// A JSON string of the arguments to pass to the function.
-    arguments: []const u8,
-    /// The status of the item. One of `in_progress`, `completed`, or `incomplete`. Populated when items are returned via API.
-    status: ?[]const u8 = null,
-    /// The identifier of the actor that created the item.
-    created_by: ?[]const u8 = null,
-};
-
-/// A click action.
-pub const ClickParam = struct {
-    /// Specifies the event type. For a click action, this property is always `click`.
-    type: []const u8,
-    /// Indicates which mouse button was pressed during the click. One of `left`, `right`, `wheel`, `back`, or `forward`.
-    button: ClickButtonType,
-    /// The x-coordinate where the click occurred.
-    x: i64,
-    /// The y-coordinate where the click occurred.
-    y: i64,
-    keys: ?std.json.Value = null,
-};
-
-/// A drag action.
-pub const DragParam = struct {
-    /// Specifies the event type. For a drag action, this property is always set to `drag`.
-    type: []const u8,
-    /// An array of coordinates representing the path of the drag action. Coordinates will appear as an array of objects, eg ``` [ { x: 100, y: 200 }, { x: 200, y: 300 } ] ```
-    path: []const CoordParam,
-    keys: ?std.json.Value = null,
-};
-
-/// The output of a computer tool call.
-pub const ComputerToolCallOutput = struct {
-    /// The type of the computer tool call output. Always `computer_call_output`.
-    type: []const u8,
-    /// The ID of the computer tool call output.
-    id: ?[]const u8 = null,
-    /// The ID of the computer tool call that produced the output.
-    call_id: []const u8,
-    /// The safety checks reported by the API that have been acknowledged by the developer.
-    acknowledged_safety_checks: ?[]const ComputerCallSafetyCheckParam = null,
-    output: ComputerScreenshotImage,
-    /// The status of the message input. One of `in_progress`, `completed`, or `incomplete`. Populated when input items are returned via API.
-    status: ?[]const u8 = null,
-};
-
-pub const ToolSearchCall = struct {
-    /// The type of the item. Always `tool_search_call`.
-    type: []const u8,
-    /// The unique ID of the tool search call item.
-    id: []const u8,
-    call_id: std.json.Value,
-    /// Whether tool search was executed by the server or by the client.
-    execution: ToolSearchExecutionType,
-    /// Arguments used for the tool search call.
-    arguments: std.json.Value,
-    /// The status of the tool search call item that was recorded.
-    status: FunctionCallStatus,
-    /// The identifier of the actor that created the item.
-    created_by: ?[]const u8 = null,
-};
-
-pub const RankingOptions = struct {
-    /// The ranker to use for the file search.
-    ranker: ?RankerVersionType = null,
-    /// The score threshold for the file search, a number between 0 and 1. Numbers closer to 1 will attempt to return only the most relevant results, but may return fewer results.
-    score_threshold: ?f64 = null,
-    /// Weights that control how reciprocal rank fusion balances semantic embedding matches versus sparse keyword matches when hybrid search is enabled.
-    hybrid_search: ?HybridSearchOptions = null,
-};
-
-/// A tool that controls a virtual computer. Learn more about the [computer tool](https://platform.openai.com/docs/guides/tools-computer-use).
-pub const ComputerUsePreviewTool = struct {
-    /// The type of the computer use tool. Always `computer_use_preview`.
-    type: []const u8,
-    /// The type of computer environment to control.
-    environment: ComputerEnvironment,
-    /// The width of the computer display.
-    display_width: i64,
-    /// The height of the computer display.
-    display_height: i64,
-};
-
-pub const CreateImageEditRequest = struct {
-    /// The image(s) to edit. Must be a supported image file or an array of images. For the GPT image models (`gpt-image-1`, `gpt-image-1-mini`, and `gpt-image-1.5`), each image should be a `png`, `webp`, or `jpg` file less than 50MB. You can provide up to 16 images. `chatgpt-image-latest` follows the same input constraints as GPT image models. For `dall-e-2`, you can only provide one image, and it should be a square `png` file less than 4MB.
-    image: std.json.Value,
-    /// A text description of the desired image(s). The maximum length is 1000 characters for `dall-e-2`, and 32000 characters for the GPT image models.
-    prompt: []const u8,
-    /// An additional image whose fully transparent areas (e.g. where alpha is zero) indicate where `image` should be edited. If there are multiple images provided, the mask will be applied on the first image. Must be a valid PNG file, less than 4MB, and have the same dimensions as `image`.
-    mask: ?[]const u8 = null,
-    /// Allows to set transparency for the background of the generated image(s). This parameter is only supported for the GPT image models. Must be one of `transparent`, `opaque` or `auto` (default value). When `auto` is used, the model will automatically determine the best background for the image. If `transparent`, the output format needs to support transparency, so it should be set to either `png` (default value) or `webp`.
-    background: ?[]const u8 = null,
-    /// The model to use for image generation. Defaults to `gpt-image-1.5`.
-    model: ?std.json.Value = null,
-    /// The number of images to generate. Must be between 1 and 10.
-    n: ?i64 = null,
-    /// The size of the generated images. Must be one of `1024x1024`, `1536x1024` (landscape), `1024x1536` (portrait), or `auto` (default value) for the GPT image models, and one of `256x256`, `512x512`, or `1024x1024` for `dall-e-2`.
-    size: ?[]const u8 = null,
-    /// The format in which the generated images are returned. Must be one of `url` or `b64_json`. URLs are only valid for 60 minutes after the image has been generated. This parameter is only supported for `dall-e-2` (default is `url` for `dall-e-2`), as GPT image models always return base64-encoded images.
-    response_format: ?[]const u8 = null,
-    /// The format in which the generated images are returned. This parameter is only supported for the GPT image models. Must be one of `png`, `jpeg`, or `webp`. The default value is `png`.
-    output_format: ?[]const u8 = null,
-    /// The compression level (0-100%) for the generated images. This parameter is only supported for the GPT image models with the `webp` or `jpeg` output formats, and defaults to 100.
-    output_compression: ?i64 = null,
-    /// A unique identifier representing your end-user, which can help OpenAI to monitor and detect abuse. [Learn more](/docs/guides/safety-best-practices#end-user-ids).
-    user: ?[]const u8 = null,
-    input_fidelity: ?std.json.Value = null,
-    /// Edit the image in streaming mode. Defaults to `false`. See the [Image generation guide](/docs/guides/image-generation) for more information.
-    stream: ?bool = null,
-    partial_images: ?PartialImages = null,
-    /// The quality of the image that will be generated for GPT image models. Defaults to `auto`.
-    quality: ?[]const u8 = null,
-};
-
-/// A tool that generates images using the GPT image models.
-pub const ImageGenTool = struct {
-    /// The type of the image generation tool. Always `image_generation`.
-    type: []const u8,
-    model: ?std.json.Value = null,
-    /// The quality of the generated image. One of `low`, `medium`, `high`, or `auto`. Default: `auto`.
-    quality: ?[]const u8 = null,
-    /// The size of the generated image. One of `1024x1024`, `1024x1536`, `1536x1024`, or `auto`. Default: `auto`.
-    size: ?[]const u8 = null,
-    /// The output format of the generated image. One of `png`, `webp`, or `jpeg`. Default: `png`.
-    output_format: ?[]const u8 = null,
-    /// Compression level for the output image. Default: 100.
-    output_compression: ?i64 = null,
-    /// Moderation level for the generated image. Default: `auto`.
-    moderation: ?[]const u8 = null,
-    /// Background type for the generated image. One of `transparent`, `opaque`, or `auto`. Default: `auto`.
-    background: ?[]const u8 = null,
-    input_fidelity: ?std.json.Value = null,
-    /// Optional mask for inpainting. Contains `image_url` (string, optional) and `file_id` (string, optional).
-    input_image_mask: ?std.json.Value = null,
-    /// Number of partial images to generate in streaming mode, from 0 (default value) to 3.
-    partial_images: ?i64 = null,
-    /// Whether to generate a new image or edit an existing image. Default: `auto`.
-    action: ?ImageGenActionEnum = null,
-};
-
-pub const LocalEnvironmentParam = struct {
-    /// Use a local computer environment.
-    type: []const u8,
-    /// An optional list of skills.
-    skills: ?[]const LocalSkillParam = null,
-};
-
-/// A grammar defined by the user.
-pub const CustomGrammarFormatParam = struct {
-    /// Grammar format. Always `grammar`.
-    type: []const u8,
-    /// The syntax of the grammar definition. One of `lark` or `regex`.
-    syntax: GrammarSyntax1,
-    /// The grammar definition.
-    definition: []const u8,
-};
-
-pub const FunctionToolParam = struct {
-    name: []const u8,
-    description: ?std.json.Value = null,
-    parameters: ?std.json.Value = null,
-    strict: ?std.json.Value = null,
-    type: []const u8,
-    /// Whether this function should be deferred and discovered via tool search.
-    defer_loading: ?bool = null,
-};
-
-/// Hosted or BYOT tool search configuration for deferred tools.
-pub const ToolSearchToolParam = struct {
-    /// The type of the tool. Always `tool_search`.
-    type: []const u8,
-    /// Whether tool search is executed by the server or by the client.
-    execution: ?ToolSearchExecutionType = null,
-    description: ?std.json.Value = null,
-    parameters: ?std.json.Value = null,
-};
-
-/// This tool searches the web for relevant results to use in a response. Learn more about the [web search tool](https://platform.openai.com/docs/guides/tools-web-search).
-pub const WebSearchPreviewTool = struct {
-    /// The type of the web search tool. One of `web_search_preview` or `web_search_preview_2025_03_11`.
-    type: []const u8,
-    user_location: ?std.json.Value = null,
-    /// High level guidance for the amount of context window space to use for the search. One of `low`, `medium`, or `high`. `medium` is the default.
-    search_context_size: ?SearchContextSize = null,
-    search_content_types: ?[]const SearchContentType = null,
-};
-
-/// A tool call to run code.
-pub const CodeInterpreterToolCall = struct {
-    /// The type of the code interpreter tool call. Always `code_interpreter_call`.
-    type: []const u8,
-    /// The unique ID of the code interpreter tool call.
-    id: []const u8,
-    /// The status of the code interpreter tool call. Valid values are `in_progress`, `completed`, `incomplete`, `interpreting`, and `failed`.
-    status: []const u8,
-    /// The ID of the container used to run the code.
-    container_id: []const u8,
-    code: std.json.Value,
-    outputs: std.json.Value,
-};
-
-/// A tool call to run a command on the local shell.
-pub const LocalShellToolCall = struct {
-    /// The type of the local shell call. Always `local_shell_call`.
-    type: []const u8,
-    /// The unique ID of the local shell call.
-    id: []const u8,
-    /// The unique ID of the local shell tool call generated by the model.
-    call_id: []const u8,
-    action: LocalShellExecAction,
-    /// The status of the local shell call.
-    status: []const u8,
-};
-
-/// A tool call that executes one or more shell commands in a managed environment.
-pub const FunctionShellCall = struct {
-    /// The type of the item. Always `shell_call`.
-    type: []const u8,
-    /// The unique ID of the shell tool call. Populated when this item is returned via API.
-    id: []const u8,
-    /// The unique ID of the shell tool call generated by the model.
-    call_id: []const u8,
-    /// The shell commands and limits that describe how to run the tool call.
-    action: FunctionShellAction,
-    /// The status of the shell call. One of `in_progress`, `completed`, or `incomplete`.
-    status: LocalShellCallStatus,
-    environment: std.json.Value,
-    /// The ID of the entity that created this tool call.
-    created_by: ?[]const u8 = null,
-};
-
-/// The content of a shell tool call output that was emitted.
-pub const FunctionShellCallOutputContent = struct {
-    /// The standard output that was captured.
-    stdout: []const u8,
-    /// The standard error output that was captured.
-    stderr: []const u8,
-    /// Represents either an exit outcome (with an exit code) or a timeout outcome for a shell call output chunk.
-    outcome: std.json.Value,
-    /// The identifier of the actor that created the item.
-    created_by: ?[]const u8 = null,
-};
-
-/// A tool call that applies file diffs by creating, deleting, or updating files.
-pub const ApplyPatchToolCall = struct {
-    /// The type of the item. Always `apply_patch_call`.
-    type: []const u8,
-    /// The unique ID of the apply patch tool call. Populated when this item is returned via API.
-    id: []const u8,
-    /// The unique ID of the apply patch tool call generated by the model.
-    call_id: []const u8,
-    /// The status of the apply patch tool call. One of `in_progress` or `completed`.
-    status: ApplyPatchCallStatus,
-    /// One of the create_file, delete_file, or update_file operations applied via apply_patch.
-    operation: std.json.Value,
-    /// The ID of the entity that created this tool call.
-    created_by: ?[]const u8 = null,
-};
-
-/// The output emitted by an apply patch tool call.
-pub const ApplyPatchToolCallOutput = struct {
-    /// The type of the item. Always `apply_patch_call_output`.
-    type: []const u8,
-    /// The unique ID of the apply patch tool call output. Populated when this item is returned via API.
-    id: []const u8,
-    /// The unique ID of the apply patch tool call generated by the model.
-    call_id: []const u8,
-    /// The status of the apply patch tool call output. One of `completed` or `failed`.
-    status: ApplyPatchCallOutputStatus,
-    output: ?std.json.Value = null,
-    /// The ID of the entity that created this tool call output.
-    created_by: ?[]const u8 = null,
-};
-
-/// An invocation of a tool on an MCP server.
-pub const MCPToolCall = struct {
-    /// The type of the item. Always `mcp_call`.
-    type: []const u8,
-    /// The unique ID of the tool call.
-    id: []const u8,
-    /// The label of the MCP server running the tool.
-    server_label: []const u8,
-    /// The name of the tool that was run.
-    name: []const u8,
-    /// A JSON string of the arguments passed to the tool.
-    arguments: []const u8,
-    output: ?std.json.Value = null,
-    @"error": ?std.json.Value = null,
-    /// The status of the tool call. One of `in_progress`, `completed`, `incomplete`, `calling`, or `failed`.
-    status: ?MCPToolCallStatus = null,
-    approval_request_id: ?std.json.Value = null,
-};
-
-/// An image input to the model. Learn about [image inputs](/docs/guides/vision)
-pub const InputImageContentParamAutoParam = struct {
-    /// The type of the input item. Always `input_image`.
-    type: []const u8,
-    image_url: ?std.json.Value = null,
-    file_id: ?std.json.Value = null,
-    detail: ?std.json.Value = null,
-};
-
-/// The output of a computer tool call.
-pub const ComputerCallOutputItemParam = struct {
-    id: ?std.json.Value = null,
-    /// The ID of the computer tool call that produced the output.
-    call_id: []const u8,
-    /// The type of the computer tool call output. Always `computer_call_output`.
-    type: []const u8,
-    output: ComputerScreenshotImage,
-    acknowledged_safety_checks: ?std.json.Value = null,
-    status: ?std.json.Value = null,
-};
-
-pub const ToolSearchCallItemParam = struct {
-    id: ?std.json.Value = null,
-    call_id: ?std.json.Value = null,
-    /// The item type. Always `tool_search_call`.
-    type: []const u8,
-    /// Whether tool search was executed by the server or by the client.
-    execution: ?ToolSearchExecutionType = null,
-    /// The arguments supplied to the tool search call.
-    arguments: EmptyModelParam,
-    status: ?std.json.Value = null,
-};
-
-/// The exit or timeout outcome associated with this shell call.
-pub const FunctionShellCallOutputOutcomeParam = union(enum) {
-    function_shell_call_output_timeout_outcome_param: FunctionShellCallOutputTimeoutOutcomeParam,
-    function_shell_call_output_exit_outcome_param: FunctionShellCallOutputExitOutcomeParam,
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
-        return try jsonParseFromValue(allocator, value, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
-        const disc_str = switch (disc_val) {
-            .string => |s| s,
-            else => return error.UnexpectedToken,
-        };
-        if (std.mem.eql(u8, disc_str, "FunctionShellCallOutputTimeoutOutcomeParam")) {
-            return .{ .function_shell_call_output_timeout_outcome_param = try std.json.parseFromValueLeaky(FunctionShellCallOutputTimeoutOutcomeParam, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "FunctionShellCallOutputExitOutcomeParam")) {
-            return .{ .function_shell_call_output_exit_outcome_param = try std.json.parseFromValueLeaky(FunctionShellCallOutputExitOutcomeParam, allocator, source, options) };
-        }
-        return error.UnexpectedToken;
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        switch (self) {
-            .function_shell_call_output_timeout_outcome_param => |v| try jw.write(v),
-            .function_shell_call_output_exit_outcome_param => |v| try jw.write(v),
-        }
-    }
-};
-
-/// One of the create_file, delete_file, or update_file operations supplied to the apply_patch tool.
-pub const ApplyPatchOperationParam = union(enum) {
-    apply_patch_create_file_operation_param: ApplyPatchCreateFileOperationParam,
-    apply_patch_delete_file_operation_param: ApplyPatchDeleteFileOperationParam,
-    apply_patch_update_file_operation_param: ApplyPatchUpdateFileOperationParam,
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
-        return try jsonParseFromValue(allocator, value, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
-        const disc_str = switch (disc_val) {
-            .string => |s| s,
-            else => return error.UnexpectedToken,
-        };
-        if (std.mem.eql(u8, disc_str, "ApplyPatchCreateFileOperationParam")) {
-            return .{ .apply_patch_create_file_operation_param = try std.json.parseFromValueLeaky(ApplyPatchCreateFileOperationParam, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "ApplyPatchDeleteFileOperationParam")) {
-            return .{ .apply_patch_delete_file_operation_param = try std.json.parseFromValueLeaky(ApplyPatchDeleteFileOperationParam, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "ApplyPatchUpdateFileOperationParam")) {
-            return .{ .apply_patch_update_file_operation_param = try std.json.parseFromValueLeaky(ApplyPatchUpdateFileOperationParam, allocator, source, options) };
-        }
-        return error.UnexpectedToken;
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        switch (self) {
-            .apply_patch_create_file_operation_param => |v| try jw.write(v),
-            .apply_patch_delete_file_operation_param => |v| try jw.write(v),
-            .apply_patch_update_file_operation_param => |v| try jw.write(v),
-        }
-    }
-};
-
-/// The streamed output emitted by an apply patch tool call.
-pub const ApplyPatchToolCallOutputItemParam = struct {
-    /// The type of the item. Always `apply_patch_call_output`.
-    type: []const u8,
-    id: ?std.json.Value = null,
-    /// The unique ID of the apply patch tool call generated by the model.
-    call_id: []const u8,
-    /// The status of the apply patch tool call output. One of `completed` or `failed`.
-    status: ApplyPatchCallOutputStatusParam,
-    output: ?std.json.Value = null,
-};
-
-/// For `gpt-image-1` only, the token usage information for the image generation.
-pub const ImageGenUsage = struct {
-    /// The number of tokens (images and text) in the input prompt.
-    input_tokens: i64,
-    /// The total number of tokens (images and text) used for the image generation.
-    total_tokens: i64,
-    /// The number of output tokens generated by the model.
-    output_tokens: i64,
-    output_tokens_details: ?ImageGenOutputTokensDetails = null,
-    input_tokens_details: ImageGenInputUsageDetails,
-};
-
-/// How the model should select which tool (or tools) to use when generating a response. See the `tools` parameter to see how to specify which tools the model can call.
-pub const ToolChoiceParam = std.json.Value;
-
-/// The conversation that this response belongs to. Items from this conversation are prepended to `input_items` for this response request. Input items and output items from this response are automatically added to this conversation after this response completes.
-pub const ConversationParam = std.json.Value;
-
-pub const DeletedConversation = struct {
-    object: []const u8,
-    deleted: bool,
-    id: []const u8,
-};
-
-/// Structured information describing a generated video job.
-pub const VideoResource = struct {
-    /// Unique identifier for the video job.
-    id: []const u8,
-    /// The object type, which is always `video`.
-    object: []const u8,
-    /// The video generation model that produced the job.
-    model: VideoModel,
-    /// Current lifecycle status of the video job.
-    status: VideoStatus,
-    /// Approximate completion percentage for the generation task.
-    progress: i64,
-    /// Unix timestamp (seconds) for when the job was created.
-    created_at: i64,
-    completed_at: std.json.Value,
-    expires_at: std.json.Value,
-    prompt: std.json.Value,
-    /// The resolution of the generated video.
-    size: VideoSize,
-    /// Duration of the generated clip in seconds. For extensions, this is the stitched total duration.
-    seconds: []const u8,
-    remixed_from_video_id: std.json.Value,
-    @"error": std.json.Value,
-};
-
-/// Multipart parameters for creating a new video generation job.
-pub const CreateVideoMultipartBody = struct {
-    /// The video generation model to use (allowed values: sora-2, sora-2-pro). Defaults to `sora-2`.
-    model: ?VideoModel = null,
-    /// Text prompt that describes the video to generate.
-    prompt: []const u8,
-    input_reference: ?std.json.Value = null,
-    /// Clip duration in seconds (allowed values: 4, 8, 12). Defaults to 4 seconds.
-    seconds: ?VideoSeconds = null,
-    /// Output resolution formatted as width x height (allowed values: 720x1280, 1280x720, 1024x1792, 1792x1024). Defaults to 720x1280.
-    size: ?VideoSize = null,
-};
-
-/// JSON parameters for creating a new video generation job.
-pub const CreateVideoJsonBody = struct {
-    /// The video generation model to use (allowed values: sora-2, sora-2-pro). Defaults to `sora-2`.
-    model: ?VideoModel = null,
-    /// Text prompt that describes the video to generate.
-    prompt: []const u8,
-    /// Optional reference object that guides generation. Provide exactly one of `image_url` or `file_id`.
-    input_reference: ?ImageRefParam2 = null,
-    /// Clip duration in seconds (allowed values: 4, 8, 12). Defaults to 4 seconds.
-    seconds: ?VideoSeconds = null,
-    /// Output resolution formatted as width x height (allowed values: 720x1280, 1280x720, 1024x1792, 1792x1024). Defaults to 720x1280.
-    size: ?VideoSize = null,
-};
-
-/// Parameters for editing an existing generated video.
-pub const CreateVideoEditMultipartBody = struct {
-    video: std.json.Value,
-    /// Text prompt that describes how to edit the source video.
-    prompt: []const u8,
-};
-
-/// JSON parameters for editing an existing generated video.
-pub const CreateVideoEditJsonBody = struct {
-    /// Reference to the completed video to edit.
-    video: VideoReferenceInputParam,
-    /// Text prompt that describes how to edit the source video.
-    prompt: []const u8,
-};
-
-/// Multipart parameters for extending an existing generated video.
-pub const CreateVideoExtendMultipartBody = struct {
-    video: std.json.Value,
-    /// Updated text prompt that directs the extension generation.
-    prompt: []const u8,
-    /// Length of the newly generated extension segment in seconds (allowed values: 4, 8, 12, 16, 20).
-    seconds: VideoSeconds,
-};
-
-/// JSON parameters for extending an existing generated video.
-pub const CreateVideoExtendJsonBody = struct {
-    /// Reference to the completed video to extend.
-    video: VideoReferenceInputParam,
-    /// Updated text prompt that directs the extension generation.
-    prompt: []const u8,
-    /// Length of the newly generated extension segment in seconds (allowed values: 4, 8, 12, 16, 20).
-    seconds: VideoSeconds,
-};
-
-pub const SkillListResource = struct {
-    /// The type of object returned, must be `list`.
-    object: []const u8,
-    /// A list of items
-    data: []const SkillResource,
-    first_id: std.json.Value,
-    last_id: std.json.Value,
-    /// Whether there are more items available.
-    has_more: bool,
-};
-
-pub const SkillVersionListResource = struct {
-    /// The type of object returned, must be `list`.
-    object: []const u8,
-    /// A list of items
-    data: []const SkillVersionResource,
-    first_id: std.json.Value,
-    last_id: std.json.Value,
-    /// Whether there are more items available.
-    has_more: bool,
-};
-
-/// Workflow metadata and state returned for the session.
-pub const ChatkitWorkflow = struct {
-    /// Identifier of the workflow backing the session.
-    id: []const u8,
-    version: std.json.Value,
-    state_variables: std.json.Value,
-    /// Tracing settings applied to the workflow.
-    tracing: ChatkitWorkflowTracing,
-};
-
-/// ChatKit configuration for the session.
-pub const ChatSessionChatkitConfiguration = struct {
-    /// Automatic thread titling preferences.
-    automatic_thread_titling: ChatSessionAutomaticThreadTitling,
-    /// Upload settings for the session.
-    file_upload: ChatSessionFileUpload,
-    /// History retention configuration.
-    history: ChatSessionHistory,
-};
-
 /// Workflow reference and overrides applied to the chat session.
 pub const WorkflowParam = struct {
     /// Identifier for the workflow invoked by the session.
@@ -8795,113 +8904,17 @@ pub const WorkflowParam = struct {
     tracing: ?WorkflowTracingParam = null,
 };
 
-/// Optional per-session configuration settings for ChatKit behavior.
-pub const ChatkitConfigurationParam = struct {
-    /// Configuration for automatic thread titling. When omitted, automatic thread titling is enabled by default.
-    automatic_thread_titling: ?AutomaticThreadTitlingParam = null,
-    /// Configuration for upload enablement and limits. When omitted, uploads are disabled by default (max_files 10, max_file_size 512 MB).
-    file_upload: ?FileUploadParam = null,
-    /// Configuration for chat history retention. When omitted, history is enabled by default with no limit on recent_threads (null).
-    history: ?HistoryParam = null,
-};
-
-/// Attachment metadata included on thread items.
-pub const Attachment = struct {
-    /// Attachment discriminator.
-    type: AttachmentType,
-    /// Identifier for the attachment.
-    id: []const u8,
-    /// Original display name for the attachment.
-    name: []const u8,
-    /// MIME type of the attachment.
-    mime_type: []const u8,
-    preview_url: std.json.Value,
-};
-
-/// Model and tool overrides applied when generating the assistant response.
-pub const InferenceOptions = struct {
-    tool_choice: std.json.Value,
-    model: std.json.Value,
-};
-
-/// Annotation that references an uploaded file.
-pub const FileAnnotation = struct {
-    /// Type discriminator that is always `file` for this annotation.
+/// A tool call representing a request to create, delete, or update files using diff patches.
+pub const ApplyPatchToolCallItemParam = struct {
+    /// The type of the item. Always `apply_patch_call`.
     type: []const u8,
-    /// File attachment referenced by the annotation.
-    source: FileAnnotationSource,
-};
-
-/// Annotation that references a URL.
-pub const UrlAnnotation = struct {
-    /// Type discriminator that is always `url` for this annotation.
-    type: []const u8,
-    /// URL referenced by the annotation.
-    source: UrlAnnotationSource,
-};
-
-/// Record of a client side tool invocation initiated by the assistant.
-pub const ClientToolCallItem = struct {
-    /// Identifier of the thread item.
-    id: []const u8,
-    /// Type discriminator that is always `chatkit.thread_item`.
-    object: []const u8,
-    /// Unix timestamp (in seconds) for when the item was created.
-    created_at: i64,
-    /// Identifier of the parent thread.
-    thread_id: []const u8,
-    /// Type discriminator that is always `chatkit.client_tool_call`.
-    type: []const u8,
-    /// Execution status for the tool call.
-    status: ClientToolCallStatus,
-    /// Identifier for the client tool call.
+    id: ?std.json.Value = null,
+    /// The unique ID of the apply patch tool call generated by the model.
     call_id: []const u8,
-    /// Tool name that was invoked.
-    name: []const u8,
-    /// JSON-encoded arguments that were sent to the tool.
-    arguments: []const u8,
-    output: std.json.Value,
-};
-
-/// Task emitted by the workflow to show progress and status updates.
-pub const TaskItem = struct {
-    /// Identifier of the thread item.
-    id: []const u8,
-    /// Type discriminator that is always `chatkit.thread_item`.
-    object: []const u8,
-    /// Unix timestamp (in seconds) for when the item was created.
-    created_at: i64,
-    /// Identifier of the parent thread.
-    thread_id: []const u8,
-    /// Type discriminator that is always `chatkit.task`.
-    type: []const u8,
-    /// Subtype for the task.
-    task_type: TaskType,
-    heading: std.json.Value,
-    summary: std.json.Value,
-};
-
-/// Task entry that appears within a TaskGroup.
-pub const TaskGroupTask = struct {
-    /// Subtype for the grouped task.
-    type: TaskType,
-    heading: std.json.Value,
-    summary: std.json.Value,
-};
-
-/// Represents a ChatKit thread and its current status.
-pub const ThreadResource = struct {
-    /// Identifier of the thread.
-    id: []const u8,
-    /// Type discriminator that is always `chatkit.thread`.
-    object: []const u8,
-    /// Unix timestamp (in seconds) for when the thread was created.
-    created_at: i64,
-    title: std.json.Value,
-    /// Current status for the thread. Defaults to `active` for newly created threads.
-    status: std.json.Value,
-    /// Free-form string that identifies your end user who owns the thread.
-    user: []const u8,
+    /// The status of the apply patch tool call. One of `in_progress` or `completed`.
+    status: ApplyPatchCallStatusParam,
+    /// The specific create, delete, or update instruction for the apply_patch tool call.
+    operation: ApplyPatchOperationParam,
 };
 
 /// Returned when a transcription session is created.
@@ -9017,6 +9030,32 @@ pub const ChatCompletionRequestUserMessage = struct {
     name: ?[]const u8 = null,
 };
 
+/// Represents a ChatKit session and its resolved configuration.
+pub const ChatSessionResource = struct {
+    /// Identifier for the ChatKit session.
+    id: []const u8,
+    /// Type discriminator that is always `chatkit.session`.
+    object: []const u8,
+    /// Unix timestamp (in seconds) for when the session expires.
+    expires_at: i64,
+    /// Ephemeral client secret that authenticates session requests.
+    client_secret: []const u8,
+    /// Workflow metadata for the session.
+    workflow: ChatkitWorkflow,
+    /// User identifier associated with the session.
+    user: []const u8,
+    /// Resolved rate limit values.
+    rate_limits: ChatSessionRateLimits,
+    /// Convenience copy of the per-minute request limit.
+    max_requests_per_1_minute: i64,
+    /// Current lifecycle state of the session.
+    status: ChatSessionStatus,
+    /// Resolved ChatKit feature configuration for the session.
+    chatkit_configuration: ChatSessionChatkitConfiguration,
+};
+
+pub const Filters = std.json.Value;
+
 pub const VectorStoreSearchRequest = struct {
     /// A query string for a search
     query: std.json.Value,
@@ -9030,7 +9069,112 @@ pub const VectorStoreSearchRequest = struct {
     ranking_options: ?std.json.Value = null,
 };
 
-pub const Filters = std.json.Value;
+pub const ComputerToolCallOutputResource = struct {
+    /// The type of the computer tool call output. Always `computer_call_output`.
+    type: []const u8,
+    /// The ID of the computer tool call output.
+    id: ?[]const u8 = null,
+    /// The ID of the computer tool call that produced the output.
+    call_id: []const u8,
+    /// The safety checks reported by the API that have been acknowledged by the developer.
+    acknowledged_safety_checks: ?[]const ComputerCallSafetyCheckParam = null,
+    output: ComputerScreenshotImage,
+    /// The status of the message input. One of `in_progress`, `completed`, or `incomplete`. Populated when input items are returned via API.
+    status: ?[]const u8 = null,
+    /// The identifier of the actor that created the item.
+    created_by: ?[]const u8 = null,
+};
+
+/// Configuration for a code interpreter container. Optionally specify the IDs of the files to run the code on.
+pub const AutoCodeInterpreterToolParam = struct {
+    /// Always `auto`.
+    type: []const u8,
+    /// An optional list of uploaded files to make available to your code.
+    file_ids: ?[]const []const u8 = null,
+    memory_limit: ?std.json.Value = null,
+    /// Network access policy for the container.
+    network_policy: ?std.json.Value = null,
+};
+
+pub const ComputerAction = union(enum) {
+    click_param: ClickParam,
+    double_click_action: DoubleClickAction,
+    drag_param: DragParam,
+    key_press_action: KeyPressAction,
+    move_param: MoveParam,
+    screenshot_param: ScreenshotParam,
+    scroll_param: ScrollParam,
+    type_param: TypeParam,
+    wait_param: WaitParam,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_str = switch (disc_val) {
+            .string => |s| s,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "ClickParam")) {
+            return .{ .click_param = try std.json.parseFromValueLeaky(ClickParam, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "DoubleClickAction")) {
+            return .{ .double_click_action = try std.json.parseFromValueLeaky(DoubleClickAction, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "DragParam")) {
+            return .{ .drag_param = try std.json.parseFromValueLeaky(DragParam, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "KeyPressAction")) {
+            return .{ .key_press_action = try std.json.parseFromValueLeaky(KeyPressAction, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MoveParam")) {
+            return .{ .move_param = try std.json.parseFromValueLeaky(MoveParam, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ScreenshotParam")) {
+            return .{ .screenshot_param = try std.json.parseFromValueLeaky(ScreenshotParam, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ScrollParam")) {
+            return .{ .scroll_param = try std.json.parseFromValueLeaky(ScrollParam, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "TypeParam")) {
+            return .{ .type_param = try std.json.parseFromValueLeaky(TypeParam, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "WaitParam")) {
+            return .{ .wait_param = try std.json.parseFromValueLeaky(WaitParam, allocator, source, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .click_param => |v| try jw.write(v),
+            .double_click_action => |v| try jw.write(v),
+            .drag_param => |v| try jw.write(v),
+            .key_press_action => |v| try jw.write(v),
+            .move_param => |v| try jw.write(v),
+            .screenshot_param => |v| try jw.write(v),
+            .scroll_param => |v| try jw.write(v),
+            .type_param => |v| try jw.write(v),
+            .wait_param => |v| try jw.write(v),
+        }
+    }
+};
+
+/// The output of a function tool call.
+pub const FunctionCallOutputItemParam = struct {
+    id: ?std.json.Value = null,
+    /// The unique ID of the function tool call generated by the model.
+    call_id: []const u8,
+    /// The type of the function tool call output. Always `function_call_output`.
+    type: []const u8,
+    /// Text, image, or file output of the function tool call.
+    output: std.json.Value,
+    status: ?std.json.Value = null,
+};
 
 /// An object representing a list of output items for an evaluation run.
 pub const EvalRunOutputItemList = struct {
@@ -9075,9 +9219,200 @@ pub const ChatCompletionTool = struct {
     function: FunctionObject,
 };
 
+/// The output of a shell tool call that was emitted.
+pub const FunctionShellCallOutput = struct {
+    /// The type of the shell call output. Always `shell_call_output`.
+    type: []const u8,
+    /// The unique ID of the shell call output. Populated when this item is returned via API.
+    id: []const u8,
+    /// The unique ID of the shell tool call generated by the model.
+    call_id: []const u8,
+    /// The status of the shell call output. One of `in_progress`, `completed`, or `incomplete`.
+    status: LocalShellCallOutputStatusEnum,
+    /// An array of shell call output contents
+    output: []const FunctionShellCallOutputContent,
+    max_output_length: std.json.Value,
+    /// The identifier of the actor that created the item.
+    created_by: ?[]const u8 = null,
+};
+
+/// Captured stdout and stderr for a portion of a shell tool call output.
+pub const FunctionShellCallOutputContentParam = struct {
+    /// Captured stdout output for the shell call.
+    stdout: []const u8,
+    /// Captured stderr output for the shell call.
+    stderr: []const u8,
+    /// The exit or timeout outcome associated with this shell call.
+    outcome: FunctionShellCallOutputOutcomeParam,
+};
+
+/// A custom tool that processes input using a specified format. Learn more about [custom tools](/docs/guides/function-calling#custom-tools)
+pub const CustomToolParam = struct {
+    /// The type of the custom tool. Always `custom`.
+    type: []const u8,
+    /// The name of the custom tool, used to identify it in tool calls.
+    name: []const u8,
+    /// Optional description of the custom tool, used to provide more context.
+    description: ?[]const u8 = null,
+    /// The input format for the custom tool. Default is unconstrained text.
+    format: ?std.json.Value = null,
+    /// Whether this tool should be deferred and discovered via tool search.
+    defer_loading: ?bool = null,
+};
+
+pub const FunctionAndCustomToolCallOutput = union(enum) {
+    input_text_content: InputTextContent,
+    input_image_content: InputImageContent,
+    input_file_content: InputFileContent,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_str = switch (disc_val) {
+            .string => |s| s,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "InputTextContent")) {
+            return .{ .input_text_content = try std.json.parseFromValueLeaky(InputTextContent, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "InputImageContent")) {
+            return .{ .input_image_content = try std.json.parseFromValueLeaky(InputImageContent, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "InputFileContent")) {
+            return .{ .input_file_content = try std.json.parseFromValueLeaky(InputFileContent, allocator, source, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .input_text_content => |v| try jw.write(v),
+            .input_image_content => |v| try jw.write(v),
+            .input_file_content => |v| try jw.write(v),
+        }
+    }
+};
+
+pub const InputContent = union(enum) {
+    input_text_content: InputTextContent,
+    input_image_content: InputImageContent,
+    input_file_content: InputFileContent,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_str = switch (disc_val) {
+            .string => |s| s,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "InputTextContent")) {
+            return .{ .input_text_content = try std.json.parseFromValueLeaky(InputTextContent, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "InputImageContent")) {
+            return .{ .input_image_content = try std.json.parseFromValueLeaky(InputImageContent, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "InputFileContent")) {
+            return .{ .input_file_content = try std.json.parseFromValueLeaky(InputFileContent, allocator, source, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .input_text_content => |v| try jw.write(v),
+            .input_image_content => |v| try jw.write(v),
+            .input_file_content => |v| try jw.write(v),
+        }
+    }
+};
+
+pub const ResponsePromptVariables = std.json.Value;
+
+/// The response from the image generation endpoint.
+pub const ImagesResponse = struct {
+    /// The Unix timestamp (in seconds) of when the image was created.
+    created: i64,
+    /// The list of generated images.
+    data: ?[]const Image = null,
+    /// The background parameter used for the image generation. Either `transparent` or `opaque`.
+    background: ?[]const u8 = null,
+    /// The output format of the image generation. Either `png`, `webp`, or `jpeg`.
+    output_format: ?[]const u8 = null,
+    /// The size of the image generated. Either `1024x1024`, `1024x1536`, or `1536x1024`.
+    size: ?[]const u8 = null,
+    /// The quality of the image generated. Either `low`, `medium`, or `high`.
+    quality: ?[]const u8 = null,
+    usage: ?ImageGenUsage = null,
+};
+
 pub const ImageEditStreamEvent = std.json.Value;
 
 pub const ImageGenStreamEvent = std.json.Value;
+
+pub const ContainerAutoParam = struct {
+    /// Automatically creates a container for this request
+    type: []const u8,
+    /// An optional list of uploaded files to make available to your code.
+    file_ids: ?[]const []const u8 = null,
+    memory_limit: ?std.json.Value = null,
+    /// Network access policy for the container.
+    network_policy: ?std.json.Value = null,
+    /// An optional list of skills referenced by id or inline data.
+    skills: ?[]const std.json.Value = null,
+};
+
+pub const CreateContainerBody = struct {
+    /// Name of the container to create.
+    name: []const u8,
+    /// IDs of files to copy to the container.
+    file_ids: ?[]const []const u8 = null,
+    /// Container expiration time in seconds relative to the 'anchor' time.
+    expires_after: ?std.json.Value = null,
+    /// An optional list of skills referenced by id or inline data.
+    skills: ?[]const std.json.Value = null,
+    /// Optional memory limit for the container. Defaults to "1g".
+    memory_limit: ?[]const u8 = null,
+    /// Network access policy for the container.
+    network_policy: ?std.json.Value = null,
+};
+
+/// A list of inputs, each of which may be either an input text, output text, input image, or input audio object.
+pub const EvalItemContentArray = []const EvalItemContentItem;
+
+/// A tool representing a request to execute one or more shell commands.
+pub const FunctionShellCallItemParam = struct {
+    id: ?std.json.Value = null,
+    /// The unique ID of the shell tool call generated by the model.
+    call_id: []const u8,
+    /// The type of the item. Always `shell_call`.
+    type: []const u8,
+    /// The shell commands and limits that describe how to run the tool call.
+    action: FunctionShellActionParam,
+    status: ?std.json.Value = null,
+    environment: ?std.json.Value = null,
+};
+
+/// A paginated list of ChatKit threads.
+pub const ThreadListResource = struct {
+    /// The type of object returned, must be `list`.
+    object: []const u8,
+    /// A list of items
+    data: []const ThreadResource,
+    first_id: std.json.Value,
+    last_id: std.json.Value,
+    /// Whether there are more items available.
+    has_more: bool,
+};
 
 /// Represents a message within a [thread](/docs/api-reference/threads).
 pub const MessageObject = struct {
@@ -9132,12 +9467,12 @@ pub const CreateThreadRequest = struct {
 
 pub const ThreadStreamEvent = union(enum) {
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValue(T, allocator, source, options) catch |err| switch (err) {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return null,
         };
         const value = try allocator.create(T);
-        value.* = parsed.value;
+        value.* = parsed;
         return value;
     }
 
@@ -9200,12 +9535,12 @@ pub const TextResponseFormatConfiguration = union(enum) {
     response_format_text: *ResponseFormatText,
 
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValue(T, allocator, source, options) catch |err| switch (err) {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return null,
         };
         const value = try allocator.create(T);
-        value.* = parsed.value;
+        value.* = parsed;
         return value;
     }
 
@@ -9339,7 +9674,62 @@ pub const VectorStoreFileObject = struct {
     attributes: ?VectorStoreFileAttributes = null,
 };
 
+/// Collection of workflow tasks grouped together in the thread.
+pub const TaskGroupItem = struct {
+    /// Identifier of the thread item.
+    id: []const u8,
+    /// Type discriminator that is always `chatkit.thread_item`.
+    object: []const u8,
+    /// Unix timestamp (in seconds) for when the item was created.
+    created_at: i64,
+    /// Identifier of the parent thread.
+    thread_id: []const u8,
+    /// Type discriminator that is always `chatkit.task_group`.
+    type: []const u8,
+    /// Tasks included in the group.
+    tasks: []const TaskGroupTask,
+};
+
+/// User-authored messages within a thread.
+pub const UserMessageItem = struct {
+    /// Identifier of the thread item.
+    id: []const u8,
+    /// Type discriminator that is always `chatkit.thread_item`.
+    object: []const u8,
+    /// Unix timestamp (in seconds) for when the item was created.
+    created_at: i64,
+    /// Identifier of the parent thread.
+    thread_id: []const u8,
+    type: []const u8,
+    /// Ordered content elements supplied by the user.
+    content: []const std.json.Value,
+    /// Attachments associated with the user message. Defaults to an empty list.
+    attachments: []const Attachment,
+    inference_options: std.json.Value,
+};
+
 pub const CreateTranscriptionResponseStreamEvent = std.json.Value;
+
+/// Assistant response text accompanied by optional annotations.
+pub const ResponseOutputText = struct {
+    /// Type discriminator that is always `output_text`.
+    type: []const u8,
+    /// Assistant generated text.
+    text: []const u8,
+    /// Ordered list of annotations attached to the response text.
+    annotations: []const std.json.Value,
+};
+
+/// A text output from the model.
+pub const OutputTextContent = struct {
+    /// The type of the output text. Always `output_text`.
+    type: []const u8,
+    /// The text output from the model.
+    text: []const u8,
+    /// The annotations of the text output.
+    annotations: []const Annotation,
+    logprobs: []const LogProb,
+};
 
 pub const UsageResponse = struct {
     object: []const u8,
@@ -9367,6 +9757,17 @@ pub const VectorStoreSearchResultsPage = struct {
     next_page: std.json.Value,
 };
 
+pub const VideoListResource = struct {
+    /// The type of object returned, must be `list`.
+    object: []const u8,
+    /// A list of items
+    data: []const VideoResource,
+    first_id: std.json.Value,
+    last_id: std.json.Value,
+    /// Whether there are more items available.
+    has_more: bool,
+};
+
 pub const CreateSpeechRequest = struct {
     /// One of the available [TTS models](/docs/models#tts): `tts-1`, `tts-1-hd`, `gpt-4o-mini-tts`, or `gpt-4o-mini-tts-2025-12-15`.
     model: std.json.Value,
@@ -9384,351 +9785,6 @@ pub const CreateSpeechRequest = struct {
     stream_format: ?[]const u8 = null,
 };
 
-pub const CreateContainerBody = struct {
-    /// Name of the container to create.
-    name: []const u8,
-    /// IDs of files to copy to the container.
-    file_ids: ?[]const []const u8 = null,
-    /// Container expiration time in seconds relative to the 'anchor' time.
-    expires_after: ?std.json.Value = null,
-    /// An optional list of skills referenced by id or inline data.
-    skills: ?[]const std.json.Value = null,
-    /// Optional memory limit for the container. Defaults to "1g".
-    memory_limit: ?[]const u8 = null,
-    /// Network access policy for the container.
-    network_policy: ?std.json.Value = null,
-};
-
-/// Configuration for a code interpreter container. Optionally specify the IDs of the files to run the code on.
-pub const AutoCodeInterpreterToolParam = struct {
-    /// Always `auto`.
-    type: []const u8,
-    /// An optional list of uploaded files to make available to your code.
-    file_ids: ?[]const []const u8 = null,
-    memory_limit: ?std.json.Value = null,
-    /// Network access policy for the container.
-    network_policy: ?std.json.Value = null,
-};
-
-pub const ContainerAutoParam = struct {
-    /// Automatically creates a container for this request
-    type: []const u8,
-    /// An optional list of uploaded files to make available to your code.
-    file_ids: ?[]const []const u8 = null,
-    memory_limit: ?std.json.Value = null,
-    /// Network access policy for the container.
-    network_policy: ?std.json.Value = null,
-    /// An optional list of skills referenced by id or inline data.
-    skills: ?[]const std.json.Value = null,
-};
-
-/// A list of inputs, each of which may be either an input text, output text, input image, or input audio object.
-pub const EvalItemContentArray = []const EvalItemContentItem;
-
-/// A text output from the model.
-pub const OutputTextContent = struct {
-    /// The type of the output text. Always `output_text`.
-    type: []const u8,
-    /// The text output from the model.
-    text: []const u8,
-    /// The annotations of the text output.
-    annotations: []const Annotation,
-    logprobs: []const LogProb,
-};
-
-pub const FunctionAndCustomToolCallOutput = union(enum) {
-    input_text_content: InputTextContent,
-    input_image_content: InputImageContent,
-    input_file_content: InputFileContent,
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
-        return try jsonParseFromValue(allocator, value, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
-        const disc_str = switch (disc_val) {
-            .string => |s| s,
-            else => return error.UnexpectedToken,
-        };
-        if (std.mem.eql(u8, disc_str, "InputTextContent")) {
-            return .{ .input_text_content = try std.json.parseFromValueLeaky(InputTextContent, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "InputImageContent")) {
-            return .{ .input_image_content = try std.json.parseFromValueLeaky(InputImageContent, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "InputFileContent")) {
-            return .{ .input_file_content = try std.json.parseFromValueLeaky(InputFileContent, allocator, source, options) };
-        }
-        return error.UnexpectedToken;
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        switch (self) {
-            .input_text_content => |v| try jw.write(v),
-            .input_image_content => |v| try jw.write(v),
-            .input_file_content => |v| try jw.write(v),
-        }
-    }
-};
-
-pub const InputContent = union(enum) {
-    input_text_content: InputTextContent,
-    input_image_content: InputImageContent,
-    input_file_content: InputFileContent,
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
-        return try jsonParseFromValue(allocator, value, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
-        const disc_str = switch (disc_val) {
-            .string => |s| s,
-            else => return error.UnexpectedToken,
-        };
-        if (std.mem.eql(u8, disc_str, "InputTextContent")) {
-            return .{ .input_text_content = try std.json.parseFromValueLeaky(InputTextContent, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "InputImageContent")) {
-            return .{ .input_image_content = try std.json.parseFromValueLeaky(InputImageContent, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "InputFileContent")) {
-            return .{ .input_file_content = try std.json.parseFromValueLeaky(InputFileContent, allocator, source, options) };
-        }
-        return error.UnexpectedToken;
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        switch (self) {
-            .input_text_content => |v| try jw.write(v),
-            .input_image_content => |v| try jw.write(v),
-            .input_file_content => |v| try jw.write(v),
-        }
-    }
-};
-
-pub const ResponsePromptVariables = std.json.Value;
-
-pub const ComputerAction = union(enum) {
-    click_param: ClickParam,
-    double_click_action: DoubleClickAction,
-    drag_param: DragParam,
-    key_press_action: KeyPressAction,
-    move_param: MoveParam,
-    screenshot_param: ScreenshotParam,
-    scroll_param: ScrollParam,
-    type_param: TypeParam,
-    wait_param: WaitParam,
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
-        return try jsonParseFromValue(allocator, value, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
-        const disc_str = switch (disc_val) {
-            .string => |s| s,
-            else => return error.UnexpectedToken,
-        };
-        if (std.mem.eql(u8, disc_str, "ClickParam")) {
-            return .{ .click_param = try std.json.parseFromValueLeaky(ClickParam, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "DoubleClickAction")) {
-            return .{ .double_click_action = try std.json.parseFromValueLeaky(DoubleClickAction, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "DragParam")) {
-            return .{ .drag_param = try std.json.parseFromValueLeaky(DragParam, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "KeyPressAction")) {
-            return .{ .key_press_action = try std.json.parseFromValueLeaky(KeyPressAction, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "MoveParam")) {
-            return .{ .move_param = try std.json.parseFromValueLeaky(MoveParam, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "ScreenshotParam")) {
-            return .{ .screenshot_param = try std.json.parseFromValueLeaky(ScreenshotParam, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "ScrollParam")) {
-            return .{ .scroll_param = try std.json.parseFromValueLeaky(ScrollParam, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "TypeParam")) {
-            return .{ .type_param = try std.json.parseFromValueLeaky(TypeParam, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "WaitParam")) {
-            return .{ .wait_param = try std.json.parseFromValueLeaky(WaitParam, allocator, source, options) };
-        }
-        return error.UnexpectedToken;
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        switch (self) {
-            .click_param => |v| try jw.write(v),
-            .double_click_action => |v| try jw.write(v),
-            .drag_param => |v| try jw.write(v),
-            .key_press_action => |v| try jw.write(v),
-            .move_param => |v| try jw.write(v),
-            .screenshot_param => |v| try jw.write(v),
-            .scroll_param => |v| try jw.write(v),
-            .type_param => |v| try jw.write(v),
-            .wait_param => |v| try jw.write(v),
-        }
-    }
-};
-
-pub const ComputerToolCallOutputResource = struct {
-    /// The type of the computer tool call output. Always `computer_call_output`.
-    type: []const u8,
-    /// The ID of the computer tool call output.
-    id: ?[]const u8 = null,
-    /// The ID of the computer tool call that produced the output.
-    call_id: []const u8,
-    /// The safety checks reported by the API that have been acknowledged by the developer.
-    acknowledged_safety_checks: ?[]const ComputerCallSafetyCheckParam = null,
-    output: ComputerScreenshotImage,
-    /// The status of the message input. One of `in_progress`, `completed`, or `incomplete`. Populated when input items are returned via API.
-    status: ?[]const u8 = null,
-    /// The identifier of the actor that created the item.
-    created_by: ?[]const u8 = null,
-};
-
-/// A tool representing a request to execute one or more shell commands.
-pub const FunctionShellCallItemParam = struct {
-    id: ?std.json.Value = null,
-    /// The unique ID of the shell tool call generated by the model.
-    call_id: []const u8,
-    /// The type of the item. Always `shell_call`.
-    type: []const u8,
-    /// The shell commands and limits that describe how to run the tool call.
-    action: FunctionShellActionParam,
-    status: ?std.json.Value = null,
-    environment: ?std.json.Value = null,
-};
-
-/// A custom tool that processes input using a specified format. Learn more about [custom tools](/docs/guides/function-calling#custom-tools)
-pub const CustomToolParam = struct {
-    /// The type of the custom tool. Always `custom`.
-    type: []const u8,
-    /// The name of the custom tool, used to identify it in tool calls.
-    name: []const u8,
-    /// Optional description of the custom tool, used to provide more context.
-    description: ?[]const u8 = null,
-    /// The input format for the custom tool. Default is unconstrained text.
-    format: ?std.json.Value = null,
-    /// Whether this tool should be deferred and discovered via tool search.
-    defer_loading: ?bool = null,
-};
-
-/// The output of a shell tool call that was emitted.
-pub const FunctionShellCallOutput = struct {
-    /// The type of the shell call output. Always `shell_call_output`.
-    type: []const u8,
-    /// The unique ID of the shell call output. Populated when this item is returned via API.
-    id: []const u8,
-    /// The unique ID of the shell tool call generated by the model.
-    call_id: []const u8,
-    /// The status of the shell call output. One of `in_progress`, `completed`, or `incomplete`.
-    status: LocalShellCallOutputStatusEnum,
-    /// An array of shell call output contents
-    output: []const FunctionShellCallOutputContent,
-    max_output_length: std.json.Value,
-    /// The identifier of the actor that created the item.
-    created_by: ?[]const u8 = null,
-};
-
-/// The output of a function tool call.
-pub const FunctionCallOutputItemParam = struct {
-    id: ?std.json.Value = null,
-    /// The unique ID of the function tool call generated by the model.
-    call_id: []const u8,
-    /// The type of the function tool call output. Always `function_call_output`.
-    type: []const u8,
-    /// Text, image, or file output of the function tool call.
-    output: std.json.Value,
-    status: ?std.json.Value = null,
-};
-
-/// Captured stdout and stderr for a portion of a shell tool call output.
-pub const FunctionShellCallOutputContentParam = struct {
-    /// Captured stdout output for the shell call.
-    stdout: []const u8,
-    /// Captured stderr output for the shell call.
-    stderr: []const u8,
-    /// The exit or timeout outcome associated with this shell call.
-    outcome: FunctionShellCallOutputOutcomeParam,
-};
-
-/// A tool call representing a request to create, delete, or update files using diff patches.
-pub const ApplyPatchToolCallItemParam = struct {
-    /// The type of the item. Always `apply_patch_call`.
-    type: []const u8,
-    id: ?std.json.Value = null,
-    /// The unique ID of the apply patch tool call generated by the model.
-    call_id: []const u8,
-    /// The status of the apply patch tool call. One of `in_progress` or `completed`.
-    status: ApplyPatchCallStatusParam,
-    /// The specific create, delete, or update instruction for the apply_patch tool call.
-    operation: ApplyPatchOperationParam,
-};
-
-/// The response from the image generation endpoint.
-pub const ImagesResponse = struct {
-    /// The Unix timestamp (in seconds) of when the image was created.
-    created: i64,
-    /// The list of generated images.
-    data: ?[]const Image = null,
-    /// The background parameter used for the image generation. Either `transparent` or `opaque`.
-    background: ?[]const u8 = null,
-    /// The output format of the image generation. Either `png`, `webp`, or `jpeg`.
-    output_format: ?[]const u8 = null,
-    /// The size of the image generated. Either `1024x1024`, `1024x1536`, or `1536x1024`.
-    size: ?[]const u8 = null,
-    /// The quality of the image generated. Either `low`, `medium`, or `high`.
-    quality: ?[]const u8 = null,
-    usage: ?ImageGenUsage = null,
-};
-
-pub const VideoListResource = struct {
-    /// The type of object returned, must be `list`.
-    object: []const u8,
-    /// A list of items
-    data: []const VideoResource,
-    first_id: std.json.Value,
-    last_id: std.json.Value,
-    /// Whether there are more items available.
-    has_more: bool,
-};
-
-/// Represents a ChatKit session and its resolved configuration.
-pub const ChatSessionResource = struct {
-    /// Identifier for the ChatKit session.
-    id: []const u8,
-    /// Type discriminator that is always `chatkit.session`.
-    object: []const u8,
-    /// Unix timestamp (in seconds) for when the session expires.
-    expires_at: i64,
-    /// Ephemeral client secret that authenticates session requests.
-    client_secret: []const u8,
-    /// Workflow metadata for the session.
-    workflow: ChatkitWorkflow,
-    /// User identifier associated with the session.
-    user: []const u8,
-    /// Resolved rate limit values.
-    rate_limits: ChatSessionRateLimits,
-    /// Convenience copy of the per-minute request limit.
-    max_requests_per_1_minute: i64,
-    /// Current lifecycle state of the session.
-    status: ChatSessionStatus,
-    /// Resolved ChatKit feature configuration for the session.
-    chatkit_configuration: ChatSessionChatkitConfiguration,
-};
-
 /// Parameters for provisioning a new ChatKit session.
 pub const CreateChatSessionBody = struct {
     /// Workflow that powers the session.
@@ -9741,62 +9797,6 @@ pub const CreateChatSessionBody = struct {
     rate_limits: ?RateLimitsParam = null,
     /// Optional overrides for ChatKit runtime configuration features
     chatkit_configuration: ?ChatkitConfigurationParam = null,
-};
-
-/// User-authored messages within a thread.
-pub const UserMessageItem = struct {
-    /// Identifier of the thread item.
-    id: []const u8,
-    /// Type discriminator that is always `chatkit.thread_item`.
-    object: []const u8,
-    /// Unix timestamp (in seconds) for when the item was created.
-    created_at: i64,
-    /// Identifier of the parent thread.
-    thread_id: []const u8,
-    type: []const u8,
-    /// Ordered content elements supplied by the user.
-    content: []const std.json.Value,
-    /// Attachments associated with the user message. Defaults to an empty list.
-    attachments: []const Attachment,
-    inference_options: std.json.Value,
-};
-
-/// Assistant response text accompanied by optional annotations.
-pub const ResponseOutputText = struct {
-    /// Type discriminator that is always `output_text`.
-    type: []const u8,
-    /// Assistant generated text.
-    text: []const u8,
-    /// Ordered list of annotations attached to the response text.
-    annotations: []const std.json.Value,
-};
-
-/// Collection of workflow tasks grouped together in the thread.
-pub const TaskGroupItem = struct {
-    /// Identifier of the thread item.
-    id: []const u8,
-    /// Type discriminator that is always `chatkit.thread_item`.
-    object: []const u8,
-    /// Unix timestamp (in seconds) for when the item was created.
-    created_at: i64,
-    /// Identifier of the parent thread.
-    thread_id: []const u8,
-    /// Type discriminator that is always `chatkit.task_group`.
-    type: []const u8,
-    /// Tasks included in the group.
-    tasks: []const TaskGroupTask,
-};
-
-/// A paginated list of ChatKit threads.
-pub const ThreadListResource = struct {
-    /// The type of object returned, must be `list`.
-    object: []const u8,
-    /// A list of items
-    data: []const ThreadResource,
-    first_id: std.json.Value,
-    last_id: std.json.Value,
-    /// Whether there are more items available.
-    has_more: bool,
 };
 
 /// A log of a user action or configuration change within this organization.
@@ -10017,6 +10017,17 @@ pub const FileSearchTool = struct {
     filters: ?std.json.Value = null,
 };
 
+/// A tool that runs Python code to help generate a response to a prompt.
+pub const CodeInterpreterTool = struct {
+    /// The type of the code interpreter tool. Always `code_interpreter`.
+    type: []const u8,
+    /// The code interpreter container. Can be a container ID or an object that specifies uploaded file IDs to make available to your code, along with an optional `memory_limit` setting.
+    container: std.json.Value,
+};
+
+/// Flattened batched actions for `computer_use`. Each action includes an `type` discriminator and action-specific fields.
+pub const ComputerActionList = []const ComputerAction;
+
 /// Details of the tool call.
 pub const RunStepDetailsToolCallsObject = struct {
     /// Always `tool_calls`.
@@ -10024,6 +10035,72 @@ pub const RunStepDetailsToolCallsObject = struct {
     /// An array of tool calls the run step was involved in. These can be associated with one of three types of tools: `code_interpreter`, `file_search`, or `function`.
     tool_calls: []const std.json.Value,
 };
+
+/// The streamed output items emitted by a shell tool call.
+pub const FunctionShellCallOutputItemParam = struct {
+    id: ?std.json.Value = null,
+    /// The unique ID of the shell tool call generated by the model.
+    call_id: []const u8,
+    /// The type of the item. Always `shell_call_output`.
+    type: []const u8,
+    /// Captured chunks of stdout and stderr output, along with their associated outcomes.
+    output: []const FunctionShellCallOutputContentParam,
+    status: ?std.json.Value = null,
+    max_output_length: ?std.json.Value = null,
+};
+
+/// Groups function/custom tools under a shared namespace.
+pub const NamespaceToolParam = struct {
+    /// The type of the tool. Always `namespace`.
+    type: []const u8,
+    /// The namespace name used in tool calls (for example, `crm`).
+    name: []const u8,
+    /// A description of the namespace shown to the model.
+    description: []const u8,
+    /// The function/custom tools available inside this namespace.
+    tools: []const std.json.Value,
+};
+
+/// The output of a custom tool call from your code, being sent back to the model.
+pub const CustomToolCallOutput = struct {
+    /// The type of the custom tool call output. Always `custom_tool_call_output`.
+    type: []const u8,
+    /// The unique ID of the custom tool call output in the OpenAI platform.
+    id: ?[]const u8 = null,
+    /// The call ID, used to map this custom tool call output to a custom tool call.
+    call_id: []const u8,
+    /// The output from the custom tool call generated by your code. Can be a string or an list of output content.
+    output: std.json.Value,
+};
+
+/// The output of a function tool call.
+pub const FunctionToolCallOutput = struct {
+    /// The unique ID of the function tool call output. Populated when this item is returned via API.
+    id: ?[]const u8 = null,
+    /// The type of the function tool call output. Always `function_call_output`.
+    type: []const u8,
+    /// The unique ID of the function tool call generated by the model.
+    call_id: []const u8,
+    /// The output from the function call generated by your code. Can be a string or an list of output content.
+    output: std.json.Value,
+    /// The status of the item. One of `in_progress`, `completed`, or `incomplete`. Populated when items are returned via API.
+    status: ?[]const u8 = null,
+};
+
+/// A list of one or many input items to the model, containing different content types.
+pub const InputMessageContentList = []const InputContent;
+
+pub const Prompt = std.json.Value;
+
+/// A tool that allows the model to execute shell commands.
+pub const FunctionShellToolParam = struct {
+    /// The type of the shell tool. Always `shell`.
+    type: []const u8,
+    environment: ?std.json.Value = null,
+};
+
+/// Inputs to the model - can contain template strings. Supports text, output text, input images, and input audio, either as a single item or an array of items.
+pub const EvalItemContent = std.json.Value;
 
 pub const ListMessagesResponse = struct {
     object: []const u8,
@@ -10035,12 +10112,12 @@ pub const ListMessagesResponse = struct {
 
 pub const MessageStreamEvent = union(enum) {
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValue(T, allocator, source, options) catch |err| switch (err) {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return null,
         };
         const value = try allocator.create(T);
-        value.* = parsed.value;
+        value.* = parsed;
         return value;
     }
 
@@ -10442,23 +10519,35 @@ pub const ListVectorStoreFilesResponse = struct {
     has_more: bool,
 };
 
-/// A tool that runs Python code to help generate a response to a prompt.
-pub const CodeInterpreterTool = struct {
-    /// The type of the code interpreter tool. Always `code_interpreter`.
+/// Assistant-authored message within a thread.
+pub const AssistantMessageItem = struct {
+    /// Identifier of the thread item.
+    id: []const u8,
+    /// Type discriminator that is always `chatkit.thread_item`.
+    object: []const u8,
+    /// Unix timestamp (in seconds) for when the item was created.
+    created_at: i64,
+    /// Identifier of the parent thread.
+    thread_id: []const u8,
+    /// Type discriminator that is always `chatkit.assistant_message`.
     type: []const u8,
-    /// The code interpreter container. Can be a container ID or an object that specifies uploaded file IDs to make available to your code, along with an optional `memory_limit` setting.
-    container: std.json.Value,
+    /// Ordered assistant response segments.
+    content: []const ResponseOutputText,
 };
 
-/// A tool that allows the model to execute shell commands.
-pub const FunctionShellToolParam = struct {
-    /// The type of the shell tool. Always `shell`.
+/// A message to or from the model.
+pub const Message = struct {
+    /// The type of the message. Always set to `message`.
     type: []const u8,
-    environment: ?std.json.Value = null,
+    /// The unique ID of the message.
+    id: []const u8,
+    /// The status of item. One of `in_progress`, `completed`, or `incomplete`. Populated when items are returned via API.
+    status: MessageStatus,
+    /// The role of the message. One of `unknown`, `user`, `assistant`, `system`, `critic`, `discriminator`, `developer`, or `tool`.
+    role: MessageRole,
+    /// The content of the message
+    content: []const std.json.Value,
 };
-
-/// Inputs to the model - can contain template strings. Supports text, output text, input images, and input audio, either as a single item or an array of items.
-pub const EvalItemContent = std.json.Value;
 
 pub const OutputContent = union(enum) {
     output_text_content: OutputTextContent,
@@ -10529,95 +10618,6 @@ pub const OutputMessageContent = union(enum) {
             .refusal_content => |v| try jw.write(v),
         }
     }
-};
-
-/// A message to or from the model.
-pub const Message = struct {
-    /// The type of the message. Always set to `message`.
-    type: []const u8,
-    /// The unique ID of the message.
-    id: []const u8,
-    /// The status of item. One of `in_progress`, `completed`, or `incomplete`. Populated when items are returned via API.
-    status: MessageStatus,
-    /// The role of the message. One of `unknown`, `user`, `assistant`, `system`, `critic`, `discriminator`, `developer`, or `tool`.
-    role: MessageRole,
-    /// The content of the message
-    content: []const std.json.Value,
-};
-
-/// The output of a custom tool call from your code, being sent back to the model.
-pub const CustomToolCallOutput = struct {
-    /// The type of the custom tool call output. Always `custom_tool_call_output`.
-    type: []const u8,
-    /// The unique ID of the custom tool call output in the OpenAI platform.
-    id: ?[]const u8 = null,
-    /// The call ID, used to map this custom tool call output to a custom tool call.
-    call_id: []const u8,
-    /// The output from the custom tool call generated by your code. Can be a string or an list of output content.
-    output: std.json.Value,
-};
-
-/// The output of a function tool call.
-pub const FunctionToolCallOutput = struct {
-    /// The unique ID of the function tool call output. Populated when this item is returned via API.
-    id: ?[]const u8 = null,
-    /// The type of the function tool call output. Always `function_call_output`.
-    type: []const u8,
-    /// The unique ID of the function tool call generated by the model.
-    call_id: []const u8,
-    /// The output from the function call generated by your code. Can be a string or an list of output content.
-    output: std.json.Value,
-    /// The status of the item. One of `in_progress`, `completed`, or `incomplete`. Populated when items are returned via API.
-    status: ?[]const u8 = null,
-};
-
-/// A list of one or many input items to the model, containing different content types.
-pub const InputMessageContentList = []const InputContent;
-
-pub const Prompt = std.json.Value;
-
-/// Flattened batched actions for `computer_use`. Each action includes an `type` discriminator and action-specific fields.
-pub const ComputerActionList = []const ComputerAction;
-
-/// Groups function/custom tools under a shared namespace.
-pub const NamespaceToolParam = struct {
-    /// The type of the tool. Always `namespace`.
-    type: []const u8,
-    /// The namespace name used in tool calls (for example, `crm`).
-    name: []const u8,
-    /// A description of the namespace shown to the model.
-    description: []const u8,
-    /// The function/custom tools available inside this namespace.
-    tools: []const std.json.Value,
-};
-
-/// The streamed output items emitted by a shell tool call.
-pub const FunctionShellCallOutputItemParam = struct {
-    id: ?std.json.Value = null,
-    /// The unique ID of the shell tool call generated by the model.
-    call_id: []const u8,
-    /// The type of the item. Always `shell_call_output`.
-    type: []const u8,
-    /// Captured chunks of stdout and stderr output, along with their associated outcomes.
-    output: []const FunctionShellCallOutputContentParam,
-    status: ?std.json.Value = null,
-    max_output_length: ?std.json.Value = null,
-};
-
-/// Assistant-authored message within a thread.
-pub const AssistantMessageItem = struct {
-    /// Identifier of the thread item.
-    id: []const u8,
-    /// Type discriminator that is always `chatkit.thread_item`.
-    object: []const u8,
-    /// Unix timestamp (in seconds) for when the item was created.
-    created_at: i64,
-    /// Identifier of the parent thread.
-    thread_id: []const u8,
-    /// Type discriminator that is always `chatkit.assistant_message`.
-    type: []const u8,
-    /// Ordered assistant response segments.
-    content: []const ResponseOutputText,
 };
 
 pub const ListAuditLogsResponse = struct {
@@ -10702,6 +10702,22 @@ pub const CreateChatCompletionRequest = struct {
     functions: ?[]const ChatCompletionFunctions = null,
 };
 
+/// A tool call to a computer use tool. See the [computer use guide](/docs/guides/tools-computer-use) for more information.
+pub const ComputerToolCall = struct {
+    /// The type of the computer call. Always `computer_call`.
+    type: []const u8,
+    /// The unique ID of the computer call.
+    id: []const u8,
+    /// An identifier used when responding to the tool call with output.
+    call_id: []const u8,
+    action: ?ComputerAction = null,
+    actions: ?ComputerActionList = null,
+    /// The pending safety checks for the computer call.
+    pending_safety_checks: []const ComputerCallSafetyCheckParam,
+    /// The status of the item. One of `in_progress`, `completed`, or `incomplete`. Populated when items are returned via API.
+    status: []const u8,
+};
+
 /// Represents a step in execution of a run.
 pub const RunStepObject = struct {
     /// The identifier of the run step, which can be referenced in API endpoints.
@@ -10729,173 +10745,6 @@ pub const RunStepObject = struct {
     completed_at: std.json.Value,
     metadata: Metadata,
     usage: RunStepCompletionUsage,
-};
-
-/// Returned when a new Response is created. The first event of response creation, where the response is in an initial state of `in_progress`.
-pub const RealtimeBetaServerEventResponseCreated = struct {
-    /// The unique ID of the server event.
-    event_id: []const u8,
-    /// The event type, must be `response.created`.
-    type: []const u8,
-    response: RealtimeBetaResponse,
-};
-
-/// Returned when a Response is done streaming. Always emitted, no matter the final state. The Response object included in the `response.done` event will include all output Items in the Response but will omit the raw audio data.
-pub const RealtimeBetaServerEventResponseDone = struct {
-    /// The unique ID of the server event.
-    event_id: []const u8,
-    /// The event type, must be `response.done`.
-    type: []const u8,
-    response: RealtimeBetaResponse,
-};
-
-/// Returned when a new Response is created. The first event of response creation, where the response is in an initial state of `in_progress`.
-pub const RealtimeServerEventResponseCreated = struct {
-    /// The unique ID of the server event.
-    event_id: []const u8,
-    /// The event type, must be `response.created`.
-    type: []const u8,
-    response: RealtimeResponse,
-};
-
-/// Returned when a Response is done streaming. Always emitted, no matter the final state. The Response object included in the `response.done` event will include all output Items in the Response but will omit the raw audio data. Clients should check the `status` field of the Response to determine if it was successful (`completed`) or if there was another outcome: `cancelled`, `failed`, or `incomplete`. A response will contain all output items that were generated during the response, excluding any audio content.
-pub const RealtimeServerEventResponseDone = struct {
-    /// The unique ID of the server event.
-    event_id: []const u8,
-    /// The event type, must be `response.done`.
-    type: []const u8,
-    response: RealtimeResponse,
-};
-
-pub const ListAssistantsResponse = struct {
-    object: []const u8,
-    data: []const AssistantObject,
-    first_id: []const u8,
-    last_id: []const u8,
-    has_more: bool,
-};
-
-pub const ListRunsResponse = struct {
-    object: []const u8,
-    data: []const RunObject,
-    first_id: []const u8,
-    last_id: []const u8,
-    has_more: bool,
-};
-
-pub const RunStreamEvent = union(enum) {
-    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValue(T, allocator, source, options) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => return null,
-        };
-        const value = try allocator.create(T);
-        value.* = parsed.value;
-        return value;
-    }
-
-    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
-        inline for (keys) |key| {
-            if (object.contains(key)) return true;
-        }
-        return false;
-    }
-
-    pub fn jsonParseFromValue(_: std.mem.Allocator, source: std.json.Value, _: std.json.ParseOptions) !@This() {
-        if (source != .object) return error.UnexpectedToken;
-        return error.UnexpectedToken;
-    }
-
-    pub fn jsonStringify(_: @This(), _: anytype) !void {}
-};
-
-pub const CreateVectorStoreFileBatchRequest = struct {
-    /// A list of [File](/docs/api-reference/files) IDs that the vector store should use. Useful for tools like `file_search` that can access files. If `attributes` or `chunking_strategy` are provided, they will be applied to all files in the batch. The maximum batch size is 2000 files. Mutually exclusive with `files`.
-    file_ids: ?[]const []const u8 = null,
-    /// A list of objects that each include a `file_id` plus optional `attributes` or `chunking_strategy`. Use this when you need to override metadata for specific files. The global `attributes` or `chunking_strategy` will be ignored and must be specified for each file. The maximum batch size is 2000 files. Mutually exclusive with `file_ids`.
-    files: ?[]const CreateVectorStoreFileRequest = null,
-    chunking_strategy: ?ChunkingStrategyRequestParam = null,
-    attributes: ?VectorStoreFileAttributes = null,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        if (self.file_ids) |value| {
-            try jw.objectField("file_ids");
-            try jw.write(value);
-        }
-        if (self.files) |value| {
-            try jw.objectField("files");
-            try jw.write(value);
-        }
-        if (self.chunking_strategy) |value| {
-            try jw.objectField("chunking_strategy");
-            try jw.write(value);
-        }
-        if (self.attributes) |value| {
-            try jw.objectField("attributes");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
-/// A message input to the model with a role indicating instruction following hierarchy. Instructions given with the `developer` or `system` role take precedence over instructions given with the `user` role. Messages with the `assistant` role are presumed to have been generated by the model in previous interactions.
-pub const EvalItem = struct {
-    /// The role of the message input. One of `user`, `assistant`, `system`, or `developer`.
-    role: []const u8,
-    content: EvalItemContent,
-    /// The type of the message input. Always `message`.
-    type: ?[]const u8 = null,
-};
-
-/// Multi-modal input and output contents.
-pub const Content = std.json.Value;
-
-/// Emitted when a new content part is added.
-pub const ResponseContentPartAddedEvent = struct {
-    /// The type of the event. Always `response.content_part.added`.
-    type: []const u8,
-    /// The ID of the output item that the content part was added to.
-    item_id: []const u8,
-    /// The index of the output item that the content part was added to.
-    output_index: i64,
-    /// The index of the content part that was added.
-    content_index: i64,
-    /// The content part that was added.
-    part: OutputContent,
-    /// The sequence number of this event.
-    sequence_number: i64,
-};
-
-/// Emitted when a content part is done.
-pub const ResponseContentPartDoneEvent = struct {
-    /// The type of the event. Always `response.content_part.done`.
-    type: []const u8,
-    /// The ID of the output item that the content part was added to.
-    item_id: []const u8,
-    /// The index of the output item that the content part was added to.
-    output_index: i64,
-    /// The index of the content part that is done.
-    content_index: i64,
-    /// The sequence number of this event.
-    sequence_number: i64,
-    /// The content part that is done.
-    part: OutputContent,
-};
-
-/// An output message from the model.
-pub const OutputMessage = struct {
-    /// The unique ID of the output message.
-    id: []const u8,
-    /// The type of the output message. Always `message`.
-    type: []const u8,
-    /// The role of the output message. Always `assistant`.
-    role: []const u8,
-    /// The content of the output message.
-    content: []const OutputMessageContent,
-    phase: ?std.json.Value = null,
-    /// The status of the message input. One of `in_progress`, `completed`, or `incomplete`. Populated when input items are returned via API.
-    status: []const u8,
 };
 
 pub const CustomToolCallOutputResource = struct {
@@ -11124,22 +10973,6 @@ pub const RealtimeSessionCreateResponseGA = struct {
     prompt: ?Prompt = null,
 };
 
-/// A tool call to a computer use tool. See the [computer use guide](/docs/guides/tools-computer-use) for more information.
-pub const ComputerToolCall = struct {
-    /// The type of the computer call. Always `computer_call`.
-    type: []const u8,
-    /// The unique ID of the computer call.
-    id: []const u8,
-    /// An identifier used when responding to the tool call with output.
-    call_id: []const u8,
-    action: ?ComputerAction = null,
-    actions: ?ComputerActionList = null,
-    /// The pending safety checks for the computer call.
-    pending_safety_checks: []const ComputerCallSafetyCheckParam,
-    /// The status of the item. One of `in_progress`, `completed`, or `incomplete`. Populated when items are returned via API.
-    status: []const u8,
-};
-
 /// A tool that can be used to generate a response.
 pub const Tool = union(enum) {
     function_tool: FunctionTool,
@@ -11239,6 +11072,123 @@ pub const Tool = union(enum) {
     }
 };
 
+/// A message input to the model with a role indicating instruction following hierarchy. Instructions given with the `developer` or `system` role take precedence over instructions given with the `user` role. Messages with the `assistant` role are presumed to have been generated by the model in previous interactions.
+pub const EvalItem = struct {
+    /// The role of the message input. One of `user`, `assistant`, `system`, or `developer`.
+    role: []const u8,
+    content: EvalItemContent,
+    /// The type of the message input. Always `message`.
+    type: ?[]const u8 = null,
+};
+
+/// Returned when a new Response is created. The first event of response creation, where the response is in an initial state of `in_progress`.
+pub const RealtimeBetaServerEventResponseCreated = struct {
+    /// The unique ID of the server event.
+    event_id: []const u8,
+    /// The event type, must be `response.created`.
+    type: []const u8,
+    response: RealtimeBetaResponse,
+};
+
+/// Returned when a Response is done streaming. Always emitted, no matter the final state. The Response object included in the `response.done` event will include all output Items in the Response but will omit the raw audio data.
+pub const RealtimeBetaServerEventResponseDone = struct {
+    /// The unique ID of the server event.
+    event_id: []const u8,
+    /// The event type, must be `response.done`.
+    type: []const u8,
+    response: RealtimeBetaResponse,
+};
+
+/// Returned when a new Response is created. The first event of response creation, where the response is in an initial state of `in_progress`.
+pub const RealtimeServerEventResponseCreated = struct {
+    /// The unique ID of the server event.
+    event_id: []const u8,
+    /// The event type, must be `response.created`.
+    type: []const u8,
+    response: RealtimeResponse,
+};
+
+/// Returned when a Response is done streaming. Always emitted, no matter the final state. The Response object included in the `response.done` event will include all output Items in the Response but will omit the raw audio data. Clients should check the `status` field of the Response to determine if it was successful (`completed`) or if there was another outcome: `cancelled`, `failed`, or `incomplete`. A response will contain all output items that were generated during the response, excluding any audio content.
+pub const RealtimeServerEventResponseDone = struct {
+    /// The unique ID of the server event.
+    event_id: []const u8,
+    /// The event type, must be `response.done`.
+    type: []const u8,
+    response: RealtimeResponse,
+};
+
+pub const ListAssistantsResponse = struct {
+    object: []const u8,
+    data: []const AssistantObject,
+    first_id: []const u8,
+    last_id: []const u8,
+    has_more: bool,
+};
+
+pub const ListRunsResponse = struct {
+    object: []const u8,
+    data: []const RunObject,
+    first_id: []const u8,
+    last_id: []const u8,
+    has_more: bool,
+};
+
+pub const RunStreamEvent = union(enum) {
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParseFromValue(_: std.mem.Allocator, source: std.json.Value, _: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(_: @This(), _: anytype) !void {}
+};
+
+pub const CreateVectorStoreFileBatchRequest = struct {
+    /// A list of [File](/docs/api-reference/files) IDs that the vector store should use. Useful for tools like `file_search` that can access files. If `attributes` or `chunking_strategy` are provided, they will be applied to all files in the batch. The maximum batch size is 2000 files. Mutually exclusive with `files`.
+    file_ids: ?[]const []const u8 = null,
+    /// A list of objects that each include a `file_id` plus optional `attributes` or `chunking_strategy`. Use this when you need to override metadata for specific files. The global `attributes` or `chunking_strategy` will be ignored and must be specified for each file. The maximum batch size is 2000 files. Mutually exclusive with `file_ids`.
+    files: ?[]const CreateVectorStoreFileRequest = null,
+    chunking_strategy: ?ChunkingStrategyRequestParam = null,
+    attributes: ?VectorStoreFileAttributes = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.file_ids) |value| {
+            try jw.objectField("file_ids");
+            try jw.write(value);
+        }
+        if (self.files) |value| {
+            try jw.objectField("files");
+            try jw.write(value);
+        }
+        if (self.chunking_strategy) |value| {
+            try jw.objectField("chunking_strategy");
+            try jw.write(value);
+        }
+        if (self.attributes) |value| {
+            try jw.objectField("attributes");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const ThreadItem = union(enum) {
     user_message_item: UserMessageItem,
     assistant_message_item: AssistantMessageItem,
@@ -11292,6 +11242,56 @@ pub const ThreadItem = union(enum) {
     }
 };
 
+/// Multi-modal input and output contents.
+pub const Content = std.json.Value;
+
+/// Emitted when a new content part is added.
+pub const ResponseContentPartAddedEvent = struct {
+    /// The type of the event. Always `response.content_part.added`.
+    type: []const u8,
+    /// The ID of the output item that the content part was added to.
+    item_id: []const u8,
+    /// The index of the output item that the content part was added to.
+    output_index: i64,
+    /// The index of the content part that was added.
+    content_index: i64,
+    /// The content part that was added.
+    part: OutputContent,
+    /// The sequence number of this event.
+    sequence_number: i64,
+};
+
+/// Emitted when a content part is done.
+pub const ResponseContentPartDoneEvent = struct {
+    /// The type of the event. Always `response.content_part.done`.
+    type: []const u8,
+    /// The ID of the output item that the content part was added to.
+    item_id: []const u8,
+    /// The index of the output item that the content part was added to.
+    output_index: i64,
+    /// The index of the content part that is done.
+    content_index: i64,
+    /// The sequence number of this event.
+    sequence_number: i64,
+    /// The content part that is done.
+    part: OutputContent,
+};
+
+/// An output message from the model.
+pub const OutputMessage = struct {
+    /// The unique ID of the output message.
+    id: []const u8,
+    /// The type of the output message. Always `message`.
+    type: []const u8,
+    /// The role of the output message. Always `assistant`.
+    role: []const u8,
+    /// The content of the output message.
+    content: []const OutputMessageContent,
+    phase: ?std.json.Value = null,
+    /// The status of the message input. One of `in_progress`, `completed`, or `incomplete`. Populated when input items are returned via API.
+    status: []const u8,
+};
+
 pub const ListRunStepsResponse = struct {
     object: []const u8,
     data: []const RunStepObject,
@@ -11302,12 +11302,12 @@ pub const ListRunStepsResponse = struct {
 
 pub const RunStepStreamEvent = union(enum) {
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValue(T, allocator, source, options) catch |err| switch (err) {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return null,
         };
         const value = try allocator.create(T);
-        value.* = parsed.value;
+        value.* = parsed;
         return value;
     }
 
@@ -11324,90 +11324,6 @@ pub const RunStepStreamEvent = union(enum) {
     }
 
     pub fn jsonStringify(_: @This(), _: anytype) !void {}
-};
-
-/// A chat message that makes up the prompt or context. May include variable references to the `item` namespace, ie {{item.name}}.
-pub const CreateEvalItem = union(enum) {
-    eval_item: *EvalItem,
-
-    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValue(T, allocator, source, options) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => return null,
-        };
-        const value = try allocator.create(T);
-        value.* = parsed.value;
-        return value;
-    }
-
-    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
-        inline for (keys) |key| {
-            if (object.contains(key)) return true;
-        }
-        return false;
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        if (source != .object) return error.UnexpectedToken;
-        if (objectHasAnyKey(source.object, &.{
-            "role",
-            "content",
-            "type",
-        })) {
-            if (try parseStructuralVariant(EvalItem, allocator, source, options)) |parsed| return .{ .eval_item = parsed };
-        }
-        return error.UnexpectedToken;
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        switch (self) {
-            .eval_item => |v| try jw.write(v.*),
-        }
-    }
-};
-
-/// A LabelModelGrader object which uses a model to assign labels to each item in the evaluation.
-pub const GraderLabelModel = struct {
-    /// The object type, which is always `label_model`.
-    type: []const u8,
-    /// The name of the grader.
-    name: []const u8,
-    /// The model to use for the evaluation. Must support structured outputs.
-    model: []const u8,
-    input: []const EvalItem,
-    /// The labels to assign to each item in the evaluation.
-    labels: []const []const u8,
-    /// The labels that indicate a passing result. Must be a subset of labels.
-    passing_labels: []const []const u8,
-};
-
-/// A ScoreModelGrader object that uses a model to assign a score to the input.
-pub const GraderScoreModel = struct {
-    /// The object type, which is always `score_model`.
-    type: []const u8,
-    /// The name of the grader.
-    name: []const u8,
-    /// The model to use for the evaluation.
-    model: []const u8,
-    /// The sampling parameters for the model.
-    sampling_params: ?std.json.Value = null,
-    /// The input messages evaluated by the grader. Supports text, output text, input image, and input audio content blocks, and may include template strings.
-    input: []const EvalItem,
-    /// The range of the score. Defaults to `[0, 1]`.
-    range: ?[]const f64 = null,
-};
-
-/// A CompletionsRunDataSource object describing a model sampling configuration.
-pub const CreateEvalCompletionsRunDataSource = struct {
-    /// The type of run data source. Always `completions`.
-    type: []const u8,
-    /// Used when sampling from a model. Dictates the structure of the messages passed into the model. Can either be a reference to a prebuilt trajectory (ie, `item.input_trajectory`), or a template with variable references to the `item` namespace.
-    input_messages: ?std.json.Value = null,
-    sampling_params: ?std.json.Value = null,
-    /// The name of the model to use for generating completions (e.g. "o3-mini").
-    model: ?[]const u8 = null,
-    /// Determines what populates the `item` namespace in this run's data source.
-    source: std.json.Value,
 };
 
 pub const InputMessageResource = struct {
@@ -11523,22 +11439,6 @@ pub const RealtimeCreateClientSecretResponse = struct {
     session: std.json.Value,
 };
 
-/// A ResponsesRunDataSource object describing a model sampling configuration.
-pub const CreateEvalResponsesRunDataSource = struct {
-    /// The type of run data source. Always `responses`.
-    type: []const u8,
-    /// Used when sampling from a model. Dictates the structure of the messages passed into the model. Can either be a reference to a prebuilt trajectory (ie, `item.input_trajectory`), or a template with variable references to the `item` namespace.
-    input_messages: ?std.json.Value = null,
-    sampling_params: ?std.json.Value = null,
-    /// The name of the model to use for generating completions (e.g. "o3-mini").
-    model: ?[]const u8 = null,
-    /// Determines what populates the `item` namespace in this run's data source.
-    source: std.json.Value,
-};
-
-/// An array of tools the model may call while generating a response. You can specify which tool to use by setting the `tool_choice` parameter. We support the following categories of tools: - **Built-in tools**: Tools that are provided by OpenAI that extend the model's capabilities, like [web search](/docs/guides/tools-web-search) or [file search](/docs/guides/tools-file-search). Learn more about [built-in tools](/docs/guides/tools). - **MCP Tools**: Integrations with third-party systems via custom MCP servers or predefined connectors such as Google Drive and SharePoint. Learn more about [MCP Tools](/docs/guides/tools-connectors-mcp). - **Function calls (custom tools)**: Functions that are defined by you, enabling the model to call your own code with strongly typed arguments and outputs. Learn more about [function calling](/docs/guides/function-calling). You can also use custom tools to call your own code.
-pub const ToolsArray = []const Tool;
-
 pub const ToolSearchOutput = struct {
     /// The type of the item. Always `tool_search_output`.
     type: []const u8,
@@ -11567,6 +11467,106 @@ pub const ToolSearchOutputItemParam = struct {
     status: ?std.json.Value = null,
 };
 
+/// An array of tools the model may call while generating a response. You can specify which tool to use by setting the `tool_choice` parameter. We support the following categories of tools: - **Built-in tools**: Tools that are provided by OpenAI that extend the model's capabilities, like [web search](/docs/guides/tools-web-search) or [file search](/docs/guides/tools-file-search). Learn more about [built-in tools](/docs/guides/tools). - **MCP Tools**: Integrations with third-party systems via custom MCP servers or predefined connectors such as Google Drive and SharePoint. Learn more about [MCP Tools](/docs/guides/tools-connectors-mcp). - **Function calls (custom tools)**: Functions that are defined by you, enabling the model to call your own code with strongly typed arguments and outputs. Learn more about [function calling](/docs/guides/function-calling). You can also use custom tools to call your own code.
+pub const ToolsArray = []const Tool;
+
+/// A CompletionsRunDataSource object describing a model sampling configuration.
+pub const CreateEvalCompletionsRunDataSource = struct {
+    /// The type of run data source. Always `completions`.
+    type: []const u8,
+    /// Used when sampling from a model. Dictates the structure of the messages passed into the model. Can either be a reference to a prebuilt trajectory (ie, `item.input_trajectory`), or a template with variable references to the `item` namespace.
+    input_messages: ?std.json.Value = null,
+    sampling_params: ?std.json.Value = null,
+    /// The name of the model to use for generating completions (e.g. "o3-mini").
+    model: ?[]const u8 = null,
+    /// Determines what populates the `item` namespace in this run's data source.
+    source: std.json.Value,
+};
+
+/// A chat message that makes up the prompt or context. May include variable references to the `item` namespace, ie {{item.name}}.
+pub const CreateEvalItem = union(enum) {
+    eval_item: *EvalItem,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        if (objectHasAnyKey(source.object, &.{
+            "role",
+            "content",
+            "type",
+        })) {
+            if (try parseStructuralVariant(EvalItem, allocator, source, options)) |parsed| return .{ .eval_item = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .eval_item => |v| try jw.write(v.*),
+        }
+    }
+};
+
+/// A ResponsesRunDataSource object describing a model sampling configuration.
+pub const CreateEvalResponsesRunDataSource = struct {
+    /// The type of run data source. Always `responses`.
+    type: []const u8,
+    /// Used when sampling from a model. Dictates the structure of the messages passed into the model. Can either be a reference to a prebuilt trajectory (ie, `item.input_trajectory`), or a template with variable references to the `item` namespace.
+    input_messages: ?std.json.Value = null,
+    sampling_params: ?std.json.Value = null,
+    /// The name of the model to use for generating completions (e.g. "o3-mini").
+    model: ?[]const u8 = null,
+    /// Determines what populates the `item` namespace in this run's data source.
+    source: std.json.Value,
+};
+
+/// A LabelModelGrader object which uses a model to assign labels to each item in the evaluation.
+pub const GraderLabelModel = struct {
+    /// The object type, which is always `label_model`.
+    type: []const u8,
+    /// The name of the grader.
+    name: []const u8,
+    /// The model to use for the evaluation. Must support structured outputs.
+    model: []const u8,
+    input: []const EvalItem,
+    /// The labels to assign to each item in the evaluation.
+    labels: []const []const u8,
+    /// The labels that indicate a passing result. Must be a subset of labels.
+    passing_labels: []const []const u8,
+};
+
+/// A ScoreModelGrader object that uses a model to assign a score to the input.
+pub const GraderScoreModel = struct {
+    /// The object type, which is always `score_model`.
+    type: []const u8,
+    /// The name of the grader.
+    name: []const u8,
+    /// The model to use for the evaluation.
+    model: []const u8,
+    /// The sampling parameters for the model.
+    sampling_params: ?std.json.Value = null,
+    /// The input messages evaluated by the grader. Supports text, output text, input image, and input audio content blocks, and may include template strings.
+    input: []const EvalItem,
+    /// The range of the score. Defaults to `[0, 1]`.
+    range: ?[]const f64 = null,
+};
+
 /// A paginated list of thread items rendered for the ChatKit API.
 pub const ThreadItemListResource = struct {
     /// The type of object returned, must be `list`.
@@ -11582,122 +11582,11 @@ pub const ThreadItemListResource = struct {
 /// Represents an event emitted when streaming a Run. Each event in a server-sent events stream has an `event` and `data` property: ``` event: thread.created data: {"id": "thread_123", "object": "thread", ...} ``` We emit events whenever a new object is created, transitions to a new state, or is being streamed in parts (deltas). For example, we emit `thread.run.created` when a new run is created, `thread.run.completed` when a run completes, and so on. When an Assistant chooses to create a message during a run, we emit a `thread.message.created event`, a `thread.message.in_progress` event, many `thread.message.delta` events, and finally a `thread.message.completed` event. We may add additional events over time, so we recommend handling unknown events gracefully in your code. See the [Assistants API quickstart](/docs/assistants/overview) to learn how to integrate the Assistants API with streaming.
 pub const AssistantStreamEvent = std.json.Value;
 
-/// A LabelModelGrader object which uses a model to assign labels to each item in the evaluation.
-pub const CreateEvalLabelModelGrader = struct {
-    /// The object type, which is always `label_model`.
-    type: []const u8,
-    /// The name of the grader.
-    name: []const u8,
-    /// The model to use for the evaluation. Must support structured outputs.
-    model: []const u8,
-    /// A list of chat messages forming the prompt or context. May include variable references to the `item` namespace, ie {{item.name}}.
-    input: []const CreateEvalItem,
-    /// The labels to classify to each item in the evaluation.
-    labels: []const []const u8,
-    /// The labels that indicate a passing result. Must be a subset of labels.
-    passing_labels: []const []const u8,
-};
-
-pub const EvalGraderLabelModel = struct {
-    /// The object type, which is always `label_model`.
-    type: []const u8,
-    /// The name of the grader.
-    name: []const u8,
-    /// The model to use for the evaluation. Must support structured outputs.
-    model: []const u8,
-    input: []const EvalItem,
-    /// The labels to assign to each item in the evaluation.
-    labels: []const []const u8,
-    /// The labels that indicate a passing result. Must be a subset of labels.
-    passing_labels: []const []const u8,
-};
-
-pub const EvalGraderScoreModel = struct {
-    /// The object type, which is always `score_model`.
-    type: []const u8,
-    /// The name of the grader.
-    name: []const u8,
-    /// The model to use for the evaluation.
-    model: []const u8,
-    /// The sampling parameters for the model.
-    sampling_params: ?std.json.Value = null,
-    /// The input messages evaluated by the grader. Supports text, output text, input image, and input audio content blocks, and may include template strings.
-    input: []const EvalItem,
-    /// The range of the score. Defaults to `[0, 1]`.
-    range: ?[]const f64 = null,
-    /// The threshold for the score.
-    pass_threshold: ?f64 = null,
-};
-
-/// A MultiGrader object combines the output of multiple graders to produce a single score.
-pub const GraderMulti = struct {
-    /// The object type, which is always `multi`.
-    type: []const u8,
-    /// The name of the grader.
-    name: []const u8,
-    graders: std.json.Value,
-    /// A formula to calculate the output based on grader results.
-    calculate_output: []const u8,
-};
-
 /// A realtime client event.
 pub const RealtimeClientEvent = std.json.Value;
 
 /// A realtime server event.
 pub const RealtimeServerEvent = std.json.Value;
-
-pub const CreateEvalRunRequest = struct {
-    /// The name of the run.
-    name: ?[]const u8 = null,
-    metadata: ?Metadata = null,
-    /// Details about the run's data source.
-    data_source: std.json.Value,
-};
-
-/// A schema representing an evaluation run.
-pub const EvalRun = struct {
-    /// The type of the object. Always "eval.run".
-    object: []const u8,
-    /// Unique identifier for the evaluation run.
-    id: []const u8,
-    /// The identifier of the associated evaluation.
-    eval_id: []const u8,
-    /// The status of the evaluation run.
-    status: []const u8,
-    /// The model that is evaluated, if applicable.
-    model: []const u8,
-    /// The name of the evaluation run.
-    name: []const u8,
-    /// Unix timestamp (in seconds) when the evaluation run was created.
-    created_at: i64,
-    /// The URL to the rendered evaluation run report on the UI dashboard.
-    report_url: []const u8,
-    /// Counters summarizing the outcomes of the evaluation run.
-    result_counts: std.json.Value,
-    /// Usage statistics for each model during the evaluation run.
-    per_model_usage: []const std.json.Value,
-    /// Results per testing criteria applied during the evaluation run.
-    per_testing_criteria_results: []const std.json.Value,
-    /// Information about the run's data source.
-    data_source: std.json.Value,
-    metadata: Metadata,
-    @"error": EvalApiError,
-};
-
-pub const ResponseProperties = struct {
-    previous_response_id: ?std.json.Value = null,
-    /// Model ID used to generate the response, like `gpt-4o` or `o3`. OpenAI offers a wide range of models with different capabilities, performance characteristics, and price points. Refer to the [model guide](/docs/models) to browse and compare available models.
-    model: ?ModelIdsResponses = null,
-    reasoning: ?std.json.Value = null,
-    background: ?std.json.Value = null,
-    max_output_tokens: ?std.json.Value = null,
-    max_tool_calls: ?std.json.Value = null,
-    text: ?ResponseTextParam = null,
-    tools: ?ToolsArray = null,
-    tool_choice: ?ToolChoiceParam = null,
-    prompt: ?Prompt = null,
-    truncation: ?std.json.Value = null,
-};
 
 /// A single item within a conversation. The set of possible types are the same as the `output` type of a [Response object](/docs/api-reference/responses/object#responses/object-output).
 pub const ConversationItem = union(enum) {
@@ -11829,6 +11718,155 @@ pub const ConversationItem = union(enum) {
             .computer_tool_call_output_resource => |v| try jw.write(v),
             .tool_search_call => |v| try jw.write(v),
             .tool_search_output => |v| try jw.write(v),
+            .reasoning_item => |v| try jw.write(v),
+            .compaction_body => |v| try jw.write(v),
+            .code_interpreter_tool_call => |v| try jw.write(v),
+            .local_shell_tool_call => |v| try jw.write(v),
+            .local_shell_tool_call_output => |v| try jw.write(v),
+            .function_shell_call => |v| try jw.write(v),
+            .function_shell_call_output => |v| try jw.write(v),
+            .apply_patch_tool_call => |v| try jw.write(v),
+            .apply_patch_tool_call_output => |v| try jw.write(v),
+            .mcp_list_tools => |v| try jw.write(v),
+            .mcp_approval_request => |v| try jw.write(v),
+            .mcp_approval_response_resource => |v| try jw.write(v),
+            .mcp_tool_call => |v| try jw.write(v),
+            .custom_tool_call => |v| try jw.write(v),
+            .custom_tool_call_output => |v| try jw.write(v),
+        }
+    }
+};
+
+/// An item representing a message, tool call, tool output, reasoning, or other response element.
+pub const ItemField = union(enum) {
+    message: Message,
+    function_tool_call: FunctionToolCall,
+    tool_search_call: ToolSearchCall,
+    tool_search_output: ToolSearchOutput,
+    function_tool_call_output: FunctionToolCallOutput,
+    file_search_tool_call: FileSearchToolCall,
+    web_search_tool_call: WebSearchToolCall,
+    image_gen_tool_call: ImageGenToolCall,
+    computer_tool_call: ComputerToolCall,
+    computer_tool_call_output_resource: ComputerToolCallOutputResource,
+    reasoning_item: ReasoningItem,
+    compaction_body: CompactionBody,
+    code_interpreter_tool_call: CodeInterpreterToolCall,
+    local_shell_tool_call: LocalShellToolCall,
+    local_shell_tool_call_output: LocalShellToolCallOutput,
+    function_shell_call: FunctionShellCall,
+    function_shell_call_output: FunctionShellCallOutput,
+    apply_patch_tool_call: ApplyPatchToolCall,
+    apply_patch_tool_call_output: ApplyPatchToolCallOutput,
+    mcp_list_tools: MCPListTools,
+    mcp_approval_request: MCPApprovalRequest,
+    mcp_approval_response_resource: MCPApprovalResponseResource,
+    mcp_tool_call: MCPToolCall,
+    custom_tool_call: CustomToolCall,
+    custom_tool_call_output: CustomToolCallOutput,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_str = switch (disc_val) {
+            .string => |s| s,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "Message")) {
+            return .{ .message = try std.json.parseFromValueLeaky(Message, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionToolCall")) {
+            return .{ .function_tool_call = try std.json.parseFromValueLeaky(FunctionToolCall, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ToolSearchCall")) {
+            return .{ .tool_search_call = try std.json.parseFromValueLeaky(ToolSearchCall, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ToolSearchOutput")) {
+            return .{ .tool_search_output = try std.json.parseFromValueLeaky(ToolSearchOutput, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionToolCallOutput")) {
+            return .{ .function_tool_call_output = try std.json.parseFromValueLeaky(FunctionToolCallOutput, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FileSearchToolCall")) {
+            return .{ .file_search_tool_call = try std.json.parseFromValueLeaky(FileSearchToolCall, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "WebSearchToolCall")) {
+            return .{ .web_search_tool_call = try std.json.parseFromValueLeaky(WebSearchToolCall, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ImageGenToolCall")) {
+            return .{ .image_gen_tool_call = try std.json.parseFromValueLeaky(ImageGenToolCall, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ComputerToolCall")) {
+            return .{ .computer_tool_call = try std.json.parseFromValueLeaky(ComputerToolCall, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ComputerToolCallOutputResource")) {
+            return .{ .computer_tool_call_output_resource = try std.json.parseFromValueLeaky(ComputerToolCallOutputResource, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ReasoningItem")) {
+            return .{ .reasoning_item = try std.json.parseFromValueLeaky(ReasoningItem, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CompactionBody")) {
+            return .{ .compaction_body = try std.json.parseFromValueLeaky(CompactionBody, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CodeInterpreterToolCall")) {
+            return .{ .code_interpreter_tool_call = try std.json.parseFromValueLeaky(CodeInterpreterToolCall, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "LocalShellToolCall")) {
+            return .{ .local_shell_tool_call = try std.json.parseFromValueLeaky(LocalShellToolCall, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "LocalShellToolCallOutput")) {
+            return .{ .local_shell_tool_call_output = try std.json.parseFromValueLeaky(LocalShellToolCallOutput, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionShellCall")) {
+            return .{ .function_shell_call = try std.json.parseFromValueLeaky(FunctionShellCall, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "FunctionShellCallOutput")) {
+            return .{ .function_shell_call_output = try std.json.parseFromValueLeaky(FunctionShellCallOutput, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ApplyPatchToolCall")) {
+            return .{ .apply_patch_tool_call = try std.json.parseFromValueLeaky(ApplyPatchToolCall, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ApplyPatchToolCallOutput")) {
+            return .{ .apply_patch_tool_call_output = try std.json.parseFromValueLeaky(ApplyPatchToolCallOutput, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPListTools")) {
+            return .{ .mcp_list_tools = try std.json.parseFromValueLeaky(MCPListTools, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPApprovalRequest")) {
+            return .{ .mcp_approval_request = try std.json.parseFromValueLeaky(MCPApprovalRequest, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPApprovalResponseResource")) {
+            return .{ .mcp_approval_response_resource = try std.json.parseFromValueLeaky(MCPApprovalResponseResource, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "MCPToolCall")) {
+            return .{ .mcp_tool_call = try std.json.parseFromValueLeaky(MCPToolCall, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CustomToolCall")) {
+            return .{ .custom_tool_call = try std.json.parseFromValueLeaky(CustomToolCall, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "CustomToolCallOutput")) {
+            return .{ .custom_tool_call_output = try std.json.parseFromValueLeaky(CustomToolCallOutput, allocator, source, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .message => |v| try jw.write(v),
+            .function_tool_call => |v| try jw.write(v),
+            .tool_search_call => |v| try jw.write(v),
+            .tool_search_output => |v| try jw.write(v),
+            .function_tool_call_output => |v| try jw.write(v),
+            .file_search_tool_call => |v| try jw.write(v),
+            .web_search_tool_call => |v| try jw.write(v),
+            .image_gen_tool_call => |v| try jw.write(v),
+            .computer_tool_call => |v| try jw.write(v),
+            .computer_tool_call_output_resource => |v| try jw.write(v),
             .reasoning_item => |v| try jw.write(v),
             .compaction_body => |v| try jw.write(v),
             .code_interpreter_tool_call => |v| try jw.write(v),
@@ -12150,155 +12188,6 @@ pub const OutputItem = union(enum) {
     }
 };
 
-/// An item representing a message, tool call, tool output, reasoning, or other response element.
-pub const ItemField = union(enum) {
-    message: Message,
-    function_tool_call: FunctionToolCall,
-    tool_search_call: ToolSearchCall,
-    tool_search_output: ToolSearchOutput,
-    function_tool_call_output: FunctionToolCallOutput,
-    file_search_tool_call: FileSearchToolCall,
-    web_search_tool_call: WebSearchToolCall,
-    image_gen_tool_call: ImageGenToolCall,
-    computer_tool_call: ComputerToolCall,
-    computer_tool_call_output_resource: ComputerToolCallOutputResource,
-    reasoning_item: ReasoningItem,
-    compaction_body: CompactionBody,
-    code_interpreter_tool_call: CodeInterpreterToolCall,
-    local_shell_tool_call: LocalShellToolCall,
-    local_shell_tool_call_output: LocalShellToolCallOutput,
-    function_shell_call: FunctionShellCall,
-    function_shell_call_output: FunctionShellCallOutput,
-    apply_patch_tool_call: ApplyPatchToolCall,
-    apply_patch_tool_call_output: ApplyPatchToolCallOutput,
-    mcp_list_tools: MCPListTools,
-    mcp_approval_request: MCPApprovalRequest,
-    mcp_approval_response_resource: MCPApprovalResponseResource,
-    mcp_tool_call: MCPToolCall,
-    custom_tool_call: CustomToolCall,
-    custom_tool_call_output: CustomToolCallOutput,
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
-        return try jsonParseFromValue(allocator, value, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
-        const disc_str = switch (disc_val) {
-            .string => |s| s,
-            else => return error.UnexpectedToken,
-        };
-        if (std.mem.eql(u8, disc_str, "Message")) {
-            return .{ .message = try std.json.parseFromValueLeaky(Message, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "FunctionToolCall")) {
-            return .{ .function_tool_call = try std.json.parseFromValueLeaky(FunctionToolCall, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "ToolSearchCall")) {
-            return .{ .tool_search_call = try std.json.parseFromValueLeaky(ToolSearchCall, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "ToolSearchOutput")) {
-            return .{ .tool_search_output = try std.json.parseFromValueLeaky(ToolSearchOutput, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "FunctionToolCallOutput")) {
-            return .{ .function_tool_call_output = try std.json.parseFromValueLeaky(FunctionToolCallOutput, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "FileSearchToolCall")) {
-            return .{ .file_search_tool_call = try std.json.parseFromValueLeaky(FileSearchToolCall, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "WebSearchToolCall")) {
-            return .{ .web_search_tool_call = try std.json.parseFromValueLeaky(WebSearchToolCall, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "ImageGenToolCall")) {
-            return .{ .image_gen_tool_call = try std.json.parseFromValueLeaky(ImageGenToolCall, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "ComputerToolCall")) {
-            return .{ .computer_tool_call = try std.json.parseFromValueLeaky(ComputerToolCall, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "ComputerToolCallOutputResource")) {
-            return .{ .computer_tool_call_output_resource = try std.json.parseFromValueLeaky(ComputerToolCallOutputResource, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "ReasoningItem")) {
-            return .{ .reasoning_item = try std.json.parseFromValueLeaky(ReasoningItem, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "CompactionBody")) {
-            return .{ .compaction_body = try std.json.parseFromValueLeaky(CompactionBody, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "CodeInterpreterToolCall")) {
-            return .{ .code_interpreter_tool_call = try std.json.parseFromValueLeaky(CodeInterpreterToolCall, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "LocalShellToolCall")) {
-            return .{ .local_shell_tool_call = try std.json.parseFromValueLeaky(LocalShellToolCall, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "LocalShellToolCallOutput")) {
-            return .{ .local_shell_tool_call_output = try std.json.parseFromValueLeaky(LocalShellToolCallOutput, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "FunctionShellCall")) {
-            return .{ .function_shell_call = try std.json.parseFromValueLeaky(FunctionShellCall, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "FunctionShellCallOutput")) {
-            return .{ .function_shell_call_output = try std.json.parseFromValueLeaky(FunctionShellCallOutput, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "ApplyPatchToolCall")) {
-            return .{ .apply_patch_tool_call = try std.json.parseFromValueLeaky(ApplyPatchToolCall, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "ApplyPatchToolCallOutput")) {
-            return .{ .apply_patch_tool_call_output = try std.json.parseFromValueLeaky(ApplyPatchToolCallOutput, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "MCPListTools")) {
-            return .{ .mcp_list_tools = try std.json.parseFromValueLeaky(MCPListTools, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "MCPApprovalRequest")) {
-            return .{ .mcp_approval_request = try std.json.parseFromValueLeaky(MCPApprovalRequest, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "MCPApprovalResponseResource")) {
-            return .{ .mcp_approval_response_resource = try std.json.parseFromValueLeaky(MCPApprovalResponseResource, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "MCPToolCall")) {
-            return .{ .mcp_tool_call = try std.json.parseFromValueLeaky(MCPToolCall, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "CustomToolCall")) {
-            return .{ .custom_tool_call = try std.json.parseFromValueLeaky(CustomToolCall, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "CustomToolCallOutput")) {
-            return .{ .custom_tool_call_output = try std.json.parseFromValueLeaky(CustomToolCallOutput, allocator, source, options) };
-        }
-        return error.UnexpectedToken;
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        switch (self) {
-            .message => |v| try jw.write(v),
-            .function_tool_call => |v| try jw.write(v),
-            .tool_search_call => |v| try jw.write(v),
-            .tool_search_output => |v| try jw.write(v),
-            .function_tool_call_output => |v| try jw.write(v),
-            .file_search_tool_call => |v| try jw.write(v),
-            .web_search_tool_call => |v| try jw.write(v),
-            .image_gen_tool_call => |v| try jw.write(v),
-            .computer_tool_call => |v| try jw.write(v),
-            .computer_tool_call_output_resource => |v| try jw.write(v),
-            .reasoning_item => |v| try jw.write(v),
-            .compaction_body => |v| try jw.write(v),
-            .code_interpreter_tool_call => |v| try jw.write(v),
-            .local_shell_tool_call => |v| try jw.write(v),
-            .local_shell_tool_call_output => |v| try jw.write(v),
-            .function_shell_call => |v| try jw.write(v),
-            .function_shell_call_output => |v| try jw.write(v),
-            .apply_patch_tool_call => |v| try jw.write(v),
-            .apply_patch_tool_call_output => |v| try jw.write(v),
-            .mcp_list_tools => |v| try jw.write(v),
-            .mcp_approval_request => |v| try jw.write(v),
-            .mcp_approval_response_resource => |v| try jw.write(v),
-            .mcp_tool_call => |v| try jw.write(v),
-            .custom_tool_call => |v| try jw.write(v),
-            .custom_tool_call_output => |v| try jw.write(v),
-        }
-    }
-};
-
 /// Content item used to generate a response.
 pub const Item = union(enum) {
     input_message: InputMessage,
@@ -12453,6 +12342,234 @@ pub const Item = union(enum) {
     }
 };
 
+pub const ResponseProperties = struct {
+    previous_response_id: ?std.json.Value = null,
+    /// Model ID used to generate the response, like `gpt-4o` or `o3`. OpenAI offers a wide range of models with different capabilities, performance characteristics, and price points. Refer to the [model guide](/docs/models) to browse and compare available models.
+    model: ?ModelIdsResponses = null,
+    reasoning: ?std.json.Value = null,
+    background: ?std.json.Value = null,
+    max_output_tokens: ?std.json.Value = null,
+    max_tool_calls: ?std.json.Value = null,
+    text: ?ResponseTextParam = null,
+    tools: ?ToolsArray = null,
+    tool_choice: ?ToolChoiceParam = null,
+    prompt: ?Prompt = null,
+    truncation: ?std.json.Value = null,
+};
+
+/// A LabelModelGrader object which uses a model to assign labels to each item in the evaluation.
+pub const CreateEvalLabelModelGrader = struct {
+    /// The object type, which is always `label_model`.
+    type: []const u8,
+    /// The name of the grader.
+    name: []const u8,
+    /// The model to use for the evaluation. Must support structured outputs.
+    model: []const u8,
+    /// A list of chat messages forming the prompt or context. May include variable references to the `item` namespace, ie {{item.name}}.
+    input: []const CreateEvalItem,
+    /// The labels to classify to each item in the evaluation.
+    labels: []const []const u8,
+    /// The labels that indicate a passing result. Must be a subset of labels.
+    passing_labels: []const []const u8,
+};
+
+pub const CreateEvalRunRequest = struct {
+    /// The name of the run.
+    name: ?[]const u8 = null,
+    metadata: ?Metadata = null,
+    /// Details about the run's data source.
+    data_source: std.json.Value,
+};
+
+/// A schema representing an evaluation run.
+pub const EvalRun = struct {
+    /// The type of the object. Always "eval.run".
+    object: []const u8,
+    /// Unique identifier for the evaluation run.
+    id: []const u8,
+    /// The identifier of the associated evaluation.
+    eval_id: []const u8,
+    /// The status of the evaluation run.
+    status: []const u8,
+    /// The model that is evaluated, if applicable.
+    model: []const u8,
+    /// The name of the evaluation run.
+    name: []const u8,
+    /// Unix timestamp (in seconds) when the evaluation run was created.
+    created_at: i64,
+    /// The URL to the rendered evaluation run report on the UI dashboard.
+    report_url: []const u8,
+    /// Counters summarizing the outcomes of the evaluation run.
+    result_counts: std.json.Value,
+    /// Usage statistics for each model during the evaluation run.
+    per_model_usage: []const std.json.Value,
+    /// Results per testing criteria applied during the evaluation run.
+    per_testing_criteria_results: []const std.json.Value,
+    /// Information about the run's data source.
+    data_source: std.json.Value,
+    metadata: Metadata,
+    @"error": EvalApiError,
+};
+
+pub const EvalGraderLabelModel = struct {
+    /// The object type, which is always `label_model`.
+    type: []const u8,
+    /// The name of the grader.
+    name: []const u8,
+    /// The model to use for the evaluation. Must support structured outputs.
+    model: []const u8,
+    input: []const EvalItem,
+    /// The labels to assign to each item in the evaluation.
+    labels: []const []const u8,
+    /// The labels that indicate a passing result. Must be a subset of labels.
+    passing_labels: []const []const u8,
+};
+
+pub const EvalGraderScoreModel = struct {
+    /// The object type, which is always `score_model`.
+    type: []const u8,
+    /// The name of the grader.
+    name: []const u8,
+    /// The model to use for the evaluation.
+    model: []const u8,
+    /// The sampling parameters for the model.
+    sampling_params: ?std.json.Value = null,
+    /// The input messages evaluated by the grader. Supports text, output text, input image, and input audio content blocks, and may include template strings.
+    input: []const EvalItem,
+    /// The range of the score. Defaults to `[0, 1]`.
+    range: ?[]const f64 = null,
+    /// The threshold for the score.
+    pass_threshold: ?f64 = null,
+};
+
+/// A MultiGrader object combines the output of multiple graders to produce a single score.
+pub const GraderMulti = struct {
+    /// The object type, which is always `multi`.
+    type: []const u8,
+    /// The name of the grader.
+    name: []const u8,
+    graders: std.json.Value,
+    /// A formula to calculate the output based on grader results.
+    calculate_output: []const u8,
+};
+
+/// A list of Conversation items.
+pub const ConversationItemList = struct {
+    /// The type of object returned, must be `list`.
+    object: []const u8,
+    /// A list of conversation items.
+    data: []const ConversationItem,
+    /// Whether there are more items available.
+    has_more: bool,
+    /// The ID of the first item in the list.
+    first_id: []const u8,
+    /// The ID of the last item in the list.
+    last_id: []const u8,
+};
+
+pub const CompactResource = struct {
+    /// The unique identifier for the compacted response.
+    id: []const u8,
+    /// The object type. Always `response.compaction`.
+    object: []const u8,
+    /// The compacted list of output items.
+    output: []const ItemField,
+    /// Unix timestamp (in seconds) when the compacted conversation was created.
+    created_at: i64,
+    /// Token accounting for the compaction pass, including cached, reasoning, and total tokens.
+    usage: ResponseUsage,
+};
+
+/// A list of Response items.
+pub const ResponseItemList = struct {
+    /// The type of object returned, must be `list`.
+    object: []const u8,
+    /// A list of items used to generate this response.
+    data: []const ItemResource,
+    /// Whether there are more items available.
+    has_more: bool,
+    /// The ID of the first item in the list.
+    first_id: []const u8,
+    /// The ID of the last item in the list.
+    last_id: []const u8,
+};
+
+/// Emitted when a new output item is added.
+pub const ResponseOutputItemAddedEvent = struct {
+    /// The type of the event. Always `response.output_item.added`.
+    type: []const u8,
+    /// The index of the output item that was added.
+    output_index: i64,
+    /// The sequence number of this event.
+    sequence_number: i64,
+    /// The output item that was added.
+    item: OutputItem,
+};
+
+/// Emitted when an output item is marked done.
+pub const ResponseOutputItemDoneEvent = struct {
+    /// The type of the event. Always `response.output_item.done`.
+    type: []const u8,
+    /// The index of the output item that was marked done.
+    output_index: i64,
+    /// The sequence number of this event.
+    sequence_number: i64,
+    /// The output item that was marked done.
+    item: OutputItem,
+};
+
+pub const InputItem = union(enum) {
+    easy_input_message: EasyInputMessage,
+    item: Item,
+    item_reference_param: ItemReferenceParam,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("type") orelse return error.MissingField;
+        const disc_str = switch (disc_val) {
+            .string => |s| s,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "EasyInputMessage")) {
+            return .{ .easy_input_message = try std.json.parseFromValueLeaky(EasyInputMessage, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "Item")) {
+            return .{ .item = try std.json.parseFromValueLeaky(Item, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "ItemReferenceParam")) {
+            return .{ .item_reference_param = try std.json.parseFromValueLeaky(ItemReferenceParam, allocator, source, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .easy_input_message => |v| try jw.write(v),
+            .item => |v| try jw.write(v),
+            .item_reference_param => |v| try jw.write(v),
+        }
+    }
+};
+
+/// An object representing a list of runs for an evaluation.
+pub const EvalRunList = struct {
+    /// The type of this object. It is always set to "list".
+    object: []const u8,
+    /// An array of eval run objects.
+    data: []const EvalRun,
+    /// The identifier of the first eval run in the data array.
+    first_id: []const u8,
+    /// The identifier of the last eval run in the data array.
+    last_id: []const u8,
+    /// Indicates whether there are more evals available.
+    has_more: bool,
+};
+
 pub const CreateEvalRequest = struct {
     /// The name of the evaluation.
     name: ?[]const u8 = null,
@@ -12506,144 +12623,17 @@ pub const ValidateGraderResponse = struct {
     grader: ?std.json.Value = null,
 };
 
-/// An object representing a list of runs for an evaluation.
-pub const EvalRunList = struct {
-    /// The type of this object. It is always set to "list".
-    object: []const u8,
-    /// An array of eval run objects.
-    data: []const EvalRun,
-    /// The identifier of the first eval run in the data array.
-    first_id: []const u8,
-    /// The identifier of the last eval run in the data array.
-    last_id: []const u8,
-    /// Indicates whether there are more evals available.
-    has_more: bool,
+pub const CompactResponseMethodPublicBody = struct {
+    model: ModelIdsCompaction,
+    input: ?std.json.Value = null,
+    previous_response_id: ?std.json.Value = null,
+    instructions: ?std.json.Value = null,
+    prompt_cache_key: ?std.json.Value = null,
 };
 
-/// A list of Conversation items.
-pub const ConversationItemList = struct {
-    /// The type of object returned, must be `list`.
-    object: []const u8,
-    /// A list of conversation items.
-    data: []const ConversationItem,
-    /// Whether there are more items available.
-    has_more: bool,
-    /// The ID of the first item in the list.
-    first_id: []const u8,
-    /// The ID of the last item in the list.
-    last_id: []const u8,
-};
-
-/// A list of Response items.
-pub const ResponseItemList = struct {
-    /// The type of object returned, must be `list`.
-    object: []const u8,
-    /// A list of items used to generate this response.
-    data: []const ItemResource,
-    /// Whether there are more items available.
-    has_more: bool,
-    /// The ID of the first item in the list.
-    first_id: []const u8,
-    /// The ID of the last item in the list.
-    last_id: []const u8,
-};
-
-/// Emitted when a new output item is added.
-pub const ResponseOutputItemAddedEvent = struct {
-    /// The type of the event. Always `response.output_item.added`.
-    type: []const u8,
-    /// The index of the output item that was added.
-    output_index: i64,
-    /// The sequence number of this event.
-    sequence_number: i64,
-    /// The output item that was added.
-    item: OutputItem,
-};
-
-/// Emitted when an output item is marked done.
-pub const ResponseOutputItemDoneEvent = struct {
-    /// The type of the event. Always `response.output_item.done`.
-    type: []const u8,
-    /// The index of the output item that was marked done.
-    output_index: i64,
-    /// The sequence number of this event.
-    sequence_number: i64,
-    /// The output item that was marked done.
-    item: OutputItem,
-};
-
-pub const CompactResource = struct {
-    /// The unique identifier for the compacted response.
-    id: []const u8,
-    /// The object type. Always `response.compaction`.
-    object: []const u8,
-    /// The compacted list of output items.
-    output: []const ItemField,
-    /// Unix timestamp (in seconds) when the compacted conversation was created.
-    created_at: i64,
-    /// Token accounting for the compaction pass, including cached, reasoning, and total tokens.
-    usage: ResponseUsage,
-};
-
-pub const InputItem = union(enum) {
-    easy_input_message: EasyInputMessage,
-    item: Item,
-    item_reference_param: ItemReferenceParam,
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
-        return try jsonParseFromValue(allocator, value, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse return error.MissingField;
-        const disc_str = switch (disc_val) {
-            .string => |s| s,
-            else => return error.UnexpectedToken,
-        };
-        if (std.mem.eql(u8, disc_str, "EasyInputMessage")) {
-            return .{ .easy_input_message = try std.json.parseFromValueLeaky(EasyInputMessage, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "Item")) {
-            return .{ .item = try std.json.parseFromValueLeaky(Item, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "ItemReferenceParam")) {
-            return .{ .item_reference_param = try std.json.parseFromValueLeaky(ItemReferenceParam, allocator, source, options) };
-        }
-        return error.UnexpectedToken;
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        switch (self) {
-            .easy_input_message => |v| try jw.write(v),
-            .item => |v| try jw.write(v),
-            .item_reference_param => |v| try jw.write(v),
-        }
-    }
-};
-
-/// An object representing a list of evals.
-pub const EvalList = struct {
-    /// The type of this object. It is always set to "list".
-    object: []const u8,
-    /// An array of eval objects.
-    data: []const Eval,
-    /// The identifier of the first eval in the data array.
-    first_id: []const u8,
-    /// The identifier of the last eval in the data array.
-    last_id: []const u8,
-    /// Indicates whether there are more evals available.
-    has_more: bool,
-};
-
-/// The method used for fine-tuning.
-pub const FineTuneMethod = struct {
-    /// The type of method. Is either `supervised`, `dpo`, or `reinforcement`.
-    type: []const u8,
-    supervised: ?FineTuneSupervisedMethod = null,
-    dpo: ?FineTuneDPOMethod = null,
-    reinforcement: ?FineTuneReinforcementMethod = null,
+pub const CreateConversationBody = struct {
+    metadata: ?std.json.Value = null,
+    items: ?std.json.Value = null,
 };
 
 /// Text, image, or file inputs to the model, used to generate a response. Learn more: - [Text inputs and outputs](/docs/guides/text) - [Image inputs](/docs/guides/images) - [File inputs](/docs/guides/pdf-files) - [Conversation state](/docs/guides/conversation-state) - [Function calling](/docs/guides/function-calling)
@@ -12695,11 +12685,6 @@ pub const Response = struct {
     conversation: ?std.json.Value = null,
 };
 
-pub const CreateConversationBody = struct {
-    metadata: ?std.json.Value = null,
-    items: ?std.json.Value = null,
-};
-
 pub const TokenCountsBody = struct {
     model: ?std.json.Value = null,
     input: ?std.json.Value = null,
@@ -12715,64 +12700,27 @@ pub const TokenCountsBody = struct {
     parallel_tool_calls: ?std.json.Value = null,
 };
 
-pub const CompactResponseMethodPublicBody = struct {
-    model: ModelIdsCompaction,
-    input: ?std.json.Value = null,
-    previous_response_id: ?std.json.Value = null,
-    instructions: ?std.json.Value = null,
-    prompt_cache_key: ?std.json.Value = null,
-};
-
-pub const CreateFineTuningJobRequest = struct {
-    /// The name of the model to fine-tune. You can select one of the [supported models](/docs/guides/fine-tuning#which-models-can-be-fine-tuned).
-    model: std.json.Value,
-    /// The ID of an uploaded file that contains training data. See [upload file](/docs/api-reference/files/create) for how to upload a file. Your dataset must be formatted as a JSONL file. Additionally, you must upload your file with the purpose `fine-tune`. The contents of the file should differ depending on if the model uses the [chat](/docs/api-reference/fine-tuning/chat-input), [completions](/docs/api-reference/fine-tuning/completions-input) format, or if the fine-tuning method uses the [preference](/docs/api-reference/fine-tuning/preference-input) format. See the [fine-tuning guide](/docs/guides/model-optimization) for more details.
-    training_file: []const u8,
-    /// The hyperparameters used for the fine-tuning job. This value is now deprecated in favor of `method`, and should be passed in under the `method` parameter.
-    hyperparameters: ?std.json.Value = null,
-    /// A string of up to 64 characters that will be added to your fine-tuned model name. For example, a `suffix` of "custom-model-name" would produce a model name like `ft:gpt-4o-mini:openai:custom-model-name:7p4lURel`.
-    suffix: ?[]const u8 = null,
-    /// The ID of an uploaded file that contains validation data. If you provide this file, the data is used to generate validation metrics periodically during fine-tuning. These metrics can be viewed in the fine-tuning results file. The same data should not be present in both train and validation files. Your dataset must be formatted as a JSONL file. You must upload your file with the purpose `fine-tune`. See the [fine-tuning guide](/docs/guides/model-optimization) for more details.
-    validation_file: ?[]const u8 = null,
-    /// A list of integrations to enable for your fine-tuning job.
-    integrations: ?[]const std.json.Value = null,
-    /// The seed controls the reproducibility of the job. Passing in the same seed and job parameters should produce the same results, but may differ in rare cases. If a seed is not specified, one will be generated for you.
-    seed: ?i64 = null,
-    method: ?FineTuneMethod = null,
-    metadata: ?Metadata = null,
-};
-
-/// The `fine_tuning.job` object represents a fine-tuning job that has been created through the API.
-pub const FineTuningJob = struct {
-    /// The object identifier, which can be referenced in the API endpoints.
-    id: []const u8,
-    /// The Unix timestamp (in seconds) for when the fine-tuning job was created.
-    created_at: i64,
-    @"error": std.json.Value,
-    fine_tuned_model: std.json.Value,
-    finished_at: std.json.Value,
-    /// The hyperparameters used for the fine-tuning job. This value will only be returned when running `supervised` jobs.
-    hyperparameters: std.json.Value,
-    /// The base model that is being fine-tuned.
-    model: []const u8,
-    /// The object type, which is always "fine_tuning.job".
+/// An object representing a list of evals.
+pub const EvalList = struct {
+    /// The type of this object. It is always set to "list".
     object: []const u8,
-    /// The organization that owns the fine-tuning job.
-    organization_id: []const u8,
-    /// The compiled results file ID(s) for the fine-tuning job. You can retrieve the results with the [Files API](/docs/api-reference/files/retrieve-contents).
-    result_files: []const []const u8,
-    /// The current status of the fine-tuning job, which can be either `validating_files`, `queued`, `running`, `succeeded`, `failed`, or `cancelled`.
-    status: []const u8,
-    trained_tokens: std.json.Value,
-    /// The file ID used for training. You can retrieve the training data with the [Files API](/docs/api-reference/files/retrieve-contents).
-    training_file: []const u8,
-    validation_file: std.json.Value,
-    integrations: ?std.json.Value = null,
-    /// The seed used for the fine-tuning job.
-    seed: i64,
-    estimated_finish: ?std.json.Value = null,
-    method: ?FineTuneMethod = null,
-    metadata: ?Metadata = null,
+    /// An array of eval objects.
+    data: []const Eval,
+    /// The identifier of the first eval in the data array.
+    first_id: []const u8,
+    /// The identifier of the last eval in the data array.
+    last_id: []const u8,
+    /// Indicates whether there are more evals available.
+    has_more: bool,
+};
+
+/// The method used for fine-tuning.
+pub const FineTuneMethod = struct {
+    /// The type of method. Is either `supervised`, `dpo`, or `reinforcement`.
+    type: []const u8,
+    supervised: ?FineTuneSupervisedMethod = null,
+    dpo: ?FineTuneDPOMethod = null,
+    reinforcement: ?FineTuneReinforcementMethod = null,
 };
 
 pub const CreateResponse = struct {
@@ -12871,10 +12819,56 @@ pub const ResponseQueuedEvent = struct {
     sequence_number: i64,
 };
 
-pub const ListPaginatedFineTuningJobsResponse = struct {
-    data: []const FineTuningJob,
-    has_more: bool,
+pub const CreateFineTuningJobRequest = struct {
+    /// The name of the model to fine-tune. You can select one of the [supported models](/docs/guides/fine-tuning#which-models-can-be-fine-tuned).
+    model: std.json.Value,
+    /// The ID of an uploaded file that contains training data. See [upload file](/docs/api-reference/files/create) for how to upload a file. Your dataset must be formatted as a JSONL file. Additionally, you must upload your file with the purpose `fine-tune`. The contents of the file should differ depending on if the model uses the [chat](/docs/api-reference/fine-tuning/chat-input), [completions](/docs/api-reference/fine-tuning/completions-input) format, or if the fine-tuning method uses the [preference](/docs/api-reference/fine-tuning/preference-input) format. See the [fine-tuning guide](/docs/guides/model-optimization) for more details.
+    training_file: []const u8,
+    /// The hyperparameters used for the fine-tuning job. This value is now deprecated in favor of `method`, and should be passed in under the `method` parameter.
+    hyperparameters: ?std.json.Value = null,
+    /// A string of up to 64 characters that will be added to your fine-tuned model name. For example, a `suffix` of "custom-model-name" would produce a model name like `ft:gpt-4o-mini:openai:custom-model-name:7p4lURel`.
+    suffix: ?[]const u8 = null,
+    /// The ID of an uploaded file that contains validation data. If you provide this file, the data is used to generate validation metrics periodically during fine-tuning. These metrics can be viewed in the fine-tuning results file. The same data should not be present in both train and validation files. Your dataset must be formatted as a JSONL file. You must upload your file with the purpose `fine-tune`. See the [fine-tuning guide](/docs/guides/model-optimization) for more details.
+    validation_file: ?[]const u8 = null,
+    /// A list of integrations to enable for your fine-tuning job.
+    integrations: ?[]const std.json.Value = null,
+    /// The seed controls the reproducibility of the job. Passing in the same seed and job parameters should produce the same results, but may differ in rare cases. If a seed is not specified, one will be generated for you.
+    seed: ?i64 = null,
+    method: ?FineTuneMethod = null,
+    metadata: ?Metadata = null,
+};
+
+/// The `fine_tuning.job` object represents a fine-tuning job that has been created through the API.
+pub const FineTuningJob = struct {
+    /// The object identifier, which can be referenced in the API endpoints.
+    id: []const u8,
+    /// The Unix timestamp (in seconds) for when the fine-tuning job was created.
+    created_at: i64,
+    @"error": std.json.Value,
+    fine_tuned_model: std.json.Value,
+    finished_at: std.json.Value,
+    /// The hyperparameters used for the fine-tuning job. This value will only be returned when running `supervised` jobs.
+    hyperparameters: std.json.Value,
+    /// The base model that is being fine-tuned.
+    model: []const u8,
+    /// The object type, which is always "fine_tuning.job".
     object: []const u8,
+    /// The organization that owns the fine-tuning job.
+    organization_id: []const u8,
+    /// The compiled results file ID(s) for the fine-tuning job. You can retrieve the results with the [Files API](/docs/api-reference/files/retrieve-contents).
+    result_files: []const []const u8,
+    /// The current status of the fine-tuning job, which can be either `validating_files`, `queued`, `running`, `succeeded`, `failed`, or `cancelled`.
+    status: []const u8,
+    trained_tokens: std.json.Value,
+    /// The file ID used for training. You can retrieve the training data with the [Files API](/docs/api-reference/files/retrieve-contents).
+    training_file: []const u8,
+    validation_file: std.json.Value,
+    integrations: ?std.json.Value = null,
+    /// The seed used for the fine-tuning job.
+    seed: i64,
+    estimated_finish: ?std.json.Value = null,
+    method: ?FineTuneMethod = null,
+    metadata: ?Metadata = null,
 };
 
 /// Client event for creating a response over a persistent WebSocket connection. This payload uses the same top-level fields as `POST /v1/responses`. Notes: - `stream` is implicit over WebSocket and should not be sent. - `background` is not supported over WebSocket.
@@ -12917,6 +12911,12 @@ pub const ResponsesClientEventResponseCreate = struct {
 };
 
 pub const ResponseStreamEvent = std.json.Value;
+
+pub const ListPaginatedFineTuningJobsResponse = struct {
+    data: []const FineTuningJob,
+    has_more: bool,
+    object: []const u8,
+};
 
 /// Client events accepted by the Responses WebSocket server.
 pub const ResponsesClientEvent = std.json.Value;
