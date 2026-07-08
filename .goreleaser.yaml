@@ -10,7 +10,6 @@ version: 2
 
 before:
   hooks:
-    - ./scripts/completions.sh
     - go mod tidy
     - go generate ./...
 

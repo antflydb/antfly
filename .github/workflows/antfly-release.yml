@@ -119,6 +119,12 @@ jobs:
           echo "GORELEASER_CURRENT_TAG=${GITHUB_REF_NAME}" >> $GITHUB_ENV
           echo "Release version: ${GITHUB_REF_NAME}"
 
+      - name: Generate shell completions
+        timeout-minutes: 10
+        run: ./scripts/completions.sh
+        env:
+          ANTFLY_COMPLETIONS_TAGS: afrelease
+
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
         with:
