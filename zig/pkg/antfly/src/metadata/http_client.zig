@@ -25,6 +25,7 @@ const routes = @import("http_routes.zig");
 
 const max_transport_retries: usize = 1;
 const max_metadata_not_leader_retries: usize = 2;
+const default_request_timeout_ms: u32 = 5_000;
 
 fn isUriUnreserved(ch: u8) bool {
     return (ch >= 'A' and ch <= 'Z') or
@@ -412,6 +413,7 @@ pub const MetadataHttpClient = struct {
         var resp = try self.executeWithRetry(.{
             .method = .GET,
             .uri = uri,
+            .timeout_ms = default_request_timeout_ms,
         });
         defer resp.deinit(self.alloc);
         if (resp.status < 200 or resp.status >= 300) return error.UnexpectedHttpStatus;
@@ -425,6 +427,7 @@ pub const MetadataHttpClient = struct {
         var resp = try self.executeWithRetry(.{
             .method = .GET,
             .uri = uri,
+            .timeout_ms = default_request_timeout_ms,
         });
         defer resp.deinit(self.alloc);
         if (resp.status < 200 or resp.status >= 300) return error.UnexpectedHttpStatus;
@@ -453,6 +456,7 @@ pub const MetadataHttpClient = struct {
             .uri = uri,
             .body = body,
             .content_type = "application/json",
+            .timeout_ms = default_request_timeout_ms,
         });
         defer resp.deinit(self.alloc);
         try mapStatus(resp.status, bad_request_err, not_found_err, conflict_err);
@@ -477,6 +481,7 @@ pub const MetadataHttpClient = struct {
             .uri = uri,
             .body = body,
             .content_type = "application/json",
+            .timeout_ms = default_request_timeout_ms,
         });
         defer resp.deinit(self.alloc);
         try mapStatus(resp.status, bad_request_err, not_found_err, conflict_err);
@@ -497,6 +502,7 @@ pub const MetadataHttpClient = struct {
         var resp = try self.executeWithRetry(.{
             .method = method,
             .uri = uri,
+            .timeout_ms = default_request_timeout_ms,
         });
         defer resp.deinit(self.alloc);
         try mapStatus(resp.status, bad_request_err, not_found_err, null);
@@ -512,6 +518,7 @@ pub const MetadataHttpClient = struct {
                 error.ConnectionRefused,
                 error.BrokenPipe,
                 error.EndOfStream,
+                error.Timeout,
                 => {
                     if (transport_attempt >= max_transport_retries) return err;
                     transport_attempt += 1;
@@ -588,6 +595,7 @@ test "metadata http client retries transient connection close on fetch status" {
         fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqual(http_common.Method.GET, req.method);
+            try std.testing.expectEqual(@as(?u32, default_request_timeout_ms), req.timeout_ms);
             self.attempts += 1;
             if (self.attempts == 1) return error.HttpConnectionClosing;
             return .{
@@ -605,6 +613,40 @@ test "metadata http client retries transient connection close on fetch status" {
     const status = try client.fetchStatus("http://127.0.0.1:9000");
     try std.testing.expectEqual(@as(u64, 77), status.metadata_group_id);
     try std.testing.expectEqual(@as(usize, 2), flaky.attempts);
+}
+
+test "metadata http client retries bounded timeout on fetch status" {
+    const TimeoutExecutor = struct {
+        attempts: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(http_common.Method.GET, req.method);
+            try std.testing.expectEqual(@as(?u32, default_request_timeout_ms), req.timeout_ms);
+            self.attempts += 1;
+            if (self.attempts == 1) return error.Timeout;
+            return .{
+                .status = 200,
+                .content_type = try alloc.dupe(u8, "application/json"),
+                .body = try alloc.dupe(u8,
+                    \\{"metadata_group_id":88,"metrics":{"rounds":0,"repairs":0,"rebalances":0,"splits":0,"merges":0},"projected_tables":0,"projected_ranges":0,"projected_placement_intents":0,"projected_split_transitions":0,"projected_merge_transitions":0,"projected_split_observations":0,"projected_merge_observations":0,"projected_schema_progress":0,"projected_restore_progress":0,"projected_snapshot_bootstrap_intents":0,"projected_backup_restore_bootstrap_intents":0,"projected_shuffle_join_leases":0,"projected_replication_source_statuses":0}
+                ),
+            };
+        }
+    };
+
+    var timeout_executor = TimeoutExecutor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, timeout_executor.executor());
+    const status = try client.fetchStatus("http://127.0.0.1:9000");
+    try std.testing.expectEqual(@as(u64, 88), status.metadata_group_id);
+    try std.testing.expectEqual(@as(usize, 2), timeout_executor.attempts);
 }
 
 test "metadata http client retries explicit metadata not leader response" {

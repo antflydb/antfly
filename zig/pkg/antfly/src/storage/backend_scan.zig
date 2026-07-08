@@ -22,6 +22,7 @@ pub const OwnedKVPair = struct {
 
 pub const ScanOptions = struct {
     skip_fn: ?*const fn (key: []const u8) bool = null,
+    reverse: bool = false,
 };
 
 pub const ScanAction = enum { @"continue", stop };
@@ -137,26 +138,49 @@ fn scanCursorWithContext(
     ctx: ?*anyopaque,
     callback: ScanWithContextCallback,
 ) !void {
-    cur.setUpperBound(if (upper.len > 0) upper else null);
+    if (!options.reverse) {
+        cur.setUpperBound(if (upper.len > 0) upper else null);
 
-    const first = if (lower.len == 0)
-        (try cur.first()) orelse return
-    else
-        (try cur.seekAtOrAfter(lower)) orelse return;
+        const first = if (lower.len == 0)
+            (try cur.first()) orelse return
+        else
+            (try cur.seekAtOrAfter(lower)) orelse return;
 
-    if (upper.len > 0 and std.mem.order(u8, first.key, upper) != .lt) return;
+        if (upper.len > 0 and std.mem.order(u8, first.key, upper) != .lt) return;
 
-    if (options.skip_fn == null or !options.skip_fn.?(first.key)) {
-        if (try callback(ctx, first.key, first.value) == .stop) return;
+        if (options.skip_fn == null or !options.skip_fn.?(first.key)) {
+            if (try callback(ctx, first.key, first.value) == .stop) return;
+        }
+
+        var entry = try cur.next();
+        while (entry) |kv| : (entry = try cur.next()) {
+            if (upper.len > 0 and std.mem.order(u8, kv.key, upper) != .lt) break;
+            if (options.skip_fn) |skip| {
+                if (skip(kv.key)) continue;
+            }
+            if (try callback(ctx, kv.key, kv.value) == .stop) return;
+        }
+        return;
     }
 
-    var entry = try cur.next();
-    while (entry) |kv| : (entry = try cur.next()) {
-        if (upper.len > 0 and std.mem.order(u8, kv.key, upper) != .lt) break;
+    var entry = if (upper.len == 0)
+        try cur.last()
+    else
+        try cur.seekAtOrBefore(upper);
+    while (entry) |kv| {
+        if (upper.len > 0 and std.mem.order(u8, kv.key, upper) != .lt) {
+            entry = try cur.prev();
+            continue;
+        }
+        if (lower.len > 0 and std.mem.order(u8, kv.key, lower) == .lt) break;
         if (options.skip_fn) |skip| {
-            if (skip(kv.key)) continue;
+            if (skip(kv.key)) {
+                entry = try cur.prev();
+                continue;
+            }
         }
         if (try callback(ctx, kv.key, kv.value) == .stop) return;
+        entry = try cur.prev();
     }
 }
 

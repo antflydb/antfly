@@ -14,6 +14,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@antfly/design-system";
+import type { QueryHitsTotal } from "@antfly/sdk";
 import { ChevronDown, ChevronUp, Code2, Download, LayoutGrid, Table2 } from "lucide-react";
 import type React from "react";
 import { useMemo } from "react";
@@ -27,6 +28,11 @@ export function formatQueryTime(nanoseconds: number): string {
   if (ms < 1) return "< 1ms";
   if (ms < 1000) return `${Math.round(ms)}ms`;
   return `${(ms / 1000).toFixed(1)}s`;
+}
+
+export function formatTotalHits(total: QueryHitsTotal): string {
+  const prefix = total.relation === "gte" ? ">= " : "";
+  return `${prefix}${total.value.toLocaleString()} ${total.value === 1 ? "hit" : "hits"}`;
 }
 
 export type ViewMode = "cards" | "table" | "json";
@@ -43,7 +49,7 @@ interface ResultsToolbarProps {
   expandAll: boolean;
   onExpandAllChange: (expand: boolean) => void;
   onExport?: (format: "json" | "csv") => void;
-  totalHits?: number;
+  totalHits?: QueryHitsTotal;
   queryTime?: number;
 }
 
@@ -92,7 +98,7 @@ const ResultsToolbar: React.FC<ResultsToolbarProps> = ({
         <div className="flex items-center gap-2 flex-wrap">
           {totalHits !== undefined && (
             <Badge className="font-mono">
-              {totalHits.toLocaleString()} {totalHits === 1 ? "hit" : "hits"}
+              {formatTotalHits(totalHits)}
             </Badge>
           )}
           {queryTime !== undefined && (

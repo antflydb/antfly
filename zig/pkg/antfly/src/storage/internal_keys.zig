@@ -29,6 +29,8 @@ pub const graph_edge_record_kind: u8 = 0x32;
 pub const asset_state_kind: u8 = 0x33;
 pub const graph_asset_state_kind: u8 = 0x34;
 pub const document_unit_record_kind: u8 = 0x35;
+pub const derived_coverage_kind: u8 = 0x36;
+pub const derived_coverage_skipped_count_kind: u8 = 0xff;
 
 pub const replay_key_len: usize = 1 + 1 + @sizeOf(u64);
 pub const replay_meta_init_key = [_]u8{ replay_namespace, 0xff, 0x01 };
@@ -248,6 +250,81 @@ pub fn artifactNamedPrefixAlloc(alloc: Allocator, doc_key: []const u8, artifact_
     try appendEncodedComponent(&list, alloc, artifact_name);
 
     return try list.toOwnedSlice(alloc);
+}
+
+pub fn derivedCoverageGeneration(config_json: []const u8) u64 {
+    return std.hash.Wyhash.hash(0x6472_636f_7665_7231, config_json);
+}
+
+pub fn derivedCoverageGenerationForConfig(coverage_generation: u64, config_json: []const u8) u64 {
+    if (coverage_generation != 0) return coverage_generation;
+    return derivedCoverageGeneration(config_json);
+}
+
+pub fn derivedCoverageOutcomePrefixAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, derived_coverage_kind });
+    try appendEncodedComponent(&list, alloc, index_name);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn derivedCoverageOutcomeGenerationPrefixAlloc(alloc: Allocator, index_name: []const u8, generation: u64) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, derived_coverage_kind });
+    try appendEncodedComponent(&list, alloc, index_name);
+    var generation_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &generation_buf, generation, .little);
+    try list.appendSlice(alloc, &generation_buf);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn derivedCoverageOutcomeKindPrefixAlloc(alloc: Allocator, index_name: []const u8, generation: u64, outcome: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, derived_coverage_kind });
+    try appendEncodedComponent(&list, alloc, index_name);
+    var generation_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &generation_buf, generation, .little);
+    try list.appendSlice(alloc, &generation_buf);
+    try appendEncodedComponent(&list, alloc, outcome);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn derivedCoverageOutcomeKeyAlloc(alloc: Allocator, index_name: []const u8, generation: u64, doc_key: []const u8, outcome: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, derived_coverage_kind });
+    try appendEncodedComponent(&list, alloc, index_name);
+    var generation_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &generation_buf, generation, .little);
+    try list.appendSlice(alloc, &generation_buf);
+    try appendEncodedComponent(&list, alloc, outcome);
+    try appendEncodedComponent(&list, alloc, doc_key);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn derivedCoverageSkippedCountKeyAlloc(alloc: Allocator, index_name: []const u8, generation: u64) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, derived_coverage_kind });
+    try appendEncodedComponent(&list, alloc, index_name);
+    var generation_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &generation_buf, generation, .little);
+    try list.appendSlice(alloc, &generation_buf);
+    try list.append(alloc, derived_coverage_skipped_count_kind);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn encodeDerivedCoverageSkippedCount(out: *[8]u8, count: u64) []const u8 {
+    std.mem.writeInt(u64, out, count, .little);
+    return out[0..];
+}
+
+pub fn decodeDerivedCoverageSkippedCount(raw: []const u8) !u64 {
+    if (raw.len != 8) return error.InvalidDerivedCoverageSkippedCount;
+    return std.mem.readInt(u64, raw[0..8], .little);
 }
 
 pub fn assetArtifactSourceIndexRootPrefixAlloc(alloc: Allocator) ![]u8 {
@@ -1449,6 +1526,38 @@ test "asset artifact source index keys group by source artifact" {
     try std.testing.expect(std.mem.startsWith(u8, prefix, root));
     try std.testing.expect(std.mem.startsWith(u8, key, prefix));
     try std.testing.expect(!std.mem.startsWith(u8, other, prefix));
+}
+
+test "derived coverage outcome keys are generation scoped" {
+    const alloc = std.testing.allocator;
+    const old_generation = derivedCoverageGeneration("{\"source\":\"body\",\"model\":\"a\"}");
+    const new_generation = derivedCoverageGeneration("{\"source\":\"body\",\"model\":\"b\"}");
+
+    const index_prefix = try derivedCoverageOutcomePrefixAlloc(alloc, "semantic_idx");
+    defer alloc.free(index_prefix);
+    const old_prefix = try derivedCoverageOutcomeKindPrefixAlloc(alloc, "semantic_idx", old_generation, "skipped");
+    defer alloc.free(old_prefix);
+    const new_prefix = try derivedCoverageOutcomeKindPrefixAlloc(alloc, "semantic_idx", new_generation, "skipped");
+    defer alloc.free(new_prefix);
+    const old_key = try derivedCoverageOutcomeKeyAlloc(alloc, "semantic_idx", old_generation, "doc:1", "skipped");
+    defer alloc.free(old_key);
+    const new_key = try derivedCoverageOutcomeKeyAlloc(alloc, "semantic_idx", new_generation, "doc:1", "skipped");
+    defer alloc.free(new_key);
+    const skipped_count_key = try derivedCoverageSkippedCountKeyAlloc(alloc, "semantic_idx", new_generation);
+    defer alloc.free(skipped_count_key);
+
+    try std.testing.expect(std.mem.startsWith(u8, old_key, index_prefix));
+    try std.testing.expect(std.mem.startsWith(u8, new_key, index_prefix));
+    try std.testing.expect(std.mem.startsWith(u8, skipped_count_key, index_prefix));
+    try std.testing.expect(std.mem.startsWith(u8, old_key, old_prefix));
+    try std.testing.expect(std.mem.startsWith(u8, new_key, new_prefix));
+    try std.testing.expect(!std.mem.startsWith(u8, skipped_count_key, new_prefix));
+    try std.testing.expect(!std.mem.startsWith(u8, old_key, new_prefix));
+    try std.testing.expect(!std.mem.eql(u8, old_key, new_key));
+
+    var encoded_count: [8]u8 = undefined;
+    const encoded = encodeDerivedCoverageSkippedCount(&encoded_count, 42);
+    try std.testing.expectEqual(@as(u64, 42), try decodeDerivedCoverageSkippedCount(encoded));
 }
 
 test "decodePrimaryDocumentKeyAlloc round-trips and rejects non-primary keys" {

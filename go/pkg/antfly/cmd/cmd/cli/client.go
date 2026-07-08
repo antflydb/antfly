@@ -66,6 +66,17 @@ func formatBytes(bytes uint64) string {
 	}
 }
 
+func stringSliceAsAny(values []string) []any {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]any, len(values))
+	for i, value := range values {
+		out[i] = value
+	}
+	return out
+}
+
 // AntflyClient wraps the SDK client with CLI-specific functionality
 type AntflyClient struct {
 	*antfly.AntflyClient
@@ -343,7 +354,7 @@ func printIndexDetails(index antfly.IndexStatus, indent string) {
 			fmt.Fprintf(os.Stderr, "%sStatus Error: %s\n", indent, ftStats.Error)
 		} else {
 			fmt.Fprintf(os.Stderr, "%sTotal Indexed: %d\n", indent, ftStats.TotalIndexed)
-			fmt.Fprintf(os.Stderr, "%sDisk Usage: %s\n", indent, formatBytes(ftStats.DiskUsage))
+			fmt.Fprintf(os.Stderr, "%sDoc Count: %d\n", indent, ftStats.DocCount)
 			if ftStats.Rebuilding {
 				fmt.Fprintf(os.Stderr, "%sRebuilding: true\n", indent)
 			}
@@ -353,8 +364,8 @@ func printIndexDetails(index antfly.IndexStatus, indent string) {
 			fmt.Fprintf(os.Stderr, "%sStatus Error: %s\n", indent, embStats.Error)
 		} else {
 			fmt.Fprintf(os.Stderr, "%sTotal Indexed: %d\n", indent, embStats.TotalIndexed)
+			fmt.Fprintf(os.Stderr, "%sDoc Count: %d\n", indent, embStats.DocCount)
 			fmt.Fprintf(os.Stderr, "%sTotal Nodes: %d\n", indent, embStats.TotalNodes)
-			fmt.Fprintf(os.Stderr, "%sDisk Usage: %s\n", indent, formatBytes(embStats.DiskUsage))
 		}
 	}
 }
@@ -565,8 +576,8 @@ func (c *AntflyClient) Query(ctx context.Context, params SearchParams, verbose b
 		Limit:        params.Limit,
 		Offset:       params.Offset,
 		OrderBy:      params.OrderBy,
-		SearchAfter:  params.SearchAfter,
-		SearchBefore: params.SearchBefore,
+		SearchAfter:  stringSliceAsAny(params.SearchAfter),
+		SearchBefore: stringSliceAsAny(params.SearchBefore),
 		FilterPrefix: params.FilterPrefix,
 		Aggregations: params.Aggregations,
 		Reranker:     params.Reranker,

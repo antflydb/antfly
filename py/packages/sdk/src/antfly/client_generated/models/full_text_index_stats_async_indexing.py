@@ -11,7 +11,7 @@ T = TypeVar("T", bound="FullTextIndexStatsAsyncIndexing")
 
 @_attrs_define
 class FullTextIndexStatsAsyncIndexing:
-    """Derived-index background indexing diagnostics."""
+    """Asynchronous indexer runtime diagnostics."""
 
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 

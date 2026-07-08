@@ -28,7 +28,7 @@
     "@antfly/cli-linux-x64": "workspace:*"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=24.0"
   },
   "os": [
     "darwin",

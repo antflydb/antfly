@@ -13,6 +13,7 @@ import (
 	"path"
 	"strings"
 
+	externalRef0 "github.com/antflydb/antfly/go/pkg/generating"
 	"github.com/getkin/kin-openapi/openapi3"
 	"github.com/oapi-codegen/runtime"
 )
@@ -69,6 +70,66 @@ type ChunkOptions struct {
 	Threshold float32 `json:"threshold,omitempty,omitzero"`
 }
 
+// InferenceAudioChunkConfig Audio chunking configuration for inference, including VAD options.
+type InferenceAudioChunkConfig struct {
+	// OverlapDurationMs Overlap duration in milliseconds between audio chunks (default: 0).
+	OverlapDurationMs int `json:"overlap_duration_ms,omitempty,omitzero"`
+
+	// Vad Options for Voice Activity Detection (VAD) based audio segmentation.
+	Vad VADOptions `json:"vad,omitempty,omitzero"`
+
+	// WindowDurationMs Window duration in milliseconds for fixed-window audio chunking (default: 30000).
+	WindowDurationMs int `json:"window_duration_ms,omitempty,omitzero"`
+}
+
+// InferenceChunkConfig Configuration for chunking requests to Antfly inference.
+// Combines shared text options with inference-specific audio/VAD options.
+type InferenceChunkConfig struct {
+	// Audio Audio chunking configuration for inference, including VAD options.
+	Audio InferenceAudioChunkConfig `json:"audio,omitempty,omitzero"`
+
+	// MaxChunks Maximum number of chunks to generate per document.
+	MaxChunks int `json:"max_chunks,omitempty,omitzero"`
+
+	// Model The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/.
+	Model string `json:"model,omitempty,omitzero"`
+
+	// Text Options specific to text chunking.
+	Text TextChunkOptions `json:"text,omitempty,omitzero"`
+
+	// Threshold Confidence threshold for model-based chunking (0.0-1.0). Used by ONNX text models and VAD audio models.
+	Threshold float32 `json:"threshold,omitempty,omitzero"`
+}
+
+// InferenceChunkContentPart Content part supported by chunking requests.
+type InferenceChunkContentPart struct {
+	union json.RawMessage
+}
+
+// InferenceChunkRequest defines model for InferenceChunkRequest.
+type InferenceChunkRequest struct {
+	// Config Configuration for chunking requests to Antfly inference.
+	// Combines shared text options with inference-specific audio/VAD options.
+	Config InferenceChunkConfig `json:"config,omitempty,omitzero"`
+
+	// Input Input content to chunk. Supports two formats:
+	// - Text string: `"This is a long document..."`
+	// - ContentPart: `{"type": "media", "data": "<base64>", "mime_type": "audio/wav"}`
+	// - ContentPart: `{"type": "text", "text": "..."}`
+	Input InferenceChunkRequest_Input `json:"input"`
+}
+
+// InferenceChunkRequestInput0 Text to chunk
+type InferenceChunkRequestInput0 = string
+
+// InferenceChunkRequest_Input Input content to chunk. Supports two formats:
+// - Text string: `"This is a long document..."`
+// - ContentPart: `{"type": "media", "data": "<base64>", "mime_type": "audio/wav"}`
+// - ContentPart: `{"type": "text", "text": "..."}`
+type InferenceChunkRequest_Input struct {
+	union json.RawMessage
+}
+
 // TextChunkOptions Options specific to text chunking.
 type TextChunkOptions struct {
 	// OverlapTokens Number of tokens to overlap between consecutive chunks. Helps maintain context across chunk boundaries. Only used by fixed-size chunkers.
@@ -91,6 +152,21 @@ type TextContent struct {
 
 	// Text The chunk text content
 	Text string `json:"text"`
+}
+
+// VADOptions Options for Voice Activity Detection (VAD) based audio segmentation.
+type VADOptions struct {
+	// MaxSegmentDurationMs Maximum segment duration (ms). Segments longer than this are split. Useful for Whisper-compatible chunking. Default: 30000.
+	MaxSegmentDurationMs int `json:"max_segment_duration_ms,omitempty,omitzero"`
+
+	// MinSilenceDurationMs Minimum silence duration (ms) to split speech segments. Gaps shorter than this are merged. Higher values produce longer, fewer segments. Default: 300.
+	MinSilenceDurationMs int `json:"min_silence_duration_ms,omitempty,omitzero"`
+
+	// MinSpeechDurationMs Minimum speech duration (ms) for a segment to be kept. Shorter segments are discarded. Default: 250.
+	MinSpeechDurationMs int `json:"min_speech_duration_ms,omitempty,omitzero"`
+
+	// SpeechPadMs Padding (ms) added before and after detected speech. Default: 30.
+	SpeechPadMs int `json:"speech_pad_ms,omitempty,omitzero"`
 }
 
 // AsTextContent returns the union data inside the Chunk as a TextContent
@@ -200,27 +276,164 @@ func (t *Chunk) UnmarshalJSON(b []byte) error {
 	return err
 }
 
+// AsExternalRef0TextContentPart returns the union data inside the InferenceChunkContentPart as a externalRef0.TextContentPart
+func (t InferenceChunkContentPart) AsExternalRef0TextContentPart() (externalRef0.TextContentPart, error) {
+	var body externalRef0.TextContentPart
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromExternalRef0TextContentPart overwrites any union data inside the InferenceChunkContentPart as the provided externalRef0.TextContentPart
+func (t *InferenceChunkContentPart) FromExternalRef0TextContentPart(v externalRef0.TextContentPart) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeExternalRef0TextContentPart performs a merge with any union data inside the InferenceChunkContentPart, using the provided externalRef0.TextContentPart
+func (t *InferenceChunkContentPart) MergeExternalRef0TextContentPart(v externalRef0.TextContentPart) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsExternalRef0MediaContentPart returns the union data inside the InferenceChunkContentPart as a externalRef0.MediaContentPart
+func (t InferenceChunkContentPart) AsExternalRef0MediaContentPart() (externalRef0.MediaContentPart, error) {
+	var body externalRef0.MediaContentPart
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromExternalRef0MediaContentPart overwrites any union data inside the InferenceChunkContentPart as the provided externalRef0.MediaContentPart
+func (t *InferenceChunkContentPart) FromExternalRef0MediaContentPart(v externalRef0.MediaContentPart) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeExternalRef0MediaContentPart performs a merge with any union data inside the InferenceChunkContentPart, using the provided externalRef0.MediaContentPart
+func (t *InferenceChunkContentPart) MergeExternalRef0MediaContentPart(v externalRef0.MediaContentPart) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+func (t InferenceChunkContentPart) MarshalJSON() ([]byte, error) {
+	b, err := t.union.MarshalJSON()
+	return b, err
+}
+
+func (t *InferenceChunkContentPart) UnmarshalJSON(b []byte) error {
+	err := t.union.UnmarshalJSON(b)
+	return err
+}
+
+// AsInferenceChunkRequestInput0 returns the union data inside the InferenceChunkRequest_Input as a InferenceChunkRequestInput0
+func (t InferenceChunkRequest_Input) AsInferenceChunkRequestInput0() (InferenceChunkRequestInput0, error) {
+	var body InferenceChunkRequestInput0
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromInferenceChunkRequestInput0 overwrites any union data inside the InferenceChunkRequest_Input as the provided InferenceChunkRequestInput0
+func (t *InferenceChunkRequest_Input) FromInferenceChunkRequestInput0(v InferenceChunkRequestInput0) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeInferenceChunkRequestInput0 performs a merge with any union data inside the InferenceChunkRequest_Input, using the provided InferenceChunkRequestInput0
+func (t *InferenceChunkRequest_Input) MergeInferenceChunkRequestInput0(v InferenceChunkRequestInput0) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsInferenceChunkContentPart returns the union data inside the InferenceChunkRequest_Input as a InferenceChunkContentPart
+func (t InferenceChunkRequest_Input) AsInferenceChunkContentPart() (InferenceChunkContentPart, error) {
+	var body InferenceChunkContentPart
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromInferenceChunkContentPart overwrites any union data inside the InferenceChunkRequest_Input as the provided InferenceChunkContentPart
+func (t *InferenceChunkRequest_Input) FromInferenceChunkContentPart(v InferenceChunkContentPart) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeInferenceChunkContentPart performs a merge with any union data inside the InferenceChunkRequest_Input, using the provided InferenceChunkContentPart
+func (t *InferenceChunkRequest_Input) MergeInferenceChunkContentPart(v InferenceChunkContentPart) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+func (t InferenceChunkRequest_Input) MarshalJSON() ([]byte, error) {
+	b, err := t.union.MarshalJSON()
+	return b, err
+}
+
+func (t *InferenceChunkRequest_Input) UnmarshalJSON(b []byte) error {
+	err := t.union.UnmarshalJSON(b)
+	return err
+}
+
 // Base64 encoded, gzipped, json marshaled Swagger object
 var swaggerSpec = []string{
 
-	"H4sIAAAAAAAC/6xWXW/bNhf+Kwd8X6AJIMtuM+xCd1kwbLtoU2DBetEEAS0eSWelSJU88kcD//eBlGwr",
-	"luJmxe5s8XzxOc95Dp9EbuvGGjTsRfYkfF5hLePP61aRvala8+W2YbImflToc0fxv8hEfwC+wZwKyoEt",
-	"yOAGefAjU6YiEY2zDTomjBHsCp2WzaNqnQzej/VU4M4I9kZABmrSmjzm1igPS+Q1ohlm83ChsJCt5gwW",
-	"lyExbxsUmSDDWKITu0SsySi7Pp/7U7R5OXVhHRS0QTXrop3ceFDF1WKxmK5kd/hkl39jzqG2X8hIt72x",
-	"htHwuKzuGGpUJCHvrGBNXIWCasmzQxNqZKkkyzH24etEZOnx559maHKrUMGySxRs4WIlNSn4dP1XAh8/",
-	"/JYAcp5eikR0OUUmllvG4wU9OzJluA0a9chU4yTEkVoZ9PihURBMT5Eepim0lXzMY9p62XW0cLLGR4Va",
-	"bqdTGapjHzNQ5BsttxCNJ5KN6dIFJ6NwczZytIO+qKlAnqXj1+IRjX8UkSlmxSEOWaXWt4XIPj8Ja7D/",
-	"9X+HhcjE/+ZHIZj3KjC/ww3vCblLzts+p+/uIdg/Zx+p8c3/xK8tmnwPHtgCuMJumOBikcDbBN4lkKaR",
-	"dSfAJmIzK+2s/9qS4at34b51wLn7eprv/R/vf4VwlAHjhueNlmSSboTna7lKgGpZ4rwxZUf2Mbd3iXD4",
-	"tSWHSmSfw62GGR9G+D8kp93ur2eL/RynEJDey1glVwiHiIM600MzX1Tkj+hmoTr0HIIXVO5lLMjWQZXh",
-	"WmsoCLXyIB2Cjf5Swwy+obNzWxMzKlhJ3aKH1vctQQe9uvmxukQQw49zNBlvldAwuXnsLj/RMbmhuq0H",
-	"BOlhYgslGnSSEZpQmM3bOoA5OYEBxe/VFul+UhpXDn1l9QR3bwK+KrL3YBVhrq1CPVtKj2qwFhbpYvY2",
-	"7fbBj0zxqLpXrWM+EOvsNmb7BadCfjiOZbQIIXufww7OrfGYt0yrniU+hd9RNx5qSYYlmY7nGwaZO+t9",
-	"z/+lbY2SjtCncGv0NtBMwXLbb1dP3w6s89NN9dhIJ9m6KWHpj6Cb29gY32hijt3AtEwTeHN/b+7vzZt4",
-	"GhxKJ5vKX/6rgo5Lj6UrkV8E8y4eD6WuwzSwN8Z97VNhqMvjLLHjwwdCXkknc445C49TsxvWdTCbYPnB",
-	"ubGe9i8i66ikIBixresK3V60MbyRLnCT69bTCi/P7MP/JmGM5c8O/QlAhwXDA6i+K/Qx2LPSkyNsY9kP",
-	"7mQKO0HNSjpUcQt1r8luNIzaP+4G08rEGiMovYzcBS+RiBU634VbpIs0rj3boJENiUxcpYv0KvRYcuVF",
-	"Zlqtd/8EAAD//xenz5bqCwAA",
+	"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",
+	"HObmNslVK+X6fwEAAP//mmQPZlwZAAA=",
 }
 
 // GetSwagger returns the content of the embedded swagger specification file
@@ -260,6 +473,12 @@ func PathToRawSpec(pathToFile string) map[string]func() ([]byte, error) {
 		res[pathToFile] = rawSpec
 	}
 
+	for rawPath, rawFunc := range externalRef0.PathToRawSpec(path.Join(path.Dir(pathToFile), "generating.yaml")) {
+		if _, ok := res[rawPath]; ok {
+			// it is not possible to compare functions in golang, so always overwrite the old value
+		}
+		res[rawPath] = rawFunc
+	}
 	return res
 }
 

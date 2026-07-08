@@ -32,8 +32,24 @@ class AlgebraicIndexStats:
             total_indexed (int | Unset): Number of documents reflected in the algebraic sidecar
             disk_usage (int | Unset): Size of the index in bytes
             rebuilding (bool | Unset): Whether the sidecar is currently rebuilding
+            backfill_active (bool | Unset): Whether the sidecar is actively rebuilding, replaying, or catching up.
             backfill_progress (float | Unset): Backfill progress as a ratio from 0.0 to 1.0
             backfill_items_processed (int | Unset): Number of documents processed during current backfill
+            backfill_state (str | Unset): Operational readiness state such as ready, running, retrying, or failed.
+            doc_count (int | Unset): Number of documents visible to the sidecar.
+            term_count (int | Unset):
+            replay_applied_sequence (int | Unset):
+            replay_target_sequence (int | Unset):
+            replay_catch_up_required (bool | Unset):
+            runtime_present (bool | Unset):
+            runtime_fresh (bool | Unset):
+            runtime_source (str | Unset):
+            runtime_freshness (str | Unset):
+            catch_up_active (bool | Unset):
+            catch_up_phase (str | Unset):
+            catch_up_applied_sequence (int | Unset):
+            catch_up_target_sequence (int | Unset):
+            async_indexing (AlgebraicIndexStatsAsyncIndexing | Unset):
             healthy (bool | Unset):
             parse_error_count (int | Unset):
             schema_version (int | Unset):
@@ -70,27 +86,12 @@ class AlgebraicIndexStats:
                 checkpoint that still need replay.
             repair_scan_issue_count (int | Unset): Repair issues found by explicit repair-scan accounting for this
                 projection.
-            backfill_active (bool | Unset): Whether this index currently has derived indexing work in progress.
-            backfill_state (str | Unset): Compact lifecycle state for derived indexing work.
-            doc_count (int | Unset):
-            term_count (int | Unset):
             edge_count (int | Unset):
             node_count (int | Unset):
-            replay_applied_sequence (int | Unset):
-            replay_target_sequence (int | Unset):
-            replay_catch_up_required (bool | Unset):
             repair_degraded (bool | Unset):
             repair_issue_count (int | Unset):
             repair_summary_ready (bool | Unset):
             repair_issue_count_estimated (bool | Unset):
-            runtime_present (bool | Unset):
-            runtime_fresh (bool | Unset):
-            runtime_source (str | Unset):
-            runtime_freshness (str | Unset):
-            catch_up_active (bool | Unset):
-            catch_up_phase (str | Unset):
-            catch_up_applied_sequence (int | Unset):
-            catch_up_target_sequence (int | Unset):
             expected_groups (int | Unset):
             reported_groups (int | Unset):
             fresh_groups (int | Unset):
@@ -102,7 +103,6 @@ class AlgebraicIndexStats:
             resolver_replay (AlgebraicIndexStatsResolverReplay | Unset): Graph resolver replay diagnostics.
             resolution (AlgebraicIndexStatsResolution | Unset): Artifact resolution replay diagnostics.
             promotion (AlgebraicIndexStatsPromotion | Unset): Artifact promotion replay diagnostics.
-            async_indexing (AlgebraicIndexStatsAsyncIndexing | Unset): Derived-index background indexing diagnostics.
     """
 
     index_type: AlgebraicIndexStatsIndexType
@@ -110,8 +110,24 @@ class AlgebraicIndexStats:
     total_indexed: int | Unset = UNSET
     disk_usage: int | Unset = UNSET
     rebuilding: bool | Unset = UNSET
+    backfill_active: bool | Unset = UNSET
     backfill_progress: float | Unset = UNSET
     backfill_items_processed: int | Unset = UNSET
+    backfill_state: str | Unset = UNSET
+    doc_count: int | Unset = UNSET
+    term_count: int | Unset = UNSET
+    replay_applied_sequence: int | Unset = UNSET
+    replay_target_sequence: int | Unset = UNSET
+    replay_catch_up_required: bool | Unset = UNSET
+    runtime_present: bool | Unset = UNSET
+    runtime_fresh: bool | Unset = UNSET
+    runtime_source: str | Unset = UNSET
+    runtime_freshness: str | Unset = UNSET
+    catch_up_active: bool | Unset = UNSET
+    catch_up_phase: str | Unset = UNSET
+    catch_up_applied_sequence: int | Unset = UNSET
+    catch_up_target_sequence: int | Unset = UNSET
+    async_indexing: AlgebraicIndexStatsAsyncIndexing | Unset = UNSET
     healthy: bool | Unset = UNSET
     parse_error_count: int | Unset = UNSET
     schema_version: int | Unset = UNSET
@@ -140,27 +156,12 @@ class AlgebraicIndexStats:
     projection_checkpoint_config_hash: int | Unset = UNSET
     checkpoint_replay_tail_sequence_count: int | Unset = UNSET
     repair_scan_issue_count: int | Unset = UNSET
-    backfill_active: bool | Unset = UNSET
-    backfill_state: str | Unset = UNSET
-    doc_count: int | Unset = UNSET
-    term_count: int | Unset = UNSET
     edge_count: int | Unset = UNSET
     node_count: int | Unset = UNSET
-    replay_applied_sequence: int | Unset = UNSET
-    replay_target_sequence: int | Unset = UNSET
-    replay_catch_up_required: bool | Unset = UNSET
     repair_degraded: bool | Unset = UNSET
     repair_issue_count: int | Unset = UNSET
     repair_summary_ready: bool | Unset = UNSET
     repair_issue_count_estimated: bool | Unset = UNSET
-    runtime_present: bool | Unset = UNSET
-    runtime_fresh: bool | Unset = UNSET
-    runtime_source: str | Unset = UNSET
-    runtime_freshness: str | Unset = UNSET
-    catch_up_active: bool | Unset = UNSET
-    catch_up_phase: str | Unset = UNSET
-    catch_up_applied_sequence: int | Unset = UNSET
-    catch_up_target_sequence: int | Unset = UNSET
     expected_groups: int | Unset = UNSET
     reported_groups: int | Unset = UNSET
     fresh_groups: int | Unset = UNSET
@@ -171,7 +172,6 @@ class AlgebraicIndexStats:
     resolver_replay: AlgebraicIndexStatsResolverReplay | Unset = UNSET
     resolution: AlgebraicIndexStatsResolution | Unset = UNSET
     promotion: AlgebraicIndexStatsPromotion | Unset = UNSET
-    async_indexing: AlgebraicIndexStatsAsyncIndexing | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -185,9 +185,43 @@ class AlgebraicIndexStats:
 
         rebuilding = self.rebuilding
 
+        backfill_active = self.backfill_active
+
         backfill_progress = self.backfill_progress
 
         backfill_items_processed = self.backfill_items_processed
+
+        backfill_state = self.backfill_state
+
+        doc_count = self.doc_count
+
+        term_count = self.term_count
+
+        replay_applied_sequence = self.replay_applied_sequence
+
+        replay_target_sequence = self.replay_target_sequence
+
+        replay_catch_up_required = self.replay_catch_up_required
+
+        runtime_present = self.runtime_present
+
+        runtime_fresh = self.runtime_fresh
+
+        runtime_source = self.runtime_source
+
+        runtime_freshness = self.runtime_freshness
+
+        catch_up_active = self.catch_up_active
+
+        catch_up_phase = self.catch_up_phase
+
+        catch_up_applied_sequence = self.catch_up_applied_sequence
+
+        catch_up_target_sequence = self.catch_up_target_sequence
+
+        async_indexing: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.async_indexing, Unset):
+            async_indexing = self.async_indexing.to_dict()
 
         healthy = self.healthy
 
@@ -247,23 +281,9 @@ class AlgebraicIndexStats:
 
         repair_scan_issue_count = self.repair_scan_issue_count
 
-        backfill_active = self.backfill_active
-
-        backfill_state = self.backfill_state
-
-        doc_count = self.doc_count
-
-        term_count = self.term_count
-
         edge_count = self.edge_count
 
         node_count = self.node_count
-
-        replay_applied_sequence = self.replay_applied_sequence
-
-        replay_target_sequence = self.replay_target_sequence
-
-        replay_catch_up_required = self.replay_catch_up_required
 
         repair_degraded = self.repair_degraded
 
@@ -272,22 +292,6 @@ class AlgebraicIndexStats:
         repair_summary_ready = self.repair_summary_ready
 
         repair_issue_count_estimated = self.repair_issue_count_estimated
-
-        runtime_present = self.runtime_present
-
-        runtime_fresh = self.runtime_fresh
-
-        runtime_source = self.runtime_source
-
-        runtime_freshness = self.runtime_freshness
-
-        catch_up_active = self.catch_up_active
-
-        catch_up_phase = self.catch_up_phase
-
-        catch_up_applied_sequence = self.catch_up_applied_sequence
-
-        catch_up_target_sequence = self.catch_up_target_sequence
 
         expected_groups = self.expected_groups
 
@@ -317,10 +321,6 @@ class AlgebraicIndexStats:
         if not isinstance(self.promotion, Unset):
             promotion = self.promotion.to_dict()
 
-        async_indexing: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.async_indexing, Unset):
-            async_indexing = self.async_indexing.to_dict()
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -336,10 +336,42 @@ class AlgebraicIndexStats:
             field_dict["disk_usage"] = disk_usage
         if rebuilding is not UNSET:
             field_dict["rebuilding"] = rebuilding
+        if backfill_active is not UNSET:
+            field_dict["backfill_active"] = backfill_active
         if backfill_progress is not UNSET:
             field_dict["backfill_progress"] = backfill_progress
         if backfill_items_processed is not UNSET:
             field_dict["backfill_items_processed"] = backfill_items_processed
+        if backfill_state is not UNSET:
+            field_dict["backfill_state"] = backfill_state
+        if doc_count is not UNSET:
+            field_dict["doc_count"] = doc_count
+        if term_count is not UNSET:
+            field_dict["term_count"] = term_count
+        if replay_applied_sequence is not UNSET:
+            field_dict["replay_applied_sequence"] = replay_applied_sequence
+        if replay_target_sequence is not UNSET:
+            field_dict["replay_target_sequence"] = replay_target_sequence
+        if replay_catch_up_required is not UNSET:
+            field_dict["replay_catch_up_required"] = replay_catch_up_required
+        if runtime_present is not UNSET:
+            field_dict["runtime_present"] = runtime_present
+        if runtime_fresh is not UNSET:
+            field_dict["runtime_fresh"] = runtime_fresh
+        if runtime_source is not UNSET:
+            field_dict["runtime_source"] = runtime_source
+        if runtime_freshness is not UNSET:
+            field_dict["runtime_freshness"] = runtime_freshness
+        if catch_up_active is not UNSET:
+            field_dict["catch_up_active"] = catch_up_active
+        if catch_up_phase is not UNSET:
+            field_dict["catch_up_phase"] = catch_up_phase
+        if catch_up_applied_sequence is not UNSET:
+            field_dict["catch_up_applied_sequence"] = catch_up_applied_sequence
+        if catch_up_target_sequence is not UNSET:
+            field_dict["catch_up_target_sequence"] = catch_up_target_sequence
+        if async_indexing is not UNSET:
+            field_dict["async_indexing"] = async_indexing
         if healthy is not UNSET:
             field_dict["healthy"] = healthy
         if parse_error_count is not UNSET:
@@ -396,24 +428,10 @@ class AlgebraicIndexStats:
             field_dict["checkpoint_replay_tail_sequence_count"] = checkpoint_replay_tail_sequence_count
         if repair_scan_issue_count is not UNSET:
             field_dict["repair_scan_issue_count"] = repair_scan_issue_count
-        if backfill_active is not UNSET:
-            field_dict["backfill_active"] = backfill_active
-        if backfill_state is not UNSET:
-            field_dict["backfill_state"] = backfill_state
-        if doc_count is not UNSET:
-            field_dict["doc_count"] = doc_count
-        if term_count is not UNSET:
-            field_dict["term_count"] = term_count
         if edge_count is not UNSET:
             field_dict["edge_count"] = edge_count
         if node_count is not UNSET:
             field_dict["node_count"] = node_count
-        if replay_applied_sequence is not UNSET:
-            field_dict["replay_applied_sequence"] = replay_applied_sequence
-        if replay_target_sequence is not UNSET:
-            field_dict["replay_target_sequence"] = replay_target_sequence
-        if replay_catch_up_required is not UNSET:
-            field_dict["replay_catch_up_required"] = replay_catch_up_required
         if repair_degraded is not UNSET:
             field_dict["repair_degraded"] = repair_degraded
         if repair_issue_count is not UNSET:
@@ -422,22 +440,6 @@ class AlgebraicIndexStats:
             field_dict["repair_summary_ready"] = repair_summary_ready
         if repair_issue_count_estimated is not UNSET:
             field_dict["repair_issue_count_estimated"] = repair_issue_count_estimated
-        if runtime_present is not UNSET:
-            field_dict["runtime_present"] = runtime_present
-        if runtime_fresh is not UNSET:
-            field_dict["runtime_fresh"] = runtime_fresh
-        if runtime_source is not UNSET:
-            field_dict["runtime_source"] = runtime_source
-        if runtime_freshness is not UNSET:
-            field_dict["runtime_freshness"] = runtime_freshness
-        if catch_up_active is not UNSET:
-            field_dict["catch_up_active"] = catch_up_active
-        if catch_up_phase is not UNSET:
-            field_dict["catch_up_phase"] = catch_up_phase
-        if catch_up_applied_sequence is not UNSET:
-            field_dict["catch_up_applied_sequence"] = catch_up_applied_sequence
-        if catch_up_target_sequence is not UNSET:
-            field_dict["catch_up_target_sequence"] = catch_up_target_sequence
         if expected_groups is not UNSET:
             field_dict["expected_groups"] = expected_groups
         if reported_groups is not UNSET:
@@ -458,8 +460,6 @@ class AlgebraicIndexStats:
             field_dict["resolution"] = resolution
         if promotion is not UNSET:
             field_dict["promotion"] = promotion
-        if async_indexing is not UNSET:
-            field_dict["async_indexing"] = async_indexing
 
         return field_dict
 
@@ -482,9 +482,46 @@ class AlgebraicIndexStats:
 
         rebuilding = d.pop("rebuilding", UNSET)
 
+        backfill_active = d.pop("backfill_active", UNSET)
+
         backfill_progress = d.pop("backfill_progress", UNSET)
 
         backfill_items_processed = d.pop("backfill_items_processed", UNSET)
+
+        backfill_state = d.pop("backfill_state", UNSET)
+
+        doc_count = d.pop("doc_count", UNSET)
+
+        term_count = d.pop("term_count", UNSET)
+
+        replay_applied_sequence = d.pop("replay_applied_sequence", UNSET)
+
+        replay_target_sequence = d.pop("replay_target_sequence", UNSET)
+
+        replay_catch_up_required = d.pop("replay_catch_up_required", UNSET)
+
+        runtime_present = d.pop("runtime_present", UNSET)
+
+        runtime_fresh = d.pop("runtime_fresh", UNSET)
+
+        runtime_source = d.pop("runtime_source", UNSET)
+
+        runtime_freshness = d.pop("runtime_freshness", UNSET)
+
+        catch_up_active = d.pop("catch_up_active", UNSET)
+
+        catch_up_phase = d.pop("catch_up_phase", UNSET)
+
+        catch_up_applied_sequence = d.pop("catch_up_applied_sequence", UNSET)
+
+        catch_up_target_sequence = d.pop("catch_up_target_sequence", UNSET)
+
+        _async_indexing = d.pop("async_indexing", UNSET)
+        async_indexing: AlgebraicIndexStatsAsyncIndexing | Unset
+        if isinstance(_async_indexing, Unset):
+            async_indexing = UNSET
+        else:
+            async_indexing = AlgebraicIndexStatsAsyncIndexing.from_dict(_async_indexing)
 
         healthy = d.pop("healthy", UNSET)
 
@@ -547,23 +584,9 @@ class AlgebraicIndexStats:
 
         repair_scan_issue_count = d.pop("repair_scan_issue_count", UNSET)
 
-        backfill_active = d.pop("backfill_active", UNSET)
-
-        backfill_state = d.pop("backfill_state", UNSET)
-
-        doc_count = d.pop("doc_count", UNSET)
-
-        term_count = d.pop("term_count", UNSET)
-
         edge_count = d.pop("edge_count", UNSET)
 
         node_count = d.pop("node_count", UNSET)
-
-        replay_applied_sequence = d.pop("replay_applied_sequence", UNSET)
-
-        replay_target_sequence = d.pop("replay_target_sequence", UNSET)
-
-        replay_catch_up_required = d.pop("replay_catch_up_required", UNSET)
 
         repair_degraded = d.pop("repair_degraded", UNSET)
 
@@ -572,22 +595,6 @@ class AlgebraicIndexStats:
         repair_summary_ready = d.pop("repair_summary_ready", UNSET)
 
         repair_issue_count_estimated = d.pop("repair_issue_count_estimated", UNSET)
-
-        runtime_present = d.pop("runtime_present", UNSET)
-
-        runtime_fresh = d.pop("runtime_fresh", UNSET)
-
-        runtime_source = d.pop("runtime_source", UNSET)
-
-        runtime_freshness = d.pop("runtime_freshness", UNSET)
-
-        catch_up_active = d.pop("catch_up_active", UNSET)
-
-        catch_up_phase = d.pop("catch_up_phase", UNSET)
-
-        catch_up_applied_sequence = d.pop("catch_up_applied_sequence", UNSET)
-
-        catch_up_target_sequence = d.pop("catch_up_target_sequence", UNSET)
 
         expected_groups = d.pop("expected_groups", UNSET)
 
@@ -629,21 +636,30 @@ class AlgebraicIndexStats:
         else:
             promotion = AlgebraicIndexStatsPromotion.from_dict(_promotion)
 
-        _async_indexing = d.pop("async_indexing", UNSET)
-        async_indexing: AlgebraicIndexStatsAsyncIndexing | Unset
-        if isinstance(_async_indexing, Unset):
-            async_indexing = UNSET
-        else:
-            async_indexing = AlgebraicIndexStatsAsyncIndexing.from_dict(_async_indexing)
-
         algebraic_index_stats = cls(
             index_type=index_type,
             error=error,
             total_indexed=total_indexed,
             disk_usage=disk_usage,
             rebuilding=rebuilding,
+            backfill_active=backfill_active,
             backfill_progress=backfill_progress,
             backfill_items_processed=backfill_items_processed,
+            backfill_state=backfill_state,
+            doc_count=doc_count,
+            term_count=term_count,
+            replay_applied_sequence=replay_applied_sequence,
+            replay_target_sequence=replay_target_sequence,
+            replay_catch_up_required=replay_catch_up_required,
+            runtime_present=runtime_present,
+            runtime_fresh=runtime_fresh,
+            runtime_source=runtime_source,
+            runtime_freshness=runtime_freshness,
+            catch_up_active=catch_up_active,
+            catch_up_phase=catch_up_phase,
+            catch_up_applied_sequence=catch_up_applied_sequence,
+            catch_up_target_sequence=catch_up_target_sequence,
+            async_indexing=async_indexing,
             healthy=healthy,
             parse_error_count=parse_error_count,
             schema_version=schema_version,
@@ -672,27 +688,12 @@ class AlgebraicIndexStats:
             projection_checkpoint_config_hash=projection_checkpoint_config_hash,
             checkpoint_replay_tail_sequence_count=checkpoint_replay_tail_sequence_count,
             repair_scan_issue_count=repair_scan_issue_count,
-            backfill_active=backfill_active,
-            backfill_state=backfill_state,
-            doc_count=doc_count,
-            term_count=term_count,
             edge_count=edge_count,
             node_count=node_count,
-            replay_applied_sequence=replay_applied_sequence,
-            replay_target_sequence=replay_target_sequence,
-            replay_catch_up_required=replay_catch_up_required,
             repair_degraded=repair_degraded,
             repair_issue_count=repair_issue_count,
             repair_summary_ready=repair_summary_ready,
             repair_issue_count_estimated=repair_issue_count_estimated,
-            runtime_present=runtime_present,
-            runtime_fresh=runtime_fresh,
-            runtime_source=runtime_source,
-            runtime_freshness=runtime_freshness,
-            catch_up_active=catch_up_active,
-            catch_up_phase=catch_up_phase,
-            catch_up_applied_sequence=catch_up_applied_sequence,
-            catch_up_target_sequence=catch_up_target_sequence,
             expected_groups=expected_groups,
             reported_groups=reported_groups,
             fresh_groups=fresh_groups,
@@ -703,7 +704,6 @@ class AlgebraicIndexStats:
             resolver_replay=resolver_replay,
             resolution=resolution,
             promotion=promotion,
-            async_indexing=async_indexing,
         )
 
         algebraic_index_stats.additional_properties = d

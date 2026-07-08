@@ -28,7 +28,7 @@ const server = setupServer(
               { _id: "1", _score: 1.0, _source: { title: "Test Item 1", name: "First" } },
               { _id: "2", _score: 0.9, _source: { title: "Test Item 2", name: "Second" } },
             ],
-            total: 2,
+            total: { value: 2, relation: "exact" },
           },
           aggregations: {},
         },

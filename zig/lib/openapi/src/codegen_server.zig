@@ -56,7 +56,9 @@ pub const ServerGenerator = struct {
 
     fn collectOps(self: *ServerGenerator, doc: *const types.OpenApiDoc) ![]const OperationInfo {
         var ops = std.ArrayListUnmanaged(OperationInfo).empty;
-        for (doc.paths.keys(), doc.paths.values()) |path, path_item| {
+        const paths = try shared.sortedStringKeys(self.arena, doc.paths.keys());
+        for (paths) |path| {
+            const path_item = doc.paths.get(path) orelse continue;
             for (shared.methodOps(path_item)) |mo| {
                 const op = mo.op orelse continue;
                 const op_id = op.operation_id orelse continue;

@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const query_search = @import("query/search_exec.zig");
 const distributed_stats = @import("../../search/distributed_stats.zig");
 const planning_adapter = @import("planning_adapter.zig");
@@ -96,6 +97,7 @@ pub const DerivedReplayDebtStatus = @import("db.zig").DerivedReplayDebtStatus;
 pub const BatchProfile = @import("db.zig").BatchProfile;
 pub const RuntimePreflight = query_search.RuntimePreflight;
 pub const RuntimePreflightSummary = query_search.RuntimePreflightSummary;
+pub const SortRejectionDiagnostic = query_search.SortRejectionDiagnostic;
 pub const PlanningStatsSummary = planning_stats.PlanningStatsSummary;
 pub const PlanningStatsProvider = planning_stats.PlanningStatsProvider;
 pub const PlanningStatsCollector = planning_stats.PlanningStatsCollector;
@@ -120,6 +122,44 @@ pub fn preflightSearchRequestAlloc(alloc: std.mem.Allocator, req: types.SearchRe
 pub fn deriveRuntimePreflightEstimates(summary: *RuntimePreflightSummary) void {
     query_search.deriveEstimateFields(summary);
 }
+
+pub fn searchRequestHasScoreBearingTextSource(req: types.SearchRequest) bool {
+    return query_search.searchRequestHasScoreBearingTextSource(req);
+}
+
+pub fn searchRequestHasScoreBearingVectorSource(req: types.SearchRequest) bool {
+    return query_search.searchRequestHasScoreBearingVectorSource(req);
+}
+
+pub fn searchRequestHasScoreBearingSource(req: types.SearchRequest) bool {
+    return query_search.searchRequestHasScoreBearingSource(req);
+}
+
+pub fn requestHasVectorScoreOrderOnly(req: types.SearchRequest) bool {
+    return query_search.requestHasVectorScoreOrderOnly(req);
+}
+
+pub fn resetLastSortRejectionDiagnostic() void {
+    query_search.resetLastSortRejectionDiagnostic();
+}
+
+pub fn takeLastSortRejectionDiagnostic() ?SortRejectionDiagnostic {
+    return query_search.takeLastSortRejectionDiagnostic();
+}
+
+pub fn peekLastSortRejectionDiagnostic() ?SortRejectionDiagnostic {
+    return query_search.peekLastSortRejectionDiagnostic();
+}
+
+pub fn recordSortRejectionDiagnostic(field: []const u8, reason: []const u8, detail: []const u8) void {
+    query_search.recordSortRejectionDiagnostic(field, reason, detail);
+}
+
+pub const testing = if (builtin.is_test) struct {
+    pub fn recordSortRejectionDiagnostic(field: []const u8, reason: []const u8, detail: []const u8) void {
+        query_search.recordSortRejectionDiagnosticForTesting(field, reason, detail);
+    }
+} else struct {};
 
 test {
     _ = types;
@@ -173,6 +213,7 @@ test {
     _ = BatchProfile;
     _ = RuntimePreflight;
     _ = RuntimePreflightSummary;
+    _ = SortRejectionDiagnostic;
     _ = PlanningStatsSummary;
     _ = PlanningStatsProvider;
     _ = PlanningStatsCollector;

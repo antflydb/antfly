@@ -2254,7 +2254,14 @@ fn normalizeRetrievalQueryResponsesJson(
             else
                 &.{};
             if (hits_value.object.get("total") == null) {
-                try hits_value.object.put(alloc, "total", .{ .integer = @intCast(hit_items.len) });
+                var total_obj = std.json.ObjectMap.empty;
+                errdefer {
+                    var total_value = std.json.Value{ .object = total_obj };
+                    json_helpers.deinitJsonValue(alloc, &total_value);
+                }
+                try total_obj.put(alloc, try alloc.dupe(u8, "value"), .{ .integer = @intCast(hit_items.len) });
+                try total_obj.put(alloc, try alloc.dupe(u8, "relation"), .{ .string = try alloc.dupe(u8, "exact") });
+                try hits_value.object.put(alloc, "total", .{ .object = total_obj });
             }
             if (hits_value.object.get("max_score") == null) {
                 try hits_value.object.put(alloc, "max_score", .{ .float = computeNormalizedMaxScore(hit_items) });
@@ -6026,7 +6033,7 @@ test "retrieval agent ignores empty map-valued tool fields for policy and strate
 
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[]}}]}
+                    \\{"responses":[{"status":200,"took":1,"hits":{"total":{"value":0,"relation":"exact"},"hits":[]}}]}
                 ),
             };
         }
@@ -7295,7 +7302,7 @@ test "retrieval agent treats aggregations as first-class tool capability" {
             try std.testing.expect(parsed_query.value.filter_query == null);
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[]}}]}
+                    \\{"responses":[{"status":200,"took":1,"hits":{"total":{"value":0,"relation":"exact"},"hits":[]}}]}
                 ),
             };
         }
@@ -7335,7 +7342,7 @@ test "retrieval agent requires filter and aggregate tools for filtered aggregati
             try std.testing.expect(parsed_query.value.filter_query != null);
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[]}}]}
+                    \\{"responses":[{"status":200,"took":1,"hits":{"total":{"value":0,"relation":"exact"},"hits":[]}}]}
                 ),
             };
         }

@@ -75,7 +75,7 @@ This monorepo uses [pnpm](https://pnpm.io/) and [Turborepo](https://turbo.build/
 
 ### Prerequisites
 
-- Node.js >= 18
+- Node.js >= 24.0
 - pnpm >= 10
 
 ### Setup
@@ -129,7 +129,7 @@ ts/
 
 ## Requirements
 
-- Node.js >= 18
+- Node.js >= 24.0
 - TypeScript >= 5.0 (for development)
 
 ## License

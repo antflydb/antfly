@@ -14,10 +14,12 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
+const bmp = @import("bmp.zig");
 const gif = @import("gif.zig");
 const jpeg = @import("jpeg.zig");
 const png = @import("png.zig");
 const test_support = @import("test_support.zig");
+const webp = @import("webp.zig");
 const c = if (build_options.enable_spng) @cImport({
     @cInclude("spng.h");
 }) else struct {};
@@ -59,6 +61,14 @@ pub fn main(init: std.process.Init) !void {
     }
     if (std.mem.eql(u8, subcommand, "verify-gif")) {
         try cmdVerifyGif(alloc);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "verify-bmp")) {
+        try cmdVerifyBmp(alloc);
+        return;
+    }
+    if (std.mem.eql(u8, subcommand, "verify-webp")) {
+        try cmdVerifyWebp(alloc);
         return;
     }
 
@@ -166,6 +176,47 @@ fn cmdDescribe(alloc: std.mem.Allocator, fixture_path: []const u8) !void {
         return;
     }
 
+    if (std.mem.eql(u8, format, "bmp")) {
+        const decoded = bmp.decodeRgba(alloc, bytes) catch |err| {
+            std.debug.print("bmp decode error: {s}\n", .{@errorName(err)});
+            return;
+        };
+        defer alloc.free(decoded.rgba);
+        const hash = try test_support.sha256HexAlloc(alloc, decoded.rgba);
+        defer alloc.free(hash);
+        std.debug.print("bmp {s}: {d}x{d}\n", .{ fixture_path, decoded.width, decoded.height });
+        std.debug.print("rgba sha256: {s}\n", .{hash});
+        return;
+    }
+
+    if (std.mem.eql(u8, format, "webp")) {
+        const info = webp.probe(bytes) catch |err| {
+            std.debug.print("webp probe error: {s}\n", .{@errorName(err)});
+            return;
+        };
+        std.debug.print(
+            "webp {s}: {s} {d}x{d} extended={} alpha={} animated={}\n",
+            .{
+                fixture_path,
+                if (info.bitstream) |bitstream| @tagName(bitstream) else "unknown",
+                info.width orelse 0,
+                info.height orelse 0,
+                info.extended,
+                info.alpha,
+                info.animated,
+            },
+        );
+        const decoded = webp.decodeRgba(alloc, bytes) catch |err| {
+            std.debug.print("webp decode error: {s}\n", .{@errorName(err)});
+            return;
+        };
+        defer alloc.free(decoded.rgba);
+        const hash = try test_support.sha256HexAlloc(alloc, decoded.rgba);
+        defer alloc.free(hash);
+        std.debug.print("rgba sha256: {s}\n", .{hash});
+        return;
+    }
+
     return error.InvalidArguments;
 }
 
@@ -173,6 +224,8 @@ fn inferFormat(fixture_path: []const u8) ?[]const u8 {
     if (std.mem.endsWith(u8, fixture_path, ".jpg") or std.mem.endsWith(u8, fixture_path, ".jpeg")) return "jpeg";
     if (std.mem.endsWith(u8, fixture_path, ".png")) return "png";
     if (std.mem.endsWith(u8, fixture_path, ".gif")) return "gif";
+    if (std.mem.endsWith(u8, fixture_path, ".bmp")) return "bmp";
+    if (std.mem.endsWith(u8, fixture_path, ".webp")) return "webp";
     return null;
 }
 
@@ -649,6 +702,195 @@ fn cmdVerifyGif(alloc: std.mem.Allocator) !void {
     std.debug.print("verified gif fixtures: checked={d} skipped={d}\n", .{ checked, skipped });
 }
 
+fn cmdVerifyBmp(alloc: std.mem.Allocator) !void {
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+
+    const manifest = try test_support.loadManifest(alloc, io_impl.io());
+    defer test_support.freeManifest(alloc, manifest);
+
+    var checked: usize = 0;
+    var skipped: usize = 0;
+
+    for (manifest.fixtures) |fixture| {
+        if (!std.mem.eql(u8, fixture.format, "bmp")) {
+            skipped += 1;
+            continue;
+        }
+        const bytes = try test_support.readFixtureAlloc(alloc, io_impl.io(), fixture.path);
+        defer alloc.free(bytes);
+
+        if (std.mem.eql(u8, fixture.result, manifest.results.success)) {
+            const decoded = try bmp.decodeRgba(alloc, bytes);
+            defer alloc.free(decoded.rgba);
+
+            const actual_hash = try test_support.sha256HexAlloc(alloc, decoded.rgba);
+            defer alloc.free(actual_hash);
+
+            if (decoded.width != fixture.width.? or decoded.height != fixture.height.?) {
+                std.debug.print(
+                    "FAIL bmp success fixture dimension mismatch: {s} expected {d}x{d} got {d}x{d}\n",
+                    .{ fixture.path, fixture.width.?, fixture.height.?, decoded.width, decoded.height },
+                );
+                return error.ImageCorpusVerificationFailed;
+            }
+            if (!std.mem.eql(u8, actual_hash, fixture.pixel_hashes[0])) {
+                std.debug.print(
+                    "FAIL bmp success fixture hash mismatch: {s}\nexpected {s}\nactual   {s}\n",
+                    .{ fixture.path, fixture.pixel_hashes[0], actual_hash },
+                );
+                return error.ImageCorpusVerificationFailed;
+            }
+
+            std.debug.print("OK   bmp success fixture: {s}\n", .{fixture.path});
+            checked += 1;
+            continue;
+        }
+
+        if (std.mem.eql(u8, fixture.result, manifest.results.known_unsupported)) {
+            _ = bmp.decodeRgba(alloc, bytes) catch |decode_err| {
+                if (decode_err == error.UnsupportedBmpFormat) {
+                    std.debug.print("OK   bmp known_unsupported fixture: {s}\n", .{fixture.path});
+                    checked += 1;
+                    continue;
+                }
+                std.debug.print(
+                    "FAIL bmp known_unsupported wrong decode error: {s} decode={s}\n",
+                    .{ fixture.path, @errorName(decode_err) },
+                );
+                return error.ImageCorpusVerificationFailed;
+            };
+            std.debug.print("FAIL bmp known_unsupported decoded successfully: {s}\n", .{fixture.path});
+            return error.ImageCorpusVerificationFailed;
+        }
+
+        if (std.mem.eql(u8, fixture.result, manifest.results.invalid)) {
+            _ = bmp.decodeRgba(alloc, bytes) catch |decode_err| {
+                if (decode_err == error.BmpDecodeFailed or decode_err == error.UnsupportedBmpFormat) {
+                    std.debug.print("OK   bmp invalid fixture: {s}\n", .{fixture.path});
+                    checked += 1;
+                    continue;
+                }
+                std.debug.print(
+                    "FAIL bmp invalid wrong decode error: {s} decode={s}\n",
+                    .{ fixture.path, @errorName(decode_err) },
+                );
+                return error.ImageCorpusVerificationFailed;
+            };
+            std.debug.print("FAIL bmp invalid decoded successfully: {s}\n", .{fixture.path});
+            return error.ImageCorpusVerificationFailed;
+        }
+
+        std.debug.print("SKIP bmp fixture with unsupported manifest result: {s} ({s})\n", .{ fixture.path, fixture.result });
+        skipped += 1;
+    }
+
+    std.debug.print("verified bmp fixtures: checked={d} skipped={d}\n", .{ checked, skipped });
+}
+
+fn cmdVerifyWebp(alloc: std.mem.Allocator) !void {
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+
+    const manifest = try test_support.loadManifest(alloc, io_impl.io());
+    defer test_support.freeManifest(alloc, manifest);
+
+    var checked: usize = 0;
+    var skipped: usize = 0;
+
+    for (manifest.fixtures) |fixture| {
+        if (!std.mem.eql(u8, fixture.format, "webp")) {
+            skipped += 1;
+            continue;
+        }
+        const bytes = try test_support.readFixtureAlloc(alloc, io_impl.io(), fixture.path);
+        defer alloc.free(bytes);
+
+        if (std.mem.eql(u8, fixture.result, manifest.results.success)) {
+            const info = try webp.probe(bytes);
+            const decoded = try webp.decodeRgba(alloc, bytes);
+            defer alloc.free(decoded.rgba);
+
+            const actual_hash = try test_support.sha256HexAlloc(alloc, decoded.rgba);
+            defer alloc.free(actual_hash);
+
+            if (info.width.? != fixture.width.? or info.height.? != fixture.height.?) {
+                std.debug.print(
+                    "FAIL webp probe dimension mismatch: {s} expected {d}x{d} got {d}x{d}\n",
+                    .{ fixture.path, fixture.width.?, fixture.height.?, info.width.?, info.height.? },
+                );
+                return error.ImageCorpusVerificationFailed;
+            }
+            if (decoded.width != fixture.width.? or decoded.height != fixture.height.?) {
+                std.debug.print(
+                    "FAIL webp success fixture dimension mismatch: {s} expected {d}x{d} got {d}x{d}\n",
+                    .{ fixture.path, fixture.width.?, fixture.height.?, decoded.width, decoded.height },
+                );
+                return error.ImageCorpusVerificationFailed;
+            }
+            if (!std.mem.eql(u8, actual_hash, fixture.pixel_hashes[0])) {
+                std.debug.print(
+                    "FAIL webp success fixture hash mismatch: {s}\nexpected {s}\nactual   {s}\n",
+                    .{ fixture.path, fixture.pixel_hashes[0], actual_hash },
+                );
+                return error.ImageCorpusVerificationFailed;
+            }
+
+            std.debug.print("OK   webp success fixture: {s} ({s})\n", .{ fixture.path, @tagName(info.bitstream.?) });
+            checked += 1;
+            continue;
+        }
+
+        if (std.mem.eql(u8, fixture.result, manifest.results.known_unsupported)) {
+            const info = try webp.probe(bytes);
+            _ = webp.decodeRgba(alloc, bytes) catch |decode_err| {
+                if (decode_err == error.AnimatedWebpUnsupported or decode_err == error.UnsupportedWebpFormat) {
+                    if (decode_err == error.AnimatedWebpUnsupported and !info.animated) {
+                        std.debug.print("FAIL webp animated unsupported error for non-animated fixture: {s}\n", .{fixture.path});
+                        return error.ImageCorpusVerificationFailed;
+                    }
+                    if (fixtureHasTag(fixture, "animated") and decode_err != error.AnimatedWebpUnsupported) {
+                        std.debug.print("FAIL webp known_unsupported expected animated fixture: {s}\n", .{fixture.path});
+                        return error.ImageCorpusVerificationFailed;
+                    }
+                    std.debug.print("OK   webp known_unsupported fixture: {s}\n", .{fixture.path});
+                    checked += 1;
+                    continue;
+                }
+                std.debug.print(
+                    "FAIL webp known_unsupported wrong decode error: {s} decode={s}\n",
+                    .{ fixture.path, @errorName(decode_err) },
+                );
+                return error.ImageCorpusVerificationFailed;
+            };
+            std.debug.print("FAIL webp known_unsupported decoded successfully: {s}\n", .{fixture.path});
+            return error.ImageCorpusVerificationFailed;
+        }
+
+        if (std.mem.eql(u8, fixture.result, manifest.results.invalid)) {
+            _ = webp.decodeRgba(alloc, bytes) catch |decode_err| {
+                if (decode_err == error.WebpDecodeFailed or decode_err == error.UnsupportedWebpFormat) {
+                    std.debug.print("OK   webp invalid fixture: {s}\n", .{fixture.path});
+                    checked += 1;
+                    continue;
+                }
+                std.debug.print(
+                    "FAIL webp invalid wrong decode error: {s} decode={s}\n",
+                    .{ fixture.path, @errorName(decode_err) },
+                );
+                return error.ImageCorpusVerificationFailed;
+            };
+            std.debug.print("FAIL webp invalid decoded successfully: {s}\n", .{fixture.path});
+            return error.ImageCorpusVerificationFailed;
+        }
+
+        std.debug.print("SKIP webp fixture with unsupported manifest result: {s} ({s})\n", .{ fixture.path, fixture.result });
+        skipped += 1;
+    }
+
+    std.debug.print("verified webp fixtures: checked={d} skipped={d}\n", .{ checked, skipped });
+}
+
 fn printUsage(argv0: []const u8) void {
     std.debug.print(
         \\usage:
@@ -658,6 +900,8 @@ fn printUsage(argv0: []const u8) void {
         \\  {s} verify-png
         \\  {s} verify-png-spng
         \\  {s} verify-gif
+        \\  {s} verify-bmp
+        \\  {s} verify-webp
         \\
         \\commands:
         \\  list         print the current image corpus entries
@@ -666,6 +910,8 @@ fn printUsage(argv0: []const u8) void {
         \\  verify-png   validate PNG success, unsupported, and invalid fixtures against the current decoder
         \\  verify-png-spng validate PNG success fixtures against the current decoder and libspng
         \\  verify-gif   validate GIF success and invalid fixtures against the current decoder
+        \\  verify-bmp   validate BMP success, unsupported, and invalid fixtures against the current decoder
+        \\  verify-webp  validate WebP success, unsupported, and invalid fixtures against the current decoder
         \\
-    , .{ argv0, argv0, argv0, argv0, argv0, argv0 });
+    , .{ argv0, argv0, argv0, argv0, argv0, argv0, argv0, argv0 });
 }

@@ -98,14 +98,7 @@ func TestHTTPHandler_ListSessions(t *testing.T) {
 			return json.Marshal(queryResponse{})
 		}
 		return json.Marshal(queryResponse{
-			Responses: []struct {
-				Hits struct {
-					Hits  []rawHit `json:"hits"`
-					Total uint64   `json:"total"`
-				} `json:"hits"`
-				Aggregations map[string]aggregationResult `json:"aggregations"`
-				Error        string                       `json:"error"`
-			}{
+			Responses: []queryResult{
 				{
 					Aggregations: map[string]aggregationResult{
 						"by_session": {Buckets: []aggregationBucket{{Key: "sess-1", DocCount: 3}}},
@@ -132,14 +125,7 @@ func TestHTTPHandler_HealthTreatsMissingNamespaceTableAsAvailable(t *testing.T) 
 	mc := newMockClient()
 	mc.queryFn = func(body []byte) ([]byte, error) {
 		return json.Marshal(queryResponse{
-			Responses: []struct {
-				Hits struct {
-					Hits  []rawHit `json:"hits"`
-					Total uint64   `json:"total"`
-				} `json:"hits"`
-				Aggregations map[string]aggregationResult `json:"aggregations"`
-				Error        string                       `json:"error"`
-			}{
+			Responses: []queryResult{
 				{Error: "table team-alpha_memories not found"},
 			},
 		})

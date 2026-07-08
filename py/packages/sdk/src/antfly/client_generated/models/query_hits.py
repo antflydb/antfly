@@ -10,6 +10,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.query_hit import QueryHit
+    from ..models.query_hits_total import QueryHitsTotal
 
 
 T = TypeVar("T", bound="QueryHits")
@@ -20,18 +21,20 @@ class QueryHits:
     """A list of query hits.
 
     Attributes:
-        total (int | Unset): Total number of hits available.
+        total (QueryHitsTotal | Unset): Total hit count metadata.
         hits (list[QueryHit] | Unset):
         max_score (float | Unset): Maximum score of the results.
     """
 
-    total: int | Unset = UNSET
+    total: QueryHitsTotal | Unset = UNSET
     hits: list[QueryHit] | Unset = UNSET
     max_score: float | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        total = self.total
+        total: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.total, Unset):
+            total = self.total.to_dict()
 
         hits: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.hits, Unset):
@@ -57,9 +60,15 @@ class QueryHits:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.query_hit import QueryHit
+        from ..models.query_hits_total import QueryHitsTotal
 
         d = dict(src_dict)
-        total = d.pop("total", UNSET)
+        _total = d.pop("total", UNSET)
+        total: QueryHitsTotal | Unset
+        if isinstance(_total, Unset):
+            total = UNSET
+        else:
+            total = QueryHitsTotal.from_dict(_total)
 
         _hits = d.pop("hits", UNSET)
         hits: list[QueryHit] | Unset = UNSET

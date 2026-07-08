@@ -66,7 +66,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 		KeepAlive:       viper.GetString("keep_alive"),
 		MaxLoadedModels: viper.GetInt("max_loaded_models"),
 		MaxMemoryMb:     viper.GetInt("max_memory_mb"),
-		Preload:         viper.GetStringSlice("preload"),
+		Preload:         preloadModelRefs(viper.GetStringSlice("preload")),
 	}
 
 	// Parse model_strategies from config (map[string]string -> map[string]ConfigModelStrategies)
@@ -94,4 +94,18 @@ func runServer(cmd *cobra.Command, args []string) error {
 
 	termite.RunAsTermite(ctx, logger, cfg, readyC)
 	return nil
+}
+
+func preloadModelRefs(names []string) []termite.ModelRef {
+	refs := make([]termite.ModelRef, 0, len(names))
+	for _, name := range names {
+		if name == "" {
+			continue
+		}
+		refs = append(refs, termite.ModelRef{
+			Kind: termite.ModelKindEmbedder,
+			Name: name,
+		})
+	}
+	return refs
 }

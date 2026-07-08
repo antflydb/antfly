@@ -108,10 +108,10 @@ pub const Routes = struct {
     pub const shard_ops_observe_split_suffix = "/shard-ops/observe-split";
     pub const shard_ops_observe_merge_suffix = "/shard-ops/observe-merge";
     pub const shard_ops_execute_suffix = "/shard-ops/execute";
-    pub const lookup_suffix = "/lookup";
     pub const schema_suffix = "/schema";
     pub const indexes_suffix = "/indexes";
     pub const indexes_marker = "/indexes/";
+    pub const documents_suffix = "/documents";
     pub const artifacts_suffix = "/artifacts";
     pub const artifact_repair_suffix = "/repair/issues";
     pub const artifact_repair_run_suffix = "/repair/run";
@@ -444,8 +444,8 @@ pub const Routes = struct {
 
     pub fn matchTableScan(path: []const u8) ?TableScan {
         if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
-        if (!std.mem.endsWith(u8, path, lookup_suffix)) return null;
-        const table_name = path[tables_prefix.len .. path.len - lookup_suffix.len];
+        if (!std.mem.endsWith(u8, path, documents_suffix)) return null;
+        const table_name = path[tables_prefix.len .. path.len - documents_suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .table_name = table_name };
     }
@@ -900,8 +900,8 @@ pub const Routes = struct {
         const group = parseGroupPrefix(path) orelse return null;
         const rest = group.rest;
         if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
-        if (!std.mem.endsWith(u8, rest, lookup_suffix)) return null;
-        const table_name = rest[tables_prefix.len .. rest.len - lookup_suffix.len];
+        if (!std.mem.endsWith(u8, rest, documents_suffix)) return null;
+        const table_name = rest[tables_prefix.len .. rest.len - documents_suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .group_id = group.group_id, .table_name = table_name };
     }
@@ -1359,8 +1359,9 @@ test "public api routes compile" {
     try std.testing.expectEqualStrings("doc:a", lookup.key);
     try std.testing.expect(Routes.matchTableLookup("/tables/docs/lookup/doc:a") == null);
     try std.testing.expect(Routes.matchTableLookup("/tables/docs/documents/doc:a/artifacts/document_units_v1") == null);
-    const scan = Routes.matchTableScan("/tables/docs/lookup").?;
+    const scan = Routes.matchTableScan("/tables/docs/documents").?;
     try std.testing.expectEqualStrings("docs", scan.table_name);
+    try std.testing.expect(Routes.matchTableScan("/tables/docs/lookup") == null);
     const query = Routes.matchTableQuery("/tables/docs/query").?;
     try std.testing.expectEqualStrings("docs", query.table_name);
     const batch = Routes.matchTableBatch("/tables/docs/batch").?;
@@ -1473,6 +1474,10 @@ test "public api routes compile" {
     try std.testing.expectEqualStrings("docs", group_lookup.table_name);
     try std.testing.expect(Routes.matchGroupLookup("/internal/v1/groups/7/tables/docs/lookup/doc:a") == null);
     try std.testing.expect(Routes.matchGroupLookup("/internal/v1/groups/7/tables/docs/documents/doc:a/artifacts/document_units_v1") == null);
+    const group_scan = Routes.matchGroupScan("/internal/v1/groups/7/tables/docs/documents").?;
+    try std.testing.expectEqual(@as(u64, 7), group_scan.group_id);
+    try std.testing.expectEqualStrings("docs", group_scan.table_name);
+    try std.testing.expect(Routes.matchGroupScan("/internal/v1/groups/7/tables/docs/lookup") == null);
     const group_query = Routes.matchGroupQuery("/internal/v1/groups/7/tables/docs/query").?;
     try std.testing.expectEqual(@as(u64, 7), group_query.group_id);
     const group_query_preflight = Routes.matchGroupQueryPreflight("/internal/v1/groups/7/tables/docs/query-preflight").?;

@@ -151,12 +151,14 @@ pub const IndexConfig = struct {
     name: []const u8,
     kind: IndexKind,
     config_json: []const u8,
+    coverage_generation: u64 = 0,
 
     pub fn clone(alloc: Allocator, cfg: IndexConfig) !IndexConfig {
         return .{
             .name = try alloc.dupe(u8, cfg.name),
             .kind = cfg.kind,
             .config_json = try alloc.dupe(u8, cfg.config_json),
+            .coverage_generation = cfg.coverage_generation,
         };
     }
 
@@ -166,6 +168,24 @@ pub const IndexConfig = struct {
         self.* = undefined;
     }
 };
+
+pub const PublicIndexConfig = struct {
+    name: []const u8,
+    kind: IndexKind,
+    config_json: []const u8,
+};
+
+pub fn publicIndexConfigsAlloc(alloc: Allocator, configs: []const IndexConfig) ![]PublicIndexConfig {
+    const public_configs = try alloc.alloc(PublicIndexConfig, configs.len);
+    for (configs, 0..) |cfg, i| {
+        public_configs[i] = .{
+            .name = cfg.name,
+            .kind = cfg.kind,
+            .config_json = cfg.config_json,
+        };
+    }
+    return public_configs;
+}
 
 pub fn indexConfigHash(cfg: IndexConfig) u64 {
     var hasher = std.hash.Wyhash.init(0x41504a4346470001);
@@ -928,6 +948,7 @@ pub const ScanOptions = struct {
     limit: u32 = 0,
     fields: []const []const u8 = &.{},
     include_all_fields: bool = true,
+    filter_query_json: []const u8 = "",
 };
 
 pub const ScanDocument = struct {
@@ -1132,6 +1153,9 @@ pub const SearchRequest = struct {
     hierarchy_include_source: bool = false,
     hierarchy_include_unit: bool = false,
     fields: []const []const u8 = &.{},
+    order_by: []const SortField = &.{},
+    search_after: []const std.json.Value = &.{},
+    search_before: []const std.json.Value = &.{},
     include_all_fields: bool = true,
     defer_stored_projection: bool = false,
     limit: u32 = 10,
@@ -1155,8 +1179,14 @@ pub const SearchRequest = struct {
     resolved_doc_filter_owned: bool = false,
     resolved_doc_filter_wire_context: ?ResolvedDocFilterWireContext = null,
     identity_read_generation: ?u64 = null,
+    execution_deadline_ns: ?u64 = null,
     require_algebraic_filter_resolution: bool = false,
     distributed_text_stats: []const distributed_stats_mod.TextFieldStats = &.{},
+};
+
+pub const SortField = struct {
+    field: []const u8,
+    desc: bool = false,
 };
 
 pub const ResolvedDocFilterWireContext = struct {
@@ -1214,8 +1244,10 @@ pub const MergeConfig = struct {
 pub const SearchHit = struct {
     id: []u8,
     doc_ordinal: ?u32 = null,
+    native_text_doc_id: ?u32 = null,
     score: ?f32 = null,
     index_scores: []fusion_mod.IndexScore = &.{},
+    sort_values: []std.json.Value = &.{},
     stored_data: ?[]u8 = null,
     ancestor_source_data: ?[]u8 = null,
     ancestor_unit_data: ?[]u8 = null,
@@ -1226,8 +1258,10 @@ pub const SearchHit = struct {
         var cloned = SearchHit{
             .id = try alloc.dupe(u8, self.id),
             .doc_ordinal = self.doc_ordinal,
+            .native_text_doc_id = self.native_text_doc_id,
             .score = self.score,
             .index_scores = try cloneIndexScores(alloc, self.index_scores),
+            .sort_values = try cloneJsonValues(alloc, self.sort_values),
             .stored_data = if (self.stored_data) |data| try alloc.dupe(u8, data) else null,
             .ancestor_source_data = if (self.ancestor_source_data) |data| try alloc.dupe(u8, data) else null,
             .ancestor_unit_data = if (self.ancestor_unit_data) |data| try alloc.dupe(u8, data) else null,
@@ -1237,6 +1271,7 @@ pub const SearchHit = struct {
         errdefer {
             alloc.free(cloned.id);
             freeIndexScores(alloc, cloned.index_scores);
+            freeJsonValues(alloc, cloned.sort_values);
             if (cloned.stored_data) |data| alloc.free(data);
             if (cloned.ancestor_source_data) |data| alloc.free(data);
             if (cloned.ancestor_unit_data) |data| alloc.free(data);
@@ -1261,6 +1296,7 @@ pub const SearchHit = struct {
     pub fn deinit(self: *SearchHit, alloc: Allocator) void {
         alloc.free(self.id);
         freeIndexScores(alloc, self.index_scores);
+        freeJsonValues(alloc, self.sort_values);
         if (self.stored_data) |data| alloc.free(data);
         if (self.ancestor_source_data) |data| alloc.free(data);
         if (self.ancestor_unit_data) |data| alloc.free(data);
@@ -1270,6 +1306,107 @@ pub const SearchHit = struct {
         self.* = undefined;
     }
 };
+
+pub fn cloneOwnedByteSlices(alloc: Allocator, values: []const []const u8) ![]const []u8 {
+    if (values.len == 0) return &.{};
+    const cloned = try alloc.alloc([]u8, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |value| alloc.free(value);
+        alloc.free(cloned);
+    }
+    for (values, 0..) |value, i| {
+        cloned[i] = try alloc.dupe(u8, value);
+        initialized += 1;
+    }
+    return cloned;
+}
+
+pub fn freeOwnedByteSlices(alloc: Allocator, values: []const []u8) void {
+    for (values) |value| alloc.free(value);
+    if (values.len > 0) alloc.free(values);
+}
+
+pub fn cloneJsonValue(alloc: Allocator, value: std.json.Value) !std.json.Value {
+    return switch (value) {
+        .null, .bool, .integer, .float => value,
+        .number_string => |text| .{ .number_string = try alloc.dupe(u8, text) },
+        .string => |text| .{ .string = try alloc.dupe(u8, text) },
+        .array => |arr| blk: {
+            var cloned = std.json.Array.init(alloc);
+            errdefer {
+                for (cloned.items) |*item| deinitJsonValue(alloc, item);
+                cloned.deinit();
+            }
+            for (arr.items) |item| {
+                var cloned_item = try cloneJsonValue(alloc, item);
+                errdefer deinitJsonValue(alloc, &cloned_item);
+                try cloned.append(cloned_item);
+            }
+            break :blk .{ .array = cloned };
+        },
+        .object => |obj| blk: {
+            var cloned = std.json.ObjectMap.empty;
+            errdefer {
+                var it = cloned.iterator();
+                while (it.next()) |entry| {
+                    alloc.free(@constCast(entry.key_ptr.*));
+                    deinitJsonValue(alloc, entry.value_ptr);
+                }
+                cloned.deinit(alloc);
+            }
+            var it = obj.iterator();
+            while (it.next()) |entry| {
+                const key = try alloc.dupe(u8, entry.key_ptr.*);
+                errdefer alloc.free(key);
+                var cloned_value = try cloneJsonValue(alloc, entry.value_ptr.*);
+                errdefer deinitJsonValue(alloc, &cloned_value);
+                try cloned.put(alloc, key, cloned_value);
+            }
+            break :blk .{ .object = cloned };
+        },
+    };
+}
+
+pub fn deinitJsonValue(alloc: Allocator, value: *std.json.Value) void {
+    switch (value.*) {
+        .string, .number_string => |text| alloc.free(text),
+        .array => |*arr| {
+            for (arr.items) |*item| deinitJsonValue(alloc, item);
+            arr.deinit();
+        },
+        .object => |*obj| {
+            var it = obj.iterator();
+            while (it.next()) |entry| {
+                alloc.free(@constCast(entry.key_ptr.*));
+                deinitJsonValue(alloc, entry.value_ptr);
+            }
+            obj.deinit(alloc);
+        },
+        else => {},
+    }
+    value.* = .null;
+}
+
+pub fn cloneJsonValues(alloc: Allocator, values: []const std.json.Value) ![]std.json.Value {
+    if (values.len == 0) return &.{};
+    const cloned = try alloc.alloc(std.json.Value, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |*value| deinitJsonValue(alloc, value);
+        alloc.free(cloned);
+    }
+    for (values, 0..) |value, i| {
+        cloned[i] = try cloneJsonValue(alloc, value);
+        initialized += 1;
+    }
+    return cloned;
+}
+
+pub fn freeJsonValues(alloc: Allocator, values: []std.json.Value) void {
+    for (values) |*value| deinitJsonValue(alloc, value);
+    if (values.len > 0) alloc.free(values);
+}
 
 pub fn cloneIndexScores(alloc: Allocator, scores: []const fusion_mod.IndexScore) ![]fusion_mod.IndexScore {
     if (scores.len == 0) return &.{};
@@ -1328,12 +1465,87 @@ pub const TotalHitsRelation = enum {
     gte,
 };
 
+pub const SortProfileField = struct {
+    bytes: [256]u8 = undefined,
+    len: u16 = 0,
+
+    pub fn init(value: []const u8) SortProfileField {
+        var out = SortProfileField{};
+        out.set(value);
+        return out;
+    }
+
+    pub fn set(self: *SortProfileField, value: []const u8) void {
+        const value_len = @min(value.len, self.bytes.len);
+        if (value_len > 0) @memcpy(self.bytes[0..value_len], value[0..value_len]);
+        self.len = @intCast(value_len);
+    }
+
+    pub fn slice(self: *const SortProfileField) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
+pub const SortProfile = struct {
+    plan: []const u8 = "",
+    exactness: []const u8 = "",
+    source: []const u8 = "",
+    candidate_source: []const u8 = "none",
+    cursor_support: []const u8 = "",
+    source_load: []const u8 = "",
+    distributed_behavior: []const u8 = "",
+    selection_reason: []const u8 = "",
+    require_native: bool = false,
+    native_loader: bool = false,
+    sort_lifecycle_state: []const u8 = "",
+    native_filter_mode: []const u8 = "none",
+    native_filter_candidate_count: u64 = 0,
+    native_filter_exclusion_count: u64 = 0,
+    selective_filter_doc_values_preferred: bool = false,
+    cost_model_live_docs: u64 = 0,
+    cost_model_candidate_count: u64 = 0,
+    cost_model_selective_limit: u64 = 0,
+    native_doc_values_coverage: []const u8 = "",
+    index_sort_coverage: []const u8 = "",
+    index_sort_match: bool = false,
+    sorted_segment_executor_available: bool = false,
+    sorted_segment_bounds_available: bool = false,
+    sorted_segment_scanned_count: u64 = 0,
+    sorted_segment_scan_budget: u64 = 0,
+    candidate_count: u64 = 0,
+    cursor_rejected_count: u64 = 0,
+    admitted_count: u64 = 0,
+    replaced_count: u64 = 0,
+    discarded_count: u64 = 0,
+    selected_count: u64 = 0,
+    decorate_us: u64 = 0,
+    native_doc_value_load_us: u64 = 0,
+    native_doc_value_hit_count: u64 = 0,
+    native_doc_value_miss_count: u64 = 0,
+    stored_json_load_us: u64 = 0,
+    stored_json_load_count: u64 = 0,
+    projected_source_load_us: u64 = 0,
+    projected_source_load_count: u64 = 0,
+    final_sort_us: u64 = 0,
+    total_us: u64 = 0,
+    window_capacity: usize = 0,
+    window_len: usize = 0,
+    collector_heap_peak: usize = 0,
+    distributed_shard_count: usize = 0,
+    distributed_shard_window: usize = 0,
+    budget_rejection_reason: []const u8 = "",
+    sort_rejection_reason: []const u8 = "",
+    sort_rejection_detail: []const u8 = "",
+    sort_rejection_field: SortProfileField = .{},
+};
+
 pub const SearchResult = struct {
     alloc: Allocator,
     hits: []SearchHit,
     total_hits: u32,
     total_hits_relation: TotalHitsRelation = .exact,
     identity_read_generation: ?u64 = null,
+    sort_profile: ?SortProfile = null,
     graph_results: []GraphSearchResult = &.{},
 
     pub fn deinit(self: *SearchResult) void {
@@ -1433,6 +1645,7 @@ pub const EnrichmentStats = struct {
     retrying: bool = false,
     worker_failed: bool = false,
     skip_by_hash_count: u64 = 0,
+    skipped_source_count: u64 = 0,
     codec_decode_failures: u64 = 0,
     embed_batches_started: u64 = 0,
     embed_batches_completed: u64 = 0,
@@ -1885,6 +2098,8 @@ pub const DBIndexStats = struct {
     edge_count: u64 = 0,
     node_count: u64 = 0,
     root_node: u64 = 0,
+    coverage_skipped_count: u64 = 0,
+    coverage_terminal_failed_count: u64 = 0,
     backfill_active: bool = false,
     backfill_progress: f64 = 0.0,
     enrichment_failed: bool = false,

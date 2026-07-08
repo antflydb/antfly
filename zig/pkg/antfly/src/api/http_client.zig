@@ -336,7 +336,7 @@ pub const ApiHttpClient = struct {
         const path = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
             table_name,
-            routes.Routes.lookup_suffix,
+            routes.Routes.documents_suffix,
         });
         defer self.alloc.free(path);
         const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
@@ -476,7 +476,7 @@ pub const ApiHttpClient = struct {
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
             table_name,
-            routes.Routes.lookup_suffix,
+            routes.Routes.documents_suffix,
         });
         defer self.alloc.free(suffix);
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });

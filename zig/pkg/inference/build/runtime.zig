@@ -70,6 +70,7 @@ pub const SharedModules = struct {
     pjrt: ?*std.Build.Module = null,
     inference_api: ?*std.Build.Module = null,
     generating_openapi: ?*std.Build.Module = null,
+    chunking_api_openapi: ?*std.Build.Module = null,
     extraction_openapi: ?*std.Build.Module = null,
     inference_client: ?*std.Build.Module = null,
 };
@@ -115,6 +116,7 @@ pub const Graph = struct {
     inference_audio_mod: *std.Build.Module,
     inference_chunker_mod: *std.Build.Module,
     generating_openapi_mod: *std.Build.Module,
+    chunking_api_openapi_mod: *std.Build.Module,
     inference_mod: *std.Build.Module,
     inference_internal_mod: *std.Build.Module,
 };
@@ -207,6 +209,8 @@ pub fn create(config: Config) Graph {
     });
     var shared_with_generating = shared;
     shared_with_generating.generating_openapi = generating_openapi_mod;
+    const chunking_api_openapi_mod = shared.chunking_api_openapi orelse addChunkingApiOpenApiModule(b, target, optimize, paths, generating_openapi_mod);
+    shared_with_generating.chunking_api_openapi = chunking_api_openapi_mod;
     const inference_api_mod = shared.inference_api orelse addInferenceApiModule(b, target, optimize, httpx_mod, backend.skip_openapi, paths, config.register_public_modules, shared_with_generating);
     const inference_client_mod = shared.inference_client orelse if (!backend.skip_openapi) blk: {
         const mod = addOrCreateModule(b, config.register_public_modules, "inference_client", .{
@@ -349,6 +353,7 @@ pub fn create(config: Config) Graph {
         .inference_audio_mod = inference_audio_mod,
         .inference_chunker_mod = inference_chunker_mod,
         .generating_openapi_mod = generating_openapi_mod,
+        .chunking_api_openapi_mod = chunking_api_openapi_mod,
         .inference_mod = inference_mod,
         .inference_internal_mod = inference_internal_mod,
     };
@@ -470,6 +475,7 @@ fn addInferenceApiModule(
         .target = target,
         .optimize = optimize,
     });
+    const chunking_api_openapi_mod = shared.chunking_api_openapi orelse addChunkingApiOpenApiModule(b, target, optimize, paths, generating_openapi_mod);
 
     if (skip_openapi) {
         const empty_wf = b.addWriteFiles();
@@ -486,6 +492,7 @@ fn addInferenceApiModule(
         });
         mod.addImport("httpx", httpx_mod);
         mod.addImport("antfly_generating_openapi", generating_openapi_mod);
+        mod.addImport("antfly_chunking_api_openapi", chunking_api_openapi_mod);
         return mod;
     }
 
@@ -503,6 +510,7 @@ fn addInferenceApiModule(
         });
         mod.addImport("httpx", httpx_mod);
         mod.addImport("antfly_generating_openapi", generating_openapi_mod);
+        mod.addImport("antfly_chunking_api_openapi", chunking_api_openapi_mod);
         mod.addImport("antfly_extraction_openapi", shared.extraction_openapi orelse addExtractionOpenApiModule(b, target, optimize, paths, generating_openapi_mod));
         return mod;
     }
@@ -527,6 +535,7 @@ fn addInferenceApiModule(
     codegen.addArgs(&.{ "--generate", "types,server,client" });
     codegen.addArgs(&.{"--import-mapping"});
     codegen.addArg(b.fmt("{s}={s}", .{ "../shared/generating.yaml", "antfly_generating_openapi" }));
+    codegen.addArg(b.fmt("{s}={s}", .{ "../shared/chunking.yaml", "antfly_chunking_api_openapi" }));
     codegen.addArg(b.fmt("{s}={s}", .{ "../ai/extraction.yaml", "antfly_extraction_openapi" }));
     codegen.addArg("--output");
     const gen_dir = codegen.addOutputDirectoryArg("inference_api");
@@ -537,7 +546,24 @@ fn addInferenceApiModule(
     });
     mod.addImport("httpx", httpx_mod);
     mod.addImport("antfly_generating_openapi", generating_openapi_mod);
+    mod.addImport("antfly_chunking_api_openapi", chunking_api_openapi_mod);
     mod.addImport("antfly_extraction_openapi", shared.extraction_openapi orelse addExtractionOpenApiModule(b, target, optimize, paths, generating_openapi_mod));
+    return mod;
+}
+
+fn addChunkingApiOpenApiModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    paths: Paths,
+    generating_openapi_mod: *std.Build.Module,
+) *std.Build.Module {
+    const mod = b.createModule(.{
+        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly/src/openapi/generated/antfly_chunking_api_openapi/root.zig")),
+        .target = target,
+        .optimize = optimize,
+    });
+    mod.addImport("antfly_generating_openapi", generating_openapi_mod);
     return mod;
 }
 

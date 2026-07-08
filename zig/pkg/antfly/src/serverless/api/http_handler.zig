@@ -4350,6 +4350,8 @@ pub const HttpHandler = struct {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             error.FileNotFound => return error.NotFound,
             error.DocIdentityUnavailable => return error.DocIdentityUnavailable,
+            error.UnsupportedExactSort => return error.UnsupportedExactSort,
+            error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
             else => {
                 std.log.err("serverless public table query failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
@@ -6820,7 +6822,7 @@ test "http handler serves public table joins on published heads" {
     const inner_response = parsed_inner.value.responses.?[0];
     const inner_hits = inner_response.hits.?.hits.?;
     try std.testing.expectEqual(@as(usize, 1), inner_hits.len);
-    try std.testing.expectEqual(@as(i64, 1), inner_response.hits.?.total.?);
+    try std.testing.expectEqual(@as(i64, 1), inner_response.hits.?.total.?.value);
     try std.testing.expectEqualStrings("Alice", testQueryHitSourcePathValue(inner_hits[0], "customers.name").?.string);
     try std.testing.expectEqualStrings("index_lookup", testJoinProfileFieldValue(inner_response, "strategy_used").?.string);
 
@@ -8265,7 +8267,7 @@ test "http handler serves the table public lifecycle and consistency routes" {
     defer parsed_public_search_via_query.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed_public_search_via_query.value.responses.?.len);
     try std.testing.expectEqualStrings("docs", parsed_public_search_via_query.value.responses.?[0].table.?);
-    try std.testing.expectEqual(@as(?i64, 1), parsed_public_search_via_query.value.responses.?[0].hits.?.total);
+    try std.testing.expectEqual(@as(i64, 1), parsed_public_search_via_query.value.responses.?[0].hits.?.total.?.value);
     try std.testing.expectEqualStrings("doc-a", parsed_public_search_via_query.value.responses.?[0].hits.?.hits.?[0]._id);
 
     var public_aggregated_query = try handler.handle(.{
@@ -8598,6 +8600,45 @@ test "http handler accepts structured table updates for metadata-only republish 
     try std.testing.expectEqual(@as(usize, 1), parsed_build_status.value.vector_index_actions.len);
     try std.testing.expectEqualStrings("semantic_idx", parsed_build_status.value.vector_index_actions[0].name);
     try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.rebuild, parsed_build_status.value.vector_index_actions[0].action);
+
+    var republish = try handler.handle(.{
+        .method = .post,
+        .path = "/internal/v1/tables/docs/build",
+    });
+    defer republish.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 202), republish.status);
+    var parsed_republish = try parseJsonTestBody(api_types.TableBuildResult, alloc, republish.body);
+    defer parsed_republish.deinit();
+    try std.testing.expect(parsed_republish.value.published);
+    try std.testing.expectEqual(@as(u64, 2), parsed_republish.value.version);
+    try std.testing.expectEqual(@as(u64, 1), parsed_republish.value.wal_end_lsn);
+
+    var after_status = try handler.handle(.{
+        .method = .get,
+        .path = "/internal/v1/tables/docs/build-status",
+    });
+    defer after_status.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), after_status.status);
+    var parsed_after_status = try parseJsonTestBody(api_types.TableBuildStatus, alloc, after_status.body);
+    defer parsed_after_status.deinit();
+    try std.testing.expect(!parsed_after_status.value.publish_recommended);
+    try std.testing.expect(!parsed_after_status.value.head_republish_recommended);
+    try std.testing.expectEqual(@as(u64, 2), parsed_after_status.value.head_version);
+    try std.testing.expectEqual(@as(u64, 1), parsed_after_status.value.published_wal_end_lsn);
+    try std.testing.expectEqual(@as(usize, 1), parsed_after_status.value.head_vector_index_actions.len);
+    try std.testing.expectEqualStrings("semantic_idx", parsed_after_status.value.head_vector_index_actions[0].name);
+    try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.rebuild, parsed_after_status.value.head_vector_index_actions[0].action);
+
+    var semantic_index = try handler.handle(.{
+        .method = .get,
+        .path = "/tables/docs/indexes/semantic_idx",
+    });
+    defer semantic_index.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), semantic_index.status);
+    var parsed_semantic_index = try parseServerlessIndexStatusTestResponse(alloc, semantic_index.body, "semantic_idx");
+    defer parsed_semantic_index.deinit();
+    try std.testing.expectEqualStrings("rebuild", parsed_semantic_index.value.status.head_publication_action.?);
+    try std.testing.expectEqual(@as(?bool, false), parsed_semantic_index.value.status.materialization_blocked);
 }
 
 test "http handler query publication exposes vector compaction targets" {
@@ -9314,7 +9355,7 @@ test "http handler serves published graph query endpoints" {
     var parsed_from_search = try parseJsonTestBody(metadata_openapi.QueryResponses, alloc, from_search.body);
     defer parsed_from_search.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed_from_search.value.responses.?.len);
-    try std.testing.expectEqual(@as(?i64, 1), parsed_from_search.value.responses.?[0].hits.?.total);
+    try std.testing.expectEqual(@as(i64, 1), parsed_from_search.value.responses.?[0].hits.?.total.?.value);
     const neighbors_from_search = parsed_from_search.value.responses.?[0].graph_results.?.map.get("neighbors_from_search").?;
     try std.testing.expectEqual(indexes_openapi.GraphQueryType.neighbors, neighbors_from_search.type);
     try std.testing.expectEqual(@as(i64, 2), neighbors_from_search.total);
@@ -9333,7 +9374,7 @@ test "http handler serves published graph query endpoints" {
     var parsed_from_fused = try parseJsonTestBody(metadata_openapi.QueryResponses, alloc, from_fused.body);
     defer parsed_from_fused.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed_from_fused.value.responses.?.len);
-    try std.testing.expectEqual(@as(?i64, 1), parsed_from_fused.value.responses.?[0].hits.?.total);
+    try std.testing.expectEqual(@as(i64, 1), parsed_from_fused.value.responses.?[0].hits.?.total.?.value);
     const neighbors_from_fused = parsed_from_fused.value.responses.?[0].graph_results.?.map.get("neighbors_from_fused").?;
     try std.testing.expectEqual(indexes_openapi.GraphQueryType.neighbors, neighbors_from_fused.type);
     try std.testing.expectEqual(@as(i64, 2), neighbors_from_fused.total);
@@ -9555,6 +9596,30 @@ test "http handler rejects ingest when namespace is backpressured" {
 
 test "serverless public graph seed total marks saturated pages incomplete" {
     try testPublicGraphSeedTotalHits();
+}
+
+test "serverless public graph query rejects exact sort controls" {
+    const alloc = std.testing.allocator;
+    var handler = HttpHandler{
+        .alloc = alloc,
+        .api = undefined,
+        .catalog = undefined,
+        .manifests = undefined,
+        .progress = undefined,
+        .query = undefined,
+        .runtime_status = undefined,
+    };
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, handler.handleTablePublicGraphQueryRequest(
+        "docs",
+        "docs",
+        "{\"graph_searches\":{\"related\":{\"type\":\"neighbors\",\"index_name\":\"graph_idx\",\"start_nodes\":{\"keys\":[\"doc:1\"]}}},\"order_by\":[{\"field\":\"created_at\"}]}",
+    ));
+    try std.testing.expectError(error.UnsupportedQueryRequest, handler.handleTablePublicGraphQueryRequest(
+        "docs",
+        "docs",
+        "{\"graph_searches\":{\"related\":{\"type\":\"neighbors\",\"index_name\":\"graph_idx\",\"start_nodes\":{\"keys\":[\"doc:1\"]}}},\"search_after\":[\"2026-01-01T00:00:00Z\",\"doc:1\"]}",
+    ));
 }
 
 var test_nonce: std.atomic.Value(u64) = .init(0);

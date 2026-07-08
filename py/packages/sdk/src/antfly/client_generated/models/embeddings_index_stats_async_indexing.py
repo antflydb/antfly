@@ -11,7 +11,7 @@ T = TypeVar("T", bound="EmbeddingsIndexStatsAsyncIndexing")
 
 @_attrs_define
 class EmbeddingsIndexStatsAsyncIndexing:
-    """Derived-index background indexing diagnostics."""
+    """ """
 
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 

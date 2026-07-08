@@ -11,7 +11,7 @@ T = TypeVar("T", bound="EmbeddingsIndexStatsHbcPosting")
 
 @_attrs_define
 class EmbeddingsIndexStatsHbcPosting:
-    """Dense-vector posting diagnostics."""
+    """ """
 
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
