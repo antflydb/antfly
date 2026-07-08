@@ -5115,6 +5115,17 @@ func TestParseHADirectAdminActionResultAcceptsOpenAPIAndLegacyShapes(t *testing.
 func TestParseHAAdminActionResultTable(t *testing.T) {
 	g := NewWithT(t)
 
+	slotResume, ok := parseHAAdminActionResultTable(`{"schema_version":1,"action":{"action_id":"replication_slot_resume:standby-a","action_kind":"replication_slot_resume","target":"standby-a","state":"applied","node_id":"primary-a"},"slot_action":"resume","slot":{"slot_name":"standby-a","timeline_id":1,"restart_lsn":0,"received_lsn":0,"applied_lsn":0,"safe_read_lsn":0,"active":true,"reseed_required":false,"last_error":null,"current_lsn":0,"dropped":false}}`)
+	g.Expect(ok).To(BeTrue())
+	g.Expect(slotResume.SchemaVersion).To(Equal(uint32(1)))
+	g.Expect(slotResume.ActionID).To(Equal("replication_slot_resume:standby-a"))
+	g.Expect(slotResume.ActionKind).To(Equal("replication_slot_resume"))
+	g.Expect(slotResume.ActionTarget).To(Equal("standby-a"))
+	g.Expect(slotResume.ActionState).To(Equal("applied"))
+	g.Expect(slotResume.ActionNodeID).To(Equal("primary-a"))
+	g.Expect(slotResume.SlotAction).To(Equal("resume"))
+	g.Expect(slotResume.SlotName).To(Equal("standby-a"))
+
 	finish, ok := parseHAAdminActionResultTable(strings.Join([]string{
 		"result=seed_finish",
 		"action.action_id=base_backup_finish:base-standby-a-5",

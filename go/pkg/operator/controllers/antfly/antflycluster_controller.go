@@ -4772,6 +4772,9 @@ func (r *AntflyClusterReconciler) updateHAAdminActionResultFromJobLogs(ctx conte
 }
 
 func parseHAAdminActionResultTable(body string) (*antflyv1.HAAdminActionResultStatus, bool) {
+	if result, ok := parseHADirectAdminActionResult([]byte(body)); ok {
+		return result, true
+	}
 	lines := parseHATableLines(body)
 	resultName := strings.TrimSpace(lines["result"])
 	if resultName == "" {
