@@ -16,6 +16,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
+const utf8_text = @import("utf8_text.zig");
 const template_mod = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
     @import("../template_stub.zig")
 else
@@ -48,9 +49,9 @@ pub const DenseEmbedder = struct {
     deinit_fn: ?DenseEmbedDeinitFn = null,
 
     pub fn embedDense(self: DenseEmbedder, alloc: Allocator, embedding_name: []const u8, text: []const u8, dims: u32) ![]f32 {
-        const sanitized = try sanitizeUtf8ForEmbeddingAlloc(alloc, text);
-        defer if (sanitized) |owned| alloc.free(owned);
-        return try self.dense_embed_fn(self.ptr, alloc, embedding_name, sanitized orelse text, dims);
+        var sanitized = try utf8_text.sanitizeAlloc(alloc, text, "dense embedder");
+        defer sanitized.deinit(alloc);
+        return try self.dense_embed_fn(self.ptr, alloc, embedding_name, sanitized.text, dims);
     }
 
     pub fn embedDenseBatch(
@@ -97,9 +98,9 @@ pub const SparseEmbedder = struct {
     deinit_fn: ?SparseEmbedDeinitFn = null,
 
     pub fn embedSparse(self: SparseEmbedder, alloc: Allocator, embedding_name: []const u8, text: []const u8) !SparseEmbedding {
-        const sanitized = try sanitizeUtf8ForEmbeddingAlloc(alloc, text);
-        defer if (sanitized) |owned| alloc.free(owned);
-        return try self.sparse_embed_fn(self.ptr, alloc, embedding_name, sanitized orelse text);
+        var sanitized = try utf8_text.sanitizeAlloc(alloc, text, "sparse embedder");
+        defer sanitized.deinit(alloc);
+        return try self.sparse_embed_fn(self.ptr, alloc, embedding_name, sanitized.text);
     }
 
     pub fn embedSparseBatch(
@@ -120,11 +121,6 @@ pub const SparseEmbedder = struct {
         deinit_fn(self.ptr, alloc);
     }
 };
-
-fn sanitizeUtf8ForEmbeddingAlloc(alloc: Allocator, text: []const u8) !?[]u8 {
-    if (std.unicode.utf8ValidateSlice(text)) return null;
-    return try std.fmt.allocPrint(alloc, "{f}", .{std.unicode.fmtUtf8(text)});
-}
 
 const SanitizedTextBatch = struct {
     original: []const []const u8,
@@ -194,7 +190,7 @@ fn sanitizeUtf8BatchForEmbeddingAlloc(alloc: Allocator, texts: []const []const u
             sanitized[i] = text;
             continue;
         }
-        const safe_text = try std.fmt.allocPrint(alloc, "{f}", .{std.unicode.fmtUtf8(text)});
+        const safe_text = try utf8_text.replacementAlloc(alloc, text, "embedding batch");
         owned[i] = safe_text;
         sanitized[i] = safe_text;
     }
@@ -239,7 +235,7 @@ fn sanitizeContentPartsForEmbeddingAlloc(alloc: Allocator, parts: []const templa
                     sanitized_parts[i] = part;
                     continue;
                 }
-                const safe_text = try std.fmt.allocPrint(alloc, "{f}", .{std.unicode.fmtUtf8(text)});
+                const safe_text = try utf8_text.replacementAlloc(alloc, text, "embedding content parts");
                 owned_texts[i] = safe_text;
                 sanitized_parts[i] = .{ .text = safe_text };
             },
