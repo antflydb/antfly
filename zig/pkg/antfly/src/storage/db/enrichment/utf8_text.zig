@@ -51,6 +51,15 @@ pub fn invalidUtf8RepairCount() u64 {
     return invalid_utf8_repairs.load(.monotonic);
 }
 
+pub fn writePrometheus(writer: *std.Io.Writer) !void {
+    try writer.writeAll(
+        \\# HELP antfly_enrichment_invalid_utf8_repairs_total Invalid UTF-8 inputs repaired before enrichment chunking or embedding
+        \\# TYPE antfly_enrichment_invalid_utf8_repairs_total counter
+        \\
+    );
+    try writer.print("antfly_enrichment_invalid_utf8_repairs_total {d}\n", .{invalidUtf8RepairCount()});
+}
+
 pub fn snapToBoundary(text: []const u8, index: usize, direction: BoundaryDirection) usize {
     var i = @min(index, text.len);
     switch (direction) {
@@ -104,4 +113,15 @@ test "enrichment utf8 sanitizer replaces invalid input" {
     try std.testing.expect(std.unicode.utf8ValidateSlice(sanitized.text));
     try std.testing.expect(std.mem.indexOf(u8, sanitized.text, &std.unicode.replacement_character_utf8) != null);
     try std.testing.expect(invalidUtf8RepairCount() > repairs_before);
+}
+
+test "enrichment utf8 repair metric writes prometheus counter" {
+    var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer writer.deinit();
+
+    try writePrometheus(&writer.writer);
+    const out = writer.writer.buffered();
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "# TYPE antfly_enrichment_invalid_utf8_repairs_total counter") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "antfly_enrichment_invalid_utf8_repairs_total ") != null);
 }

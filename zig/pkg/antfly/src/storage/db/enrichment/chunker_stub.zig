@@ -76,17 +76,21 @@ pub fn chunkTextWithConfigJson(
     var cfg = try chunking_types.parseConfigFromSlice(alloc, config_json);
     defer cfg.deinit(alloc);
 
+    var sanitized = try utf8_text.sanitizeAlloc(alloc, text, "configured enrichment chunker");
+    defer sanitized.deinit(alloc);
+    const source_text = sanitized.text;
+
     return switch (cfg.provider) {
         .mock => try chunkText(
             alloc,
-            text,
+            source_text,
             cfg.defaultedTargetTokens(),
             cfg.defaultedOverlapTokens(),
         ),
         .antfly => if (cfg.model.len == 0)
             try chunkText(
                 alloc,
-                text,
+                source_text,
                 cfg.defaultedTargetTokens(),
                 cfg.defaultedOverlapTokens(),
             )
@@ -154,6 +158,22 @@ test "enrichment chunker stub replaces invalid utf8 before storing chunk text" {
     try std.testing.expectEqual(@as(usize, 1), chunks.len);
     try std.testing.expect(std.unicode.utf8ValidateSlice(chunks[0].text.?));
     try std.testing.expect(std.mem.indexOf(u8, chunks[0].text.?, &std.unicode.replacement_character_utf8) != null);
+    try std.testing.expect(utf8_text.invalidUtf8RepairCount() > repairs_before);
+}
+
+test "enrichment chunker stub configured chunking replaces invalid utf8 before dispatch" {
+    const alloc = std.testing.allocator;
+    const repairs_before = utf8_text.invalidUtf8RepairCount();
+
+    const chunks = try chunkTextWithConfigJson(alloc, "bad\xc2 text",
+        \\{"provider":"antfly","text":{"target_tokens":512,"overlap_tokens":0}}
+    );
+    defer freeChunks(alloc, chunks);
+
+    try std.testing.expect(chunks.len > 0);
+    for (chunks) |chunk| {
+        try std.testing.expect(std.unicode.utf8ValidateSlice(chunk.text.?));
+    }
     try std.testing.expect(utf8_text.invalidUtf8RepairCount() > repairs_before);
 }
 

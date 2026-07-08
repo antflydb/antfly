@@ -508,6 +508,7 @@ pub const HealthSource = struct {
         try writeTextMergeMetrics(writer, live_write_source.textMergeStatsBestEffort());
         try writeAsyncIndexingMetrics(writer, live_write_source.asyncIndexingStatsBestEffort());
         try antfly.db.query_metrics.writePrometheus(writer);
+        try antfly.db.enrichment_utf8_text.writePrometheus(writer);
     }
 
     fn writeHAMetrics(self: *HealthSource, writer: *std.Io.Writer) !void {
