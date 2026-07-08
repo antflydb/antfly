@@ -4833,22 +4833,6 @@ pub const ApiHttpServer = struct {
         return try out.toOwnedSlice(alloc);
     }
 
-    fn loadOwnedTableNames(self: *ApiHttpServer) ![]const []const u8 {
-        var snapshot = (try self.source.adminSnapshot()) orelse return try self.alloc.alloc([]const u8, 0);
-        defer self.source.freeAdminSnapshot(&snapshot);
-        const names = try self.alloc.alloc([]const u8, snapshot.tables.len);
-        var initialized: usize = 0;
-        errdefer {
-            for (names[0..initialized]) |name| self.alloc.free(@constCast(name));
-            self.alloc.free(names);
-        }
-        for (snapshot.tables, 0..) |table, i| {
-            names[i] = try self.alloc.dupe(u8, table.name);
-            initialized += 1;
-        }
-        return names;
-    }
-
     pub fn tableExists(self: *ApiHttpServer, table_name: []const u8) !bool {
         var snapshot = (try self.source.adminSnapshot()) orelse return false;
         defer self.source.freeAdminSnapshot(&snapshot);
@@ -7014,12 +6998,18 @@ pub const ApiHttpServer = struct {
             return error.InternalFailure;
         };
 
-        const owns_table_names = req.table_names == null;
-        const table_names = if (req.table_names) |values|
-            values
-        else
-            self.loadOwnedTableNames() catch |err| return metadataAccessFailure(err);
-        defer if (owns_table_names) freeOwnedStrings(alloc, table_names);
+        var all_tables_snapshot: ?metadata_api.AdminSnapshot = null;
+        defer if (all_tables_snapshot) |*snapshot| self.source.freeAdminSnapshot(snapshot);
+        var borrowed_table_names: ?[][]const u8 = null;
+        defer if (borrowed_table_names) |names| alloc.free(names);
+        const table_names: []const []const u8 = if (req.table_names) |values| values else blk: {
+            all_tables_snapshot = (self.source.adminSnapshot() catch |err| return metadataAccessFailure(err)) orelse {
+                borrowed_table_names = alloc.alloc([]const u8, 0) catch return error.InternalFailure;
+                break :blk borrowed_table_names.?;
+            };
+            borrowed_table_names = borrowedTableNamesFromAdminSnapshot(alloc, &all_tables_snapshot.?) catch return error.InternalFailure;
+            break :blk borrowed_table_names.?;
+        };
 
         const statuses = alloc.alloc(backups_api.ClusterTableBackupStatus, table_names.len) catch return error.InternalFailure;
         defer alloc.free(statuses);
@@ -7028,11 +7018,17 @@ pub const ApiHttpServer = struct {
             for (cluster_tables.items) |*entry| entry.deinit(alloc);
             cluster_tables.deinit(alloc);
         }
-        var extension_snapshot_opt = self.source.adminSnapshot() catch |err| switch (err) {
-            error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
-            else => null,
-        };
+        var extension_snapshot_opt: ?metadata_api.AdminSnapshot = null;
         defer if (extension_snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
+        const extension_snapshot: ?*const metadata_api.AdminSnapshot = if (all_tables_snapshot) |*snapshot|
+            snapshot
+        else blk: {
+            extension_snapshot_opt = self.source.adminSnapshot() catch |err| switch (err) {
+                error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
+                else => null,
+            };
+            break :blk if (extension_snapshot_opt) |*snapshot| snapshot else null;
+        };
 
         for (table_names, 0..) |table_name, i| {
             statuses[i] = .{ .name = table_name, .status = "failed", .@"error" = null };
@@ -7064,9 +7060,9 @@ pub const ApiHttpServer = struct {
             }) catch return error.InternalFailure;
         }
 
-        const installed_extensions = if (extension_snapshot_opt) |*snapshot| snapshot.installed_extensions else &.{};
-        const extension_members = if (extension_snapshot_opt) |*snapshot| snapshot.extension_members else &.{};
-        const extension_dependencies = if (extension_snapshot_opt) |*snapshot| snapshot.extension_dependencies else &.{};
+        const installed_extensions = if (extension_snapshot) |snapshot| snapshot.installed_extensions else &.{};
+        const extension_members = if (extension_snapshot) |snapshot| snapshot.extension_members else &.{};
+        const extension_dependencies = if (extension_snapshot) |snapshot| snapshot.extension_dependencies else &.{};
         var manifest = backups_api.createClusterManifestWithExtensions(alloc, req.backup_id, req.location, cluster_tables.items, installed_extensions, extension_members, extension_dependencies) catch return error.InternalFailure;
         defer manifest.deinit(alloc);
         backups_api.writeClusterManifestToLocation(alloc, location, &manifest) catch return error.InternalFailure;
@@ -7091,12 +7087,12 @@ pub const ApiHttpServer = struct {
             else => return error.InvalidRequest,
         };
 
-        const owns_table_names = req.table_names == null;
-        const table_names = if (req.table_names) |values|
-            values
-        else
-            cloneClusterManifestTableNames(alloc, &manifest) catch return error.InternalFailure;
-        defer if (owns_table_names) freeOwnedStrings(alloc, table_names);
+        var borrowed_table_names: ?[][]const u8 = null;
+        defer if (borrowed_table_names) |names| alloc.free(names);
+        const table_names: []const []const u8 = if (req.table_names) |values| values else blk: {
+            borrowed_table_names = borrowedTableNamesFromClusterManifest(alloc, &manifest) catch return error.InternalFailure;
+            break :blk borrowed_table_names.?;
+        };
 
         if (std.mem.eql(u8, restore_mode, "fail_if_exists")) {
             for (table_names) |table_name| {
@@ -7221,7 +7217,7 @@ pub const ApiHttpServer = struct {
             statuses[i].status = "triggered";
         }
 
-        if (owns_table_names and clusterRestoreStatusesHaveNoErrors(statuses)) {
+        if (req.table_names == null and clusterRestoreStatusesHaveNoErrors(statuses)) {
             self.source.restoreExtensions(
                 alloc,
                 manifest.installed_extensions,
@@ -8817,19 +8813,24 @@ fn queryBuilderJsonInt(value: ?std.json.Value) ?i64 {
     };
 }
 
-fn cloneClusterManifestTableNames(
+fn borrowedTableNamesFromAdminSnapshot(
+    alloc: std.mem.Allocator,
+    snapshot: *const metadata_api.AdminSnapshot,
+) ![][]const u8 {
+    const names = try alloc.alloc([]const u8, snapshot.tables.len);
+    for (snapshot.tables, 0..) |table, i| {
+        names[i] = table.name;
+    }
+    return names;
+}
+
+fn borrowedTableNamesFromClusterManifest(
     alloc: std.mem.Allocator,
     manifest: *const backups_api.ClusterBackupManifest,
-) ![]const []const u8 {
+) ![][]const u8 {
     const names = try alloc.alloc([]const u8, manifest.tables.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (names[0..initialized]) |name| alloc.free(@constCast(name));
-        alloc.free(names);
-    }
     for (manifest.tables, 0..) |table, i| {
-        names[i] = try alloc.dupe(u8, table.name);
-        initialized += 1;
+        names[i] = table.name;
     }
     return names;
 }

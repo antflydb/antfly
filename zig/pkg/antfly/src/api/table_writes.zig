@@ -7270,36 +7270,62 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
         table_name: []const u8,
     ) !void {
-        if (!try db_mod.DB.restoreRuntimeRepairNeededForPath(alloc, path)) return;
+        const open_retry_timeout_ns = 2 * std.time.ns_per_s;
+        const open_start_ns = platform_time.monotonicNs();
+        var open_attempts: usize = 0;
+        var logged_open_wait = false;
+        while (true) {
+            if (!try db_mod.DB.restoreRuntimeRepairNeededForPath(alloc, path)) return;
 
-        const indexes_json = (try loadTableIndexesJson(alloc, self.catalog, table_name)) orelse return error.TableVisibilityTimeout;
-        defer alloc.free(indexes_json);
+            const indexes_json = (try loadTableIndexesJson(alloc, self.catalog, table_name)) orelse return error.TableVisibilityTimeout;
+            defer alloc.free(indexes_json);
 
-        var db = try self.openRestoreRepairDbForGroup(
-            alloc,
-            path,
-            group_id,
-            table_name,
-            indexes_json,
-        );
-        defer db.close();
+            open_attempts += 1;
+            var db = self.openRestoreRepairDbForGroup(
+                alloc,
+                path,
+                group_id,
+                table_name,
+                indexes_json,
+            ) catch |err| switch (err) {
+                error.LsmRootWriterAlreadyOpen, error.WriterLocked => {
+                    if (platform_time.monotonicNs() -| open_start_ns >= open_retry_timeout_ns) return err;
+                    if (!logged_open_wait) {
+                        logged_open_wait = true;
+                        std.log.warn("restore foreground repair waiting for writer table={s} group_id={d} err={s}", .{
+                            table_name,
+                            group_id,
+                            @errorName(err),
+                        });
+                    }
+                    self.table_activity_threaded.io().sleep(Io.Duration.fromNanoseconds(replicated_apply_writer_open_retry_ns), .awake) catch |sleep_err| switch (sleep_err) {
+                        error.Canceled => Io.recancel(self.table_activity_threaded.io()),
+                    };
+                    continue;
+                },
+                else => return err,
+            };
+            defer db.close();
 
-        const timeout_ns = 30 * std.time.ns_per_s;
-        const start_ns = platform_time.monotonicNs();
-        var attempts: usize = 0;
-        std.log.info("restore foreground repair begin table={s} group_id={d}", .{ table_name, group_id });
-        while (try db.restoreRuntimeRepairNeeded()) {
-            attempts += 1;
-            if (try db.repairRestoreRuntimeStateStepIfNeeded(alloc)) {
-                db.clearDenseHbcCaches();
+            const timeout_ns = 30 * std.time.ns_per_s;
+            const start_ns = platform_time.monotonicNs();
+            var attempts: usize = 0;
+            std.log.info("restore foreground repair begin table={s} group_id={d}", .{ table_name, group_id });
+            while (try db.restoreRuntimeRepairNeeded()) {
+                attempts += 1;
+                if (try db.repairRestoreRuntimeStateStepIfNeeded(alloc)) {
+                    db.clearDenseHbcCaches();
+                }
+                if (platform_time.monotonicNs() -| start_ns >= timeout_ns) return error.TableVisibilityTimeout;
             }
-            if (platform_time.monotonicNs() -| start_ns >= timeout_ns) return error.TableVisibilityTimeout;
+            std.log.info("restore foreground repair complete table={s} group_id={d} attempts={d} open_attempts={d}", .{
+                table_name,
+                group_id,
+                attempts,
+                open_attempts,
+            });
+            return;
         }
-        std.log.info("restore foreground repair complete table={s} group_id={d} attempts={d}", .{
-            table_name,
-            group_id,
-            attempts,
-        });
     }
 
     const RestoreRepairCatchUpWork = struct {
@@ -7336,8 +7362,7 @@ pub const ProvisionedTableWriteSource = struct {
                 if (work.source.restore_repair_shutdown.load(.acquire)) return;
                 attempts += 1;
                 const busy = try work.repairOnce(path);
-                const still_needed = try db_mod.DB.restoreRuntimeRepairNeededForPath(work.alloc, path);
-                if (!busy and !still_needed) {
+                if (!busy) {
                     work.source.enqueueRestoreRepairComplete(work.table_name);
                     std.log.info("restore background catch-up complete table={s} group_id={d} attempts={d}", .{
                         work.table_name,
@@ -7351,14 +7376,13 @@ pub const ProvisionedTableWriteSource = struct {
         }
 
         fn repairOnce(self: *@This(), path: []const u8) !bool {
-            if (!try db_mod.DB.restoreRuntimeRepairNeededForPath(self.alloc, path)) return false;
-
             if (!self.source.tryBeginStructuralTableActivity(self.table_name)) return true;
             defer self.source.endStructuralTableActivity(self.table_name);
             var read_cache_exclusive = try self.source.beginReadCacheExclusive(self.table_name);
             defer {
                 if (read_cache_exclusive) |*exclusive| exclusive.deinit();
             }
+            if (!try db_mod.DB.restoreRuntimeRepairNeededForPath(self.alloc, path)) return false;
 
             if (!self.source.local_db_mutex.tryLock()) return true;
             if (self.source.hasDirtyWriteTableWithLocalDbLocked(self.table_name)) {
@@ -7391,7 +7415,7 @@ pub const ProvisionedTableWriteSource = struct {
             if (try db.repairRestoreRuntimeStateStepIfNeeded(self.alloc)) {
                 db.clearDenseHbcCaches();
             }
-            return false;
+            return try db.restoreRuntimeRepairNeeded();
         }
 
         fn deinit(ptr: *anyopaque) void {
@@ -8140,6 +8164,10 @@ pub const ProvisionedTableWriteSource = struct {
 
         self.beginLocalStructuralMutation(table_name);
         errdefer self.abortLocalStructuralMutation(table_name);
+        var read_cache_exclusive = try self.beginReadCacheExclusive(table_name);
+        defer {
+            if (read_cache_exclusive) |*exclusive| exclusive.deinit();
+        }
 
         for (group_ids) |group_id| {
             const trash_path = try moveDroppedGroupPathToTrash(alloc, self.replica_root_dir, table_name, group_id);
@@ -8544,6 +8572,10 @@ pub const ProvisionedTableWriteSource = struct {
         defer {
             self.endGroupOperation(table_name, group_id);
         }
+        var read_cache_exclusive = try self.beginReadCacheExclusive(table_name);
+        defer {
+            if (read_cache_exclusive) |*exclusive| exclusive.deinit();
+        }
 
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
@@ -8618,6 +8650,10 @@ pub const ProvisionedTableWriteSource = struct {
 
         self.beginLocalRestoreMutation(table_name);
         errdefer self.abortLocalRestoreMutation(table_name);
+        var read_cache_exclusive = try self.beginReadCacheExclusive(table_name);
+        defer {
+            if (read_cache_exclusive) |*exclusive| exclusive.deinit();
+        }
         var restore_io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer restore_io_impl.deinit();
 
@@ -8661,11 +8697,12 @@ pub const ProvisionedTableWriteSource = struct {
                 }
                 return err;
             };
+            var needs_background_repair = false;
             self.repairRestoredTableRuntimeStateBlocking(alloc, path, group_id, table_name) catch |err| switch (err) {
-                error.LsmRootWriterAlreadyOpen, error.WriterLocked => {},
+                error.LsmRootWriterAlreadyOpen, error.WriterLocked => needs_background_repair = true,
                 else => return err,
             };
-            self.requestRestoreRepairCatchUp(table_name, group_id);
+            if (needs_background_repair) self.requestRestoreRepairCatchUp(table_name, group_id);
         }
 
         self.finishLocalRestoreMutation(table_name);
@@ -26083,6 +26120,116 @@ test "provisioned table write source drop table waits for in-flight group batch 
     drop_probe.release.store(true, .release);
     drop_thread.join();
     if (drop_worker.err) |err| return err;
+}
+
+test "provisioned table write source drop table waits for active read cache lease" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/provisioned-drop-table-waits-for-read-cache", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
+    defer alloc.free(path);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = tables_api.default_indexes_json,
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    {
+        var db = try db_mod.DB.open(alloc, path, .{});
+        defer db.close();
+    }
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+
+    var lsm_cache = lsm_backend.Cache.init(alloc, lsm_backend.DefaultCacheSizeBytes);
+    defer lsm_cache.deinit();
+    var read_cache = table_reads.ProvisionedTableReadCache.init(alloc);
+    defer read_cache.deinit();
+    read_cache.lsm_cache = &lsm_cache;
+
+    var read_lease = try read_cache.getOrOpen(path, Catalog.iface(), 7001, 1, "docs");
+    var read_lease_active = true;
+    defer if (read_lease_active) read_lease.release();
+
+    const Probe = struct {
+        entered: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+
+        fn run(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.entered.store(true, .release);
+            while (!self.release.load(.acquire)) std.atomic.spinLoopHint();
+        }
+    };
+
+    const DropWorker = struct {
+        source: *ProvisionedTableWriteSource,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            _ = self.source.source().dropTable(std.heap.page_allocator, "docs", &.{7001}) catch |err| {
+                self.err = err;
+            };
+        }
+    };
+
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    source.read_cache = &read_cache;
+
+    var probe = Probe{};
+    test_before_drop_table_delete_hook = .{ .ptr = &probe, .run = Probe.run };
+    defer test_before_drop_table_delete_hook = null;
+
+    var worker = DropWorker{ .source = &source };
+    const thread = try std.Thread.spawn(.{}, DropWorker.run, .{&worker});
+
+    io_impl.io().sleep(Io.Duration.fromMilliseconds(10), .awake) catch {};
+    try std.testing.expect(!probe.entered.load(.acquire));
+
+    read_lease.release();
+    read_lease_active = false;
+    while (!probe.entered.load(.acquire)) {
+        io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+    probe.release.store(true, .release);
+    thread.join();
+    if (worker.err) |err| return err;
 }
 
 test "provisioned table write source drop index does not hold local db mutex during index deletion work" {
