@@ -812,6 +812,51 @@ func TestReconcileHAAdminJobsRecoversStaleDirectAPIMissingTokenFailureWithEnvFro
 	g.Expect(container.Env[0].ValueFrom.SecretKeyRef.Key).To(Equal("token"))
 }
 
+func TestHAAdminBearerTokenUsesRuntimeSecretOnlyWhenAllowed(t *testing.T) {
+	g := NewWithT(t)
+	t.Setenv("MISSING_HA_ADMIN_TOKEN", "")
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			HighAvailability: &antflyv1.HighAvailabilitySpec{
+				Admin: &antflyv1.HAAdminSpec{
+					TokenEnvVar: "MISSING_HA_ADMIN_TOKEN",
+				},
+				Runtime: &antflyv1.HARuntimeSpec{
+					AdminTokenSecretRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "ha-admin-token"},
+						Key:                  "token",
+					},
+				},
+			},
+		},
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "ha-admin-token", Namespace: "default"},
+		Data:       map[string][]byte{"token": []byte("secret-token")},
+	}
+	reconciler := &AntflyClusterReconciler{
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster, secret).Build(),
+		Scheme: s,
+	}
+
+	token, err := reconciler.haAdminBearerToken(context.Background(), cluster, true)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(token).To(Equal("secret-token"))
+
+	_, err = reconciler.haAdminBearerToken(context.Background(), cluster, false)
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(err.Error()).To(ContainSubstring("configured HA admin token env var MISSING_HA_ADMIN_TOKEN is empty or unset"))
+}
+
 func TestReconcileHAAdminJobsRecreatesMissingFailedFallbackJob(t *testing.T) {
 	g := NewWithT(t)
 	t.Setenv("MISSING_HA_ADMIN_TOKEN", "")

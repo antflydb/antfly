@@ -3751,7 +3751,7 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 	if err := haValidatePlannedActionAdminOperation(*action); err != nil {
 		return true, err
 	}
-	adminClient, err := r.haAdminSDKClient(cluster, action.AdminURL)
+	adminClient, err := r.haAdminSDKClient(ctx, cluster, action.AdminURL, false)
 	if err != nil {
 		return true, err
 	}
@@ -3964,7 +3964,7 @@ func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Contex
 	}
 }
 
-func (r *AntflyClusterReconciler) haAdminSDKClient(cluster *antflyv1.AntflyCluster, baseURL string) (*adminsdk.HAClient, error) {
+func (r *AntflyClusterReconciler) haAdminSDKClient(ctx context.Context, cluster *antflyv1.AntflyCluster, baseURL string, allowRuntimeSecret bool) (*adminsdk.HAClient, error) {
 	if strings.TrimSpace(baseURL) == "" {
 		return nil, fmt.Errorf("HA admin API execution requires adminURL")
 	}
@@ -3972,7 +3972,7 @@ func (r *AntflyClusterReconciler) haAdminSDKClient(cluster *antflyv1.AntflyClust
 	if err != nil {
 		return nil, err
 	}
-	token, err := haAdminBearerToken(cluster)
+	token, err := r.haAdminBearerToken(ctx, cluster, allowRuntimeSecret)
 	if err != nil {
 		return nil, err
 	}
@@ -3982,15 +3982,41 @@ func (r *AntflyClusterReconciler) haAdminSDKClient(cluster *antflyv1.AntflyClust
 	return client, nil
 }
 
-func haAdminBearerToken(cluster *antflyv1.AntflyCluster) (string, error) {
+func (r *AntflyClusterReconciler) haAdminBearerToken(ctx context.Context, cluster *antflyv1.AntflyCluster, allowRuntimeSecret bool) (string, error) {
 	var admin *antflyv1.HAAdminSpec
 	if cluster != nil && cluster.Spec.HighAvailability != nil && cluster.Spec.HighAvailability.Admin != nil {
 		admin = cluster.Spec.HighAvailability.Admin
 	}
 	envVar := haAdminTokenEnvVar(admin)
 	token := strings.TrimSpace(os.Getenv(envVar))
+	if token == "" && allowRuntimeSecret {
+		secretToken, err := r.haAdminRuntimeSecretBearerToken(ctx, cluster)
+		if err != nil {
+			return "", err
+		}
+		token = secretToken
+	}
 	if haAdminConfiguredTokenEnvVar(admin) != "" && token == "" {
 		return "", fmt.Errorf("configured HA admin token env var %s is empty or unset: %w", envVar, errHAAdminTokenEnvMissing)
+	}
+	return token, nil
+}
+
+func (r *AntflyClusterReconciler) haAdminRuntimeSecretBearerToken(ctx context.Context, cluster *antflyv1.AntflyCluster) (string, error) {
+	if r == nil || cluster == nil || cluster.Spec.HighAvailability == nil || cluster.Spec.HighAvailability.Runtime == nil {
+		return "", nil
+	}
+	ref := cluster.Spec.HighAvailability.Runtime.AdminTokenSecretRef
+	if ref == nil || strings.TrimSpace(ref.Name) == "" || strings.TrimSpace(ref.Key) == "" {
+		return "", nil
+	}
+	secret := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{Name: ref.Name, Namespace: cluster.Namespace}, secret); err != nil {
+		return "", fmt.Errorf("configured HA admin token secret %s/%s could not be read: %w", cluster.Namespace, ref.Name, err)
+	}
+	token := strings.TrimSpace(string(secret.Data[ref.Key]))
+	if token == "" {
+		return "", fmt.Errorf("configured HA admin token secret %s/%s key %s is empty or unset: %w", cluster.Namespace, ref.Name, ref.Key, errHAAdminTokenEnvMissing)
 	}
 	return token, nil
 }
@@ -6372,7 +6398,7 @@ func (r *AntflyClusterReconciler) observeHAStandbyAdminStatuses(ctx context.Cont
 }
 
 func (r *AntflyClusterReconciler) observeHAPrimaryStatusTyped(ctx context.Context, cluster *antflyv1.AntflyCluster, baseURL string, ha *antflyv1.HighAvailabilitySpec) (haObservedPrimaryStatus, error) {
-	adminClient, err := r.haAdminSDKClient(cluster, baseURL)
+	adminClient, err := r.haAdminSDKClient(ctx, cluster, baseURL, true)
 	if err != nil {
 		return haObservedPrimaryStatus{}, err
 	}
@@ -6391,7 +6417,7 @@ func (r *AntflyClusterReconciler) observeHAPrimaryStatusTyped(ctx context.Contex
 }
 
 func (r *AntflyClusterReconciler) observeHAStandbyStatusTyped(ctx context.Context, cluster *antflyv1.AntflyCluster, baseURL string, standbyName string, slotName string, upstreamLSN uint64, ha *antflyv1.HighAvailabilitySpec) (antflyv1.HAStandbyStatus, error) {
-	adminClient, err := r.haAdminSDKClient(cluster, baseURL)
+	adminClient, err := r.haAdminSDKClient(ctx, cluster, baseURL, true)
 	if err != nil {
 		return antflyv1.HAStandbyStatus{}, err
 	}
