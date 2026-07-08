@@ -14,7 +14,8 @@
 
 const std = @import("std");
 const chunking_types = @import("types.zig");
-const Chunk = @import("chunk.zig").Chunk;
+const chunk_mod = @import("chunk.zig");
+const Chunk = chunk_mod.Chunk;
 
 const inference_chunker = @import("inference_chunker");
 
@@ -38,7 +39,7 @@ pub fn chunkText(alloc: Allocator, text: []const u8, cfg: chunking_types.Config)
     for (shared_chunks, 0..) |shared, i| {
         if (!std.mem.eql(u8, shared.mime_type, "text/plain")) return error.UnsupportedChunkMediaType;
         const shared_text = shared.text orelse return error.InvalidChunkerResponse;
-        const offsets = completeOffsetPair(shared.start_char, shared.end_char);
+        const offsets = chunk_mod.completeTextOffsetPair(shared.start_char, shared.end_char, text.len);
         chunks[i] = .{
             .chunk_id = shared.id,
             .text = try alloc.dupe(u8, shared_text),
@@ -48,16 +49,6 @@ pub fn chunkText(alloc: Allocator, text: []const u8, cfg: chunking_types.Config)
     }
 
     return chunks;
-}
-
-const OffsetPair = struct {
-    start: ?u32,
-    end: ?u32,
-};
-
-fn completeOffsetPair(start: ?u32, end: ?u32) OffsetPair {
-    if (start == null or end == null) return .{ .start = null, .end = null };
-    return .{ .start = start, .end = end };
 }
 
 pub fn freeChunks(alloc: Allocator, chunks: []Chunk) void {
@@ -80,10 +71,4 @@ test "fixed chunker splits by token target" {
     defer freeChunks(alloc, chunks);
     try std.testing.expect(chunks.len >= 2);
     try std.testing.expectEqual(@as(?u32, 0), chunks[0].start_offset);
-}
-
-test "fixed chunker drops incomplete provenance spans" {
-    try std.testing.expectEqual(OffsetPair{ .start = null, .end = null }, completeOffsetPair(0, null));
-    try std.testing.expectEqual(OffsetPair{ .start = null, .end = null }, completeOffsetPair(null, 5));
-    try std.testing.expectEqual(OffsetPair{ .start = 0, .end = 5 }, completeOffsetPair(0, 5));
 }

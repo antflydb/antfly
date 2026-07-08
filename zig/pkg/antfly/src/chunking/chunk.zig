@@ -41,6 +41,19 @@ pub const Chunk = struct {
     }
 };
 
+pub const OffsetPair = struct {
+    start: ?u32,
+    end: ?u32,
+};
+
+pub fn completeTextOffsetPair(start: ?u32, end: ?u32, text_len: usize) OffsetPair {
+    const start_value = start orelse return .{ .start = null, .end = null };
+    const end_value = end orelse return .{ .start = null, .end = null };
+    if (start_value > end_value) return .{ .start = null, .end = null };
+    if (@as(usize, @intCast(end_value)) > text_len) return .{ .start = null, .end = null };
+    return .{ .start = start_value, .end = end_value };
+}
+
 pub const ProvenanceScope = enum {
     document,
     unit,
@@ -264,6 +277,14 @@ test "append artifact fields stores text offsets and payload" {
     try std.testing.expectEqual(@as(i64, 12), provenance.get("char_end").?.integer);
     try std.testing.expectEqual(@as(i64, 7), provenance.get("document_char_start").?.integer);
     try std.testing.expectEqual(@as(i64, 12), provenance.get("document_char_end").?.integer);
+}
+
+test "complete text offset pair only returns complete valid source spans" {
+    try std.testing.expectEqual(OffsetPair{ .start = null, .end = null }, completeTextOffsetPair(0, null, 5));
+    try std.testing.expectEqual(OffsetPair{ .start = null, .end = null }, completeTextOffsetPair(null, 5, 5));
+    try std.testing.expectEqual(OffsetPair{ .start = null, .end = null }, completeTextOffsetPair(6, 5, 10));
+    try std.testing.expectEqual(OffsetPair{ .start = null, .end = null }, completeTextOffsetPair(0, 6, 5));
+    try std.testing.expectEqual(OffsetPair{ .start = 0, .end = 5 }, completeTextOffsetPair(0, 5, 5));
 }
 
 test "append artifact fields stores unit-local and document-global provenance" {

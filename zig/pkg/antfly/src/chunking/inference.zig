@@ -16,7 +16,8 @@ const std = @import("std");
 const httpx = @import("httpx");
 const inference_api = @import("inference_api");
 const chunking_types = @import("types.zig");
-const Chunk = @import("chunk.zig").Chunk;
+const chunk_mod = @import("chunk.zig");
+const Chunk = chunk_mod.Chunk;
 const http_common = @import("../raft/transport/http_common.zig");
 const std_http_listener = @import("../raft/transport/std_http_listener.zig");
 const inference_chunker = @import("inference_chunker");
@@ -39,7 +40,7 @@ pub fn chunkText(alloc: Allocator, cfg: chunking_types.Config, text: []const u8)
     for (shared_chunks, 0..) |shared, i| {
         if (!std.mem.eql(u8, shared.mime_type, "text/plain")) return error.UnsupportedChunkMediaType;
         const shared_text = shared.text orelse return error.InvalidChunkerResponse;
-        const offsets = completeOffsetPair(shared.start_char, shared.end_char);
+        const offsets = chunk_mod.completeTextOffsetPair(shared.start_char, shared.end_char, text.len);
         chunks[i] = .{
             .chunk_id = shared.id,
             .text = try alloc.dupe(u8, shared_text),
@@ -48,16 +49,6 @@ pub fn chunkText(alloc: Allocator, cfg: chunking_types.Config, text: []const u8)
         };
     }
     return chunks;
-}
-
-const OffsetPair = struct {
-    start: ?u32,
-    end: ?u32,
-};
-
-fn completeOffsetPair(start: ?u32, end: ?u32) OffsetPair {
-    if (start == null or end == null) return .{ .start = null, .end = null };
-    return .{ .start = start, .end = end };
 }
 
 pub fn chunkBinary(alloc: Allocator, cfg: chunking_types.Config, mime_type: []const u8, data: []const u8) ![]RemoteChunk {
@@ -323,7 +314,7 @@ test "antfly chunker text round trip" {
     try std.testing.expectEqual(@as(?u32, 11), chunks[1].start_offset);
 }
 
-test "antfly chunker omits incomplete provenance spans" {
+test "antfly chunker omits incomplete and invalid provenance spans" {
     const alloc = std.testing.allocator;
     const FakeApp = struct {
         fn executor() http_common.RequestExecutor {
@@ -344,7 +335,9 @@ test "antfly chunker omits incomplete provenance spans" {
                 .body = try req_alloc.dupe(u8,
                     \\{"object":"list","data":[
                     \\  {"object":"chunk","index":0,"id":0,"mime_type":"text/plain","text":"alpha","start_char":0},
-                    \\  {"object":"chunk","index":1,"id":1,"mime_type":"text/plain","text":"beta","end_char":9}
+                    \\  {"object":"chunk","index":1,"id":1,"mime_type":"text/plain","text":"beta","end_char":9},
+                    \\  {"object":"chunk","index":2,"id":2,"mime_type":"text/plain","text":"gamma","start_char":8,"end_char":2},
+                    \\  {"object":"chunk","index":3,"id":3,"mime_type":"text/plain","text":"delta","start_char":0,"end_char":99}
                     \\],"model":"chunker-v1","usage":{"prompt_tokens":2,"completion_tokens":0,"total_tokens":2},"cache_hit":false}
                 ),
             };
@@ -371,11 +364,15 @@ test "antfly chunker omits incomplete provenance spans" {
         alloc.free(chunks);
     }
 
-    try std.testing.expectEqual(@as(usize, 2), chunks.len);
+    try std.testing.expectEqual(@as(usize, 4), chunks.len);
     try std.testing.expectEqual(@as(?u32, null), chunks[0].start_offset);
     try std.testing.expectEqual(@as(?u32, null), chunks[0].end_offset);
     try std.testing.expectEqual(@as(?u32, null), chunks[1].start_offset);
     try std.testing.expectEqual(@as(?u32, null), chunks[1].end_offset);
+    try std.testing.expectEqual(@as(?u32, null), chunks[2].start_offset);
+    try std.testing.expectEqual(@as(?u32, null), chunks[2].end_offset);
+    try std.testing.expectEqual(@as(?u32, null), chunks[3].start_offset);
+    try std.testing.expectEqual(@as(?u32, null), chunks[3].end_offset);
 }
 
 test "antfly chunker binary round trip" {
