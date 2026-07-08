@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   goreleaser:
-    runs-on: arc-antfly-standard
+    runs-on: arc-antfly-publish
     env:
       GOEXPERIMENT: simd
     steps:
