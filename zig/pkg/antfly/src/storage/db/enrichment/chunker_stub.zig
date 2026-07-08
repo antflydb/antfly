@@ -38,8 +38,13 @@ pub fn chunkText(
     var chunk_id: u32 = 0;
     const step = chunk_size - chunk_overlap;
     var start: usize = 0;
-    while (start < text.len) : (start += step) {
-        const end = @min(start + chunk_size, text.len);
+    while (start < text.len) {
+        start = snapToUtf8Boundary(text, start, .backward);
+        if (start >= text.len) break;
+        const raw_end = @min(start + chunk_size, text.len);
+        const backward_end = snapToUtf8Boundary(text, raw_end, .backward);
+        const end = if (backward_end > start) backward_end else snapToUtf8Boundary(text, raw_end, .forward);
+        if (end <= start) break;
         try chunks.append(alloc, .{
             .chunk_id = chunk_id,
             .text = try alloc.dupe(u8, text[start..end]),
@@ -48,9 +53,33 @@ pub fn chunkText(
         });
         chunk_id += 1;
         if (end == text.len) break;
+        const previous_start = start;
+        const raw_next = previous_start + step;
+        var next = snapToUtf8Boundary(text, raw_next, .backward);
+        if (next <= previous_start) next = snapToUtf8Boundary(text, raw_next, .forward);
+        start = if (next > previous_start) next else end;
     }
 
     return try chunks.toOwnedSlice(alloc);
+}
+
+const BoundaryDirection = enum { backward, forward };
+
+fn snapToUtf8Boundary(text: []const u8, index: usize, direction: BoundaryDirection) usize {
+    var i = @min(index, text.len);
+    switch (direction) {
+        .backward => {
+            while (i > 0 and i < text.len and isUtf8Continuation(text[i])) : (i -= 1) {}
+        },
+        .forward => {
+            while (i < text.len and isUtf8Continuation(text[i])) : (i += 1) {}
+        },
+    }
+    return i;
+}
+
+fn isUtf8Continuation(byte: u8) bool {
+    return (byte & 0xc0) == 0x80;
 }
 
 pub fn chunkTextWithConfigJson(
@@ -97,6 +126,36 @@ test "chunker stub supports local configured chunking" {
     try std.testing.expectEqualStrings("abcd", chunks[0].text.?);
     try std.testing.expectEqualStrings("defg", chunks[1].text.?);
     try std.testing.expectEqualStrings("ghij", chunks[2].text.?);
+}
+
+test "enrichment chunker stub preserves utf8 boundaries across default byte windows" {
+    const alloc = std.testing.allocator;
+
+    var text = try alloc.alloc(u8, 520);
+    defer alloc.free(text);
+    @memset(text, 'a');
+    text[447] = 0xc2;
+    text[448] = 0xa0;
+
+    const chunks = try chunkText(alloc, text, 512, 64);
+    defer freeChunks(alloc, chunks);
+
+    try std.testing.expect(chunks.len >= 2);
+    for (chunks) |chunk| {
+        try std.testing.expect(std.unicode.utf8ValidateSlice(chunk.text.?));
+    }
+    try std.testing.expectEqual(@as(?u32, 447), chunks[1].start_offset);
+}
+
+test "enrichment chunker stub makes progress when byte window is smaller than utf8 scalar" {
+    const alloc = std.testing.allocator;
+
+    const chunks = try chunkText(alloc, "éx", 1, 0);
+    defer freeChunks(alloc, chunks);
+
+    try std.testing.expectEqual(@as(usize, 2), chunks.len);
+    try std.testing.expectEqualStrings("é", chunks[0].text.?);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(chunks[0].text.?));
 }
 
 test "chunker stub rejects antfly configured chunking" {

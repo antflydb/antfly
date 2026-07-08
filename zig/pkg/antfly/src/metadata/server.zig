@@ -337,7 +337,11 @@ const MetadataAdminMux = struct {
 
     fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
         const self: *MetadataAdminMux = @ptrCast(@alignCast(ptr));
-        if (isPublicApiRequest(req.uri)) return try self.public_api.handle(req);
+        if (isPublicApiRequest(req.uri)) {
+            var response = try self.public_api.handle(req);
+            defer response.deinit(self.public_api.alloc);
+            return try cloneHttpResponse(alloc, response);
+        }
         return try self.admin.executor().execute(alloc, req);
     }
 
@@ -345,6 +349,35 @@ const MetadataAdminMux = struct {
         return std.mem.eql(u8, uri, "/db/v1") or
             std.mem.startsWith(u8, uri, "/db/v1/") or
             std.mem.startsWith(u8, uri, "/db/v1?");
+    }
+
+    fn cloneHttpResponse(alloc: std.mem.Allocator, response: http_common.HttpResponse) !http_common.HttpResponse {
+        const content_type = if (response.content_type) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (content_type) |value| alloc.free(value);
+
+        const body = try alloc.dupe(u8, response.body);
+        errdefer alloc.free(body);
+
+        const headers = try alloc.alloc(http_common.Header, response.headers.len);
+        errdefer alloc.free(headers);
+        var initialized_headers: usize = 0;
+        errdefer {
+            for (headers[0..initialized_headers]) |*header| header.deinit(alloc);
+        }
+        for (response.headers, 0..) |header, i| {
+            const name = try alloc.dupe(u8, header.name);
+            errdefer alloc.free(name);
+            const value = try alloc.dupe(u8, header.value);
+            headers[i] = .{ .name = name, .value = value };
+            initialized_headers += 1;
+        }
+
+        return .{
+            .status = response.status,
+            .content_type = content_type,
+            .headers = headers,
+            .body = body,
+        };
     }
 };
 

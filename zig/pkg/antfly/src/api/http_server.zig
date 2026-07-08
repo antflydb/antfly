@@ -4256,7 +4256,7 @@ pub const ApiHttpServer = struct {
                 };
                 defer self.alloc.free(schema_json);
 
-                const table_before = try self.loadOwnedTableRecord(table_name);
+                const table_before = try self.loadOwnedTableRecord(self.alloc, table_name);
                 if (table_before == null) {
                     self.source.updateSchema(self.alloc, table_name, schema_json) catch |err| switch (err) {
                         error.InvalidSchemaUpdateRequest => return try textResponse(self.alloc, 400, invalid_schema_message),
@@ -4761,11 +4761,15 @@ pub const ApiHttpServer = struct {
         return try self.restoreManifestGroupIdsAlloc(alloc, backup_location, backup_id);
     }
 
-    pub fn loadOwnedTableRecord(self: *ApiHttpServer, table_name: []const u8) !?metadata_table_manager.TableRecord {
+    pub fn loadOwnedTableRecord(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+    ) !?metadata_table_manager.TableRecord {
         var snapshot = (try self.source.adminSnapshot()) orelse return null;
         defer self.source.freeAdminSnapshot(&snapshot);
         const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
-        return try metadata_table_manager.cloneTable(self.alloc, table.*);
+        return try metadata_table_manager.cloneTable(alloc, table.*);
     }
 
     pub fn docMatchesRowFilter(
@@ -5409,7 +5413,7 @@ pub const ApiHttpServer = struct {
         backup_id: []const u8,
         format: backups_api.BackupFormat,
     ) !void {
-        const table = (try self.loadOwnedTableRecord(table_name)) orelse return error.TableNotFound;
+        const table = (try self.loadOwnedTableRecord(self.alloc, table_name)) orelse return error.TableNotFound;
         defer metadata_table_manager.freeTable(self.alloc, table);
         if (table.read_schema_json.len > 0) return error.UnsupportedBackupMigrationState;
 
@@ -6680,7 +6684,7 @@ pub const ApiHttpServer = struct {
         body: []const u8,
     ) public_table_http.TableApi.ExecuteCreateIndexError!void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        const table_before = (self.loadOwnedTableRecord(table_name) catch |err| return metadataAccessFailure(err)) orelse return error.NotFound;
+        const table_before = (self.loadOwnedTableRecord(alloc, table_name) catch |err| return metadataAccessFailure(err)) orelse return error.NotFound;
         defer metadata_table_manager.freeTable(alloc, table_before);
         const index_json = table_contract.parseCreateIndexRequest(alloc, index_name, body) catch {
             return error.InvalidIndexRequest;
@@ -6768,7 +6772,7 @@ pub const ApiHttpServer = struct {
         index_name: []const u8,
     ) public_table_http.TableApi.ExecuteDeleteIndexError!void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        const table_before = (self.loadOwnedTableRecord(table_name) catch |err| return metadataAccessFailure(err)) orelse return error.NotFound;
+        const table_before = (self.loadOwnedTableRecord(alloc, table_name) catch |err| return metadataAccessFailure(err)) orelse return error.NotFound;
         defer metadata_table_manager.freeTable(alloc, table_before);
         self.source.dropIndex(alloc, table_name, index_name) catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
@@ -6810,7 +6814,7 @@ pub const ApiHttpServer = struct {
         body: []const u8,
     ) public_table_http.TableApi.ExecutePutArtifactEnrichmentError!void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        const table_before = (self.loadOwnedTableRecord(table_name) catch |err| return metadataAccessFailure(err)) orelse return error.NotFound;
+        const table_before = (self.loadOwnedTableRecord(alloc, table_name) catch |err| return metadataAccessFailure(err)) orelse return error.NotFound;
         defer metadata_table_manager.freeTable(alloc, table_before);
         const enrichment_json = table_contract.parseArtifactEnrichmentRequest(alloc, artifact_name, body) catch {
             return error.InvalidEnrichmentRequest;
@@ -6862,7 +6866,7 @@ pub const ApiHttpServer = struct {
         artifact_name: []const u8,
     ) public_table_http.TableApi.ExecuteDeleteArtifactEnrichmentError!void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        const table_before = (self.loadOwnedTableRecord(table_name) catch |err| return metadataAccessFailure(err)) orelse return error.NotFound;
+        const table_before = (self.loadOwnedTableRecord(alloc, table_name) catch |err| return metadataAccessFailure(err)) orelse return error.NotFound;
         defer metadata_table_manager.freeTable(alloc, table_before);
         const expected_indexes_json = (indexes_api.removeEnrichmentFromTableIndexesJson(alloc, table_before.indexes_json, artifact_name) catch return error.InternalFailure) orelse {
             return error.NotFound;

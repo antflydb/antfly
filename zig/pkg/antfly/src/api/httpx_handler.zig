@@ -1846,7 +1846,7 @@ pub const AntflyApiHandler = struct {
         };
         defer alloc.free(schema_json);
 
-        const table_before = try self.api_server.loadOwnedTableRecord(decoded_table_name);
+        const table_before = try self.api_server.loadOwnedTableRecord(alloc, decoded_table_name);
         if (table_before == null) {
             self.api_server.source.updateSchema(alloc, decoded_table_name, schema_json) catch |err| switch (err) {
                 error.InvalidSchemaUpdateRequest => {
