@@ -3583,7 +3583,7 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 		}
 		if action.AdminJobPhase == haAdminJobPhaseFailed &&
 			action.AdminJobName == haAdminDirectAPIName &&
-			haAdminActionMissingTokenCanFallbackFromStatus(ha.Admin, *action) {
+			haAdminActionMissingTokenCanFallbackFromStatus(cluster, ha.Admin, *action) {
 			action.AdminJobName = ""
 			action.AdminJobPhase = ""
 			action.AdminError = ""
@@ -3610,7 +3610,7 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 			continue
 		}
 		if handled, err := r.executeHAPlannedActionTyped(ctx, cluster, action); handled {
-			if err != nil && haAdminActionCanRunAsFallbackJob(ha.Admin, *action, err) {
+			if err != nil && haAdminActionCanRunAsFallbackJob(cluster, ha.Admin, *action, err) {
 				action.AdminError = ""
 				action.AdminStatusCode = 0
 				if err := r.reconcileHAAdminJob(ctx, cluster, ha.Admin, action); err != nil {
@@ -3706,26 +3706,26 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJob(ctx context.Context, clust
 	return nil
 }
 
-func haAdminActionCanRunAsFallbackJob(admin *antflyv1.HAAdminSpec, action antflyv1.HAPlannedActionStatus, err error) bool {
+func haAdminActionCanRunAsFallbackJob(cluster *antflyv1.AntflyCluster, admin *antflyv1.HAAdminSpec, action antflyv1.HAPlannedActionStatus, err error) bool {
 	if !stderrors.Is(err, errHAAdminTokenEnvMissing) {
 		return false
 	}
-	return haAdminActionHasEnvFromFallback(admin, action)
+	return haAdminActionHasJobTokenFallback(cluster, admin, action)
 }
 
-func haAdminActionMissingTokenCanFallbackFromStatus(admin *antflyv1.HAAdminSpec, action antflyv1.HAPlannedActionStatus) bool {
+func haAdminActionMissingTokenCanFallbackFromStatus(cluster *antflyv1.AntflyCluster, admin *antflyv1.HAAdminSpec, action antflyv1.HAPlannedActionStatus) bool {
 	if !strings.Contains(action.AdminError, "configured HA admin token env var") ||
 		!strings.Contains(action.AdminError, "is empty or unset") {
 		return false
 	}
-	return haAdminActionHasEnvFromFallback(admin, action)
+	return haAdminActionHasJobTokenFallback(cluster, admin, action)
 }
 
-func haAdminActionHasEnvFromFallback(admin *antflyv1.HAAdminSpec, action antflyv1.HAPlannedActionStatus) bool {
-	return admin != nil &&
-		haAdminConfiguredTokenEnvVar(admin) != "" &&
-		len(admin.EnvFrom) > 0 &&
-		len(action.AdminCommand) > 0
+func haAdminActionHasJobTokenFallback(cluster *antflyv1.AntflyCluster, admin *antflyv1.HAAdminSpec, action antflyv1.HAPlannedActionStatus) bool {
+	if admin == nil || haAdminConfiguredTokenEnvVar(admin) == "" || len(action.AdminCommand) == 0 {
+		return false
+	}
+	return len(admin.EnvFrom) > 0 || len(haAdminJobTokenEnv(cluster, admin)) > 0
 }
 
 func haPlannedActionRequiresAdminTarget(action antflyv1.HAPlannedActionStatus) bool {
