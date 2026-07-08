@@ -5259,6 +5259,31 @@ func TestParseHAAdminActionResultTable(t *testing.T) {
 	g.Expect(rejoin.DataLossDiscarded).To(BeTrue())
 }
 
+func TestCompletedSlotAdminJobResultSatisfiesReceiptEvidence(t *testing.T) {
+	g := NewWithT(t)
+
+	action := antflyv1.HAPlannedActionStatus{
+		Kind:        string(haActionResumeSlot),
+		SlotName:    "standby-a",
+		AdminNodeID: "primary-a",
+		AdminURL:    "http://primary-ha.default.svc:8081",
+		AdminMethod: "PUT",
+		AdminPath:   "/admin/v1/ha/replication-slots/standby-a/resume",
+	}
+	action.AdminResult = haCompletedSlotAdminJobResult(action)
+
+	g.Expect(action.AdminResult).NotTo(BeNil())
+	g.Expect(action.AdminResult.ActionID).To(Equal("replication_slot_resume:standby-a"))
+	g.Expect(action.AdminResult.ActionKind).To(Equal("replication_slot_resume"))
+	g.Expect(action.AdminResult.ActionTarget).To(Equal("standby-a"))
+	g.Expect(action.AdminResult.ActionState).To(Equal("applied"))
+	g.Expect(action.AdminResult.ActionNodeID).To(Equal("primary-a"))
+	g.Expect(action.AdminResult.SlotAction).To(Equal("resume"))
+	g.Expect(action.AdminResult.SlotName).To(Equal("standby-a"))
+	g.Expect(haActionHasRequiredAdminResult(action)).To(BeTrue())
+	g.Expect(haDirectAdminActionReceiptMatches(action)).To(BeTrue())
+}
+
 func TestParseHARejoinJobResult(t *testing.T) {
 	g := NewWithT(t)
 

@@ -4759,16 +4759,48 @@ func (r *AntflyClusterReconciler) updateHAAdminActionResultFromJobLogs(ctx conte
 	}
 	body, ok := r.haAdminJobLogBody(ctx, cluster, action.AdminJobName)
 	if !ok {
+		action.AdminResult = haCompletedSlotAdminJobResult(*action)
 		return
 	}
 	result, ok := parseHAAdminActionResultTable(body)
 	if !ok {
+		action.AdminResult = haCompletedSlotAdminJobResult(*action)
 		return
 	}
 	if haActionKind(action.Kind) == haActionPromoteStandby {
 		enrichHAPromotionAdminActionResult(result, haReplicationIdentity(cluster.Spec.HighAvailability), *action)
 	}
 	action.AdminResult = result
+}
+
+func haCompletedSlotAdminJobResult(action antflyv1.HAPlannedActionStatus) *antflyv1.HAAdminActionResultStatus {
+	slotAction := ""
+	switch haActionKind(action.Kind) {
+	case haActionCreateSlot:
+		slotAction = "create"
+	case haActionResumeSlot:
+		slotAction = "resume"
+	case haActionPauseSlot:
+		slotAction = "pause"
+	case haActionDropSlot:
+		slotAction = "drop"
+	default:
+		return nil
+	}
+	expectedKind, expectedTarget, expectedState := haDirectAdminActionReceiptExpectation(action)
+	if expectedKind == "" || expectedTarget == "" || expectedState == "" {
+		return nil
+	}
+	return &antflyv1.HAAdminActionResultStatus{
+		SchemaVersion: 1,
+		ActionID:      expectedKind + ":" + expectedTarget,
+		ActionKind:    expectedKind,
+		ActionTarget:  expectedTarget,
+		ActionState:   expectedState,
+		ActionNodeID:  strings.TrimSpace(action.AdminNodeID),
+		SlotAction:    slotAction,
+		SlotName:      expectedTarget,
+	}
 }
 
 func parseHAAdminActionResultTable(body string) (*antflyv1.HAAdminActionResultStatus, bool) {
