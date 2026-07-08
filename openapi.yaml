@@ -20015,6 +20015,7 @@ components:
             0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction.
         prompt_cache_key:
           type: string
+          maxLength: 256
           description: >
             inference-native prompt prefix cache namespace/routing key. Requests with the same key can
 

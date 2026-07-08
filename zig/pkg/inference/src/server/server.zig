@@ -2006,6 +2006,14 @@ pub const Node = struct {
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
         const body = parsed.value;
+        if (body.prompt_cache_key) |key| {
+            if (key.len > runtime.kv.prompt_cache.max_namespace_bytes) {
+                return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = "prompt_cache_key is too long",
+                });
+            }
+        }
         self.metrics.incRequest("generate");
         defer self.metrics.decActive();
 

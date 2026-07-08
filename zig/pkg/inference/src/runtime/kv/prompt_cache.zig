@@ -18,6 +18,8 @@ const manager_mod = @import("manager.zig");
 const pool_mod = @import("pool.zig");
 const storage_runtime_mod = @import("storage_runtime.zig");
 
+pub const max_namespace_bytes: usize = 256;
+
 pub const Config = struct {
     enabled: bool = false,
     max_bytes: usize = 512 * 1024 * 1024,
@@ -132,6 +134,10 @@ pub const PromptPrefixCache = struct {
         max_prefix_tokens: usize,
     ) !?AttachedPrefix {
         if (!self.config.enabled or self.pool_id == null) return null;
+        if (namespace.len > max_namespace_bytes) {
+            self.misses += 1;
+            return null;
+        }
         const page_size = self.pageSize() orelse return null;
         const limit = (max_prefix_tokens / page_size) * page_size;
         if (limit < page_size) {
@@ -186,6 +192,7 @@ pub const PromptPrefixCache = struct {
         sequence_id: manager_mod.SequenceId,
     ) !void {
         if (!self.config.enabled or self.pool_id == null) return;
+        if (namespace.len > max_namespace_bytes) return;
         const page_size = self.pageSize() orelse return;
         const cacheable_tokens = (prompt_tokens.len / page_size) * page_size;
         if (cacheable_tokens < self.config.min_tokens) return;
@@ -221,7 +228,7 @@ pub const PromptPrefixCache = struct {
         errdefer if (owned_storage_blocks.len > 0) self.allocator.free(owned_storage_blocks);
 
         self.tick += 1;
-        const bytes = self.estimateBytes(cacheable_tokens);
+        const bytes = self.estimateBytes(namespace.len, cacheable_tokens, owned_blocks.len, owned_storage_blocks.len);
         try self.entries.append(self.allocator, .{
             .namespace = owned_namespace,
             .tokens = owned_tokens,
@@ -255,9 +262,14 @@ pub const PromptPrefixCache = struct {
         return null;
     }
 
-    fn estimateBytes(self: *const PromptPrefixCache, token_count: usize) usize {
-        const cfg = self.pool_config orelse return token_count * @sizeOf(i64);
-        return token_count * cfg.num_layers_packed * cfg.bytesPerTokenPair();
+    fn estimateBytes(self: *const PromptPrefixCache, namespace_len: usize, token_count: usize, block_count: usize, storage_block_count: usize) usize {
+        const metadata_bytes =
+            @sizeOf(Entry) +
+            namespace_len +
+            token_count * @sizeOf(i64) +
+            (block_count + storage_block_count) * @sizeOf(block.KvBlockId);
+        const cfg = self.pool_config orelse return metadata_bytes;
+        return metadata_bytes + token_count * cfg.num_layers_packed * cfg.bytesPerTokenPair();
     }
 
     fn expireOld(self: *PromptPrefixCache) void {
@@ -365,6 +377,56 @@ test "prompt cache evicts retained blocks by budget" {
     try cache.storeFromSequence("", &.{ 1, 2 }, source_id);
 
     try std.testing.expectEqual(@as(usize, 0), cache.stats().live_entries);
+}
+
+test "prompt cache budgets metadata bytes" {
+    const allocator = std.testing.allocator;
+    const pool_config = pool_mod.KvPoolConfig{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 2,
+        .num_layers_packed = 1,
+        .num_kv_heads = 1,
+        .head_dim = 2,
+    };
+    var cache = PromptPrefixCache.init(allocator);
+    defer cache.deinit();
+    cache.configure(.{
+        .enabled = true,
+        .min_tokens = 2,
+        .max_bytes = 2 * pool_config.num_layers_packed * pool_config.bytesPerTokenPair(),
+    });
+
+    const pool_id = (try cache.ensurePool(pool_config)).?;
+    const source_id = try cache.manager.attachSequence(pool_id);
+    try cache.manager.appendTokens(source_id, 2);
+    try cache.storeFromSequence("agent", &.{ 1, 2 }, source_id);
+
+    try std.testing.expectEqual(@as(usize, 0), cache.stats().live_entries);
+}
+
+test "prompt cache skips oversized namespace" {
+    const allocator = std.testing.allocator;
+    var cache = PromptPrefixCache.init(allocator);
+    defer cache.deinit();
+    cache.configure(.{ .enabled = true, .min_tokens = 2, .max_bytes = 1 << 20 });
+
+    const pool_id = (try cache.ensurePool(.{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 2,
+        .num_layers_packed = 1,
+        .num_kv_heads = 1,
+        .head_dim = 2,
+    })).?;
+    const source_id = try cache.manager.attachSequence(pool_id);
+    try cache.manager.appendTokens(source_id, 2);
+
+    var namespace: [max_namespace_bytes + 1]u8 = undefined;
+    @memset(&namespace, 'x');
+    try cache.storeFromSequence(namespace[0..], &.{ 1, 2 }, source_id);
+    try std.testing.expectEqual(@as(usize, 0), cache.stats().live_entries);
+    try std.testing.expect((try cache.attachLongestPrefix(namespace[0..], &.{ 1, 2 }, 2)) == null);
 }
 
 test "prompt cache attaches longest retained prefix with storage runtime" {
