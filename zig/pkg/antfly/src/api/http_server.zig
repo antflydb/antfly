@@ -1050,6 +1050,7 @@ pub const ApiHttpServer = struct {
     }
 
     alloc: std.mem.Allocator,
+    owner_alloc: std.mem.Allocator,
     cfg: ApiHttpServerConfig,
     source: StatusSource,
     table_reads: ?table_reads.TableReadSource = null,
@@ -1085,8 +1086,20 @@ pub const ApiHttpServer = struct {
         table_read_source: ?table_reads.TableReadSource,
         table_write_source: ?table_writes.TableWriteSource,
     ) ApiHttpServer {
+        return ApiHttpServer.initWithRequestAllocator(alloc, alloc, cfg, source, table_read_source, table_write_source);
+    }
+
+    pub fn initWithRequestAllocator(
+        owner_alloc: std.mem.Allocator,
+        request_alloc: std.mem.Allocator,
+        cfg: ApiHttpServerConfig,
+        source: StatusSource,
+        table_read_source: ?table_reads.TableReadSource,
+        table_write_source: ?table_writes.TableWriteSource,
+    ) ApiHttpServer {
         return .{
-            .alloc = alloc,
+            .alloc = request_alloc,
+            .owner_alloc = owner_alloc,
             .cfg = cfg,
             .source = source,
             .table_reads = table_read_source,
@@ -1096,29 +1109,29 @@ pub const ApiHttpServer = struct {
             .txn_sessions = transactions_api.SessionRegistry.initWithOptions(
                 cfg.session_store,
                 if (cfg.session_store != null and cfg.session_owner_lease_ttl_ns != null)
-                    transactions_api.SessionLeaseStore.init(alloc, cfg.session_store.?.store)
+                    transactions_api.SessionLeaseStore.init(owner_alloc, cfg.session_store.?.store)
                 else
                     null,
                 cfg.session_owner_lease_ttl_ns,
                 cfg.session_savepoint_limit,
             ),
-            .join_job_store = distributed_join.JoinJobStore.init(alloc, .{
+            .join_job_store = distributed_join.JoinJobStore.init(owner_alloc, .{
                 .join_job_store_path = cfg.join_job_store_path,
                 .join_job_lease_ttl_ms = cfg.join_job_lease_ttl_ms,
                 .join_job_retention_ms = cfg.join_job_retention_ms,
             }),
-            .artifact_reprocess_job_store = artifact_reprocess_jobs.Store.init(alloc, .{
+            .artifact_reprocess_job_store = artifact_reprocess_jobs.Store.init(owner_alloc, .{
                 .artifact_reprocess_job_store_path = cfg.artifact_reprocess_job_store_path,
                 .artifact_reprocess_job_retention_ms = cfg.artifact_reprocess_job_retention_ms,
             }),
-            .repair_job_store = repair_jobs.Store.init(alloc, .{
+            .repair_job_store = repair_jobs.Store.init(owner_alloc, .{
                 .repair_job_store_path = cfg.repair_job_store_path,
                 .repair_job_retention_ms = cfg.repair_job_retention_ms,
             }),
             .repair_job_owner_id = if (cfg.backend_runtime) |runtime| runtime.allocOwnerId() else 0,
-            .connections_cache = connections_api.Cache.init(alloc),
-            .mcp_sessions = mcp.InMemorySessionStore.init(alloc),
-            .a2a_tasks = a2a.InMemoryTaskStore.init(alloc),
+            .connections_cache = connections_api.Cache.init(owner_alloc),
+            .mcp_sessions = mcp.InMemorySessionStore.init(owner_alloc),
+            .a2a_tasks = a2a.InMemoryTaskStore.init(owner_alloc),
         };
     }
 
@@ -1209,11 +1222,11 @@ pub const ApiHttpServer = struct {
 
     fn ensureForeignRegistry(self: *ApiHttpServer) !*const foreign_mod.Registry {
         if (self.foreign_registry) |registry| return registry;
-        const registry = try self.alloc.create(foreign_mod.Registry);
-        errdefer self.alloc.destroy(registry);
+        const registry = try self.owner_alloc.create(foreign_mod.Registry);
+        errdefer self.owner_alloc.destroy(registry);
         registry.* = .{};
-        errdefer registry.deinit(self.alloc);
-        try foreign_mod.registerDefaultPostgresExecutor(self.alloc, registry);
+        errdefer registry.deinit(self.owner_alloc);
+        try foreign_mod.registerDefaultPostgresExecutor(self.owner_alloc, registry);
         self.owned_foreign_registry = registry;
         self.foreign_registry = registry;
         self.cfg.foreign_registry = registry;
@@ -1224,19 +1237,19 @@ pub const ApiHttpServer = struct {
         if (self.cfg.backend_runtime) |runtime| {
             if (self.repair_job_owner_id != 0) runtime.durable_jobs.closeOwner(self.repair_job_owner_id);
         }
-        self.mcp_sessions.deinit(self.alloc);
-        self.a2a_tasks.deinit(self.alloc);
-        self.txn_sessions.deinit(self.alloc);
+        self.mcp_sessions.deinit(self.owner_alloc);
+        self.a2a_tasks.deinit(self.owner_alloc);
+        self.txn_sessions.deinit(self.owner_alloc);
         if (self.opened_session_store) |opened| {
             opened.deinit();
-            self.alloc.destroy(opened);
+            self.owner_alloc.destroy(opened);
         }
         self.join_job_store.deinit();
         self.artifact_reprocess_job_store.deinit();
         self.repair_job_store.deinit();
         if (self.owned_foreign_registry) |registry| {
-            registry.deinit(self.alloc);
-            self.alloc.destroy(registry);
+            registry.deinit(self.owner_alloc);
+            self.owner_alloc.destroy(registry);
         }
         self.connections_cache.deinit();
         self.* = undefined;
@@ -1897,14 +1910,14 @@ pub const ApiHttpServer = struct {
             try std.base64.standard.Decoder.decode(raw, encoded);
             const colon_pos = std.mem.indexOfScalar(u8, raw, ':') orelse return error.Unauthorized;
             var user = try manager.authenticateUser(raw[0..colon_pos], raw[colon_pos + 1 ..]);
-            defer user.deinit(self.alloc);
-            return .{
-                .username = try self.alloc.dupe(u8, user.username),
-                .permissions = try manager.getPermissionsForUser(user.username),
-                .row_filter = try manager.getRowFilters(user.username),
-                .metadata_json = try self.alloc.dupe(u8, user.metadata_json),
-                .roles = try manager.getRolesForUser(user.username),
-            };
+            defer user.deinit(manager.alloc);
+            const manager_permissions = try manager.getPermissionsForUser(user.username);
+            defer freePermissions(manager.alloc, manager_permissions);
+            const manager_row_filters = try manager.getRowFilters(user.username);
+            defer freeRowFilters(manager.alloc, manager_row_filters);
+            const manager_roles = try manager.getRolesForUser(user.username);
+            defer freeOwnedStrings(manager.alloc, manager_roles);
+            return try cloneAuthenticatedIdentity(self.alloc, user.username, manager_permissions, manager_row_filters, user.metadata_json, manager_roles);
         }
 
         if (std.mem.startsWith(u8, value, "ApiKey ") or std.mem.startsWith(u8, value, "Bearer ")) {
@@ -1914,14 +1927,9 @@ pub const ApiHttpServer = struct {
             defer self.alloc.free(raw);
             try std.base64.standard.Decoder.decode(raw, encoded);
             const colon_pos = std.mem.indexOfScalar(u8, raw, ':') orelse return error.Unauthorized;
-            const validated = try manager.validateApiKey(raw[0..colon_pos], raw[colon_pos + 1 ..]);
-            return .{
-                .username = validated.username,
-                .permissions = validated.permissions,
-                .row_filter = validated.row_filter,
-                .metadata_json = validated.metadata_json,
-                .roles = validated.roles,
-            };
+            var validated = try manager.validateApiKey(raw[0..colon_pos], raw[colon_pos + 1 ..]);
+            defer validated.deinit(manager.alloc);
+            return try cloneAuthenticatedIdentity(self.alloc, validated.username, validated.permissions, validated.row_filter, validated.metadata_json, validated.roles);
         }
 
         return error.Unauthorized;
@@ -8260,6 +8268,20 @@ pub fn freeOwnedStrings(alloc: std.mem.Allocator, values: []const []const u8) vo
     if (values.len > 0) alloc.free(@constCast(values));
 }
 
+fn cloneOwnedStrings(alloc: std.mem.Allocator, values: []const []const u8) ![][]u8 {
+    const out = try alloc.alloc([]u8, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |value| alloc.free(value);
+        if (out.len > 0) alloc.free(out);
+    }
+    for (values, 0..) |value, i| {
+        out[i] = try alloc.dupe(u8, value);
+        initialized += 1;
+    }
+    return out;
+}
+
 fn freeOwnedStringItems(alloc: std.mem.Allocator, values: []const []const u8) void {
     for (values) |value| alloc.free(@constCast(value));
 }
@@ -10394,12 +10416,69 @@ pub fn freePermissions(alloc: std.mem.Allocator, permissions: []const usermgr.Pe
     alloc.free(@constCast(permissions));
 }
 
+fn clonePermissions(alloc: std.mem.Allocator, permissions: []const usermgr.Permission) ![]usermgr.Permission {
+    var out = std.ArrayList(usermgr.Permission).empty;
+    errdefer {
+        for (out.items) |*permission| permission.deinit(alloc);
+        out.deinit(alloc);
+    }
+    for (permissions) |permission| {
+        var cloned = try usermgr.Permission.initOwned(
+            alloc,
+            permission.resource_type,
+            permission.resource,
+            permission.type,
+        );
+        var cloned_owned = true;
+        errdefer if (cloned_owned) cloned.deinit(alloc);
+        try out.append(alloc, cloned);
+        cloned_owned = false;
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
 pub fn freeRowFilters(alloc: std.mem.Allocator, row_filters: []const usermgr.RowFilterEntry) void {
     for (row_filters) |entry| {
         var owned = entry;
         owned.deinit(alloc);
     }
     alloc.free(@constCast(row_filters));
+}
+
+fn cloneRowFilters(alloc: std.mem.Allocator, row_filters: []const usermgr.RowFilterEntry) ![]usermgr.RowFilterEntry {
+    var out = std.ArrayList(usermgr.RowFilterEntry).empty;
+    errdefer {
+        for (out.items) |*entry| entry.deinit(alloc);
+        out.deinit(alloc);
+    }
+    for (row_filters) |entry| {
+        var cloned = try usermgr.RowFilterEntry.initOwned(alloc, entry.table, entry.filter);
+        var cloned_owned = true;
+        errdefer if (cloned_owned) cloned.deinit(alloc);
+        try out.append(alloc, cloned);
+        cloned_owned = false;
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn cloneAuthenticatedIdentity(
+    alloc: std.mem.Allocator,
+    username: []const u8,
+    permissions: []const usermgr.Permission,
+    row_filter: []const usermgr.RowFilterEntry,
+    metadata_json: []const u8,
+    roles: []const []const u8,
+) !AuthenticatedIdentity {
+    var identity = AuthenticatedIdentity{
+        .username = try alloc.dupe(u8, username),
+        .metadata_json = &.{},
+    };
+    errdefer identity.deinit(alloc);
+    identity.permissions = try clonePermissions(alloc, permissions);
+    identity.row_filter = try cloneRowFilters(alloc, row_filter);
+    identity.metadata_json = try alloc.dupe(u8, if (metadata_json.len > 0) metadata_json else "{}");
+    identity.roles = try cloneOwnedStrings(alloc, roles);
+    return identity;
 }
 
 pub fn freeAuthSubjects(alloc: std.mem.Allocator, subjects: []const usermgr.AuthSubjectEntry) void {

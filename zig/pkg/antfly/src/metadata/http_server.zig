@@ -995,46 +995,50 @@ pub const MetadataHttpServer = struct {
     }
 
     pub fn handle(self: *MetadataHttpServer, req: http_common.HttpRequest) !http_common.HttpResponse {
+        return self.handleWithAllocator(self.alloc, req);
+    }
+
+    fn handleWithAllocator(self: *MetadataHttpServer, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
         _ = self.cfg;
         switch (req.method) {
             .GET => {
                 if (routes.Routes.matchInternalNodeShutdown(req.uri)) |node_id| {
                     var snapshot = try self.source.adminSnapshot();
                     defer self.source.freeAdminSnapshot(&snapshot);
-                    var status = try buildNodeShutdownStatus(self.alloc, &snapshot, node_id);
-                    defer freeNodeShutdownStatus(self.alloc, &status);
-                    return try jsonResponse(self.alloc, self.source, status);
+                    var status = try buildNodeShutdownStatus(alloc, &snapshot, node_id);
+                    defer freeNodeShutdownStatus(alloc, &status);
+                    return try jsonResponse(alloc, self.source, status);
                 }
                 if (std.mem.eql(u8, req.uri, routes.Routes.health)) {
-                    return try textResponse(self.alloc, 200, "ok");
+                    return try textResponse(alloc, 200, "ok");
                 }
                 if (std.mem.eql(u8, req.uri, routes.Routes.head)) {
-                    return try jsonResponse(self.alloc, self.source, try self.source.head());
+                    return try jsonResponse(alloc, self.source, try self.source.head());
                 }
                 if (std.mem.eql(u8, req.uri, routes.Routes.status)) {
-                    return try jsonResponse(self.alloc, self.source, try self.source.status());
+                    return try jsonResponse(alloc, self.source, try self.source.status());
                 }
                 if (std.mem.eql(u8, req.uri, routes.Routes.admin_snapshot)) {
                     var snapshot = try self.source.adminSnapshot();
                     defer self.source.freeAdminSnapshot(&snapshot);
-                    return try jsonResponse(self.alloc, self.source, snapshot);
+                    return try jsonResponse(alloc, self.source, snapshot);
                 }
                 if (std.mem.eql(u8, req.uri, routes.Routes.active_transitions)) {
                     var snapshot = try self.source.adminSnapshot();
                     defer self.source.freeAdminSnapshot(&snapshot);
-                    var active = try metadata_admin.listActiveTransitions(self.alloc, &snapshot);
-                    defer metadata_admin.freeActiveTransitions(self.alloc, &active);
+                    var active = try metadata_admin.listActiveTransitions(alloc, &snapshot);
+                    defer metadata_admin.freeActiveTransitions(alloc, &active);
 
                     const Response = struct {
                         split: []const @TypeOf(snapshot.split_transitions[0]),
                         merge: []const @TypeOf(snapshot.merge_transitions[0]),
                     };
 
-                    const split = try cloneValues(self.alloc, @TypeOf(snapshot.split_transitions[0]), active.split);
-                    defer self.alloc.free(split);
-                    const merge = try cloneValues(self.alloc, @TypeOf(snapshot.merge_transitions[0]), active.merge);
-                    defer self.alloc.free(merge);
-                    return try jsonResponse(self.alloc, self.source, Response{
+                    const split = try cloneValues(alloc, @TypeOf(snapshot.split_transitions[0]), active.split);
+                    defer alloc.free(split);
+                    const merge = try cloneValues(alloc, @TypeOf(snapshot.merge_transitions[0]), active.merge);
+                    defer alloc.free(merge);
+                    return try jsonResponse(alloc, self.source, Response{
                         .split = split,
                         .merge = merge,
                     });
@@ -1042,43 +1046,43 @@ pub const MetadataHttpServer = struct {
                 if (routes.Routes.matchTableRanges(req.uri)) |table_id| {
                     var snapshot = try self.source.adminSnapshot();
                     defer self.source.freeAdminSnapshot(&snapshot);
-                    const refs = try metadata_admin.listTableRanges(self.alloc, &snapshot, table_id);
-                    defer metadata_admin.freeRangeRefs(self.alloc, refs);
-                    const records = try cloneValues(self.alloc, @TypeOf(snapshot.ranges[0]), refs);
-                    defer self.alloc.free(records);
-                    return try jsonResponse(self.alloc, self.source, records);
+                    const refs = try metadata_admin.listTableRanges(alloc, &snapshot, table_id);
+                    defer metadata_admin.freeRangeRefs(alloc, refs);
+                    const records = try cloneValues(alloc, @TypeOf(snapshot.ranges[0]), refs);
+                    defer alloc.free(records);
+                    return try jsonResponse(alloc, self.source, records);
                 }
                 if (routes.Routes.matchGroupPlacement(req.uri)) |group_id| {
                     var snapshot = try self.source.adminSnapshot();
                     defer self.source.freeAdminSnapshot(&snapshot);
-                    const refs = try metadata_admin.listGroupPlacement(self.alloc, &snapshot, group_id);
-                    defer metadata_admin.freePlacementRefs(self.alloc, refs);
-                    const records = try cloneValues(self.alloc, @TypeOf(snapshot.placement_intents[0]), refs);
-                    defer self.alloc.free(records);
-                    return try jsonResponse(self.alloc, self.source, records);
+                    const refs = try metadata_admin.listGroupPlacement(alloc, &snapshot, group_id);
+                    defer metadata_admin.freePlacementRefs(alloc, refs);
+                    const records = try cloneValues(alloc, @TypeOf(snapshot.placement_intents[0]), refs);
+                    defer alloc.free(records);
+                    return try jsonResponse(alloc, self.source, records);
                 }
             },
             .POST => {
                 if (std.mem.eql(u8, req.uri, routes.Routes.internal_reallocate)) {
                     self.source.triggerReallocate() catch |err| switch (err) {
-                        error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
+                        error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
                         else => return err,
                     };
-                    return try textResponse(self.alloc, 202, "accepted");
+                    return try textResponse(alloc, 202, "accepted");
                 }
                 if (std.mem.eql(u8, req.uri, routes.Routes.internal_extension_restore)) {
-                    var parsed = std.json.parseFromSlice(RestoreExtensionsRequest, self.alloc, req.body, .{
+                    var parsed = std.json.parseFromSlice(RestoreExtensionsRequest, alloc, req.body, .{
                         .allocate = .alloc_always,
                         .ignore_unknown_fields = true,
-                    }) catch return try textResponse(self.alloc, 400, "invalid extension restore request");
+                    }) catch return try textResponse(alloc, 400, "invalid extension restore request");
                     defer parsed.deinit();
                     self.source.restoreExtensions(
-                        self.alloc,
+                        alloc,
                         parsed.value.installed_extensions,
                         parsed.value.extension_members,
                         parsed.value.extension_dependencies,
                     ) catch |err| switch (err) {
-                        error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
+                        error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
                         error.UnsupportedManifestApiVersion,
                         error.UnsupportedPackageKind,
                         error.UnsupportedExtensionScope,
@@ -1087,297 +1091,297 @@ pub const MetadataHttpServer = struct {
                         error.EmptyName,
                         error.InvalidIdentifier,
                         error.MemberTableOutsideScope,
-                        => return try textResponse(self.alloc, 400, "invalid extension restore request"),
+                        => return try textResponse(alloc, 400, "invalid extension restore request"),
                         else => return err,
                     };
-                    return try textResponse(self.alloc, 202, "accepted");
+                    return try textResponse(alloc, 202, "accepted");
                 }
                 if (routes.Routes.matchInternalExtensionUpdate(req.uri)) |extension_route| {
-                    var parsed = std.json.parseFromSlice(extension_domain.UpdateExtensionRequest, self.alloc, jsonBodyOrEmptyObject(req.body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
-                        return try textResponse(self.alloc, 400, "invalid extension update request");
+                    var parsed = std.json.parseFromSlice(extension_domain.UpdateExtensionRequest, alloc, jsonBodyOrEmptyObject(req.body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+                        return try textResponse(alloc, 400, "invalid extension update request");
                     };
                     defer parsed.deinit();
-                    var installed = self.source.updateExtension(self.alloc, extension_route.name, parsed.value) catch |err| {
-                        return try extensionLifecycleErrorResponse(self.alloc, err);
+                    var installed = self.source.updateExtension(alloc, extension_route.name, parsed.value) catch |err| {
+                        return try extensionLifecycleErrorResponse(alloc, err);
                     };
-                    defer installed.deinitOwned(self.alloc);
-                    return try jsonResponse(self.alloc, self.source, installed);
+                    defer installed.deinitOwned(alloc);
+                    return try jsonResponse(alloc, self.source, installed);
                 }
                 if (routes.Routes.matchInternalExtensionDrop(req.uri)) |extension_route| {
-                    var parsed = std.json.parseFromSlice(extension_domain.DropExtensionRequest, self.alloc, jsonBodyOrEmptyObject(req.body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
-                        return try textResponse(self.alloc, 400, "invalid extension drop request");
+                    var parsed = std.json.parseFromSlice(extension_domain.DropExtensionRequest, alloc, jsonBodyOrEmptyObject(req.body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+                        return try textResponse(alloc, 400, "invalid extension drop request");
                     };
                     defer parsed.deinit();
-                    self.source.dropExtension(self.alloc, extension_route.name, parsed.value) catch |err| {
-                        return try extensionLifecycleErrorResponse(self.alloc, err);
+                    self.source.dropExtension(alloc, extension_route.name, parsed.value) catch |err| {
+                        return try extensionLifecycleErrorResponse(alloc, err);
                     };
-                    return try textResponse(self.alloc, 202, "accepted");
+                    return try textResponse(alloc, 202, "accepted");
                 }
                 if (routes.Routes.matchInternalExtensionEnable(req.uri)) |extension_route| {
-                    var installed = self.source.enableExtension(self.alloc, extension_route.name) catch |err| {
-                        return try extensionLifecycleErrorResponse(self.alloc, err);
+                    var installed = self.source.enableExtension(alloc, extension_route.name) catch |err| {
+                        return try extensionLifecycleErrorResponse(alloc, err);
                     };
-                    defer installed.deinitOwned(self.alloc);
-                    return try jsonResponse(self.alloc, self.source, installed);
+                    defer installed.deinitOwned(alloc);
+                    return try jsonResponse(alloc, self.source, installed);
                 }
                 if (routes.Routes.matchInternalExtensionDisable(req.uri)) |extension_route| {
-                    var installed = self.source.disableExtension(self.alloc, extension_route.name) catch |err| {
-                        return try extensionLifecycleErrorResponse(self.alloc, err);
+                    var installed = self.source.disableExtension(alloc, extension_route.name) catch |err| {
+                        return try extensionLifecycleErrorResponse(alloc, err);
                     };
-                    defer installed.deinitOwned(self.alloc);
-                    return try jsonResponse(self.alloc, self.source, installed);
+                    defer installed.deinitOwned(alloc);
+                    return try jsonResponse(alloc, self.source, installed);
                 }
                 if (routes.Routes.matchInternalExtension(req.uri)) |extension_route| {
-                    var parsed = std.json.parseFromSlice(extension_domain.InstallExtensionRequest, self.alloc, jsonBodyOrEmptyObject(req.body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
-                        return try textResponse(self.alloc, 400, "invalid extension install request");
+                    var parsed = std.json.parseFromSlice(extension_domain.InstallExtensionRequest, alloc, jsonBodyOrEmptyObject(req.body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+                        return try textResponse(alloc, 400, "invalid extension install request");
                     };
                     defer parsed.deinit();
-                    var installed = self.source.installExtension(self.alloc, extension_route.name, parsed.value) catch |err| {
-                        return try extensionLifecycleErrorResponse(self.alloc, err);
+                    var installed = self.source.installExtension(alloc, extension_route.name, parsed.value) catch |err| {
+                        return try extensionLifecycleErrorResponse(alloc, err);
                     };
-                    defer installed.deinitOwned(self.alloc);
-                    return try jsonResponse(self.alloc, self.source, installed);
+                    defer installed.deinitOwned(alloc);
+                    return try jsonResponse(alloc, self.source, installed);
                 }
                 if (std.mem.eql(u8, req.uri, routes.Routes.internal_nodes)) {
-                    var node = parseNodeRecord(self.alloc, req.body) catch return try textResponse(self.alloc, 400, "invalid node registration request");
+                    var node = parseNodeRecord(alloc, req.body) catch return try textResponse(alloc, 400, "invalid node registration request");
                     var node_owned = true;
-                    defer if (node_owned) metadata_table_manager.freeNode(self.alloc, node);
+                    defer if (node_owned) metadata_table_manager.freeNode(alloc, node);
                     var store: ?metadata_table_manager.StoreRecord = null;
                     var store_owned = false;
                     defer if (store_owned) {
-                        if (store) |record| metadata_table_manager.freeStore(self.alloc, record);
+                        if (store) |record| metadata_table_manager.freeStore(alloc, record);
                     };
-                    if (parseNodeRegistrationIncludesStore(self.alloc, req.body) catch return try textResponse(self.alloc, 400, "invalid node registration request")) {
-                        store = parseStoreRecord(self.alloc, req.body) catch return try textResponse(self.alloc, 400, "invalid node registration request");
+                    if (parseNodeRegistrationIncludesStore(alloc, req.body) catch return try textResponse(alloc, 400, "invalid node registration request")) {
+                        store = parseStoreRecord(alloc, req.body) catch return try textResponse(alloc, 400, "invalid node registration request");
                         store_owned = true;
-                        if (store.?.node_id != node.node_id or store.?.store_id != node.node_id) return try textResponse(self.alloc, 400, "store identity must match node identity");
+                        if (store.?.node_id != node.node_id or store.?.store_id != node.node_id) return try textResponse(alloc, 400, "store identity must match node identity");
                         try self.preserveExistingStoreDrainIntent(&store.?);
-                        if (self.source.vtable.upsert_store == null) return try textResponse(self.alloc, 405, "unsupported operation");
+                        if (self.source.vtable.upsert_store == null) return try textResponse(alloc, 405, "unsupported operation");
                     }
-                    try self.preserveExistingNodeLifecycle(&node);
-                    if (self.source.vtable.upsert_node == null) return try textResponse(self.alloc, 405, "unsupported operation");
+                    try self.preserveExistingNodeLifecycle(alloc, &node);
+                    if (self.source.vtable.upsert_node == null) return try textResponse(alloc, 405, "unsupported operation");
                     node_owned = false;
-                    self.source.upsertNode(self.alloc, node) catch |err| switch (err) {
+                    self.source.upsertNode(alloc, node) catch |err| switch (err) {
                         else => return err,
                     };
                     if (store) |record| {
                         store_owned = false;
-                        self.source.upsertStore(self.alloc, record) catch |err| switch (err) {
+                        self.source.upsertStore(alloc, record) catch |err| switch (err) {
                             else => return err,
                         };
                     }
-                    return try textResponse(self.alloc, 202, "accepted");
+                    return try textResponse(alloc, 202, "accepted");
                 }
                 if (routes.Routes.matchInternalNodeStatus(req.uri)) |node_id| {
-                    const report = parseNodeStatusReport(self.alloc, req.body, node_id) catch return try textResponse(self.alloc, 400, "invalid node status request");
-                    self.source.reportStoreStatus(self.alloc, report) catch |err| switch (err) {
-                        error.UnknownStore => return try textResponse(self.alloc, 404, "node not found"),
-                        error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
+                    const report = parseNodeStatusReport(alloc, req.body, node_id) catch return try textResponse(alloc, 400, "invalid node status request");
+                    self.source.reportStoreStatus(alloc, report) catch |err| switch (err) {
+                        error.UnknownStore => return try textResponse(alloc, 404, "node not found"),
+                        error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
                         else => return err,
                     };
-                    return try textResponse(self.alloc, 202, "accepted");
+                    return try textResponse(alloc, 202, "accepted");
                 }
                 if (std.mem.eql(u8, req.uri, routes.Routes.internal_schema_progress)) {
-                    const record = parseSchemaProgressRecord(req.body) catch return try textResponse(self.alloc, 400, "invalid schema progress request");
-                    self.source.upsertSchemaProgress(self.alloc, record) catch |err| switch (err) {
-                        error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
+                    const record = parseSchemaProgressRecord(req.body) catch return try textResponse(alloc, 400, "invalid schema progress request");
+                    self.source.upsertSchemaProgress(alloc, record) catch |err| switch (err) {
+                        error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
                         else => return err,
                     };
-                    return try textResponse(self.alloc, 202, "accepted");
+                    return try textResponse(alloc, 202, "accepted");
                 }
                 if (routes.Routes.matchInternalTable(req.uri)) |table| {
-                    var create_req = parseCreateTableRequest(self.alloc, req.body) catch return try textResponse(self.alloc, 400, "invalid create table request");
-                    defer create_req.deinit(self.alloc);
-                    self.source.createTable(self.alloc, table.table_name, create_req) catch |err| switch (err) {
-                        error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
-                        error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return try textResponse(self.alloc, 400, "invalid create table request"),
+                    var create_req = parseCreateTableRequest(alloc, req.body) catch return try textResponse(alloc, 400, "invalid create table request");
+                    defer create_req.deinit(alloc);
+                    self.source.createTable(alloc, table.table_name, create_req) catch |err| switch (err) {
+                        error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
+                        error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return try textResponse(alloc, 400, "invalid create table request"),
                         else => return err,
                     };
-                    return try textResponse(self.alloc, 201, "created");
+                    return try textResponse(alloc, 201, "created");
                 }
                 if (routes.Routes.matchInternalTableRestore(req.uri)) |table| {
-                    var restore_req = backups_api.parseRestoreRequest(self.alloc, req.body) catch return try textResponse(self.alloc, 400, "invalid restore request");
+                    var restore_req = backups_api.parseRestoreRequest(alloc, req.body) catch return try textResponse(alloc, 400, "invalid restore request");
                     defer restore_req.deinit();
-                    self.source.restoreTable(self.alloc, table.table_name, restore_req.value.location, restore_req.value.backup_id) catch |err| {
+                    self.source.restoreTable(alloc, table.table_name, restore_req.value.location, restore_req.value.backup_id) catch |err| {
                         if (backups_api.backupLocationErrorMessage(err)) |msg| {
-                            return try textResponse(self.alloc, 400, msg);
+                            return try textResponse(alloc, 400, msg);
                         }
                         switch (err) {
-                            error.TableAlreadyExists => return try textResponse(self.alloc, 409, "table already exists"),
+                            error.TableAlreadyExists => return try textResponse(alloc, 409, "table already exists"),
                             error.InvalidBackupRequest, error.UnsupportedBackupFormat, error.UnsupportedBackupMigrationState => {
-                                return try textResponse(self.alloc, 400, "invalid restore request");
+                                return try textResponse(alloc, 400, "invalid restore request");
                             },
-                            error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
+                            error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
                             else => return err,
                         }
                     };
-                    return try textResponse(self.alloc, 202, "accepted");
+                    return try textResponse(alloc, 202, "accepted");
                 }
                 if (routes.Routes.matchInternalTableSplit(req.uri)) |table| {
-                    const split_req = parseSplitRequest(self.alloc, req.body) catch return try textResponse(self.alloc, 400, "invalid split request");
-                    defer self.alloc.free(split_req.split_key);
+                    const split_req = parseSplitRequest(alloc, req.body) catch return try textResponse(alloc, 400, "invalid split request");
+                    defer alloc.free(split_req.split_key);
                     validateSplitRequestDocIdentity(self.source, table.table_name, split_req) catch |err| switch (err) {
-                        error.TableNotFound, error.RangeNotFound => return try textResponse(self.alloc, 404, "not found"),
-                        error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 409, "doc identity namespace mismatch"),
-                        else => return try textResponse(self.alloc, 400, "invalid split request"),
+                        error.TableNotFound, error.RangeNotFound => return try textResponse(alloc, 404, "not found"),
+                        error.DocIdentityNamespaceMismatch => return try textResponse(alloc, 409, "doc identity namespace mismatch"),
+                        else => return try textResponse(alloc, 400, "invalid split request"),
                     };
-                    self.source.requestSplit(self.alloc, table.table_name, split_req) catch |err| switch (err) {
-                        error.TableNotFound, error.RangeNotFound => return try textResponse(self.alloc, 404, "not found"),
-                        error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 409, "doc identity namespace mismatch"),
-                        error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
-                        else => return try textResponse(self.alloc, 400, "invalid split request"),
+                    self.source.requestSplit(alloc, table.table_name, split_req) catch |err| switch (err) {
+                        error.TableNotFound, error.RangeNotFound => return try textResponse(alloc, 404, "not found"),
+                        error.DocIdentityNamespaceMismatch => return try textResponse(alloc, 409, "doc identity namespace mismatch"),
+                        error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
+                        else => return try textResponse(alloc, 400, "invalid split request"),
                     };
-                    return try textResponse(self.alloc, 202, "accepted");
+                    return try textResponse(alloc, 202, "accepted");
                 }
                 if (routes.Routes.matchInternalTableMerge(req.uri)) |table| {
-                    const merge_req = parseMergeRequest(self.alloc, req.body) catch return try textResponse(self.alloc, 400, "invalid merge request");
+                    const merge_req = parseMergeRequest(alloc, req.body) catch return try textResponse(alloc, 400, "invalid merge request");
                     validateMergeRequestDocIdentity(self.source, table.table_name, merge_req) catch |err| switch (err) {
-                        error.TableNotFound, error.RangeNotFound => return try textResponse(self.alloc, 404, "not found"),
-                        error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 409, "doc identity namespace mismatch"),
-                        else => return try textResponse(self.alloc, 400, "invalid merge request"),
+                        error.TableNotFound, error.RangeNotFound => return try textResponse(alloc, 404, "not found"),
+                        error.DocIdentityNamespaceMismatch => return try textResponse(alloc, 409, "doc identity namespace mismatch"),
+                        else => return try textResponse(alloc, 400, "invalid merge request"),
                     };
-                    self.source.requestMerge(self.alloc, table.table_name, merge_req) catch |err| switch (err) {
-                        error.TableNotFound, error.RangeNotFound => return try textResponse(self.alloc, 404, "not found"),
-                        error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 409, "doc identity namespace mismatch"),
-                        error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
-                        else => return try textResponse(self.alloc, 400, "invalid merge request"),
+                    self.source.requestMerge(alloc, table.table_name, merge_req) catch |err| switch (err) {
+                        error.TableNotFound, error.RangeNotFound => return try textResponse(alloc, 404, "not found"),
+                        error.DocIdentityNamespaceMismatch => return try textResponse(alloc, 409, "doc identity namespace mismatch"),
+                        error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
+                        else => return try textResponse(alloc, 400, "invalid merge request"),
                     };
-                    return try textResponse(self.alloc, 202, "accepted");
+                    return try textResponse(alloc, 202, "accepted");
                 }
                 if (routes.Routes.matchInternalTableReplicationSourceReseedExactCutover(req.uri)) |source_path| {
-                    var result = self.source.reseedReplicationSourceExactCutover(self.alloc, source_path.table_name, source_path.source_ordinal) catch |err| switch (err) {
-                        error.TableNotFound, error.UnknownReplicationSource => return try textResponse(self.alloc, 404, "not found"),
-                        error.InvalidReplicationSourceConfig, error.UnsupportedReplicationSource => return try textResponse(self.alloc, 400, "invalid replication source"),
-                        error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
+                    var result = self.source.reseedReplicationSourceExactCutover(alloc, source_path.table_name, source_path.source_ordinal) catch |err| switch (err) {
+                        error.TableNotFound, error.UnknownReplicationSource => return try textResponse(alloc, 404, "not found"),
+                        error.InvalidReplicationSourceConfig, error.UnsupportedReplicationSource => return try textResponse(alloc, 400, "invalid replication source"),
+                        error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
                         else => return err,
                     };
-                    defer result.deinit(self.alloc);
+                    defer result.deinit(alloc);
                     return .{
                         .status = 202,
-                        .content_type = try self.alloc.dupe(u8, "application/json"),
-                        .body = try std.fmt.allocPrint(self.alloc, "{{\"slot_name\":\"{s}\",\"publication_name\":\"{s}\"}}", .{ result.slot_name, result.publication_name }),
+                        .content_type = try alloc.dupe(u8, "application/json"),
+                        .body = try std.fmt.allocPrint(alloc, "{{\"slot_name\":\"{s}\",\"publication_name\":\"{s}\"}}", .{ result.slot_name, result.publication_name }),
                     };
                 }
             },
             .PUT => {
                 if (routes.Routes.matchInternalExtensionConfig(req.uri)) |extension_route| {
-                    var parsed = std.json.parseFromSlice(extension_domain.ConfigureExtensionRequest, self.alloc, jsonBodyOrEmptyObject(req.body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
-                        return try textResponse(self.alloc, 400, "invalid extension config request");
+                    var parsed = std.json.parseFromSlice(extension_domain.ConfigureExtensionRequest, alloc, jsonBodyOrEmptyObject(req.body), .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch {
+                        return try textResponse(alloc, 400, "invalid extension config request");
                     };
                     defer parsed.deinit();
-                    var installed = self.source.configureExtension(self.alloc, extension_route.name, parsed.value) catch |err| {
-                        return try extensionLifecycleErrorResponse(self.alloc, err);
+                    var installed = self.source.configureExtension(alloc, extension_route.name, parsed.value) catch |err| {
+                        return try extensionLifecycleErrorResponse(alloc, err);
                     };
-                    defer installed.deinitOwned(self.alloc);
-                    return try jsonResponse(self.alloc, self.source, installed);
+                    defer installed.deinitOwned(alloc);
+                    return try jsonResponse(alloc, self.source, installed);
                 }
                 if (routes.Routes.matchInternalNodeShutdown(req.uri)) |node_id| {
-                    parseNodeShutdownRequest(self.alloc, req.body) catch return try textResponse(self.alloc, 400, "invalid node shutdown request");
-                    self.requestNodeShutdown(node_id) catch |err| switch (err) {
-                        error.NodeNotFound => return try textResponse(self.alloc, 404, "node not found"),
-                        error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
+                    parseNodeShutdownRequest(alloc, req.body) catch return try textResponse(alloc, 400, "invalid node shutdown request");
+                    self.requestNodeShutdown(alloc, node_id) catch |err| switch (err) {
+                        error.NodeNotFound => return try textResponse(alloc, 404, "node not found"),
+                        error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
                         else => return err,
                     };
-                    return try textResponse(self.alloc, 202, "accepted");
+                    return try textResponse(alloc, 202, "accepted");
                 }
                 if (routes.Routes.matchInternalTableSchema(req.uri)) |table| {
-                    self.source.updateSchema(self.alloc, table.table_name, req.body) catch |err| switch (err) {
-                        error.TableNotFound => return try textResponse(self.alloc, 404, "table not found"),
-                        error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
-                        error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
-                        error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, "invalid schema update request"),
+                    self.source.updateSchema(alloc, table.table_name, req.body) catch |err| switch (err) {
+                        error.TableNotFound => return try textResponse(alloc, 404, "table not found"),
+                        error.ExtensionOwnedObject => return try textResponse(alloc, 405, "method not allowed"),
+                        error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
+                        error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => return try textResponse(alloc, 400, "invalid schema update request"),
                         else => return err,
                     };
-                    return try textResponse(self.alloc, 202, "accepted");
+                    return try textResponse(alloc, 202, "accepted");
                 }
                 if (routes.Routes.matchInternalTableIndex(req.uri)) |table_index| {
-                    self.source.createIndex(self.alloc, table_index.table_name, table_index.index_name, req.body) catch |err| switch (err) {
-                        error.TableNotFound => return try textResponse(self.alloc, 404, "table not found"),
-                        error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
-                        error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
-                        error.InvalidTableIndexMetadata, error.InvalidCreateIndexRequest, error.UnsupportedCreateTableRequest => return try textResponse(self.alloc, 400, "unsupported index configuration"),
+                    self.source.createIndex(alloc, table_index.table_name, table_index.index_name, req.body) catch |err| switch (err) {
+                        error.TableNotFound => return try textResponse(alloc, 404, "table not found"),
+                        error.ExtensionOwnedObject => return try textResponse(alloc, 405, "method not allowed"),
+                        error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
+                        error.InvalidTableIndexMetadata, error.InvalidCreateIndexRequest, error.UnsupportedCreateTableRequest => return try textResponse(alloc, 400, "unsupported index configuration"),
                         else => return err,
                     };
-                    return try textResponse(self.alloc, 202, "accepted");
+                    return try textResponse(alloc, 202, "accepted");
                 }
                 if (routes.Routes.matchInternalTableEnrichment(req.uri)) |table_enrichment| {
-                    const table_name = http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, table_enrichment.table_name) catch |err| switch (err) {
-                        error.InvalidArgument => return try textResponse(self.alloc, 400, "invalid table name"),
+                    const table_name = http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, table_enrichment.table_name) catch |err| switch (err) {
+                        error.InvalidArgument => return try textResponse(alloc, 400, "invalid table name"),
                         else => return err,
                     };
-                    defer self.alloc.free(table_name);
-                    const enrichment_name = http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, table_enrichment.enrichment_name) catch |err| switch (err) {
-                        error.InvalidArgument => return try textResponse(self.alloc, 400, "invalid artifact enrichment name"),
+                    defer alloc.free(table_name);
+                    const enrichment_name = http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, table_enrichment.enrichment_name) catch |err| switch (err) {
+                        error.InvalidArgument => return try textResponse(alloc, 400, "invalid artifact enrichment name"),
                         else => return err,
                     };
-                    defer self.alloc.free(enrichment_name);
-                    self.source.putArtifactEnrichment(self.alloc, table_name, enrichment_name, req.body) catch |err| switch (err) {
-                        error.TableNotFound => return try textResponse(self.alloc, 404, "table not found"),
-                        error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
-                        error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
-                        error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment, error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return try textResponse(self.alloc, 400, "unsupported artifact enrichment configuration"),
+                    defer alloc.free(enrichment_name);
+                    self.source.putArtifactEnrichment(alloc, table_name, enrichment_name, req.body) catch |err| switch (err) {
+                        error.TableNotFound => return try textResponse(alloc, 404, "table not found"),
+                        error.ExtensionOwnedObject => return try textResponse(alloc, 405, "method not allowed"),
+                        error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
+                        error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment, error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return try textResponse(alloc, 400, "unsupported artifact enrichment configuration"),
                         else => return err,
                     };
-                    return try textResponse(self.alloc, 202, "accepted");
+                    return try textResponse(alloc, 202, "accepted");
                 }
             },
             .DELETE => {
                 if (routes.Routes.matchInternalNodeShutdown(req.uri)) |node_id| {
-                    self.cancelNodeShutdown(node_id) catch |err| switch (err) {
-                        error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
+                    self.cancelNodeShutdown(alloc, node_id) catch |err| switch (err) {
+                        error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
                         else => return err,
                     };
-                    return try textResponse(self.alloc, 202, "accepted");
+                    return try textResponse(alloc, 202, "accepted");
                 }
                 if (routes.Routes.matchInternalNode(req.uri)) |node_id| {
-                    self.finalizeNodeShutdown(node_id) catch |err| switch (err) {
-                        error.ActiveNodeFinalizeRejected => return try textResponse(self.alloc, 409, "active node cannot be finalized"),
-                        error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
+                    self.finalizeNodeShutdown(alloc, node_id) catch |err| switch (err) {
+                        error.ActiveNodeFinalizeRejected => return try textResponse(alloc, 409, "active node cannot be finalized"),
+                        error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
                         else => return err,
                     };
-                    return try textResponse(self.alloc, 202, "accepted");
+                    return try textResponse(alloc, 202, "accepted");
                 }
                 if (routes.Routes.matchInternalTable(req.uri)) |table| {
-                    self.source.dropTable(self.alloc, table.table_name) catch |err| switch (err) {
-                        error.TableNotFound => return try textResponse(self.alloc, 404, "table not found"),
-                        error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
-                        error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
+                    self.source.dropTable(alloc, table.table_name) catch |err| switch (err) {
+                        error.TableNotFound => return try textResponse(alloc, 404, "table not found"),
+                        error.ExtensionOwnedObject => return try textResponse(alloc, 405, "method not allowed"),
+                        error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
                         else => return err,
                     };
-                    return try textResponse(self.alloc, 204, "");
+                    return try textResponse(alloc, 204, "");
                 }
                 if (routes.Routes.matchInternalTableIndex(req.uri)) |table_index| {
-                    self.source.dropIndex(self.alloc, table_index.table_name, table_index.index_name) catch |err| switch (err) {
-                        error.TableNotFound, error.IndexNotFound => return try textResponse(self.alloc, 404, "index not found"),
-                        error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
-                        error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
+                    self.source.dropIndex(alloc, table_index.table_name, table_index.index_name) catch |err| switch (err) {
+                        error.TableNotFound, error.IndexNotFound => return try textResponse(alloc, 404, "index not found"),
+                        error.ExtensionOwnedObject => return try textResponse(alloc, 405, "method not allowed"),
+                        error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
                         else => return err,
                     };
-                    return try textResponse(self.alloc, 204, "");
+                    return try textResponse(alloc, 204, "");
                 }
                 if (routes.Routes.matchInternalTableEnrichment(req.uri)) |table_enrichment| {
-                    const table_name = http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, table_enrichment.table_name) catch |err| switch (err) {
-                        error.InvalidArgument => return try textResponse(self.alloc, 400, "invalid table name"),
+                    const table_name = http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, table_enrichment.table_name) catch |err| switch (err) {
+                        error.InvalidArgument => return try textResponse(alloc, 400, "invalid table name"),
                         else => return err,
                     };
-                    defer self.alloc.free(table_name);
-                    const enrichment_name = http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, table_enrichment.enrichment_name) catch |err| switch (err) {
-                        error.InvalidArgument => return try textResponse(self.alloc, 400, "invalid artifact enrichment name"),
+                    defer alloc.free(table_name);
+                    const enrichment_name = http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, table_enrichment.enrichment_name) catch |err| switch (err) {
+                        error.InvalidArgument => return try textResponse(alloc, 400, "invalid artifact enrichment name"),
                         else => return err,
                     };
-                    defer self.alloc.free(enrichment_name);
-                    self.source.deleteArtifactEnrichment(self.alloc, table_name, enrichment_name) catch |err| switch (err) {
-                        error.TableNotFound, error.EnrichmentNotFound => return try textResponse(self.alloc, 404, "artifact enrichment not found"),
-                        error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
-                        error.UnsupportedOperation => return try textResponse(self.alloc, 405, "unsupported operation"),
-                        error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment, error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return try textResponse(self.alloc, 400, "unsupported artifact enrichment configuration"),
+                    defer alloc.free(enrichment_name);
+                    self.source.deleteArtifactEnrichment(alloc, table_name, enrichment_name) catch |err| switch (err) {
+                        error.TableNotFound, error.EnrichmentNotFound => return try textResponse(alloc, 404, "artifact enrichment not found"),
+                        error.ExtensionOwnedObject => return try textResponse(alloc, 405, "method not allowed"),
+                        error.UnsupportedOperation => return try textResponse(alloc, 405, "unsupported operation"),
+                        error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment, error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig => return try textResponse(alloc, 400, "unsupported artifact enrichment configuration"),
                         else => return err,
                     };
-                    return try textResponse(self.alloc, 204, "");
+                    return try textResponse(alloc, 204, "");
                 }
             },
         }
-        return try textResponse(self.alloc, 404, "not found");
+        return try textResponse(alloc, 404, "not found");
     }
 
     fn preserveExistingStoreDrainIntent(self: *MetadataHttpServer, record: *metadata_table_manager.StoreRecord) !void {
@@ -1399,15 +1403,15 @@ pub const MetadataHttpServer = struct {
         }
     }
 
-    fn preserveExistingNodeLifecycle(self: *MetadataHttpServer, record: *metadata_table_manager.NodeRecord) !void {
+    fn preserveExistingNodeLifecycle(self: *MetadataHttpServer, alloc: std.mem.Allocator, record: *metadata_table_manager.NodeRecord) !void {
         if (!metadata_table_manager.nodeLifecycleActive(record.lifecycle)) return;
         var snapshot = try self.source.adminSnapshot();
         defer self.source.freeAdminSnapshot(&snapshot);
         for (snapshot.nodes) |existing| {
             if (existing.node_id != record.node_id) continue;
             if (metadata_table_manager.nodeLifecycleActive(existing.lifecycle)) return;
-            self.alloc.free(record.lifecycle);
-            record.lifecycle = try self.alloc.dupe(u8, existing.lifecycle);
+            alloc.free(record.lifecycle);
+            record.lifecycle = try alloc.dupe(u8, existing.lifecycle);
             return;
         }
     }
@@ -1437,7 +1441,7 @@ pub const MetadataHttpServer = struct {
         return false;
     }
 
-    fn requestNodeShutdown(self: *MetadataHttpServer, node_id: u64) !void {
+    fn requestNodeShutdown(self: *MetadataHttpServer, alloc: std.mem.Allocator, node_id: u64) !void {
         if (self.source.vtable.request_node_shutdown) |_| {
             try self.source.requestNodeShutdown(node_id);
             self.source.triggerReallocate() catch |err| switch (err) {
@@ -1460,30 +1464,30 @@ pub const MetadataHttpServer = struct {
 
             var updated_node: metadata_table_manager.NodeRecord = undefined;
             {
-                var cloned_node = try metadata_table_manager.cloneNode(self.alloc, node);
-                errdefer metadata_table_manager.freeNode(self.alloc, cloned_node);
-                const draining_lifecycle = try self.alloc.dupe(u8, metadata_table_manager.node_lifecycle_draining);
-                self.alloc.free(cloned_node.lifecycle);
+                var cloned_node = try metadata_table_manager.cloneNode(alloc, node);
+                errdefer metadata_table_manager.freeNode(alloc, cloned_node);
+                const draining_lifecycle = try alloc.dupe(u8, metadata_table_manager.node_lifecycle_draining);
+                alloc.free(cloned_node.lifecycle);
                 cloned_node.lifecycle = draining_lifecycle;
                 updated_node = cloned_node;
             }
-            try self.source.upsertNode(self.alloc, updated_node);
+            try self.source.upsertNode(alloc, updated_node);
             changed = true;
             break;
         }
         if (!node_found) {
             var draining_node: metadata_table_manager.NodeRecord = undefined;
             {
-                const role = try self.alloc.dupe(u8, "data");
-                errdefer self.alloc.free(role);
-                const lifecycle = try self.alloc.dupe(u8, metadata_table_manager.node_lifecycle_draining);
+                const role = try alloc.dupe(u8, "data");
+                errdefer alloc.free(role);
+                const lifecycle = try alloc.dupe(u8, metadata_table_manager.node_lifecycle_draining);
                 draining_node = .{
                     .node_id = node_id,
                     .role = role,
                     .lifecycle = lifecycle,
                 };
             }
-            try self.source.upsertNode(self.alloc, draining_node);
+            try self.source.upsertNode(alloc, draining_node);
             changed = true;
         }
 
@@ -1491,9 +1495,9 @@ pub const MetadataHttpServer = struct {
             if (store.node_id != node_id) continue;
             if (store.drain_requested) continue;
 
-            var updated = try metadata_table_manager.cloneStore(self.alloc, store);
+            var updated = try metadata_table_manager.cloneStore(alloc, store);
             updated.drain_requested = true;
-            try self.source.upsertStore(self.alloc, updated);
+            try self.source.upsertStore(alloc, updated);
             changed = true;
         }
 
@@ -1505,7 +1509,7 @@ pub const MetadataHttpServer = struct {
         }
     }
 
-    fn cancelNodeShutdown(self: *MetadataHttpServer, node_id: u64) !void {
+    fn cancelNodeShutdown(self: *MetadataHttpServer, alloc: std.mem.Allocator, node_id: u64) !void {
         if (self.source.vtable.cancel_node_shutdown) |_| {
             try self.source.cancelNodeShutdown(node_id);
             self.source.triggerReallocate() catch |err| switch (err) {
@@ -1524,14 +1528,14 @@ pub const MetadataHttpServer = struct {
             if (node.node_id != node_id) continue;
             if (metadata_table_manager.nodeLifecycleActive(node.lifecycle)) break;
 
-            var updated_node = try metadata_table_manager.cloneNode(self.alloc, node);
+            var updated_node = try metadata_table_manager.cloneNode(alloc, node);
             var updated_node_owned = true;
-            errdefer if (updated_node_owned) metadata_table_manager.freeNode(self.alloc, updated_node);
-            const active_lifecycle = try self.alloc.dupe(u8, metadata_table_manager.node_lifecycle_active);
-            self.alloc.free(updated_node.lifecycle);
+            errdefer if (updated_node_owned) metadata_table_manager.freeNode(alloc, updated_node);
+            const active_lifecycle = try alloc.dupe(u8, metadata_table_manager.node_lifecycle_active);
+            alloc.free(updated_node.lifecycle);
             updated_node.lifecycle = active_lifecycle;
             updated_node_owned = false;
-            try self.source.upsertNode(self.alloc, updated_node);
+            try self.source.upsertNode(alloc, updated_node);
             changed = true;
             break;
         }
@@ -1540,12 +1544,12 @@ pub const MetadataHttpServer = struct {
             if (store.node_id != node_id) continue;
             if (!store.drain_requested) continue;
 
-            var updated = try metadata_table_manager.cloneStore(self.alloc, store);
+            var updated = try metadata_table_manager.cloneStore(alloc, store);
             var updated_owned = true;
-            errdefer if (updated_owned) metadata_table_manager.freeStore(self.alloc, updated);
+            errdefer if (updated_owned) metadata_table_manager.freeStore(alloc, updated);
             updated.drain_requested = false;
             updated_owned = false;
-            try self.source.upsertStore(self.alloc, updated);
+            try self.source.upsertStore(alloc, updated);
             changed = true;
         }
 
@@ -1557,7 +1561,8 @@ pub const MetadataHttpServer = struct {
         }
     }
 
-    fn finalizeNodeShutdown(self: *MetadataHttpServer, node_id: u64) !void {
+    fn finalizeNodeShutdown(self: *MetadataHttpServer, alloc: std.mem.Allocator, node_id: u64) !void {
+        _ = alloc;
         if (self.source.vtable.finalize_node_shutdown) |_| {
             var snapshot = try self.source.adminSnapshot();
             defer self.source.freeAdminSnapshot(&snapshot);
@@ -1572,10 +1577,10 @@ pub const MetadataHttpServer = struct {
         return error.UnsupportedOperation;
     }
 
-    fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+    fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
         const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
-        return self.handle(req) catch |err| switch (err) {
-            error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => try notLeaderResponse(self.alloc),
+        return self.handleWithAllocator(alloc, req) catch |err| switch (err) {
+            error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => try notLeaderResponse(alloc),
             else => return err,
         };
     }

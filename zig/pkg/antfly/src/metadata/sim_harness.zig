@@ -67,6 +67,10 @@ const lean_sim_http_listener_cfg = std_http_listener.StdHttpListenerConfig{
     .thread_stack_size = lean_sim_thread_stack_size,
 };
 
+fn leanSimHttpAllocator() std.mem.Allocator {
+    return std.heap.smp_allocator;
+}
+
 const SimSplitRuntime = struct {
     const Entry = struct {
         source_group_id: u64,
@@ -4402,6 +4406,7 @@ fn startPublicApiServers(
     options: PublicApiServerOptions(N),
     api_base_uris: *[N][]const u8,
 ) !void {
+    const http_alloc = leanSimHttpAllocator();
     var started: usize = 0;
     errdefer {
         for (0..started) |i| listeners[i].deinit();
@@ -4431,14 +4436,15 @@ fn startPublicApiServers(
             .auth_enabled = true,
             .user_manager = &auth_managers[i].manager,
         } else .{};
-        servers[i] = api_http_server.ApiHttpServer.init(
+        servers[i] = api_http_server.ApiHttpServer.initWithRequestAllocator(
             alloc,
+            http_alloc,
             server_config,
             status_sources[i].iface(),
             read_sources[i].source(),
             write_sources[i].source(),
         );
-        listeners[i] = std_http_listener.StdHttpListener.initShared(alloc, lean_sim_http_listener_cfg, servers[i].executor(), shared_io);
+        listeners[i] = std_http_listener.StdHttpListener.initShared(http_alloc, lean_sim_http_listener_cfg, servers[i].executor(), shared_io);
         try listeners[i].start();
         started += 1;
     }
@@ -4547,7 +4553,7 @@ fn PublicApiTestRig(comptime N: usize) type {
         ) !void {
             self.* = .{
                 .alloc = alloc,
-                .http_io = std.Io.Threaded.init(alloc, .{ .stack_size = lean_sim_thread_stack_size }),
+                .http_io = std.Io.Threaded.init(leanSimHttpAllocator(), .{ .stack_size = lean_sim_thread_stack_size }),
             };
             self.forward_executor.initSharedInPlace(std.heap.page_allocator, .{}, &self.http_io);
             errdefer self.forward_executor.deinit();
@@ -5210,6 +5216,7 @@ fn startMetadataAdminServers(
     sources: *[N]MetadataAdminSimSource,
     base_uris: *[N][]const u8,
 ) !void {
+    const http_alloc = leanSimHttpAllocator();
     var started: usize = 0;
     errdefer {
         for (0..started) |i| listeners[i].deinit();
@@ -5219,7 +5226,7 @@ fn startMetadataAdminServers(
     for (0..N) |i| {
         sources[i] = .{ .node = cluster.node(i) };
         servers[i] = metadata_http_server.MetadataHttpServer.init(alloc, .{}, sources[i].iface());
-        listeners[i] = std_http_listener.StdHttpListener.initShared(alloc, lean_sim_http_listener_cfg, servers[i].executor(), shared_io);
+        listeners[i] = std_http_listener.StdHttpListener.initShared(http_alloc, lean_sim_http_listener_cfg, servers[i].executor(), shared_io);
         try listeners[i].start();
         started += 1;
     }
@@ -5653,7 +5660,7 @@ test "metadata http cluster simulation forwards public split flow from a non-hos
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var http_io = std.Io.Threaded.init(sim_alloc, .{ .stack_size = lean_sim_thread_stack_size });
+    var http_io = std.Io.Threaded.init(leanSimHttpAllocator(), .{ .stack_size = lean_sim_thread_stack_size });
     defer http_io.deinit();
 
     var metadata_admin_listeners: [4]std_http_listener.StdHttpListener = undefined;
@@ -5854,7 +5861,7 @@ test "metadata http cluster simulation forwards public merge flow from a non-hos
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var http_io = std.Io.Threaded.init(sim_alloc, .{ .stack_size = lean_sim_thread_stack_size });
+    var http_io = std.Io.Threaded.init(leanSimHttpAllocator(), .{ .stack_size = lean_sim_thread_stack_size });
     defer http_io.deinit();
 
     var metadata_admin_listeners: [4]std_http_listener.StdHttpListener = undefined;
@@ -9285,7 +9292,7 @@ test "metadata http cluster simulation forwards public table io from a non-host 
     const client_index: usize = if (actual_host_index == 0) 1 else 0;
     try std.testing.expectEqual(raft_host.HostedReplicaStatus.absent, cluster.node(client_index).status(4831));
 
-    var http_io = std.Io.Threaded.init(std.testing.allocator, .{ .stack_size = lean_sim_thread_stack_size });
+    var http_io = std.Io.Threaded.init(leanSimHttpAllocator(), .{ .stack_size = lean_sim_thread_stack_size });
     defer http_io.deinit();
 
     var listeners: [3]std_http_listener.StdHttpListener = undefined;
@@ -9302,6 +9309,7 @@ test "metadata http cluster simulation forwards public table io from a non-host 
     forward_executor.initSharedInPlace(std.heap.page_allocator, .{}, &http_io);
     defer forward_executor.deinit();
 
+    const http_alloc = leanSimHttpAllocator();
     for (0..3) |i| {
         status_sources[i] = .{ .node = cluster.node(i) };
         catalog_sources[i] = .{ .node = cluster.node(i) };
@@ -9321,14 +9329,15 @@ test "metadata http cluster simulation forwards public table io from a non-host 
             forward_executor.executor(),
         );
         attachHostedSourcesBackendRuntimeForSimulation(&read_sources[i], &write_sources[i], cluster.backendRuntime(i));
-        servers[i] = api_http_server.ApiHttpServer.init(
+        servers[i] = api_http_server.ApiHttpServer.initWithRequestAllocator(
             std.testing.allocator,
+            http_alloc,
             .{},
             status_sources[i].iface(),
             read_sources[i].source(),
             write_sources[i].source(),
         );
-        listeners[i] = std_http_listener.StdHttpListener.initShared(std.testing.allocator, lean_sim_http_listener_cfg, servers[i].executor(), &http_io);
+        listeners[i] = std_http_listener.StdHttpListener.initShared(http_alloc, lean_sim_http_listener_cfg, servers[i].executor(), &http_io);
         try listeners[i].start();
     }
     for (0..3) |i| api_base_uris[i] = try listeners[i].baseUri(std.testing.allocator);
@@ -9569,7 +9578,7 @@ test "metadata http cluster simulation forwards public table io across split ran
         if (i != left and i != right) break i;
     } else return error.TestExpectedEqual;
 
-    var http_io = std.Io.Threaded.init(std.testing.allocator, .{ .stack_size = lean_sim_thread_stack_size });
+    var http_io = std.Io.Threaded.init(leanSimHttpAllocator(), .{ .stack_size = lean_sim_thread_stack_size });
     defer http_io.deinit();
 
     var listeners: [3]std_http_listener.StdHttpListener = undefined;
@@ -9585,6 +9594,7 @@ test "metadata http cluster simulation forwards public table io across split ran
     var forward_executor: std_http_executor.StdHttpExecutor = undefined;
     forward_executor.initSharedInPlace(std.heap.page_allocator, .{}, &http_io);
     defer forward_executor.deinit();
+    const http_alloc = leanSimHttpAllocator();
     for (0..3) |i| {
         status_sources[i] = .{ .node = cluster.node(i) };
         catalog_sources[i] = .{ .node = cluster.node(i) };
@@ -9604,8 +9614,8 @@ test "metadata http cluster simulation forwards public table io across split ran
             forward_executor.executor(),
         );
         attachHostedSourcesBackendRuntimeForSimulation(&read_sources[i], &write_sources[i], cluster.backendRuntime(i));
-        servers[i] = api_http_server.ApiHttpServer.init(std.testing.allocator, .{}, status_sources[i].iface(), read_sources[i].source(), write_sources[i].source());
-        listeners[i] = std_http_listener.StdHttpListener.initShared(std.testing.allocator, lean_sim_http_listener_cfg, servers[i].executor(), &http_io);
+        servers[i] = api_http_server.ApiHttpServer.initWithRequestAllocator(std.testing.allocator, http_alloc, .{}, status_sources[i].iface(), read_sources[i].source(), write_sources[i].source());
+        listeners[i] = std_http_listener.StdHttpListener.initShared(http_alloc, lean_sim_http_listener_cfg, servers[i].executor(), &http_io);
         try listeners[i].start();
     }
     for (0..3) |i| api_base_uris[i] = try listeners[i].baseUri(std.testing.allocator);
@@ -9852,7 +9862,7 @@ test "metadata http cluster simulation forwards public table io after merge fina
     try std.testing.expectEqual(raft_host.HostedReplicaStatus.absent, cluster.node(client_index).status(4851));
     try std.testing.expectEqual(raft_host.HostedReplicaStatus.absent, cluster.node(client_index).status(4852));
 
-    var http_io = std.Io.Threaded.init(std.testing.allocator, .{ .stack_size = lean_sim_thread_stack_size });
+    var http_io = std.Io.Threaded.init(leanSimHttpAllocator(), .{ .stack_size = lean_sim_thread_stack_size });
     defer http_io.deinit();
 
     var listeners: [3]std_http_listener.StdHttpListener = undefined;
@@ -9868,6 +9878,7 @@ test "metadata http cluster simulation forwards public table io after merge fina
     var forward_executor: std_http_executor.StdHttpExecutor = undefined;
     forward_executor.initSharedInPlace(std.heap.page_allocator, .{}, &http_io);
     defer forward_executor.deinit();
+    const http_alloc = leanSimHttpAllocator();
     for (0..3) |i| {
         status_sources[i] = .{ .node = cluster.node(i) };
         catalog_sources[i] = .{ .node = cluster.node(i) };
@@ -9887,8 +9898,8 @@ test "metadata http cluster simulation forwards public table io after merge fina
             forward_executor.executor(),
         );
         attachHostedSourcesBackendRuntimeForSimulation(&read_sources[i], &write_sources[i], cluster.backendRuntime(i));
-        servers[i] = api_http_server.ApiHttpServer.init(std.testing.allocator, .{}, status_sources[i].iface(), read_sources[i].source(), write_sources[i].source());
-        listeners[i] = std_http_listener.StdHttpListener.initShared(std.testing.allocator, lean_sim_http_listener_cfg, servers[i].executor(), &http_io);
+        servers[i] = api_http_server.ApiHttpServer.initWithRequestAllocator(std.testing.allocator, http_alloc, .{}, status_sources[i].iface(), read_sources[i].source(), write_sources[i].source());
+        listeners[i] = std_http_listener.StdHttpListener.initShared(http_alloc, lean_sim_http_listener_cfg, servers[i].executor(), &http_io);
         try listeners[i].start();
     }
     for (0..3) |i| api_base_uris[i] = try listeners[i].baseUri(std.testing.allocator);

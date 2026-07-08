@@ -120,6 +120,7 @@ pub const MetadataServer = struct {
         };
 
         if (cfg.admin_listener) |listener_cfg| {
+            const request_alloc = std.heap.smp_allocator;
             const admin_http_server = try alloc.create(metadata_http_server.MetadataHttpServer);
             admin_http_server.* = metadata_http_server.MetadataHttpServer.init(
                 alloc,
@@ -160,8 +161,9 @@ pub const MetadataServer = struct {
             api_server_cfg.shard_db_adapter = owned_hosted_shard_db.?.adapter();
 
             const public_http_server = try alloc.create(public_api_http_server.ApiHttpServer);
-            public_http_server.* = public_api_http_server.ApiHttpServer.init(
+            public_http_server.* = public_api_http_server.ApiHttpServer.initWithRequestAllocator(
                 alloc,
+                request_alloc,
                 api_server_cfg,
                 public_api_http_server.StatusSource.fromMetadataHttpService(svc),
                 public_read_source.source(),
@@ -178,9 +180,9 @@ pub const MetadataServer = struct {
 
             const listener = try alloc.create(raft_transport.StdHttpListener);
             listener.* = if (svc.apiIoImpl()) |io_impl|
-                raft_transport.StdHttpListener.initShared(alloc, listener_cfg, mux.executor(), io_impl)
+                raft_transport.StdHttpListener.initShared(request_alloc, listener_cfg, mux.executor(), io_impl)
             else
-                raft_transport.StdHttpListener.init(alloc, listener_cfg, mux.executor());
+                raft_transport.StdHttpListener.init(request_alloc, listener_cfg, mux.executor());
             owned_admin_listener = listener;
         }
 

@@ -2406,8 +2406,9 @@ pub const DataServer = struct {
             _ = apply_sm.write_source.withEntitySink(entity_sink);
         }
         self.syncInferenceRuntimeConfig();
-        self.http_server = antfly.public_api.ApiHttpServer.init(
+        self.http_server = antfly.public_api.ApiHttpServer.initWithRequestAllocator(
             self.alloc,
+            std.heap.smp_allocator,
             api_server_cfg,
             self.status_source,
             self.read_source.source(),
@@ -2647,23 +2648,24 @@ pub const DataServer = struct {
             self.data_raft_base_uri = try raft.baseUri(self.alloc);
         }
         if (self.listener == null) {
+            const request_alloc = std.heap.smp_allocator;
             self.listener = if (self.backend_runtime) |runtime|
                 if (runtime.apiIoImpl()) |io_impl|
                     antfly.raft.transport.std_http_listener.StdHttpListener.initShared(
-                        self.alloc,
+                        request_alloc,
                         self.listener_cfg,
                         self.http_server.?.executor(),
                         io_impl,
                     )
                 else
                     antfly.raft.transport.std_http_listener.StdHttpListener.init(
-                        self.alloc,
+                        request_alloc,
                         self.listener_cfg,
                         self.http_server.?.executor(),
                     )
             else
                 antfly.raft.transport.std_http_listener.StdHttpListener.init(
-                    self.alloc,
+                    request_alloc,
                     self.listener_cfg,
                     self.http_server.?.executor(),
                 );
