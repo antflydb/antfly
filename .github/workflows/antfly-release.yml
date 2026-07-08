@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   goreleaser:
-    runs-on: arc-antfly-publish
+    runs-on: ubuntu-latest
     env:
       GOEXPERIMENT: simd
     steps:
@@ -26,7 +26,8 @@ jobs:
         uses: actions/setup-go@v6
         with:
           go-version: "1.26"
-          cache: false
+          cache: true
+          cache-dependency-path: go.sum
 
       - name: Verify Go version
         run: go version
@@ -118,12 +119,6 @@ jobs:
         run: |
           echo "GORELEASER_CURRENT_TAG=${GITHUB_REF_NAME}" >> $GITHUB_ENV
           echo "Release version: ${GITHUB_REF_NAME}"
-
-      - name: Generate shell completions
-        timeout-minutes: 10
-        run: ./scripts/completions.sh
-        env:
-          ANTFLY_COMPLETIONS_TAGS: afrelease
 
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6

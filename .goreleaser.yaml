@@ -134,7 +134,6 @@ archives:
     files:
       - README.md
       - LICENSE
-      - completions/*
 
   # OMNI builds (ONNX + XLA) with runtime backend selection
   # Includes bundled ONNX Runtime and PJRT libraries
@@ -153,7 +152,6 @@ archives:
     files:
       - README.md
       - LICENSE
-      - completions/*
       # Bundle ONNX Runtime libraries for each platform
       - src: "onnxruntime/{{ .Os }}-{{ .Arch }}/lib/libonnxruntime*"
         dst: lib/
@@ -256,10 +254,6 @@ homebrew_casks:
     url:
       template: "https://releases.antfly.io/antfly/{{ .Tag }}/{{ .ArtifactName }}"
     binary: antfly
-    completions:
-      bash: completions/antfly.bash
-      zsh: completions/antfly.zsh
-      fish: completions/antfly.fish
     caveats: |
       antfly includes both ONNX Runtime and XLA backends for ML inference.
       Bundled libraries are auto-discovered from lib/ next to the binary.
