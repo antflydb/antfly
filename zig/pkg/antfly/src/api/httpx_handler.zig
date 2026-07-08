@@ -1488,7 +1488,7 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("unsupported table pattern");
         }
-        const storage_statuses = try self.api_server.collectTableStorageStatuses(&snapshot, params.prefix);
+        const storage_statuses = try self.api_server.collectTableStorageStatuses(alloc, &snapshot, params.prefix);
         defer if (storage_statuses) |items| alloc.free(items);
         var arena_impl = std.heap.ArenaAllocator.init(alloc);
         defer arena_impl.deinit();
@@ -1969,7 +1969,7 @@ pub const AntflyApiHandler = struct {
         const row_filter_json = try http_server_mod.resolveEffectiveRowFilterJson(alloc, authenticated_identity, decoded_table_name);
         defer if (row_filter_json) |value| alloc.free(value);
         if (row_filter_json) |value| {
-            const filtered = try self.api_server.filterScanResultByRowFilter(source, decoded_table_name, result.ndjson, value);
+            const filtered = try self.api_server.filterScanResultByRowFilter(alloc, source, decoded_table_name, result.ndjson, value);
             defer alloc.free(filtered);
             try ctx.setHeader("content-type", "application/x-ndjson");
             _ = ctx.response.body(filtered);

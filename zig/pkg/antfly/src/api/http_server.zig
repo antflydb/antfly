@@ -3980,7 +3980,7 @@ pub const ApiHttpServer = struct {
             defer query_arena_impl.deinit();
             const params = try parseListTablesParams(query_arena_impl.allocator(), uri_parts.query);
             if (params.pattern != null) return try textResponse(self.alloc, 400, "unsupported table pattern");
-            const storage_statuses = try self.collectTableStorageStatuses(&snapshot, params.prefix);
+            const storage_statuses = try self.collectTableStorageStatuses(self.alloc, &snapshot, params.prefix);
             defer if (storage_statuses) |items| self.alloc.free(items);
             var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
             defer arena_impl.deinit();
@@ -4506,7 +4506,7 @@ pub const ApiHttpServer = struct {
                 const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
                 defer if (row_filter_json) |value| self.alloc.free(value);
                 if (row_filter_json) |value| {
-                    const filtered = try self.filterScanResultByRowFilter(source, table_name, result.ndjson, value);
+                    const filtered = try self.filterScanResultByRowFilter(self.alloc, source, table_name, result.ndjson, value);
                     defer self.alloc.free(filtered);
                     return try http_route_helpers.ndjsonResponse(self.alloc, 200, filtered);
                 }
@@ -4700,22 +4700,23 @@ pub const ApiHttpServer = struct {
 
     pub fn collectTableStorageStatuses(
         self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
         snapshot: *const metadata_api.AdminSnapshot,
         prefix: ?[]const u8,
     ) !?[]tables_api.TableStorageStatus {
         var items = std.ArrayListUnmanaged(tables_api.TableStorageStatus).empty;
-        defer items.deinit(self.alloc);
+        defer items.deinit(alloc);
 
         for (snapshot.tables) |*table| {
             if (prefix) |pfx| {
                 if (!std.mem.startsWith(u8, table.name, pfx)) continue;
             }
             const status = (try self.bestEffortSingleTableStorageStatus(table.name)) orelse continue;
-            try items.append(self.alloc, status);
+            try items.append(alloc, status);
         }
 
         if (items.items.len == 0) return null;
-        return try items.toOwnedSlice(self.alloc);
+        return try items.toOwnedSlice(alloc);
     }
 
     pub fn tableGroupIdsFromSnapshot(
@@ -4810,25 +4811,26 @@ pub const ApiHttpServer = struct {
 
     pub fn filterScanResultByRowFilter(
         self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
         source: table_reads.TableReadSource,
         table_name: []const u8,
         ndjson: []const u8,
         row_filter_json: []const u8,
     ) ![]u8 {
         var out = std.ArrayList(u8).empty;
-        defer out.deinit(self.alloc);
+        defer out.deinit(alloc);
 
         var lines = std.mem.splitScalar(u8, ndjson, '\n');
         while (lines.next()) |line| {
             if (line.len == 0) continue;
-            const key = try scanLineKey(self.alloc, line);
-            defer self.alloc.free(key);
+            const key = try scanLineKey(alloc, line);
+            defer alloc.free(key);
             if (!(try self.docMatchesRowFilter(source, table_name, key, row_filter_json))) continue;
-            try out.appendSlice(self.alloc, line);
-            try out.append(self.alloc, '\n');
+            try out.appendSlice(alloc, line);
+            try out.append(alloc, '\n');
         }
 
-        return try out.toOwnedSlice(self.alloc);
+        return try out.toOwnedSlice(alloc);
     }
 
     fn loadOwnedTableNames(self: *ApiHttpServer) ![]const []const u8 {
