@@ -13,6 +13,7 @@ on:
         type: string
 
 env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   # Google Artifact Registry configuration
   GAR_LOCATION: us-east5
   GAR_PROJECT: antfly-image-artifacts
@@ -22,7 +23,7 @@ env:
 jobs:
   # Build and publish the Antfly database image
   publish-antfly-docker-image:
-    runs-on: arc-antfly-publish
+    runs-on: ubuntu-latest
     environment: container-publish
     # Required permissions for OIDC signing and GCP Workload Identity Federation
     permissions:
