@@ -51,8 +51,8 @@ pub fn chunkText(
         try chunks.append(alloc, .{
             .chunk_id = chunk_id,
             .text = try alloc.dupe(u8, source_text[start..end]),
-            .start_offset = std.math.cast(u32, start),
-            .end_offset = std.math.cast(u32, end),
+            .start_offset = mapOffset(&sanitized, start, .start),
+            .end_offset = mapOffset(&sanitized, end, .end),
         });
         chunk_id += 1;
         if (end == source_text.len) break;
@@ -78,15 +78,35 @@ pub fn chunkTextWithConfigJson(
     defer sanitized.deinit(alloc);
     const source_text = sanitized.text;
 
-    return switch (cfg.provider) {
+    const chunks = switch (cfg.provider) {
         .mock => try chunking.fixed.chunkText(alloc, source_text, cfg),
         .antfly => try chunking.inference.chunkText(alloc, cfg, source_text),
     };
+    errdefer freeChunks(alloc, chunks);
+    remapChunkOffsets(&sanitized, chunks);
+    return chunks;
 }
 
 pub fn freeChunks(alloc: Allocator, chunks: []Chunk) void {
     for (chunks) |*chunk| chunk.deinit(alloc);
     alloc.free(chunks);
+}
+
+fn remapChunkOffsets(sanitized: *const utf8_text.SanitizedText, chunks: []Chunk) void {
+    for (chunks) |*chunk| {
+        if (chunk.start_offset) |start| chunk.start_offset = mapU32Offset(sanitized, start, .start);
+        if (chunk.end_offset) |end| chunk.end_offset = mapU32Offset(sanitized, end, .end);
+    }
+}
+
+fn mapOffset(sanitized: *const utf8_text.SanitizedText, offset: usize, boundary: utf8_text.SourceBoundary) ?u32 {
+    const checked = std.math.cast(u32, offset) orelse return null;
+    return mapU32Offset(sanitized, checked, boundary);
+}
+
+fn mapU32Offset(sanitized: *const utf8_text.SanitizedText, offset: u32, boundary: utf8_text.SourceBoundary) u32 {
+    if (sanitized.source_map) |source_map| return source_map.mapBoundary(offset, boundary);
+    return offset;
 }
 
 test "chunker splits overlapping windows" {
@@ -144,6 +164,8 @@ test "enrichment chunker replaces invalid utf8 before storing chunk text" {
     try std.testing.expectEqual(@as(usize, 1), chunks.len);
     try std.testing.expect(std.unicode.utf8ValidateSlice(chunks[0].text.?));
     try std.testing.expect(std.mem.indexOf(u8, chunks[0].text.?, &std.unicode.replacement_character_utf8) != null);
+    try std.testing.expectEqual(@as(?u32, 0), chunks[0].start_offset);
+    try std.testing.expectEqual(@as(?u32, 9), chunks[0].end_offset);
     try std.testing.expect(utf8_text.invalidUtf8RepairCount() > repairs_before);
 }
 
@@ -160,5 +182,7 @@ test "enrichment configured chunker replaces invalid utf8 before dispatch" {
     for (chunks) |chunk| {
         try std.testing.expect(std.unicode.utf8ValidateSlice(chunk.text.?));
     }
+    try std.testing.expectEqual(@as(?u32, 0), chunks[0].start_offset);
+    try std.testing.expectEqual(@as(?u32, 9), chunks[0].end_offset);
     try std.testing.expect(utf8_text.invalidUtf8RepairCount() > repairs_before);
 }

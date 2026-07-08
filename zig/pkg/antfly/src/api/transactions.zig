@@ -530,7 +530,7 @@ pub const DurableSessionStore = struct {
         try self.store.put(key, value);
     }
 
-    pub fn load(self: *DurableSessionStore, txn_id: db_mod.types.TxnId) !?Session {
+    pub fn load(self: *DurableSessionStore, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !?Session {
         const key = try makeSessionKey(self.alloc, txn_id);
         defer self.alloc.free(key);
         const value = self.store.get(self.alloc, key) catch |err| switch (err) {
@@ -538,7 +538,7 @@ pub const DurableSessionStore = struct {
             else => return err,
         };
         defer self.alloc.free(value);
-        return try decodeSessionRecord(self.alloc, txn_id, value);
+        return try decodeSessionRecord(alloc, txn_id, value);
     }
 
     pub fn delete(self: *DurableSessionStore, txn_id: db_mod.types.TxnId) !void {
@@ -999,7 +999,7 @@ pub const SessionRegistry = struct {
     fn loadIntoCacheLocked(self: *SessionRegistry, txn_id: db_mod.types.TxnId) !?*Session {
         if (self.sessions.getPtr(txn_id)) |session| return session;
         const durable = self.durable orelse return null;
-        const loaded = (try durable.load(txn_id)) orelse return null;
+        const loaded = (try durable.load(self.alloc, txn_id)) orelse return null;
         try self.sessions.put(self.alloc, txn_id, loaded);
         return self.sessions.getPtr(txn_id).?;
     }
@@ -2750,6 +2750,35 @@ test "transaction session registry adopts durable session ownership" {
     try std.testing.expectEqual(@as(u64, 12), status.owner_node_id);
 }
 
+test "transaction session registry owns sessions loaded from durable store" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/txn-session-split-allocator-store", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    defer std.testing.allocator.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(std.testing.allocator, path_z, .{});
+    defer store.close();
+    var durable = DurableSessionStore.init(std.testing.allocator, &store);
+
+    var writer = SessionRegistry.init(std.testing.allocator, &durable);
+    defer writer.deinit();
+    const session = try writer.begin(.{ .sync_level = .write }, 9);
+
+    var registry_gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer std.debug.assert(registry_gpa.deinit() == .ok);
+    const registry_alloc = registry_gpa.allocator();
+
+    var adopter = SessionRegistry.init(registry_alloc, &durable);
+    defer adopter.deinit();
+    try std.testing.expect(try adopter.adopt(session.txn_id, 12));
+
+    const status = (try adopter.getStatus(session.txn_id)).?;
+    try std.testing.expectEqual(@as(u64, 12), status.owner_node_id);
+}
+
 test "transaction session registry only adopts durable sessions after lease expiry" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2891,7 +2920,7 @@ test "transaction session registry reports status and cleans expired durable ses
     const removed = try registry.cleanupExpired(2);
     try std.testing.expectEqual(@as(usize, 1), removed);
     try std.testing.expect(registry.getInfo(session.txn_id) == null);
-    try std.testing.expect((try durable.load(session.txn_id)) == null);
+    try std.testing.expect((try durable.load(std.testing.allocator, session.txn_id)) == null);
 }
 
 test "transaction session registry enforces savepoint limits and reports remaining capacity" {

@@ -173,21 +173,26 @@ const ServerlessHealthSource = struct {
         const self: *ServerlessHealthSource = @ptrCast(@alignCast(ptr));
         const run_stats = self.srv.stack.runtime.metricsSnapshot();
         const query_metrics = self.srv.stack.query.metricsSnapshot();
-        const append = antfly.common.health_server.appendPromMetric;
-
-        try append(writer, "antfly_serverless_published_namespaces_total", "counter", "Namespaces published by the maintenance runtime", @intCast(run_stats.published_namespaces));
-        try append(writer, "antfly_serverless_compacted_namespaces_total", "counter", "Namespaces compacted by the maintenance runtime", @intCast(run_stats.compacted_namespaces));
-        try append(writer, "antfly_serverless_pruned_namespaces_total", "counter", "Namespaces pruned by the maintenance runtime", @intCast(run_stats.pruned_namespaces));
-        try append(writer, "antfly_serverless_deleted_versions_total", "counter", "Manifest versions deleted by pruning", @intCast(run_stats.deleted_versions));
-        try append(writer, "antfly_serverless_enriched_documents_total", "counter", "Documents successfully enriched", @intCast(run_stats.enriched_documents));
-        try append(writer, "antfly_serverless_enrichment_failed_documents_total", "counter", "Documents for which enrichment failed", @intCast(run_stats.enrichment_failed_documents));
-        try append(writer, "antfly_serverless_queries_total", "counter", "Total query executions", query_metrics.total_queries);
-        try append(writer, "antfly_serverless_vector_queries_total", "counter", "Vector query executions", query_metrics.vector_queries);
-        try append(writer, "antfly_serverless_hybrid_queries_total", "counter", "Hybrid query executions", query_metrics.hybrid_queries);
-        try append(writer, "antfly_serverless_sparse_queries_total", "counter", "Sparse query executions", query_metrics.sparse_queries);
-        try antfly.db.query_metrics.writePrometheus(writer);
+        try writeServerlessPrometheus(writer, run_stats, query_metrics);
     }
 };
+
+fn writeServerlessPrometheus(writer: *std.Io.Writer, run_stats: anytype, query_metrics: anytype) !void {
+    const append = antfly.common.prometheus.appendPromMetric;
+
+    try append(writer, "antfly_serverless_published_namespaces_total", "counter", "Namespaces published by the maintenance runtime", @intCast(run_stats.published_namespaces));
+    try append(writer, "antfly_serverless_compacted_namespaces_total", "counter", "Namespaces compacted by the maintenance runtime", @intCast(run_stats.compacted_namespaces));
+    try append(writer, "antfly_serverless_pruned_namespaces_total", "counter", "Namespaces pruned by the maintenance runtime", @intCast(run_stats.pruned_namespaces));
+    try append(writer, "antfly_serverless_deleted_versions_total", "counter", "Manifest versions deleted by pruning", @intCast(run_stats.deleted_versions));
+    try append(writer, "antfly_serverless_enriched_documents_total", "counter", "Documents successfully enriched", @intCast(run_stats.enriched_documents));
+    try append(writer, "antfly_serverless_enrichment_failed_documents_total", "counter", "Documents for which enrichment failed", @intCast(run_stats.enrichment_failed_documents));
+    try append(writer, "antfly_serverless_queries_total", "counter", "Total query executions", query_metrics.total_queries);
+    try append(writer, "antfly_serverless_vector_queries_total", "counter", "Vector query executions", query_metrics.vector_queries);
+    try append(writer, "antfly_serverless_hybrid_queries_total", "counter", "Hybrid query executions", query_metrics.hybrid_queries);
+    try append(writer, "antfly_serverless_sparse_queries_total", "counter", "Sparse query executions", query_metrics.sparse_queries);
+    try antfly.db.query_metrics.writePrometheus(writer);
+    try antfly.db.enrichment_utf8_text.writePrometheus(writer);
+}
 
 fn parseEnvOptionalInt(
     env_map: *std.process.Environ.Map,
@@ -512,6 +517,33 @@ fn backendSummary(target: serverless.RuntimeStorageTarget) []const u8 {
 
 test "serverless main module compiles" {
     _ = CliConfig;
+}
+
+test "serverless metrics include shared enrichment utf8 repair counter" {
+    var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer writer.deinit();
+
+    try writeServerlessPrometheus(
+        &writer.writer,
+        .{
+            .published_namespaces = 0,
+            .compacted_namespaces = 0,
+            .pruned_namespaces = 0,
+            .deleted_versions = 0,
+            .enriched_documents = 0,
+            .enrichment_failed_documents = 0,
+        },
+        .{
+            .total_queries = 0,
+            .vector_queries = 0,
+            .hybrid_queries = 0,
+            .sparse_queries = 0,
+        },
+    );
+
+    const out = writer.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "# TYPE antfly_enrichment_invalid_utf8_repairs_total counter") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "antfly_enrichment_invalid_utf8_repairs_total ") != null);
 }
 
 test "serverless main startup hint covers backend config errors" {
