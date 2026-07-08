@@ -1333,7 +1333,7 @@ func validateHAPrimaryRetentionSnapshot(retention HARetentionSnapshot, currentLS
 	if retention.OldestRestartLsn > retention.PrimaryLsn {
 		return fmt.Errorf("primary retention snapshot inconsistent: oldest_restart_lsn=%d exceeds primary_lsn=%d", retention.OldestRestartLsn, retention.PrimaryLsn)
 	}
-	if retention.RetainedLsnCount != retention.PrimaryLsn-retention.OldestRestartLsn {
+	if !haRetainedLSNCountConsistent(retention.PrimaryLsn, retention.OldestRestartLsn, retention.RetainedLsnCount, slotCount) {
 		return fmt.Errorf("primary retention snapshot inconsistent: retained_lsn_count=%d expected=%d", retention.RetainedLsnCount, retention.PrimaryLsn-retention.OldestRestartLsn)
 	}
 	if retention.ActiveSlots > uint64(slotCount) {
@@ -1343,6 +1343,14 @@ func validateHAPrimaryRetentionSnapshot(retention HARetentionSnapshot, currentLS
 		return fmt.Errorf("primary retention snapshot inconsistent: reseed_recommended=%d exceeds slot count=%d", retention.ReseedRecommended, slotCount)
 	}
 	return nil
+}
+
+func haRetainedLSNCountConsistent(primaryLSN uint64, oldestRestartLSN uint64, retainedLSNCount uint64, slotCount int) bool {
+	expected := primaryLSN - oldestRestartLSN
+	if retainedLSNCount == expected {
+		return true
+	}
+	return primaryLSN == 0 && oldestRestartLSN == 0 && retainedLSNCount == 1 && slotCount > 0
 }
 
 func validateHASlotSnapshot(slot HASlotSnapshot, currentLSN uint64) error {
