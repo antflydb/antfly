@@ -1374,8 +1374,19 @@ def _wait_node_shutdown_phase(
     phase: str,
     *,
     timeout_s: float = 60.0,
-) -> dict[str, Any] | None:
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    last_status: dict[str, Any] | None = None
+
     def status_matches() -> dict[str, Any] | None:
+        nonlocal last_status
+        # Shutdown convergence (drain debt clearing, then post-finalize cleanup to
+        # "not_found") is driven by the metadata reconcile loop. A reallocation
+        # request is a reconcile wake signal, so nudge it each poll to keep the loop
+        # advancing under load instead of waiting on the next unforced periodic pass.
+        try:
+            cluster.trigger_reallocate()
+        except (AssertionError, requests.RequestException):
+            pass
         try:
             response = requests.get(f"{cluster.metadata_urls[0]}/internal/v1/nodes/{node_id}/shutdown", timeout=10)
             response.raise_for_status()
@@ -1384,11 +1395,13 @@ def _wait_node_shutdown_phase(
             return None
         if not isinstance(payload, dict):
             return None
+        last_status = payload
         if payload.get("phase") != phase:
             return None
         return payload
 
-    return wait_until(status_matches, timeout_s=timeout_s, interval_s=0.5)
+    matched = wait_until(status_matches, timeout_s=timeout_s, interval_s=0.5)
+    return matched, last_status
 
 
 def test_multinode_cluster_uses_configured_multi_metadata_discovery_and_data_raft_urls(
@@ -1541,21 +1554,22 @@ def test_autoscaling_drains_stops_and_finalizes_data_node_without_losing_reads(
         f"snapshot: {cluster.metadata_snapshot()}\n"
         f"{cluster.debug_logs()}"
     )
-    complete = _wait_node_shutdown_phase(cluster, node_to_stop, "complete")
+    complete, complete_status = _wait_node_shutdown_phase(cluster, node_to_stop, "complete")
     assert complete is not None and complete.get("safe_to_terminate") is True, (
         "node shutdown never became safe to terminate\n"
         f"node_to_stop: {node_to_stop}\n"
-        f"status: {complete}\n"
+        f"last shutdown status: {complete_status}\n"
         f"metadata statuses: {json.dumps(cluster.metadata_statuses(), indent=2, sort_keys=True)}\n"
         f"{cluster.debug_logs()}"
     )
 
     cluster.stop_data_node(node_to_stop)
     cluster.finalize_node_shutdown(node_to_stop)
-    finalized = _wait_node_shutdown_phase(cluster, node_to_stop, "not_found")
+    finalized, finalized_status = _wait_node_shutdown_phase(cluster, node_to_stop, "not_found")
     assert finalized is not None and finalized.get("safe_to_terminate") is True, (
         "finalized node still appeared as shutdown debt\n"
         f"node_to_stop: {node_to_stop}\n"
+        f"last shutdown status: {finalized_status}\n"
         f"metadata statuses: {json.dumps(cluster.metadata_statuses(), indent=2, sort_keys=True)}\n"
         f"snapshot: {cluster.metadata_snapshot()}\n"
         f"{cluster.debug_logs()}"
