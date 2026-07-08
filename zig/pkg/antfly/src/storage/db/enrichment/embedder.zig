@@ -49,7 +49,7 @@ pub const DenseEmbedder = struct {
     deinit_fn: ?DenseEmbedDeinitFn = null,
 
     pub fn embedDense(self: DenseEmbedder, alloc: Allocator, embedding_name: []const u8, text: []const u8, dims: u32) ![]f32 {
-        var sanitized = try utf8_text.sanitizeAlloc(alloc, text, "dense embedder");
+        var sanitized = try utf8_text.sanitizeWithoutSourceMapAlloc(alloc, text, "dense embedder");
         defer sanitized.deinit(alloc);
         return try self.dense_embed_fn(self.ptr, alloc, embedding_name, sanitized.text, dims);
     }
@@ -98,7 +98,7 @@ pub const SparseEmbedder = struct {
     deinit_fn: ?SparseEmbedDeinitFn = null,
 
     pub fn embedSparse(self: SparseEmbedder, alloc: Allocator, embedding_name: []const u8, text: []const u8) !SparseEmbedding {
-        var sanitized = try utf8_text.sanitizeAlloc(alloc, text, "sparse embedder");
+        var sanitized = try utf8_text.sanitizeWithoutSourceMapAlloc(alloc, text, "sparse embedder");
         defer sanitized.deinit(alloc);
         return try self.sparse_embed_fn(self.ptr, alloc, embedding_name, sanitized.text);
     }

@@ -84,10 +84,35 @@ pub fn sanitizeAlloc(alloc: Allocator, text: []const u8, context: []const u8) !S
     };
 }
 
+pub fn sanitizeWithoutSourceMapAlloc(alloc: Allocator, text: []const u8, context: []const u8) !SanitizedText {
+    if (std.unicode.utf8ValidateSlice(text)) return .{ .text = text };
+    const repaired = try replacementAlloc(alloc, text, context);
+    return .{
+        .text = repaired,
+        .owned = repaired,
+        .repaired = true,
+    };
+}
+
 pub fn replacementAlloc(alloc: Allocator, text: []const u8, context: []const u8) ![]u8 {
-    var repaired = try replacementWithMapAlloc(alloc, text, context);
-    repaired.source_map.deinit(alloc);
-    return repaired.text;
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+
+    var i: usize = 0;
+    while (i < text.len) {
+        const seq_len = std.unicode.utf8ByteSequenceLength(text[i]) catch 0;
+        if (seq_len > 0 and i + seq_len <= text.len and std.unicode.utf8ValidateSlice(text[i .. i + seq_len])) {
+            try out.appendSlice(alloc, text[i .. i + seq_len]);
+            i += seq_len;
+        } else {
+            try out.appendSlice(alloc, &std.unicode.replacement_character_utf8);
+            i += 1;
+        }
+    }
+
+    const repaired = try out.toOwnedSlice(alloc);
+    noteInvalidUtf8Repair(context, text.len, repaired.len);
+    return repaired;
 }
 
 pub fn invalidUtf8RepairCount() u64 {
@@ -239,6 +264,20 @@ test "enrichment utf8 sanitizer replaces invalid input" {
 
     try std.testing.expect(sanitized.repaired);
     try std.testing.expect(sanitized.source_map != null);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(sanitized.text));
+    try std.testing.expect(std.mem.indexOf(u8, sanitized.text, &std.unicode.replacement_character_utf8) != null);
+    try std.testing.expect(invalidUtf8RepairCount() > repairs_before);
+}
+
+test "enrichment utf8 sanitizer can repair without source offset map" {
+    const alloc = std.testing.allocator;
+    const repairs_before = invalidUtf8RepairCount();
+
+    var sanitized = try sanitizeWithoutSourceMapAlloc(alloc, "bad\xc2 text", "test");
+    defer sanitized.deinit(alloc);
+
+    try std.testing.expect(sanitized.repaired);
+    try std.testing.expect(sanitized.source_map == null);
     try std.testing.expect(std.unicode.utf8ValidateSlice(sanitized.text));
     try std.testing.expect(std.mem.indexOf(u8, sanitized.text, &std.unicode.replacement_character_utf8) != null);
     try std.testing.expect(invalidUtf8RepairCount() > repairs_before);
