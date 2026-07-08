@@ -383,7 +383,7 @@ func haRetentionStatusJSONConsistent(currentLSN uint64, retention *haRetentionSt
 	if oldestRestartLSN > primaryLSN {
 		return fmt.Errorf("primary retention snapshot inconsistent: oldest_restart_lsn=%d primary_lsn=%d", oldestRestartLSN, primaryLSN)
 	}
-	if retainedLSNCount != primaryLSN-oldestRestartLSN {
+	if !haRetainedLSNCountConsistent(primaryLSN, oldestRestartLSN, retainedLSNCount, slotCount) {
 		return fmt.Errorf("primary retention snapshot inconsistent: retained_lsn_count=%d expected=%d", retainedLSNCount, primaryLSN-oldestRestartLSN)
 	}
 	if activeSlots > uint64(slotCount) {

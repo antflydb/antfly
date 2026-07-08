@@ -50,8 +50,12 @@ API.
 
 When Antfly pods use `spec.highAvailability.runtime.adminTokenSecretRef`, set
 `optional: false` or omit `optional` so Kubernetes fails pod startup if the
-token Secret is missing. Use `spec.swarm.envFrom` only when the same Secret is
-already being injected for other runtime configuration.
+token Secret is missing. This field is a pod/Job `SecretKeySelector`; the
+operator does not read the Secret value from the Kubernetes API. Operator status
+probes and typed HA admin actions still require the token to be injected into
+the operator pod through `spec.highAvailability.admin.tokenEnvVar`. Use
+`spec.swarm.envFrom` only when the same Secret is already being injected for
+other runtime configuration.
 
 When using CLI commands, pass `--ha-token-env ANTFLY_HA_ADMIN_TOKEN`. Do not
 put raw tokens in command-line flags because argv can be exposed through process

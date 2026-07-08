@@ -678,13 +678,15 @@ type HARuntimeSpec struct {
 
 	// AdminTokenEnvVar is the Antfly process environment variable containing the bearer token required by /admin/v1/ha.
 	// When set, the operator passes --ha-admin-token-env and the runtime rejects typed HA admin requests without a matching Authorization header.
-	// Populate it with adminTokenSecretRef or spec.swarm.envFrom.
+	// Populate it with adminTokenSecretRef or spec.swarm.envFrom for Antfly runtime pods and CLI fallback Jobs.
+	// The operator does not read this Secret; operator status probes and typed admin actions use spec.highAvailability.admin.tokenEnvVar.
 	// +kubebuilder:validation:Pattern=`^$|^[A-Za-z_][A-Za-z0-9_]*$`
 	// +optional
 	AdminTokenEnvVar string `json:"adminTokenEnvVar,omitempty"`
 
-	// AdminTokenSecretRef injects AdminTokenEnvVar from a required Secret key into the Antfly runtime container.
+	// AdminTokenSecretRef injects AdminTokenEnvVar from a required Secret key into Antfly runtime pods and CLI fallback Jobs.
 	// Use this when the token is not already provided by spec.swarm.envFrom. optional must not be true.
+	// This Secret is passed as a Kubernetes SecretKeySelector and is not read by the operator process.
 	// +optional
 	AdminTokenSecretRef *corev1.SecretKeySelector `json:"adminTokenSecretRef,omitempty"`
 
