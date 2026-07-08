@@ -316,6 +316,26 @@ pub const KvStorageRuntime = struct {
         return id;
     }
 
+    pub fn attachSequenceWithRetainedBlocks(self: *KvStorageRuntime, pool_id: block.KvPoolId, block_ids: []const block.KvBlockId, token_count: usize) !SequenceId {
+        if (pool_id != self.storage.pool_id) return error.InvalidPoolId;
+        const page_size = self.storage.config.page_size_tokens;
+        if (page_size == 0) return error.InvalidPoolId;
+        if (token_count > block_ids.len * page_size) return error.InvalidKvShape;
+        if (token_count % page_size != 0) return error.InvalidKvShape;
+
+        const sequence_id = try self.attachSequence(pool_id);
+        errdefer self.releaseSequence(sequence_id) catch {};
+        const sequence_state = try self.sequenceMut(sequence_id);
+
+        for (block_ids) |block_id| {
+            try self.storage.retain(block_id);
+            try sequence_state.block_table.appendExisting(self.allocator, block_id);
+        }
+        sequence_state.block_table.markSharedPrefix(@intCast(block_ids.len));
+        if (block_ids.len > 0) sequence_state.block_table.tail_tokens = page_size;
+        return sequence_id;
+    }
+
     pub fn releaseSequence(self: *KvStorageRuntime, sequence_id: SequenceId) !void {
         const idx = sequenceIndex(sequence_id) orelse return error.InvalidSequenceId;
         if (idx >= self.sequences.items.len) return error.InvalidSequenceId;
@@ -326,6 +346,29 @@ pub const KvStorageRuntime = struct {
         const idx = sequenceIndex(sequence_id) orelse return null;
         if (idx >= self.sequences.items.len) return null;
         return self.sequences.items[idx].block_table.tokenCount(self.storage.config.page_size_tokens);
+    }
+
+    pub fn retainSequencePrefixBlocks(self: *KvStorageRuntime, sequence_id: SequenceId, token_count: usize, out: *std.ArrayListUnmanaged(block.KvBlockId)) !void {
+        const sequence_state = try self.sequenceMut(sequence_id);
+        const page_size = self.storage.config.page_size_tokens;
+        if (page_size == 0) return error.InvalidPoolId;
+        if (token_count % page_size != 0) return error.InvalidKvShape;
+        if (token_count > sequence_state.block_table.tokenCount(page_size)) return error.KvCapacityTooSmall;
+        const block_count = token_count / page_size;
+
+        out.clearRetainingCapacity();
+        errdefer {
+            for (out.items) |block_id| _ = self.storage.releaseRef(self.allocator, block_id) catch {};
+            out.clearRetainingCapacity();
+        }
+        for (sequence_state.block_table.blocks.items[0..block_count]) |block_id| {
+            try self.storage.retain(block_id);
+            try out.append(self.allocator, block_id);
+        }
+    }
+
+    pub fn releaseRetainedBlocks(self: *KvStorageRuntime, block_ids: []const block.KvBlockId) void {
+        for (block_ids) |block_id| _ = self.storage.releaseRef(self.allocator, block_id) catch {};
     }
 
     pub fn blockTable(self: *KvStorageRuntime, sequence_id: SequenceId) ?*const block_table.SequenceBlockTable {
@@ -667,6 +710,36 @@ test "storage runtime reserves future token capacity without advancing token cou
 
     const logical_blocks_after_append = try runtime.logicalBlocksWithReservations(sequence_id);
     try std.testing.expectEqual(@as(usize, 3), logical_blocks_after_append.len);
+}
+
+test "storage runtime can attach sequence with retained blocks" {
+    const allocator = std.testing.allocator;
+    var runtime = try KvStorageRuntime.init(allocator, .{
+        .backend = .metal,
+        .dtype = .f32,
+        .page_size_tokens = 2,
+        .num_layers_packed = 1,
+        .num_kv_heads = 1,
+        .head_dim = 4,
+    });
+    defer runtime.deinit();
+
+    const source_id = try runtime.attachSequence(runtime.poolId());
+    try runtime.appendTokens(source_id, 4);
+
+    var blocks: std.ArrayListUnmanaged(block.KvBlockId) = .empty;
+    defer blocks.deinit(allocator);
+    try runtime.retainSequencePrefixBlocks(source_id, 4, &blocks);
+    defer runtime.releaseRetainedBlocks(blocks.items);
+
+    const derived_id = try runtime.attachSequenceWithRetainedBlocks(runtime.poolId(), blocks.items, 4);
+    const storage = runtime.getPool(runtime.poolId()).?;
+    try std.testing.expectEqual(@as(u32, 3), storage.blockInfo(0).?.refcount);
+    try std.testing.expectEqual(@as(u32, 3), storage.blockInfo(1).?.refcount);
+
+    try runtime.releaseSequence(derived_id);
+    try std.testing.expectEqual(@as(u32, 2), storage.blockInfo(0).?.refcount);
+    try std.testing.expectEqual(@as(u32, 2), storage.blockInfo(1).?.refcount);
 }
 
 const TestDeviceWriteHookContext = struct {

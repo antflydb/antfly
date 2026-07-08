@@ -107,6 +107,51 @@ pub const KvManager = struct {
         return sequence_id;
     }
 
+    pub fn attachSequenceWithRetainedBlocks(self: *KvManager, pool_id: block.KvPoolId, block_ids: []const block.KvBlockId, token_count: usize) !SequenceId {
+        const storage = self.getPoolMut(pool_id) orelse return error.InvalidPoolId;
+        const page_size = storage.config.page_size_tokens;
+        if (page_size == 0) return error.InvalidPoolId;
+        if (token_count > block_ids.len * page_size) return error.InvalidKvShape;
+        if (token_count % page_size != 0) return error.InvalidKvShape;
+
+        const sequence_id = try self.attachSequence(pool_id);
+        errdefer self.releaseSequence(sequence_id) catch {};
+        const sequence_state = try self.sequenceMut(sequence_id);
+
+        for (block_ids) |block_id| {
+            try storage.retain(block_id);
+            try sequence_state.block_table.appendExisting(self.allocator, block_id);
+        }
+        sequence_state.block_table.markSharedPrefix(@intCast(block_ids.len));
+        if (block_ids.len > 0) sequence_state.block_table.tail_tokens = page_size;
+        return sequence_id;
+    }
+
+    pub fn retainSequencePrefixBlocks(self: *KvManager, sequence_id: SequenceId, token_count: usize, out: *std.ArrayListUnmanaged(block.KvBlockId)) !void {
+        const sequence_state = try self.sequenceState(sequence_id);
+        const storage = self.getPoolMut(sequence_state.pool_id) orelse return error.InvalidPoolId;
+        const page_size = storage.config.page_size_tokens;
+        if (page_size == 0) return error.InvalidPoolId;
+        if (token_count % page_size != 0) return error.InvalidKvShape;
+        if (token_count > sequence_state.block_table.tokenCount(page_size)) return error.KvCapacityTooSmall;
+        const block_count = token_count / page_size;
+
+        out.clearRetainingCapacity();
+        errdefer {
+            for (out.items) |block_id| _ = storage.releaseRef(self.allocator, block_id) catch {};
+            out.clearRetainingCapacity();
+        }
+        for (sequence_state.block_table.blocks.items[0..block_count]) |block_id| {
+            try storage.retain(block_id);
+            try out.append(self.allocator, block_id);
+        }
+    }
+
+    pub fn releaseRetainedBlocks(self: *KvManager, pool_id: block.KvPoolId, block_ids: []const block.KvBlockId) void {
+        const storage = self.getPoolMut(pool_id) orelse return;
+        for (block_ids) |block_id| _ = storage.releaseRef(self.allocator, block_id) catch {};
+    }
+
     pub fn reserveTailBlock(self: *KvManager, sequence_id: SequenceId) !block.KvBlockId {
         const sequence_state = try self.sequenceMut(sequence_id);
         const storage = &self.pools.items[sequence_state.pool_id];
@@ -669,6 +714,36 @@ test "manager releases shared prefix blocks by refcount" {
     try manager.releaseSequence(source_id);
     try std.testing.expectEqual(@as(u32, 0), pool.blockInfo(0).?.refcount);
     try std.testing.expectEqual(@as(u32, 0), pool.blockInfo(1).?.refcount);
+}
+
+test "manager can attach sequence with retained blocks" {
+    const allocator = std.testing.allocator;
+    var manager = KvManager.init(allocator);
+    defer manager.deinit();
+
+    const pool_id = try manager.addPool(.{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 2,
+        .num_kv_heads = 1,
+        .head_dim = 4,
+    });
+    const source_id = try manager.attachSequence(pool_id);
+    try manager.appendTokens(source_id, 4);
+
+    var blocks: std.ArrayListUnmanaged(block.KvBlockId) = .empty;
+    defer blocks.deinit(allocator);
+    try manager.retainSequencePrefixBlocks(source_id, 4, &blocks);
+    defer manager.releaseRetainedBlocks(pool_id, blocks.items);
+
+    const derived_id = try manager.attachSequenceWithRetainedBlocks(pool_id, blocks.items, 4);
+    const pool = manager.getPool(pool_id).?;
+    try std.testing.expectEqual(@as(u32, 3), pool.blockInfo(0).?.refcount);
+    try std.testing.expectEqual(@as(u32, 3), pool.blockInfo(1).?.refcount);
+
+    try manager.releaseSequence(derived_id);
+    try std.testing.expectEqual(@as(u32, 2), pool.blockInfo(0).?.refcount);
+    try std.testing.expectEqual(@as(u32, 2), pool.blockInfo(1).?.refcount);
 }
 
 test "manager trims sequence to sliding window in whole blocks" {

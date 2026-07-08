@@ -47,6 +47,13 @@ const RunConfig = struct {
         quantization: ?[]const u8 = null,
     };
 
+    const PromptCacheConfig = struct {
+        enabled: bool = false,
+        max_bytes_mb: usize = 512,
+        min_tokens: usize = 64,
+        ttl_ms: u64 = 300_000,
+    };
+
     models_dir: ?[]const u8 = null,
     ml_dir: ?[]const u8 = null,
     content_security: ?inference.scraping.ContentSecurityConfig = null,
@@ -56,6 +63,7 @@ const RunConfig = struct {
     max_loaded_models: ?usize = null,
     max_concurrent_requests: ?usize = null,
     pool_size: ?usize = null,
+    prompt_cache: ?PromptCacheConfig = null,
 };
 
 fn loadRunConfig(allocator: std.mem.Allocator, path: []const u8) !RunConfig {
@@ -310,11 +318,18 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
         if (cfg.max_loaded_models) |value| node_cfg.max_loaded_models = value;
         if (cfg.max_concurrent_requests) |value| node_cfg.max_concurrent_requests = value;
         if (cfg.pool_size) |value| node_cfg.pool_size = value;
+        if (cfg.prompt_cache) |value| node_cfg.prompt_cache = .{
+            .enabled = value.enabled,
+            .max_bytes_mb = value.max_bytes_mb,
+            .min_tokens = value.min_tokens,
+            .ttl_ms = value.ttl_ms,
+        };
     }
     if (max_concurrent_requests_override) |value| node_cfg.max_concurrent_requests = value;
 
     var node = try inference.server.Node.init(allocator, node_cfg);
     defer node.deinit();
+    node.attachIo(io);
 
     try node.warmConfiguredModels(allocator);
     print("listening on {s}:{d}\n", .{ host, port });
@@ -486,7 +501,8 @@ test "run config parses shared scraping fields and ignores api_url" {
         \\    { "kind": "generator", "name": "antflydb/gemma-e2b", "backend": "metal", "format": "gguf", "quantization": "q4_k" }
         \\  ],
         \\  "max_loaded_models": 8,
-        \\  "pool_size": 4
+        \\  "pool_size": 4,
+        \\  "prompt_cache": { "enabled": true, "max_bytes_mb": 64, "min_tokens": 32, "ttl_ms": 1000 }
         \\}
     ;
     const parsed = try std.json.parseFromSlice(RunConfig, std.testing.allocator, raw, .{
@@ -507,6 +523,10 @@ test "run config parses shared scraping fields and ignores api_url" {
     try std.testing.expectEqualStrings("q4_k", parsed.value.preload[0].quantization.?);
     try std.testing.expectEqual(@as(?usize, 8), parsed.value.max_loaded_models);
     try std.testing.expectEqual(@as(?usize, 4), parsed.value.pool_size);
+    try std.testing.expectEqual(true, parsed.value.prompt_cache.?.enabled);
+    try std.testing.expectEqual(@as(usize, 64), parsed.value.prompt_cache.?.max_bytes_mb);
+    try std.testing.expectEqual(@as(usize, 32), parsed.value.prompt_cache.?.min_tokens);
+    try std.testing.expectEqual(@as(u64, 1000), parsed.value.prompt_cache.?.ttl_ms);
 }
 
 test "run max concurrent request parser rejects zero" {

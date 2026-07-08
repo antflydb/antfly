@@ -315,6 +315,8 @@ pub const GenerateUsage = struct {
     completion_tokens: i64,
     /// Total tokens used (prompt + completion)
     total_tokens: i64,
+    /// Prompt tokens served from inference-native prefix KV cache
+    cached_prompt_tokens: ?i64 = null,
 };
 
 /// Incremental function call data for streaming
@@ -850,6 +852,10 @@ pub const GenerateRequest = struct {
     stream: ?bool = null,
     /// List of tools (functions) the model can call. Only supported by models with tool_call_format configured.
     tools: ?[]const Tool = null,
+    /// inference-native prompt prefix cache namespace/routing key. Requests with the same key can reuse matching prompt-prefix KV on the same node.
+    prompt_cache_key: ?[]const u8 = null,
+    /// inference-native prompt prefix cache control. False bypasses prompt cache for this request.
+    prompt_cache: ?bool = null,
     /// Controls how the model uses tools
     tool_choice: ?ToolChoice = null,
 };

@@ -2539,6 +2539,15 @@ components:
             inference-native KV cache compaction ratio applied after prefill via Attention Matching.
             Selects a subset of keys and fits new values via OLS to preserve attention behavior.
             0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction.
+        prompt_cache_key:
+          type: string
+          description: |
+            inference-native prompt prefix cache namespace/routing key. Requests with the same key can
+            reuse matching prompt-prefix KV on the same node.
+        prompt_cache:
+          type: boolean
+          description: |
+            inference-native prompt prefix cache control. False bypasses prompt cache for this request.
         backend:
           $ref: '#/components/schemas/ModelBackend'
         mode:
@@ -2673,6 +2682,9 @@ components:
         total_tokens:
           type: integer
           description: Total tokens used (prompt + completion)
+        cached_prompt_tokens:
+          type: integer
+          description: Prompt tokens served from inference-native prefix KV cache
     GenerateChunk:
       type: object
       description: Streaming generation chunk (SSE event data)

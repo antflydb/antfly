@@ -1190,6 +1190,15 @@ components:
           description: |
             List of tools (functions) the model can call.
             Only supported by models with tool_call_format configured.
+        prompt_cache_key:
+          type: string
+          description: |
+            inference-native prompt prefix cache namespace/routing key. Requests with the same key can
+            reuse matching prompt-prefix KV on the same node.
+        prompt_cache:
+          type: boolean
+          description: |
+            inference-native prompt prefix cache control. False bypasses prompt cache for this request.
         tool_choice:
           $ref: "#/components/schemas/ToolChoice"
           description: Controls how the model uses tools
@@ -1280,6 +1289,9 @@ components:
         total_tokens:
           type: integer
           description: Total tokens used (prompt + completion)
+        cached_prompt_tokens:
+          type: integer
+          description: Prompt tokens served from inference-native prefix KV cache
 
     GenerateChunk:
       type: object

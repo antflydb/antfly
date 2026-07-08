@@ -724,6 +724,7 @@ pub const LoadedModel = struct {
     chat_tmpl: ?*ChatTemplate = null,
     shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache = null,
     shared_prefetch: ?*runtime.tier.shared.SharedPrefetchState = null,
+    prompt_prefix_cache: runtime.kv.prompt_cache.PromptPrefixCache,
     native_generate_coordinator: ?*runtime.scheduler.native_generate.NativeGenerateCoordinator = null,
     native_generation_graph_cache: graph_mod.cache.GraphCache,
     // ponytail: per-model native generation lock; replace with Metal-safe batching if throughput matters.
@@ -744,6 +745,15 @@ pub const LoadedModel = struct {
         if (self.hf_tok) |ht| return ht.tokenizer();
         if (self.sp_tok) |sp| return sp.tokenizer();
         unreachable;
+    }
+
+    pub fn attachIo(self: *LoadedModel, io: std.Io) void {
+        session_factory.attachIo(self.session, io);
+        if (self.vision_session) |session| session_factory.attachIo(session, io);
+        if (self.audio_session) |session| session_factory.attachIo(session, io);
+        if (self.text_projection) |session| session_factory.attachIo(session, io);
+        if (self.visual_projection) |session| session_factory.attachIo(session, io);
+        if (self.audio_projection) |session| session_factory.attachIo(session, io);
     }
 
     pub fn lockNativeGeneration(self: *LoadedModel) void {
@@ -957,6 +967,7 @@ pub const LoadedModel = struct {
 
     pub fn deinit(self: *LoadedModel) void {
         self.native_generation_graph_cache.deinit();
+        self.prompt_prefix_cache.deinit();
         self.session.close();
         if (self.vision_session) |vs| vs.close();
         if (self.audio_session) |as_| as_.close();
@@ -1033,6 +1044,12 @@ pub const ModelManager = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.loaded_aliases.deinit(self.allocator);
+    }
+
+    pub fn attachIo(self: *ModelManager, io: std.Io) void {
+        self.session_manager.io = io;
+        var it = self.loaded.iterator();
+        while (it.next()) |entry| entry.value_ptr.*.attachIo(io);
     }
 
     /// Load a model from a directory path. Returns a cached model if already loaded.
@@ -1169,6 +1186,7 @@ pub const ModelManager = struct {
             .chat_tmpl = chat_tmpl,
             .shared_moe_cache = shared_moe_cache,
             .shared_prefetch = shared_prefetch,
+            .prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(self.allocator),
             .native_generate_coordinator = native_generate_coordinator,
             .native_generation_graph_cache = graph_mod.cache.GraphCache.init(self.allocator),
             .vision_session = null,
