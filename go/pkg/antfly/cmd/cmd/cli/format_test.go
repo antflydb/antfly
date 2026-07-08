@@ -23,12 +23,23 @@ import (
 	antfly "github.com/antflydb/antfly/go/pkg/sdk"
 )
 
+func testHitsTotal(value uint64, relation antfly.QueryHitsTotalRelation) antfly.QueryHitsTotal {
+	return antfly.QueryHitsTotal{
+		Relation: relation,
+		Value:    value,
+	}
+}
+
+func testExactHitsTotal(value uint64) antfly.QueryHitsTotal {
+	return testHitsTotal(value, antfly.QueryHitsTotalRelationExact)
+}
+
 func TestFormatTable(t *testing.T) {
 	res := &antfly.QueryResponses{
 		Responses: []antfly.QueryResult{
 			{
 				Hits: antfly.Hits{
-					Total: 2,
+					Total: testExactHitsTotal(2),
 					Hits: []antfly.Hit{
 						{
 							ID:    "doc-1",
@@ -82,9 +93,34 @@ func TestFormatTable(t *testing.T) {
 		t.Error("table output missing score 0.950")
 	}
 
-	// Should show hit count
-	if !strings.Contains(out, "Found 2 hit(s)") {
-		t.Error("table output missing hit count")
+	// Should show exact total count
+	if !strings.Contains(out, "Found 2 hit(s) (total: 2)") {
+		t.Error("table output missing exact total")
+	}
+}
+
+func TestFormatTableLowerBoundTotal(t *testing.T) {
+	res := &antfly.QueryResponses{
+		Responses: []antfly.QueryResult{
+			{
+				Hits: antfly.Hits{
+					Total: testHitsTotal(100, antfly.QueryHitsTotalRelationGte),
+					Hits: []antfly.Hit{
+						{ID: "doc-1", Score: 0.5, Source: map[string]any{"title": "Test"}},
+					},
+				},
+			},
+		},
+	}
+
+	var buf bytes.Buffer
+	err := formatQueryResults(&buf, res, outputTable)
+	if err != nil {
+		t.Fatalf("formatQueryResults: %v", err)
+	}
+
+	if !strings.Contains(buf.String(), "Found 1 hit(s) (total: >= 100)") {
+		t.Fatalf("table output missing lower-bound total: %q", buf.String())
 	}
 }
 
@@ -93,7 +129,7 @@ func TestFormatJSON(t *testing.T) {
 		Responses: []antfly.QueryResult{
 			{
 				Hits: antfly.Hits{
-					Total: 1,
+					Total: testExactHitsTotal(1),
 					Hits: []antfly.Hit{
 						{ID: "doc-1", Score: 0.5, Source: map[string]any{"title": "Test"}},
 					},
@@ -122,7 +158,7 @@ func TestFormatJSONL(t *testing.T) {
 		Responses: []antfly.QueryResult{
 			{
 				Hits: antfly.Hits{
-					Total: 2,
+					Total: testExactHitsTotal(2),
 					Hits: []antfly.Hit{
 						{ID: "doc-1", Score: 0.9, Source: map[string]any{"a": "1"}},
 						{ID: "doc-2", Score: 0.8, Source: map[string]any{"a": "2"}},
@@ -147,7 +183,7 @@ func TestFormatJSONL(t *testing.T) {
 func TestFormatTableNoResults(t *testing.T) {
 	res := &antfly.QueryResponses{
 		Responses: []antfly.QueryResult{
-			{Hits: antfly.Hits{Total: 0, Hits: nil}},
+			{Hits: antfly.Hits{Total: testExactHitsTotal(0), Hits: nil}},
 		},
 	}
 

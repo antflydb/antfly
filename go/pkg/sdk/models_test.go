@@ -18,12 +18,15 @@ package sdk
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
 )
 
 func TestModelDirUsesAntflyInferenceLayout(t *testing.T) {
@@ -33,6 +36,42 @@ func TestModelDirUsesAntflyInferenceLayout(t *testing.T) {
 	}
 	if got, want := dir, filepath.Join("/tmp/models", "antflydb", "clipclap"); got != want {
 		t.Fatalf("ModelDir = %q, want %q", got, want)
+	}
+}
+
+func TestSortProfileUsesClosedPublicDiagnosticShape(t *testing.T) {
+	payload := []byte(`{
+		"plan": "native_doc_values_top_n",
+		"cursor": "after",
+		"candidate_count": 7,
+		"native_doc_value_load_us": 13,
+		"collector_heap_peak": 5
+	}`)
+
+	var profile oapi.SortProfile
+	if err := json.Unmarshal(payload, &profile); err != nil {
+		t.Fatalf("unmarshal SortProfile: %v", err)
+	}
+	if got, want := profile.Plan, "native_doc_values_top_n"; got != want {
+		t.Fatalf("Plan = %q, want %q", got, want)
+	}
+	if got, want := profile.CandidateCount, int64(7); got != want {
+		t.Fatalf("CandidateCount = %d, want %d", got, want)
+	}
+
+	encoded, err := json.Marshal(profile)
+	if err != nil {
+		t.Fatalf("marshal SortProfile: %v", err)
+	}
+	var roundTrip map[string]any
+	if err := json.Unmarshal(encoded, &roundTrip); err != nil {
+		t.Fatalf("unmarshal encoded SortProfile: %v", err)
+	}
+	if _, found := roundTrip["native_doc_value_load_us"]; found {
+		t.Fatalf("internal native_doc_value_load_us diagnostic leaked into public model: %s", encoded)
+	}
+	if _, found := roundTrip["collector_heap_peak"]; found {
+		t.Fatalf("internal collector_heap_peak diagnostic leaked into public model: %s", encoded)
 	}
 }
 

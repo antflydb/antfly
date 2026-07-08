@@ -108,7 +108,7 @@ func (s *JoinService) ExecuteQueryWithJoin(ctx context.Context, queryReq *QueryR
 		Status: http.StatusOK,
 		Hits: QueryHits{
 			Hits:  hits,
-			Total: uint64(len(hits)),
+			Total: exactQueryHitsTotalFromInt(len(hits)),
 		},
 		Took:  time.Since(startTime),
 		Table: queryReq.Table,

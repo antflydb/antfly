@@ -37,6 +37,15 @@ def assert_single_top_hit(payload: dict, doc_id: str) -> None:
     assert hits[0]["doc_id"] == doc_id
 
 
+def query_hits_total_value(hits: dict) -> int:
+    total = hits["total"]
+    assert isinstance(total, dict), (
+        f"expected structured hits.total, got {type(total).__name__}"
+    )
+    assert total.get("relation") in {"exact", "gte"}
+    return int(total["value"])
+
+
 def wait_until(
     fn: Callable[[], dict | None],
     *,

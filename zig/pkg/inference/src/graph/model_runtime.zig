@@ -195,6 +195,10 @@ pub const RuntimeDebugTimingStats = struct {
     decode_greedy_calls: u64 = 0,
     decode_greedy_direct_nanos: u128 = 0,
     decode_greedy_fallback_nanos: u128 = 0,
+    decode_greedy_device_token_handoff_attempts: u64 = 0,
+    decode_greedy_device_token_handoff_hits: u64 = 0,
+    decode_greedy_device_token_handoff_fallbacks: u64 = 0,
+    decode_greedy_device_token_seeds: u64 = 0,
     ensure_prepared_calls: u64 = 0,
     ensure_prepared_nanos: u128 = 0,
     ensure_prepared_sync_nanos: u128 = 0,
@@ -236,6 +240,7 @@ pub const ModelOutput = struct {
         vocab_size: usize,
         eps: f32,
         final_logit_softcap: f32 = 0.0,
+        greedy_token_id: ?i64 = null,
 
         fn logits(self: *PreparedTail) !?contracts.CT {
             return switch (self.norm) {
@@ -259,6 +264,7 @@ pub const ModelOutput = struct {
         }
 
         fn greedyToken(self: *PreparedTail) !?i64 {
+            if (self.greedy_token_id) |token_id| return token_id;
             // Final logit softcap is monotonic, so it changes sampling
             // probabilities but not the greedy argmax ordering.
             const token = switch (self.norm) {
@@ -380,10 +386,12 @@ pub const PrefillRequest = struct {
     query_seq_len: usize,
     attention_mode: cache_mod.AttentionMode,
     force_host_logits: bool = false,
+    prefer_greedy_token: bool = false,
 };
 
 pub const DecodeRequest = struct {
     token_id: i64,
+    input_token_tensor: ?ops.CT = null,
     position: usize,
     attention_mode: cache_mod.AttentionMode = .paged_decode,
 };
@@ -396,6 +404,10 @@ pub const SampledDecodeRequest = struct {
 
 pub const GreedyDecodeOutput = struct {
     token_id: i64,
+    /// Optional backend-owned token tensor for the returned token. Callers that
+    /// pass it back as DecodeRequest.input_token_tensor own and must eventually
+    /// free it with the producing backend.
+    token_tensor: ?ops.CT = null,
 };
 
 pub const SampledDecodeOutput = struct {

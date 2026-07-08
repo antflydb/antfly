@@ -33,7 +33,7 @@ For AI Engineers we're also prioritizing telemetry, scaling and security. We kno
 - **Multi-Raft Design**: Separate consensus groups for metadata (single cluster) and storage (one per shard)
 - **Horizontal Sharding**: Data automatically partitioned across shards with configurable replication
 - **Distributed Transactions**: Atomic cross-shard writes using coordinator-based 2PC with intent-based locking
-- **Fine-Grained Durability**: Control write consistency with sync levels (propose, write, full_text, enrichments, aknn)
+- **Fine-Grained Durability**: Control write consistency with sync levels (propose, write, full_text, enrichments, full_index)
 
 ### AI-Native Features
 - **RAG**: Streaming retrieval-augmented generation with Server-Sent Events
@@ -156,3 +156,5 @@ Antfly is designed for high-performance search and retrieval workloads. Some fea
 ## Getting Started
 
 Ready to dive in? Check out our [Quickstart Guide](/docs/guides/quickstart) to get AntflyDB running in minutes, use [Antfly Lite](/docs/guides/lite) for embedded local-first applications, or explore the [Architecture](/docs/architecture) to understand how it all works under the hood.
+
+For the query model itself, see the [Document Engine guide](/docs/guides/document-engine) for how mappings, full-text search, vector search, filters, graph search, sorting, and cursor pagination compose.

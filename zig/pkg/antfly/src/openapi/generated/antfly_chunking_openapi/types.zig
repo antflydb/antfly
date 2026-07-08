@@ -4,6 +4,31 @@
 const std = @import("std");
 const antfly_chunking_api_openapi = @import("antfly_chunking_api_openapi");
 
+/// Configuration for the Antfly inference chunking provider. Antfly inference is a centralized HTTP service that provides chunking with multi-tier caching. The model name maps to ONNX model directory names (similar to how Ollama works). **Chunking Models:** - fixed: Simple fixed-size chunking by token count (built-in, no ONNX required) - Any other name will attempt to load from models/chunkers/{name}/ directory **Caching:** - L1: Memory cache with 2-minute TTL - L2: Persistent Pebble database - Singleflight deduplication for concurrent identical requests
+pub const AntflyChunkerConfig = struct {
+    /// The URL of the Inference API endpoint (e.g., 'http://localhost:8080'). Can also be set via ANTFLY_INFERENCE_URL environment variable.
+    api_url: ?[]const u8 = null,
+    /// The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/.
+    model: []const u8,
+};
+
+pub const Chunk = antfly_chunking_api_openapi.Chunk;
+
+pub const ChunkOptions = antfly_chunking_api_openapi.ChunkOptions;
+
+/// A unified configuration for a chunking provider.
+pub const ChunkerConfig = struct {
+    /// The URL of the Inference API endpoint (e.g., 'http://localhost:8080'). Can also be set via ANTFLY_INFERENCE_URL environment variable.
+    api_url: ?[]const u8 = null,
+    /// The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/.
+    model: ?[]const u8 = null,
+    provider: ChunkerProvider,
+    /// Controls whether chunk data is persisted to storage. When false (default), chunks are generated in memory and only embeddings are stored. When true, both chunks and embeddings are stored.
+    store_chunks: ?bool = null,
+    /// Configuration for full-text indexing of chunks in Bleve. When present (even if empty), chunks will be stored with :cft: suffix and indexed in Bleve's _chunks field. When absent, chunks use :c: suffix and are only used for vector embeddings.
+    full_text_index: ?std.json.Value = null,
+};
+
 /// The chunking provider to use.
 pub const ChunkerProvider = enum {
     mock,
@@ -28,29 +53,4 @@ pub const ChunkerProvider = enum {
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
-};
-
-/// Configuration for the Antfly inference chunking provider. Antfly inference is a centralized HTTP service that provides chunking with multi-tier caching. The model name maps to ONNX model directory names (similar to how Ollama works). **Chunking Models:** - fixed: Simple fixed-size chunking by token count (built-in, no ONNX required) - Any other name will attempt to load from models/chunkers/{name}/ directory **Caching:** - L1: Memory cache with 2-minute TTL - L2: Persistent Pebble database - Singleflight deduplication for concurrent identical requests
-pub const AntflyChunkerConfig = struct {
-    /// The URL of the Inference API endpoint (e.g., 'http://localhost:8080'). Can also be set via ANTFLY_INFERENCE_URL environment variable.
-    api_url: ?[]const u8 = null,
-    /// The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/.
-    model: []const u8,
-};
-
-pub const Chunk = antfly_chunking_api_openapi.Chunk;
-
-pub const ChunkOptions = antfly_chunking_api_openapi.ChunkOptions;
-
-/// A unified configuration for a chunking provider.
-pub const ChunkerConfig = struct {
-    /// The URL of the Inference API endpoint (e.g., 'http://localhost:8080'). Can also be set via ANTFLY_INFERENCE_URL environment variable.
-    api_url: ?[]const u8 = null,
-    /// The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/.
-    model: ?[]const u8 = null,
-    provider: ChunkerProvider,
-    /// Controls whether chunk data is persisted to storage. When false (default), chunks are generated in memory and only embeddings are stored. When true, both chunks and embeddings are stored.
-    store_chunks: ?bool = null,
-    /// Configuration for full-text indexing of chunks in Bleve. When present (even if empty), chunks will be stored with :cft: suffix and indexed in Bleve's _chunks field. When absent, chunks use :c: suffix and are only used for vector embeddings.
-    full_text_index: ?std.json.Value = null,
 };

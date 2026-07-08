@@ -73,11 +73,11 @@ const full_text_search_schema_json =
 ;
 
 const query_request_schema_json =
-    \\{"type":"object","additionalProperties":true,"description":"Raw Antfly QueryRequest body for POST /tables/{tableName}/query. Use this to access the full OpenAPI query contract. Mutually exclusive with query shorthand arguments.","properties":{"query":{"type":"object","additionalProperties":true},"full_text_search":{"type":"object","additionalProperties":true},"filter_query":{"type":"object","additionalProperties":true},"exclusion_query":{"type":"object","additionalProperties":true},"semantic_search":{"type":"string"},"embedding_template":{"type":"string"},"indexes":{"type":"array","items":{"type":"string"}},"embeddings":{"type":"object","additionalProperties":true},"fields":{"type":"array","items":{"type":"string"}},"limit":{"type":"integer"},"offset":{"type":"integer"},"order_by":{"type":"array"},"search_after":{"type":"array","items":{"type":"string"}},"search_before":{"type":"array","items":{"type":"string"}},"filter_prefix":{"type":"string"},"distance_under":{"type":"number"},"distance_over":{"type":"number"},"search_effort":{"type":"number"},"merge_config":{"type":"object","additionalProperties":true},"count":{"type":"boolean"},"profile":{"type":"boolean"},"reranker":{"type":"object","additionalProperties":true},"aggregations":{"type":"object","additionalProperties":true},"graph_searches":{"type":"object","additionalProperties":true},"expand_strategy":{"type":"string"},"document_renderer":{"type":"string"},"pruner":{"type":"object","additionalProperties":true},"join":{"type":"object","additionalProperties":true},"foreign_sources":{"type":"object","additionalProperties":true}}}
+    \\{"type":"object","additionalProperties":true,"description":"Raw Antfly QueryRequest body for POST /tables/{tableName}/query. Use this to access the full OpenAPI query contract. Mutually exclusive with query shorthand arguments.","properties":{"query":{"type":"object","additionalProperties":true},"full_text_search":{"type":"object","additionalProperties":true},"filter_query":{"type":"object","additionalProperties":true},"exclusion_query":{"type":"object","additionalProperties":true},"semantic_search":{"type":"string"},"embedding_template":{"type":"string"},"indexes":{"type":"array","items":{"type":"string"}},"embeddings":{"type":"object","additionalProperties":true},"fields":{"type":"array","items":{"type":"string"}},"limit":{"type":"integer"},"offset":{"type":"integer"},"timeout_ms":{"type":"integer","minimum":0},"order_by":{"type":"array"},"search_after":{"type":"array","items":{}},"search_before":{"type":"array","items":{}},"filter_prefix":{"type":"string"},"distance_under":{"type":"number"},"distance_over":{"type":"number"},"search_effort":{"type":"number"},"merge_config":{"type":"object","additionalProperties":true},"count":{"type":"boolean"},"profile":{"type":"boolean"},"reranker":{"type":"object","additionalProperties":true},"aggregations":{"type":"object","additionalProperties":true},"graph_searches":{"type":"object","additionalProperties":true},"expand_strategy":{"type":"string"},"document_renderer":{"type":"string"},"pruner":{"type":"object","additionalProperties":true},"join":{"type":"object","additionalProperties":true},"foreign_sources":{"type":"object","additionalProperties":true}}}
 ;
 
 const query_request_description_json =
-    \\{"openapi_schema":"specs/openapi/antfly/metadata.yaml#/components/schemas/QueryRequest","query_ast_schema":"specs/openapi/antfly/query.yaml#/components/schemas/Query","mcp_usage":{"tool":"query","path_table_argument":"tableName","raw_body_argument":"queryRequest","rules":["queryRequest is forwarded unchanged as the POST /tables/{tableName}/query body.","queryRequest is mutually exclusive with shorthand query arguments such as fullTextSearch, semanticSearch, fields, limit, orderBy, indexes, and filterPrefix.","queryRequest.table is rejected because tableName selects the table-scoped route.","Use describe_query_request for this compact schema instead of relying on tools/list to inline the full recursive OpenAPI schema."]},"top_level_fields":["query","full_text_search","semantic_search","embedding_template","indexes","filter_prefix","filter_query","exclusion_query","aggregations","embeddings","search_effort","fields","limit","offset","order_by","search_after","search_before","distance_under","distance_over","merge_config","count","profile","reranker","analyses","graph_searches","expand_strategy","document_renderer","pruner","join","foreign_sources"],"examples":{"fielded_full_text":{"full_text_search":{"match":"hello","field":"body"},"fields":["title","body"],"limit":5},"hybrid":{"full_text_search":{"match":"raft","field":"body"},"semantic_search":"raft snapshot architecture","indexes":["body_embedding"],"merge_config":{"strategy":"rrf"},"fields":["title","body"],"limit":20,"profile":true},"filtered":{"query":{"bool":{"must":[{"match":{"field":"body","text":"computer"}}],"filter":[{"term":{"path":"/tenant","value":"acme"}}]}},"fields":["title","url"],"limit":10}}}
+    \\{"openapi_schema":"specs/openapi/antfly/metadata.yaml#/components/schemas/QueryRequest","query_ast_schema":"specs/openapi/antfly/query.yaml#/components/schemas/Query","mcp_usage":{"tool":"query","path_table_argument":"tableName","raw_body_argument":"queryRequest","rules":["queryRequest is forwarded unchanged as the POST /tables/{tableName}/query body.","queryRequest is mutually exclusive with shorthand query arguments such as fullTextSearch, semanticSearch, fields, limit, orderBy, indexes, and filterPrefix.","queryRequest.table is rejected because tableName selects the table-scoped route.","Use describe_query_request for this compact schema instead of relying on tools/list to inline the full recursive OpenAPI schema.","Structured filter_query.geo_bbox accepts field, min_lat, min_lon, max_lat, and max_lon; min_lon greater than max_lon represents an antimeridian-wrapped box."]},"top_level_fields":["query","full_text_search","semantic_search","embedding_template","indexes","filter_prefix","filter_query","exclusion_query","aggregations","embeddings","search_effort","fields","limit","offset","timeout_ms","order_by","search_after","search_before","distance_under","distance_over","merge_config","count","profile","reranker","analyses","graph_searches","expand_strategy","document_renderer","pruner","join","foreign_sources"],"examples":{"fielded_full_text":{"full_text_search":{"match":"hello","field":"body"},"fields":["title","body"],"limit":5,"timeout_ms":5000},"hybrid":{"full_text_search":{"match":"raft","field":"body"},"semantic_search":"raft snapshot architecture","indexes":["body_embedding"],"merge_config":{"strategy":"rrf"},"fields":["title","body"],"limit":20,"profile":true},"filtered":{"query":{"bool":{"must":[{"match":{"field":"body","text":"computer"}}],"filter":[{"term":{"path":"/tenant","value":"acme"}}]}},"fields":["title","url"],"limit":10},"geo_bbox_filter":{"filter_query":{"geo_bbox":{"field":"location","min_lat":-1,"min_lon":179.5,"max_lat":1,"max_lon":-179.5}},"limit":10}}}
 ;
 
 const mcp_capabilities_description_json =
@@ -247,6 +247,7 @@ const ExtensionMcpTool = struct {
 const ExtensionRuntimeBinding = struct {
     package_name: []u8,
     package_version: []u8,
+    package_digest: []u8,
     runtime_name: []u8,
     artifact: []u8,
     entrypoint: []u8,
@@ -254,6 +255,7 @@ const ExtensionRuntimeBinding = struct {
     fn deinit(self: ExtensionRuntimeBinding, alloc: std.mem.Allocator) void {
         alloc.free(self.package_name);
         alloc.free(self.package_version);
+        alloc.free(self.package_digest);
         alloc.free(self.runtime_name);
         alloc.free(self.artifact);
         alloc.free(self.entrypoint);
@@ -263,6 +265,7 @@ const ExtensionRuntimeBinding = struct {
         return .{
             .package_name = self.package_name,
             .package_version = self.package_version,
+            .package_digest = self.package_digest,
             .runtime_name = self.runtime_name,
             .artifact = self.artifact,
             .entrypoint = self.entrypoint,
@@ -393,7 +396,7 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
             if (jsonStringArg(args, "to")) |to| if (to.len != 0) try body.put(alloc, "to", .{ .string = to });
             if (jsonBoolArg(args, "inclusiveFrom")) |inclusive| try body.put(alloc, "inclusive_from", .{ .bool = inclusive });
             if (jsonValueArg(args, "fields")) |fields| try body.put(alloc, "fields", fields);
-            const uri = try std.fmt.allocPrint(alloc, "{s}/{s}/lookup", .{ routes.Routes.tables, table_name });
+            const uri = try std.fmt.allocPrint(alloc, "{s}/{s}{s}", .{ routes.Routes.tables, table_name, routes.Routes.documents_suffix });
             return try ctx.simpleRoute(alloc, .POST, uri, try stringifyJsonValue(alloc, .{ .object = body }));
         }
 
@@ -796,13 +799,15 @@ fn freeExtensionCapabilities(alloc: std.mem.Allocator, capabilities: []const ext
 fn extensionRuntimeBindingAlloc(alloc: std.mem.Allocator, member: *const extension_domain.ExtensionMember, handler: []const u8, snapshot: anytype) !?ExtensionRuntimeBinding {
     const parsed = parseWasmHandler(handler) orelse return null;
     const installed = findInstalledExtension(snapshot.installed_extensions, member.extension_name) orelse return null;
-    const package = findExtensionPackage(snapshot.extension_packages, installed.package_name, installed.package_version) orelse return null;
+    const package = findExtensionPackage(snapshot.extension_packages, installed.package_name, installed.package_version, installed.package_digest) orelse return null;
     const runtime = findWasmRuntime(package.install.runtimes, parsed.runtime_name) orelse return null;
 
     var package_name: ?[]u8 = null;
     errdefer if (package_name) |value| alloc.free(value);
     var package_version: ?[]u8 = null;
     errdefer if (package_version) |value| alloc.free(value);
+    var package_digest: ?[]u8 = null;
+    errdefer if (package_digest) |value| alloc.free(value);
     var runtime_name: ?[]u8 = null;
     errdefer if (runtime_name) |value| alloc.free(value);
     var artifact: ?[]u8 = null;
@@ -812,6 +817,7 @@ fn extensionRuntimeBindingAlloc(alloc: std.mem.Allocator, member: *const extensi
 
     package_name = try alloc.dupe(u8, installed.package_name);
     package_version = try alloc.dupe(u8, installed.package_version);
+    package_digest = try alloc.dupe(u8, installed.package_digest);
     runtime_name = try alloc.dupe(u8, parsed.runtime_name);
     artifact = try alloc.dupe(u8, runtime.artifact);
     entrypoint = try runtimeEntrypointAlloc(alloc, runtime.config_json);
@@ -819,6 +825,7 @@ fn extensionRuntimeBindingAlloc(alloc: std.mem.Allocator, member: *const extensi
     return .{
         .package_name = package_name.?,
         .package_version = package_version.?,
+        .package_digest = package_digest.?,
         .runtime_name = runtime_name.?,
         .artifact = artifact.?,
         .entrypoint = entrypoint.?,
@@ -852,11 +859,111 @@ fn findInstalledExtension(installed_extensions: []const extension_domain.Install
     return null;
 }
 
-fn findExtensionPackage(packages: []const extension_domain.PackageManifest, name: []const u8, version: []const u8) ?extension_domain.PackageManifest {
+fn findExtensionPackage(packages: []const extension_domain.PackageManifest, name: []const u8, version: []const u8, digest: []const u8) ?extension_domain.PackageManifest {
     for (packages) |package| {
-        if (std.mem.eql(u8, package.name, name) and std.mem.eql(u8, package.version, version)) return package;
+        if (std.mem.eql(u8, package.name, name) and
+            std.mem.eql(u8, package.version, version) and
+            std.mem.eql(u8, package.digest, digest))
+        {
+            return package;
+        }
     }
     return null;
+}
+
+pub fn testExtensionRuntimeBindingRequiresInstalledPackageDigestMatch() !void {
+    if (!@import("builtin").is_test) @compileError("test-only helper");
+    const alloc = std.testing.allocator;
+    const runtimes = [_]extension_domain.RuntimeDecl{.{
+        .name = "memoryaf_wasm",
+        .mode = .wasm,
+        .artifact = "target/wasm32-wasip2/release/memoryaf_extension.wasm",
+    }};
+    const packages = [_]extension_domain.PackageManifest{.{
+        .name = "memoryaf",
+        .version = "0.0.1",
+        .digest = "sha256:projected",
+        .install = .{
+            .scopes_supported = &.{.cluster},
+            .runtimes = &runtimes,
+        },
+    }};
+    const installed = [_]extension_domain.InstalledExtension{.{
+        .name = "memories",
+        .package_name = "memoryaf",
+        .package_version = "0.0.1",
+        .package_digest = "sha256:installed",
+        .scope = .{ .kind = .cluster },
+        .status = .ready,
+    }};
+    const snapshot = .{
+        .extension_packages = packages[0..],
+        .installed_extensions = installed[0..],
+    };
+    const member = extension_domain.ExtensionMember{
+        .extension_name = "memories",
+        .scope = .{ .kind = .cluster },
+        .object_kind = .mcp_tool,
+        .object_name = "store_memory",
+    };
+
+    try std.testing.expectEqual(@as(?ExtensionRuntimeBinding, null), try extensionRuntimeBindingAlloc(alloc, &member, "wasm:memoryaf_wasm/store_memory", snapshot));
+}
+
+test "extension runtime binding requires installed package digest to match projected package" {
+    try testExtensionRuntimeBindingRequiresInstalledPackageDigestMatch();
+}
+
+pub fn testExtensionRuntimeBindingCarriesMatchedInstalledPackageDigest() !void {
+    if (!@import("builtin").is_test) @compileError("test-only helper");
+    const alloc = std.testing.allocator;
+    const runtimes = [_]extension_domain.RuntimeDecl{.{
+        .name = "memoryaf_wasm",
+        .mode = .wasm,
+        .artifact = "target/wasm32-wasip2/release/memoryaf_extension.wasm",
+        .config_json = "{\"entrypoint\":\"run-tool\"}",
+    }};
+    const packages = [_]extension_domain.PackageManifest{.{
+        .name = "memoryaf",
+        .version = "0.0.1",
+        .digest = "sha256:projected",
+        .install = .{
+            .scopes_supported = &.{.cluster},
+            .runtimes = &runtimes,
+        },
+    }};
+    const installed = [_]extension_domain.InstalledExtension{.{
+        .name = "memories",
+        .package_name = "memoryaf",
+        .package_version = "0.0.1",
+        .package_digest = "sha256:projected",
+        .scope = .{ .kind = .cluster },
+        .status = .ready,
+    }};
+    const snapshot = .{
+        .extension_packages = packages[0..],
+        .installed_extensions = installed[0..],
+    };
+    const member = extension_domain.ExtensionMember{
+        .extension_name = "memories",
+        .scope = .{ .kind = .cluster },
+        .object_kind = .mcp_tool,
+        .object_name = "store_memory",
+    };
+
+    const binding = (try extensionRuntimeBindingAlloc(alloc, &member, "wasm:memoryaf_wasm/store_memory", snapshot)).?;
+    defer binding.deinit(alloc);
+
+    try std.testing.expectEqualStrings("memoryaf", binding.package_name);
+    try std.testing.expectEqualStrings("0.0.1", binding.package_version);
+    try std.testing.expectEqualStrings("sha256:projected", binding.package_digest);
+    try std.testing.expectEqualStrings("memoryaf_wasm", binding.runtime_name);
+    try std.testing.expectEqualStrings("target/wasm32-wasip2/release/memoryaf_extension.wasm", binding.artifact);
+    try std.testing.expectEqualStrings("run-tool", binding.entrypoint);
+}
+
+test "extension runtime binding carries matched installed package digest" {
+    try testExtensionRuntimeBindingCarriesMatchedInstalledPackageDigest();
 }
 
 fn findWasmRuntime(runtimes: []const extension_domain.RuntimeDecl, name: []const u8) ?extension_domain.RuntimeDecl {
@@ -904,8 +1011,14 @@ fn callExtensionMcpTool(alloc: std.mem.Allocator, server: anytype, authorization
             error.WasmtimePackageStoreUnavailable,
             error.WasmtimeArtifactNotFound,
             error.WasmtimeSymbolMissing,
-            => return try mcpError(alloc, "extension wasm runtime is unavailable"),
-            else => return try mcpError(alloc, "extension wasm runtime invocation failed"),
+            => {
+                std.log.warn("extension wasm runtime unavailable package={s} version={s} runtime={s} artifact={s} err={}", .{ binding.package_name, binding.package_version, binding.runtime_name, binding.artifact, err });
+                return try mcpError(alloc, "extension wasm runtime is unavailable");
+            },
+            else => {
+                std.log.warn("extension wasm runtime invocation failed package={s} version={s} runtime={s} artifact={s} err={}", .{ binding.package_name, binding.package_version, binding.runtime_name, binding.artifact, err });
+                return try mcpError(alloc, "extension wasm runtime invocation failed");
+            },
         }
     }
 

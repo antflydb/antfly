@@ -3,6 +3,12 @@
 
 const std = @import("std");
 
+/// Logging configuration for Antfly inference services
+pub const Config = struct {
+    level: ?Level = null,
+    style: ?Style = null,
+};
+
 /// Logging verbosity level
 pub const Level = enum {
     debug,
@@ -65,10 +71,4 @@ pub const Style = enum {
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
-};
-
-/// Logging configuration for Antfly inference services
-pub const Config = struct {
-    level: ?Level = null,
-    style: ?Style = null,
 };

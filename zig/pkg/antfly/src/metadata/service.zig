@@ -114,9 +114,12 @@ fn logMetadataRaftRoundDiagnostics(round: raft_engine.runtime.multi_raft.HostRou
     );
     const persist = ready.persist_ready_detail;
     std.log.warn(
-        "metadata raft ready persist detail group_id={d} storage_apply_ms={d} encode_ms={d} wal_append_ms={d} wal_wait_ms={d} wal_coalesce_ms={d} wal_txn_open_ms={d} wal_put_ms={d} wal_commit_ms={d} wal_physical_commits={d} encoded_bytes={d} replay_debt_records={d} replay_debt_bytes={d}",
+        "metadata raft ready persist detail group_id={d} skipped_no_durable_state={} used_batch={} used_group_storage={} storage_apply_ms={d} encode_ms={d} wal_append_ms={d} wal_wait_ms={d} wal_coalesce_ms={d} wal_txn_open_ms={d} wal_put_ms={d} wal_commit_ms={d} wal_physical_commits={d} encoded_bytes={d} replay_debt_records={d} replay_debt_bytes={d}",
         .{
             ready.group_id,
+            persist.skipped_no_durable_state,
+            persist.used_batch,
+            persist.used_group_storage,
             @divTrunc(persist.storage_apply_elapsed_ns, std.time.ns_per_ms),
             @divTrunc(persist.encode_elapsed_ns, std.time.ns_per_ms),
             @divTrunc(persist.wal_append_elapsed_ns, std.time.ns_per_ms),
@@ -413,41 +416,8 @@ pub const MetadataServiceConfig = struct {
     reconcile_lease: metadata_reconcile_lease.Config = .{},
     observe_local_replica_root: bool = true,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
-    metadata_orchestration_urls: []const MetadataOrchestrationUrl = &.{},
-    internal_metadata_forward_token: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
 };
-
-pub const MetadataOrchestrationUrl = struct {
-    node_id: u64,
-    url: []const u8,
-};
-
-fn cloneMetadataOrchestrationUrls(
-    alloc: std.mem.Allocator,
-    urls: []const MetadataOrchestrationUrl,
-) ![]MetadataOrchestrationUrl {
-    if (urls.len == 0) return &.{};
-    const out = try alloc.alloc(MetadataOrchestrationUrl, urls.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (out[0..initialized]) |entry| alloc.free(entry.url);
-        alloc.free(out);
-    }
-    for (urls, 0..) |entry, index| {
-        out[index] = .{
-            .node_id = entry.node_id,
-            .url = try alloc.dupe(u8, entry.url),
-        };
-        initialized += 1;
-    }
-    return out;
-}
-
-fn freeMetadataOrchestrationUrls(alloc: std.mem.Allocator, urls: []MetadataOrchestrationUrl) void {
-    for (urls) |entry| alloc.free(entry.url);
-    if (urls.len > 0) alloc.free(urls);
-}
 
 pub const MetadataServiceDeps = struct {
     host: raft_managed_host.ManagedHostDeps = .{},
@@ -1521,9 +1491,10 @@ pub const MetadataService = struct {
             error.FileNotFound, error.WriterLocked, error.LmdbUnexpected, error.Corrupted => {},
             else => return err,
         };
+        try self.refreshLocalTransitions();
+        _ = try self.raft.stepTransitions();
         if (!try runReplicationBackfillIfLeaseHeld(self)) return;
         try self.refreshLocalPlacementIntents();
-        try self.refreshLocalTransitions();
         _ = self.refreshLocalTableProvisioning() catch |err| switch (err) {
             error.FileNotFound, error.WriterLocked, error.LmdbUnexpected, error.Corrupted => .{},
             else => return err,
@@ -1549,9 +1520,10 @@ pub const MetadataService = struct {
             error.FileNotFound, error.WriterLocked, error.LmdbUnexpected, error.Corrupted => {},
             else => return err,
         };
+        try self.refreshLocalTransitions();
+        _ = try self.raft.stepTransitions();
         if (!try runReplicationBackfillIfLeaseHeld(self)) return;
         try self.refreshLocalPlacementIntents();
-        try self.refreshLocalTransitions();
         _ = self.refreshLocalTableProvisioning() catch |err| switch (err) {
             error.FileNotFound, error.WriterLocked, error.LmdbUnexpected, error.Corrupted => .{},
             else => return err,
@@ -1862,16 +1834,13 @@ pub const MetadataService = struct {
 
         var local = std.ArrayListUnmanaged(raft_reconciler.PlacementIntent).empty;
         defer {
-            for (local.items) |intent| if (intent.peer_node_ids.len > 0) self.alloc.free(intent.peer_node_ids);
+            for (local.items) |intent| raft_reconciler.freeIntentOwned(self.alloc, intent);
             local.deinit(self.alloc);
         }
 
         for (projected) |intent| {
             if (intent.record.local_node_id != self.raft.host.host.cfg.local_node_id) continue;
-            try local.append(self.alloc, .{
-                .record = intent.record,
-                .peer_node_ids = if (intent.peer_node_ids.len == 0) &.{} else try self.alloc.dupe(u64, intent.peer_node_ids),
-            });
+            try local.append(self.alloc, try raft_reconciler.cloneIntentOwned(self.alloc, intent));
         }
 
         if (!containsLocalIntent(local.items, self.metadata_group_id)) {
@@ -2351,8 +2320,6 @@ pub const MetadataHttpService = struct {
     backend_runtime_mutex: std.Io.Mutex = .init,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     owned_backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = null,
-    metadata_orchestration_urls: []MetadataOrchestrationUrl = &.{},
-    internal_metadata_forward_token: ?[]u8 = null,
     linearizable_read_tracker: *LinearizableMetadataReadTracker,
     json_response_calls: std.atomic.Value(u64) = .init(0),
     json_response_bytes_total: std.atomic.Value(u64) = .init(0),
@@ -2405,8 +2372,6 @@ pub const MetadataHttpService = struct {
             .backend_runtime = backend_runtime,
             .owned_backend_runtime = owned_backend_runtime,
             .secret_store = cfg.secret_store,
-            .metadata_orchestration_urls = try cloneMetadataOrchestrationUrls(alloc, cfg.metadata_orchestration_urls),
-            .internal_metadata_forward_token = if (cfg.internal_metadata_forward_token) |token| try alloc.dupe(u8, token) else null,
             .linearizable_read_tracker = read_tracker,
             .raft = try raft_service.ManagedHttpHostService.init(alloc, host_cfg, http_deps, cfg.raft, deps.raft),
         };
@@ -2422,8 +2387,6 @@ pub const MetadataHttpService = struct {
         self.store_status_backfill_marker_cache.deinit(self.alloc);
         self.cdc_backfill_registry.deinit(self.alloc);
         self.lifecycle_signal.deinit();
-        if (self.internal_metadata_forward_token) |token| self.alloc.free(token);
-        freeMetadataOrchestrationUrls(self.alloc, self.metadata_orchestration_urls);
         self.raft.deinit();
         self.linearizable_read_tracker.deinit();
         self.alloc.destroy(self.linearizable_read_tracker);
@@ -2581,69 +2544,6 @@ pub const MetadataHttpService = struct {
         self.lockRuntime();
         defer self.unlockRuntime();
         try self.raft.host.http_host.campaignGroup(self.metadata_group_id);
-    }
-
-    pub fn forwardMetadataLeaderRequest(
-        self: *MetadataHttpService,
-        alloc: std.mem.Allocator,
-        req: http_common.HttpRequest,
-    ) !?http_common.HttpResponse {
-        self.lockRuntime();
-        const local_node_id = self.raft.host.http_host.host.cfg.local_node_id;
-        const leader_id = self.raft.host.http_host.leaderId(self.metadata_group_id);
-        self.unlockRuntime();
-        const target_node_id = leader_id orelse return null;
-        if (target_node_id == local_node_id) return null;
-        const base_uri = self.metadataOrchestrationUrlForNode(target_node_id) orelse return null;
-        const uri = try std.fmt.allocPrint(alloc, "{s}{s}", .{ base_uri, req.uri });
-        defer alloc.free(uri);
-        const headers = try forwardedMetadataHeaders(alloc, req.headers, self.internal_metadata_forward_token);
-        defer if (headers.len > 0) alloc.free(headers);
-        return try self.raft.host.http_host.request_executor.execute(alloc, .{
-            .method = req.method,
-            .uri = uri,
-            .headers = headers,
-            .source_node_id = local_node_id,
-            .metadata_leader_forwarded = true,
-            .authorization = req.authorization,
-            .content_type = req.content_type,
-            .body = req.body,
-        });
-    }
-
-    fn forwardedMetadataHeaders(
-        alloc: std.mem.Allocator,
-        headers: []const http_common.RequestHeader,
-        internal_metadata_forward_token: ?[]const u8,
-    ) ![]http_common.RequestHeader {
-        if (headers.len == 0 and internal_metadata_forward_token == null) return &.{};
-        var out = std.ArrayListUnmanaged(http_common.RequestHeader).empty;
-        errdefer out.deinit(alloc);
-        for (headers) |header| {
-            if (http_common.isInternalRequestMetadataHeader(header.name)) continue;
-            if (std.ascii.eqlIgnoreCase(header.name, "host")) continue;
-            if (std.ascii.eqlIgnoreCase(header.name, "connection")) continue;
-            if (std.ascii.eqlIgnoreCase(header.name, "content-length")) continue;
-            if (std.ascii.eqlIgnoreCase(header.name, "content-type")) continue;
-            try out.append(alloc, header);
-        }
-        if (internal_metadata_forward_token) |token| {
-            if (token.len > 0) {
-                try out.append(alloc, .{
-                    .name = http_common.metadata_leader_forwarded_header,
-                    .value = token,
-                });
-            }
-        }
-        if (out.items.len == 0) return &.{};
-        return try out.toOwnedSlice(alloc);
-    }
-
-    fn metadataOrchestrationUrlForNode(self: *const MetadataHttpService, node_id: u64) ?[]const u8 {
-        for (self.metadata_orchestration_urls) |entry| {
-            if (entry.node_id == node_id) return entry.url;
-        }
-        return null;
     }
 
     pub fn proposeTransitionCommand(self: *MetadataHttpService, command: metadata_storage.TransitionCommand) !void {
@@ -2857,6 +2757,21 @@ pub const MetadataHttpService = struct {
         if (!self.observe_local_replica_root) return;
 
         phase_start_ns = platform_time.monotonicNs();
+        var local_transition_inputs = try captureLocalTransitionInputs(self);
+        defer {
+            const cleanup_phase_start_ns = platform_time.monotonicNs();
+            freeLocalTransitionInputs(self, &local_transition_inputs);
+            run_round_trace.recordSince("free_transition_inputs", cleanup_phase_start_ns);
+        }
+        run_round_trace.recordSince("capture_transition_inputs", phase_start_ns);
+        phase_start_ns = platform_time.monotonicNs();
+        try self.refreshLocalTransitions(&local_transition_inputs);
+        run_round_trace.recordSince("refresh_local_transitions", phase_start_ns);
+        phase_start_ns = platform_time.monotonicNs();
+        _ = try self.raft.stepTransitions();
+        run_round_trace.recordSince("step_committed_transitions", phase_start_ns);
+
+        phase_start_ns = platform_time.monotonicNs();
         const has_reconcile_lease = try self.ensureReconcileLease();
         run_round_trace.recordSince("ensure_reconcile_lease", phase_start_ns);
         if (!has_reconcile_lease) return;
@@ -2897,19 +2812,8 @@ pub const MetadataHttpService = struct {
         }
         run_round_trace.recordSince("capture_placement_inputs", phase_start_ns);
         phase_start_ns = platform_time.monotonicNs();
-        var local_transition_inputs = try captureLocalTransitionInputs(self);
-        defer {
-            const cleanup_phase_start_ns = platform_time.monotonicNs();
-            freeLocalTransitionInputs(self, &local_transition_inputs);
-            run_round_trace.recordSince("free_transition_inputs", cleanup_phase_start_ns);
-        }
-        run_round_trace.recordSince("capture_transition_inputs", phase_start_ns);
-        phase_start_ns = platform_time.monotonicNs();
         try self.refreshLocalPlacementIntents(&local_placement_inputs);
         run_round_trace.recordSince("refresh_local_placement_intents", phase_start_ns);
-        phase_start_ns = platform_time.monotonicNs();
-        try self.refreshLocalTransitions(&local_transition_inputs);
-        run_round_trace.recordSince("refresh_local_transitions", phase_start_ns);
         phase_start_ns = platform_time.monotonicNs();
         _ = self.refreshLocalTableProvisioning(&local_projection_inputs) catch |err| switch (err) {
             error.FileNotFound, error.WriterLocked, error.LmdbUnexpected, error.Corrupted => .{},
@@ -2927,7 +2831,7 @@ pub const MetadataHttpService = struct {
         run_round_trace.recordSince("run_lifecycle_reconcile_hook", phase_start_ns);
         phase_start_ns = platform_time.monotonicNs();
         _ = try self.raft.stepTransitions();
-        run_round_trace.recordSince("step_transitions", phase_start_ns);
+        run_round_trace.recordSince("step_post_reconcile_transitions", phase_start_ns);
     }
 
     pub fn probeReady(self: *const MetadataHttpService) bool {
@@ -2957,6 +2861,11 @@ pub const MetadataHttpService = struct {
         }
         if (!self.observe_local_replica_root) return;
 
+        var local_transition_inputs = try captureLocalTransitionInputs(self);
+        defer freeLocalTransitionInputs(self, &local_transition_inputs);
+        try self.refreshLocalTransitions(&local_transition_inputs);
+        _ = try self.raft.stepTransitions();
+
         const has_reconcile_lease = try self.ensureReconcileLease();
         if (!has_reconcile_lease) return;
 
@@ -2976,10 +2885,7 @@ pub const MetadataHttpService = struct {
         };
         var local_placement_inputs = try captureLocalPlacementInputs(self);
         defer freeLocalPlacementInputs(self, &local_placement_inputs);
-        var local_transition_inputs = try captureLocalTransitionInputs(self);
-        defer freeLocalTransitionInputs(self, &local_transition_inputs);
         try self.refreshLocalPlacementIntents(&local_placement_inputs);
-        try self.refreshLocalTransitions(&local_transition_inputs);
         _ = self.refreshLocalTableProvisioning(&local_projection_inputs) catch |err| switch (err) {
             error.FileNotFound, error.WriterLocked, error.LmdbUnexpected, error.Corrupted => .{},
             else => return err,
@@ -3285,10 +3191,13 @@ pub const MetadataHttpService = struct {
         );
         const persist = ready.persist_ready_detail;
         std.log.warn(
-            "metadata linearizable read timeout persist detail request_id={d} group_id={d} storage_apply_ms={d} encode_ms={d} wal_append_ms={d} wal_wait_ms={d} wal_coalesce_ms={d} wal_txn_open_ms={d} wal_put_ms={d} wal_commit_ms={d} wal_physical_commits={d} encoded_bytes={d} replay_debt_records={d} replay_debt_bytes={d}",
+            "metadata linearizable read timeout persist detail request_id={d} group_id={d} skipped_no_durable_state={} used_batch={} used_group_storage={} storage_apply_ms={d} encode_ms={d} wal_append_ms={d} wal_wait_ms={d} wal_coalesce_ms={d} wal_txn_open_ms={d} wal_put_ms={d} wal_commit_ms={d} wal_physical_commits={d} encoded_bytes={d} replay_debt_records={d} replay_debt_bytes={d}",
             .{
                 request_id,
                 ready.group_id,
+                persist.skipped_no_durable_state,
+                persist.used_batch,
+                persist.used_group_storage,
                 @divTrunc(persist.storage_apply_elapsed_ns, std.time.ns_per_ms),
                 @divTrunc(persist.encode_elapsed_ns, std.time.ns_per_ms),
                 @divTrunc(persist.wal_append_elapsed_ns, std.time.ns_per_ms),
@@ -3718,16 +3627,13 @@ pub const MetadataHttpService = struct {
 
         var local = std.ArrayListUnmanaged(raft_reconciler.PlacementIntent).empty;
         defer {
-            for (local.items) |intent| if (intent.peer_node_ids.len > 0) self.alloc.free(intent.peer_node_ids);
+            for (local.items) |intent| raft_reconciler.freeIntentOwned(self.alloc, intent);
             local.deinit(self.alloc);
         }
 
         for (inputs.placement_intents) |intent| {
             if (intent.record.local_node_id != self.raft.host.http_host.host.cfg.local_node_id) continue;
-            try local.append(self.alloc, .{
-                .record = intent.record,
-                .peer_node_ids = if (intent.peer_node_ids.len == 0) &.{} else try self.alloc.dupe(u64, intent.peer_node_ids),
-            });
+            try local.append(self.alloc, try raft_reconciler.cloneIntentOwned(self.alloc, intent));
         }
 
         if (!containsLocalIntent(local.items, self.metadata_group_id)) {

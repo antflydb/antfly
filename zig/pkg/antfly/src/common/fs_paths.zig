@@ -87,6 +87,31 @@ pub fn syncDirPortable(io: anytype, path: []const u8) !void {
     };
 }
 
+pub fn syncFdPortable(fd: std.posix.fd_t) !void {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return;
+    while (true) switch (std.posix.errno(std.posix.system.fsync(fd))) {
+        .SUCCESS => return,
+        .INTR => continue,
+        .INVAL => return,
+        .BADF => return error.InvalidFileDescriptor,
+        .IO => return error.InputOutput,
+        .NOSPC => return error.NoSpaceLeft,
+        .DQUOT => return error.DiskQuota,
+        else => |err| return std.posix.unexpectedErrno(err),
+    };
+}
+
+pub fn syncFileAndParentPortable(io: anytype, path: []const u8) !void {
+    const file = if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.openFileAbsolute(io, path, .{})
+    else
+        try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    try file.sync(io);
+    const parent = std.fs.path.dirname(path) orelse if (std.fs.path.isAbsolute(path)) "/" else ".";
+    try syncDirPortable(io, parent);
+}
+
 test "syncDirPortable opens a real directory fd" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

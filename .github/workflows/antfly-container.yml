@@ -25,6 +25,7 @@ on:
         default: build
 
 env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   GCP_REGION: us-central1
   GCP_PROJECT: antfly-image-artifacts
   GCP_REPOSITORY: containers
@@ -219,7 +220,7 @@ jobs:
           }
           VERSION="${{ steps.version.outputs.version }}"
           ALIAS_TAG=latest
-          if [[ "$VERSION" == *-* ]]; then
+          if [[ "$VERSION" == *-* || "$VERSION" == v0.1.* ]]; then
             ALIAS_TAG=__skip_alias__
           fi
           submit_cloud_build . \
@@ -238,7 +239,7 @@ jobs:
           echo "${{ steps.auth.outputs.access_token }}" | crane auth login "$GAR_REGISTRY" -u oauth2accesstoken --password-stdin
           echo "${{ secrets.GITHUB_TOKEN }}" | crane auth login ghcr.io -u "${{ github.actor }}" --password-stdin
           TAGS=("${VERSION}")
-          if [[ "$VERSION" != *-* ]]; then
+          if [[ "$VERSION" != *-* && "$VERSION" != v0.1.* ]]; then
             TAGS=(latest "${TAGS[@]}")
           fi
           for tag in "${TAGS[@]}"; do
@@ -253,7 +254,7 @@ jobs:
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           TAGS=("${VERSION}")
-          if [[ "$VERSION" != *-* ]]; then
+          if [[ "$VERSION" != *-* && "$VERSION" != v0.1.* ]]; then
             TAGS=(latest "${TAGS[@]}")
           fi
           for tag in "${TAGS[@]}"; do
@@ -268,7 +269,7 @@ jobs:
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           TAGS=("${VERSION}")
-          if [[ "$VERSION" != *-* ]]; then
+          if [[ "$VERSION" != *-* && "$VERSION" != v0.1.* ]]; then
             TAGS=(latest "${TAGS[@]}")
           fi
           for tag in "${TAGS[@]}"; do

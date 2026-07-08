@@ -5,10 +5,35 @@ const std = @import("std");
 const httpx = @import("httpx");
 const types = @import("types.zig");
 const antfly_eval_openapi = @import("antfly_eval_openapi");
-const antfly_schema_openapi = @import("antfly_schema_openapi");
 const antfly_indexes_openapi = @import("antfly_indexes_openapi");
+const antfly_schema_openapi = @import("antfly_schema_openapi");
 
 /// --- Extractors (framework-agnostic) ---
+/// Parse the JSON request body for queryBuilderAgent.
+pub fn parseQueryBuilderAgentBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.QueryBuilderRequest) {
+    return std.json.parseFromSlice(types.QueryBuilderRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Parse the JSON request body for retrievalAgent.
+pub fn parseRetrievalAgentBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RetrievalAgentRequest) {
+    return std.json.parseFromSlice(types.RetrievalAgentRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Parse the JSON request body for backup.
+pub fn parseBackupBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.ClusterBackupRequest) {
+    return std.json.parseFromSlice(types.ClusterBackupRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+pub const ListBackupsParams = struct {
+    /// Storage location to search for backups. - Local filesystem: `file:///path/to/backup` - Amazon S3: `s3://bucket-name/path/to/backup`
+    location: []const u8,
+};
+
+/// Parse the JSON request body for multiBatchWrite.
+pub fn parseMultiBatchWriteBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.MultiBatchRequest) {
+    return std.json.parseFromSlice(types.MultiBatchRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 pub const ListConnectionsParams = struct {
     /// Comma-separated list of connection kinds to include (e.g. "inference,external_io,cdc"). Defaults to all kinds. This filters by the response "kind" field.
     types: ?[]const u8 = null,
@@ -17,6 +42,21 @@ pub const ListConnectionsParams = struct {
     /// Set to "true" to bypass the short server-side cache for live provider model listings and probes. This does not force a node config or metadata reload.
     refresh: ?[]const u8 = null,
 };
+
+/// Parse the JSON request body for evaluate.
+pub fn parseEvaluateBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_eval_openapi.EvalRequest) {
+    return std.json.parseFromSlice(antfly_eval_openapi.EvalRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Parse the JSON request body for globalQuery.
+pub fn parseGlobalQueryBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.QueryRequest) {
+    return std.json.parseFromSlice(types.QueryRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Parse the JSON request body for restore.
+pub fn parseRestoreBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.ClusterRestoreRequest) {
+    return std.json.parseFromSlice(types.ClusterRestoreRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
 
 /// Store a secret
 pub const PutSecretPathParams = struct {
@@ -34,131 +74,6 @@ pub const DeleteSecretPathParams = struct {
     /// Secret key name (e.g., openai.api_key)
     key: []const u8,
 };
-
-/// Parse the JSON request body for multiBatchWrite.
-pub fn parseMultiBatchWriteBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.MultiBatchRequest) {
-    return std.json.parseFromSlice(types.MultiBatchRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Parse the JSON request body for commitTransaction.
-pub fn parseCommitTransactionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TransactionCommitRequest) {
-    return std.json.parseFromSlice(types.TransactionCommitRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-pub const CleanupTransactionSessionsParams = struct {
-    cutoff_ns: ?[]const u8 = null,
-};
-
-/// Parse the JSON request body for beginTransaction.
-pub fn parseBeginTransactionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TransactionBeginRequest) {
-    return std.json.parseFromSlice(types.TransactionBeginRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Get transaction session details
-pub const GetTransactionSessionPathParams = struct {
-    transaction_id: []const u8,
-};
-
-/// Stage a transaction commit request
-pub const StageTransactionSessionPathParams = struct {
-    transaction_id: []const u8,
-};
-
-/// Parse the JSON request body for stageTransactionSession.
-pub fn parseStageTransactionSessionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TransactionCommitRequest) {
-    return std.json.parseFromSlice(types.TransactionCommitRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Stage a transaction read version
-pub const StageTransactionReadPathParams = struct {
-    transaction_id: []const u8,
-};
-
-/// Parse the JSON request body for stageTransactionRead.
-pub fn parseStageTransactionReadBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TransactionStageReadRequest) {
-    return std.json.parseFromSlice(types.TransactionStageReadRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Stage a transaction write
-pub const StageTransactionWritePathParams = struct {
-    transaction_id: []const u8,
-};
-
-/// Parse the JSON request body for stageTransactionWrite.
-pub fn parseStageTransactionWriteBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TransactionStageWriteRequest) {
-    return std.json.parseFromSlice(types.TransactionStageWriteRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Stage a transaction delete
-pub const StageTransactionDeletePathParams = struct {
-    transaction_id: []const u8,
-};
-
-/// Parse the JSON request body for stageTransactionDelete.
-pub fn parseStageTransactionDeleteBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TransactionStageDeleteRequest) {
-    return std.json.parseFromSlice(types.TransactionStageDeleteRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Create a transaction savepoint
-pub const CreateTransactionSavepointPathParams = struct {
-    transaction_id: []const u8,
-};
-
-/// Roll back a transaction session to a savepoint
-pub const RollbackTransactionSavepointPathParams = struct {
-    transaction_id: []const u8,
-    savepoint_id: []const u8,
-};
-
-/// Commit a transaction session
-pub const CommitTransactionSessionPathParams = struct {
-    transaction_id: []const u8,
-};
-
-/// Parse the JSON request body for commitTransactionSession.
-pub fn parseCommitTransactionSessionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TransactionCommitRequest) {
-    return std.json.parseFromSlice(types.TransactionCommitRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Abort a transaction session
-pub const AbortTransactionSessionPathParams = struct {
-    transaction_id: []const u8,
-};
-
-/// Parse the JSON request body for backup.
-pub fn parseBackupBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.ClusterBackupRequest) {
-    return std.json.parseFromSlice(types.ClusterBackupRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Parse the JSON request body for restore.
-pub fn parseRestoreBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.ClusterRestoreRequest) {
-    return std.json.parseFromSlice(types.ClusterRestoreRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-pub const ListBackupsParams = struct {
-    /// Storage location to search for backups. - Local filesystem: `file:///path/to/backup` - Amazon S3: `s3://bucket-name/path/to/backup`
-    location: []const u8,
-};
-
-/// Parse the JSON request body for globalQuery.
-pub fn parseGlobalQueryBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.QueryRequest) {
-    return std.json.parseFromSlice(types.QueryRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Parse the JSON request body for evaluate.
-pub fn parseEvaluateBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_eval_openapi.EvalRequest) {
-    return std.json.parseFromSlice(antfly_eval_openapi.EvalRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Parse the JSON request body for queryBuilderAgent.
-pub fn parseQueryBuilderAgentBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.QueryBuilderRequest) {
-    return std.json.parseFromSlice(types.QueryBuilderRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Parse the JSON request body for retrievalAgent.
-pub fn parseRetrievalAgentBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RetrievalAgentRequest) {
-    return std.json.parseFromSlice(types.RetrievalAgentRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
 
 pub const ListTablesParams = struct {
     /// Filter tables by name prefix (e.g., "prod_")
@@ -190,129 +105,11 @@ pub const DropTablePathParams = struct {
     table_name: []const u8,
 };
 
-/// Query a specific table
-pub const QueryTablePathParams = struct {
-    /// Name of the table to query
-    table_name: []const u8,
-};
-
-/// Parse the JSON request body for queryTable.
-pub fn parseQueryTableBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.QueryRequest) {
-    return std.json.parseFromSlice(types.QueryRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Perform batch inserts and deletes on a table
-pub const BatchWritePathParams = struct {
-    /// Name of the table for batch operation
-    table_name: []const u8,
-};
-
-/// Parse the JSON request body for batchWrite.
-pub fn parseBatchWriteBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.BatchRequest) {
-    return std.json.parseFromSlice(types.BatchRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Synchronize data from external sources (Shopify, Postgres, S3) using a linear merge
-pub const LinearMergePathParams = struct {
-    /// Name of the table
-    table_name: []const u8,
-};
-
-/// Parse the JSON request body for linearMerge.
-pub fn parseLinearMergeBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.LinearMergeRequest) {
-    return std.json.parseFromSlice(types.LinearMergeRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Backup a table
-pub const BackupTablePathParams = struct {
-    /// Name of the table to backup
-    table_name: []const u8,
-};
-
-/// Parse the JSON request body for backupTable.
-pub fn parseBackupTableBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.BackupRequest) {
-    return std.json.parseFromSlice(types.BackupRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Restore a table from backup
-pub const RestoreTablePathParams = struct {
-    /// Name of the table to restore into
-    table_name: []const u8,
-};
-
-/// Parse the JSON request body for restoreTable.
-pub fn parseRestoreTableBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RestoreRequest) {
-    return std.json.parseFromSlice(types.RestoreRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Update a table's schema
-pub const UpdateSchemaPathParams = struct {
-    /// Name of the table
-    table_name: []const u8,
-};
-
-/// Parse the JSON request body for updateSchema.
-pub fn parseUpdateSchemaBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_schema_openapi.TableSchema) {
-    return std.json.parseFromSlice(antfly_schema_openapi.TableSchema, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Scan keys in a table within a key range
-pub const ScanKeysPathParams = struct {
-    /// Name of the table
-    table_name: []const u8,
-};
-
-/// Parse the JSON request body for scanKeys.
-pub fn parseScanKeysBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.ScanKeysRequest) {
-    return std.json.parseFromSlice(types.ScanKeysRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
-
-/// Retrieve a document by key
-pub const LookupKeyPathParams = struct {
-    /// Name of the table
-    table_name: []const u8,
-    /// Key of the document to retrieve
-    key: []const u8,
-};
-
-pub const LookupKeyParams = struct {
-    /// Comma-separated list of fields to include in the response. If not specified, returns the full document. Supports: - Simple fields: "title,author" - Nested paths: "user.address.city" - Wildcards: "_chunks.*" - Exclusions: "-_chunks.*._embedding" - Special fields: "_embeddings,_summaries,_chunks"
-    fields: ?[]const u8 = null,
-    /// Read consistency for the lookup. The default `read_index` routes to the primary for linearizable reads. `stale` allows a hot standby to serve the lookup at its safe-read LSN.
-    consistency: ?[]const u8 = null,
-};
-
-/// List derived document artifact manifests
-pub const ListDocumentArtifactManifestsPathParams = struct {
-    /// Name of the table
-    table_name: []const u8,
-    /// Percent-encoded source document key.
-    key: []const u8,
-};
-
-pub const ListDocumentArtifactManifestsParams = struct {
-    /// Response detail level. `summary` returns typed manifest fields only. `raw` also includes opaque manifest/state JSON and requires table admin permission when authentication is enabled.
-    detail: ?[]const u8 = null,
-};
-
 /// List table artifact enrichments
 pub const ListArtifactEnrichmentsPathParams = struct {
     /// Name of the table
     table_name: []const u8,
 };
-
-/// Reprocess a derived document artifact across a table range
-pub const ReprocessDocumentArtifactRangePathParams = struct {
-    /// Name of the table
-    table_name: []const u8,
-    /// Name of the derived document artifact.
-    artifact_name: []const u8,
-};
-
-/// Parse the JSON request body for reprocessDocumentArtifactRange.
-pub fn parseReprocessDocumentArtifactRangeBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.DocumentArtifactTableReprocessRequest) {
-    return std.json.parseFromSlice(types.DocumentArtifactTableReprocessRequest, allocator, body, .{ .ignore_unknown_fields = true });
-}
 
 /// Register or replace an artifact enrichment
 pub const PutArtifactEnrichmentPathParams = struct {
@@ -334,6 +131,19 @@ pub const DeleteArtifactEnrichmentPathParams = struct {
     /// Stable generated artifact name.
     artifact_name: []const u8,
 };
+
+/// Reprocess a derived document artifact across a table range
+pub const ReprocessDocumentArtifactRangePathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Name of the derived document artifact.
+    artifact_name: []const u8,
+};
+
+/// Parse the JSON request body for reprocessDocumentArtifactRange.
+pub fn parseReprocessDocumentArtifactRangeBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.DocumentArtifactTableReprocessRequest) {
+    return std.json.parseFromSlice(types.DocumentArtifactTableReprocessRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
 
 /// Create a derived document artifact reprocess job
 pub const StartDocumentArtifactReprocessJobPathParams = struct {
@@ -376,6 +186,67 @@ pub const CancelDocumentArtifactReprocessJobPathParams = struct {
     artifact_name: []const u8,
     /// Reprocess job identifier.
     job_id: []const u8,
+};
+
+/// Backup a table
+pub const BackupTablePathParams = struct {
+    /// Name of the table to backup
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for backupTable.
+pub fn parseBackupTableBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.BackupRequest) {
+    return std.json.parseFromSlice(types.BackupRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Perform batch inserts and deletes on a table
+pub const BatchWritePathParams = struct {
+    /// Name of the table for batch operation
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for batchWrite.
+pub fn parseBatchWriteBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.BatchRequest) {
+    return std.json.parseFromSlice(types.BatchRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Scan documents in a table within a key range
+pub const ScanKeysPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for scanKeys.
+pub fn parseScanKeysBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.ScanKeysRequest) {
+    return std.json.parseFromSlice(types.ScanKeysRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Retrieve a document by key
+pub const LookupKeyPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Key of the document to retrieve
+    key: []const u8,
+};
+
+pub const LookupKeyParams = struct {
+    /// Comma-separated list of fields to include in the response. If not specified, returns the full document. Supports: - Simple fields: "title,author" - Nested paths: "user.address.city" - Wildcards: "_chunks.*" - Exclusions: "-_chunks.*._embedding" - Special fields: "_embeddings,_summaries,_chunks"
+    fields: ?[]const u8 = null,
+    /// Read consistency for the lookup. The default `read_index` routes to the primary for linearizable reads. `stale` allows a hot standby to serve the lookup at its safe-read LSN.
+    consistency: ?[]const u8 = null,
+};
+
+/// List derived document artifact manifests
+pub const ListDocumentArtifactManifestsPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Percent-encoded source document key.
+    key: []const u8,
+};
+
+pub const ListDocumentArtifactManifestsParams = struct {
+    /// Response detail level. `summary` returns typed manifest fields only. `raw` also includes opaque manifest/state JSON and requires table admin permission when authentication is enabled.
+    detail: ?[]const u8 = null,
 };
 
 /// Inspect a derived document artifact manifest
@@ -438,6 +309,192 @@ pub const DropIndexPathParams = struct {
     index_name: []const u8,
 };
 
+/// Synchronize data from external sources (Shopify, Postgres, S3) using a linear merge
+pub const LinearMergePathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for linearMerge.
+pub fn parseLinearMergeBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.LinearMergeRequest) {
+    return std.json.parseFromSlice(types.LinearMergeRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Query a specific table
+pub const QueryTablePathParams = struct {
+    /// Name of the table to query
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for queryTable.
+pub fn parseQueryTableBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.QueryRequest) {
+    return std.json.parseFromSlice(types.QueryRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// List table repair issues
+pub const ListTableRepairIssuesPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for listTableRepairIssues.
+pub fn parseListTableRepairIssuesBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RepairIssueListRequest) {
+    return std.json.parseFromSlice(types.RepairIssueListRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Start a durable table repair job
+pub const StartTableRepairJobPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for startTableRepairJob.
+pub fn parseStartTableRepairJobBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TableRepairJobStartRequest) {
+    return std.json.parseFromSlice(types.TableRepairJobStartRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Get a table repair job
+pub const GetTableRepairJobPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Repair job identifier.
+    job_id: []const u8,
+};
+
+/// Advance a table repair job
+pub const AdvanceTableRepairJobPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Repair job identifier.
+    job_id: []const u8,
+};
+
+/// Cancel a table repair job
+pub const CancelTableRepairJobPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+    /// Repair job identifier.
+    job_id: []const u8,
+};
+
+/// Run a bounded table repair pass
+pub const RunTableRepairPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for runTableRepair.
+pub fn parseRunTableRepairBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RepairRunRequest) {
+    return std.json.parseFromSlice(types.RepairRunRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Restore a table from backup
+pub const RestoreTablePathParams = struct {
+    /// Name of the table to restore into
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for restoreTable.
+pub fn parseRestoreTableBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.RestoreRequest) {
+    return std.json.parseFromSlice(types.RestoreRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Update a table's schema
+pub const UpdateSchemaPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for updateSchema.
+pub fn parseUpdateSchemaBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_schema_openapi.TableSchema) {
+    return std.json.parseFromSlice(antfly_schema_openapi.TableSchema, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Parse the JSON request body for beginTransaction.
+pub fn parseBeginTransactionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TransactionBeginRequest) {
+    return std.json.parseFromSlice(types.TransactionBeginRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+pub const CleanupTransactionSessionsParams = struct {
+    cutoff_ns: ?[]const u8 = null,
+};
+
+/// Parse the JSON request body for commitTransaction.
+pub fn parseCommitTransactionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TransactionCommitRequest) {
+    return std.json.parseFromSlice(types.TransactionCommitRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Get transaction session details
+pub const GetTransactionSessionPathParams = struct {
+    transaction_id: []const u8,
+};
+
+/// Abort a transaction session
+pub const AbortTransactionSessionPathParams = struct {
+    transaction_id: []const u8,
+};
+
+/// Commit a transaction session
+pub const CommitTransactionSessionPathParams = struct {
+    transaction_id: []const u8,
+};
+
+/// Parse the JSON request body for commitTransactionSession.
+pub fn parseCommitTransactionSessionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TransactionCommitRequest) {
+    return std.json.parseFromSlice(types.TransactionCommitRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Stage a transaction delete
+pub const StageTransactionDeletePathParams = struct {
+    transaction_id: []const u8,
+};
+
+/// Parse the JSON request body for stageTransactionDelete.
+pub fn parseStageTransactionDeleteBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TransactionStageDeleteRequest) {
+    return std.json.parseFromSlice(types.TransactionStageDeleteRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Stage a transaction read version
+pub const StageTransactionReadPathParams = struct {
+    transaction_id: []const u8,
+};
+
+/// Parse the JSON request body for stageTransactionRead.
+pub fn parseStageTransactionReadBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TransactionStageReadRequest) {
+    return std.json.parseFromSlice(types.TransactionStageReadRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Create a transaction savepoint
+pub const CreateTransactionSavepointPathParams = struct {
+    transaction_id: []const u8,
+};
+
+/// Roll back a transaction session to a savepoint
+pub const RollbackTransactionSavepointPathParams = struct {
+    transaction_id: []const u8,
+    savepoint_id: []const u8,
+};
+
+/// Stage a transaction commit request
+pub const StageTransactionSessionPathParams = struct {
+    transaction_id: []const u8,
+};
+
+/// Parse the JSON request body for stageTransactionSession.
+pub fn parseStageTransactionSessionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TransactionCommitRequest) {
+    return std.json.parseFromSlice(types.TransactionCommitRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Stage a transaction write
+pub const StageTransactionWritePathParams = struct {
+    transaction_id: []const u8,
+};
+
+/// Parse the JSON request body for stageTransactionWrite.
+pub fn parseStageTransactionWriteBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.TransactionStageWriteRequest) {
+    return std.json.parseFromSlice(types.TransactionStageWriteRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Route metadata for all operations.
 pub const Route = struct {
     method: []const u8,
@@ -446,60 +503,66 @@ pub const Route = struct {
 };
 
 pub const routes = [_]Route{
-    .{ .method = "GET", .path = "/status", .operation_id = "getStatus" },
+    .{ .method = "POST", .path = "/agents/query-builder", .operation_id = "queryBuilderAgent" },
+    .{ .method = "POST", .path = "/agents/retrieval", .operation_id = "retrievalAgent" },
+    .{ .method = "POST", .path = "/backup", .operation_id = "backup" },
+    .{ .method = "GET", .path = "/backups", .operation_id = "listBackups" },
+    .{ .method = "POST", .path = "/batch", .operation_id = "multiBatchWrite" },
     .{ .method = "GET", .path = "/cluster", .operation_id = "getCluster" },
     .{ .method = "GET", .path = "/connections", .operation_id = "listConnections" },
+    .{ .method = "POST", .path = "/eval", .operation_id = "evaluate" },
+    .{ .method = "POST", .path = "/query", .operation_id = "globalQuery" },
+    .{ .method = "POST", .path = "/restore", .operation_id = "restore" },
     .{ .method = "GET", .path = "/secrets", .operation_id = "listSecrets" },
     .{ .method = "PUT", .path = "/secrets/{key}", .operation_id = "putSecret" },
     .{ .method = "DELETE", .path = "/secrets/{key}", .operation_id = "deleteSecret" },
-    .{ .method = "POST", .path = "/batch", .operation_id = "multiBatchWrite" },
-    .{ .method = "POST", .path = "/transactions/commit", .operation_id = "commitTransaction" },
-    .{ .method = "GET", .path = "/transactions", .operation_id = "listTransactionSessions" },
-    .{ .method = "POST", .path = "/transactions/cleanup", .operation_id = "cleanupTransactionSessions" },
-    .{ .method = "POST", .path = "/transactions/begin", .operation_id = "beginTransaction" },
-    .{ .method = "GET", .path = "/transactions/{transaction_id}", .operation_id = "getTransactionSession" },
-    .{ .method = "POST", .path = "/transactions/{transaction_id}/stage", .operation_id = "stageTransactionSession" },
-    .{ .method = "POST", .path = "/transactions/{transaction_id}/read", .operation_id = "stageTransactionRead" },
-    .{ .method = "POST", .path = "/transactions/{transaction_id}/write", .operation_id = "stageTransactionWrite" },
-    .{ .method = "POST", .path = "/transactions/{transaction_id}/delete", .operation_id = "stageTransactionDelete" },
-    .{ .method = "POST", .path = "/transactions/{transaction_id}/savepoints", .operation_id = "createTransactionSavepoint" },
-    .{ .method = "POST", .path = "/transactions/{transaction_id}/savepoints/{savepoint_id}/rollback", .operation_id = "rollbackTransactionSavepoint" },
-    .{ .method = "POST", .path = "/transactions/{transaction_id}/commit", .operation_id = "commitTransactionSession" },
-    .{ .method = "POST", .path = "/transactions/{transaction_id}/abort", .operation_id = "abortTransactionSession" },
-    .{ .method = "POST", .path = "/backup", .operation_id = "backup" },
-    .{ .method = "POST", .path = "/restore", .operation_id = "restore" },
-    .{ .method = "GET", .path = "/backups", .operation_id = "listBackups" },
-    .{ .method = "POST", .path = "/query", .operation_id = "globalQuery" },
-    .{ .method = "POST", .path = "/eval", .operation_id = "evaluate" },
-    .{ .method = "POST", .path = "/agents/query-builder", .operation_id = "queryBuilderAgent" },
-    .{ .method = "POST", .path = "/agents/retrieval", .operation_id = "retrievalAgent" },
+    .{ .method = "GET", .path = "/status", .operation_id = "getStatus" },
     .{ .method = "GET", .path = "/tables", .operation_id = "listTables" },
     .{ .method = "GET", .path = "/tables/{tableName}", .operation_id = "getTable" },
     .{ .method = "POST", .path = "/tables/{tableName}", .operation_id = "createTable" },
     .{ .method = "DELETE", .path = "/tables/{tableName}", .operation_id = "dropTable" },
-    .{ .method = "POST", .path = "/tables/{tableName}/query", .operation_id = "queryTable" },
-    .{ .method = "POST", .path = "/tables/{tableName}/batch", .operation_id = "batchWrite" },
-    .{ .method = "POST", .path = "/tables/{tableName}/merge", .operation_id = "linearMerge" },
-    .{ .method = "POST", .path = "/tables/{tableName}/backup", .operation_id = "backupTable" },
-    .{ .method = "POST", .path = "/tables/{tableName}/restore", .operation_id = "restoreTable" },
-    .{ .method = "PUT", .path = "/tables/{tableName}/schema", .operation_id = "updateSchema" },
-    .{ .method = "POST", .path = "/tables/{tableName}/lookup", .operation_id = "scanKeys" },
-    .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}", .operation_id = "lookupKey" },
-    .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts", .operation_id = "listDocumentArtifactManifests" },
     .{ .method = "GET", .path = "/tables/{tableName}/artifacts", .operation_id = "listArtifactEnrichments" },
-    .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess", .operation_id = "reprocessDocumentArtifactRange" },
     .{ .method = "PUT", .path = "/tables/{tableName}/artifacts/{artifactName}/enrichment", .operation_id = "putArtifactEnrichment" },
     .{ .method = "DELETE", .path = "/tables/{tableName}/artifacts/{artifactName}/enrichment", .operation_id = "deleteArtifactEnrichment" },
+    .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess", .operation_id = "reprocessDocumentArtifactRange" },
     .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs", .operation_id = "startDocumentArtifactReprocessJob" },
     .{ .method = "GET", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}", .operation_id = "getDocumentArtifactReprocessJob" },
     .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}/advance", .operation_id = "advanceDocumentArtifactReprocessJob" },
     .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}/cancel", .operation_id = "cancelDocumentArtifactReprocessJob" },
+    .{ .method = "POST", .path = "/tables/{tableName}/backup", .operation_id = "backupTable" },
+    .{ .method = "POST", .path = "/tables/{tableName}/batch", .operation_id = "batchWrite" },
+    .{ .method = "POST", .path = "/tables/{tableName}/documents", .operation_id = "scanKeys" },
+    .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}", .operation_id = "lookupKey" },
+    .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts", .operation_id = "listDocumentArtifactManifests" },
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts/{artifactName}", .operation_id = "getDocumentArtifactManifest" },
     .{ .method = "POST", .path = "/tables/{tableName}/documents/{key}/artifacts/{artifactName}/reprocess", .operation_id = "reprocessDocumentArtifact" },
     .{ .method = "GET", .path = "/tables/{tableName}/indexes", .operation_id = "listIndexes" },
     .{ .method = "GET", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "getIndex" },
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "createIndex" },
     .{ .method = "DELETE", .path = "/tables/{tableName}/indexes/{indexName}", .operation_id = "dropIndex" },
+    .{ .method = "POST", .path = "/tables/{tableName}/merge", .operation_id = "linearMerge" },
+    .{ .method = "POST", .path = "/tables/{tableName}/query", .operation_id = "queryTable" },
+    .{ .method = "POST", .path = "/tables/{tableName}/repair/issues", .operation_id = "listTableRepairIssues" },
+    .{ .method = "POST", .path = "/tables/{tableName}/repair/jobs", .operation_id = "startTableRepairJob" },
+    .{ .method = "GET", .path = "/tables/{tableName}/repair/jobs/{jobId}", .operation_id = "getTableRepairJob" },
+    .{ .method = "POST", .path = "/tables/{tableName}/repair/jobs/{jobId}/advance", .operation_id = "advanceTableRepairJob" },
+    .{ .method = "POST", .path = "/tables/{tableName}/repair/jobs/{jobId}/cancel", .operation_id = "cancelTableRepairJob" },
+    .{ .method = "POST", .path = "/tables/{tableName}/repair/run", .operation_id = "runTableRepair" },
+    .{ .method = "POST", .path = "/tables/{tableName}/restore", .operation_id = "restoreTable" },
+    .{ .method = "PUT", .path = "/tables/{tableName}/schema", .operation_id = "updateSchema" },
+    .{ .method = "GET", .path = "/transactions", .operation_id = "listTransactionSessions" },
+    .{ .method = "POST", .path = "/transactions/begin", .operation_id = "beginTransaction" },
+    .{ .method = "POST", .path = "/transactions/cleanup", .operation_id = "cleanupTransactionSessions" },
+    .{ .method = "POST", .path = "/transactions/commit", .operation_id = "commitTransaction" },
+    .{ .method = "GET", .path = "/transactions/{transaction_id}", .operation_id = "getTransactionSession" },
+    .{ .method = "POST", .path = "/transactions/{transaction_id}/abort", .operation_id = "abortTransactionSession" },
+    .{ .method = "POST", .path = "/transactions/{transaction_id}/commit", .operation_id = "commitTransactionSession" },
+    .{ .method = "POST", .path = "/transactions/{transaction_id}/delete", .operation_id = "stageTransactionDelete" },
+    .{ .method = "POST", .path = "/transactions/{transaction_id}/read", .operation_id = "stageTransactionRead" },
+    .{ .method = "POST", .path = "/transactions/{transaction_id}/savepoints", .operation_id = "createTransactionSavepoint" },
+    .{ .method = "POST", .path = "/transactions/{transaction_id}/savepoints/{savepoint_id}/rollback", .operation_id = "rollbackTransactionSavepoint" },
+    .{ .method = "POST", .path = "/transactions/{transaction_id}/stage", .operation_id = "stageTransactionSession" },
+    .{ .method = "POST", .path = "/transactions/{transaction_id}/write", .operation_id = "stageTransactionWrite" },
 };
 
 /// Generated server router for httpx. Register routes on an httpx.Server
@@ -513,60 +576,66 @@ pub const routes = [_]Route{
 ///   try router.register(&server);
 pub fn ServerRouter(comptime Impl: type) type {
     comptime {
-        if (!@hasDecl(Impl, "getStatus")) @compileError("ServerRouter: Impl missing required method 'getStatus'");
+        if (!@hasDecl(Impl, "queryBuilderAgent")) @compileError("ServerRouter: Impl missing required method 'queryBuilderAgent'");
+        if (!@hasDecl(Impl, "retrievalAgent")) @compileError("ServerRouter: Impl missing required method 'retrievalAgent'");
+        if (!@hasDecl(Impl, "backup")) @compileError("ServerRouter: Impl missing required method 'backup'");
+        if (!@hasDecl(Impl, "listBackups")) @compileError("ServerRouter: Impl missing required method 'listBackups'");
+        if (!@hasDecl(Impl, "multiBatchWrite")) @compileError("ServerRouter: Impl missing required method 'multiBatchWrite'");
         if (!@hasDecl(Impl, "getCluster")) @compileError("ServerRouter: Impl missing required method 'getCluster'");
         if (!@hasDecl(Impl, "listConnections")) @compileError("ServerRouter: Impl missing required method 'listConnections'");
+        if (!@hasDecl(Impl, "evaluate")) @compileError("ServerRouter: Impl missing required method 'evaluate'");
+        if (!@hasDecl(Impl, "globalQuery")) @compileError("ServerRouter: Impl missing required method 'globalQuery'");
+        if (!@hasDecl(Impl, "restore")) @compileError("ServerRouter: Impl missing required method 'restore'");
         if (!@hasDecl(Impl, "listSecrets")) @compileError("ServerRouter: Impl missing required method 'listSecrets'");
         if (!@hasDecl(Impl, "putSecret")) @compileError("ServerRouter: Impl missing required method 'putSecret'");
         if (!@hasDecl(Impl, "deleteSecret")) @compileError("ServerRouter: Impl missing required method 'deleteSecret'");
-        if (!@hasDecl(Impl, "multiBatchWrite")) @compileError("ServerRouter: Impl missing required method 'multiBatchWrite'");
-        if (!@hasDecl(Impl, "commitTransaction")) @compileError("ServerRouter: Impl missing required method 'commitTransaction'");
-        if (!@hasDecl(Impl, "listTransactionSessions")) @compileError("ServerRouter: Impl missing required method 'listTransactionSessions'");
-        if (!@hasDecl(Impl, "cleanupTransactionSessions")) @compileError("ServerRouter: Impl missing required method 'cleanupTransactionSessions'");
-        if (!@hasDecl(Impl, "beginTransaction")) @compileError("ServerRouter: Impl missing required method 'beginTransaction'");
-        if (!@hasDecl(Impl, "getTransactionSession")) @compileError("ServerRouter: Impl missing required method 'getTransactionSession'");
-        if (!@hasDecl(Impl, "stageTransactionSession")) @compileError("ServerRouter: Impl missing required method 'stageTransactionSession'");
-        if (!@hasDecl(Impl, "stageTransactionRead")) @compileError("ServerRouter: Impl missing required method 'stageTransactionRead'");
-        if (!@hasDecl(Impl, "stageTransactionWrite")) @compileError("ServerRouter: Impl missing required method 'stageTransactionWrite'");
-        if (!@hasDecl(Impl, "stageTransactionDelete")) @compileError("ServerRouter: Impl missing required method 'stageTransactionDelete'");
-        if (!@hasDecl(Impl, "createTransactionSavepoint")) @compileError("ServerRouter: Impl missing required method 'createTransactionSavepoint'");
-        if (!@hasDecl(Impl, "rollbackTransactionSavepoint")) @compileError("ServerRouter: Impl missing required method 'rollbackTransactionSavepoint'");
-        if (!@hasDecl(Impl, "commitTransactionSession")) @compileError("ServerRouter: Impl missing required method 'commitTransactionSession'");
-        if (!@hasDecl(Impl, "abortTransactionSession")) @compileError("ServerRouter: Impl missing required method 'abortTransactionSession'");
-        if (!@hasDecl(Impl, "backup")) @compileError("ServerRouter: Impl missing required method 'backup'");
-        if (!@hasDecl(Impl, "restore")) @compileError("ServerRouter: Impl missing required method 'restore'");
-        if (!@hasDecl(Impl, "listBackups")) @compileError("ServerRouter: Impl missing required method 'listBackups'");
-        if (!@hasDecl(Impl, "globalQuery")) @compileError("ServerRouter: Impl missing required method 'globalQuery'");
-        if (!@hasDecl(Impl, "evaluate")) @compileError("ServerRouter: Impl missing required method 'evaluate'");
-        if (!@hasDecl(Impl, "queryBuilderAgent")) @compileError("ServerRouter: Impl missing required method 'queryBuilderAgent'");
-        if (!@hasDecl(Impl, "retrievalAgent")) @compileError("ServerRouter: Impl missing required method 'retrievalAgent'");
+        if (!@hasDecl(Impl, "getStatus")) @compileError("ServerRouter: Impl missing required method 'getStatus'");
         if (!@hasDecl(Impl, "listTables")) @compileError("ServerRouter: Impl missing required method 'listTables'");
         if (!@hasDecl(Impl, "getTable")) @compileError("ServerRouter: Impl missing required method 'getTable'");
         if (!@hasDecl(Impl, "createTable")) @compileError("ServerRouter: Impl missing required method 'createTable'");
         if (!@hasDecl(Impl, "dropTable")) @compileError("ServerRouter: Impl missing required method 'dropTable'");
-        if (!@hasDecl(Impl, "queryTable")) @compileError("ServerRouter: Impl missing required method 'queryTable'");
-        if (!@hasDecl(Impl, "batchWrite")) @compileError("ServerRouter: Impl missing required method 'batchWrite'");
-        if (!@hasDecl(Impl, "linearMerge")) @compileError("ServerRouter: Impl missing required method 'linearMerge'");
-        if (!@hasDecl(Impl, "backupTable")) @compileError("ServerRouter: Impl missing required method 'backupTable'");
-        if (!@hasDecl(Impl, "restoreTable")) @compileError("ServerRouter: Impl missing required method 'restoreTable'");
-        if (!@hasDecl(Impl, "updateSchema")) @compileError("ServerRouter: Impl missing required method 'updateSchema'");
-        if (!@hasDecl(Impl, "scanKeys")) @compileError("ServerRouter: Impl missing required method 'scanKeys'");
-        if (!@hasDecl(Impl, "lookupKey")) @compileError("ServerRouter: Impl missing required method 'lookupKey'");
-        if (!@hasDecl(Impl, "listDocumentArtifactManifests")) @compileError("ServerRouter: Impl missing required method 'listDocumentArtifactManifests'");
         if (!@hasDecl(Impl, "listArtifactEnrichments")) @compileError("ServerRouter: Impl missing required method 'listArtifactEnrichments'");
-        if (!@hasDecl(Impl, "reprocessDocumentArtifactRange")) @compileError("ServerRouter: Impl missing required method 'reprocessDocumentArtifactRange'");
         if (!@hasDecl(Impl, "putArtifactEnrichment")) @compileError("ServerRouter: Impl missing required method 'putArtifactEnrichment'");
         if (!@hasDecl(Impl, "deleteArtifactEnrichment")) @compileError("ServerRouter: Impl missing required method 'deleteArtifactEnrichment'");
+        if (!@hasDecl(Impl, "reprocessDocumentArtifactRange")) @compileError("ServerRouter: Impl missing required method 'reprocessDocumentArtifactRange'");
         if (!@hasDecl(Impl, "startDocumentArtifactReprocessJob")) @compileError("ServerRouter: Impl missing required method 'startDocumentArtifactReprocessJob'");
         if (!@hasDecl(Impl, "getDocumentArtifactReprocessJob")) @compileError("ServerRouter: Impl missing required method 'getDocumentArtifactReprocessJob'");
         if (!@hasDecl(Impl, "advanceDocumentArtifactReprocessJob")) @compileError("ServerRouter: Impl missing required method 'advanceDocumentArtifactReprocessJob'");
         if (!@hasDecl(Impl, "cancelDocumentArtifactReprocessJob")) @compileError("ServerRouter: Impl missing required method 'cancelDocumentArtifactReprocessJob'");
+        if (!@hasDecl(Impl, "backupTable")) @compileError("ServerRouter: Impl missing required method 'backupTable'");
+        if (!@hasDecl(Impl, "batchWrite")) @compileError("ServerRouter: Impl missing required method 'batchWrite'");
+        if (!@hasDecl(Impl, "scanKeys")) @compileError("ServerRouter: Impl missing required method 'scanKeys'");
+        if (!@hasDecl(Impl, "lookupKey")) @compileError("ServerRouter: Impl missing required method 'lookupKey'");
+        if (!@hasDecl(Impl, "listDocumentArtifactManifests")) @compileError("ServerRouter: Impl missing required method 'listDocumentArtifactManifests'");
         if (!@hasDecl(Impl, "getDocumentArtifactManifest")) @compileError("ServerRouter: Impl missing required method 'getDocumentArtifactManifest'");
         if (!@hasDecl(Impl, "reprocessDocumentArtifact")) @compileError("ServerRouter: Impl missing required method 'reprocessDocumentArtifact'");
         if (!@hasDecl(Impl, "listIndexes")) @compileError("ServerRouter: Impl missing required method 'listIndexes'");
         if (!@hasDecl(Impl, "getIndex")) @compileError("ServerRouter: Impl missing required method 'getIndex'");
         if (!@hasDecl(Impl, "createIndex")) @compileError("ServerRouter: Impl missing required method 'createIndex'");
         if (!@hasDecl(Impl, "dropIndex")) @compileError("ServerRouter: Impl missing required method 'dropIndex'");
+        if (!@hasDecl(Impl, "linearMerge")) @compileError("ServerRouter: Impl missing required method 'linearMerge'");
+        if (!@hasDecl(Impl, "queryTable")) @compileError("ServerRouter: Impl missing required method 'queryTable'");
+        if (!@hasDecl(Impl, "listTableRepairIssues")) @compileError("ServerRouter: Impl missing required method 'listTableRepairIssues'");
+        if (!@hasDecl(Impl, "startTableRepairJob")) @compileError("ServerRouter: Impl missing required method 'startTableRepairJob'");
+        if (!@hasDecl(Impl, "getTableRepairJob")) @compileError("ServerRouter: Impl missing required method 'getTableRepairJob'");
+        if (!@hasDecl(Impl, "advanceTableRepairJob")) @compileError("ServerRouter: Impl missing required method 'advanceTableRepairJob'");
+        if (!@hasDecl(Impl, "cancelTableRepairJob")) @compileError("ServerRouter: Impl missing required method 'cancelTableRepairJob'");
+        if (!@hasDecl(Impl, "runTableRepair")) @compileError("ServerRouter: Impl missing required method 'runTableRepair'");
+        if (!@hasDecl(Impl, "restoreTable")) @compileError("ServerRouter: Impl missing required method 'restoreTable'");
+        if (!@hasDecl(Impl, "updateSchema")) @compileError("ServerRouter: Impl missing required method 'updateSchema'");
+        if (!@hasDecl(Impl, "listTransactionSessions")) @compileError("ServerRouter: Impl missing required method 'listTransactionSessions'");
+        if (!@hasDecl(Impl, "beginTransaction")) @compileError("ServerRouter: Impl missing required method 'beginTransaction'");
+        if (!@hasDecl(Impl, "cleanupTransactionSessions")) @compileError("ServerRouter: Impl missing required method 'cleanupTransactionSessions'");
+        if (!@hasDecl(Impl, "commitTransaction")) @compileError("ServerRouter: Impl missing required method 'commitTransaction'");
+        if (!@hasDecl(Impl, "getTransactionSession")) @compileError("ServerRouter: Impl missing required method 'getTransactionSession'");
+        if (!@hasDecl(Impl, "abortTransactionSession")) @compileError("ServerRouter: Impl missing required method 'abortTransactionSession'");
+        if (!@hasDecl(Impl, "commitTransactionSession")) @compileError("ServerRouter: Impl missing required method 'commitTransactionSession'");
+        if (!@hasDecl(Impl, "stageTransactionDelete")) @compileError("ServerRouter: Impl missing required method 'stageTransactionDelete'");
+        if (!@hasDecl(Impl, "stageTransactionRead")) @compileError("ServerRouter: Impl missing required method 'stageTransactionRead'");
+        if (!@hasDecl(Impl, "createTransactionSavepoint")) @compileError("ServerRouter: Impl missing required method 'createTransactionSavepoint'");
+        if (!@hasDecl(Impl, "rollbackTransactionSavepoint")) @compileError("ServerRouter: Impl missing required method 'rollbackTransactionSavepoint'");
+        if (!@hasDecl(Impl, "stageTransactionSession")) @compileError("ServerRouter: Impl missing required method 'stageTransactionSession'");
+        if (!@hasDecl(Impl, "stageTransactionWrite")) @compileError("ServerRouter: Impl missing required method 'stageTransactionWrite'");
     }
 
     return struct {
@@ -581,67 +650,104 @@ pub fn ServerRouter(comptime Impl: type) type {
         /// Register all routes on the server and activate the impl.
         pub fn register(self: *const @This(), server: anytype) !void {
             active_impl = self.impl;
-            try server.get("/status", getStatus);
+            try server.post("/agents/query-builder", queryBuilderAgent);
+            try server.post("/agents/retrieval", retrievalAgent);
+            try server.post("/backup", backup);
+            try server.get("/backups", listBackups);
+            try server.post("/batch", multiBatchWrite);
             try server.get("/cluster", getCluster);
             try server.get("/connections", listConnections);
+            try server.post("/eval", evaluate);
+            try server.post("/query", globalQuery);
+            try server.post("/restore", restore);
             try server.get("/secrets", listSecrets);
             try server.put("/secrets/:key", putSecret);
             try server.delete("/secrets/:key", deleteSecret);
-            try server.post("/batch", multiBatchWrite);
-            try server.post("/transactions/commit", commitTransaction);
-            try server.get("/transactions", listTransactionSessions);
-            try server.post("/transactions/cleanup", cleanupTransactionSessions);
-            try server.post("/transactions/begin", beginTransaction);
-            try server.get("/transactions/:transaction_id", getTransactionSession);
-            try server.post("/transactions/:transaction_id/stage", stageTransactionSession);
-            try server.post("/transactions/:transaction_id/read", stageTransactionRead);
-            try server.post("/transactions/:transaction_id/write", stageTransactionWrite);
-            try server.post("/transactions/:transaction_id/delete", stageTransactionDelete);
-            try server.post("/transactions/:transaction_id/savepoints", createTransactionSavepoint);
-            try server.post("/transactions/:transaction_id/savepoints/:savepoint_id/rollback", rollbackTransactionSavepoint);
-            try server.post("/transactions/:transaction_id/commit", commitTransactionSession);
-            try server.post("/transactions/:transaction_id/abort", abortTransactionSession);
-            try server.post("/backup", backup);
-            try server.post("/restore", restore);
-            try server.get("/backups", listBackups);
-            try server.post("/query", globalQuery);
-            try server.post("/eval", evaluate);
-            try server.post("/agents/query-builder", queryBuilderAgent);
-            try server.post("/agents/retrieval", retrievalAgent);
+            try server.get("/status", getStatus);
             try server.get("/tables", listTables);
             try server.get("/tables/:tableName", getTable);
             try server.post("/tables/:tableName", createTable);
             try server.delete("/tables/:tableName", dropTable);
-            try server.post("/tables/:tableName/query", queryTable);
-            try server.post("/tables/:tableName/batch", batchWrite);
-            try server.post("/tables/:tableName/merge", linearMerge);
-            try server.post("/tables/:tableName/backup", backupTable);
-            try server.post("/tables/:tableName/restore", restoreTable);
-            try server.put("/tables/:tableName/schema", updateSchema);
-            try server.post("/tables/:tableName/lookup", scanKeys);
-            try server.get("/tables/:tableName/documents/:key", lookupKey);
-            try server.get("/tables/:tableName/documents/:key/artifacts", listDocumentArtifactManifests);
             try server.get("/tables/:tableName/artifacts", listArtifactEnrichments);
-            try server.post("/tables/:tableName/artifacts/:artifactName/reprocess", reprocessDocumentArtifactRange);
             try server.put("/tables/:tableName/artifacts/:artifactName/enrichment", putArtifactEnrichment);
             try server.delete("/tables/:tableName/artifacts/:artifactName/enrichment", deleteArtifactEnrichment);
+            try server.post("/tables/:tableName/artifacts/:artifactName/reprocess", reprocessDocumentArtifactRange);
             try server.post("/tables/:tableName/artifacts/:artifactName/reprocess-jobs", startDocumentArtifactReprocessJob);
             try server.get("/tables/:tableName/artifacts/:artifactName/reprocess-jobs/:jobId", getDocumentArtifactReprocessJob);
             try server.post("/tables/:tableName/artifacts/:artifactName/reprocess-jobs/:jobId/advance", advanceDocumentArtifactReprocessJob);
             try server.post("/tables/:tableName/artifacts/:artifactName/reprocess-jobs/:jobId/cancel", cancelDocumentArtifactReprocessJob);
+            try server.post("/tables/:tableName/backup", backupTable);
+            try server.post("/tables/:tableName/batch", batchWrite);
+            try server.post("/tables/:tableName/documents", scanKeys);
+            try server.get("/tables/:tableName/documents/:key", lookupKey);
+            try server.get("/tables/:tableName/documents/:key/artifacts", listDocumentArtifactManifests);
             try server.get("/tables/:tableName/documents/:key/artifacts/:artifactName", getDocumentArtifactManifest);
             try server.post("/tables/:tableName/documents/:key/artifacts/:artifactName/reprocess", reprocessDocumentArtifact);
             try server.get("/tables/:tableName/indexes", listIndexes);
             try server.get("/tables/:tableName/indexes/:indexName", getIndex);
             try server.post("/tables/:tableName/indexes/:indexName", createIndex);
             try server.delete("/tables/:tableName/indexes/:indexName", dropIndex);
+            try server.post("/tables/:tableName/merge", linearMerge);
+            try server.post("/tables/:tableName/query", queryTable);
+            try server.post("/tables/:tableName/repair/issues", listTableRepairIssues);
+            try server.post("/tables/:tableName/repair/jobs", startTableRepairJob);
+            try server.get("/tables/:tableName/repair/jobs/:jobId", getTableRepairJob);
+            try server.post("/tables/:tableName/repair/jobs/:jobId/advance", advanceTableRepairJob);
+            try server.post("/tables/:tableName/repair/jobs/:jobId/cancel", cancelTableRepairJob);
+            try server.post("/tables/:tableName/repair/run", runTableRepair);
+            try server.post("/tables/:tableName/restore", restoreTable);
+            try server.put("/tables/:tableName/schema", updateSchema);
+            try server.get("/transactions", listTransactionSessions);
+            try server.post("/transactions/begin", beginTransaction);
+            try server.post("/transactions/cleanup", cleanupTransactionSessions);
+            try server.post("/transactions/commit", commitTransaction);
+            try server.get("/transactions/:transaction_id", getTransactionSession);
+            try server.post("/transactions/:transaction_id/abort", abortTransactionSession);
+            try server.post("/transactions/:transaction_id/commit", commitTransactionSession);
+            try server.post("/transactions/:transaction_id/delete", stageTransactionDelete);
+            try server.post("/transactions/:transaction_id/read", stageTransactionRead);
+            try server.post("/transactions/:transaction_id/savepoints", createTransactionSavepoint);
+            try server.post("/transactions/:transaction_id/savepoints/:savepoint_id/rollback", rollbackTransactionSavepoint);
+            try server.post("/transactions/:transaction_id/stage", stageTransactionSession);
+            try server.post("/transactions/:transaction_id/write", stageTransactionWrite);
         }
 
-        /// Get cluster status
-        /// GET /status
-        fn getStatus(ctx: *httpx.Context) anyerror!httpx.Response {
+        /// Build a search query from natural language
+        /// POST /agents/query-builder
+        fn queryBuilderAgent(ctx: *httpx.Context) anyerror!httpx.Response {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            return impl.getStatus(ctx);
+            return impl.queryBuilderAgent(ctx);
+        }
+
+        /// Retrieval Agent - Agentic document retrieval with tool calling
+        /// POST /agents/retrieval
+        fn retrievalAgent(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            return impl.retrievalAgent(ctx);
+        }
+
+        /// Backup all tables or selected tables
+        /// POST /backup
+        fn backup(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            return impl.backup(ctx);
+        }
+
+        /// List available backups
+        /// GET /backups
+        fn listBackups(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const query_params = ListBackupsParams{
+                .location = ctx.query("location") orelse return ctx.status(400).json(.{ .@"error" = "missing_query_param", .message = "Missing required query parameter: location" }),
+            };
+            return impl.listBackups(ctx, query_params);
+        }
+
+        /// Cross-table batch operations
+        /// POST /batch
+        fn multiBatchWrite(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            return impl.multiBatchWrite(ctx);
         }
 
         /// Get cluster topology
@@ -661,6 +767,27 @@ pub fn ServerRouter(comptime Impl: type) type {
                 .refresh = ctx.query("refresh"),
             };
             return impl.listConnections(ctx, query_params);
+        }
+
+        /// Standalone evaluation endpoint
+        /// POST /eval
+        fn evaluate(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            return impl.evaluate(ctx);
+        }
+
+        /// Perform a global query
+        /// POST /query
+        fn globalQuery(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            return impl.globalQuery(ctx);
+        }
+
+        /// Restore multiple tables from a backup
+        /// POST /restore
+        fn restore(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            return impl.restore(ctx);
         }
 
         /// List secrets status
@@ -686,167 +813,11 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.deleteSecret(ctx, key);
         }
 
-        /// Cross-table batch operations
-        /// POST /batch
-        fn multiBatchWrite(ctx: *httpx.Context) anyerror!httpx.Response {
+        /// Get cluster status
+        /// GET /status
+        fn getStatus(ctx: *httpx.Context) anyerror!httpx.Response {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            return impl.multiBatchWrite(ctx);
-        }
-
-        /// Commit an OCC transaction
-        /// POST /transactions/commit
-        fn commitTransaction(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            return impl.commitTransaction(ctx);
-        }
-
-        /// List transaction sessions
-        /// GET /transactions
-        fn listTransactionSessions(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            return impl.listTransactionSessions(ctx);
-        }
-
-        /// Clean up expired transaction sessions
-        /// POST /transactions/cleanup
-        fn cleanupTransactionSessions(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            const query_params = CleanupTransactionSessionsParams{
-                .cutoff_ns = ctx.query("cutoff_ns"),
-            };
-            return impl.cleanupTransactionSessions(ctx, query_params);
-        }
-
-        /// Begin a transaction session
-        /// POST /transactions/begin
-        fn beginTransaction(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            return impl.beginTransaction(ctx);
-        }
-
-        /// Get transaction session details
-        /// GET /transactions/{transaction_id}
-        fn getTransactionSession(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            const transaction_id = ctx.param("transaction_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: transaction_id" });
-            return impl.getTransactionSession(ctx, transaction_id);
-        }
-
-        /// Stage a transaction commit request
-        /// POST /transactions/{transaction_id}/stage
-        fn stageTransactionSession(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            const transaction_id = ctx.param("transaction_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: transaction_id" });
-            return impl.stageTransactionSession(ctx, transaction_id);
-        }
-
-        /// Stage a transaction read version
-        /// POST /transactions/{transaction_id}/read
-        fn stageTransactionRead(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            const transaction_id = ctx.param("transaction_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: transaction_id" });
-            return impl.stageTransactionRead(ctx, transaction_id);
-        }
-
-        /// Stage a transaction write
-        /// POST /transactions/{transaction_id}/write
-        fn stageTransactionWrite(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            const transaction_id = ctx.param("transaction_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: transaction_id" });
-            return impl.stageTransactionWrite(ctx, transaction_id);
-        }
-
-        /// Stage a transaction delete
-        /// POST /transactions/{transaction_id}/delete
-        fn stageTransactionDelete(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            const transaction_id = ctx.param("transaction_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: transaction_id" });
-            return impl.stageTransactionDelete(ctx, transaction_id);
-        }
-
-        /// Create a transaction savepoint
-        /// POST /transactions/{transaction_id}/savepoints
-        fn createTransactionSavepoint(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            const transaction_id = ctx.param("transaction_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: transaction_id" });
-            return impl.createTransactionSavepoint(ctx, transaction_id);
-        }
-
-        /// Roll back a transaction session to a savepoint
-        /// POST /transactions/{transaction_id}/savepoints/{savepoint_id}/rollback
-        fn rollbackTransactionSavepoint(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            const transaction_id = ctx.param("transaction_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: transaction_id" });
-            const savepoint_id = ctx.param("savepoint_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: savepoint_id" });
-            return impl.rollbackTransactionSavepoint(ctx, transaction_id, savepoint_id);
-        }
-
-        /// Commit a transaction session
-        /// POST /transactions/{transaction_id}/commit
-        fn commitTransactionSession(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            const transaction_id = ctx.param("transaction_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: transaction_id" });
-            return impl.commitTransactionSession(ctx, transaction_id);
-        }
-
-        /// Abort a transaction session
-        /// POST /transactions/{transaction_id}/abort
-        fn abortTransactionSession(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            const transaction_id = ctx.param("transaction_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: transaction_id" });
-            return impl.abortTransactionSession(ctx, transaction_id);
-        }
-
-        /// Backup all tables or selected tables
-        /// POST /backup
-        fn backup(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            return impl.backup(ctx);
-        }
-
-        /// Restore multiple tables from a backup
-        /// POST /restore
-        fn restore(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            return impl.restore(ctx);
-        }
-
-        /// List available backups
-        /// GET /backups
-        fn listBackups(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            const query_params = ListBackupsParams{
-                .location = ctx.query("location") orelse return ctx.status(400).json(.{ .@"error" = "missing_query_param", .message = "Missing required query parameter: location" }),
-            };
-            return impl.listBackups(ctx, query_params);
-        }
-
-        /// Perform a global query
-        /// POST /query
-        fn globalQuery(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            return impl.globalQuery(ctx);
-        }
-
-        /// Standalone evaluation endpoint
-        /// POST /eval
-        fn evaluate(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            return impl.evaluate(ctx);
-        }
-
-        /// Build a search query from natural language
-        /// POST /agents/query-builder
-        fn queryBuilderAgent(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            return impl.queryBuilderAgent(ctx);
-        }
-
-        /// Retrieval Agent - Agentic document retrieval with tool calling
-        /// POST /agents/retrieval
-        fn retrievalAgent(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            return impl.retrievalAgent(ctx);
+            return impl.getStatus(ctx);
         }
 
         /// List all tables
@@ -884,102 +855,12 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.dropTable(ctx, table_name);
         }
 
-        /// Query a specific table
-        /// POST /tables/{tableName}/query
-        fn queryTable(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
-            return impl.queryTable(ctx, table_name);
-        }
-
-        /// Perform batch inserts and deletes on a table
-        /// POST /tables/{tableName}/batch
-        fn batchWrite(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
-            return impl.batchWrite(ctx, table_name);
-        }
-
-        /// Synchronize data from external sources (Shopify, Postgres, S3) using a linear merge
-        /// POST /tables/{tableName}/merge
-        fn linearMerge(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
-            return impl.linearMerge(ctx, table_name);
-        }
-
-        /// Backup a table
-        /// POST /tables/{tableName}/backup
-        fn backupTable(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
-            return impl.backupTable(ctx, table_name);
-        }
-
-        /// Restore a table from backup
-        /// POST /tables/{tableName}/restore
-        fn restoreTable(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
-            return impl.restoreTable(ctx, table_name);
-        }
-
-        /// Update a table's schema
-        /// PUT /tables/{tableName}/schema
-        fn updateSchema(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
-            return impl.updateSchema(ctx, table_name);
-        }
-
-        /// Scan keys in a table within a key range
-        /// POST /tables/{tableName}/lookup
-        fn scanKeys(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
-            return impl.scanKeys(ctx, table_name);
-        }
-
-        /// Retrieve a document by key
-        /// GET /tables/{tableName}/documents/{key}
-        fn lookupKey(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
-            const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
-            const query_params = LookupKeyParams{
-                .fields = ctx.query("fields"),
-                .consistency = ctx.query("consistency"),
-            };
-            return impl.lookupKey(ctx, table_name, key, query_params);
-        }
-
-        /// List derived document artifact manifests
-        /// GET /tables/{tableName}/documents/{key}/artifacts
-        fn listDocumentArtifactManifests(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
-            const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
-            const query_params = ListDocumentArtifactManifestsParams{
-                .detail = ctx.query("detail"),
-            };
-            return impl.listDocumentArtifactManifests(ctx, table_name, key, query_params);
-        }
-
         /// List table artifact enrichments
         /// GET /tables/{tableName}/artifacts
         fn listArtifactEnrichments(ctx: *httpx.Context) anyerror!httpx.Response {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             return impl.listArtifactEnrichments(ctx, table_name);
-        }
-
-        /// Reprocess a derived document artifact across a table range
-        /// POST /tables/{tableName}/artifacts/{artifactName}/reprocess
-        fn reprocessDocumentArtifactRange(ctx: *httpx.Context) anyerror!httpx.Response {
-            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
-            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
-            const artifact_name = ctx.param("artifactName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: artifactName" });
-            return impl.reprocessDocumentArtifactRange(ctx, table_name, artifact_name);
         }
 
         /// Register or replace an artifact enrichment
@@ -998,6 +879,15 @@ pub fn ServerRouter(comptime Impl: type) type {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             const artifact_name = ctx.param("artifactName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: artifactName" });
             return impl.deleteArtifactEnrichment(ctx, table_name, artifact_name);
+        }
+
+        /// Reprocess a derived document artifact across a table range
+        /// POST /tables/{tableName}/artifacts/{artifactName}/reprocess
+        fn reprocessDocumentArtifactRange(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const artifact_name = ctx.param("artifactName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: artifactName" });
+            return impl.reprocessDocumentArtifactRange(ctx, table_name, artifact_name);
         }
 
         /// Create a derived document artifact reprocess job
@@ -1037,6 +927,55 @@ pub fn ServerRouter(comptime Impl: type) type {
             const artifact_name = ctx.param("artifactName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: artifactName" });
             const job_id = ctx.param("jobId") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: jobId" });
             return impl.cancelDocumentArtifactReprocessJob(ctx, table_name, artifact_name, job_id);
+        }
+
+        /// Backup a table
+        /// POST /tables/{tableName}/backup
+        fn backupTable(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.backupTable(ctx, table_name);
+        }
+
+        /// Perform batch inserts and deletes on a table
+        /// POST /tables/{tableName}/batch
+        fn batchWrite(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.batchWrite(ctx, table_name);
+        }
+
+        /// Scan documents in a table within a key range
+        /// POST /tables/{tableName}/documents
+        fn scanKeys(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.scanKeys(ctx, table_name);
+        }
+
+        /// Retrieve a document by key
+        /// GET /tables/{tableName}/documents/{key}
+        fn lookupKey(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
+            const query_params = LookupKeyParams{
+                .fields = ctx.query("fields"),
+                .consistency = ctx.query("consistency"),
+            };
+            return impl.lookupKey(ctx, table_name, key, query_params);
+        }
+
+        /// List derived document artifact manifests
+        /// GET /tables/{tableName}/documents/{key}/artifacts
+        fn listDocumentArtifactManifests(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
+            const query_params = ListDocumentArtifactManifestsParams{
+                .detail = ctx.query("detail"),
+            };
+            return impl.listDocumentArtifactManifests(ctx, table_name, key, query_params);
         }
 
         /// Inspect a derived document artifact manifest
@@ -1096,62 +1035,255 @@ pub fn ServerRouter(comptime Impl: type) type {
             const index_name = ctx.param("indexName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: indexName" });
             return impl.dropIndex(ctx, table_name, index_name);
         }
+
+        /// Synchronize data from external sources (Shopify, Postgres, S3) using a linear merge
+        /// POST /tables/{tableName}/merge
+        fn linearMerge(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.linearMerge(ctx, table_name);
+        }
+
+        /// Query a specific table
+        /// POST /tables/{tableName}/query
+        fn queryTable(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.queryTable(ctx, table_name);
+        }
+
+        /// List table repair issues
+        /// POST /tables/{tableName}/repair/issues
+        fn listTableRepairIssues(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.listTableRepairIssues(ctx, table_name);
+        }
+
+        /// Start a durable table repair job
+        /// POST /tables/{tableName}/repair/jobs
+        fn startTableRepairJob(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.startTableRepairJob(ctx, table_name);
+        }
+
+        /// Get a table repair job
+        /// GET /tables/{tableName}/repair/jobs/{jobId}
+        fn getTableRepairJob(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const job_id = ctx.param("jobId") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: jobId" });
+            return impl.getTableRepairJob(ctx, table_name, job_id);
+        }
+
+        /// Advance a table repair job
+        /// POST /tables/{tableName}/repair/jobs/{jobId}/advance
+        fn advanceTableRepairJob(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const job_id = ctx.param("jobId") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: jobId" });
+            return impl.advanceTableRepairJob(ctx, table_name, job_id);
+        }
+
+        /// Cancel a table repair job
+        /// POST /tables/{tableName}/repair/jobs/{jobId}/cancel
+        fn cancelTableRepairJob(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const job_id = ctx.param("jobId") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: jobId" });
+            return impl.cancelTableRepairJob(ctx, table_name, job_id);
+        }
+
+        /// Run a bounded table repair pass
+        /// POST /tables/{tableName}/repair/run
+        fn runTableRepair(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.runTableRepair(ctx, table_name);
+        }
+
+        /// Restore a table from backup
+        /// POST /tables/{tableName}/restore
+        fn restoreTable(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.restoreTable(ctx, table_name);
+        }
+
+        /// Update a table's schema
+        /// PUT /tables/{tableName}/schema
+        fn updateSchema(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.updateSchema(ctx, table_name);
+        }
+
+        /// List transaction sessions
+        /// GET /transactions
+        fn listTransactionSessions(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            return impl.listTransactionSessions(ctx);
+        }
+
+        /// Begin a transaction session
+        /// POST /transactions/begin
+        fn beginTransaction(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            return impl.beginTransaction(ctx);
+        }
+
+        /// Clean up expired transaction sessions
+        /// POST /transactions/cleanup
+        fn cleanupTransactionSessions(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const query_params = CleanupTransactionSessionsParams{
+                .cutoff_ns = ctx.query("cutoff_ns"),
+            };
+            return impl.cleanupTransactionSessions(ctx, query_params);
+        }
+
+        /// Commit an OCC transaction
+        /// POST /transactions/commit
+        fn commitTransaction(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            return impl.commitTransaction(ctx);
+        }
+
+        /// Get transaction session details
+        /// GET /transactions/{transaction_id}
+        fn getTransactionSession(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const transaction_id = ctx.param("transaction_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: transaction_id" });
+            return impl.getTransactionSession(ctx, transaction_id);
+        }
+
+        /// Abort a transaction session
+        /// POST /transactions/{transaction_id}/abort
+        fn abortTransactionSession(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const transaction_id = ctx.param("transaction_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: transaction_id" });
+            return impl.abortTransactionSession(ctx, transaction_id);
+        }
+
+        /// Commit a transaction session
+        /// POST /transactions/{transaction_id}/commit
+        fn commitTransactionSession(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const transaction_id = ctx.param("transaction_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: transaction_id" });
+            return impl.commitTransactionSession(ctx, transaction_id);
+        }
+
+        /// Stage a transaction delete
+        /// POST /transactions/{transaction_id}/delete
+        fn stageTransactionDelete(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const transaction_id = ctx.param("transaction_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: transaction_id" });
+            return impl.stageTransactionDelete(ctx, transaction_id);
+        }
+
+        /// Stage a transaction read version
+        /// POST /transactions/{transaction_id}/read
+        fn stageTransactionRead(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const transaction_id = ctx.param("transaction_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: transaction_id" });
+            return impl.stageTransactionRead(ctx, transaction_id);
+        }
+
+        /// Create a transaction savepoint
+        /// POST /transactions/{transaction_id}/savepoints
+        fn createTransactionSavepoint(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const transaction_id = ctx.param("transaction_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: transaction_id" });
+            return impl.createTransactionSavepoint(ctx, transaction_id);
+        }
+
+        /// Roll back a transaction session to a savepoint
+        /// POST /transactions/{transaction_id}/savepoints/{savepoint_id}/rollback
+        fn rollbackTransactionSavepoint(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const transaction_id = ctx.param("transaction_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: transaction_id" });
+            const savepoint_id = ctx.param("savepoint_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: savepoint_id" });
+            return impl.rollbackTransactionSavepoint(ctx, transaction_id, savepoint_id);
+        }
+
+        /// Stage a transaction commit request
+        /// POST /transactions/{transaction_id}/stage
+        fn stageTransactionSession(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const transaction_id = ctx.param("transaction_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: transaction_id" });
+            return impl.stageTransactionSession(ctx, transaction_id);
+        }
+
+        /// Stage a transaction write
+        /// POST /transactions/{transaction_id}/write
+        fn stageTransactionWrite(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            const transaction_id = ctx.param("transaction_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: transaction_id" });
+            return impl.stageTransactionWrite(ctx, transaction_id);
+        }
     };
 }
 
 // Handler interface. Implement these methods on your Impl struct:
 //
-//   fn getStatus(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn queryBuilderAgent(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn retrievalAgent(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn backup(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn listBackups(self: *Impl, ctx: *httpx.Context, params: ListBackupsParams) !httpx.Response
+//   fn multiBatchWrite(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn getCluster(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listConnections(self: *Impl, ctx: *httpx.Context, params: ListConnectionsParams) !httpx.Response
+//   fn evaluate(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn globalQuery(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn restore(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listSecrets(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn putSecret(self: *Impl, ctx: *httpx.Context, key: []const u8) !httpx.Response
 //   fn deleteSecret(self: *Impl, ctx: *httpx.Context, key: []const u8) !httpx.Response
-//   fn multiBatchWrite(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn commitTransaction(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn listTransactionSessions(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn cleanupTransactionSessions(self: *Impl, ctx: *httpx.Context, params: CleanupTransactionSessionsParams) !httpx.Response
-//   fn beginTransaction(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn getTransactionSession(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response
-//   fn stageTransactionSession(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response
-//   fn stageTransactionRead(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response
-//   fn stageTransactionWrite(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response
-//   fn stageTransactionDelete(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response
-//   fn createTransactionSavepoint(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response
-//   fn rollbackTransactionSavepoint(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8, savepoint_id: []const u8) !httpx.Response
-//   fn commitTransactionSession(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response
-//   fn abortTransactionSession(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response
-//   fn backup(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn restore(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn listBackups(self: *Impl, ctx: *httpx.Context, params: ListBackupsParams) !httpx.Response
-//   fn globalQuery(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn evaluate(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn queryBuilderAgent(self: *Impl, ctx: *httpx.Context) !httpx.Response
-//   fn retrievalAgent(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn getStatus(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listTables(self: *Impl, ctx: *httpx.Context, params: ListTablesParams) !httpx.Response
 //   fn getTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn createTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn dropTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
-//   fn queryTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
-//   fn batchWrite(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
-//   fn linearMerge(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
-//   fn backupTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
-//   fn restoreTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
-//   fn updateSchema(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
-//   fn scanKeys(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
-//   fn lookupKey(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: LookupKeyParams) !httpx.Response
-//   fn listDocumentArtifactManifests(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: ListDocumentArtifactManifestsParams) !httpx.Response
 //   fn listArtifactEnrichments(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
-//   fn reprocessDocumentArtifactRange(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response
 //   fn putArtifactEnrichment(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response
 //   fn deleteArtifactEnrichment(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response
+//   fn reprocessDocumentArtifactRange(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response
 //   fn startDocumentArtifactReprocessJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response
 //   fn getDocumentArtifactReprocessJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8, job_id: []const u8) !httpx.Response
 //   fn advanceDocumentArtifactReprocessJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8, job_id: []const u8) !httpx.Response
 //   fn cancelDocumentArtifactReprocessJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8, job_id: []const u8) !httpx.Response
+//   fn backupTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn batchWrite(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn scanKeys(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn lookupKey(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: LookupKeyParams) !httpx.Response
+//   fn listDocumentArtifactManifests(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: ListDocumentArtifactManifestsParams) !httpx.Response
 //   fn getDocumentArtifactManifest(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8, params: GetDocumentArtifactManifestParams) !httpx.Response
 //   fn reprocessDocumentArtifact(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8) !httpx.Response
 //   fn listIndexes(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn getIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn createIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn dropIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
+//   fn linearMerge(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn queryTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn listTableRepairIssues(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn startTableRepairJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn getTableRepairJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response
+//   fn advanceTableRepairJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response
+//   fn cancelTableRepairJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, job_id: []const u8) !httpx.Response
+//   fn runTableRepair(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn restoreTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn updateSchema(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn listTransactionSessions(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn beginTransaction(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn cleanupTransactionSessions(self: *Impl, ctx: *httpx.Context, params: CleanupTransactionSessionsParams) !httpx.Response
+//   fn commitTransaction(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn getTransactionSession(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response
+//   fn abortTransactionSession(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response
+//   fn commitTransactionSession(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response
+//   fn stageTransactionDelete(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response
+//   fn stageTransactionRead(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response
+//   fn createTransactionSavepoint(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response
+//   fn rollbackTransactionSavepoint(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8, savepoint_id: []const u8) !httpx.Response
+//   fn stageTransactionSession(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response
+//   fn stageTransactionWrite(self: *Impl, ctx: *httpx.Context, transaction_id: []const u8) !httpx.Response

@@ -646,18 +646,24 @@ pub const MultiRaft = struct {
         };
 
         const persist_ready_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
-        if (persist_batch) |batch| {
-            try batch.persistReadyWithDiagnostics(
-                group_id,
-                ready,
-                if (diagnostics) |diag| &diag.persist_ready_detail else null,
-            );
-        } else if (self.hooks.group_storage) |storage| {
-            try storage.persistReadyWithDiagnostics(
-                group_id,
-                ready,
-                if (diagnostics) |diag| &diag.persist_ready_detail else null,
-            );
+        if (ready.requiresPersistence()) {
+            if (persist_batch) |batch| {
+                if (diagnostics) |diag| diag.persist_ready_detail.used_batch = true;
+                try batch.persistReadyWithDiagnostics(
+                    group_id,
+                    ready,
+                    if (diagnostics) |diag| &diag.persist_ready_detail else null,
+                );
+            } else if (self.hooks.group_storage) |storage| {
+                if (diagnostics) |diag| diag.persist_ready_detail.used_group_storage = true;
+                try storage.persistReadyWithDiagnostics(
+                    group_id,
+                    ready,
+                    if (diagnostics) |diag| &diag.persist_ready_detail else null,
+                );
+            }
+        } else {
+            if (diagnostics) |diag| diag.persist_ready_detail.skipped_no_durable_state = true;
         }
         if (diagnostics) |diag| diag.persist_ready_elapsed_ns = clock.elapsedSinceNs(persist_ready_start_ns);
 

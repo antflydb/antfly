@@ -477,6 +477,7 @@ pub fn persistManifestWithStorageCount(
     });
     defer allocator.free(encoded);
     try replaceFileAtomicallyAbsolute(storage, manifest_path, encoded);
+    try storage.syncFileAbsolute(manifest_path);
     return @intCast(encoded.len);
 }
 

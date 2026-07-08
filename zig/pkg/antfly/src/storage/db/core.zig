@@ -55,6 +55,7 @@ pub const PendingWorkStats = struct {
     resolution: types.ReplayStageStats = .{},
     promotion: types.ReplayStageStats = .{},
     text_merge: types.TextMergeStats = .{},
+    repair_metadata_rebuild_pending: bool = false,
 };
 
 pub const MaintenanceDriver = struct {
@@ -697,12 +698,36 @@ pub const DBCore = struct {
     }
 
     pub fn loadAppliedSequence(self: *DBCore, alloc: Allocator, index_name: []const u8) !u64 {
-        return try apply_state.loadAppliedSequenceWithCheckpoint(
+        if (self.index_manager.denseProjectionCheckpointMetadata(index_name)) |dense_checkpoint| {
+            if (dense_checkpoint.config_hash != 0) return dense_checkpoint.applied_sequence;
+        }
+        return apply_state.loadAppliedSequenceWithCheckpoint(
             alloc,
             self.store,
             self.applied_sequence_checkpoint_path,
             index_name,
-        );
+        ) catch |err| switch (err) {
+            error.InvalidDerivedApplyState => 0,
+            else => return err,
+        };
+    }
+
+    pub fn loadProjectionCheckpoint(self: *DBCore, alloc: Allocator, index_name: []const u8) !apply_state.ProjectionCheckpoint {
+        if (self.index_manager.denseProjectionCheckpointMetadata(index_name)) |dense_checkpoint| {
+            if (dense_checkpoint.config_hash != 0) return dense_checkpoint;
+        }
+        return apply_state.loadProjectionCheckpointWithSidecar(
+            alloc,
+            self.store,
+            self.applied_sequence_checkpoint_path,
+            index_name,
+        ) catch |err| switch (err) {
+            error.InvalidDerivedApplyState => .{
+                .status = .repair_required,
+                .config_hash = if (self.index_manager.get(index_name)) |cfg| types.indexConfigHash(cfg.*) else 0,
+            },
+            else => return err,
+        };
     }
 
     pub fn indexRequiresEnrichmentReplay(self: *DBCore, index_name: []const u8) !bool {
@@ -710,12 +735,60 @@ pub const DBCore = struct {
     }
 
     pub fn saveAppliedSequence(self: *DBCore, index_name: []const u8, sequence: u64) !void {
-        try apply_state.saveAppliedSequenceWithCheckpoint(
+        const cfg = self.index_manager.get(index_name);
+        const config_hash = if (cfg) |value|
+            types.indexConfigHash(value.*)
+        else
+            0;
+        if (self.index_manager.denseProjectionCheckpointMetadata(index_name)) |checkpoint| {
+            try self.index_manager.saveDenseProjectionCheckpointMetadata(index_name, .{
+                .applied_sequence = sequence,
+                .status = checkpoint.status,
+                .generation = checkpoint.generation,
+                .config_hash = if (config_hash != 0) config_hash else checkpoint.config_hash,
+            });
+            try self.index_manager.checkpointLsmWalForManagedIndex(.{
+                .name = index_name,
+                .kind = .dense_vector,
+            });
+        } else if (cfg) |value| {
+            try self.index_manager.checkpointLsmWalForManagedIndex(.{
+                .name = index_name,
+                .kind = value.kind,
+            });
+        }
+        try apply_state.saveAppliedSequenceUpdateWithCheckpoint(
+            self.alloc,
+            self.store,
+            self.applied_sequence_checkpoint_path,
+            .{
+                .index_name = index_name,
+                .sequence = sequence,
+                .config_hash = config_hash,
+            },
+        );
+    }
+
+    pub fn saveProjectionCheckpoint(self: *DBCore, index_name: []const u8, checkpoint: apply_state.ProjectionCheckpoint) !void {
+        var checkpoint_with_identity = checkpoint;
+        if (checkpoint_with_identity.config_hash == 0) {
+            if (self.index_manager.get(index_name)) |cfg| {
+                checkpoint_with_identity.config_hash = types.indexConfigHash(cfg.*);
+            }
+        }
+        if (self.index_manager.denseProjectionCheckpointMetadata(index_name) != null) {
+            try self.index_manager.saveDenseProjectionCheckpointMetadata(index_name, checkpoint_with_identity);
+            try self.index_manager.checkpointLsmWalForManagedIndex(.{
+                .name = index_name,
+                .kind = .dense_vector,
+            });
+        }
+        try apply_state.saveProjectionCheckpointWithSidecar(
             self.alloc,
             self.store,
             self.applied_sequence_checkpoint_path,
             index_name,
-            sequence,
+            checkpoint_with_identity,
         );
     }
 
@@ -844,6 +917,17 @@ pub const DBCore = struct {
 
     pub fn scanStoreRange(self: *DBCore, alloc: Allocator, lower: []const u8, upper: []const u8) ![]docstore_mod.OwnedKVPair {
         return try self.store.scanRange(alloc, lower, upper);
+    }
+
+    pub fn scanStoreRangeWithContext(
+        self: *DBCore,
+        lower: []const u8,
+        upper: []const u8,
+        options: docstore_mod.DocStore.ScanOptions,
+        ctx: ?*anyopaque,
+        callback: docstore_mod.DocStore.ScanWithContextCallback,
+    ) !void {
+        return try self.store.scanWithContext(lower, upper, options, ctx, callback);
     }
 
     pub fn findMedianStoreKey(

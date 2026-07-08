@@ -40,13 +40,13 @@ pub const CatchUpStats = struct {
     replay_scan_batches: usize = 0,
     replay_hint_filter_skips: usize = 0,
     last_sequence: u64 = 0,
+    last_applied_sequence: u64 = 0,
     window_collect_ns: u64 = 0,
     apply_ns: u64 = 0,
 
     pub fn appliedSequenceAdvance(self: @This(), from_sequence: u64) ?u64 {
-        if (self.applied_entries == 0) return null;
-        if (self.last_sequence <= from_sequence) return null;
-        return self.last_sequence;
+        if (self.last_applied_sequence <= from_sequence) return null;
+        return self.last_applied_sequence;
     }
 
     pub fn shouldTryTargetAdvance(self: @This(), from_sequence: u64, target_sequence: u64) bool {
@@ -82,11 +82,17 @@ test "CatchUpStats target advance covers scanned zero-applied tail" {
         .scanned_entries = 13,
         .applied_entries = 0,
         .last_sequence = target_sequence,
+    }).appliedSequenceAdvance(target_sequence));
+    try std.testing.expectEqual(@as(?u64, null), (CatchUpStats{
+        .scanned_entries = 13,
+        .applied_entries = 0,
+        .last_sequence = target_sequence,
     }).appliedSequenceAdvance(applied));
     try std.testing.expectEqual(target_sequence, (CatchUpStats{
         .scanned_entries = 13,
         .applied_entries = 1,
         .last_sequence = target_sequence,
+        .last_applied_sequence = target_sequence,
     }).appliedSequenceAdvance(applied).?);
 }
 
@@ -142,6 +148,7 @@ fn logCatchUpError(
 ) void {
     if (err == error.WriterLocked) return;
     if (err == error.ReplayDocumentNotVisible) return;
+    if (err == error.ArtifactRepairRequired) return;
     if (index_ref.kind == .dense_vector and err == error.NotFound) return;
     std.log.err(
         "derived catch_up failed index={s} kind={s} phase={s} sequence={} scanned_entries={} applied_entries={} err={s}",
@@ -282,14 +289,16 @@ pub fn catchUpIndexFromMatchingCursor(
         }
 
         const apply_started_ns = monotonicTimeNs();
-        if (apply_fn(apply_ctx, batch, index_ref) catch |err| {
+        const applied = apply_fn(apply_ctx, batch, index_ref) catch |err| {
             stats.apply_ns += monotonicTimeNs() - apply_started_ns;
             logCatchUpError(index_ref, "journal_apply", chunk_stats.last_sequence, stats.scanned_entries, stats.applied_entries, err);
             derived_types.deinitDerivedBatch(alloc, &batch);
             return err;
-        }) {
+        };
+        if (applied) {
             stats.apply_ns += monotonicTimeNs() - apply_started_ns;
             stats.applied_entries += 1;
+            stats.last_applied_sequence = chunk_stats.last_sequence;
         } else {
             stats.apply_ns += monotonicTimeNs() - apply_started_ns;
         }
@@ -311,11 +320,13 @@ pub fn catchUpIndexFromMatchingCursor(
             window_open = false;
         }
         if (options.persist_progress_fn) |persist| {
-            persist(options.persist_ctx.?, index_ref.name, chunk_stats.last_sequence) catch |err| {
-                logCatchUpError(index_ref, "persist_progress", chunk_stats.last_sequence, stats.scanned_entries, stats.applied_entries, err);
-                derived_types.deinitDerivedBatch(alloc, &batch);
-                return err;
-            };
+            if (applied) {
+                persist(options.persist_ctx.?, index_ref.name, chunk_stats.last_sequence) catch |err| {
+                    logCatchUpError(index_ref, "persist_progress", chunk_stats.last_sequence, stats.scanned_entries, stats.applied_entries, err);
+                    derived_types.deinitDerivedBatch(alloc, &batch);
+                    return err;
+                };
+            }
         }
         derived_types.deinitDerivedBatch(alloc, &batch);
         completed_windows += 1;

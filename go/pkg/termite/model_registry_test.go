@@ -45,6 +45,12 @@ func (m *closeTrackingReranker) Close() error {
 	return nil
 }
 
+func registryOrphanCount(reg *RerankerRegistry, key string) int {
+	reg.base.refs.mu.Lock()
+	defer reg.base.refs.mu.Unlock()
+	return len(reg.base.refs.evictedHandles[key])
+}
+
 // TestRegistryEvictionRespectsRefcount verifies that the eviction callback
 // does NOT close a model when refcount > 0, and instead tracks it as an
 // orphan in evictedHandles for deferred cleanup.
@@ -65,24 +71,24 @@ func TestRegistryEvictionRespectsRefcount(t *testing.T) {
 	// Add model to cache — TTL eviction will fire after keepAlive
 	reg.base.cache.Set("test", mock, reg.base.keepAlive)
 
-	// Wait for TTL eviction
-	time.Sleep(200 * time.Millisecond)
+	require.Eventually(t, func() bool {
+		return registryOrphanCount(reg, "test") > 0
+	}, 2*time.Second, 10*time.Millisecond,
+		"evicted model must be tracked in evictedHandles")
 
 	// With the fix: callback sees refcount=1 > 0, must NOT close
 	assert.False(t, mock.closed.Load(),
 		"model must not be closed while refcount > 0")
 
 	// Evicted model must be tracked in evictedHandles
-	reg.base.refs.mu.Lock()
-	orphanCount := len(reg.base.refs.evictedHandles["test"])
-	reg.base.refs.mu.Unlock()
+	orphanCount := registryOrphanCount(reg, "test")
 	assert.Positive(t, orphanCount,
 		"evicted model must be tracked in evictedHandles")
 
 	// Release — should close orphaned handle
 	reg.Release("test")
 
-	assert.True(t, mock.closed.Load(),
+	require.Eventually(t, mock.closed.Load, 2*time.Second, 10*time.Millisecond,
 		"Release must close orphaned model when refcount hits 0")
 }
 
@@ -106,10 +112,15 @@ func TestRegistryOrphanCleanup(t *testing.T) {
 	// Simulate an active acquire (refcount > 0)
 	reg.base.refs.incRef("test")
 
-	// Simulate multiple evictions: each adds a model to cache, waits for eviction
+	// Simulate multiple evictions. Wait for each TTL callback to publish its
+	// orphan before replacing the cache entry, otherwise the test races the
+	// cache's asynchronous cleanup goroutine instead of testing registry logic.
 	for i := range evictions {
 		reg.base.cache.Set("test", mocks[i], reg.base.keepAlive)
-		time.Sleep(50 * time.Millisecond)
+		require.Eventually(t, func() bool {
+			return registryOrphanCount(reg, "test") >= i+1
+		}, 2*time.Second, 10*time.Millisecond,
+			"evicted model %d must be tracked in evictedHandles", i)
 	}
 
 	// All models should still be alive (refcount > 0 prevents closing)
@@ -119,24 +130,25 @@ func TestRegistryOrphanCleanup(t *testing.T) {
 	}
 
 	// All should be tracked as orphans
-	reg.base.refs.mu.Lock()
-	orphanCount := len(reg.base.refs.evictedHandles["test"])
-	reg.base.refs.mu.Unlock()
+	orphanCount := registryOrphanCount(reg, "test")
 	assert.Equal(t, evictions, orphanCount,
 		"all evicted models must be tracked in evictedHandles")
 
 	// Release — should close all orphans
 	reg.Release("test")
 
-	for i, mock := range mocks {
-		assert.True(t, mock.closed.Load(),
-			"orphaned model %d must be closed after Release", i)
-	}
+	require.Eventually(t, func() bool {
+		for _, mock := range mocks {
+			if !mock.closed.Load() {
+				return false
+			}
+		}
+		return true
+	}, 2*time.Second, 10*time.Millisecond,
+		"all orphaned models must be closed after Release")
 
 	// evictedHandles should be empty
-	reg.base.refs.mu.Lock()
-	remaining := len(reg.base.refs.evictedHandles["test"])
-	reg.base.refs.mu.Unlock()
+	remaining := registryOrphanCount(reg, "test")
 	assert.Equal(t, 0, remaining,
 		"evictedHandles must be empty after Release cleanup")
 }

@@ -292,7 +292,7 @@ func (c *InferenceClient) Chunk(ctx context.Context, text string, config ChunkCo
 			Model:     config.Model,
 			MaxChunks: config.MaxChunks,
 			Threshold: config.Threshold,
-			Text: oapi.InferenceTextChunkOptions{
+			Text: oapi.TextChunkOptions{
 				TargetTokens:  config.TargetTokens,
 				OverlapTokens: config.OverlapTokens,
 				Separator:     config.Separator,
@@ -329,8 +329,8 @@ type MediaChunkConfig struct {
 
 // ChunkMedia splits binary media content (audio/wav, image/gif) into chunks.
 func (c *InferenceClient) ChunkMedia(ctx context.Context, data []byte, mimeType string, config MediaChunkConfig) ([]chunking.Chunk, error) {
-	// Build MediaContentPart
-	var part oapi.ContentPart
+	// Build chunk-specific media content part.
+	var part oapi.InferenceChunkContentPart
 	if err := part.FromMediaContentPart(oapi.MediaContentPart{
 		Type:     oapi.MediaContentPartTypeMedia,
 		Data:     data,
@@ -340,7 +340,7 @@ func (c *InferenceClient) ChunkMedia(ctx context.Context, data []byte, mimeType 
 	}
 
 	var input oapi.InferenceChunkRequest_Input
-	if err := input.FromContentPart(part); err != nil {
+	if err := input.FromInferenceChunkContentPart(part); err != nil {
 		return nil, fmt.Errorf("building chunk request input: %w", err)
 	}
 

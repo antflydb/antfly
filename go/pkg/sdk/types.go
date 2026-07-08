@@ -92,14 +92,16 @@ type (
 	SortField = oapi.SortField
 
 	// Query response types
-	QueryResponses     = oapi.QueryResponses
-	QueryResult        = oapi.QueryResult
-	Hits               = oapi.QueryHits
-	Hit                = oapi.QueryHit
-	AggregationRequest = oapi.AggregationRequest
-	AggregationOption  = oapi.AggregationBucket
-	AggregationResult  = oapi.AggregationResult
-	AggregationType    = oapi.AggregationType
+	QueryResponses         = oapi.QueryResponses
+	QueryResult            = oapi.QueryResult
+	Hits                   = oapi.QueryHits
+	QueryHitsTotal         = oapi.QueryHitsTotal
+	QueryHitsTotalRelation = oapi.QueryHitsTotalRelation
+	Hit                    = oapi.QueryHit
+	AggregationRequest     = oapi.AggregationRequest
+	AggregationOption      = oapi.AggregationBucket
+	AggregationResult      = oapi.AggregationResult
+	AggregationType        = oapi.AggregationType
 
 	// Embedding types
 	Embedding             = oapi.Embedding
@@ -266,6 +268,18 @@ type (
 	PathWeightMode     = oapi.PathWeightMode
 )
 
+const (
+	QueryHitsTotalRelationExact = oapi.QueryHitsTotalRelationExact
+	QueryHitsTotalRelationGte   = oapi.QueryHitsTotalRelationGte
+)
+
+// QueryHitsTotalValue returns the numeric value from total hit-count metadata.
+// Callers that render user-facing output should inspect Relation as well so
+// lower-bound totals are not presented as exact counts.
+func QueryHitsTotalValue(total QueryHitsTotal) uint64 {
+	return total.Value
+}
+
 // NewDenseEmbedding creates an Embedding from a float32 slice.
 // The vector is sent as a JSON array of floats on the wire.
 func NewDenseEmbedding(v []float32) Embedding {
@@ -372,7 +386,6 @@ const (
 	SyncLevelPropose     = oapi.SyncLevelPropose
 	SyncLevelWrite       = oapi.SyncLevelWrite
 	SyncLevelFullText    = oapi.SyncLevelFullText
-	SyncLevelAknn        = oapi.SyncLevelAknn
 	SyncLevelFullIndex   = oapi.SyncLevelFullIndex
 	SyncLevelEnrichments = oapi.SyncLevelEnrichments
 
@@ -531,8 +544,8 @@ const (
 	TransformOpTypeRename      = oapi.TransformOpTypeRename
 	TransformOpTypeCurrentDate = oapi.TransformOpTypeCurrentDate
 
-	// SyncLevel embeddings (renamed from SyncLevelAknn)
-	SyncLevelEmbeddings = oapi.SyncLevelAknn
+	// SyncLevelEmbeddings is a compatibility alias for waiting on all managed index writes.
+	SyncLevelEmbeddings = oapi.SyncLevelFullIndex
 
 	// EdgeDirection values
 	EdgeDirectionBoth = oapi.EdgeDirectionBoth

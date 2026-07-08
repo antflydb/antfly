@@ -1276,10 +1276,7 @@ fn analyzeActivationTrace(
     );
     defer cb.free(hidden_result.hidden);
 
-    const lm_w = if (cfg.weight_tying)
-        try gpt_arch.getEmbeddingWeight(&cb, cfg)
-    else
-        cb.getWeight("lm_head.weight") catch try gpt_arch.getEmbeddingWeight(&cb, cfg);
+    const lm_w = try gpt_arch.getLmHeadWeight(&cb, cfg);
     defer cb.free(lm_w);
     const logits_ct = try cb.linearNoBias(hidden_result.hidden, lm_w, hidden_result.total_rows, cfg.hidden_size, cfg.vocab_size);
     defer cb.free(logits_ct);
@@ -2582,10 +2579,7 @@ fn captureRuntimeParityForward(
     defer cb.free(hidden_result.final_hidden);
     defer cb.free(hidden_result.pre_norm_hidden);
 
-    const lm_w = if (cfg.weight_tying)
-        try gpt_arch.getEmbeddingWeight(cb, cfg)
-    else
-        cb.getWeight("lm_head.weight") catch try gpt_arch.getEmbeddingWeight(cb, cfg);
+    const lm_w = try gpt_arch.getLmHeadWeight(cb, cfg);
     defer cb.free(lm_w);
 
     const logits_ct = try cb.linearNoBias(hidden_result.final_hidden, lm_w, hidden_result.total_rows, cfg.hidden_size, cfg.vocab_size);

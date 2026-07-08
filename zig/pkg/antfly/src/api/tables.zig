@@ -138,7 +138,18 @@ pub const TableStorageStatus = struct {
     table_name: []const u8,
     empty: bool,
     lsm: ?LsmStorageStatus = null,
+    observed_dynamic_field_capability_sets: []table_reads.ObservedDynamicFieldCapabilitySet = &.{},
 };
+
+pub fn freeTableStorageStatuses(alloc: std.mem.Allocator, statuses: []TableStorageStatus) void {
+    for (statuses) |*status| {
+        for (status.observed_dynamic_field_capability_sets) |*set| set.deinit(alloc);
+        if (status.observed_dynamic_field_capability_sets.len > 0) {
+            alloc.free(status.observed_dynamic_field_capability_sets);
+        }
+    }
+    if (statuses.len > 0) alloc.free(statuses);
+}
 
 fn readerPinCount(counts: [lsm_backend.reader_pin_kind_count]u64, kind: lsm_backend.ReaderPinKind) u64 {
     return counts[@intFromEnum(kind)];
@@ -342,6 +353,7 @@ const RuntimeSchemaDebugBinding = struct {
     schema_version: ?u32 = null,
     schema_slot: ?[]const u8 = null,
     runtime_schema: ?std.json.Value = null,
+    observed_dynamic_field_capabilities: ?std.json.Value = null,
 };
 
 const RuntimeSchemaDebugSchemaEntry = struct {
@@ -391,6 +403,7 @@ pub const TableStatusWithRuntimeSchemaDebug = struct {
     schema: ?schema_openapi.TableSchema = null,
     migration: ?metadata_openapi.TableMigration = null,
     replication_sources: ?[]const metadata_openapi.ReplicationSource = null,
+    field_capabilities: ?[]const metadata_openapi.FieldCapability = null,
     storage_status: metadata_openapi.StorageStatus,
     debug: TableRuntimeSchemaDebug,
 };
@@ -496,7 +509,7 @@ pub fn buildSingleTableStatusWithRuntimeSchemaDebug(
 ) !?TableStatusWithRuntimeSchemaDebug {
     const table = findTableByName(snapshot, table_name) orelse return null;
     const base = (try buildSingleTableStatusWithStorageStatuses(alloc, snapshot, table_name, storage_statuses)) orelse return null;
-    const debug = try buildTableRuntimeSchemaDebug(alloc, table);
+    const debug = try buildTableRuntimeSchemaDebug(alloc, table, findTableStorageStatus(storage_statuses, table.name));
     return .{
         .name = base.name,
         .description = base.description,
@@ -505,6 +518,7 @@ pub fn buildSingleTableStatusWithRuntimeSchemaDebug(
         .schema = base.schema,
         .migration = base.migration,
         .replication_sources = base.replication_sources,
+        .field_capabilities = base.field_capabilities,
         .storage_status = base.storage_status,
         .debug = debug,
     };
@@ -592,7 +606,18 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !Crea
                 else => return err,
             };
             defer alloc.free(validated_schema);
-            req.schema_json = try normalizeSchemaVersion(alloc, validated_schema, 0);
+            const normalized_schema = normalizeSchemaVersion(alloc, validated_schema, 0) catch |err| switch (err) {
+                error.InvalidSchemaUpdateRequest => return error.InvalidCreateTableRequest,
+                else => return err,
+            };
+            var normalized_schema_owned = true;
+            errdefer if (normalized_schema_owned) alloc.free(normalized_schema);
+            validateRuntimeDerivableSchemaJson(alloc, normalized_schema) catch |err| switch (err) {
+                error.InvalidSchemaUpdateRequest => return error.InvalidCreateTableRequest,
+                else => return err,
+            };
+            req.schema_json = normalized_schema;
+            normalized_schema_owned = false;
         }
     }
     if (root.get("replication_sources")) |value| {
@@ -862,8 +887,12 @@ pub fn applySchemaUpdateRecord(
     const next_version = if (doc_schemas_changed) current_version + 1 else current_version;
 
     const normalized_schema_json = try normalizeSchemaVersion(alloc, schema_json, next_version);
+    var normalized_schema_json_owned = true;
+    errdefer if (normalized_schema_json_owned) alloc.free(normalized_schema_json);
+    try validateRuntimeDerivableSchemaJson(alloc, normalized_schema_json);
     alloc.free(updated.schema_json);
     updated.schema_json = normalized_schema_json;
+    normalized_schema_json_owned = false;
 
     if (!doc_schemas_changed) return updated;
 
@@ -880,6 +909,14 @@ pub fn applySchemaUpdateRecord(
     alloc.free(updated.indexes_json);
     updated.indexes_json = next_indexes_json;
     return updated;
+}
+
+fn validateRuntimeDerivableSchemaJson(alloc: std.mem.Allocator, schema_json: []const u8) !void {
+    var parsed_schema = try parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+
+    const runtime_schema = try deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer runtime_schema_mod.freeSchema(alloc, runtime_schema);
 }
 
 pub fn routeQueryRequestToActiveReadIndex(
@@ -937,11 +974,467 @@ fn buildTableStatus(
             .read_schema = try parseTableSchema(alloc, table.read_schema_json),
         } else null,
         .replication_sources = try parseReplicationSources(alloc, snapshot, table, include_replication_runtime),
+        .field_capabilities = try generatedFieldCapabilitiesAlloc(alloc, table, storage_status),
         .storage_status = .{
             .disk_usage = 0,
             .empty = empty,
             .lsm = lsm_status,
         },
+    };
+}
+
+fn generatedFieldCapabilitiesAlloc(
+    alloc: std.mem.Allocator,
+    table: *const metadata_table_manager.TableRecord,
+    storage_status: ?TableStorageStatus,
+) !?[]const metadata_openapi.FieldCapability {
+    const schema_json = if (table.read_schema_json.len > 0) table.read_schema_json else effectiveSchemaJson(table.schema_json);
+    var parsed_schema = schema_mod.parseValidatedTableSchema(alloc, schema_json) catch return null;
+    defer parsed_schema.deinit(alloc);
+
+    const runtime_schema = schema_mod.deriveRuntimeTableSchema(alloc, parsed_schema) catch return null;
+    defer runtime_schema_mod.freeSchema(alloc, runtime_schema);
+
+    const schema_capabilities = try runtime_schema_mod.fieldCapabilitiesAlloc(alloc, runtime_schema);
+    defer runtime_schema_mod.freeFieldCapabilities(alloc, schema_capabilities);
+
+    var out = std.ArrayListUnmanaged(GeneratedFieldCapability).empty;
+    var capability_index = GeneratedFieldCapabilityIndex.empty;
+    defer freeGeneratedFieldCapabilityIndex(alloc, &capability_index);
+    errdefer freeGeneratedFieldCapabilitiesFromList(alloc, &out);
+    for (schema_capabilities) |capability| {
+        try appendGeneratedFieldCapability(alloc, &out, &capability_index, try generatedFieldCapabilityAlloc(alloc, capability));
+    }
+
+    for (observedDynamicFieldCapabilitySetsFromStatus(storage_status)) |set| {
+        for (set.field_capabilities) |capability| {
+            try appendRuntimeGeneratedFieldCapability(alloc, &out, &capability_index, try generatedFieldCapabilityAlloc(alloc, capability));
+        }
+    }
+
+    return try generatedFieldCapabilitiesPublicSliceAlloc(alloc, &out);
+}
+
+const GeneratedFieldCapability = struct {
+    name: ?[]const u8 = null,
+    field: ?[]const u8 = null,
+    path_pattern: ?[]const u8 = null,
+    field_pattern: ?[]const u8 = null,
+    match_mapping_type: ?[]const u8 = null,
+    emitted_name: ?[]const u8 = null,
+    document_schema: ?[]const u8 = null,
+    type: metadata_openapi.AntflyType,
+    query_modes: []const []const u8,
+    sortable: bool,
+    doc_value_coverage: []const u8,
+    provenance: []const u8,
+    missing_null_policy: []const u8,
+    queryability_state: []const u8,
+    sort_lifecycle_state: []const u8,
+    analyzer: ?[]const u8 = null,
+    index_sort_position: ?i64 = null,
+    index_sort_order: ?[]const u8 = null,
+};
+
+const GeneratedFieldCapabilityIndex = std.StringHashMapUnmanaged(usize);
+
+fn appendGeneratedFieldCapability(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(GeneratedFieldCapability),
+    capability_index: *GeneratedFieldCapabilityIndex,
+    capability: GeneratedFieldCapability,
+) !void {
+    const owned = capability;
+    var owned_in_list = false;
+    errdefer if (!owned_in_list) freeGeneratedFieldCapability(alloc, owned);
+    const key = try generatedFieldCapabilityAggregationKeyAlloc(alloc, owned);
+    var key_owned = true;
+    errdefer if (key_owned) alloc.free(key);
+    if (capability_index.get(key)) |existing_index| {
+        const existing = &out.items[existing_index];
+        std.debug.assert(generatedFieldCapabilityAggregationKeyEqual(existing.*, owned));
+        try mergeGeneratedFieldCapability(alloc, existing, owned);
+        alloc.free(key);
+        key_owned = false;
+        freeGeneratedFieldCapability(alloc, owned);
+        return;
+    }
+    var key_in_index = false;
+    errdefer if (key_in_index) {
+        _ = capability_index.remove(key);
+        alloc.free(key);
+    };
+    try capability_index.put(alloc, key, out.items.len);
+    key_owned = false;
+    key_in_index = true;
+    try out.append(alloc, owned);
+    owned_in_list = true;
+}
+
+fn appendRuntimeGeneratedFieldCapability(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(GeneratedFieldCapability),
+    capability_index: *GeneratedFieldCapabilityIndex,
+    capability: GeneratedFieldCapability,
+) !void {
+    const owned = capability;
+    var owned_in_list = false;
+    errdefer if (!owned_in_list) freeGeneratedFieldCapability(alloc, owned);
+    const key = try generatedFieldCapabilityAggregationKeyAlloc(alloc, owned);
+    var key_owned = true;
+    errdefer if (key_owned) alloc.free(key);
+    if (capability_index.get(key)) |existing_index| {
+        const existing = &out.items[existing_index];
+        std.debug.assert(generatedFieldCapabilityAggregationKeyEqual(existing.*, owned));
+        if (runtimeCapabilityCanPromoteSchemaDeclaration(existing.*, owned)) {
+            try replaceOwnedStringIfDifferent(alloc, &existing.doc_value_coverage, owned.doc_value_coverage);
+            try replaceOwnedStringIfDifferent(alloc, &existing.queryability_state, owned.queryability_state);
+            try replaceOwnedStringIfDifferent(alloc, &existing.sort_lifecycle_state, owned.sort_lifecycle_state);
+            alloc.free(key);
+            key_owned = false;
+            freeGeneratedFieldCapability(alloc, owned);
+            return;
+        }
+        try mergeGeneratedFieldCapability(alloc, existing, owned);
+        alloc.free(key);
+        key_owned = false;
+        freeGeneratedFieldCapability(alloc, owned);
+        return;
+    }
+    var key_in_index = false;
+    errdefer if (key_in_index) {
+        _ = capability_index.remove(key);
+        alloc.free(key);
+    };
+    try capability_index.put(alloc, key, out.items.len);
+    key_owned = false;
+    key_in_index = true;
+    try out.append(alloc, owned);
+    owned_in_list = true;
+}
+
+fn runtimeCapabilityCanPromoteSchemaDeclaration(
+    existing: GeneratedFieldCapability,
+    incoming: GeneratedFieldCapability,
+) bool {
+    return std.mem.eql(u8, existing.doc_value_coverage, "schema_declared") and
+        std.mem.eql(u8, existing.queryability_state, "declared") and
+        std.mem.eql(u8, incoming.doc_value_coverage, "covered") and
+        std.mem.eql(u8, incoming.queryability_state, "queryable") and
+        !std.mem.eql(u8, incoming.provenance, "observed_dynamic") and
+        generatedFieldCapabilityPromotionSurfaceEqual(existing, incoming);
+}
+
+fn generatedFieldCapabilityPromotionSurfaceEqual(
+    left: GeneratedFieldCapability,
+    right: GeneratedFieldCapability,
+) bool {
+    return queryModesEqual(left.query_modes, right.query_modes) and
+        left.sortable == right.sortable and
+        std.mem.eql(u8, left.missing_null_policy, right.missing_null_policy) and
+        left.index_sort_position == right.index_sort_position and
+        optionalStringEql(left.index_sort_order, right.index_sort_order);
+}
+
+fn queryModesEqual(left: []const []const u8, right: []const []const u8) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |left_mode, right_mode| {
+        if (!std.mem.eql(u8, left_mode, right_mode)) return false;
+    }
+    return true;
+}
+
+fn generatedFieldCapabilityAggregationKeyEqual(
+    left: GeneratedFieldCapability,
+    right: GeneratedFieldCapability,
+) bool {
+    return optionalStringEql(left.field, right.field) and
+        optionalStringEql(left.name, right.name) and
+        optionalStringEql(left.path_pattern, right.path_pattern) and
+        optionalStringEql(left.field_pattern, right.field_pattern) and
+        optionalStringEql(left.match_mapping_type, right.match_mapping_type) and
+        optionalStringEql(left.emitted_name, right.emitted_name) and
+        optionalStringEql(left.document_schema, right.document_schema) and
+        left.type == right.type and
+        std.mem.eql(u8, left.provenance, right.provenance) and
+        optionalStringEql(left.analyzer, right.analyzer);
+}
+
+fn generatedFieldCapabilityAggregationKeyAlloc(
+    alloc: std.mem.Allocator,
+    capability: GeneratedFieldCapability,
+) ![]const u8 {
+    var key = std.ArrayListUnmanaged(u8).empty;
+    errdefer key.deinit(alloc);
+
+    try appendCapabilityKeyPart(alloc, &key, capability.field);
+    try appendCapabilityKeyPart(alloc, &key, capability.name);
+    try appendCapabilityKeyPart(alloc, &key, capability.path_pattern);
+    try appendCapabilityKeyPart(alloc, &key, capability.field_pattern);
+    try appendCapabilityKeyPart(alloc, &key, capability.match_mapping_type);
+    try appendCapabilityKeyPart(alloc, &key, capability.emitted_name);
+    try appendCapabilityKeyPart(alloc, &key, capability.document_schema);
+    try appendCapabilityKeyPart(alloc, &key, @tagName(capability.type));
+    try appendCapabilityKeyPart(alloc, &key, capability.provenance);
+    try appendCapabilityKeyPart(alloc, &key, capability.analyzer);
+
+    return try key.toOwnedSlice(alloc);
+}
+
+fn appendCapabilityKeyPart(
+    alloc: std.mem.Allocator,
+    key: *std.ArrayListUnmanaged(u8),
+    value: ?[]const u8,
+) !void {
+    if (value) |text| {
+        var len_buf: [20]u8 = undefined;
+        const len_text = std.fmt.bufPrint(&len_buf, "{d}", .{text.len}) catch unreachable;
+        try key.appendSlice(alloc, len_text);
+        try key.append(alloc, ':');
+        try key.appendSlice(alloc, text);
+        try key.append(alloc, '|');
+    } else {
+        try key.appendSlice(alloc, "-:|");
+    }
+}
+
+fn freeGeneratedFieldCapabilityIndex(
+    alloc: std.mem.Allocator,
+    capability_index: *GeneratedFieldCapabilityIndex,
+) void {
+    var it = capability_index.keyIterator();
+    while (it.next()) |key| alloc.free(@constCast(key.*));
+    capability_index.deinit(alloc);
+    capability_index.* = .empty;
+}
+
+fn mergeGeneratedFieldCapability(
+    alloc: std.mem.Allocator,
+    existing: *GeneratedFieldCapability,
+    incoming: GeneratedFieldCapability,
+) !void {
+    try intersectOwnedQueryModes(alloc, &existing.query_modes, incoming.query_modes);
+    existing.sortable = existing.sortable and incoming.sortable;
+    try replaceOwnedStringIfDifferent(alloc, &existing.doc_value_coverage, runtime_schema_mod.conservativeDocValueCoverage(existing.doc_value_coverage, incoming.doc_value_coverage));
+    try replaceOwnedStringIfDifferent(alloc, &existing.queryability_state, runtime_schema_mod.conservativeQueryabilityState(existing.queryability_state, incoming.queryability_state));
+    try replaceOwnedStringIfDifferent(alloc, &existing.sort_lifecycle_state, runtime_schema_mod.conservativeSortLifecycleState(existing.sort_lifecycle_state, incoming.sort_lifecycle_state));
+    if (!std.mem.eql(u8, existing.missing_null_policy, incoming.missing_null_policy)) {
+        try replaceOwnedStringIfDifferent(alloc, &existing.missing_null_policy, "mixed");
+    }
+    if (existing.index_sort_position != incoming.index_sort_position or
+        !optionalStringEql(existing.index_sort_order, incoming.index_sort_order))
+    {
+        existing.index_sort_position = null;
+        if (existing.index_sort_order) |order| alloc.free(@constCast(order));
+        existing.index_sort_order = null;
+    }
+}
+
+fn intersectOwnedQueryModes(
+    alloc: std.mem.Allocator,
+    target: *[]const []const u8,
+    incoming: []const []const u8,
+) !void {
+    var intersection = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer freeOwnedStringSliceFromList(alloc, &intersection);
+    for (target.*) |mode| {
+        if (!stringSliceContains(incoming, mode)) continue;
+        try intersection.append(alloc, try alloc.dupe(u8, mode));
+    }
+    freeOwnedStringSlice(alloc, target.*);
+    target.* = if (intersection.items.len == 0) empty: {
+        intersection.deinit(alloc);
+        break :empty &.{};
+    } else try intersection.toOwnedSlice(alloc);
+}
+
+fn stringSliceContains(values: []const []const u8, needle: []const u8) bool {
+    for (values) |value| {
+        if (std.mem.eql(u8, value, needle)) return true;
+    }
+    return false;
+}
+
+fn freeOwnedStringSliceFromList(alloc: std.mem.Allocator, values: *std.ArrayListUnmanaged([]const u8)) void {
+    for (values.items) |value| alloc.free(@constCast(value));
+    values.deinit(alloc);
+}
+
+fn generatedFieldCapabilitiesPublicSliceAlloc(
+    alloc: std.mem.Allocator,
+    capabilities: *std.ArrayListUnmanaged(GeneratedFieldCapability),
+) ![]const metadata_openapi.FieldCapability {
+    const public = try alloc.alloc(metadata_openapi.FieldCapability, capabilities.items.len);
+    errdefer alloc.free(public);
+    for (capabilities.items, 0..) |capability, i| {
+        public[i] = .{
+            .name = capability.name,
+            .field = capability.field,
+            .path_pattern = capability.path_pattern,
+            .field_pattern = capability.field_pattern,
+            .match_mapping_type = capability.match_mapping_type,
+            .emitted_name = capability.emitted_name,
+            .document_schema = capability.document_schema,
+            .type = capability.type,
+            .query_modes = capability.query_modes,
+            .sortable = capability.sortable,
+            .provenance = capability.provenance,
+            .missing_null_policy = capability.missing_null_policy,
+            .sort_lifecycle_state = capability.sort_lifecycle_state,
+            .analyzer = capability.analyzer,
+            .index_sort_position = capability.index_sort_position,
+            .index_sort_order = capability.index_sort_order,
+        };
+        if (capability.doc_value_coverage.len > 0) alloc.free(@constCast(capability.doc_value_coverage));
+        if (capability.queryability_state.len > 0) alloc.free(@constCast(capability.queryability_state));
+    }
+    capabilities.deinit(alloc);
+    return public;
+}
+
+fn optionalStringEql(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return std.mem.eql(u8, left.?, right.?);
+}
+
+fn generatedFieldCapabilityAlloc(alloc: std.mem.Allocator, capability: runtime_schema_mod.FieldCapability) !GeneratedFieldCapability {
+    var owned = GeneratedFieldCapability{
+        .type = generatedAntflyType(capability.field_type),
+        .query_modes = try dupeStringSlice(alloc, queryModesForFieldCapability(capability)),
+        .sortable = capability.sortable,
+        .doc_value_coverage = "",
+        .provenance = "",
+        .missing_null_policy = "",
+        .queryability_state = "",
+        .sort_lifecycle_state = "",
+        .index_sort_position = if (capability.index_sort) |membership| @intCast(membership.position) else null,
+    };
+    errdefer freeGeneratedFieldCapability(alloc, owned);
+
+    owned.name = try dupeOptionalString(alloc, capability.name);
+    owned.field = try dupeOptionalString(alloc, capability.field);
+    owned.path_pattern = try dupeOptionalString(alloc, capability.path_pattern);
+    owned.field_pattern = try dupeOptionalString(alloc, capability.field_pattern);
+    owned.match_mapping_type = try dupeOptionalString(alloc, capability.match_mapping_type);
+    owned.emitted_name = try dupeOptionalString(alloc, capability.emitted_name);
+    owned.document_schema = try dupeOptionalString(alloc, capability.document_schema);
+    owned.doc_value_coverage = try alloc.dupe(u8, capability.doc_value_coverage);
+    owned.provenance = try alloc.dupe(u8, capability.provenance);
+    owned.missing_null_policy = try alloc.dupe(u8, capability.missing_null_policy);
+    owned.queryability_state = try alloc.dupe(u8, capability.queryability_state);
+    owned.sort_lifecycle_state = try alloc.dupe(u8, capability.sort_lifecycle_state);
+    owned.analyzer = try dupeOptionalString(alloc, capability.analyzer);
+    owned.index_sort_order = if (capability.index_sort) |membership| try alloc.dupe(u8, if (membership.desc) "desc" else "asc") else null;
+    return owned;
+}
+
+fn dupeOptionalString(alloc: std.mem.Allocator, value: ?[]const u8) !?[]const u8 {
+    return if (value) |text| try alloc.dupe(u8, text) else null;
+}
+
+fn replaceOwnedStringIfDifferent(alloc: std.mem.Allocator, target: *[]const u8, value: []const u8) !void {
+    if (std.mem.eql(u8, target.*, value)) return;
+    const owned = try alloc.dupe(u8, value);
+    alloc.free(@constCast(target.*));
+    target.* = owned;
+}
+
+fn dupeStringSlice(alloc: std.mem.Allocator, values: []const []const u8) ![]const []const u8 {
+    if (values.len == 0) return &.{};
+    const out = try alloc.alloc([]const u8, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |value| alloc.free(@constCast(value));
+        alloc.free(out);
+    }
+    for (values, 0..) |value, i| {
+        out[i] = try alloc.dupe(u8, value);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn freeOwnedStringSlice(alloc: std.mem.Allocator, values: []const []const u8) void {
+    for (values) |value| alloc.free(@constCast(value));
+    if (values.len > 0) alloc.free(@constCast(values));
+}
+
+fn freeGeneratedFieldCapabilitiesFromList(
+    alloc: std.mem.Allocator,
+    capabilities: *std.ArrayListUnmanaged(GeneratedFieldCapability),
+) void {
+    for (capabilities.items) |capability| freeGeneratedFieldCapability(alloc, capability);
+    capabilities.deinit(alloc);
+}
+
+fn freeGeneratedFieldCapabilities(
+    alloc: std.mem.Allocator,
+    capabilities: []const metadata_openapi.FieldCapability,
+) void {
+    for (capabilities) |capability| freePublicGeneratedFieldCapability(alloc, capability);
+    if (capabilities.len > 0) alloc.free(@constCast(capabilities));
+}
+
+fn freePublicGeneratedFieldCapability(alloc: std.mem.Allocator, capability: metadata_openapi.FieldCapability) void {
+    if (capability.name) |value| alloc.free(@constCast(value));
+    if (capability.field) |value| alloc.free(@constCast(value));
+    if (capability.path_pattern) |value| alloc.free(@constCast(value));
+    if (capability.field_pattern) |value| alloc.free(@constCast(value));
+    if (capability.match_mapping_type) |value| alloc.free(@constCast(value));
+    if (capability.emitted_name) |value| alloc.free(@constCast(value));
+    if (capability.document_schema) |value| alloc.free(@constCast(value));
+    freeOwnedStringSlice(alloc, capability.query_modes);
+    if (capability.provenance.len > 0) alloc.free(@constCast(capability.provenance));
+    if (capability.missing_null_policy.len > 0) alloc.free(@constCast(capability.missing_null_policy));
+    if (capability.sort_lifecycle_state.len > 0) alloc.free(@constCast(capability.sort_lifecycle_state));
+    if (capability.analyzer) |value| alloc.free(@constCast(value));
+    if (capability.index_sort_order) |value| alloc.free(@constCast(value));
+}
+
+fn freeGeneratedFieldCapability(alloc: std.mem.Allocator, capability: GeneratedFieldCapability) void {
+    if (capability.name) |value| alloc.free(@constCast(value));
+    if (capability.field) |value| alloc.free(@constCast(value));
+    if (capability.path_pattern) |value| alloc.free(@constCast(value));
+    if (capability.field_pattern) |value| alloc.free(@constCast(value));
+    if (capability.match_mapping_type) |value| alloc.free(@constCast(value));
+    if (capability.emitted_name) |value| alloc.free(@constCast(value));
+    if (capability.document_schema) |value| alloc.free(@constCast(value));
+    freeOwnedStringSlice(alloc, capability.query_modes);
+    if (capability.doc_value_coverage.len > 0) alloc.free(@constCast(capability.doc_value_coverage));
+    if (capability.provenance.len > 0) alloc.free(@constCast(capability.provenance));
+    if (capability.missing_null_policy.len > 0) alloc.free(@constCast(capability.missing_null_policy));
+    if (capability.queryability_state.len > 0) alloc.free(@constCast(capability.queryability_state));
+    if (capability.sort_lifecycle_state.len > 0) alloc.free(@constCast(capability.sort_lifecycle_state));
+    if (capability.analyzer) |value| alloc.free(@constCast(value));
+    if (capability.index_sort_order) |value| alloc.free(@constCast(value));
+}
+
+fn queryModesForFieldCapability(capability: runtime_schema_mod.FieldCapability) []const []const u8 {
+    return switch (capability.field_type) {
+        .text, .html => if (capability.searchable) &.{"full_text"} else &.{},
+        .search_as_you_type => if (capability.searchable) &.{ "full_text", "autocomplete" } else &.{"autocomplete"},
+        .keyword, .link => if (capability.filterable) &.{"exact"} else &.{},
+        .numeric, .datetime => if (capability.filterable) &.{ "exact", "range" } else &.{},
+        .boolean => if (capability.filterable) &.{"exact"} else &.{},
+        .geopoint, .geoshape => if (capability.filterable) &.{"geo"} else &.{},
+        .embedding, .blob => &.{},
+    };
+}
+
+fn generatedAntflyType(value: runtime_schema_mod.AntflyType) metadata_openapi.AntflyType {
+    return switch (value) {
+        .search_as_you_type => .search_as_you_type,
+        .keyword => .keyword,
+        .text => .text,
+        .html => .html,
+        .numeric => .numeric,
+        .embedding => .embedding,
+        .link => .link,
+        .boolean => .boolean,
+        .datetime => .datetime,
+        .geopoint => .geopoint,
+        .geoshape => .geoshape,
+        .blob => .blob,
     };
 }
 
@@ -1361,6 +1854,7 @@ fn cloneJsonValueAlloc(alloc: std.mem.Allocator, value: std.json.Value) !std.jso
 fn buildTableRuntimeSchemaDebug(
     alloc: std.mem.Allocator,
     table: *const metadata_table_manager.TableRecord,
+    storage_status: ?TableStorageStatus,
 ) !TableRuntimeSchemaDebug {
     const runtime_schemas = try alloc.alloc(RuntimeSchemaDebugSchemaEntry, 2);
     runtime_schemas[0] = try buildTableSchemaDebugEntry(alloc, "active", table.schema_json);
@@ -1371,7 +1865,7 @@ fn buildTableRuntimeSchemaDebug(
     try annotateAlgebraicCapabilityLifecycle(alloc, table.schema_json, table.read_schema_json, algebraic_capabilities);
     return .{
         .runtime_schemas = runtime_schemas,
-        .full_text_index_bindings = try buildFullTextIndexBindings(alloc, table),
+        .full_text_index_bindings = try buildFullTextIndexBindings(alloc, table, observedDynamicFieldCapabilitySetsFromStatus(storage_status)),
         .algebraic_capabilities = algebraic_capabilities,
     };
 }
@@ -1382,7 +1876,7 @@ fn encodeTableRuntimeSchemaDebug(
 ) ![]u8 {
     var arena_impl = std.heap.ArenaAllocator.init(alloc);
     defer arena_impl.deinit();
-    const debug = try buildTableRuntimeSchemaDebug(arena_impl.allocator(), table);
+    const debug = try buildTableRuntimeSchemaDebug(arena_impl.allocator(), table, null);
     return try std.json.Stringify.valueAlloc(alloc, debug, .{ .emit_null_optional_fields = false });
 }
 
@@ -1390,9 +1884,10 @@ fn buildTableIndexRuntimeSchemaDebug(
     alloc: std.mem.Allocator,
     table: *const metadata_table_manager.TableRecord,
     index_name: []const u8,
+    observed_sets: []const table_reads.ObservedDynamicFieldCapabilitySet,
 ) !IndexRuntimeSchemaDebug {
     return .{
-        .binding = try buildSingleIndexBinding(alloc, table, index_name),
+        .binding = try buildSingleIndexBinding(alloc, table, index_name, observed_sets),
     };
 }
 
@@ -1401,7 +1896,16 @@ pub fn buildTableIndexRuntimeSchemaDebugValue(
     table: *const metadata_table_manager.TableRecord,
     index_name: []const u8,
 ) !std.json.Value {
-    const debug = try buildTableIndexRuntimeSchemaDebug(alloc, table, index_name);
+    return try buildTableIndexRuntimeSchemaDebugValueWithObserved(alloc, table, index_name, &.{});
+}
+
+pub fn buildTableIndexRuntimeSchemaDebugValueWithObserved(
+    alloc: std.mem.Allocator,
+    table: *const metadata_table_manager.TableRecord,
+    index_name: []const u8,
+    observed_sets: []const table_reads.ObservedDynamicFieldCapabilitySet,
+) !std.json.Value {
+    const debug = try buildTableIndexRuntimeSchemaDebug(alloc, table, index_name, observed_sets);
     var object = std.json.ObjectMap.empty;
     errdefer {
         var value: std.json.Value = .{ .object = object };
@@ -1442,7 +1946,26 @@ fn jsonValueFromRuntimeSchemaDebugBinding(
     if (binding.runtime_schema) |runtime_schema| {
         try object.put(alloc, try alloc.dupe(u8, "runtime_schema"), try cloneJsonValueAlloc(alloc, runtime_schema));
     }
+    if (binding.observed_dynamic_field_capabilities) |capabilities| {
+        try object.put(alloc, try alloc.dupe(u8, "observed_dynamic_field_capabilities"), try cloneJsonValueAlloc(alloc, capabilities));
+    }
     return .{ .object = object };
+}
+
+fn observedDynamicFieldCapabilitySetsFromStatus(
+    storage_status: ?TableStorageStatus,
+) []const table_reads.ObservedDynamicFieldCapabilitySet {
+    return if (storage_status) |status| status.observed_dynamic_field_capability_sets else &.{};
+}
+
+fn observedDynamicFieldCapabilitiesForIndex(
+    observed_sets: []const table_reads.ObservedDynamicFieldCapabilitySet,
+    index_name: []const u8,
+) ?[]const runtime_schema_mod.FieldCapability {
+    for (observed_sets) |set| {
+        if (std.mem.eql(u8, set.index_name, index_name)) return set.field_capabilities;
+    }
+    return null;
 }
 
 fn buildTableSchemaDebugEntry(
@@ -1595,6 +2118,7 @@ fn countAlgebraicRole(
 fn buildFullTextIndexBindings(
     alloc: std.mem.Allocator,
     table: *const metadata_table_manager.TableRecord,
+    observed_sets: []const table_reads.ObservedDynamicFieldCapabilitySet,
 ) ![]RuntimeSchemaDebugBinding {
     const source = if (table.indexes_json.len > 0) table.indexes_json else default_indexes_json;
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, source, .{});
@@ -1615,7 +2139,7 @@ fn buildFullTextIndexBindings(
     var index: usize = 0;
     while (it.next()) |entry| {
         if (!isFullTextIndexConfig(entry.value_ptr.*)) continue;
-        bindings[index] = try buildSingleIndexBinding(alloc, table, entry.key_ptr.*);
+        bindings[index] = try buildSingleIndexBinding(alloc, table, entry.key_ptr.*, observed_sets);
         index += 1;
     }
     return bindings;
@@ -1625,6 +2149,7 @@ fn buildSingleIndexBinding(
     alloc: std.mem.Allocator,
     table: *const metadata_table_manager.TableRecord,
     index_name: []const u8,
+    observed_sets: []const table_reads.ObservedDynamicFieldCapabilitySet,
 ) !RuntimeSchemaDebugBinding {
     const binding = try resolveFullTextIndexBinding(alloc, table, index_name);
     defer if (binding.runtime_schema_json) |value| alloc.free(value);
@@ -1635,6 +2160,10 @@ fn buildSingleIndexBinding(
         .schema_slot = binding.schema_slot,
         .runtime_schema = if (binding.runtime_schema_json) |runtime_schema_json|
             try parseJsonValueAlloc(alloc, runtime_schema_json)
+        else
+            null,
+        .observed_dynamic_field_capabilities = if (observedDynamicFieldCapabilitiesForIndex(observed_sets, index_name)) |capabilities|
+            try runtimeFieldCapabilitiesJsonValueAlloc(alloc, capabilities)
         else
             null,
     };
@@ -1751,6 +2280,20 @@ fn runtimeSchemaJsonAlloc(
     return try out.toOwnedSlice(alloc);
 }
 
+fn runtimeFieldCapabilitiesJsonValueAlloc(
+    alloc: std.mem.Allocator,
+    capabilities: []const runtime_schema_mod.FieldCapability,
+) !std.json.Value {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    try out.append(alloc, '[');
+    for (capabilities, 0..) |capability, i| {
+        try appendRuntimeFieldCapability(alloc, &out, i > 0, capability);
+    }
+    try out.append(alloc, ']');
+    return try parseJsonValueAlloc(alloc, out.items);
+}
+
 fn appendRuntimeSchemaObject(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -1770,7 +2313,18 @@ fn appendRuntimeSchemaObject(
     const ttl_text = try std.fmt.allocPrint(alloc, "{d}", .{schema.ttl_duration_ns});
     defer alloc.free(ttl_text);
     try out.appendSlice(alloc, ttl_text);
-    try out.appendSlice(alloc, ",\"dynamic_templates\":[");
+    try out.appendSlice(alloc, ",\"index_sort\":[");
+    for (schema.index_sort, 0..) |field, i| {
+        if (i > 0) try out.append(alloc, ',');
+        try out.append(alloc, '{');
+        try appendJsonString(alloc, out, "field");
+        try out.append(alloc, ':');
+        try appendJsonString(alloc, out, field.field);
+        try out.appendSlice(alloc, ",\"order\":");
+        try appendJsonString(alloc, out, if (field.desc) "desc" else "asc");
+        try out.append(alloc, '}');
+    }
+    try out.appendSlice(alloc, "],\"dynamic_templates\":[");
     for (schema.dynamic_templates, 0..) |tmpl, i| {
         if (i > 0) try out.append(alloc, ',');
         try out.append(alloc, '{');
@@ -1805,14 +2359,18 @@ fn appendRuntimeSchemaObject(
         try out.appendSlice(alloc, if (tmpl.mapping.do_index) "true" else "false");
         try out.appendSlice(alloc, ",\"store\":");
         try out.appendSlice(alloc, if (tmpl.mapping.store) "true" else "false");
-        try out.appendSlice(alloc, ",\"doc_values\":");
-        try out.appendSlice(alloc, if (tmpl.mapping.doc_values) "true" else "false");
+        try out.appendSlice(alloc, ",\"sortable\":");
+        try out.appendSlice(alloc, if (tmpl.mapping.sortable) "true" else "false");
+        try out.appendSlice(alloc, ",\"missing_null_policy\":");
+        try appendJsonString(alloc, out, runtime_schema_mod.missingNullPolicyName(tmpl.mapping.missing_null_policy));
         try out.appendSlice(alloc, ",\"include_in_all\":");
         try out.appendSlice(alloc, if (tmpl.mapping.include_in_all) "true" else "false");
         try out.appendSlice(alloc, ",\"analyzer\":");
         try appendJsonString(alloc, out, tmpl.mapping.analyzer);
         try out.appendSlice(alloc, "}}");
     }
+    try out.appendSlice(alloc, "],\"field_capabilities\":[");
+    try appendRuntimeFieldCapabilities(alloc, out, schema);
     try out.appendSlice(alloc, "],\"full_text_documents\":[");
     for (schema.full_text_documents, 0..) |doc, doc_idx| {
         if (doc_idx > 0) try out.append(alloc, ',');
@@ -1871,6 +2429,92 @@ fn appendRuntimeSchemaObject(
         try out.appendSlice(alloc, "]}");
     }
     try out.appendSlice(alloc, "]}");
+}
+
+fn appendRuntimeFieldCapabilities(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    schema: runtime_schema_mod.TableSchema,
+) !void {
+    const capabilities = try runtime_schema_mod.fieldCapabilitiesAlloc(alloc, schema);
+    defer runtime_schema_mod.freeFieldCapabilities(alloc, capabilities);
+
+    for (capabilities, 0..) |capability, i| {
+        try appendRuntimeFieldCapability(alloc, out, i > 0, capability);
+    }
+}
+
+fn appendRuntimeFieldCapability(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    needs_comma: bool,
+    capability: runtime_schema_mod.FieldCapability,
+) !void {
+    if (needs_comma) try out.append(alloc, ',');
+    try out.append(alloc, '{');
+
+    var field_count: usize = 0;
+    try appendOptionalJsonStringField(alloc, out, "name", capability.name, &field_count);
+    try appendOptionalJsonStringField(alloc, out, "field", capability.field, &field_count);
+    try appendOptionalJsonStringField(alloc, out, "path_pattern", capability.path_pattern, &field_count);
+    try appendOptionalJsonStringField(alloc, out, "field_pattern", capability.field_pattern, &field_count);
+    try appendOptionalJsonStringField(alloc, out, "match_mapping_type", capability.match_mapping_type, &field_count);
+    try appendOptionalJsonStringField(alloc, out, "emitted_name", capability.emitted_name, &field_count);
+    try appendOptionalJsonStringField(alloc, out, "document_schema", capability.document_schema, &field_count);
+    if (field_count > 0) try out.append(alloc, ',');
+    try appendJsonString(alloc, out, "type");
+    try out.append(alloc, ':');
+    try appendJsonString(alloc, out, antflyTypeName(capability.field_type));
+    try out.appendSlice(alloc, ",\"query_modes\":[");
+    for (queryModesForFieldCapability(capability), 0..) |mode, mode_idx| {
+        if (mode_idx > 0) try out.append(alloc, ',');
+        try appendJsonString(alloc, out, mode);
+    }
+    try out.append(alloc, ']');
+    try out.appendSlice(alloc, ",\"sortable\":");
+    try appendJsonBool(out, alloc, capability.sortable);
+    try out.appendSlice(alloc, ",\"doc_value_coverage\":");
+    try appendJsonString(alloc, out, capability.doc_value_coverage);
+    try out.appendSlice(alloc, ",\"provenance\":");
+    try appendJsonString(alloc, out, capability.provenance);
+    try out.appendSlice(alloc, ",\"missing_null_policy\":");
+    try appendJsonString(alloc, out, capability.missing_null_policy);
+    try out.appendSlice(alloc, ",\"queryability_state\":");
+    try appendJsonString(alloc, out, capability.queryability_state);
+    try out.appendSlice(alloc, ",\"sort_lifecycle_state\":");
+    try appendJsonString(alloc, out, capability.sort_lifecycle_state);
+    if (capability.analyzer) |analyzer| {
+        try out.appendSlice(alloc, ",\"analyzer\":");
+        try appendJsonString(alloc, out, analyzer);
+    }
+    if (capability.index_sort) |membership| {
+        try out.appendSlice(alloc, ",\"index_sort_position\":");
+        const text = try std.fmt.allocPrint(alloc, "{d}", .{membership.position});
+        defer alloc.free(text);
+        try out.appendSlice(alloc, text);
+        try out.appendSlice(alloc, ",\"index_sort_order\":");
+        try appendJsonString(alloc, out, if (membership.desc) "desc" else "asc");
+    }
+    try out.append(alloc, '}');
+}
+
+fn appendOptionalJsonStringField(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    name: []const u8,
+    maybe_value: ?[]const u8,
+    field_count: *usize,
+) !void {
+    const value = maybe_value orelse return;
+    if (field_count.* > 0) try out.append(alloc, ',');
+    field_count.* += 1;
+    try appendJsonString(alloc, out, name);
+    try out.append(alloc, ':');
+    try appendJsonString(alloc, out, value);
+}
+
+fn appendJsonBool(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, value: bool) !void {
+    try out.appendSlice(alloc, if (value) "true" else "false");
 }
 
 fn antflyTypeName(value: runtime_schema_mod.AntflyType) []const u8 {
@@ -2384,6 +3028,445 @@ test "metadata.table status encoder canonicalizes embeddings indexes without inl
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"semantic_kg\":{\"name\":\"semantic_kg\",\"type\":\"embeddings\"") != null);
 }
 
+fn testFieldCapabilityByIdentifier(root: std.json.Value, identifier: []const u8) ?std.json.Value {
+    const capabilities = root.object.get("field_capabilities") orelse return null;
+    if (capabilities != .array) return null;
+    for (capabilities.array.items) |capability| {
+        if (capability != .object) continue;
+        if (capability.object.get("field")) |field| {
+            if (field == .string and std.mem.eql(u8, field.string, identifier)) return capability;
+        }
+        if (capability.object.get("name")) |name| {
+            if (name == .string and std.mem.eql(u8, name.string, identifier)) return capability;
+        }
+    }
+    return null;
+}
+
+fn testGeneratedCapabilityByIdentifier(capabilities: []const metadata_openapi.FieldCapability, identifier: []const u8) ?metadata_openapi.FieldCapability {
+    for (capabilities) |capability| {
+        if (capability.field) |field| {
+            if (std.mem.eql(u8, field, identifier)) return capability;
+        }
+        if (capability.name) |name| {
+            if (std.mem.eql(u8, name, identifier)) return capability;
+        }
+    }
+    return null;
+}
+
+fn testStringSliceContains(values: []const []const u8, expected: []const u8) bool {
+    for (values) |value| {
+        if (std.mem.eql(u8, value, expected)) return true;
+    }
+    return false;
+}
+
+fn testJsonArrayContainsString(value: std.json.Value, expected: []const u8) bool {
+    if (value != .array) return false;
+    for (value.array.items) |item| {
+        if (item == .string and std.mem.eql(u8, item.string, expected)) return true;
+    }
+    return false;
+}
+
+test "metadata.table generated field capabilities include schema dynamic templates" {
+    const schema_json =
+        \\{"version":1,"default_type":"doc","dynamic_templates":[{"name":"created","path_match":"created_at","mapping":{"type":"datetime","sortable":true}}],"index_sort":[{"field":"created_at","order":"desc"}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"string","x-antfly-types":["text"]}}}}}}
+    ;
+    const table = metadata_table_manager.TableRecord{
+        .table_id = 7,
+        .name = "docs",
+        .schema_json = schema_json,
+        .indexes_json = "{}",
+        .replication_sources_json = "[]",
+        .placement_role = "data",
+    };
+
+    const capabilities = (try generatedFieldCapabilitiesAlloc(std.testing.allocator, &table, null)) orelse return error.TestUnexpectedResult;
+    defer freeGeneratedFieldCapabilities(std.testing.allocator, capabilities);
+
+    const created = testGeneratedCapabilityByIdentifier(capabilities, "created") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("created_at", created.path_pattern.?);
+    try std.testing.expectEqual(metadata_openapi.AntflyType.datetime, created.type);
+    try std.testing.expect(testStringSliceContains(created.query_modes, "exact"));
+    try std.testing.expect(testStringSliceContains(created.query_modes, "range"));
+    try std.testing.expect(created.sortable);
+    try std.testing.expectEqualStrings("missing_rejected", created.missing_null_policy);
+    try std.testing.expectEqualStrings("dynamic_template", created.provenance);
+    try std.testing.expectEqual(@as(?i64, 0), created.index_sort_position);
+    try std.testing.expectEqualStrings("desc", created.index_sort_order.?);
+}
+
+test "metadata.table status exposes stable field capabilities" {
+    const schema_json =
+        \\{"version":1,"default_type":"doc","dynamic_templates":[{"name":"created","path_match":"created_at","mapping":{"type":"datetime","sortable":true}}],"index_sort":[{"field":"created_at","order":"desc"}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"string","x-antfly-types":["text"]}}}}}}
+    ;
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs", .schema_json = schema_json, .indexes_json = "{}", .replication_sources_json = "[]", .placement_role = "data" }})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null }})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+    };
+
+    const encoded = (try encodeSingleTableStatus(std.testing.allocator, &snapshot, "docs")).?;
+    defer std.testing.allocator.free(encoded);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+
+    const id_capability = testFieldCapabilityByIdentifier(parsed.value, "_id") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(id_capability.object.get("sortable").?.bool);
+
+    const created = testFieldCapabilityByIdentifier(parsed.value, "created") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("created_at", created.object.get("path_pattern").?.string);
+    try std.testing.expectEqualStrings("datetime", created.object.get("type").?.string);
+    try std.testing.expect(testJsonArrayContainsString(created.object.get("query_modes").?, "exact"));
+    try std.testing.expect(testJsonArrayContainsString(created.object.get("query_modes").?, "range"));
+    try std.testing.expect(created.object.get("sortable").?.bool);
+    try std.testing.expectEqualStrings("missing_rejected", created.object.get("missing_null_policy").?.string);
+    try std.testing.expectEqualStrings("dynamic_template", created.object.get("provenance").?.string);
+    try std.testing.expectEqual(@as(i64, 0), created.object.get("index_sort_position").?.integer);
+    try std.testing.expectEqualStrings("desc", created.object.get("index_sort_order").?.string);
+
+    try std.testing.expectEqualStrings("not_null", id_capability.object.get("missing_null_policy").?.string);
+    try std.testing.expect(testJsonArrayContainsString(id_capability.object.get("query_modes").?, "exact"));
+}
+
+test "metadata.table status includes observed dynamic field capabilities" {
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs", .indexes_json = "{}", .replication_sources_json = "[]", .placement_role = "data" }})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null }})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+    };
+
+    var observed_capabilities = [_]runtime_schema_mod.FieldCapability{
+        runtime_schema_mod.observedDynamicFieldCapability(null, "meta.status", .{
+            .field_type = .keyword,
+            .do_index = true,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        }),
+    };
+    var observed_sets = [_]table_reads.ObservedDynamicFieldCapabilitySet{.{
+        .index_name = @constCast("full_text_index_v0"),
+        .field_capabilities = observed_capabilities[0..],
+    }};
+    const storage_statuses = [_]TableStorageStatus{.{
+        .table_name = "docs",
+        .empty = false,
+        .observed_dynamic_field_capability_sets = observed_sets[0..],
+    }};
+
+    const encoded = (try encodeSingleTableStatusWithStorageStatuses(std.testing.allocator, &snapshot, "docs", storage_statuses[0..])).?;
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"field\":\"meta.status\",\"type\":\"keyword\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"query_modes\":[\"exact\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"provenance\":\"observed_dynamic\"") != null);
+}
+
+test "metadata.table status promotes schema capability when runtime coverage is complete" {
+    const schema_json =
+        \\{"version":1,"default_type":"doc","dynamic_templates":[{"name":"created","path_match":"created_at","mapping":{"type":"datetime","sortable":true}}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"created_at":{"type":"string","format":"date-time"}}}}}}
+    ;
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs", .schema_json = schema_json, .indexes_json = "{}", .replication_sources_json = "[]", .placement_role = "data" }})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null }})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+    };
+
+    const template = runtime_schema_mod.DynamicTemplate{
+        .name = "created",
+        .path_match = "created_at",
+        .mapping = .{
+            .field_type = .datetime,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "standard",
+        },
+    };
+    const runtime_schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &.{template} };
+    var covered = runtime_schema_mod.dynamicTemplateFieldCapability(runtime_schema, template);
+    covered.doc_value_coverage = "covered";
+    covered.queryability_state = "queryable";
+    runtime_schema_mod.refreshSortLifecycleState(&covered);
+    var runtime_capabilities = [_]runtime_schema_mod.FieldCapability{covered};
+    var observed_sets = [_]table_reads.ObservedDynamicFieldCapabilitySet{.{
+        .index_name = @constCast("full_text_index_v0"),
+        .field_capabilities = runtime_capabilities[0..],
+    }};
+    const storage_statuses = [_]TableStorageStatus{.{
+        .table_name = "docs",
+        .empty = false,
+        .observed_dynamic_field_capability_sets = observed_sets[0..],
+    }};
+
+    const encoded = (try encodeSingleTableStatusWithStorageStatuses(std.testing.allocator, &snapshot, "docs", storage_statuses[0..])).?;
+    defer std.testing.allocator.free(encoded);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+    const created = testFieldCapabilityByIdentifier(parsed.value, "created") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("datetime", created.object.get("type").?.string);
+    try std.testing.expect(testJsonArrayContainsString(created.object.get("query_modes").?, "exact"));
+    try std.testing.expect(testJsonArrayContainsString(created.object.get("query_modes").?, "range"));
+    try std.testing.expectEqualStrings("dynamic_template", created.object.get("provenance").?.string);
+    try std.testing.expectEqualStrings("queryable", created.object.get("sort_lifecycle_state").?.string);
+}
+
+test "metadata.table status promotes schema geo capability when runtime coverage is complete" {
+    const schema_json =
+        \\{"version":1,"default_type":"doc","dynamic_templates":[{"name":"location","path_match":"location","mapping":{"type":"geopoint","index":true}}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"location":{"type":"object","x-antfly-field":{"type":"geopoint"}}}}}}}
+    ;
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs", .schema_json = schema_json, .indexes_json = "{}", .replication_sources_json = "[]", .placement_role = "data" }})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null }})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+    };
+
+    const template = runtime_schema_mod.DynamicTemplate{
+        .name = "location",
+        .path_match = "location",
+        .mapping = .{
+            .field_type = .geopoint,
+            .do_index = true,
+            .doc_values = true,
+            .sortable = false,
+            .analyzer = "standard",
+        },
+    };
+    const runtime_schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &.{template} };
+    var covered = runtime_schema_mod.dynamicTemplateFieldCapability(runtime_schema, template);
+    covered.doc_value_coverage = "covered";
+    covered.queryability_state = "queryable";
+    runtime_schema_mod.refreshSortLifecycleState(&covered);
+    var runtime_capabilities = [_]runtime_schema_mod.FieldCapability{covered};
+    var observed_sets = [_]table_reads.ObservedDynamicFieldCapabilitySet{.{
+        .index_name = @constCast("full_text_index_v0"),
+        .field_capabilities = runtime_capabilities[0..],
+    }};
+    const storage_statuses = [_]TableStorageStatus{.{
+        .table_name = "docs",
+        .empty = false,
+        .observed_dynamic_field_capability_sets = observed_sets[0..],
+    }};
+
+    const encoded = (try encodeSingleTableStatusWithStorageStatuses(std.testing.allocator, &snapshot, "docs", storage_statuses[0..])).?;
+    defer std.testing.allocator.free(encoded);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+    const location = testFieldCapabilityByIdentifier(parsed.value, "location") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("geopoint", location.object.get("type").?.string);
+    try std.testing.expect(testJsonArrayContainsString(location.object.get("query_modes").?, "geo"));
+    try std.testing.expect(!location.object.get("sortable").?.bool);
+    try std.testing.expectEqualStrings("dynamic_template", location.object.get("provenance").?.string);
+    try std.testing.expectEqualStrings("unsupported", location.object.get("sort_lifecycle_state").?.string);
+}
+
+test "metadata.table status does not promote mismatched index sort runtime capability" {
+    const schema_json =
+        \\{"version":1,"default_type":"doc","dynamic_templates":[{"name":"created","path_match":"created_at","mapping":{"type":"datetime","sortable":true}}],"index_sort":[{"field":"created_at","order":"desc"}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"created_at":{"type":"string","format":"date-time"}}}}}}
+    ;
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs", .schema_json = schema_json, .indexes_json = "{}", .replication_sources_json = "[]", .placement_role = "data" }})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null }})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+    };
+
+    const template = runtime_schema_mod.DynamicTemplate{
+        .name = "created",
+        .path_match = "created_at",
+        .mapping = .{
+            .field_type = .datetime,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "standard",
+        },
+    };
+    const runtime_schema_without_index_sort = runtime_schema_mod.TableSchema{ .dynamic_templates = &.{template} };
+    var covered_without_index_sort = runtime_schema_mod.dynamicTemplateFieldCapability(runtime_schema_without_index_sort, template);
+    covered_without_index_sort.doc_value_coverage = "covered";
+    covered_without_index_sort.queryability_state = "queryable";
+    runtime_schema_mod.refreshSortLifecycleState(&covered_without_index_sort);
+    var runtime_capabilities = [_]runtime_schema_mod.FieldCapability{covered_without_index_sort};
+    var observed_sets = [_]table_reads.ObservedDynamicFieldCapabilitySet{.{
+        .index_name = @constCast("full_text_index_v0"),
+        .field_capabilities = runtime_capabilities[0..],
+    }};
+    const storage_statuses = [_]TableStorageStatus{.{
+        .table_name = "docs",
+        .empty = false,
+        .observed_dynamic_field_capability_sets = observed_sets[0..],
+    }};
+
+    const encoded = (try encodeSingleTableStatusWithStorageStatuses(std.testing.allocator, &snapshot, "docs", storage_statuses[0..])).?;
+    defer std.testing.allocator.free(encoded);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+    const created = testFieldCapabilityByIdentifier(parsed.value, "created") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("datetime", created.object.get("type").?.string);
+    try std.testing.expectEqualStrings("declared", created.object.get("sort_lifecycle_state").?.string);
+    try std.testing.expect(created.object.get("index_sort_position") == null);
+    try std.testing.expect(created.object.get("index_sort_order") == null);
+}
+
+test "metadata.table status does not advertise changed index sort direction before rebuild" {
+    const schema_json =
+        \\{"version":2,"default_type":"doc","dynamic_templates":[{"name":"created","path_match":"created_at","mapping":{"type":"datetime","sortable":true}}],"index_sort":[{"field":"created_at","order":"asc"}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"created_at":{"type":"string","format":"date-time"}}}}}}
+    ;
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs", .schema_json = schema_json, .indexes_json = "{}", .replication_sources_json = "[]", .placement_role = "data" }})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null }})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+    };
+
+    const template = runtime_schema_mod.DynamicTemplate{
+        .name = "created",
+        .path_match = "created_at",
+        .mapping = .{
+            .field_type = .datetime,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "standard",
+        },
+    };
+    const old_index_sort = [_]runtime_schema_mod.IndexSortField{.{ .field = "created_at", .desc = true }};
+    const old_runtime_schema = runtime_schema_mod.TableSchema{
+        .dynamic_templates = &.{template},
+        .index_sort = &old_index_sort,
+    };
+    var old_covered = runtime_schema_mod.dynamicTemplateFieldCapability(old_runtime_schema, template);
+    old_covered.doc_value_coverage = "covered";
+    old_covered.queryability_state = "queryable";
+    runtime_schema_mod.refreshSortLifecycleState(&old_covered);
+    try std.testing.expectEqualStrings("accelerated", old_covered.sort_lifecycle_state);
+    var runtime_capabilities = [_]runtime_schema_mod.FieldCapability{old_covered};
+    var observed_sets = [_]table_reads.ObservedDynamicFieldCapabilitySet{.{
+        .index_name = @constCast("full_text_index_v0"),
+        .field_capabilities = runtime_capabilities[0..],
+    }};
+    const storage_statuses = [_]TableStorageStatus{.{
+        .table_name = "docs",
+        .empty = false,
+        .observed_dynamic_field_capability_sets = observed_sets[0..],
+    }};
+
+    const encoded = (try encodeSingleTableStatusWithStorageStatuses(std.testing.allocator, &snapshot, "docs", storage_statuses[0..])).?;
+    defer std.testing.allocator.free(encoded);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+    const created = testFieldCapabilityByIdentifier(parsed.value, "created") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("datetime", created.object.get("type").?.string);
+    try std.testing.expect(testJsonArrayContainsString(created.object.get("query_modes").?, "exact"));
+    try std.testing.expect(testJsonArrayContainsString(created.object.get("query_modes").?, "range"));
+    try std.testing.expect(created.object.get("sortable").?.bool);
+    try std.testing.expectEqualStrings("declared", created.object.get("sort_lifecycle_state").?.string);
+    try std.testing.expect(created.object.get("index_sort_position") == null);
+    try std.testing.expect(created.object.get("index_sort_order") == null);
+}
+
+test "metadata.table status merges query modes conservatively" {
+    var queryable = runtime_schema_mod.observedDynamicFieldCapability(null, "price", .{
+        .field_type = .numeric,
+        .do_index = true,
+        .doc_values = true,
+        .sortable = true,
+    });
+    queryable.doc_value_coverage = "covered";
+    queryable.queryability_state = "queryable";
+    runtime_schema_mod.refreshSortLifecycleState(&queryable);
+    const unqueryable = runtime_schema_mod.observedDynamicFieldCapability(null, "price", .{
+        .field_type = .numeric,
+        .do_index = false,
+        .doc_values = true,
+        .sortable = false,
+    });
+
+    var merged = try generatedFieldCapabilityAlloc(std.testing.allocator, queryable);
+    defer freeGeneratedFieldCapability(std.testing.allocator, merged);
+    var incoming = try generatedFieldCapabilityAlloc(std.testing.allocator, unqueryable);
+    defer freeGeneratedFieldCapability(std.testing.allocator, incoming);
+    freeOwnedStringSlice(std.testing.allocator, incoming.query_modes);
+    incoming.query_modes = &.{};
+
+    try std.testing.expect(testStringSliceContains(merged.query_modes, "exact"));
+    try std.testing.expect(testStringSliceContains(merged.query_modes, "range"));
+    try mergeGeneratedFieldCapability(std.testing.allocator, &merged, incoming);
+    try std.testing.expectEqual(@as(usize, 0), merged.query_modes.len);
+    try std.testing.expect(!merged.sortable);
+}
+
+test "metadata.table status merges observed capabilities conservatively" {
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs", .indexes_json = "{}", .replication_sources_json = "[]", .placement_role = "data" }})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null }})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+    };
+
+    var covered = runtime_schema_mod.observedDynamicFieldCapability(null, "price", .{
+        .field_type = .numeric,
+        .do_index = true,
+        .doc_values = true,
+        .sortable = true,
+    });
+    covered.doc_value_coverage = "covered";
+    covered.queryability_state = "queryable";
+    runtime_schema_mod.refreshSortLifecycleState(&covered);
+    const declared = runtime_schema_mod.observedDynamicFieldCapability(null, "price", .{
+        .field_type = .numeric,
+        .do_index = true,
+        .doc_values = true,
+        .sortable = true,
+    });
+    var observed_capabilities = [_]runtime_schema_mod.FieldCapability{ covered, declared };
+    var observed_sets = [_]table_reads.ObservedDynamicFieldCapabilitySet{.{
+        .index_name = @constCast("full_text_index_v0"),
+        .field_capabilities = observed_capabilities[0..],
+    }};
+    const storage_statuses = [_]TableStorageStatus{.{
+        .table_name = "docs",
+        .empty = false,
+        .observed_dynamic_field_capability_sets = observed_sets[0..],
+    }};
+
+    const encoded = (try encodeSingleTableStatusWithStorageStatuses(std.testing.allocator, &snapshot, "docs", storage_statuses[0..])).?;
+    defer std.testing.allocator.free(encoded);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+    const price = testFieldCapabilityByIdentifier(parsed.value, "price") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("numeric", price.object.get("type").?.string);
+    try std.testing.expect(testJsonArrayContainsString(price.object.get("query_modes").?, "exact"));
+    try std.testing.expect(testJsonArrayContainsString(price.object.get("query_modes").?, "range"));
+    try std.testing.expectEqualStrings("indexed", price.object.get("sort_lifecycle_state").?.string);
+    try std.testing.expectEqualStrings("observed_dynamic", price.object.get("provenance").?.string);
+}
+
 test "metadata.table status encoder projects inline enrichment configs as names" {
     const indexes_json =
         \\{
@@ -2424,7 +3507,7 @@ test "metadata.table status encoder projects inline enrichment configs as names"
 
 test "metadata.table debug encoder emits runtime schemas and index bindings" {
     const schema_v1 =
-        \\{"version":1,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"string","x-antfly-types":["text"],"x-antfly-analyzer":"french"}}}}}}
+        \\{"version":1,"default_type":"doc","dynamic_templates":[{"name":"dates","path_match":"created_at","mapping":{"type":"datetime","sortable":true}}],"index_sort":[{"field":"created_at","order":"desc"}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"string","x-antfly-types":["text"],"x-antfly-analyzer":"french"}}}}}}
     ;
     const schema_v0 =
         \\{"version":0,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"name":{"type":"string","x-antfly-types":["search_as_you_type"]}}}}}}
@@ -2456,11 +3539,108 @@ test "metadata.table debug encoder emits runtime schemas and index bindings" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"schema_slot\":\"read\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"schema_slot\":\"active\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"analyzer\":\"french\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"sortable\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"missing_null_policy\":\"missing_rejected\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"index_sort\":[{\"field\":\"created_at\",\"order\":\"desc\"},{\"field\":\"_id\",\"order\":\"asc\"}]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"field_capabilities\":[{\"field\":\"_id\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"field\":\"created_at\",\"path_pattern\":\"created_at\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"query_modes\":[\"exact\",\"range\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"provenance\":\"dynamic_template\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"sort_lifecycle_state\":\"declared\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"index_sort_position\":0,\"index_sort_order\":\"desc\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"field\":\"title\",\"emitted_name\":\"title\",\"document_schema\":\"doc\",\"type\":\"text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"query_modes\":[\"full_text\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"algebraic_capabilities\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"capability_fingerprint\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"lifecycle_status\":\"rebuild_required\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"requires_rebuild\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"materializations\":[]") != null);
+}
+
+pub fn testRuntimeSchemaDebugEmitsObservedDynamicCapabilities() !void {
+    const schema_json =
+        \\{"version":1,"default_type":"doc","dynamic_templates":[{"name":"status","path_match":"meta.status","mapping":{"type":"keyword"}}],"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true}}}}
+    ;
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .schema_json = schema_json,
+            .indexes_json = "{\"full_text_index_v1\":{\"type\":\"full_text\"}}",
+            .replication_sources_json = "[]",
+            .placement_role = "data",
+        }})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null }})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+    };
+    var observed_capabilities = [_]runtime_schema_mod.FieldCapability{
+        runtime_schema_mod.observedDynamicFieldCapability(null, "meta.status", .{
+            .field_type = .keyword,
+            .do_index = true,
+            .store = true,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        }),
+    };
+    var observed_sets = [_]table_reads.ObservedDynamicFieldCapabilitySet{.{
+        .index_name = @constCast("full_text_index_v1"),
+        .field_capabilities = observed_capabilities[0..],
+    }};
+    const storage_statuses = [_]TableStorageStatus{.{
+        .table_name = "docs",
+        .empty = false,
+        .observed_dynamic_field_capability_sets = observed_sets[0..],
+    }};
+
+    const encoded = (try encodeSingleTableStatusWithRuntimeSchemaDebug(std.testing.allocator, &snapshot, "docs", storage_statuses[0..])).?;
+    defer std.testing.allocator.free(encoded);
+
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"index_name\":\"full_text_index_v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"observed_dynamic_field_capabilities\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"field\":\"meta.status\",\"type\":\"keyword\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"query_modes\":[\"exact\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"provenance\":\"observed_dynamic\"") != null);
+}
+
+pub fn testRuntimeSchemaDebugEmitsSortCapabilities() !void {
+    const schema_json =
+        \\{"version":1,"default_type":"doc","dynamic_templates":[{"name":"dates","path_match":"created_at","mapping":{"type":"datetime","sortable":true}}],"index_sort":[{"field":"created_at","order":"desc"}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"string","x-antfly-types":["text"],"x-antfly-analyzer":"french"}}}}}}
+    ;
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .schema_json = schema_json,
+            .indexes_json = "{\"full_text_index_v1\":{\"type\":\"full_text\"}}",
+            .replication_sources_json = "[]",
+            .placement_role = "data",
+        }})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null }})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+    };
+
+    const encoded = (try encodeSingleTableStatusWithRuntimeSchemaDebug(std.testing.allocator, &snapshot, "docs", null)).?;
+    defer std.testing.allocator.free(encoded);
+
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"field_capabilities\":[{\"field\":\"_id\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"field\":\"created_at\",\"path_pattern\":\"created_at\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"query_modes\":[\"exact\",\"range\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"provenance\":\"dynamic_template\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"sort_lifecycle_state\":\"declared\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"index_sort_position\":0,\"index_sort_order\":\"desc\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"field\":\"_id\",\"type\":\"keyword\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"index_sort_position\":1,\"index_sort_order\":\"asc\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"field\":\"title\",\"emitted_name\":\"title\",\"document_schema\":\"doc\",\"type\":\"text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"query_modes\":[\"full_text\"]") != null);
 }
 
 test "create table parser preserves supported metadata fields" {
@@ -2471,6 +3651,39 @@ test "create table parser preserves supported metadata fields" {
     try std.testing.expectEqualStrings("{\"version\":0,\"kind\":\"demo\"}", parsed.schema_json.?);
     try std.testing.expectEqualStrings("{\"default\":{}}", parsed.indexes_json.?);
     try std.testing.expectEqualStrings("[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"users\"}]", parsed.replication_sources_json.?);
+}
+
+test "create table parser rejects schemas that cannot derive runtime mappings" {
+    const invalid_index_sort =
+        \\{
+        \\  "schema": {
+        \\    "dynamic_templates": [
+        \\      {"name":"rank","path_match":"rank","mapping":{"type":"numeric","sortable":false}}
+        \\    ],
+        \\    "index_sort": [
+        \\      {"field":"rank","order":"asc"}
+        \\    ]
+        \\  }
+        \\}
+    ;
+    try std.testing.expectError(
+        error.InvalidCreateTableRequest,
+        parseCreateTableRequest(std.testing.allocator, invalid_index_sort),
+    );
+
+    const invalid_id_order =
+        \\{
+        \\  "schema": {
+        \\    "index_sort": [
+        \\      {"field":"_id","order":"desc"}
+        \\    ]
+        \\  }
+        \\}
+    ;
+    try std.testing.expectError(
+        error.InvalidCreateTableRequest,
+        parseCreateTableRequest(std.testing.allocator, invalid_id_order),
+    );
 }
 
 test "schema-derived algebraic indexes expand into explicit capability config" {
@@ -2648,12 +3861,24 @@ test "schema update parser rejects invalid top-level schema fields" {
         error.InvalidSchemaUpdateRequest,
         parseSchemaUpdateRequest(std.testing.allocator, "{\"dynamic_templates\":{\"body\":{\"mapping\":true}}}"),
     );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchemaUpdateRequest(std.testing.allocator, "{\"index_sort\":[]}"),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchemaUpdateRequest(std.testing.allocator, "{\"index_sort\":[{\"field\":\"created_at\",\"order\":\"newest\"}]}"),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchemaUpdateRequest(std.testing.allocator, "{\"index_sort\":[{\"field\":\"created_at\",\"order\":\"asc\",\"desc\":false}]}"),
+    );
 }
 
 test "validated table schema parses default type and dynamic templates" {
     var parsed = try parseValidatedTableSchema(
         std.testing.allocator,
-        "{\"default_type\":\"doc\",\"enforce_types\":true,\"dynamic_templates\":{\"meta\":{\"match\":\"meta_*\",\"mapping\":{\"type\":\"keyword\"}}},\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"published\":{\"type\":\"boolean\"}}}}}}",
+        "{\"default_type\":\"doc\",\"enforce_types\":true,\"dynamic_templates\":{\"meta\":{\"match\":\"meta_*\",\"mapping\":{\"type\":\"keyword\"}}},\"index_sort\":[{\"field\":\"meta_rank\",\"order\":\"desc\"}],\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"published\":{\"type\":\"boolean\"}}}}}}",
     );
     defer parsed.deinit(std.testing.allocator);
 
@@ -2661,6 +3886,9 @@ test "validated table schema parses default type and dynamic templates" {
     try std.testing.expect(parsed.enforce_types);
     try std.testing.expectEqual(@as(usize, 1), parsed.document_schemas.len);
     try std.testing.expectEqual(@as(usize, 1), parsed.dynamic_templates.len);
+    try std.testing.expectEqual(@as(usize, 1), parsed.index_sort.len);
+    try std.testing.expectEqualStrings("meta_rank", parsed.index_sort[0].field);
+    try std.testing.expect(parsed.index_sort[0].desc);
 }
 
 test "table schema write validation rejects unknown fields when enforce_types is enabled" {
@@ -2738,6 +3966,49 @@ test "metadata.schema update keeps version for template-only changes" {
     try std.testing.expectEqualStrings(table.read_schema_json, updated.read_schema_json);
     try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"full_text_index_v2\":{\"type\":\"full_text\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"full_text_index_v3\"") == null);
+}
+
+test "metadata.schema update rejects schemas that cannot derive runtime mappings" {
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 7,
+        .name = "docs",
+        .schema_json = "{\"version\":0}",
+        .indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"}}",
+        .replication_sources_json = "[]",
+        .placement_role = "data",
+    };
+
+    const invalid_index_sort =
+        \\{
+        \\  "dynamic_templates": [
+        \\    {"name":"rank","path_match":"rank","mapping":{"type":"numeric","sortable":false}}
+        \\  ],
+        \\  "index_sort": [
+        \\    {"field":"rank","order":"asc"}
+        \\  ]
+        \\}
+    ;
+
+    const normalized = try parseSchemaUpdateRequest(std.testing.allocator, invalid_index_sort);
+    defer std.testing.allocator.free(normalized);
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        applySchemaUpdateRecord(std.testing.allocator, &table, normalized),
+    );
+
+    const invalid_id_order =
+        \\{
+        \\  "index_sort": [
+        \\    {"field":"_id","order":"desc"}
+        \\  ]
+        \\}
+    ;
+    const normalized_id_order = try parseSchemaUpdateRequest(std.testing.allocator, invalid_id_order);
+    defer std.testing.allocator.free(normalized_id_order);
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        applySchemaUpdateRecord(std.testing.allocator, &table, normalized_id_order),
+    );
 }
 
 test "metadata.query routing selects read schema full text index" {

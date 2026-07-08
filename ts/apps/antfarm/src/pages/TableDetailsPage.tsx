@@ -55,6 +55,7 @@ import type {
   QueryResult,
   TableStatus,
 } from "@antfly/sdk";
+import { queryResultTotalHits } from "@antfly/sdk";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import type React from "react";
 import { useCallback, useEffect, useMemo, useState } from "react";
@@ -408,7 +409,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
         count: true,
         limit: 0,
       } as QueryRequest);
-      setDocumentCount(response?.responses?.[0]?.hits?.total ?? null);
+      setDocumentCount(queryResultTotalHits(response?.responses?.[0]) ?? null);
     } catch {
       setDocumentCount(null);
     }

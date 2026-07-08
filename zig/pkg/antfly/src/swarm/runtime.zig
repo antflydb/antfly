@@ -65,7 +65,7 @@ const CliConfig = struct {
     replica_catalog_path: ?[]const u8 = null,
     snapshot_root_dir: ?[]const u8 = null,
     extension_package_store_dir: ?[]const u8 = null,
-    secret_store_path: ?[]const u8 = null,
+    secret_store_paths: std.ArrayListUnmanaged([]const u8) = .empty,
     ha_primary_log: ?[]const u8 = null,
     ha_primary_slots: ?[]const u8 = null,
     ha_primary_node_id: ?[]const u8 = null,
@@ -93,9 +93,15 @@ const CliConfig = struct {
     help: bool = false,
 
     fn deinit(self: *CliConfig, alloc: std.mem.Allocator) void {
+        self.secret_store_paths.deinit(alloc);
         self.ha_sync_standby_names.deinit(alloc);
         self.inference_preload_models.deinit(alloc);
         self.* = undefined;
+    }
+
+    fn primarySecretStorePath(self: *const CliConfig) ?[]const u8 {
+        if (self.secret_store_paths.items.len == 0) return null;
+        return self.secret_store_paths.items[0];
     }
 };
 
@@ -855,10 +861,8 @@ pub fn runFromIterator(
     var secret_store_initialized = false;
     defer if (secret_store_initialized) secret_store.deinit();
 
-    if (cli.secret_store_path) |raw_secret_store_path| {
-        const normalized_secret_store_path = try normalizeResolvedPathAlloc(alloc, raw_secret_store_path);
-        defer alloc.free(normalized_secret_store_path);
-        secret_store = try antfly.common.secrets.FileStore.init(alloc, normalized_secret_store_path);
+    if (cli.secret_store_paths.items.len > 0) {
+        secret_store = try initLayeredSecretStore(alloc, cli.secret_store_paths.items);
         secret_store_initialized = true;
     }
 
@@ -1948,10 +1952,12 @@ fn registerInternalGroupRoutes(server: anytype) !void {
     const group_prefix = routes.internal_groups_prefix ++ ":group_id";
     const table_prefix = group_prefix ++ "/tables/:table_name";
     const internal_table_prefix = routes.internal_tables_prefix ++ ":table_name";
+    const internal_table_repair_cancel_state = internal_table_prefix ++ routes.repair_jobs_marker ++ ":job_id" ++ routes.repair_attempts_marker ++ ":attempt_id" ++ routes.repair_cancel_state_suffix;
 
     const get_routes = [_][]const u8{
         group_prefix ++ routes.group_db_median_key_suffix,
         table_prefix ++ routes.documents_marker ++ ":key",
+        internal_table_repair_cancel_state,
     };
     inline for (get_routes) |path| {
         try server.get(path, internalBridgeHandler);
@@ -1962,7 +1968,7 @@ fn registerInternalGroupRoutes(server: anytype) !void {
         group_prefix ++ routes.shard_ops_observe_split_suffix,
         group_prefix ++ routes.shard_ops_observe_merge_suffix,
         group_prefix ++ routes.shard_ops_execute_suffix,
-        table_prefix ++ routes.lookup_suffix,
+        table_prefix ++ routes.documents_suffix,
         table_prefix ++ routes.graph_expand_suffix,
         table_prefix ++ routes.graph_hydrate_suffix,
         table_prefix ++ routes.text_stats_suffix,
@@ -1987,7 +1993,8 @@ fn internalBridgeHandler(ctx: *httpx.Context) anyerror!httpx.Response {
     const path = ctx.request.uri.path;
     const routes = antfly.public_api.http_routes.Routes;
     if (!std.mem.startsWith(u8, path, routes.internal_groups_prefix) and
-        routes.matchInternalTableCorruptEmbeddingArtifact(path) == null)
+        routes.matchInternalTableCorruptEmbeddingArtifact(path) == null and
+        routes.matchInternalTableRepairCancelState(path) == null)
     {
         _ = ctx.status(404);
         return ctx.text("not found");
@@ -2208,7 +2215,7 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
             continue;
         }
         if (std.mem.eql(u8, arg, "--secret-store-path")) {
-            cfg.secret_store_path = args.next() orelse return error.InvalidArguments;
+            try cfg.secret_store_paths.append(alloc, args.next() orelse return error.InvalidArguments);
             continue;
         }
         if (std.mem.eql(u8, arg, "--ha-primary-log")) {
@@ -2365,7 +2372,7 @@ fn resolvePaths(
     errdefer alloc.free(snapshot_root_dir);
     const extension_package_store_dir = try resolveExtensionPackageStoreDir(alloc, cli.extension_package_store_dir, local_base);
     errdefer alloc.free(extension_package_store_dir);
-    const secret_store_path = if (cli.secret_store_path) |path|
+    const secret_store_path = if (cli.primarySecretStorePath()) |path|
         try normalizeResolvedPathAlloc(alloc, path)
     else blk: {
         const raw = try std.fmt.allocPrint(alloc, "{s}/secrets.json", .{local_base});
@@ -2389,6 +2396,23 @@ fn resolvePaths(
         .secret_store_path = secret_store_path,
         .auth_store_root_dir = auth_store_root_dir,
     };
+}
+
+fn initLayeredSecretStore(
+    alloc: std.mem.Allocator,
+    raw_paths: []const []const u8,
+) !antfly.common.secrets.FileStore {
+    var normalized_paths: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (normalized_paths.items) |path| alloc.free(path);
+        normalized_paths.deinit(alloc);
+    }
+    for (raw_paths) |raw_path| {
+        const normalized_path = try normalizeResolvedPathAlloc(alloc, raw_path);
+        errdefer alloc.free(normalized_path);
+        try normalized_paths.append(alloc, normalized_path);
+    }
+    return try antfly.common.secrets.FileStore.initLayered(alloc, normalized_paths.items);
 }
 
 fn resolveExtensionPackageStoreDir(
@@ -2896,7 +2920,7 @@ fn printUsage() void {
         \\  --replica-catalog-path <path>         Replica catalog file path
         \\  --snapshot-root-dir <path>            Snapshot root directory
         \\  --extension-package-store <path>      Extension package store directory
-        \\  --secret-store-path <path>            Antfly secrets.json file path
+        \\  --secret-store-path <path>            Antfly secrets.json file path; repeat for fallback layers
         \\  --ha-primary-log <path>               Enable HA primary WAL/admin API with this replication log path
         \\  --ha-primary-slots <path>             HA primary replication slot store path
         \\  --ha-primary-node-id <id>             HA primary node id for typed admin receipts
@@ -3116,12 +3140,13 @@ test "swarm runtime registers internal group routes explicitly" {
 
     try std.testing.expect(server.hasRoute(.get, group_prefix ++ routes.group_db_median_key_suffix));
     try std.testing.expect(server.hasRoute(.get, table_prefix ++ routes.documents_marker ++ ":key"));
+    try std.testing.expect(server.hasRoute(.get, internal_table_prefix ++ routes.repair_jobs_marker ++ ":job_id" ++ routes.repair_attempts_marker ++ ":attempt_id" ++ routes.repair_cancel_state_suffix));
 
     try std.testing.expect(server.hasRoute(.post, internal_table_prefix ++ routes.corrupt_embedding_artifact_suffix));
     try std.testing.expect(server.hasRoute(.post, group_prefix ++ routes.shard_ops_observe_split_suffix));
     try std.testing.expect(server.hasRoute(.post, group_prefix ++ routes.shard_ops_observe_merge_suffix));
     try std.testing.expect(server.hasRoute(.post, group_prefix ++ routes.shard_ops_execute_suffix));
-    try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.lookup_suffix));
+    try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.documents_suffix));
     try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.graph_expand_suffix));
     try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.graph_hydrate_suffix));
     try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.text_stats_suffix));
@@ -3250,7 +3275,7 @@ test "parse cli accepts secret store path" {
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("/run/antfly/secrets/secrets.json", cfg.secret_store_path.?);
+    try std.testing.expectEqualStrings("/run/antfly/secrets/secrets.json", cfg.secret_store_paths.items[0]);
 }
 
 test "parse cli accepts extension package store path" {
@@ -4224,7 +4249,10 @@ test "swarm runtime resolves extension package store env before local default" {
 
 test "swarm runtime resolves explicit secret store path" {
     const alloc = std.testing.allocator;
-    const resolved = try resolvePaths(alloc, .{ .secret_store_path = "/run/antfly/secrets/secrets.json" }, null);
+    var cli = CliConfig{};
+    defer cli.deinit(alloc);
+    try cli.secret_store_paths.append(alloc, "/run/antfly/secrets/secrets.json");
+    const resolved = try resolvePaths(alloc, cli, null);
     defer resolved.deinit(alloc);
     try std.testing.expectEqualStrings("/run/antfly/secrets/secrets.json", resolved.secret_store_path);
 }

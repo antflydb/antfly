@@ -232,22 +232,22 @@ func TestValidateSearchAfterSearchBefore(t *testing.T) {
 			name: "search_after with order_by is valid",
 			query: QueryRequest{
 				OrderBy:     orderBy,
-				SearchAfter: []string{"value1"},
+				SearchAfter: []any{"value1"},
 			},
 		},
 		{
 			name: "search_before with order_by is valid",
 			query: QueryRequest{
 				OrderBy:      orderBy,
-				SearchBefore: []string{"value1"},
+				SearchBefore: []any{"value1"},
 			},
 		},
 		{
 			name: "search_after and search_before are mutually exclusive",
 			query: QueryRequest{
 				OrderBy:      orderBy,
-				SearchAfter:  []string{"a"},
-				SearchBefore: []string{"b"},
+				SearchAfter:  []any{"a"},
+				SearchBefore: []any{"b"},
 			},
 			wantErr: "search_after and search_before are mutually exclusive",
 		},
@@ -255,7 +255,7 @@ func TestValidateSearchAfterSearchBefore(t *testing.T) {
 			name: "search_after and offset are mutually exclusive",
 			query: QueryRequest{
 				OrderBy:     orderBy,
-				SearchAfter: []string{"a"},
+				SearchAfter: []any{"a"},
 				Offset:      10,
 			},
 			wantErr: "search_after/search_before and offset are mutually exclusive",
@@ -263,7 +263,7 @@ func TestValidateSearchAfterSearchBefore(t *testing.T) {
 		{
 			name: "search_after requires order_by",
 			query: QueryRequest{
-				SearchAfter: []string{"a"},
+				SearchAfter: []any{"a"},
 			},
 			wantErr: "order_by is required when using search_after or search_before",
 		},
@@ -271,7 +271,7 @@ func TestValidateSearchAfterSearchBefore(t *testing.T) {
 			name: "search_after not supported with semantic_search",
 			query: QueryRequest{
 				OrderBy:        orderBy,
-				SearchAfter:    []string{"a"},
+				SearchAfter:    []any{"a"},
 				SemanticSearch: "find me something",
 				Indexes:        []string{"idx"},
 			},
@@ -281,7 +281,7 @@ func TestValidateSearchAfterSearchBefore(t *testing.T) {
 			name: "search_after length must match order_by length",
 			query: QueryRequest{
 				OrderBy:     orderBy,
-				SearchAfter: []string{"a", "b"},
+				SearchAfter: []any{"a", "b"},
 			},
 			wantErr: "search_after must have the same number of values as order_by fields (got 2, expected 1)",
 		},
@@ -289,7 +289,7 @@ func TestValidateSearchAfterSearchBefore(t *testing.T) {
 			name: "search_before length must match order_by length",
 			query: QueryRequest{
 				OrderBy:      orderBy,
-				SearchBefore: []string{"a", "b"},
+				SearchBefore: []any{"a", "b"},
 			},
 			wantErr: "search_before must have the same number of values as order_by fields (got 2, expected 1)",
 		},

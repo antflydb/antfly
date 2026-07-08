@@ -729,7 +729,7 @@ fn expectCountProfile(
     var count_profile_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.heap.page_allocator, count_profile_query.body, .{});
     defer count_profile_responses.deinit();
     const count_profile_result = count_profile_responses.value.responses.?[0];
-    try std.testing.expectEqual(expected_total_hits, count_profile_result.hits.?.total.?);
+    try std.testing.expectEqual(expected_total_hits, count_profile_result.hits.?.total.?.value);
     try std.testing.expectEqual(@as(usize, 0), count_profile_result.hits.?.hits.?.len);
     try std.testing.expect(count_profile_result.profile != null);
     try std.testing.expectEqual(expected_shards, count_profile_result.profile.?.object.get("shards").?.object.get("total").?.integer);
@@ -3672,6 +3672,14 @@ fn hashPlacementIntent(hasher: *std.hash.Wyhash, intent: raft_reconciler.Placeme
     hashPlacementU64(hasher, @intFromEnum(intent.record.bootstrap_mode));
     hashPlacementU64(hasher, intent.record.metadata_version);
     hashPlacementU64(hasher, intent.store_id);
+    hashPlacementU64(hasher, @intFromEnum(intent.serving_state));
+    hashPlacementU64(hasher, intent.relocation_generation);
+    hashPlacementU64(hasher, intent.relocation_source_node_id);
+    hashPlacementU64(hasher, intent.relocation_source_store_id);
+    hashPlacementU64(hasher, intent.relocation_doc_count_watermark);
+    hashPlacementU64(hasher, intent.relocation_disk_bytes_watermark);
+    hashPlacementU64(hasher, intent.relocation_target_sequence);
+    hashPlacementU64(hasher, intent.relocation_applied_sequence);
     hashPlacementU64(hasher, intent.peer_node_ids.len);
     for (intent.peer_node_ids) |node_id| hashPlacementU64(hasher, node_id);
 
@@ -3725,6 +3733,14 @@ fn placementIntentEquals(
         if (!std.mem.eql(u8, backup.snapshot_path, other.snapshot_path)) return false;
     }
     if (left.store_id != right.store_id) return false;
+    if (left.serving_state != right.serving_state) return false;
+    if (left.relocation_generation != right.relocation_generation) return false;
+    if (left.relocation_source_node_id != right.relocation_source_node_id) return false;
+    if (left.relocation_source_store_id != right.relocation_source_store_id) return false;
+    if (left.relocation_doc_count_watermark != right.relocation_doc_count_watermark) return false;
+    if (left.relocation_disk_bytes_watermark != right.relocation_disk_bytes_watermark) return false;
+    if (left.relocation_target_sequence != right.relocation_target_sequence) return false;
+    if (left.relocation_applied_sequence != right.relocation_applied_sequence) return false;
     return std.mem.eql(u64, left.peer_node_ids, right.peer_node_ids);
 }
 
@@ -4319,42 +4335,6 @@ fn PublicApiRouter(comptime N: usize) type {
     };
 }
 
-fn PublicApiMetadataForwarder(comptime N: usize) type {
-    return struct {
-        node: MetadataHttpNodeSimulation,
-        cluster: *MetadataHttpClusterSimulation,
-        api_base_uris: *const [N][]const u8,
-        executor: http_common.RequestExecutor,
-        forward_count: std.atomic.Value(u64) = .init(0),
-
-        fn iface(self: *@This()) api_http_server.RequestForwarder {
-            return .{
-                .ptr = self,
-                .vtable = &.{ .forward = forward },
-            };
-        }
-
-        fn forward(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !?http_common.HttpResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            const leader_index = currentMetadataLeaderIndex(self.cluster) orelse return null;
-            const leader_node_id = @as(u64, @intCast(leader_index + 1));
-            const local_node_id = @as(u64, @intCast(self.node.index + 1));
-            if (leader_node_id == local_node_id) return null;
-            const uri = try std.fmt.allocPrint(alloc, "{s}{s}", .{ self.api_base_uris[leader_index], req.uri });
-            defer alloc.free(uri);
-            _ = self.forward_count.fetchAdd(1, .monotonic);
-            return try self.executor.execute(alloc, .{
-                .method = req.method,
-                .uri = uri,
-                .source_node_id = local_node_id,
-                .authorization = req.authorization,
-                .content_type = req.content_type,
-                .body = req.body,
-            });
-        }
-    };
-}
-
 const SimAuthManager = struct {
     store: usermgr.MemoryStore,
     policy_store: casbin.MemoryAdapter,
@@ -4417,7 +4397,6 @@ fn startPublicApiServers(
     status_sources: *[N]PublicApiStatusSource,
     catalog_sources: *[N]PublicApiCatalogSource,
     routers: *[N]PublicApiRouter(N),
-    forwarders: *[N]PublicApiMetadataForwarder(N),
     read_sources: *[N]api_table_reads.HostedProvisionedTableReadSource,
     write_sources: *[N]api_table_writes.HostedProvisionedTableWriteSource,
     options: PublicApiServerOptions(N),
@@ -4433,7 +4412,6 @@ fn startPublicApiServers(
         status_sources[i] = .{ .node = cluster.node(i), .metadata_snapshot_mode = metadata_snapshot_mode };
         catalog_sources[i] = .{ .node = cluster.node(i), .metadata_snapshot_mode = metadata_snapshot_mode };
         routers[i] = .{ .node = cluster.node(i), .cluster = cluster, .api_base_uris = api_base_uris };
-        forwarders[i] = .{ .node = cluster.node(i), .cluster = cluster, .api_base_uris = api_base_uris, .executor = forward_executor.executor() };
         read_sources[i] = api_table_reads.HostedProvisionedTableReadSource.init(
             roots[i],
             catalog_sources[i].iface(),
@@ -4449,11 +4427,10 @@ fn startPublicApiServers(
             forward_executor.executor(),
         );
         attachHostedSourcesBackendRuntimeForSimulation(&read_sources[i], &write_sources[i], cluster.backendRuntime(i));
-        var server_config: api_http_server.ApiHttpServerConfig = if (options.auth_managers) |auth_managers| .{
+        const server_config: api_http_server.ApiHttpServerConfig = if (options.auth_managers) |auth_managers| .{
             .auth_enabled = true,
             .user_manager = &auth_managers[i].manager,
         } else .{};
-        server_config.metadata_mutation_forwarder = forwarders[i].iface();
         servers[i] = api_http_server.ApiHttpServer.init(
             alloc,
             server_config,
@@ -4514,7 +4491,6 @@ fn PublicApiTestRig(comptime N: usize) type {
         status_sources: [N]PublicApiStatusSource = undefined,
         catalog_sources: [N]PublicApiCatalogSource = undefined,
         routers: [N]PublicApiRouter(N) = undefined,
-        forwarders: [N]PublicApiMetadataForwarder(N) = undefined,
         read_sources: [N]api_table_reads.HostedProvisionedTableReadSource = undefined,
         write_sources: [N]api_table_writes.HostedProvisionedTableWriteSource = undefined,
         api_base_uris: [N][]const u8 = undefined,
@@ -4589,7 +4565,6 @@ fn PublicApiTestRig(comptime N: usize) type {
                 &self.status_sources,
                 &self.catalog_sources,
                 &self.routers,
-                &self.forwarders,
                 &self.read_sources,
                 &self.write_sources,
                 options,
@@ -5494,7 +5469,7 @@ test "metadata http cluster simulation serves public lifecycle from a non-host n
     var query_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.heap.page_allocator, query.body, .{});
     defer query_responses.deinit();
     const query_result = query_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 2), query_result.hits.?.total.?);
+    try std.testing.expectEqual(@as(i64, 2), query_result.hits.?.total.?.value);
     try std.testing.expectEqual(@as(usize, 0), query_result.hits.?.hits.?.len);
     try std.testing.expect(query_result.profile != null);
     try std.testing.expectEqual(@as(i64, 1), query_result.profile.?.object.get("shards").?.object.get("total").?.integer);
@@ -5575,11 +5550,15 @@ test "metadata http cluster simulation seeds default admin for auth-enabled publ
 
     var auth_managers: [3]SimAuthManager = undefined;
     var auth_count: usize = 0;
-    errdefer for (auth_managers[0..auth_count]) |*auth| auth.deinit();
+    var auth_init_complete = false;
+    errdefer if (!auth_init_complete) {
+        for (auth_managers[0..auth_count]) |*auth| auth.deinit();
+    };
     for (&auth_managers) |*auth| {
         auth.* = try SimAuthManager.init(sim_alloc);
         auth_count += 1;
     }
+    auth_init_complete = true;
     defer for (auth_managers[0..auth_count]) |*auth| auth.deinit();
 
     const roots = [_][]const u8{ root_a, root_b, root_c };
@@ -5700,7 +5679,6 @@ test "metadata http cluster simulation forwards public split flow from a non-hos
     var status_sources: [4]PublicApiStatusSource = undefined;
     var catalog_sources: [4]PublicApiCatalogSource = undefined;
     var routers: [4]PublicApiRouter(4) = undefined;
-    var forwarders: [4]PublicApiMetadataForwarder(4) = undefined;
     var read_sources: [4]api_table_reads.HostedProvisionedTableReadSource = undefined;
     var write_sources: [4]api_table_writes.HostedProvisionedTableWriteSource = undefined;
     var api_base_uris: [4][]const u8 = undefined;
@@ -5722,7 +5700,6 @@ test "metadata http cluster simulation forwards public split flow from a non-hos
         &status_sources,
         &catalog_sources,
         &routers,
-        &forwarders,
         &read_sources,
         &write_sources,
         .{},
@@ -5903,7 +5880,6 @@ test "metadata http cluster simulation forwards public merge flow from a non-hos
     var status_sources: [4]PublicApiStatusSource = undefined;
     var catalog_sources: [4]PublicApiCatalogSource = undefined;
     var routers: [4]PublicApiRouter(4) = undefined;
-    var forwarders: [4]PublicApiMetadataForwarder(4) = undefined;
     var read_sources: [4]api_table_reads.HostedProvisionedTableReadSource = undefined;
     var write_sources: [4]api_table_writes.HostedProvisionedTableWriteSource = undefined;
     var api_base_uris: [4][]const u8 = undefined;
@@ -5925,7 +5901,6 @@ test "metadata http cluster simulation forwards public merge flow from a non-hos
         &status_sources,
         &catalog_sources,
         &routers,
-        &forwarders,
         &read_sources,
         &write_sources,
         .{},

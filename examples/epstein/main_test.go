@@ -394,8 +394,7 @@ func TestParseSyncLevelFlag(t *testing.T) {
 	}{
 		{in: "write", want: antfly.SyncLevelWrite},
 		{in: " full_text ", want: antfly.SyncLevelFullText},
-		{in: "aknn", want: antfly.SyncLevelAknn},
-		{in: "embeddings", want: antfly.SyncLevelAknn},
+		{in: "embeddings", want: antfly.SyncLevelFullIndex},
 		{in: "full_index", want: antfly.SyncLevelFullIndex},
 		{in: "enrichments", want: antfly.SyncLevelEnrichments},
 		{in: "propose", want: antfly.SyncLevelPropose},
@@ -744,6 +743,10 @@ func TestExtractZipPDFs_Parallel(t *testing.T) {
 			t.Errorf("content mismatch for %s: got %d bytes, want %d bytes",
 				entry.Name(), len(data), len(pdfData))
 		}
+	}
+
+	if _, err := parseSyncLevelFlag("aknn"); err == nil {
+		t.Fatalf("parseSyncLevelFlag accepted removed aknn sync level")
 	}
 }
 

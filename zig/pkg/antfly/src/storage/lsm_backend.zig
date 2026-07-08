@@ -244,6 +244,13 @@ pub const Options = struct {
     bulk_ingest_current_scan_clone_total_max_bytes: u64 = 256 * 1024 * 1024,
 };
 
+fn normalizeOptionsForDurability(options: Options) Options {
+    var normalized = options;
+    normalized.wal_sync_on_commit = normalized.wal_sync_on_commit or
+        (!normalized.backend.read_only and normalized.backend.durability == .full);
+    return normalized;
+}
+
 fn writePressureDuringBulkIngestEnvEnabled() bool {
     const raw = platform.env.getenv("ANTFLY_LSM_WRITE_PRESSURE_DURING_BULK") orelse return false;
     if (raw.len == 0) return true;
@@ -1146,11 +1153,13 @@ pub const Backend = struct {
     }
 
     pub fn open(allocator: Allocator, root_dir: []const u8, options: Options) !Backend {
-        return try recovery_mod.open(Backend, allocator, root_dir, options.backend, options);
+        const normalized_options = normalizeOptionsForDurability(options);
+        return try recovery_mod.open(Backend, allocator, root_dir, normalized_options.backend, normalized_options);
     }
 
     pub fn openInto(self: *Backend, allocator: Allocator, root_dir: []const u8, options: Options) !void {
-        try recovery_mod.openInto(Backend, self, allocator, root_dir, options.backend, options);
+        const normalized_options = normalizeOptionsForDurability(options);
+        try recovery_mod.openInto(Backend, self, allocator, root_dir, normalized_options.backend, normalized_options);
     }
 
     pub fn close(self: *Backend) void {
@@ -1323,10 +1332,14 @@ pub const Backend = struct {
     }
 
     pub fn sync(self: *Backend, force: bool) !void {
-        _ = force;
         if (self.root_dir == null) return;
         const locked = runtime_mod.lockBackend(Backend, self);
         defer runtime_mod.unlockBackend(Backend, self, locked);
+        if (force and !self.options.backend.read_only and self.options.wal_enabled) {
+            var wal_lock = try self.acquireWalOperationLock(.exclusive);
+            defer wal_lock.release();
+            try wal_mod.syncCurrentState(self.storage.?, self.allocator, self.root_dir.?);
+        }
         try self.finalizeDeferredStorageWorkLocked();
     }
 
@@ -7409,6 +7422,7 @@ test "lsm backend write stats separate wal sync latency from append latency" {
         var storage = storage_io.MemoryStorage.init(std.testing.allocator);
         defer storage.deinit();
         var backend = try Backend.open(std.testing.allocator, "/lsm-wal-async-stats", .{
+            .backend = .{ .durability = .none },
             .storage = storage.storage(),
             .flush_threshold = 1024,
             .wal_sync_on_commit = false,
@@ -7423,6 +7437,24 @@ test "lsm backend write stats separate wal sync latency from append latency" {
         try std.testing.expectEqual(@as(u64, 1), stats.wal_append_records);
         try std.testing.expectEqual(@as(u64, 0), stats.wal_sync_records);
         try std.testing.expectEqual(@as(u64, 0), stats.wal_sync_ns);
+    }
+
+    {
+        var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+        defer storage.deinit();
+        var backend = try Backend.open(std.testing.allocator, "/lsm-wal-full-durability-stats", .{
+            .storage = storage.storage(),
+            .flush_threshold = 1024,
+        });
+        defer backend.close();
+
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, "doc:a", "A");
+        try txn.commit();
+
+        const stats = backend.snapshotWriteStats();
+        try std.testing.expectEqual(@as(u64, 1), stats.wal_append_records);
+        try std.testing.expectEqual(@as(u64, 1), stats.wal_sync_records);
     }
 
     {
@@ -12687,6 +12719,77 @@ test "lsm backend open manifest version refs pin obsolete files across handles" 
     try std.testing.expectEqual(@as(u64, 0), stats.obsolete_paths);
     try std.testing.expectEqual(@as(u64, 0), stats.obsolete_paths_pinned_by_versions);
     try std.testing.expectError(error.FileNotFound, backing.storage().readFileAlloc(alloc, obsolete_path, 1024));
+}
+
+test "lsm backend reopen reclaim stress preserves manifest referenced runs" {
+    const alloc = std.testing.allocator;
+    var backing = storage_io.MemoryStorage.init(alloc);
+    defer backing.deinit();
+
+    const root_dir = "/memory/lsm-reopen-reclaim-stress";
+
+    for (0..8) |i| {
+        var writer = try Backend.open(alloc, root_dir, .{
+            .storage = backing.storage(),
+            .flush_threshold = 1,
+            .compact_threshold_runs = 1,
+            .foreground_soft_compaction = true,
+            .obsolete_retention_ns = 0,
+        });
+        var writer_open = true;
+        defer if (writer_open) writer.close();
+
+        {
+            var runtime = try writer.runtimeStore(alloc, .{ .name = "docs" });
+            defer runtime.deinit();
+            var seed_txn = try runtime.beginWrite();
+            const seed_value = try std.fmt.allocPrint(alloc, "value-{d}-seed", .{i});
+            defer alloc.free(seed_value);
+            try seed_txn.put("doc:stable", seed_value);
+            try seed_txn.commit();
+        }
+
+        var reader = try Backend.open(alloc, root_dir, .{
+            .storage = backing.storage(),
+            .backend = .{ .read_only = true },
+            .obsolete_retention_ns = 0,
+        });
+        var reader_open = true;
+        defer if (reader_open) reader.close();
+
+        {
+            var runtime = try writer.runtimeStore(alloc, .{ .name = "docs" });
+            defer runtime.deinit();
+            var update_txn = try runtime.beginWrite();
+            const update_value = try std.fmt.allocPrint(alloc, "value-{d}-updated", .{i});
+            defer alloc.free(update_value);
+            try update_txn.put("doc:stable", update_value);
+            try update_txn.commit();
+        }
+
+        const pinned = writer.snapshotMaintenanceStats();
+        try std.testing.expect(pinned.obsolete_paths == 0 or pinned.obsolete_paths_pinned_by_versions > 0);
+        reader.close();
+        reader_open = false;
+        while (try writer.runMaintenanceStep()) {}
+
+        const clean = writer.snapshotMaintenanceStats();
+        try std.testing.expectEqual(@as(u64, 0), clean.obsolete_paths_pinned_by_versions);
+        writer.close();
+        writer_open = false;
+    }
+
+    var final_reader = try Backend.open(alloc, root_dir, .{
+        .storage = backing.storage(),
+        .backend = .{ .read_only = true },
+        .obsolete_retention_ns = 0,
+    });
+    defer final_reader.close();
+    var runtime = try final_reader.runtimeStore(alloc, .{ .name = "docs" });
+    defer runtime.deinit();
+    var txn = try runtime.beginRead();
+    defer txn.abort();
+    try std.testing.expectEqualStrings("value-7-updated", try txn.get("doc:stable"));
 }
 
 test "lsm backend reader release reclaims expired clean obsolete paths" {

@@ -19,6 +19,8 @@ const backups_api = @import("backups.zig");
 const batch_api = @import("batch.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const common_secrets = @import("../common/secrets.zig");
+const http_route_helpers = @import("http_route_helpers.zig");
+const query_contract = @import("query_contract.zig");
 
 pub const DocumentArtifactManifestDetail = enum {
     summary,
@@ -29,13 +31,14 @@ pub const DocumentArtifactManifestOptions = struct {
     detail: DocumentArtifactManifestDetail = .raw,
 };
 
-pub fn parseDocumentArtifactManifestOptions(query: []const u8) !DocumentArtifactManifestOptions {
+pub fn parseDocumentArtifactManifestOptions(alloc: std.mem.Allocator, query: []const u8) !DocumentArtifactManifestOptions {
     var opts = DocumentArtifactManifestOptions{};
     if (query.len == 0) return opts;
     var it = std.mem.splitScalar(u8, query, '&');
     while (it.next()) |part| {
         if (!std.mem.startsWith(u8, part, "detail=")) continue;
-        const value = part["detail=".len..];
+        const value = try http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, part["detail=".len..]);
+        defer alloc.free(value);
         if (std.mem.eql(u8, value, "summary")) {
             opts.detail = .summary;
         } else if (std.mem.eql(u8, value, "raw")) {
@@ -73,6 +76,8 @@ pub const TableApi = struct {
         ReadRequiresPrimary,
         ReadUnavailable,
         ModelNotFound,
+        UnsupportedExactSort,
+        QueryCandidateBudgetExceeded,
         InternalFailure,
     };
 
@@ -475,6 +480,49 @@ pub const OwnedResponse = struct {
     }
 };
 
+fn unsupportedExactSortBody(alloc: std.mem.Allocator) ![]u8 {
+    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse db_mod.SortRejectionDiagnostic{};
+    const public_rejection = query_contract.publicExactSortRejection(diagnostic.reason, diagnostic.detail);
+    return try std.json.Stringify.valueAlloc(alloc, struct {
+        @"error": []const u8 = "unsupported_exact_sort",
+        message: []const u8 = "exact sort is unsupported for this query",
+        reason: []const u8,
+        sort_rejection_reason: []const u8,
+        sort_rejection_detail: []const u8,
+        sort_rejection_field: []const u8,
+        status: u16 = 422,
+    }{
+        .reason = public_rejection.reason,
+        .sort_rejection_reason = public_rejection.reason,
+        .sort_rejection_detail = public_rejection.detail,
+        .sort_rejection_field = diagnostic.field,
+    }, .{});
+}
+
+fn queryCandidateBudgetExceededBody(alloc: std.mem.Allocator) ![]u8 {
+    const diagnostic = db_mod.takeLastSortRejectionDiagnostic() orelse db_mod.SortRejectionDiagnostic{
+        .reason = "candidate_budget_exceeded",
+        .detail = "candidate_budget_exceeded",
+    };
+    const public_rejection = query_contract.publicExactSortRejection(diagnostic.reason, diagnostic.detail);
+    return try std.json.Stringify.valueAlloc(alloc, struct {
+        @"error": []const u8 = "query_candidate_budget_exceeded",
+        message: []const u8 = "query candidate budget exceeded",
+        reason: []const u8,
+        budget_rejection_reason: []const u8,
+        sort_rejection_reason: []const u8,
+        sort_rejection_detail: []const u8,
+        sort_rejection_field: []const u8,
+        status: u16 = 422,
+    }{
+        .reason = public_rejection.reason,
+        .budget_rejection_reason = diagnostic.detail,
+        .sort_rejection_reason = public_rejection.reason,
+        .sort_rejection_detail = public_rejection.detail,
+        .sort_rejection_field = diagnostic.field,
+    }, .{});
+}
+
 pub fn handleTableBatch(
     alloc: std.mem.Allocator,
     table_name: []const u8,
@@ -522,9 +570,20 @@ pub fn handleTableQueryRequest(
         return .{ .status = 400, .body = try alloc.dupe(u8, "invalid query request") };
     }
 
+    db_mod.resetLastSortRejectionDiagnostic();
+    query_contract.validatePublicQuerySortTupleContract(alloc, body) catch |err| switch (err) {
+        error.InvalidQueryRequest => {
+            std.log.warn("public table query invalid exact sort table={s} err={}", .{ table_name, err });
+            return .{ .status = 422, .body = try unsupportedExactSortBody(alloc) };
+        },
+    };
     const response_body = api.executeTableQueryRequest(alloc, table_name, body, row_filter_json) catch |err| {
         switch (err) {
             error.InvalidQueryRequest => {
+                if (db_mod.peekLastSortRejectionDiagnostic() != null) {
+                    std.log.warn("public table query invalid exact sort table={s} err={}", .{ table_name, err });
+                    return .{ .status = 422, .body = try unsupportedExactSortBody(alloc) };
+                }
                 std.log.err("public table query invalid table={s} err={}", .{ table_name, err });
                 return .{ .status = 400, .body = try alloc.dupe(u8, "invalid query request") };
             },
@@ -547,6 +606,14 @@ pub fn handleTableQueryRequest(
             error.ModelNotFound => {
                 std.log.warn("public table query model not found table={s} err={}", .{ table_name, err });
                 return .{ .status = 404, .body = try alloc.dupe(u8, "{\"error\":\"MODEL_NOT_FOUND\",\"message\":\"model not found\"}") };
+            },
+            error.QueryCandidateBudgetExceeded => {
+                std.log.warn("public table query candidate budget exceeded table={s} err={}", .{ table_name, err });
+                return .{ .status = 422, .body = try queryCandidateBudgetExceededBody(alloc) };
+            },
+            error.UnsupportedExactSort => {
+                std.log.warn("public table query unsupported exact sort table={s} err={}", .{ table_name, err });
+                return .{ .status = 422, .body = try unsupportedExactSortBody(alloc) };
             },
             error.InternalFailure => {
                 std.log.err("public table query failed table={s} err={}", .{ table_name, err });
@@ -1740,6 +1807,356 @@ test "public table query handler maps backend errors" {
 
     try std.testing.expectEqual(@as(u16, 400), resp.status);
     try std.testing.expectEqualStrings("invalid query request", resp.body);
+}
+
+test "public table query handler maps invalid exact sort diagnostics" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute_table_batch = unsupportedBatch,
+                    .execute_table_query_request = executeTableQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableQueryRequest(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: ?[]const u8,
+        ) TableApi.ExecuteQueryError![]u8 {
+            db_mod.testing.recordSortRejectionDiagnostic(
+                "_score",
+                "invalid_sort_tuple",
+                "non_numeric_score",
+            );
+            return error.InvalidQueryRequest;
+        }
+    };
+
+    var resp = try handleTableQueryRequest(std.testing.allocator, "docs",
+        \\{"full_text_search":{"match":"raft","field":"body"},"order_by":[{"field":"_score","desc":true}]}
+    , null, Backend.iface());
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 422), resp.status);
+    var parsed = try std.json.parseFromSlice(struct {
+        status: u16,
+        @"error": []const u8,
+        message: []const u8,
+        reason: []const u8,
+        sort_rejection_reason: []const u8,
+        sort_rejection_detail: []const u8,
+        sort_rejection_field: []const u8,
+    }, std.testing.allocator, resp.body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(u16, 422), parsed.value.status);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", parsed.value.@"error");
+    try std.testing.expectEqualStrings("exact sort is unsupported for this query", parsed.value.message);
+    try std.testing.expectEqualStrings("invalid_sort_tuple", parsed.value.reason);
+    try std.testing.expectEqualStrings("invalid_sort_tuple", parsed.value.sort_rejection_reason);
+    try std.testing.expectEqualStrings("invalid_sort_tuple", parsed.value.sort_rejection_detail);
+    try std.testing.expectEqualStrings("_score", parsed.value.sort_rejection_field);
+}
+
+test "public table query handler rejects unknown sort tuple properties before dispatch" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute_table_batch = unsupportedBatch,
+                    .execute_table_query_request = executeTableQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableQueryRequest(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: ?[]const u8,
+        ) TableApi.ExecuteQueryError![]u8 {
+            return error.InternalFailure;
+        }
+    };
+
+    var resp = try handleTableQueryRequest(std.testing.allocator, "docs",
+        \\{"query":{"match_all":{}},"order_by":[{"field":"created_at","descc":true}]}
+    , null, Backend.iface());
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 422), resp.status);
+    var parsed = try std.json.parseFromSlice(struct {
+        status: u16,
+        @"error": []const u8,
+        reason: []const u8,
+        sort_rejection_reason: []const u8,
+        sort_rejection_detail: []const u8,
+        sort_rejection_field: []const u8,
+    }, std.testing.allocator, resp.body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("unsupported_exact_sort", parsed.value.@"error");
+    try std.testing.expectEqualStrings("invalid_sort_tuple", parsed.value.reason);
+    try std.testing.expectEqualStrings("invalid_sort_tuple", parsed.value.sort_rejection_reason);
+    try std.testing.expectEqualStrings("invalid_sort_tuple", parsed.value.sort_rejection_detail);
+    try std.testing.expectEqualStrings("created_at", parsed.value.sort_rejection_field);
+}
+
+test "public table query handler maps candidate budget exhaustion" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute_table_batch = unsupportedBatch,
+                    .execute_table_query_request = executeTableQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableQueryRequest(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: ?[]const u8,
+        ) TableApi.ExecuteQueryError![]u8 {
+            db_mod.testing.recordSortRejectionDiagnostic(
+                "full_text_index_v0",
+                "candidate_budget_exceeded",
+                "text_field_sort_candidate_window",
+            );
+            return error.QueryCandidateBudgetExceeded;
+        }
+    };
+
+    var resp = try handleTableQueryRequest(std.testing.allocator, "docs",
+        \\{"query":{"match_all":{}},"order_by":[{"field":"created_at"}]}
+    , null, Backend.iface());
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 422), resp.status);
+    var parsed = try std.json.parseFromSlice(struct {
+        status: u16,
+        @"error": []const u8,
+        message: []const u8,
+        reason: []const u8,
+        budget_rejection_reason: []const u8,
+        sort_rejection_reason: []const u8,
+        sort_rejection_detail: []const u8,
+        sort_rejection_field: []const u8,
+    }, std.testing.allocator, resp.body, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(u16, 422), parsed.value.status);
+    try std.testing.expectEqualStrings("query_candidate_budget_exceeded", parsed.value.@"error");
+    try std.testing.expectEqualStrings("query candidate budget exceeded", parsed.value.message);
+    try std.testing.expectEqualStrings("candidate_budget_exceeded", parsed.value.reason);
+    try std.testing.expectEqualStrings("text_field_sort_candidate_window", parsed.value.budget_rejection_reason);
+    try std.testing.expectEqualStrings("candidate_budget_exceeded", parsed.value.sort_rejection_reason);
+    try std.testing.expectEqualStrings("candidate_budget_exceeded", parsed.value.sort_rejection_detail);
+    try std.testing.expectEqualStrings("full_text_index_v0", parsed.value.sort_rejection_field);
+}
+
+test "public table query handler maps unsupported exact sort" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute_table_batch = unsupportedBatch,
+                    .execute_table_query_request = executeTableQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableQueryRequest(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: ?[]const u8,
+        ) TableApi.ExecuteQueryError![]u8 {
+            return error.UnsupportedExactSort;
+        }
+    };
+
+    var resp = try handleTableQueryRequest(std.testing.allocator, "docs",
+        \\{"query":{"match_all":{}},"order_by":[{"field":"created_at"}]}
+    , null, Backend.iface());
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 422), resp.status);
+    var parsed = try std.json.parseFromSlice(struct {
+        status: u16,
+        @"error": []const u8,
+        message: []const u8,
+        reason: []const u8,
+        sort_rejection_reason: []const u8,
+        sort_rejection_detail: []const u8,
+        sort_rejection_field: []const u8,
+    }, std.testing.allocator, resp.body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u16, 422), parsed.value.status);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", parsed.value.@"error");
+    try std.testing.expectEqualStrings("exact sort is unsupported for this query", parsed.value.message);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", parsed.value.reason);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", parsed.value.sort_rejection_reason);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", parsed.value.sort_rejection_detail);
+    try std.testing.expectEqualStrings("", parsed.value.sort_rejection_field);
+}
+
+test "public table query handler exposes stable count-only sort rejection reason" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute_table_batch = unsupportedBatch,
+                    .execute_table_query_request = executeTableQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableQueryRequest(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: ?[]const u8,
+        ) TableApi.ExecuteQueryError![]u8 {
+            db_mod.testing.recordSortRejectionDiagnostic(
+                "*",
+                "unsupported_exact_sort",
+                "count_only_ordered_page",
+            );
+            return error.UnsupportedExactSort;
+        }
+    };
+
+    var resp = try handleTableQueryRequest(std.testing.allocator, "docs",
+        \\{"query":{"match_all":{}},"count":true,"order_by":[{"field":"created_at"}]}
+    , null, Backend.iface());
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 422), resp.status);
+    var parsed = try std.json.parseFromSlice(struct {
+        status: u16,
+        @"error": []const u8,
+        reason: []const u8,
+        sort_rejection_reason: []const u8,
+        sort_rejection_detail: []const u8,
+        sort_rejection_field: []const u8,
+    }, std.testing.allocator, resp.body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u16, 422), parsed.value.status);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", parsed.value.@"error");
+    try std.testing.expectEqualStrings("count_only_ordered_page", parsed.value.reason);
+    try std.testing.expectEqualStrings("count_only_ordered_page", parsed.value.sort_rejection_reason);
+    try std.testing.expectEqualStrings("count_only_ordered_page", parsed.value.sort_rejection_detail);
+    try std.testing.expectEqualStrings("*", parsed.value.sort_rejection_field);
+}
+
+test "public table query handler surfaces exact sort rejection diagnostics" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute_table_batch = unsupportedBatch,
+                    .execute_table_query_request = executeTableQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableQueryRequest(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: ?[]const u8,
+        ) TableApi.ExecuteQueryError![]u8 {
+            db_mod.testing.recordSortRejectionDiagnostic(
+                "created_at",
+                "missing_doc_values_coverage",
+                "missing_doc_values_section",
+            );
+            return error.UnsupportedExactSort;
+        }
+    };
+
+    var resp = try handleTableQueryRequest(std.testing.allocator, "docs",
+        \\{"query":{"match_all":{}},"order_by":[{"field":"created_at"}]}
+    , null, Backend.iface());
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 422), resp.status);
+    var parsed = try std.json.parseFromSlice(struct {
+        status: u16,
+        @"error": []const u8,
+        message: []const u8,
+        reason: []const u8,
+        sort_rejection_reason: []const u8,
+        sort_rejection_detail: []const u8,
+        sort_rejection_field: []const u8,
+    }, std.testing.allocator, resp.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u16, 422), parsed.value.status);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", parsed.value.@"error");
+    try std.testing.expectEqualStrings("exact sort is unsupported for this query", parsed.value.message);
+    try std.testing.expectEqualStrings("field_not_sort_ready", parsed.value.reason);
+    try std.testing.expectEqualStrings("field_not_sort_ready", parsed.value.sort_rejection_reason);
+    try std.testing.expectEqualStrings("field_not_sort_ready", parsed.value.sort_rejection_detail);
+    try std.testing.expectEqualStrings("created_at", parsed.value.sort_rejection_field);
 }
 
 test "public table query view handler maps doc identity unavailable errors" {

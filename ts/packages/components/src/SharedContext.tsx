@@ -30,7 +30,7 @@ export interface Widget {
   result?: {
     data?: QueryHit[];
     facetData?: AggregationBucket[] | AggregationBucket[][]; // Can be array of arrays for multiple facets
-    total?: number | { value: number };
+    total?: number;
     error?: string;
   };
 }

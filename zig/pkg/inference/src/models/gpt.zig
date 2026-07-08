@@ -311,6 +311,17 @@ pub const Config = struct {
         return ((layer_index + 1) % self.sliding_window_pattern) != 0;
     }
 
+    /// True when at least one layer attends globally (no sliding window).
+    /// Such layers need the full KV history: trimming the shared KV pool to
+    /// the sliding window silently truncates their context.
+    pub fn hasGlobalAttentionLayers(self: Config) bool {
+        const layer_count: usize = @intCast(self.num_hidden_layers);
+        for (0..layer_count) |layer| {
+            if (!self.layerUsesSlidingAttention(layer)) return true;
+        }
+        return false;
+    }
+
     pub fn layerRopeTheta(self: Config, layer_index: usize) f32 {
         if (self.family == .deepseek_v4 and
             self.deepseekV4AttentionKind(layer_index) != .sliding_attention and
@@ -1164,8 +1175,10 @@ pub fn parseGgufMetadata(view: gguf_metadata.View) ?Config {
     // Gemma 4: partial rotary for full attention layers.
     // rope.dimension_count gives the number of dims to rotate for full-attn layers.
     // Derive partial_rotary_factor from it: factor = rope_dim / head_dim.
+    var saw_rope_dimension_count = false;
     var derived_rope_partial_from_dim = false;
     if (metaU32(view, &key_buf, arch, "rope.dimension_count")) |rope_dim| {
+        saw_rope_dimension_count = true;
         if (config.global_head_dim > 0 and rope_dim < config.global_head_dim) {
             config.rope_partial_factor = @as(f32, @floatFromInt(rope_dim)) / @as(f32, @floatFromInt(config.global_head_dim));
             derived_rope_partial_from_dim = true;
@@ -1174,7 +1187,8 @@ pub fn parseGgufMetadata(view: gguf_metadata.View) ?Config {
             derived_rope_partial_from_dim = true;
         }
     }
-    if (!derived_rope_partial_from_dim and
+    if (!saw_rope_dimension_count and
+        !derived_rope_partial_from_dim and
         isGemma4ModelType(arch) and
         config.global_head_dim > config.attention_head_dim and
         config.attention_head_dim > 0 and
@@ -2773,12 +2787,13 @@ test "parse gguf metadata for gemma4 shared kv config" {
     try std.testing.expectEqual(@as(u32, 5), config.sliding_window_pattern);
     try std.testing.expectEqual(@as(f32, 10000.0), config.rope_local_theta);
     try std.testing.expectEqual(@as(f32, 1000000.0), config.rope_theta);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.25), config.rope_partial_factor, 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), config.rope_partial_factor, 0.000001);
     // Per-layer head_dim: sliding=256 (from key_length_swa), global=512 (from key_length).
     try std.testing.expectEqual(@as(u32, 256), config.effectiveHeadDimForLayer(0)); // sliding
     try std.testing.expectEqual(@as(u32, 512), config.effectiveHeadDimForLayer(4)); // global
     try std.testing.expectEqual(@as(u32, 256), config.layerRopeDim(0)); // sliding rotates full local width
-    try std.testing.expectEqual(@as(u32, 128), config.layerRopeDim(4)); // full attention uses p-RoPE
+    try std.testing.expectEqual(@as(u32, 512), config.layerRopeDim(4)); // full attention rotates full exported width
+    try std.testing.expectEqual(@as(u32, 512), config.layerRopeActiveDim(4));
 }
 
 test "parse gguf metadata for gemma4 assistant mtp fields" {

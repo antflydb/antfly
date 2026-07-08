@@ -268,7 +268,7 @@ npm run test:ts
 
 ## Requirements
 
-- Node.js >= 18
+- Node.js >= 24.0
 - TypeScript >= 5.0 (for development)
 
 ## License

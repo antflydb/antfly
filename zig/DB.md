@@ -48,6 +48,161 @@ Current first implementation:
 - chunk artifacts are stored under `<doc>:e:chunk:<chunk_name>:<chunk_id>`
 - overwrites and deletes clear stale chunk artifacts before regeneration
 
+## Derived Coverage Accounting
+
+Derived artifacts and artifact-backed indexes need coverage accounting that is
+stronger than raw artifact or index-entry counts. A managed embeddings index can
+legitimately cover only a subset of table documents, for example a conditional
+media template over a mixed corpus, while a failed or lagging enrichment must
+not be hidden as "ready" simply because partial coverage is allowed.
+
+The DB-level invariant is:
+
+- coverage measures whether every source unit for a derived generation reached a
+  terminal outcome
+- readiness is separate from health
+- query correctness must know when an index is partial, and should not treat a
+  partial index as a full-table access path unless the query or caller accepts
+  that coverage
+
+This follows the database precedent for partial indexes: eligibility is explicit
+and planners avoid using a partial index when doing so would produce an
+incomplete result set. For derived work, the corresponding rule is that
+eligibility and terminal outcomes are explicit, not inferred from template
+syntax or artifact counts.
+
+### Coverage State
+
+Coverage is tracked per derived generation over source units, not just per table
+document. For simple document embeddings the source unit is a document. For
+chunked embeddings it may be a chunk artifact. For media extraction it may be an
+asset artifact. The coverage key should identify:
+
+- table or shard
+- derived artifact or index name
+- source artifact name, when the producer consumes another artifact stream
+- source unit identity
+- generation or config version
+
+Each source unit has one current outcome for that generation:
+
+- `pending`: not evaluated yet
+- `in_flight`: currently being evaluated
+- `produced`: artifact or index entry exists for the generation
+- `skipped`: evaluated and intentionally produced nothing
+- `terminal_failed`: evaluated and cannot produce after the configured policy
+  and retry budget
+- `stale`: an older generation result exists, but the current generation has not
+  completed for this source unit
+
+Aggregate status is derived from those durable per-source outcomes:
+
+- `source_total`
+- `eligible`
+- `produced`
+- `skipped`
+- `terminal_failed`
+- `retryable_failed`
+- `pending`
+- `in_flight`
+- `generation`
+- `complete`
+- `healthy`
+- `degraded`
+
+The core completion predicate is:
+
+```text
+complete =
+    produced + skipped + terminal_failed >= source_total
+    and pending == 0
+    and in_flight == 0
+```
+
+Health is stricter:
+
+```text
+healthy = complete and terminal_failed == 0
+degraded = complete and terminal_failed > 0
+```
+
+This keeps "no work remains" distinct from "all desired outputs exist".
+
+### Coverage Policy
+
+Derived configs should declare how missing or non-embeddable source units affect
+readiness:
+
+- `strict`: every eligible source unit must produce an output; skipped or failed
+  required units keep the derived artifact/index not ready
+- `partial`: intentional skips satisfy completion; terminal failures do not
+  satisfy healthy readiness
+- `best_effort`: intentional skips and terminal failures may satisfy completion,
+  but terminal failures make the status degraded
+
+The policy should be explicit in index and enrichment config, for example:
+
+```json
+{
+  "type": "embeddings",
+  "coverage_policy": "partial",
+  "applies_when": {
+    "exists": "image_url"
+  },
+  "template": "{{remoteMedia url=image_url}}"
+}
+```
+
+`applies_when` is preferred over syntax sniffing because it gives the planner,
+repair jobs, and operators a stable eligibility predicate. Templates may still
+produce `skipped` outcomes when rendering produces no input, but empty-template
+detection is an execution outcome, not the primary declaration of index
+coverage.
+
+### Readiness And Repair
+
+Runtime status must use coverage accounting instead of raw `doc_count >=
+table_doc_count` for managed derived indexes. In particular:
+
+- `rebuilding` and `backfill_active` remain true while coverage has pending or
+  in-flight source units
+- `replay_catch_up_required` reflects source/enrichment replay debt and must not
+  be cleared solely because at least one artifact or index entry exists
+- partial coverage can mark skipped units complete, but it cannot mask pending
+  enrichment work
+- terminal failures are visible through degraded status and reason counters
+
+Repair also needs durable source-unit outcomes. Aggregate counters are not
+enough, because repair must distinguish:
+
+- never evaluated
+- intentionally skipped
+- produced but lost
+- stale generation
+- terminal failure
+
+Coverage-gap repair should regenerate missing `produced` artifacts, leave
+current-generation `skipped` units alone, and retry or surface
+`terminal_failed` units according to policy.
+
+### Scope
+
+The coverage model should be shared by all derived artifact producers and
+artifact-backed indexes:
+
+- embeddings
+- chunks
+- summaries
+- image, audio, PDF, and OCR extraction artifacts
+- graph extraction
+- artifact-backed dense and sparse vector indexes
+- algebraic or materialized derived indexes where source-unit coverage matters
+
+Full-text indexes usually have trivial full coverage, but can still project the
+same status shape with `eligible == source_total` when useful. The shared model
+should live below the public API so each producer can report comparable lifecycle
+state without pretending every index is document-count based.
+
 ## Search Contract
 
 `DB.search()` is coordinator-style orchestration over named result sets.
@@ -124,6 +279,109 @@ remains the fallback, not the normal replay path.
 
 Once every managed index has advanced past a sequence, the derived log may be
 truncated at the global minimum applied watermark.
+
+### Sequence-Stamped Projection Checkpoints
+
+Every derived projection should publish a durable checkpoint that says exactly
+which base-data sequence is queryable through that projection. This applies to
+dense, sparse, full-text, graph, algebraic indexes, and enrichment scopes. The
+checkpoint is not an optimization; it is the restart contract.
+
+The checkpoint must atomically couple:
+
+- the visible projection artifact, root, manifest, or generation
+- the highest applied derived-log sequence covered by that artifact
+- the projection status: clean, rebuilding, degraded, or repair-required
+- the projection schema/config/version identity needed to validate reuse
+
+On open, a clean checkpoint means the DB may serve the checkpointed projection
+immediately and replay only the derived-log tail after the checkpoint sequence.
+Startup must not scan the primary document store to prove that a durable,
+cleanly-published projection is queryable. Full corpus scans remain valid only
+for explicit repair, incompatible metadata, interrupted rebuilds, or corruption
+markers.
+
+The applied sequence must live in the same atomic publish domain as the
+projection effects. A separate applied-sequence row is not enough unless the
+write protocol can prove that, after a crash, the sequence never advances beyond
+the durable projection data visible to queries.
+
+Planned shape by projection type:
+
+- dense/HBC: publish the applied sequence, status, generation, and config
+  identity in the HBC metadata record; mirror the same checkpoint into the
+  shared sidecar for common status APIs and non-HBC tooling
+- full-text, sparse, graph, and algebraic indexes: store the applied sequence in
+  each index manifest or LSM/runtime-store manifest and publish it with the
+  visible root
+- enrichments: checkpoint each enrichment scope only after every source change
+  through the sequence has a durable artifact, durable skip, or durable
+  failure/repair record; external model side effects make clean versus degraded
+  status part of the contract
+- artifact counters: maintain per-index target/completed counters
+  incrementally on artifact put/delete so coverage checks are O(1) during
+  normal startup; corpus-wide recounts are repair tooling
+
+Implementation plan:
+
+1. Add a shared `ProjectionCheckpoint` format with applied sequence, status,
+   generation, config identity, and compatibility version.
+2. Add storage helpers that read, validate, and atomically publish a checkpoint
+   with the owning projection artifact.
+3. Migrate dense first: extend the HBC metadata publish path, make dense catchup
+   advance the checkpoint only after durable artifact/root publication, and make
+   clean restart trust the checkpoint plus replay the derived-log tail.
+4. Move full-text, sparse, graph, and algebraic managed indexes onto the same
+   checkpoint API through their existing typed index ownership boundaries.
+5. Convert enrichment progress to checkpoint semantics so a scope can report
+   clean, degraded, or repair-required rather than only "last sequence seen".
+6. Replace normal-startup dense artifact recounts with incremental counters and
+   reserve full-store scans for explicit repair paths.
+7. Reduce read-cache churn so tail replay only invalidates query state when a
+   visible root, generation, or config actually changes.
+
+Current implementation notes:
+
+- Dense/HBC metadata format version 2 carries the projection checkpoint fields
+  directly in the HBC metadata record. DB checkpoint saves update HBC metadata
+  first, then update the shared sidecar mirror; dense checkpoint reads prefer
+  the HBC metadata checkpoint when it has a nonzero config identity.
+- Shared sidecar checkpoint format `AFPRJCP1` is current-only and stores applied
+  sequence, status, generation, and config identity for all managed projection
+  types.
+- Enrichment progress uses checkpoint semantics for applied sequence and
+  clean/degraded/repair-required status, with a deterministic enrichment-catalog
+  config identity.
+- Normal dense startup trusts a clean, config-matching, caught-up HBC checkpoint
+  and does not run a primary document-store artifact recount. Recounts remain
+  repair/rebuild tooling for stale config identity, repair-required status,
+  interrupted rebuild state, corruption, or watermark regression.
+- Dense artifact target counters are durable metadata rows updated in the same
+  primary-store batch as artifact writes/deletes. Counter classification uses
+  the shared embedding artifact identity decoder, so direct document embeddings
+  and derived chunk embeddings feed the same O(1) startup coverage path.
+- Applied-sequence and runtime-status-only visibility notifications publish the
+  status snapshot without invalidating cached query DBs. Read-cache invalidation
+  remains reserved for visible-root/data publishes, blocking publish repair, and
+  explicit table invalidation.
+- Dense catch-up pacing sizes replay-window coalescing and catch-up session
+  reuse waits to the current derived-log tail. Small restart tails no longer pay
+  the full 256-record/2s coalesce window or 5s session-idle ceiling; those
+  ceilings remain available for large hot-ingest backlogs.
+
+Acceptance criteria:
+
+- clean restart with no new writes opens queryable projections without a primary
+  document-store scan
+- startup work is proportional to the derived-log tail, not corpus size
+- crash tests around checkpoint publication never expose a sequence ahead of
+  durable projection effects
+- repair markers, incompatible metadata, and corrupted checkpoints still force
+  rebuild or degraded status
+- enrichment failures do not advance a clean checkpoint past missing durable
+  outcomes
+- metrics expose checkpoint applied sequence, status, replay tail size, and
+  repair-scan counts per projection
 
 ## Runtime Ownership
 

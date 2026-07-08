@@ -10,7 +10,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.inference_audio_chunk_config import InferenceAudioChunkConfig
-    from ..models.inference_text_chunk_options import InferenceTextChunkOptions
+    from ..models.text_chunk_options import TextChunkOptions
 
 
 T = TypeVar("T", bound="InferenceChunkConfig")
@@ -18,7 +18,7 @@ T = TypeVar("T", bound="InferenceChunkConfig")
 
 @_attrs_define
 class InferenceChunkConfig:
-    """Configuration for chunking requests to Inference API.
+    """Configuration for chunking requests to Antfly inference.
     Combines shared text options with inference-specific audio/VAD options.
 
         Attributes:
@@ -27,14 +27,14 @@ class InferenceChunkConfig:
             max_chunks (int | Unset): Maximum number of chunks to generate per document.
             threshold (float | Unset): Confidence threshold for model-based chunking (0.0-1.0). Used by ONNX text models and
                 VAD audio models.
-            text (InferenceTextChunkOptions | Unset): Options specific to text chunking.
+            text (TextChunkOptions | Unset): Options specific to text chunking.
             audio (InferenceAudioChunkConfig | Unset): Audio chunking configuration for inference, including VAD options.
     """
 
     model: str | Unset = "fixed"
     max_chunks: int | Unset = UNSET
     threshold: float | Unset = UNSET
-    text: InferenceTextChunkOptions | Unset = UNSET
+    text: TextChunkOptions | Unset = UNSET
     audio: InferenceAudioChunkConfig | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -72,7 +72,7 @@ class InferenceChunkConfig:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.inference_audio_chunk_config import InferenceAudioChunkConfig
-        from ..models.inference_text_chunk_options import InferenceTextChunkOptions
+        from ..models.text_chunk_options import TextChunkOptions
 
         d = dict(src_dict)
         model = d.pop("model", UNSET)
@@ -82,11 +82,11 @@ class InferenceChunkConfig:
         threshold = d.pop("threshold", UNSET)
 
         _text = d.pop("text", UNSET)
-        text: InferenceTextChunkOptions | Unset
+        text: TextChunkOptions | Unset
         if isinstance(_text, Unset):
             text = UNSET
         else:
-            text = InferenceTextChunkOptions.from_dict(_text)
+            text = TextChunkOptions.from_dict(_text)
 
         _audio = d.pop("audio", UNSET)
         audio: InferenceAudioChunkConfig | Unset

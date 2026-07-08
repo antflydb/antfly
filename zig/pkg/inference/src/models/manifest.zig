@@ -950,9 +950,13 @@ fn findFirstExtensionInDir(allocator: std.mem.Allocator, base_dir: []const u8, e
 
 fn isGgufProjectorFileName(name: []const u8) bool {
     if (!std.mem.endsWith(u8, name, ".gguf")) return false;
-    return std.mem.eql(u8, name, "mmproj.gguf") or
-        std.mem.startsWith(u8, name, "mmproj-") or
-        std.mem.startsWith(u8, name, "mmproj_");
+    const ext = ".gguf";
+    const stem = name[0 .. name.len - ext.len];
+    return std.mem.eql(u8, stem, "mmproj") or
+        std.mem.startsWith(u8, stem, "mmproj-") or
+        std.mem.startsWith(u8, stem, "mmproj_") or
+        std.mem.endsWith(u8, stem, "-mmproj") or
+        std.mem.endsWith(u8, stem, "_mmproj");
 }
 
 fn isGlinerHeadGgufFileName(name: []const u8) bool {
@@ -2912,6 +2916,27 @@ test "manifest gguf discovery separates decoder and projector files" {
     try std.testing.expect(std.mem.endsWith(u8, projector, "mmproj-gemma-4-e2b-it-f16.gguf"));
 }
 
+test "manifest gguf discovery handles google gemma4 e4b qat layout" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "gemma-4-E4B-it-mmproj.gguf", .data = "projector" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "gemma-4-E4B_q4_0-it.gguf", .data = "decoder" });
+
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(model_dir);
+
+    const decoder = try findFirstGgufInDir(allocator, model_dir, false) orelse return error.TestExpectedDecoderGguf;
+    defer allocator.free(decoder);
+    const projector = try findFirstGgufInDir(allocator, model_dir, true) orelse return error.TestExpectedProjectorGguf;
+    defer allocator.free(projector);
+
+    try std.testing.expect(std.mem.endsWith(u8, decoder, "gemma-4-E4B_q4_0-it.gguf"));
+    try std.testing.expect(std.mem.endsWith(u8, projector, "gemma-4-E4B-it-mmproj.gguf"));
+}
+
 test "manifest does not treat projector-only gguf as decoder weights" {
     const allocator = std.testing.allocator;
 
@@ -2929,6 +2954,25 @@ test "manifest does not treat projector-only gguf as decoder weights" {
     try std.testing.expect(manifest.gguf_path == null);
     try std.testing.expect(manifest.gguf_projector_path != null);
     try std.testing.expect(std.mem.endsWith(u8, manifest.gguf_projector_path.?, "mmproj.gguf"));
+}
+
+test "manifest does not treat trailing mmproj gguf as decoder weights" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "gemma-4-E4B-it-mmproj.gguf", .data = "projector" });
+
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(model_dir);
+
+    var manifest = try loadFromDir(allocator, model_dir);
+    defer manifest.deinit();
+
+    try std.testing.expect(manifest.gguf_path == null);
+    try std.testing.expect(manifest.gguf_projector_path != null);
+    try std.testing.expect(std.mem.endsWith(u8, manifest.gguf_projector_path.?, "gemma-4-E4B-it-mmproj.gguf"));
 }
 
 test "listing manifest detects gguf assets without gguf metadata parse" {
@@ -2958,6 +3002,38 @@ test "listing manifest detects gguf assets without gguf metadata parse" {
     try std.testing.expect(manifest.hasInput("image"));
     try std.testing.expect(manifest.gguf_path != null);
     try std.testing.expect(manifest.gguf_projector_path != null);
+}
+
+test "listing manifest separates google gemma4 e4b qat decoder and projector" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "model_manifest.json",
+        .data =
+        \\{"type":"generator","tasks":["generate"],"inputs":["text","image","audio"]}
+        ,
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "gemma-4-E4B-it-mmproj.gguf", .data = "" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "gemma-4-E4B_q4_0-it.gguf", .data = "" });
+
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(model_dir);
+
+    var manifest = try loadListingFromDir(allocator, model_dir);
+    defer manifest.deinit();
+
+    try std.testing.expectEqual(ModelType.generator, manifest.model_type);
+    try std.testing.expect(manifest.hasTask("generate"));
+    try std.testing.expect(manifest.hasInput("image"));
+    try std.testing.expect(manifest.hasInput("audio"));
+    try std.testing.expect(manifest.gguf_path != null);
+    try std.testing.expect(manifest.gguf_projector_path != null);
+    try std.testing.expect(std.mem.endsWith(u8, manifest.gguf_path.?, "gemma-4-E4B_q4_0-it.gguf"));
+    try std.testing.expect(std.mem.endsWith(u8, manifest.gguf_projector_path.?, "gemma-4-E4B-it-mmproj.gguf"));
 }
 
 test "manifest treats gemma4 unified config as generator" {

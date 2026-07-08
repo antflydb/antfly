@@ -35,6 +35,7 @@ const db_embedder = @import("../storage/db/enrichment/embedder.zig");
 const asset_producer_mod = @import("../storage/db/enrichment/asset_producer.zig");
 const ha_read_gate_mod = @import("../storage/ha/read_gate.zig");
 const ha_standby_mod = @import("../storage/ha/standby.zig");
+const storage_schema = @import("../storage/schema.zig");
 const hbc_mod = @import("../storage/hbc_adapter.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const resource_manager_mod = @import("../storage/resource_manager.zig");
@@ -46,6 +47,7 @@ const reranking_runtime = @import("../reranking/mod.zig");
 const template_mod = @import("../template.zig");
 const table_catalog = @import("table_catalog.zig");
 const table_router = @import("table_router.zig");
+const tables_api = @import("tables.zig");
 const query_api = @import("query.zig");
 const query_contract = @import("query_contract.zig");
 const distributed_graph = @import("distributed_graph.zig");
@@ -67,6 +69,25 @@ const algebraic_ir = db_mod.algebraic.ir;
 fn benchQueryApiPhaseProfileEnabled() bool {
     return std.c.getenv("ANTFLY_BENCH_QUERY_API_PHASES\x00") != null or
         std.c.getenv("ANTFLY_BENCH_QUERY_PROFILE_EVERY\x00") != null;
+}
+
+const default_aggregation_full_result_budget: u32 = 100_000;
+
+fn aggregationFullResultBudgetFromRaw(raw: ?[*:0]u8) u32 {
+    const value = raw orelse return default_aggregation_full_result_budget;
+    const slice = std.mem.span(value);
+    if (slice.len == 0) return default_aggregation_full_result_budget;
+    const parsed = std.fmt.parseUnsigned(u32, slice, 10) catch return default_aggregation_full_result_budget;
+    return if (parsed == 0) std.math.maxInt(u32) else parsed;
+}
+
+fn aggregationFullResultBudget() u32 {
+    return aggregationFullResultBudgetFromRaw(std.c.getenv("ANTFLY_AGGREGATION_FULL_RESULT_BUDGET\x00"));
+}
+
+fn checkQueryDeadline(req: db_mod.types.SearchRequest) !void {
+    const deadline_ns = req.execution_deadline_ns orelse return;
+    if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
 }
 
 fn nsToUsFloat(ns: u64) f64 {
@@ -113,6 +134,7 @@ pub const BackgroundTextStatsResponse = struct {
 };
 
 pub const LsmStorageStats = runtime_status.LsmStorageStats;
+pub const ObservedDynamicFieldCapabilitySet = db_mod.IndexManager.ObservedDynamicFieldCapabilitySet;
 
 pub const ParsedTextStatsHttpResponse = union(enum) {
     fields: TextStatsResponse,
@@ -179,6 +201,8 @@ pub const ProvisionedTableReadCache = struct {
     pending_opens: std.ArrayListUnmanaged(PendingOpen) = .empty,
 
     const max_cached_tables = 64;
+    const pending_open_wait_poll_ns: u64 = 25 * std.time.ns_per_ms;
+    const pending_open_wait_timeout_ns: u64 = 5 * std.time.ns_per_s;
 
     /// Current epoch for `table_name`, creating its slot on first use. The
     /// key is duped on insert and owned by the map. Must be called with the
@@ -302,6 +326,7 @@ pub const ProvisionedTableReadCache = struct {
     ) !Lease {
         const io = self.threaded.io();
         var stale_epoch_retries: u8 = 0;
+        var pending_open_wait_started_ns: u64 = 0;
         while (true) {
             // Reloaded every attempt: a stale-epoch retry usually means the
             // table was dropped/recreated or moved mid-open, which changes
@@ -324,10 +349,15 @@ pub const ProvisionedTableReadCache = struct {
                 };
             }
             if (self.hasPendingOpenForNamespaceLocked(group_id, identity_namespace, table_name)) {
-                self.ready.waitUncancelable(io, &self.mutex);
                 self.mutex.unlock(io);
+                const now_ns = platform_time.monotonicNs();
+                if (pending_open_wait_started_ns == 0) pending_open_wait_started_ns = now_ns;
+                const waited_ns = now_ns -| pending_open_wait_started_ns;
+                if (waited_ns >= pending_open_wait_timeout_ns) return error.TableReadChurn;
+                io.sleep(Io.Duration.fromNanoseconds(@min(pending_open_wait_poll_ns, pending_open_wait_timeout_ns - waited_ns)), .awake) catch {};
                 continue;
             }
+            pending_open_wait_started_ns = 0;
             const owned_pending_name = try self.alloc.dupe(u8, table_name);
             var pending_name_owned_locally = true;
             errdefer if (pending_name_owned_locally) self.alloc.free(owned_pending_name);
@@ -1400,6 +1430,11 @@ pub const TableReadSource = struct {
             alloc: std.mem.Allocator,
             table_name: []const u8,
         ) anyerror!?LsmStorageStats = null,
+        observed_dynamic_field_capability_sets: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+        ) anyerror!?[]ObservedDynamicFieldCapabilitySet = null,
         document_artifact_manifest: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -1721,6 +1756,15 @@ pub const TableReadSource = struct {
         const fn_ptr = self.vtable.lsm_storage_stats orelse return null;
         return try fn_ptr(self.ptr, alloc, table_name);
     }
+
+    pub fn observedDynamicFieldCapabilitySets(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+    ) !?[]ObservedDynamicFieldCapabilitySet {
+        const fn_ptr = self.vtable.observed_dynamic_field_capability_sets orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name);
+    }
 };
 
 pub fn searchRequestFromVectorWorkerEnvelope(envelope: *const query_contract.OwnedAlgebraicVectorWorkerRequestEnvelope) db_mod.types.SearchRequest {
@@ -1969,6 +2013,7 @@ pub const BoundTableReadSource = struct {
                 .graph_edges_group_local = graphEdgesGroupLocal,
                 .local_runtime_statuses = localRuntimeStatuses,
                 .lsm_storage_stats = lsmStorageStats,
+                .observed_dynamic_field_capability_sets = observedDynamicFieldCapabilitySets,
                 .document_artifact_manifest = documentArtifactManifest,
                 .document_artifact_manifests = documentArtifactManifests,
             },
@@ -2014,6 +2059,16 @@ pub const BoundTableReadSource = struct {
             .maintenance_score = self.db.lsmMaintenanceScore(),
             .maintenance_debt_hint = self.db.lsmMaintenanceDebtHint(),
         };
+    }
+
+    fn observedDynamicFieldCapabilitySets(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+    ) !?[]ObservedDynamicFieldCapabilitySet {
+        const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, table_name, self.table_name)) return null;
+        return try self.db.observedDynamicFieldCapabilitySetsAlloc(alloc);
     }
 
     fn localRuntimeStatuses(
@@ -2088,6 +2143,7 @@ pub const BoundTableReadSource = struct {
     ) !?query_api.QueryResponse {
         const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        try checkQueryDeadline(req);
 
         const start_ns = platform_time.monotonicNs();
         const phase_profile = benchQueryApiPhaseProfileEnabled();
@@ -2096,6 +2152,7 @@ pub const BoundTableReadSource = struct {
         const prepare_ns = if (phase_profile) platform_time.monotonicNs() - prepare_start_ns else 0;
         const snapshot_start_ns = if (phase_profile) platform_time.monotonicNs() else 0;
         const snapshot_req = try self.db.searchRequestAtCurrentIdentityGeneration(req);
+        try checkQueryDeadline(snapshot_req);
         const snapshot_ns = if (phase_profile) platform_time.monotonicNs() - snapshot_start_ns else 0;
         var execution: LocalQueryExecution = .{ .request = snapshot_req, .result = undefined };
         const search_start_ns = if (phase_profile) platform_time.monotonicNs() else 0;
@@ -2113,6 +2170,7 @@ pub const BoundTableReadSource = struct {
             };
         }
         const search_ns = if (phase_profile) platform_time.monotonicNs() - search_start_ns else 0;
+        try checkQueryDeadline(snapshot_req);
         var result = execution.result;
         defer result.deinit();
         const response_req = execution.request;
@@ -2125,6 +2183,7 @@ pub const BoundTableReadSource = struct {
         const agg_start_ns = if (phase_profile) platform_time.monotonicNs() else 0;
         try applyBoundQueryAggregations(self, alloc, response_req, &result, &meta, consistency);
         const agg_ns = if (phase_profile) platform_time.monotonicNs() - agg_start_ns else 0;
+        try checkQueryDeadline(response_req);
         const post_start_ns = if (phase_profile) platform_time.monotonicNs() else 0;
         try applyQueryPostProcessing(alloc, response_req, &result, &meta, null, null);
         const post_ns = if (phase_profile) platform_time.monotonicNs() - post_start_ns else 0;
@@ -2455,6 +2514,7 @@ pub const ProvisionedTableReadSource = struct {
                 .graph_edges_group_local = graphEdgesGroupLocal,
                 .local_runtime_statuses = localRuntimeStatuses,
                 .lsm_storage_stats = lsmStorageStats,
+                .observed_dynamic_field_capability_sets = observedDynamicFieldCapabilitySets,
                 .document_artifact_manifest = documentArtifactManifest,
                 .document_artifact_manifests = documentArtifactManifests,
                 .document_artifact_manifest_group_local = documentArtifactManifestGroupLocal,
@@ -2586,6 +2646,7 @@ pub const ProvisionedTableReadSource = struct {
     ) !?query_api.QueryResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
+        try checkQueryDeadline(req);
         if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, readPreparationKindForQuery(req));
         const group_ids = try table_catalog.resolveGroupsForSpan(alloc, self.catalog, table_name, "", "");
         defer alloc.free(group_ids);
@@ -2595,6 +2656,7 @@ pub const ProvisionedTableReadSource = struct {
         const start_ns = platform_time.monotonicNs();
         if (group_ids.len == 1 and !distributed_graph.supportsCrossRange(req)) {
             const execution = try queryHostedLocalDetailed(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_ids[0], self.visibleRootGeneration(group_ids[0]), self.managedReadRuntimeConfig(), table_name, req, consistency);
+            try checkQueryDeadline(execution.request);
             var result = execution.result;
             defer result.deinit();
             const response_req = execution.request;
@@ -2605,6 +2667,7 @@ pub const ProvisionedTableReadSource = struct {
             };
             defer meta.deinit(alloc);
             try applyProvisionedQueryAggregations(self, alloc, group_ids, table_name, response_req, &result, &meta, consistency);
+            try checkQueryDeadline(response_req);
             try applyQueryPostProcessing(alloc, response_req, &result, &meta, self.antfly_provider, self.secret_store);
             return try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
         }
@@ -2614,6 +2677,7 @@ pub const ProvisionedTableReadSource = struct {
             base_req.graph_queries = &.{};
             base_req.expand_strategy = null;
             var merged = try queryProvisionedAcrossGroups(self, alloc, group_ids, base_req, table_name, consistency);
+            try checkQueryDeadline(base_req);
             defer merged.deinit();
             const graph_req = requestWithResultIdentityGeneration(req, merged);
 
@@ -2628,10 +2692,12 @@ pub const ProvisionedTableReadSource = struct {
             };
             defer meta.deinit(alloc);
             try applyProvisionedQueryAggregations(self, alloc, group_ids, table_name, graph_req, &merged, &meta, consistency);
+            try checkQueryDeadline(graph_req);
             try applyQueryPostProcessing(alloc, graph_req, &merged, &meta, self.antfly_provider, self.secret_store);
             return try query_api.encodeQueryResponses(alloc, table_name, graph_req, meta, merged);
         }
         var merged = try queryProvisionedAcrossGroups(self, alloc, group_ids, req, table_name, consistency);
+        try checkQueryDeadline(req);
         defer merged.deinit();
         var meta: query_api.QueryResponseMeta = .{
             .took_ms = @intCast(@divTrunc(platform_time.monotonicNs() - start_ns, std.time.ns_per_ms)),
@@ -2640,6 +2706,7 @@ pub const ProvisionedTableReadSource = struct {
         };
         defer meta.deinit(alloc);
         try applyProvisionedQueryAggregations(self, alloc, group_ids, table_name, req, &merged, &meta, consistency);
+        try checkQueryDeadline(req);
         try applyQueryPostProcessing(alloc, req, &merged, &meta, self.antfly_provider, self.secret_store);
         return try query_api.encodeQueryResponses(alloc, table_name, req, meta, merged);
     }
@@ -2935,7 +3002,188 @@ pub const ProvisionedTableReadSource = struct {
         }
         return out;
     }
+
+    fn observedDynamicFieldCapabilitySets(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+    ) !?[]ObservedDynamicFieldCapabilitySet {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const group_ids = try table_catalog.resolveGroupsForSpan(alloc, self.catalog, table_name, "", "");
+        defer alloc.free(group_ids);
+        if (group_ids.len == 0) return null;
+
+        var merged = std.ArrayListUnmanaged(ObservedDynamicFieldCapabilitySet).empty;
+        errdefer freeObservedDynamicFieldCapabilitySetsFromList(alloc, &merged);
+
+        for (group_ids) |group_id| {
+            const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+            defer alloc.free(path);
+            const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id);
+            var db = try openProvisionedWarmStatusDbForTable(
+                alloc,
+                path,
+                self.visibleRootGeneration(group_id),
+                self.backend_runtime,
+                identity_namespace,
+            );
+            defer db.close();
+
+            const group_sets = try db.observedDynamicFieldCapabilitySetsAlloc(alloc);
+            defer freeObservedDynamicFieldCapabilitySets(alloc, group_sets);
+            for (group_sets) |set| try mergeObservedDynamicFieldCapabilitySet(alloc, &merged, set);
+        }
+
+        return try merged.toOwnedSlice(alloc);
+    }
 };
+
+fn freeObservedDynamicFieldCapabilitySets(
+    alloc: std.mem.Allocator,
+    sets: []ObservedDynamicFieldCapabilitySet,
+) void {
+    for (sets) |*set| set.deinit(alloc);
+    if (sets.len > 0) alloc.free(sets);
+}
+
+fn freeObservedDynamicFieldCapabilitySetsFromList(
+    alloc: std.mem.Allocator,
+    sets: *std.ArrayListUnmanaged(ObservedDynamicFieldCapabilitySet),
+) void {
+    for (sets.items) |*set| set.deinit(alloc);
+    sets.deinit(alloc);
+}
+
+fn mergeObservedDynamicFieldCapabilitySet(
+    alloc: std.mem.Allocator,
+    merged: *std.ArrayListUnmanaged(ObservedDynamicFieldCapabilitySet),
+    incoming: ObservedDynamicFieldCapabilitySet,
+) !void {
+    for (merged.items) |*existing| {
+        if (!std.mem.eql(u8, existing.index_name, incoming.index_name)) continue;
+        for (incoming.field_capabilities) |capability| {
+            if (mergeObservedFieldCapabilityIntoSet(existing.field_capabilities, capability)) continue;
+            const cloned = try storage_schema.cloneFieldCapabilityAlloc(alloc, capability);
+            const old_len = existing.field_capabilities.len;
+            const expanded = alloc.realloc(existing.field_capabilities, old_len + 1) catch |err| {
+                storage_schema.freeOwnedFieldCapability(alloc, cloned);
+                return err;
+            };
+            existing.field_capabilities = expanded;
+            existing.field_capabilities[old_len] = cloned;
+        }
+        return;
+    }
+
+    {
+        var new_set = ObservedDynamicFieldCapabilitySet{
+            .index_name = try alloc.dupe(u8, incoming.index_name),
+            .field_capabilities = &.{},
+        };
+        errdefer new_set.deinit(alloc);
+        new_set.field_capabilities = try storage_schema.cloneFieldCapabilitiesAlloc(alloc, incoming.field_capabilities);
+        try merged.append(alloc, new_set);
+    }
+}
+
+fn mergeObservedFieldCapabilityIntoSet(
+    capabilities: []storage_schema.FieldCapability,
+    needle: storage_schema.FieldCapability,
+) bool {
+    for (capabilities) |*capability| {
+        if (!fieldCapabilityAggregationKeyEqual(capability.*, needle)) continue;
+        mergeObservedFieldCapability(capability, needle);
+        return true;
+    }
+    return false;
+}
+
+fn fieldCapabilityAggregationKeyEqual(left: storage_schema.FieldCapability, right: storage_schema.FieldCapability) bool {
+    return optionalStringsEqual(left.name, right.name) and
+        optionalStringsEqual(left.field, right.field) and
+        optionalStringsEqual(left.path_pattern, right.path_pattern) and
+        optionalStringsEqual(left.field_pattern, right.field_pattern) and
+        optionalStringsEqual(left.match_mapping_type, right.match_mapping_type) and
+        optionalStringsEqual(left.emitted_name, right.emitted_name) and
+        optionalStringsEqual(left.document_schema, right.document_schema) and
+        left.field_type == right.field_type and
+        std.mem.eql(u8, left.provenance, right.provenance) and
+        optionalStringsEqual(left.analyzer, right.analyzer);
+}
+
+fn mergeObservedFieldCapability(
+    existing: *storage_schema.FieldCapability,
+    incoming: storage_schema.FieldCapability,
+) void {
+    existing.searchable = existing.searchable and incoming.searchable;
+    existing.filterable = existing.filterable and incoming.filterable;
+    existing.aggregatable = existing.aggregatable and incoming.aggregatable;
+    existing.doc_values = existing.doc_values and incoming.doc_values;
+    existing.sortable = existing.sortable and incoming.sortable;
+    existing.doc_value_coverage = storage_schema.conservativeDocValueCoverage(existing.doc_value_coverage, incoming.doc_value_coverage);
+    existing.queryability_state = storage_schema.conservativeQueryabilityState(existing.queryability_state, incoming.queryability_state);
+    existing.sort_lifecycle_state = storage_schema.conservativeSortLifecycleState(existing.sort_lifecycle_state, incoming.sort_lifecycle_state);
+    if (!std.mem.eql(u8, existing.missing_null_policy, incoming.missing_null_policy)) {
+        existing.missing_null_policy = "mixed";
+    }
+    if (!indexSortMembershipEqual(existing.index_sort, incoming.index_sort)) {
+        existing.index_sort = null;
+    }
+}
+
+fn optionalStringsEqual(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return std.mem.eql(u8, left.?, right.?);
+}
+
+fn indexSortMembershipEqual(left: ?storage_schema.IndexSortMembership, right: ?storage_schema.IndexSortMembership) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return left.?.position == right.?.position and left.?.desc == right.?.desc;
+}
+
+test "provisioned observed dynamic capability merge is conservative across groups" {
+    const alloc = std.testing.allocator;
+
+    var covered = storage_schema.observedDynamicFieldCapability(null, "price", .{
+        .field_type = .numeric,
+        .do_index = true,
+        .doc_values = true,
+        .sortable = true,
+    });
+    covered.doc_value_coverage = "covered";
+    covered.queryability_state = "queryable";
+    storage_schema.refreshSortLifecycleState(&covered);
+
+    const declared = storage_schema.observedDynamicFieldCapability(null, "price", .{
+        .field_type = .numeric,
+        .do_index = true,
+        .doc_values = true,
+        .sortable = true,
+    });
+
+    const first_set = ObservedDynamicFieldCapabilitySet{
+        .index_name = @constCast("full_text_index_v0"),
+        .field_capabilities = @constCast((&[_]storage_schema.FieldCapability{covered})[0..]),
+    };
+    const second_set = ObservedDynamicFieldCapabilitySet{
+        .index_name = @constCast("full_text_index_v0"),
+        .field_capabilities = @constCast((&[_]storage_schema.FieldCapability{declared})[0..]),
+    };
+
+    var merged = std.ArrayListUnmanaged(ObservedDynamicFieldCapabilitySet).empty;
+    defer freeObservedDynamicFieldCapabilitySetsFromList(alloc, &merged);
+
+    try mergeObservedDynamicFieldCapabilitySet(alloc, &merged, first_set);
+    try mergeObservedDynamicFieldCapabilitySet(alloc, &merged, second_set);
+
+    try std.testing.expectEqual(@as(usize, 1), merged.items.len);
+    try std.testing.expectEqual(@as(usize, 1), merged.items[0].field_capabilities.len);
+    const capability = merged.items[0].field_capabilities[0];
+    try std.testing.expectEqualStrings("price", capability.field.?);
+    try std.testing.expect(capability.sortable);
+    try std.testing.expectEqualStrings("observed_declared", capability.doc_value_coverage);
+    try std.testing.expectEqualStrings("declared", capability.queryability_state);
+}
 
 pub const HostedProvisionedTableReadSource = struct {
     replica_root_dir: []const u8,
@@ -3141,6 +3389,7 @@ pub const HostedProvisionedTableReadSource = struct {
         };
 
         for (placements) |intent| {
+            if (!placementRefReadableWithPeers(placements, intent)) continue;
             const node_id = intent.record.local_node_id;
             if (node_id == local_node_id) {
                 if (tried_local or self.router.localStatus(group_id) != .active) continue;
@@ -3161,6 +3410,27 @@ pub const HostedProvisionedTableReadSource = struct {
             }
         }
         return null;
+    }
+
+    fn placementRefReadableWithPeers(
+        placements: []const *const raft_reconciler.PlacementIntent,
+        intent: *const raft_reconciler.PlacementIntent,
+    ) bool {
+        switch (intent.serving_state) {
+            .serving => return true,
+            .draining => {
+                for (placements) |peer| {
+                    if (peer.record.group_id == intent.record.group_id and
+                        peer.record.local_node_id != intent.record.local_node_id and
+                        peer.serving_state == .serving)
+                    {
+                        return false;
+                    }
+                }
+                return true;
+            },
+            .planned, .bootstrapping, .replaying, .cutover_ready => return false,
+        }
     }
 
     fn scan(
@@ -3212,6 +3482,7 @@ pub const HostedProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?query_api.QueryResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try checkQueryDeadline(req);
         const group_ids = try table_catalog.resolveGroupsForSpan(alloc, self.catalog, table_name, "", "");
         defer alloc.free(group_ids);
         if (group_ids.len == 0) return null;
@@ -3224,6 +3495,7 @@ pub const HostedProvisionedTableReadSource = struct {
 
             if (route == .local) {
                 const execution = try queryHostedLocalDetailed(null, self.replica_root_dir, self.catalog, self.requester, alloc, group_ids[0], self.visibleRootGeneration(group_ids[0]), .{ .backend_runtime = self.backend_runtime }, table_name, req, consistency);
+                try checkQueryDeadline(execution.request);
                 var result = execution.result;
                 defer result.deinit();
                 const response_req = execution.request;
@@ -3234,6 +3506,7 @@ pub const HostedProvisionedTableReadSource = struct {
                 };
                 defer meta.deinit(alloc);
                 try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, response_req, &result, &meta, consistency);
+                try checkQueryDeadline(response_req);
                 try applyQueryPostProcessing(alloc, response_req, &result, &meta, null, null);
                 return try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
             }
@@ -3244,6 +3517,7 @@ pub const HostedProvisionedTableReadSource = struct {
             base_req.graph_queries = &.{};
             base_req.expand_strategy = null;
             var merged = try queryHostedAcrossGroups(self, alloc, group_ids, base_req, table_name, consistency);
+            try checkQueryDeadline(base_req);
             defer merged.deinit();
             const graph_req = requestWithResultIdentityGeneration(req, merged);
 
@@ -3258,10 +3532,12 @@ pub const HostedProvisionedTableReadSource = struct {
             };
             defer meta.deinit(alloc);
             try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, graph_req, &merged, &meta, consistency);
+            try checkQueryDeadline(graph_req);
             try applyQueryPostProcessing(alloc, graph_req, &merged, &meta, null, null);
             return try query_api.encodeQueryResponses(alloc, table_name, graph_req, meta, merged);
         }
         var merged = try queryHostedAcrossGroups(self, alloc, group_ids, req, table_name, consistency);
+        try checkQueryDeadline(req);
         defer merged.deinit();
         var meta: query_api.QueryResponseMeta = .{
             .took_ms = @intCast(@divTrunc(platform_time.monotonicNs() - start_ns, std.time.ns_per_ms)),
@@ -3270,6 +3546,7 @@ pub const HostedProvisionedTableReadSource = struct {
         };
         defer meta.deinit(alloc);
         try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, req, &merged, &meta, consistency);
+        try checkQueryDeadline(req);
         try applyQueryPostProcessing(alloc, req, &merged, &meta, null, null);
         return try query_api.encodeQueryResponses(alloc, table_name, req, meta, merged);
     }
@@ -3995,7 +4272,7 @@ fn queryProvisionedAcrossGroupsParallel(
     const shard_results = try alloc.alloc(db_mod.types.SearchResult, group_ids.len);
     defer alloc.free(shard_results);
     for (slots, 0..) |slot, i| shard_results[i] = slot.result.?;
-    const merged = try query_api.mergeSearchResults(alloc, req, shard_results, req.offset, req.limit);
+    const merged = try mergeSearchResultsWithTableRuntimeSchema(alloc, self.catalog, table_name, req, shard_results, req.offset, req.limit);
     recordParallelFanout(.query, @intCast(platform_time.monotonicNs() - start_ns));
     return merged;
 }
@@ -4068,9 +4345,349 @@ fn queryHostedAcrossGroupsParallel(
     const shard_results = try alloc.alloc(db_mod.types.SearchResult, group_ids.len);
     defer alloc.free(shard_results);
     for (slots, 0..) |slot, i| shard_results[i] = slot.result.?;
-    const merged = try query_api.mergeSearchResults(alloc, req, shard_results, req.offset, req.limit);
+    const merged = try mergeSearchResultsWithTableRuntimeSchema(alloc, self.catalog, table_name, req, shard_results, req.offset, req.limit);
     recordParallelFanout(.query, @intCast(platform_time.monotonicNs() - start_ns));
     return merged;
+}
+
+fn distributedSearchShardLimit(req: db_mod.types.SearchRequest) u32 {
+    if (req.search_after.len > 0 or req.search_before.len > 0) return req.limit;
+    const shard_limit = req.limit +| req.offset;
+    return if (shard_limit == 0) req.limit else shard_limit;
+}
+
+fn distributedSearchShardRequest(
+    req: db_mod.types.SearchRequest,
+    distributed_text_stats: []const distributed_stats_mod.TextFieldStats,
+) db_mod.types.SearchRequest {
+    var copy = req;
+    copy.offset = 0;
+    copy.limit = distributedSearchShardLimit(req);
+    copy.distributed_text_stats = distributed_text_stats;
+    return copy;
+}
+
+test "distributed query shard request preserves sorted cursor contract" {
+    const order_by = [_]db_mod.types.SortField{
+        .{ .field = "created_at", .desc = true },
+        .{ .field = "_id" },
+    };
+    const search_after = [_]std.json.Value{
+        .{ .string = "2026-01-01T00:00:00Z" },
+        .{ .string = "doc:cursor" },
+    };
+    const stats = [_]distributed_stats_mod.TextFieldStats{
+        .{ .field = "body", .global_doc_count = 12 },
+    };
+
+    const cursor_shard_req = distributedSearchShardRequest(.{
+        .order_by = order_by[0..],
+        .search_after = search_after[0..],
+        .offset = 50,
+        .limit = 25,
+        .distributed_text_stats = &.{},
+    }, stats[0..]);
+
+    try std.testing.expectEqual(@as(u32, 0), cursor_shard_req.offset);
+    try std.testing.expectEqual(@as(u32, 25), cursor_shard_req.limit);
+    try std.testing.expectEqual(@as(usize, 2), cursor_shard_req.order_by.len);
+    try std.testing.expectEqualStrings("created_at", cursor_shard_req.order_by[0].field);
+    try std.testing.expect(cursor_shard_req.order_by[0].desc);
+    try std.testing.expectEqual(@as(usize, 2), cursor_shard_req.search_after.len);
+    try std.testing.expectEqualStrings("2026-01-01T00:00:00Z", cursor_shard_req.search_after[0].string);
+    try std.testing.expectEqualStrings("doc:cursor", cursor_shard_req.search_after[1].string);
+    try std.testing.expectEqual(@as(usize, 1), cursor_shard_req.distributed_text_stats.len);
+    try std.testing.expectEqualStrings("body", cursor_shard_req.distributed_text_stats[0].field);
+
+    const search_before = [_]std.json.Value{
+        .{ .string = "2025-12-31T23:59:59Z" },
+        .{ .string = "doc:previous" },
+    };
+    const before_shard_req = distributedSearchShardRequest(.{
+        .order_by = order_by[0..],
+        .search_before = search_before[0..],
+        .offset = 50,
+        .limit = 25,
+        .distributed_text_stats = &.{},
+    }, stats[0..]);
+
+    try std.testing.expectEqual(@as(u32, 0), before_shard_req.offset);
+    try std.testing.expectEqual(@as(u32, 25), before_shard_req.limit);
+    try std.testing.expectEqual(@as(usize, 2), before_shard_req.order_by.len);
+    try std.testing.expectEqual(@as(usize, 0), before_shard_req.search_after.len);
+    try std.testing.expectEqual(@as(usize, 2), before_shard_req.search_before.len);
+    try std.testing.expectEqualStrings("2025-12-31T23:59:59Z", before_shard_req.search_before[0].string);
+    try std.testing.expectEqualStrings("doc:previous", before_shard_req.search_before[1].string);
+    try std.testing.expectEqual(@as(usize, 1), before_shard_req.distributed_text_stats.len);
+
+    const offset_shard_req = distributedSearchShardRequest(.{
+        .order_by = order_by[0..],
+        .offset = 50,
+        .limit = 25,
+    }, &.{});
+    try std.testing.expectEqual(@as(u32, 0), offset_shard_req.offset);
+    try std.testing.expectEqual(@as(u32, 75), offset_shard_req.limit);
+    try std.testing.expectEqual(@as(usize, 0), offset_shard_req.search_after.len);
+    try std.testing.expectEqual(@as(usize, 0), offset_shard_req.search_before.len);
+}
+
+fn queryMergeRuntimeSchemaAlloc(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+) !?storage_schema.TableSchema {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
+    const schema_json = if (table.read_schema_json.len > 0) table.read_schema_json else table.schema_json;
+    if (schema_json.len == 0) return null;
+
+    var parsed = try tables_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    return try tables_api.deriveRuntimeTableSchema(alloc, parsed);
+}
+
+fn mergeSearchResultsWithTableRuntimeSchema(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    req: db_mod.types.SearchRequest,
+    shard_results: []const db_mod.types.SearchResult,
+    offset: u32,
+    limit: u32,
+) !db_mod.types.SearchResult {
+    const runtime_schema = try queryMergeRuntimeSchemaAlloc(alloc, catalog, table_name);
+    defer if (runtime_schema) |schema| storage_schema.freeSchema(alloc, schema);
+    return try query_api.mergeSearchResultsWithRuntimeSchema(alloc, req, shard_results, offset, limit, runtime_schema);
+}
+
+fn testTableReadSortedHitAlloc(alloc: std.mem.Allocator, id: []const u8, rank: i64) !db_mod.types.SearchHit {
+    const sort_values = try alloc.alloc(std.json.Value, 2);
+    errdefer alloc.free(sort_values);
+    sort_values[0] = .{ .integer = rank };
+    sort_values[1] = .{ .string = try alloc.dupe(u8, id) };
+    errdefer db_mod.types.deinitJsonValue(alloc, &sort_values[1]);
+    return .{
+        .id = try alloc.dupe(u8, id),
+        .sort_values = sort_values,
+    };
+}
+
+fn testTableReadStringSortedHitAlloc(alloc: std.mem.Allocator, id: []const u8, rank: []const u8) !db_mod.types.SearchHit {
+    const sort_values = try alloc.alloc(std.json.Value, 2);
+    errdefer alloc.free(sort_values);
+    sort_values[0] = .{ .string = try alloc.dupe(u8, rank) };
+    errdefer db_mod.types.deinitJsonValue(alloc, &sort_values[0]);
+    sort_values[1] = .{ .string = try alloc.dupe(u8, id) };
+    errdefer db_mod.types.deinitJsonValue(alloc, &sort_values[1]);
+    return .{
+        .id = try alloc.dupe(u8, id),
+        .sort_values = sort_values,
+    };
+}
+
+fn testTableReadIdSortedHitAlloc(alloc: std.mem.Allocator, id: []const u8) !db_mod.types.SearchHit {
+    const sort_values = try alloc.alloc(std.json.Value, 1);
+    errdefer alloc.free(sort_values);
+    sort_values[0] = .{ .string = try alloc.dupe(u8, id) };
+    errdefer db_mod.types.deinitJsonValue(alloc, &sort_values[0]);
+    return .{
+        .id = try alloc.dupe(u8, id),
+        .sort_values = sort_values,
+    };
+}
+
+fn testTableReadScoreSortedHitAlloc(alloc: std.mem.Allocator, id: []const u8, score: f32) !db_mod.types.SearchHit {
+    const sort_values = try alloc.alloc(std.json.Value, 2);
+    errdefer alloc.free(sort_values);
+    sort_values[0] = .{ .float = @floatCast(score) };
+    sort_values[1] = .{ .string = try alloc.dupe(u8, id) };
+    errdefer db_mod.types.deinitJsonValue(alloc, &sort_values[1]);
+    return .{
+        .id = try alloc.dupe(u8, id),
+        .score = score,
+        .sort_values = sort_values,
+    };
+}
+
+test "table read distributed sorted merge uses catalog runtime schema and rejects incomplete shard windows" {
+    const alloc = std.testing.allocator;
+    const non_sortable_rank_schema_json =
+        \\{"version":1,"default_type":"doc","dynamic_templates":[{"name":"rank","path_match":"rank","mapping":{"type":"numeric","sortable":false}}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"rank":{"type":"number"}}}}}}
+    ;
+    const sortable_rank_schema_json =
+        \\{"version":1,"default_type":"doc","dynamic_templates":[{"name":"rank","path_match":"rank","mapping":{"type":"numeric","sortable":true}}],"document_schemas":{"doc":{"schema":{"type":"object","properties":{"rank":{"type":"number"}}}}}}
+    ;
+
+    const FakeCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .description = "docs table",
+                    .schema_json = non_sortable_rank_schema_json,
+                    .read_schema_json = sortable_rank_schema_json,
+                    .indexes_json = tables_api.default_indexes_json,
+                    .replication_sources_json = "[]",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const order_by = [_]db_mod.types.SortField{.{ .field = "rank" }};
+
+    var left_hits = try alloc.alloc(db_mod.types.SearchHit, 3);
+    left_hits[0] = try testTableReadSortedHitAlloc(alloc, "doc:a", 1);
+    left_hits[1] = try testTableReadSortedHitAlloc(alloc, "doc:c", 3);
+    left_hits[2] = try testTableReadSortedHitAlloc(alloc, "doc:f", 6);
+    var right_hits = try alloc.alloc(db_mod.types.SearchHit, 3);
+    right_hits[0] = try testTableReadSortedHitAlloc(alloc, "doc:b", 2);
+    right_hits[1] = try testTableReadSortedHitAlloc(alloc, "doc:d", 4);
+    right_hits[2] = try testTableReadSortedHitAlloc(alloc, "doc:e", 5);
+
+    var left = db_mod.types.SearchResult{ .alloc = alloc, .hits = left_hits, .total_hits = 3 };
+    defer left.deinit();
+    var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 3, .total_hits_relation = .gte };
+    defer right.deinit();
+
+    var merged = try mergeSearchResultsWithTableRuntimeSchema(alloc, FakeCatalog.iface(), "docs", .{
+        .order_by = &order_by,
+        .limit = 3,
+        .profile = true,
+    }, &.{ left, right }, 0, 3);
+    defer merged.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), merged.hits.len);
+    try std.testing.expectEqualStrings("doc:a", merged.hits[0].id);
+    try std.testing.expectEqualStrings("doc:b", merged.hits[1].id);
+    try std.testing.expectEqualStrings("doc:c", merged.hits[2].id);
+    try std.testing.expectEqual(@as(u32, 6), merged.total_hits);
+    try std.testing.expectEqual(db_mod.types.TotalHitsRelation.gte, merged.total_hits_relation);
+    const sort_profile = merged.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("distributed_k_way_merge", sort_profile.plan);
+    try std.testing.expectEqualStrings("distributed_merge", sort_profile.source);
+    try std.testing.expectEqual(@as(usize, 2), sort_profile.distributed_shard_count);
+    try std.testing.expectEqual(@as(usize, 3), sort_profile.distributed_shard_window);
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResultsWithTableRuntimeSchema(alloc, table_catalog.emptyCatalogSource(), "docs", .{
+        .order_by = &order_by,
+        .limit = 3,
+    }, &.{ left, right }, 0, 3));
+
+    var incomplete_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    incomplete_hits[0] = try testTableReadSortedHitAlloc(alloc, "doc:e", 5);
+    var incomplete = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = incomplete_hits,
+        .total_hits = 2,
+        .total_hits_relation = .gte,
+    };
+    defer incomplete.deinit();
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResultsWithTableRuntimeSchema(alloc, FakeCatalog.iface(), "docs", .{
+        .order_by = &order_by,
+        .limit = 2,
+    }, &.{incomplete}, 0, 2));
+
+    var tie_left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    tie_left_hits[0] = try testTableReadSortedHitAlloc(alloc, "doc:b", 1);
+    var tie_right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    tie_right_hits[0] = try testTableReadSortedHitAlloc(alloc, "doc:a", 1);
+    var tie_left = db_mod.types.SearchResult{ .alloc = alloc, .hits = tie_left_hits, .total_hits = 1 };
+    defer tie_left.deinit();
+    var tie_right = db_mod.types.SearchResult{ .alloc = alloc, .hits = tie_right_hits, .total_hits = 1 };
+    defer tie_right.deinit();
+
+    var tie_merged = try mergeSearchResultsWithTableRuntimeSchema(alloc, FakeCatalog.iface(), "docs", .{
+        .order_by = &order_by,
+        .limit = 2,
+    }, &.{ tie_left, tie_right }, 0, 2);
+    defer tie_merged.deinit();
+    try std.testing.expectEqual(@as(usize, 2), tie_merged.hits.len);
+    try std.testing.expectEqualStrings("doc:a", tie_merged.hits[0].id);
+    try std.testing.expectEqualStrings("doc:b", tie_merged.hits[1].id);
+
+    var id_left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    id_left_hits[0] = try testTableReadIdSortedHitAlloc(alloc, "doc:c");
+    var id_right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    id_right_hits[0] = try testTableReadIdSortedHitAlloc(alloc, "doc:d");
+    var id_left = db_mod.types.SearchResult{ .alloc = alloc, .hits = id_left_hits, .total_hits = 1 };
+    defer id_left.deinit();
+    var id_right = db_mod.types.SearchResult{ .alloc = alloc, .hits = id_right_hits, .total_hits = 1 };
+    defer id_right.deinit();
+
+    const id_after = [_]std.json.Value{.{ .string = "doc:b" }};
+    var id_page = try mergeSearchResultsWithTableRuntimeSchema(alloc, FakeCatalog.iface(), "docs", .{
+        .search_after = &id_after,
+        .limit = 2,
+        .profile = true,
+    }, &.{ id_left, id_right }, 0, 2);
+    defer id_page.deinit();
+    try std.testing.expectEqual(@as(usize, 2), id_page.hits.len);
+    try std.testing.expectEqualStrings("doc:c", id_page.hits[0].id);
+    try std.testing.expectEqualStrings("doc:d", id_page.hits[1].id);
+    const id_profile = id_page.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("distributed_k_way_merge", id_profile.plan);
+    try std.testing.expectEqualStrings("distributed_merge", id_profile.source);
+
+    const bad_id_after = [_]std.json.Value{.{ .integer = 1 }};
+    try std.testing.expectError(error.InvalidQueryRequest, mergeSearchResultsWithTableRuntimeSchema(alloc, FakeCatalog.iface(), "docs", .{
+        .search_after = &bad_id_after,
+        .limit = 2,
+    }, &.{ id_left, id_right }, 0, 2));
+
+    const score_order = [_]db_mod.types.SortField{.{ .field = "_score", .desc = true }};
+    var score_left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    score_left_hits[0] = try testTableReadScoreSortedHitAlloc(alloc, "doc:a", 0.8);
+    var score_right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    score_right_hits[0] = try testTableReadScoreSortedHitAlloc(alloc, "doc:b", 0.9);
+    var score_left = db_mod.types.SearchResult{ .alloc = alloc, .hits = score_left_hits, .total_hits = 1 };
+    defer score_left.deinit();
+    var score_right = db_mod.types.SearchResult{ .alloc = alloc, .hits = score_right_hits, .total_hits = 1 };
+    defer score_right.deinit();
+
+    var score_page = try mergeSearchResultsWithTableRuntimeSchema(alloc, FakeCatalog.iface(), "docs", .{
+        .order_by = &score_order,
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .limit = 2,
+        .profile = true,
+    }, &.{ score_left, score_right }, 0, 2);
+    defer score_page.deinit();
+    try std.testing.expectEqual(@as(usize, 2), score_page.hits.len);
+    try std.testing.expectEqualStrings("doc:b", score_page.hits[0].id);
+    try std.testing.expectEqualStrings("doc:a", score_page.hits[1].id);
+    const score_profile = score_page.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("distributed_k_way_merge", score_profile.plan);
+    try std.testing.expectEqualStrings("distributed_merge", score_profile.source);
+
+    var string_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    string_hits[0] = try testTableReadStringSortedHitAlloc(alloc, "doc:z", "two");
+    var string_result = db_mod.types.SearchResult{ .alloc = alloc, .hits = string_hits, .total_hits = 1 };
+    defer string_result.deinit();
+    try std.testing.expectError(error.InvalidQueryRequest, mergeSearchResultsWithTableRuntimeSchema(alloc, FakeCatalog.iface(), "docs", .{
+        .order_by = &order_by,
+        .limit = 2,
+    }, &.{ left, string_result }, 0, 2));
 }
 
 fn cloneRuntimePreflightSummary(
@@ -4434,14 +5051,7 @@ fn queryProvisionedAcrossGroups(
     try validateResolvedDocFilterForGroups(alloc, self.catalog, table_name, group_ids, req);
     const distributed_text_stats = try collectProvisionedSearchRequestTextStats(self, alloc, group_ids, req, table_name);
     defer distributed_stats_mod.deinitTextFieldStats(alloc, distributed_text_stats);
-    const shard_limit = req.limit + req.offset;
-    const shard_req = blk: {
-        var copy = req;
-        copy.offset = 0;
-        copy.limit = if (shard_limit == 0) req.limit else shard_limit;
-        copy.distributed_text_stats = distributed_text_stats;
-        break :blk copy;
-    };
+    const shard_req = distributedSearchShardRequest(req, distributed_text_stats);
 
     const plan = planQueryFanout(self.io_impl, group_ids.len, req);
     recordFanoutPlan(.query, plan);
@@ -4461,7 +5071,7 @@ fn queryProvisionedAcrossGroups(
         shard_results[i] = try queryHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, shard_req, consistency);
         initialized += 1;
     }
-    return try query_api.mergeSearchResults(alloc, req, shard_results[0..initialized], req.offset, req.limit);
+    return try mergeSearchResultsWithTableRuntimeSchema(alloc, self.catalog, table_name, req, shard_results[0..initialized], req.offset, req.limit);
 }
 
 fn queryHostedAcrossGroups(
@@ -4477,14 +5087,7 @@ fn queryHostedAcrossGroups(
     try rejectHostedRemoteResolvedDocFilter(self, alloc, group_ids, table_name, req, consistency);
     const distributed_text_stats = try collectHostedSearchRequestTextStats(self, alloc, group_ids, req, table_name, consistency);
     defer distributed_stats_mod.deinitTextFieldStats(alloc, distributed_text_stats);
-    const shard_limit = req.limit + req.offset;
-    const shard_req = blk: {
-        var copy = req;
-        copy.offset = 0;
-        copy.limit = if (shard_limit == 0) req.limit else shard_limit;
-        copy.distributed_text_stats = distributed_text_stats;
-        break :blk copy;
-    };
+    const shard_req = distributedSearchShardRequest(req, distributed_text_stats);
 
     const plan = planQueryFanout(self.io_impl, group_ids.len, req);
     recordFanoutPlan(.query, plan);
@@ -4509,7 +5112,7 @@ fn queryHostedAcrossGroups(
         };
         initialized += 1;
     }
-    return try query_api.mergeSearchResults(alloc, req, shard_results[0..initialized], req.offset, req.limit);
+    return try mergeSearchResultsWithTableRuntimeSchema(alloc, self.catalog, table_name, req, shard_results[0..initialized], req.offset, req.limit);
 }
 
 fn provisionedGraphWorker(self: *ProvisionedTableReadSource) distributed_graph.Worker {
@@ -9014,9 +9617,111 @@ fn identityGenerationForAggregationFullResultRerun(
     req: db_mod.types.SearchRequest,
     result: db_mod.types.SearchResult,
 ) !?u64 {
-    if (!req.count_only and result.hits.len == result.total_hits) return req.identity_read_generation orelse result.identity_read_generation;
-    if (result.total_hits == 0) return req.identity_read_generation orelse result.identity_read_generation;
+    if (aggregationCanUseCurrentResult(req, result)) return req.identity_read_generation orelse result.identity_read_generation;
     return req.identity_read_generation orelse result.identity_read_generation orelse error.UnsupportedQueryRequest;
+}
+
+fn aggregationCanUseCurrentResult(req: db_mod.types.SearchRequest, result: db_mod.types.SearchResult) bool {
+    if (result.total_hits_relation != .exact) return false;
+    if (result.total_hits == 0) return true;
+    return !req.count_only and result.hits.len == result.total_hits;
+}
+
+fn aggregationFullResultLimit(req: db_mod.types.SearchRequest, result: db_mod.types.SearchResult, operation: []const u8) !u32 {
+    try checkQueryDeadline(req);
+    if (result.total_hits_relation != .exact) return error.UnsupportedQueryRequest;
+    const budget = aggregationFullResultBudget();
+    if (result.total_hits > budget) {
+        std.log.warn("query aggregation full-result rerun budget exceeded operation={s} total_hits={d} budget={d}", .{
+            operation,
+            result.total_hits,
+            budget,
+        });
+        return error.QueryCandidateBudgetExceeded;
+    }
+    return result.total_hits;
+}
+
+fn aggregationFullResultRequest(req: db_mod.types.SearchRequest, result: db_mod.types.SearchResult, operation: []const u8) !db_mod.types.SearchRequest {
+    const identity_read_generation = try identityGenerationForAggregationFullResultRerun(req, result);
+    const full_limit = try aggregationFullResultLimit(req, result, operation);
+    var full_req = req;
+    full_req.identity_read_generation = identity_read_generation;
+    full_req.offset = 0;
+    full_req.limit = full_limit;
+    full_req.include_stored = true;
+    full_req.count_only = false;
+    full_req.order_by = &.{};
+    full_req.search_after = &.{};
+    full_req.search_before = &.{};
+    return full_req;
+}
+
+test "aggregation completeness requires exact total relation" {
+    const req = db_mod.types.SearchRequest{};
+    try std.testing.expect(aggregationCanUseCurrentResult(req, .{
+        .alloc = std.testing.allocator,
+        .hits = &.{},
+        .total_hits = 0,
+        .total_hits_relation = .exact,
+    }));
+    try std.testing.expect(!aggregationCanUseCurrentResult(req, .{
+        .alloc = std.testing.allocator,
+        .hits = &.{},
+        .total_hits = 0,
+        .total_hits_relation = .gte,
+    }));
+
+    const hits = [_]db_mod.types.SearchHit{.{ .id = @constCast("doc:a") }};
+    try std.testing.expect(aggregationCanUseCurrentResult(req, .{
+        .alloc = std.testing.allocator,
+        .hits = @constCast(hits[0..]),
+        .total_hits = 1,
+        .total_hits_relation = .exact,
+    }));
+    try std.testing.expect(!aggregationCanUseCurrentResult(req, .{
+        .alloc = std.testing.allocator,
+        .hits = @constCast(hits[0..]),
+        .total_hits = 1,
+        .total_hits_relation = .gte,
+    }));
+    try std.testing.expectError(error.UnsupportedQueryRequest, aggregationFullResultLimit(.{}, .{
+        .alloc = std.testing.allocator,
+        .hits = @constCast(hits[0..]),
+        .total_hits = 1,
+        .total_hits_relation = .gte,
+    }, "test"));
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, aggregationFullResultLimit(.{}, .{
+        .alloc = std.testing.allocator,
+        .hits = @constCast(hits[0..]),
+        .total_hits = default_aggregation_full_result_budget + 1,
+        .total_hits_relation = .exact,
+    }, "test"));
+
+    const order_by = [_]db_mod.types.SortField{.{ .field = "created_at", .desc = true }};
+    const cursor = [_]std.json.Value{.{ .string = "2026-01-01" }};
+    const full_req = try aggregationFullResultRequest(.{
+        .offset = 10,
+        .limit = 5,
+        .count_only = true,
+        .include_stored = false,
+        .order_by = order_by[0..],
+        .search_after = cursor[0..],
+    }, .{
+        .alloc = std.testing.allocator,
+        .hits = @constCast(hits[0..]),
+        .total_hits = 1,
+        .total_hits_relation = .exact,
+        .identity_read_generation = 99,
+    }, "test");
+    try std.testing.expectEqual(@as(u32, 0), full_req.offset);
+    try std.testing.expectEqual(@as(u32, 1), full_req.limit);
+    try std.testing.expect(!full_req.count_only);
+    try std.testing.expect(full_req.include_stored);
+    try std.testing.expectEqual(@as(?u64, 99), full_req.identity_read_generation);
+    try std.testing.expectEqual(@as(usize, 0), full_req.order_by.len);
+    try std.testing.expectEqual(@as(usize, 0), full_req.search_after.len);
+    try std.testing.expectEqual(@as(usize, 0), full_req.search_before.len);
 }
 
 fn applyBoundQueryAggregations(
@@ -9029,20 +9734,11 @@ fn applyBoundQueryAggregations(
 ) !void {
     if (req.aggregations_json.len == 0) return;
     const aggregation_req = requestWithResultIdentityGeneration(req, result.*);
-    if (!req.count_only and result.hits.len == result.total_hits) {
-        return try applyAggregationResults(alloc, aggregation_req, result.*, try aggregationContextForDb(alloc, aggregation_req, self.db), meta);
-    }
-    if (result.total_hits == 0) {
+    if (aggregationCanUseCurrentResult(req, result.*)) {
         return try applyAggregationResults(alloc, aggregation_req, result.*, try aggregationContextForDb(alloc, aggregation_req, self.db), meta);
     }
 
-    const identity_read_generation = try identityGenerationForAggregationFullResultRerun(req, result.*);
-    var full_req = req;
-    full_req.identity_read_generation = identity_read_generation;
-    full_req.offset = 0;
-    full_req.limit = result.total_hits;
-    full_req.include_stored = true;
-    full_req.count_only = false;
+    const full_req = try aggregationFullResultRequest(req, result.*, "bound");
     var full_result = try self.reads.searchWithConsistency(alloc, self.db, full_req, consistency);
     defer full_result.deinit();
     return try applyAggregationResults(alloc, full_req, full_result, try aggregationContextForDb(alloc, full_req, self.db), meta);
@@ -9066,21 +9762,12 @@ fn applyProvisionedQueryAggregations(
         var db = try openProvisionedQueryDbForTableWithRuntime(alloc, path, self.catalog, table_name, group_ids[0], self.visibleRootGeneration(group_ids[0]), self.backend_runtime);
         defer db.close();
 
-        if (!req.count_only and result.hits.len == result.total_hits) {
-            return try applyAggregationResults(alloc, aggregation_req, result.*, try aggregationContextForDb(alloc, aggregation_req, &db), meta);
-        }
-        if (result.total_hits == 0) {
+        if (aggregationCanUseCurrentResult(req, result.*)) {
             return try applyAggregationResults(alloc, aggregation_req, result.*, try aggregationContextForDb(alloc, aggregation_req, &db), meta);
         }
 
         var reads = raft_mod.FeatureDBReads.init(group_ids[0], self.requester);
-        const identity_read_generation = try identityGenerationForAggregationFullResultRerun(req, result.*);
-        var full_req = req;
-        full_req.identity_read_generation = identity_read_generation;
-        full_req.offset = 0;
-        full_req.limit = result.total_hits;
-        full_req.include_stored = true;
-        full_req.count_only = false;
+        const full_req = try aggregationFullResultRequest(req, result.*, "provisioned-local");
         var full_result = try reads.searchWithConsistency(alloc, &db, full_req, consistency);
         defer full_result.deinit();
         return try applyAggregationResults(alloc, full_req, full_result, try aggregationContextForDb(alloc, full_req, &db), meta);
@@ -9092,26 +9779,14 @@ fn applyProvisionedQueryAggregations(
     defer distributed_stats_mod.deinitTextFieldStats(alloc, current_agg_stats);
     const current_bg_stats = try collectProvisionedAggregationBackgroundTextStats(self, alloc, group_ids, table_name, aggregation_req, result.hits);
     defer db_mod.aggregations.deinitDistributedBackgroundTextStats(alloc, current_bg_stats);
-    if (!req.count_only and result.hits.len == result.total_hits) {
-        return try applyAggregationResults(alloc, aggregation_req, result.*, .{
-            .distributed_text_stats = current_agg_stats,
-            .distributed_background_text_stats = current_bg_stats,
-        }, meta);
-    }
-    if (result.total_hits == 0) {
+    if (aggregationCanUseCurrentResult(req, result.*)) {
         return try applyAggregationResults(alloc, aggregation_req, result.*, .{
             .distributed_text_stats = current_agg_stats,
             .distributed_background_text_stats = current_bg_stats,
         }, meta);
     }
 
-    const identity_read_generation = try identityGenerationForAggregationFullResultRerun(req, result.*);
-    var full_req = req;
-    full_req.identity_read_generation = identity_read_generation;
-    full_req.offset = 0;
-    full_req.limit = result.total_hits;
-    full_req.include_stored = true;
-    full_req.count_only = false;
+    const full_req = try aggregationFullResultRequest(req, result.*, "provisioned-distributed");
     var full_result = try queryProvisionedAcrossGroups(self, alloc, group_ids, full_req, table_name, consistency);
     defer full_result.deinit();
     const full_agg_stats = try collectProvisionedAggregationTextStats(self, alloc, group_ids, table_name, full_req, full_result.hits);
@@ -9275,21 +9950,12 @@ fn applyHostedProvisionedQueryAggregations(
                 var db = try openProvisionedQueryDbForTableWithRuntime(alloc, path, self.catalog, table_name, group_ids[0], self.visibleRootGeneration(group_ids[0]), self.backend_runtime);
                 defer db.close();
 
-                if (!req.count_only and result.hits.len == result.total_hits) {
-                    return try applyAggregationResults(alloc, aggregation_req, result.*, try aggregationContextForDb(alloc, aggregation_req, &db), meta);
-                }
-                if (result.total_hits == 0) {
+                if (aggregationCanUseCurrentResult(req, result.*)) {
                     return try applyAggregationResults(alloc, aggregation_req, result.*, try aggregationContextForDb(alloc, aggregation_req, &db), meta);
                 }
 
                 var reads = raft_mod.FeatureDBReads.init(group_ids[0], self.requester);
-                const identity_read_generation = try identityGenerationForAggregationFullResultRerun(req, result.*);
-                var full_req = req;
-                full_req.identity_read_generation = identity_read_generation;
-                full_req.offset = 0;
-                full_req.limit = result.total_hits;
-                full_req.include_stored = true;
-                full_req.count_only = false;
+                const full_req = try aggregationFullResultRequest(req, result.*, "hosted-local");
                 var full_result = try reads.searchWithConsistency(alloc, &db, full_req, consistency);
                 defer full_result.deinit();
                 return try applyAggregationResults(alloc, full_req, full_result, try aggregationContextForDb(alloc, full_req, &db), meta);
@@ -9304,26 +9970,14 @@ fn applyHostedProvisionedQueryAggregations(
     defer distributed_stats_mod.deinitTextFieldStats(alloc, current_agg_stats);
     const current_bg_stats = try collectHostedAggregationBackgroundTextStats(self, alloc, group_ids, table_name, aggregation_req, result.hits, consistency);
     defer db_mod.aggregations.deinitDistributedBackgroundTextStats(alloc, current_bg_stats);
-    if (!req.count_only and result.hits.len == result.total_hits) {
-        return try applyAggregationResults(alloc, aggregation_req, result.*, .{
-            .distributed_text_stats = current_agg_stats,
-            .distributed_background_text_stats = current_bg_stats,
-        }, meta);
-    }
-    if (result.total_hits == 0) {
+    if (aggregationCanUseCurrentResult(req, result.*)) {
         return try applyAggregationResults(alloc, aggregation_req, result.*, .{
             .distributed_text_stats = current_agg_stats,
             .distributed_background_text_stats = current_bg_stats,
         }, meta);
     }
 
-    const identity_read_generation = try identityGenerationForAggregationFullResultRerun(req, result.*);
-    var full_req = req;
-    full_req.identity_read_generation = identity_read_generation;
-    full_req.offset = 0;
-    full_req.limit = result.total_hits;
-    full_req.include_stored = true;
-    full_req.count_only = false;
+    const full_req = try aggregationFullResultRequest(req, result.*, "hosted-distributed");
     var full_result = try queryHostedAcrossGroups(self, alloc, group_ids, full_req, table_name, consistency);
     defer full_result.deinit();
     const full_agg_stats = try collectHostedAggregationTextStats(self, alloc, group_ids, table_name, full_req, full_result.hits, consistency);
@@ -12504,6 +13158,10 @@ fn encodeScanRequest(
     if (opts.fields.len > 0 and !opts.include_all_fields) {
         try appendJsonFieldNames(alloc, &out, &first, "fields", opts.fields);
     }
+    if (opts.filter_query_json.len > 0) {
+        try appendJsonFieldName(alloc, &out, &first, "filter_query");
+        try out.appendSlice(alloc, opts.filter_query_json);
+    }
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
 }
@@ -13115,6 +13773,7 @@ fn parseRemoteSearchResult(alloc: std.mem.Allocator, body: []const u8) !db_mod.t
     if (responses.len == 0) return error.InvalidQueryRequest;
     const response = responses[0];
     const hits_obj = response.hits orelse return error.InvalidQueryRequest;
+    const total_obj = hits_obj.total orelse return error.InvalidQueryRequest;
     const hits_value = hits_obj.hits orelse return error.InvalidQueryRequest;
 
     const hits = try alloc.alloc(db_mod.types.SearchHit, hits_value.len);
@@ -13141,7 +13800,8 @@ fn parseRemoteSearchResult(alloc: std.mem.Allocator, body: []const u8) !db_mod.t
     return .{
         .alloc = alloc,
         .hits = hits,
-        .total_hits = @intCast(hits_obj.total orelse 0),
+        .total_hits = try query_contract.queryHitsTotalValueToU32(total_obj),
+        .total_hits_relation = try query_contract.parseTotalHitsRelation(total_obj.relation),
         .graph_results = graph_results,
     };
 }
@@ -13189,11 +13849,12 @@ fn parseRemoteIndexScoresAlloc(
 test "parseRemoteSearchResult preserves fused index scores" {
     const alloc = std.testing.allocator;
     var result = try parseRemoteSearchResult(alloc,
-        \\{"responses":[{"hits":{"total":1,"hits":[{"_id":"doc:a","_score":0.9,"_index_scores":{"full_text":0.75,"semantic_idx":0.25},"_source":{"title":"alpha"}}],"max_score":0.9},"took":1,"status":200,"table":"docs"}]}
+        \\{"responses":[{"hits":{"total":{"value":1,"relation":"gte"},"hits":[{"_id":"doc:a","_score":0.9,"_index_scores":{"full_text":0.75,"semantic_idx":0.25},"_source":{"title":"alpha"}}],"max_score":0.9},"took":1,"status":200,"table":"docs"}]}
     );
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqual(db_mod.types.TotalHitsRelation.gte, result.total_hits_relation);
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
     try std.testing.expectEqual(@as(usize, 2), result.hits[0].index_scores.len);
     try std.testing.expectEqualStrings("full_text", result.hits[0].index_scores[0].index_name);
@@ -13566,24 +14227,61 @@ fn appendScanLine(
     const escaped_key = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(key, .{})});
     defer alloc.free(escaped_key);
 
-    try out.appendSlice(alloc, "{\"key\":");
+    try out.appendSlice(alloc, "{\"_id\":");
     try out.appendSlice(alloc, escaped_key);
     if (projected_json) |json| {
-        if (json.len < 2 or json[0] != '{' or json[json.len - 1] != '}') return error.InvalidProjectedDocumentJson;
-        if (json.len > 2) {
-            try out.append(alloc, ',');
-            try out.appendSlice(alloc, json[1..]);
-        } else {
-            try out.append(alloc, '}');
-        }
+        try appendScanProjectedFields(alloc, out, json);
     } else {
         try out.append(alloc, '}');
     }
     try out.append(alloc, '\n');
 }
 
+fn appendScanProjectedFields(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    projected_json: []const u8,
+) !void {
+    if (projected_json.len < 2 or projected_json[0] != '{' or projected_json[projected_json.len - 1] != '}') return error.InvalidProjectedDocumentJson;
+    if (projected_json.len == 2) {
+        try out.append(alloc, '}');
+        return;
+    }
+
+    if (std.mem.indexOf(u8, projected_json, "\"_id\"") == null) {
+        try out.append(alloc, ',');
+        try out.appendSlice(alloc, projected_json[1..]);
+        return;
+    }
+
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, projected_json, .{}) catch return error.InvalidProjectedDocumentJson;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidProjectedDocumentJson;
+
+    var it = parsed.value.object.iterator();
+    while (it.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, "_id")) continue;
+        try out.append(alloc, ',');
+        try appendJsonString(alloc, out, entry.key_ptr.*);
+        try out.append(alloc, ':');
+        const encoded_value = try std.json.Stringify.valueAlloc(alloc, entry.value_ptr.*, .{});
+        defer alloc.free(encoded_value);
+        try out.appendSlice(alloc, encoded_value);
+    }
+    try out.append(alloc, '}');
+}
+
 fn parseJsonTestBody(comptime T: type, alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(T) {
     return try std.json.parseFromSlice(T, alloc, body, .{});
+}
+
+test "scan ndjson keeps _id reserved for server document identity" {
+    const alloc = std.testing.allocator;
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+
+    try appendScanLine(alloc, &out, "doc:server", "{\"_id\":\"doc:stored\",\"title\":\"alpha\"}");
+    try std.testing.expectEqualStrings("{\"_id\":\"doc:server\",\"title\":\"alpha\"}\n", out.items);
 }
 
 fn parseNdjsonTestRowsAlloc(comptime T: type, alloc: std.mem.Allocator, ndjson: []const u8) ![]T {
@@ -13708,13 +14406,13 @@ test "bound table read source scans keys as ndjson" {
     }, .read_index)).?;
     defer scan.deinit(alloc);
     const ScanRow = struct {
-        key: []const u8,
+        _id: []const u8,
         title: []const u8,
     };
     const rows = try parseNdjsonTestRowsAlloc(ScanRow, alloc, scan.ndjson);
     defer alloc.free(rows);
     try std.testing.expectEqual(@as(usize, 2), rows.len);
-    try std.testing.expectEqualStrings("doc:a", rows[0].key);
+    try std.testing.expectEqualStrings("doc:a", rows[0]._id);
     try std.testing.expectEqualStrings("alpha", rows[0].title);
 }
 
@@ -14049,7 +14747,7 @@ test "provisioned table read source routes lookup and scan across ranges" {
     }, .stale)).?;
     defer scan.deinit(alloc);
     const ScanRow = struct {
-        key: []const u8,
+        _id: []const u8,
         title: []const u8,
     };
     const rows = try parseNdjsonTestRowsAlloc(ScanRow, alloc, scan.ndjson);
@@ -16086,7 +16784,7 @@ test "remote simple vector query uses vector worker route" {
             }
             return .{
                 .status = 200,
-                .body = try alloc_inner.dupe(u8, "{\"responses\":[{\"hits\":{\"total\":0,\"hits\":[]},\"took\":0,\"status\":200,\"table\":\"docs\"}]}"),
+                .body = try alloc_inner.dupe(u8, "{\"responses\":[{\"hits\":{\"total\":{\"value\":0,\"relation\":\"exact\"},\"hits\":[]},\"took\":0,\"status\":200,\"table\":\"docs\"}]}"),
             };
         }
     };
@@ -16117,6 +16815,8 @@ test "remote simple vector query uses vector worker route" {
     defer vector_result.deinit();
     try std.testing.expectEqual(@as(usize, 1), state.vector_worker_calls);
     try std.testing.expectEqual(@as(usize, 0), state.query_calls);
+    try std.testing.expectEqual(@as(u32, 0), vector_result.total_hits);
+    try std.testing.expectEqual(db_mod.types.TotalHitsRelation.exact, vector_result.total_hits_relation);
     try std.testing.expectEqual(@as(?u64, 77), vector_result.identity_read_generation);
 
     var fallback_result = try queryRemote(state.iface(), alloc, "http://remote.test", 11, "docs", .{
@@ -16128,6 +16828,8 @@ test "remote simple vector query uses vector worker route" {
     defer fallback_result.deinit();
     try std.testing.expectEqual(@as(usize, 1), state.vector_worker_calls);
     try std.testing.expectEqual(@as(usize, 1), state.query_calls);
+    try std.testing.expectEqual(@as(u32, 0), fallback_result.total_hits);
+    try std.testing.expectEqual(db_mod.types.TotalHitsRelation.exact, fallback_result.total_hits_relation);
     try std.testing.expectEqual(@as(?u64, 88), fallback_result.identity_read_generation);
 }
 

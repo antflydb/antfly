@@ -6,6 +6,8 @@ replace github.com/antflydb/antfly/go/pkg/libaf => ../libaf
 
 replace github.com/antflydb/antfly/go/pkg/antfly => ../antfly
 
+replace github.com/antflydb/antfly/go/pkg/generating => ../generating
+
 replace github.com/antflydb/antfly/go/pkg/sdk => ../sdk
 
 require (
@@ -17,6 +19,7 @@ require (
 )
 
 require (
+	github.com/antflydb/antfly/go/pkg/generating v0.0.0 // indirect
 	github.com/antflydb/antfly/go/pkg/libaf v0.0.1 // indirect
 	github.com/apapsch/go-jsonmerge/v2 v2.0.0 // indirect
 	github.com/getkin/kin-openapi v0.134.0 // indirect

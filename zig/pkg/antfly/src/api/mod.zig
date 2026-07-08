@@ -39,6 +39,7 @@ pub const table_router = @import("table_router.zig");
 pub const tables = @import("tables.zig");
 pub const table_contract = @import("table_contract.zig");
 pub const indexes = @import("indexes.zig");
+const openapi_contract = @import("openapi_contract.zig");
 pub const http_routes = @import("http_routes.zig");
 pub const provisioned_storage = @import("provisioned_storage.zig");
 pub const table_reads = @import("table_reads.zig");
@@ -48,12 +49,15 @@ pub const distributed_entity_sink = @import("distributed_entity_sink.zig");
 pub const distributed_join = @import("distributed_join.zig");
 pub const distributed_graph = @import("distributed_graph.zig");
 pub const artifact_reprocess_jobs = @import("artifact_reprocess_jobs.zig");
+pub const repair_jobs = @import("repair_jobs.zig");
 pub const http_internal_group_read_routes = @import("http_internal_group_read_routes.zig");
+pub const http_internal_group_write_routes = @import("http_internal_group_write_routes.zig");
 pub const http_internal_group_join_routes = @import("http_internal_group_join_routes.zig");
 pub const http_server = @import("http_server.zig");
 pub const http_client = @import("http_client.zig");
 pub const httpx_handler = @import("httpx_handler.zig");
 pub const connections = @import("connections.zig");
+const protocol_adapters = @import("protocol_adapters.zig");
 
 pub const ClusterHealth = cluster.ClusterHealth;
 pub const ClusterStatus = cluster.ClusterStatus;
@@ -80,6 +84,26 @@ pub const HostedGroupRouter = table_router.HostedGroupRouter;
 pub const ApiHttpServer = http_server.ApiHttpServer;
 pub const ApiHttpClient = http_client.ApiHttpClient;
 
+test "public index contract exposes runtime status metadata" {
+    try openapi_contract.expectPublicIndexRuntimeStatusMetadata();
+}
+
+test "public openapi documents stable exact sort diagnostics" {
+    try openapi_contract.expectPublicOpenApiDocumentsStableExactSortDiagnostics();
+}
+
+test "api query contract serializes sort profile diagnostics" {
+    try query_contract.testing.expectSortProfileDiagnosticsSerialization();
+}
+
+test "api query contract maps public exact sort rejection diagnostics" {
+    try query_contract.testing.expectPublicExactSortRejectionMapping();
+}
+
+test "api query contract preserves filter-only query string filters" {
+    try query_contract.testing.expectFilterOnlyQueryStringFilterPreserved();
+}
+
 test "linear merge request parser accepts raw payload value under public request cap" {
     const alloc = std.testing.allocator;
     const payload = try alloc.alloc(u8, 6 * 1024 * 1024);
@@ -99,6 +123,30 @@ test "linear merge request parser accepts raw payload value under public request
 
     try std.testing.expectEqual(@as(usize, 1), req.writes.len);
     try std.testing.expect(std.mem.indexOf(u8, req.writes[0].value, "\"raw_payload\"") != null);
+}
+
+test "protocol adapters require extension runtime package digest identity" {
+    try protocol_adapters.testExtensionRuntimeBindingRequiresInstalledPackageDigestMatch();
+}
+
+test "protocol adapters carry matched extension runtime package digest" {
+    try protocol_adapters.testExtensionRuntimeBindingCarriesMatchedInstalledPackageDigest();
+}
+
+test "api table runtime schema debug emits sort capabilities" {
+    try tables.testRuntimeSchemaDebugEmitsSortCapabilities();
+}
+
+test "api table runtime schema debug emits observed dynamic capabilities" {
+    try tables.testRuntimeSchemaDebugEmitsObservedDynamicCapabilities();
+}
+
+test "api query builder preflight describes missing physical sort coverage with public sortable wording" {
+    try query_builder_agent.testPreflightDescribesMissingPhysicalSortCoverageWithPublicSortableWording();
+}
+
+test "api query builder prompt exposes native sort capabilities" {
+    try query_builder_agent.testQueryBuilderUsesGeneratedFullTextSpecialistWhenRunnerProvided();
 }
 
 test "public batch default schema accepts docsaf doc_type row and rejects reserved _type" {
@@ -222,6 +270,7 @@ test "api module compiles" {
     _ = distributed_join;
     _ = distributed_graph;
     _ = http_internal_group_read_routes;
+    _ = http_internal_group_write_routes;
     _ = http_internal_group_join_routes;
     _ = http_server;
     _ = http_client;
@@ -246,6 +295,31 @@ test "api module compiles" {
     _ = HostedGroupRouter;
     _ = ApiHttpServer;
     _ = ApiHttpClient;
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, query_contract.parseQueryRequest(std.testing.allocator, null, "docs",
+        \\{
+        \\  "full_text_search": {"match":"raft","field":"body"},
+        \\  "order_by": [{"field":"_id"},{"field":"created_at"}]
+        \\}
+    ));
+    try std.testing.expectError(error.UnsupportedQueryRequest, query_contract.parseQueryRequest(std.testing.allocator, null, "docs",
+        \\{
+        \\  "full_text_search": {"match":"raft","field":"body"},
+        \\  "order_by": [{"field":"created_at"},{"field":"_id","desc":true}]
+        \\}
+    ));
+}
+
+test "artifact enrichment request permits asset full text routing" {
+    const config_json = try table_contract.parseArtifactEnrichmentRequest(
+        std.testing.allocator,
+        "image_caption_v1",
+        "{\"kind\":\"asset\",\"field\":\"caption_json\",\"full_text_index\":true}",
+    );
+    defer std.testing.allocator.free(config_json);
+
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"kind\":\"asset\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"full_text_index\":true") != null);
 }
 
 test "distributed graph result_ref fail-closed guards are covered" {

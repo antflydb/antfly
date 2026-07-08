@@ -22,7 +22,7 @@ from typing import Any
 import pytest
 import requests
 
-from helpers import wait_until
+from helpers import query_hits_total_value, wait_until
 
 pytestmark = pytest.mark.postgres_integration
 
@@ -200,10 +200,7 @@ def _result_hits(result: dict[str, Any]) -> list[dict[str, Any]]:
 def _result_total(result: dict[str, Any]) -> int:
     response = _first_response(result)
     hits = response.get("hits", {})
-    total = hits.get("total", 0)
-    if isinstance(total, dict):
-        return int(total.get("value", 0))
-    return int(total)
+    return query_hits_total_value(hits)
 
 
 def _result_status(result: dict[str, Any]) -> int:

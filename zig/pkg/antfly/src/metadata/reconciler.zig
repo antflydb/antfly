@@ -156,11 +156,7 @@ pub const ReconciliationPlan = struct {
     }
 
     pub fn deinit(self: *ReconciliationPlan, alloc: std.mem.Allocator) void {
-        for (self.placement_upserts) |intent| {
-            var record = intent.record;
-            record.deinit(alloc);
-            if (intent.peer_node_ids.len > 0) alloc.free(intent.peer_node_ids);
-        }
+        for (self.placement_upserts) |intent| raft_reconciler.freeIntentOwned(alloc, intent);
         alloc.free(self.placement_upserts);
         for (self.table_upserts) |record| table_manager.freeTable(alloc, record);
         alloc.free(self.table_upserts);
@@ -270,9 +266,7 @@ pub const Reconciler = struct {
         var table_upserts = std.ArrayListUnmanaged(table_manager.TableRecord).empty;
         var placement_upserts = std.ArrayListUnmanaged(raft_reconciler.PlacementIntent).empty;
         errdefer {
-            for (placement_upserts.items) |intent| {
-                if (intent.peer_node_ids.len > 0) self.alloc.free(intent.peer_node_ids);
-            }
+            for (placement_upserts.items) |intent| raft_reconciler.freeIntentOwned(self.alloc, intent);
             placement_upserts.deinit(self.alloc);
         }
         errdefer {
@@ -316,7 +310,7 @@ pub const Reconciler = struct {
         }
 
         for (desired_placements) |desired| {
-            const effective = normalizeRestoreBootstrapIntent(current, desired_tables, desired_ranges, desired);
+            const effective = effectivePlacementIntent(current, desired_tables, desired_ranges, desired);
             const existing = findPlacementIntent(current.placement_intents, effective.record.group_id, effective.record.local_node_id);
             if (existing == null or !placementIntentsEqual(existing.?, effective)) {
                 try placement_upserts.append(self.alloc, try clonePlacementIntent(self.alloc, effective));
@@ -409,10 +403,21 @@ pub const Reconciler = struct {
 
         for (current.placement_intents) |intent| {
             if (findPlacementIntent(desired_placements, intent.record.group_id, intent.record.local_node_id) == null) {
-                try placement_removals.append(self.alloc, .{
-                    .group_id = intent.record.group_id,
-                    .local_node_id = intent.record.local_node_id,
-                });
+                if (placementSafeToRemove(current, desired_placements, intent)) {
+                    try placement_removals.append(self.alloc, .{
+                        .group_id = intent.record.group_id,
+                        .local_node_id = intent.record.local_node_id,
+                    });
+                } else {
+                    var draining = intent;
+                    draining.serving_state = .draining;
+                    const watermark = relocationWatermarkForGroup(current, intent.record.group_id);
+                    if (draining.relocation_generation == 0) draining.relocation_generation = intent.record.metadata_version + 1;
+                    applyRelocationWatermark(&draining, watermark);
+                    if (!placementIntentsEqual(intent, draining)) {
+                        try placement_upserts.append(self.alloc, try clonePlacementIntent(self.alloc, draining));
+                    }
+                }
             }
         }
         for (current.tables) |record| {
@@ -595,11 +600,11 @@ pub const Reconciler = struct {
                 if (!groupStatusReadyForAutomaticPlanning(status)) continue;
                 if (!docIdentityNamespaceReadyForAutomaticSplit(status)) continue;
                 if (status.disk_bytes <= self.config.max_shard_size_bytes) continue;
-                if (status.doc_count < 2) continue;
                 const lookup = self.config.median_key_lookup orelse continue;
                 const owned_split_key = (lookup.fetchMedianKey(self.alloc, range.group_id) catch continue) orelse continue;
                 var split_key_consumed = false;
                 defer if (!split_key_consumed) self.alloc.free(owned_split_key);
+                if (status.doc_count > 0 and status.doc_count < 2) continue;
                 if (owned_split_key.len == 0) continue;
                 if (!keyStrictlyInsideRange(owned_split_key, range.start_key, range.end_key)) continue;
 
@@ -712,13 +717,7 @@ const AutomaticTransitions = struct {
 };
 
 fn clonePlacementIntent(alloc: std.mem.Allocator, intent: raft_reconciler.PlacementIntent) !raft_reconciler.PlacementIntent {
-    var cloned_record = try intent.record.clone(alloc);
-    errdefer cloned_record.deinit(alloc);
-    return .{
-        .record = cloned_record,
-        .store_id = intent.store_id,
-        .peer_node_ids = if (intent.peer_node_ids.len == 0) &.{} else try alloc.dupe(u64, intent.peer_node_ids),
-    };
+    return try raft_reconciler.cloneIntentOwned(alloc, intent);
 }
 
 fn placementIntentsEqual(a: raft_reconciler.PlacementIntent, b: raft_reconciler.PlacementIntent) bool {
@@ -730,6 +729,14 @@ fn placementIntentsEqual(a: raft_reconciler.PlacementIntent, b: raft_reconciler.
         snapshotBootstrapEqual(a.record.snapshot_bootstrap, b.record.snapshot_bootstrap) and
         backupRestoreBootstrapEqual(a.record.backup_restore_bootstrap, b.record.backup_restore_bootstrap) and
         a.store_id == b.store_id and
+        a.serving_state == b.serving_state and
+        a.relocation_generation == b.relocation_generation and
+        a.relocation_source_node_id == b.relocation_source_node_id and
+        a.relocation_source_store_id == b.relocation_source_store_id and
+        a.relocation_doc_count_watermark == b.relocation_doc_count_watermark and
+        a.relocation_disk_bytes_watermark == b.relocation_disk_bytes_watermark and
+        a.relocation_target_sequence == b.relocation_target_sequence and
+        a.relocation_applied_sequence == b.relocation_applied_sequence and
         std.mem.eql(u64, a.peer_node_ids, b.peer_node_ids);
 }
 
@@ -788,6 +795,288 @@ fn normalizeRestoreBootstrapIntent(
         };
     }
     return effective;
+}
+
+fn effectivePlacementIntent(
+    current: CurrentMetadataState,
+    tables: []const table_manager.TableRecord,
+    ranges: []const table_manager.RangeRecord,
+    intent: raft_reconciler.PlacementIntent,
+) raft_reconciler.PlacementIntent {
+    var effective = normalizeRestoreBootstrapIntent(current, tables, ranges, intent);
+    const existing = findPlacementIntent(current.placement_intents, effective.record.group_id, effective.record.local_node_id);
+    const has_current_group = countPlacementIntents(current.placement_intents, effective.record.group_id) > 0;
+    if (!has_current_group) {
+        effective.serving_state = .serving;
+        return effective;
+    }
+
+    const watermark = relocationWatermarkForGroup(current, effective.record.group_id);
+    applyRelocationWatermark(&effective, watermark);
+
+    if (existing) |current_intent| {
+        effective.relocation_generation = current_intent.relocation_generation;
+        if (effective.relocation_generation == 0 and current_intent.serving_state != .serving) {
+            effective.relocation_generation = current_intent.record.metadata_version + 1;
+        }
+        if (effective.relocation_source_node_id == 0) effective.relocation_source_node_id = current_intent.relocation_source_node_id;
+        if (effective.relocation_source_store_id == 0) effective.relocation_source_store_id = current_intent.relocation_source_store_id;
+        if (current_intent.relocation_doc_count_watermark > effective.relocation_doc_count_watermark) effective.relocation_doc_count_watermark = current_intent.relocation_doc_count_watermark;
+        if (current_intent.relocation_disk_bytes_watermark > effective.relocation_disk_bytes_watermark) effective.relocation_disk_bytes_watermark = current_intent.relocation_disk_bytes_watermark;
+        effective.relocation_target_sequence = current_intent.relocation_target_sequence;
+        effective.relocation_applied_sequence = current_intent.relocation_applied_sequence;
+        applyRelocationWatermark(&effective, watermark);
+
+        effective.serving_state = switch (current_intent.serving_state) {
+            .serving => .serving,
+            .draining => .serving,
+            .planned, .bootstrapping, .replaying, .cutover_ready => relocationTargetServingState(current, effective),
+        };
+        return effective;
+    }
+
+    effective.serving_state = relocationTargetServingState(current, effective);
+    if (effective.serving_state == .serving) return effective;
+    if (effective.relocation_generation == 0) effective.relocation_generation = watermark.generation_hint;
+    if (effective.relocation_source_node_id == 0) {
+        if (findRelocationSourceIntent(current.placement_intents, effective.record.group_id)) |source| {
+            effective.relocation_source_node_id = source.record.local_node_id;
+            effective.relocation_source_store_id = source.store_id;
+        }
+    }
+    return effective;
+}
+
+const RelocationWatermark = struct {
+    doc_count: u64 = 0,
+    disk_bytes: u64 = 0,
+    generation_hint: u64 = 1,
+    has_visible_data: bool = false,
+};
+
+fn relocationWatermarkForGroup(current: CurrentMetadataState, group_id: u64) RelocationWatermark {
+    var watermark: RelocationWatermark = .{};
+    for (current.placement_intents) |intent| {
+        if (intent.record.group_id != group_id) continue;
+        if (intent.relocation_doc_count_watermark > 0) watermark.has_visible_data = true;
+        if (intent.relocation_doc_count_watermark > watermark.doc_count) watermark.doc_count = intent.relocation_doc_count_watermark;
+        if (intent.relocation_doc_count_watermark > 0 and intent.relocation_disk_bytes_watermark > watermark.disk_bytes) watermark.disk_bytes = intent.relocation_disk_bytes_watermark;
+        if (intent.relocation_generation >= watermark.generation_hint) watermark.generation_hint = intent.relocation_generation + 1;
+    }
+    if (mergedGroupStatus(current, group_id)) |status| {
+        if (relocationStatusHasVisibleDocuments(status.doc_count)) watermark.has_visible_data = true;
+        if (status.doc_count > watermark.doc_count) watermark.doc_count = status.doc_count;
+        if (relocationStatusHasVisibleDocuments(status.doc_count) and status.disk_bytes > watermark.disk_bytes) watermark.disk_bytes = status.disk_bytes;
+        if (status.updated_at_millis >= watermark.generation_hint) watermark.generation_hint = status.updated_at_millis + 1;
+    }
+    for (current.stores) |store| {
+        if (!store.live or !std.mem.eql(u8, store.health_class, "healthy")) continue;
+        if (!storeHasPlacement(current.placement_intents, group_id, store.node_id)) continue;
+        for (store.group_statuses) |status| {
+            if (status.group_id != group_id) continue;
+            if (relocationStatusHasVisibleDocuments(status.doc_count)) watermark.has_visible_data = true;
+            if (status.doc_count > watermark.doc_count) watermark.doc_count = status.doc_count;
+            if (relocationStatusHasVisibleDocuments(status.doc_count) and status.disk_bytes > watermark.disk_bytes) watermark.disk_bytes = status.disk_bytes;
+            if (status.updated_at_millis >= watermark.generation_hint) watermark.generation_hint = status.updated_at_millis + 1;
+        }
+        for (store.runtime_statuses) |status| {
+            if (status.group_id != group_id) continue;
+            if (status.doc_count > 0) watermark.has_visible_data = true;
+            if (status.doc_count > watermark.doc_count) watermark.doc_count = status.doc_count;
+            if (status.doc_count > 0 and status.disk_bytes > watermark.disk_bytes) watermark.disk_bytes = status.disk_bytes;
+        }
+    }
+    return watermark;
+}
+
+fn applyRelocationWatermark(intent: *raft_reconciler.PlacementIntent, watermark: RelocationWatermark) void {
+    if (!watermark.has_visible_data) {
+        intent.relocation_doc_count_watermark = 0;
+        intent.relocation_disk_bytes_watermark = 0;
+        return;
+    }
+    if (intent.relocation_doc_count_watermark < watermark.doc_count) intent.relocation_doc_count_watermark = watermark.doc_count;
+    if (intent.relocation_disk_bytes_watermark < watermark.disk_bytes) intent.relocation_disk_bytes_watermark = watermark.disk_bytes;
+}
+
+fn relocationStatusHasVisibleDocuments(doc_count: u64) bool {
+    return doc_count > 0;
+}
+
+fn relocationTargetServingState(
+    current: CurrentMetadataState,
+    intent: raft_reconciler.PlacementIntent,
+) raft_reconciler.PlacementServingState {
+    if (relocationTargetReady(current, intent)) return .serving;
+    if (!groupHasVisibleData(current, intent.record.group_id)) return .serving;
+    if (relocationTargetCutoverReady(current, intent)) return .cutover_ready;
+    if (relocationTargetHasDataReport(current, intent)) return .replaying;
+    return .bootstrapping;
+}
+
+fn relocationTargetReady(current: CurrentMetadataState, intent: raft_reconciler.PlacementIntent) bool {
+    return relocationTargetCutoverReady(current, intent);
+}
+
+fn relocationTargetCutoverReady(current: CurrentMetadataState, intent: raft_reconciler.PlacementIntent) bool {
+    const store = findStoreByNode(current.stores, intent.record.local_node_id) orelse return false;
+    if (!store.live or !std.mem.eql(u8, store.health_class, "healthy")) return false;
+    if (store.active_backfills != 0) return false;
+
+    var saw_group_status = false;
+    for (store.group_statuses) |status| {
+        if (status.group_id != intent.record.group_id) continue;
+        saw_group_status = true;
+        if (status.transition_pending) return false;
+        if (status.replay_required and !status.replay_caught_up) return false;
+        if (status.doc_count < intent.relocation_doc_count_watermark) return false;
+        if (status.disk_bytes < intent.relocation_disk_bytes_watermark) return false;
+        if (status.cutover_ready or status.reads_ready_after_cutover) return true;
+    }
+    if (!saw_group_status) return false;
+    return intent.relocation_doc_count_watermark == 0 and intent.relocation_disk_bytes_watermark == 0;
+}
+
+fn relocationTargetHasDataReport(current: CurrentMetadataState, intent: raft_reconciler.PlacementIntent) bool {
+    const store = findStoreByNode(current.stores, intent.record.local_node_id) orelse return false;
+    for (store.group_statuses) |status| {
+        if (status.group_id == intent.record.group_id) return true;
+    }
+    for (store.runtime_statuses) |status| {
+        if (status.group_id == intent.record.group_id) return true;
+    }
+    return false;
+}
+
+fn placementSafeToRemove(
+    current: CurrentMetadataState,
+    desired_placements: []const raft_reconciler.PlacementIntent,
+    source: raft_reconciler.PlacementIntent,
+) bool {
+    const desired_count = countPlacementIntents(desired_placements, source.record.group_id);
+    if (desired_count == 0) return true;
+    const data_bearing_group = groupHasVisibleData(current, source.record.group_id);
+    if (!data_bearing_group) return emptyGroupSourceSafeToRemove(current, desired_placements, source);
+    const watermark = relocationWatermarkForGroup(current, source.record.group_id);
+    var saw_replacement = false;
+    for (desired_placements) |desired| {
+        if (desired.record.group_id != source.record.group_id) continue;
+        if (desired.record.local_node_id == source.record.local_node_id) continue;
+        if (!placementIsReplacementForSource(desired, source)) continue;
+        saw_replacement = true;
+        const current_target = findPlacementIntent(current.placement_intents, desired.record.group_id, desired.record.local_node_id) orelse return false;
+        if (current_target.serving_state != .serving) return false;
+        var target = current_target;
+        applyRelocationWatermark(&target, watermark);
+        if (!relocationTargetReady(current, target)) return false;
+    }
+    if (saw_replacement) return true;
+    return compactShrinkSafeToRemove(current, desired_placements, source, watermark);
+}
+
+fn compactShrinkSafeToRemove(
+    current: CurrentMetadataState,
+    desired_placements: []const raft_reconciler.PlacementIntent,
+    source: raft_reconciler.PlacementIntent,
+    watermark: RelocationWatermark,
+) bool {
+    const current_count = countPlacementIntents(current.placement_intents, source.record.group_id);
+    const desired_count = countPlacementIntents(desired_placements, source.record.group_id);
+    if (desired_count == 0 or desired_count >= current_count) return false;
+
+    var survivors: usize = 0;
+    for (desired_placements) |desired| {
+        if (desired.record.group_id != source.record.group_id) continue;
+        if (desired.record.local_node_id == source.record.local_node_id) continue;
+        const current_target = findPlacementIntent(current.placement_intents, desired.record.group_id, desired.record.local_node_id) orelse return false;
+        if (current_target.serving_state != .serving) return false;
+        if (!placementCaughtUpForCompactShrink(current, current_target, watermark)) return false;
+        survivors += 1;
+    }
+    return survivors == desired_count;
+}
+
+fn placementCaughtUpForCompactShrink(
+    current: CurrentMetadataState,
+    target: raft_reconciler.PlacementIntent,
+    watermark: RelocationWatermark,
+) bool {
+    const store = findStoreByNode(current.stores, target.record.local_node_id) orelse return false;
+    if (!store.live or !std.mem.eql(u8, store.health_class, "healthy")) return false;
+    if (store.active_backfills != 0) return false;
+    for (store.group_statuses) |status| {
+        if (status.group_id != target.record.group_id) continue;
+        if (!status.local_voter) return false;
+        if (status.transition_pending) return false;
+        if (status.replay_required and !status.replay_caught_up) return false;
+        if (status.doc_count < watermark.doc_count) return false;
+        if (status.disk_bytes < watermark.disk_bytes) return false;
+        return true;
+    }
+    return false;
+}
+
+fn emptyGroupSourceSafeToRemove(
+    current: CurrentMetadataState,
+    desired_placements: []const raft_reconciler.PlacementIntent,
+    source: raft_reconciler.PlacementIntent,
+) bool {
+    for (desired_placements) |desired| {
+        if (desired.record.group_id != source.record.group_id) continue;
+        if (desired.record.local_node_id == source.record.local_node_id) continue;
+        const current_target = findPlacementIntent(current.placement_intents, desired.record.group_id, desired.record.local_node_id) orelse continue;
+        if (current_target.serving_state == .serving) return true;
+    }
+    return false;
+}
+
+fn placementIsReplacementForSource(
+    target: raft_reconciler.PlacementIntent,
+    source: raft_reconciler.PlacementIntent,
+) bool {
+    if (target.relocation_source_node_id != 0 and target.relocation_source_node_id == source.record.local_node_id) return true;
+    if (target.relocation_source_store_id != 0 and target.relocation_source_store_id == source.store_id) return true;
+    return false;
+}
+
+fn groupHasVisibleData(current: CurrentMetadataState, group_id: u64) bool {
+    if (mergedGroupStatus(current, group_id)) |status| {
+        if (relocationStatusHasVisibleDocuments(status.doc_count)) return true;
+    }
+    for (current.stores) |store| {
+        for (store.group_statuses) |status| {
+            if (status.group_id != group_id) continue;
+            if (relocationStatusHasVisibleDocuments(status.doc_count)) return true;
+        }
+        for (store.runtime_statuses) |status| {
+            if (status.group_id != group_id) continue;
+            if (status.doc_count > 0) return true;
+        }
+    }
+    return false;
+}
+
+fn findRelocationSourceIntent(
+    intents: []const raft_reconciler.PlacementIntent,
+    group_id: u64,
+) ?raft_reconciler.PlacementIntent {
+    for (intents) |intent| {
+        if (intent.record.group_id == group_id and intent.serving_state == .serving) return intent;
+    }
+    for (intents) |intent| {
+        if (intent.record.group_id == group_id and intent.serving_state == .draining) return intent;
+    }
+    for (intents) |intent| {
+        if (intent.record.group_id == group_id) return intent;
+    }
+    return null;
+}
+
+fn findStoreByNode(stores: []const table_manager.StoreRecord, node_id: u64) ?table_manager.StoreRecord {
+    for (stores) |store| {
+        if (store.node_id == node_id) return store;
+    }
+    return null;
 }
 
 fn findRestoreProgress(
@@ -855,6 +1144,7 @@ fn pruneAutomaticIntents(
         if (!entry.value_ptr.automatic) continue;
         if (containsU64(desired_split_ids, entry.key_ptr.*)) continue;
         if (findSplitRecord(current.split_transitions, entry.key_ptr.*) != null) continue;
+        if (automaticSplitIntentStillValid(manager, entry.value_ptr.*)) continue;
         try split_ids.append(alloc, entry.key_ptr.*);
     }
     for (split_ids.items) |transition_id| _ = manager.removeSplitIntent(transition_id);
@@ -866,9 +1156,24 @@ fn pruneAutomaticIntents(
         if (!entry.value_ptr.automatic) continue;
         if (containsU64(desired_merge_ids, entry.key_ptr.*)) continue;
         if (findMergeRecord(current.merge_transitions, entry.key_ptr.*) != null) continue;
+        if (automaticMergeIntentStillValid(manager, entry.value_ptr.*)) continue;
         try merge_ids.append(alloc, entry.key_ptr.*);
     }
     for (merge_ids.items) |transition_id| _ = manager.removeMergeIntent(transition_id);
+}
+
+fn automaticSplitIntentStillValid(manager: *table_manager.TableManager, intent: table_manager.SplitIntent) bool {
+    const source = manager.ranges.get(intent.source_group_id) orelse return false;
+    if (source.table_id != intent.table_id) return false;
+    if (manager.ranges.contains(intent.destination_group_id)) return false;
+    return keyStrictlyInsideRange(intent.split_key, source.start_key, source.end_key);
+}
+
+fn automaticMergeIntentStillValid(manager: *table_manager.TableManager, intent: table_manager.MergeIntent) bool {
+    const donor = manager.ranges.get(intent.donor_group_id) orelse return false;
+    const receiver = manager.ranges.get(intent.receiver_group_id) orelse return false;
+    if (donor.table_id != intent.table_id or receiver.table_id != intent.table_id) return false;
+    return rangesAdjacent(donor, receiver);
 }
 
 fn activeRangeTransitionCount(current: CurrentMetadataState) u32 {
@@ -927,7 +1232,7 @@ fn mergeRuntimeGroupFacts(
                 runtimeDocIdentityHasFacts(status.doc_identity);
             if (status.doc_count > merged.doc_count) merged.doc_count = status.doc_count;
             if (status.disk_bytes > merged.disk_bytes) merged.disk_bytes = status.disk_bytes;
-            if (status.doc_count > 0 or status.disk_bytes > 0) merged.empty = false;
+            if (status.doc_count > 0) merged.empty = false;
             const updated_at_millis = @divTrunc(status.updated_at_ns, std.time.ns_per_ms);
             if (updated_at_millis > merged.updated_at_millis) merged.updated_at_millis = updated_at_millis;
             mergeRuntimeDocIdentity(&merged, status.doc_identity);
@@ -2102,6 +2407,733 @@ test "metadata reconciler forced reallocation can place replicas on newly added 
     );
 }
 
+test "metadata reconciler keeps relocation source serving while target bootstraps" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 220, .name = "docs", .desired_replica_count = 1 });
+    try manager.upsertRange(.{ .group_id = 2201, .table_id = 220, .start_key = "", .end_key = null });
+
+    const current = [_]raft_reconciler.PlacementIntent{.{
+        .record = .{
+            .group_id = 2201,
+            .replica_id = 1,
+            .local_node_id = 1,
+        },
+        .store_id = 11,
+        .peer_node_ids = &.{1},
+        .serving_state = .serving,
+    }};
+    const stores = [_]table_manager.StoreRecord{.{
+        .store_id = 11,
+        .node_id = 1,
+        .role = "data",
+        .health_class = "healthy",
+        .live = true,
+        .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{.{
+            .group_id = 2201,
+            .doc_count = 5,
+            .disk_bytes = 2048,
+            .empty = false,
+            .local_leader = true,
+            .local_voter = true,
+            .voter_count = 1,
+        }})[0..]),
+    }};
+    const candidates = [_]@import("state.zig").CandidatePlacementInfo{.{
+        .node_id = 2,
+        .store_id = 22,
+        .role = "data",
+        .failure_domain = "rack-b",
+        .retain_current = false,
+    }};
+
+    var reconciler = Reconciler.init(std.testing.allocator);
+    var plan = try reconciler.computePlan(&manager, &.{2}, &candidates, .{
+        .placement_intents = &current,
+        .stores = &stores,
+        .reallocate_requested = true,
+    });
+    defer plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), plan.placement_removals.len);
+    const target = findPlacementIntent(plan.placement_upserts, 2201, 2) orelse return error.MissingRelocationTarget;
+    try std.testing.expectEqual(raft_reconciler.PlacementServingState.bootstrapping, target.serving_state);
+    try std.testing.expectEqual(@as(u64, 1), target.relocation_source_node_id);
+    try std.testing.expectEqual(@as(u64, 5), target.relocation_doc_count_watermark);
+    const source = findPlacementIntent(plan.placement_upserts, 2201, 1) orelse return error.MissingDrainingSource;
+    try std.testing.expectEqual(raft_reconciler.PlacementServingState.draining, source.serving_state);
+}
+
+test "metadata reconciler removes relocation source only after target is durably serving" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 221, .name = "docs", .desired_replica_count = 1 });
+    try manager.upsertRange(.{ .group_id = 2211, .table_id = 221, .start_key = "", .end_key = null });
+
+    const current = [_]raft_reconciler.PlacementIntent{
+        .{
+            .record = .{
+                .group_id = 2211,
+                .replica_id = 1,
+                .local_node_id = 1,
+            },
+            .store_id = 11,
+            .peer_node_ids = &.{1},
+            .serving_state = .draining,
+            .relocation_doc_count_watermark = 5,
+            .relocation_disk_bytes_watermark = 2048,
+        },
+        .{
+            .record = .{
+                .group_id = 2211,
+                .replica_id = 1,
+                .local_node_id = 2,
+                .bootstrap_mode = .persisted,
+            },
+            .store_id = 22,
+            .peer_node_ids = &.{2},
+            .serving_state = .serving,
+            .relocation_source_node_id = 1,
+            .relocation_source_store_id = 11,
+            .relocation_doc_count_watermark = 5,
+            .relocation_disk_bytes_watermark = 2048,
+        },
+    };
+    const stores = [_]table_manager.StoreRecord{
+        .{
+            .store_id = 11,
+            .node_id = 1,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{.{
+                .group_id = 2211,
+                .doc_count = 5,
+                .disk_bytes = 2048,
+                .empty = false,
+                .local_voter = true,
+                .voter_count = 1,
+            }})[0..]),
+        },
+        .{
+            .store_id = 22,
+            .node_id = 2,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{.{
+                .group_id = 2211,
+                .doc_count = 5,
+                .disk_bytes = 2048,
+                .empty = false,
+                .local_leader = true,
+                .local_voter = true,
+                .voter_count = 1,
+                .replay_required = false,
+                .replay_caught_up = true,
+                .cutover_ready = true,
+                .reads_ready_after_cutover = true,
+            }})[0..]),
+        },
+    };
+    const merged_statuses = [_]MergedGroupStatus{.{
+        .group_id = 2211,
+        .doc_count = 0,
+        .disk_bytes = 2190,
+        .empty = false,
+        .voter_count_known = true,
+        .voter_count = 1,
+        .healthy_voter_reports = 2,
+    }};
+    const candidates = [_]@import("state.zig").CandidatePlacementInfo{.{
+        .node_id = 2,
+        .store_id = 22,
+        .role = "data",
+        .failure_domain = "rack-b",
+        .retain_current = false,
+    }};
+
+    var reconciler = Reconciler.init(std.testing.allocator);
+    var plan = try reconciler.computePlan(&manager, &.{2}, &candidates, .{
+        .placement_intents = &current,
+        .stores = &stores,
+        .merged_group_statuses = &merged_statuses,
+        .reallocate_requested = true,
+    });
+    defer plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), plan.placement_removals.len);
+    try std.testing.expectEqual(@as(u64, 2211), plan.placement_removals[0].group_id);
+    try std.testing.expectEqual(@as(u64, 1), plan.placement_removals[0].local_node_id);
+    try std.testing.expect(findPlacementIntent(plan.placement_upserts, 2211, 1) == null);
+}
+
+test "metadata reconciler does not gate empty relocation on storage overhead bytes" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 223, .name = "docs", .desired_replica_count = 1 });
+    try manager.upsertRange(.{ .group_id = 2231, .table_id = 223, .start_key = "", .end_key = null });
+
+    const current = [_]raft_reconciler.PlacementIntent{
+        .{
+            .record = .{
+                .group_id = 2231,
+                .replica_id = 1,
+                .local_node_id = 1,
+            },
+            .store_id = 11,
+            .peer_node_ids = &.{ 1, 2 },
+            .serving_state = .draining,
+            .relocation_disk_bytes_watermark = 2190,
+        },
+        .{
+            .record = .{
+                .group_id = 2231,
+                .replica_id = 1,
+                .local_node_id = 2,
+                .bootstrap_mode = .persisted,
+            },
+            .store_id = 22,
+            .peer_node_ids = &.{ 1, 2 },
+            .serving_state = .replaying,
+            .relocation_source_node_id = 1,
+            .relocation_source_store_id = 11,
+            .relocation_disk_bytes_watermark = 2190,
+        },
+    };
+    const empty_group_status = table_manager.GroupStatusReport{
+        .group_id = 2231,
+        .doc_count = 0,
+        .disk_bytes = 0,
+        .empty = true,
+        .local_voter = true,
+        .voter_count = 1,
+    };
+    const stores = [_]table_manager.StoreRecord{
+        .{
+            .store_id = 11,
+            .node_id = 1,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{empty_group_status})[0..]),
+            .runtime_statuses = @constCast((&[_]table_manager.RuntimeGroupStatusReport{.{
+                .table_id = 223,
+                .group_id = 2231,
+                .store_id = 11,
+                .node_id = 1,
+                .doc_count = 0,
+                .disk_bytes = 2190,
+            }})[0..]),
+        },
+        .{
+            .store_id = 22,
+            .node_id = 2,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{empty_group_status})[0..]),
+            .runtime_statuses = @constCast((&[_]table_manager.RuntimeGroupStatusReport{.{
+                .table_id = 223,
+                .group_id = 2231,
+                .store_id = 22,
+                .node_id = 2,
+                .doc_count = 0,
+                .disk_bytes = 2190,
+            }})[0..]),
+        },
+    };
+    const candidates = [_]@import("state.zig").CandidatePlacementInfo{.{
+        .node_id = 2,
+        .store_id = 22,
+        .role = "data",
+        .failure_domain = "rack-b",
+        .retain_current = true,
+    }};
+
+    var reconciler = Reconciler.init(std.testing.allocator);
+    var plan = try reconciler.computePlan(&manager, &.{2}, &candidates, .{
+        .placement_intents = &current,
+        .stores = &stores,
+        .reallocate_requested = true,
+    });
+    defer plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), plan.placement_removals.len);
+    const target = findPlacementIntent(plan.placement_upserts, 2231, 2) orelse return error.MissingRelocationTarget;
+    try std.testing.expectEqual(raft_reconciler.PlacementServingState.serving, target.serving_state);
+    try std.testing.expectEqual(@as(u64, 0), target.relocation_doc_count_watermark);
+    try std.testing.expectEqual(@as(u64, 0), target.relocation_disk_bytes_watermark);
+    const source = findPlacementIntent(plan.placement_upserts, 2231, 1) orelse return error.MissingDrainingSource;
+    try std.testing.expectEqual(raft_reconciler.PlacementServingState.draining, source.serving_state);
+    try std.testing.expectEqual(@as(u64, 0), source.relocation_doc_count_watermark);
+    try std.testing.expectEqual(@as(u64, 0), source.relocation_disk_bytes_watermark);
+}
+
+test "metadata reconciler does not remove a data-bearing draining source until compact shrink survivors catch up" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 225, .name = "docs", .desired_replica_count = 2 });
+    try manager.upsertRange(.{ .group_id = 2251, .table_id = 225, .start_key = "", .end_key = null });
+
+    const current = [_]raft_reconciler.PlacementIntent{
+        .{
+            .record = .{ .group_id = 2251, .replica_id = 1, .local_node_id = 101 },
+            .store_id = 101,
+            .peer_node_ids = &.{ 101, 102, 103 },
+            .serving_state = .draining,
+        },
+        .{
+            .record = .{ .group_id = 2251, .replica_id = 2, .local_node_id = 102 },
+            .store_id = 102,
+            .peer_node_ids = &.{ 101, 102, 103 },
+            .serving_state = .serving,
+        },
+        .{
+            .record = .{ .group_id = 2251, .replica_id = 3, .local_node_id = 103 },
+            .store_id = 103,
+            .peer_node_ids = &.{ 101, 102, 103 },
+            .serving_state = .serving,
+        },
+    };
+    const stores = [_]table_manager.StoreRecord{
+        .{
+            .store_id = 101,
+            .node_id = 101,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{.{
+                .group_id = 2251,
+                .doc_count = 18,
+                .disk_bytes = 2048,
+                .empty = false,
+                .local_leader = true,
+                .local_voter = true,
+                .voter_count = 3,
+            }})[0..]),
+            .runtime_statuses = @constCast((&[_]table_manager.RuntimeGroupStatusReport{.{
+                .table_id = 225,
+                .group_id = 2251,
+                .store_id = 101,
+                .node_id = 101,
+                .doc_count = 18,
+                .disk_bytes = 2048,
+            }})[0..]),
+        },
+        .{
+            .store_id = 102,
+            .node_id = 102,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{.{
+                .group_id = 2251,
+                .doc_count = 10,
+                .disk_bytes = 1024,
+                .empty = false,
+                .local_voter = true,
+                .voter_count = 3,
+            }})[0..]),
+        },
+        .{
+            .store_id = 103,
+            .node_id = 103,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{.{
+                .group_id = 2251,
+                .doc_count = 18,
+                .disk_bytes = 2048,
+                .empty = false,
+                .local_voter = true,
+                .voter_count = 3,
+            }})[0..]),
+        },
+    };
+    const merged_statuses = [_]MergedGroupStatus{.{
+        .group_id = 2251,
+        .doc_count = 18,
+        .disk_bytes = 2048,
+        .empty = false,
+        .leader_known = true,
+        .leader_store_id = 101,
+        .voter_count_known = true,
+        .voter_count = 3,
+        .healthy_voter_reports = 3,
+    }};
+    const candidates = [_]@import("state.zig").CandidatePlacementInfo{
+        .{ .node_id = 102, .store_id = 102, .role = "data", .failure_domain = "rack-b", .retain_current = true },
+        .{ .node_id = 103, .store_id = 103, .role = "data", .failure_domain = "rack-c", .retain_current = true },
+    };
+
+    var reconciler = Reconciler.init(std.testing.allocator);
+    var plan = try reconciler.computePlan(&manager, &.{ 102, 103 }, &candidates, .{
+        .placement_intents = &current,
+        .stores = &stores,
+        .merged_group_statuses = &merged_statuses,
+        .reallocate_requested = true,
+    });
+    defer plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), plan.placement_removals.len);
+    const source = findPlacementIntent(plan.placement_upserts, 2251, 101) orelse return error.MissingDrainingSource;
+    try std.testing.expectEqual(raft_reconciler.PlacementServingState.draining, source.serving_state);
+}
+
+test "metadata reconciler removes a data-bearing draining source after compact shrink survivors catch up" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 226, .name = "docs", .desired_replica_count = 2 });
+    try manager.upsertRange(.{ .group_id = 2261, .table_id = 226, .start_key = "", .end_key = null });
+
+    const current = [_]raft_reconciler.PlacementIntent{
+        .{
+            .record = .{ .group_id = 2261, .replica_id = 1, .local_node_id = 101 },
+            .store_id = 101,
+            .peer_node_ids = &.{ 101, 102, 103 },
+            .serving_state = .draining,
+            .relocation_doc_count_watermark = 18,
+            .relocation_disk_bytes_watermark = 2048,
+        },
+        .{
+            .record = .{ .group_id = 2261, .replica_id = 2, .local_node_id = 102 },
+            .store_id = 102,
+            .peer_node_ids = &.{ 101, 102, 103 },
+            .serving_state = .serving,
+        },
+        .{
+            .record = .{ .group_id = 2261, .replica_id = 3, .local_node_id = 103 },
+            .store_id = 103,
+            .peer_node_ids = &.{ 101, 102, 103 },
+            .serving_state = .serving,
+        },
+    };
+    const caught_up = table_manager.GroupStatusReport{
+        .group_id = 2261,
+        .doc_count = 18,
+        .disk_bytes = 2048,
+        .empty = false,
+        .local_voter = true,
+        .voter_count = 3,
+    };
+    const stores = [_]table_manager.StoreRecord{
+        .{
+            .store_id = 101,
+            .node_id = 101,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{.{
+                .group_id = 2261,
+                .doc_count = 18,
+                .disk_bytes = 2048,
+                .empty = false,
+                .local_leader = true,
+                .local_voter = true,
+                .voter_count = 3,
+            }})[0..]),
+        },
+        .{
+            .store_id = 102,
+            .node_id = 102,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{caught_up})[0..]),
+        },
+        .{
+            .store_id = 103,
+            .node_id = 103,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{caught_up})[0..]),
+        },
+    };
+    const candidates = [_]@import("state.zig").CandidatePlacementInfo{
+        .{ .node_id = 102, .store_id = 102, .role = "data", .failure_domain = "rack-b", .retain_current = true },
+        .{ .node_id = 103, .store_id = 103, .role = "data", .failure_domain = "rack-c", .retain_current = true },
+    };
+
+    var reconciler = Reconciler.init(std.testing.allocator);
+    var plan = try reconciler.computePlan(&manager, &.{ 102, 103 }, &candidates, .{
+        .placement_intents = &current,
+        .stores = &stores,
+        .reallocate_requested = true,
+    });
+    defer plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), plan.placement_removals.len);
+    try std.testing.expectEqual(@as(u64, 2261), plan.placement_removals[0].group_id);
+    try std.testing.expectEqual(@as(u64, 101), plan.placement_removals[0].local_node_id);
+}
+
+test "metadata reconciler does not require preserved peers to report relocation cutover" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 222, .name = "docs", .desired_replica_count = 2 });
+    try manager.upsertRange(.{ .group_id = 2221, .table_id = 222, .start_key = "", .end_key = null });
+
+    const current = [_]raft_reconciler.PlacementIntent{
+        .{
+            .record = .{
+                .group_id = 2221,
+                .replica_id = 1,
+                .local_node_id = 1,
+            },
+            .store_id = 11,
+            .peer_node_ids = &.{ 1, 2 },
+            .serving_state = .draining,
+            .relocation_doc_count_watermark = 7,
+            .relocation_disk_bytes_watermark = 4096,
+        },
+        .{
+            .record = .{
+                .group_id = 2221,
+                .replica_id = 2,
+                .local_node_id = 2,
+            },
+            .store_id = 22,
+            .peer_node_ids = &.{ 1, 2 },
+            .serving_state = .serving,
+        },
+        .{
+            .record = .{
+                .group_id = 2221,
+                .replica_id = 2,
+                .local_node_id = 3,
+                .bootstrap_mode = .persisted,
+            },
+            .store_id = 33,
+            .peer_node_ids = &.{ 2, 3 },
+            .serving_state = .serving,
+            .relocation_source_node_id = 1,
+            .relocation_source_store_id = 11,
+            .relocation_doc_count_watermark = 7,
+            .relocation_disk_bytes_watermark = 4096,
+        },
+    };
+    const stores = [_]table_manager.StoreRecord{
+        .{
+            .store_id = 11,
+            .node_id = 1,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{.{
+                .group_id = 2221,
+                .doc_count = 7,
+                .disk_bytes = 4096,
+                .empty = false,
+                .local_voter = true,
+                .voter_count = 2,
+            }})[0..]),
+        },
+        .{
+            .store_id = 22,
+            .node_id = 2,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{.{
+                .group_id = 2221,
+                .doc_count = 7,
+                .disk_bytes = 4096,
+                .empty = false,
+                .local_voter = true,
+                .voter_count = 2,
+            }})[0..]),
+        },
+        .{
+            .store_id = 33,
+            .node_id = 3,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{.{
+                .group_id = 2221,
+                .doc_count = 7,
+                .disk_bytes = 4096,
+                .empty = false,
+                .local_leader = true,
+                .local_voter = true,
+                .voter_count = 2,
+                .replay_required = false,
+                .replay_caught_up = true,
+                .cutover_ready = true,
+                .reads_ready_after_cutover = true,
+            }})[0..]),
+        },
+    };
+    const candidates = [_]@import("state.zig").CandidatePlacementInfo{
+        .{
+            .node_id = 2,
+            .store_id = 22,
+            .role = "data",
+            .failure_domain = "rack-b",
+            .retain_current = true,
+        },
+        .{
+            .node_id = 3,
+            .store_id = 33,
+            .role = "data",
+            .failure_domain = "rack-c",
+            .retain_current = true,
+        },
+    };
+
+    var reconciler = Reconciler.init(std.testing.allocator);
+    var plan = try reconciler.computePlan(&manager, &.{ 2, 3 }, &candidates, .{
+        .placement_intents = &current,
+        .stores = &stores,
+        .reallocate_requested = true,
+    });
+    defer plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), plan.placement_removals.len);
+    try std.testing.expectEqual(@as(u64, 2221), plan.placement_removals[0].group_id);
+    try std.testing.expectEqual(@as(u64, 1), plan.placement_removals[0].local_node_id);
+}
+
+test "metadata reconciler ignores unrelated relocation targets when removing a drained source" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 224, .name = "docs", .desired_replica_count = 3 });
+    try manager.upsertRange(.{ .group_id = 2241, .table_id = 224, .start_key = "", .end_key = null });
+
+    const current = [_]raft_reconciler.PlacementIntent{
+        .{
+            .record = .{ .group_id = 2241, .replica_id = 1, .local_node_id = 101 },
+            .store_id = 101,
+            .peer_node_ids = &.{ 102, 103, 104 },
+            .serving_state = .draining,
+            .relocation_doc_count_watermark = 3,
+            .relocation_disk_bytes_watermark = 2048,
+        },
+        .{
+            .record = .{ .group_id = 2241, .replica_id = 2, .local_node_id = 102 },
+            .store_id = 102,
+            .peer_node_ids = &.{ 102, 103, 104 },
+            .serving_state = .serving,
+        },
+        .{
+            .record = .{ .group_id = 2241, .replica_id = 3, .local_node_id = 103 },
+            .store_id = 103,
+            .peer_node_ids = &.{ 102, 103, 104 },
+            .serving_state = .serving,
+            .relocation_source_node_id = 101,
+            .relocation_source_store_id = 101,
+            .relocation_doc_count_watermark = 3,
+            .relocation_disk_bytes_watermark = 2048,
+        },
+        .{
+            .record = .{ .group_id = 2241, .replica_id = 1, .local_node_id = 104 },
+            .store_id = 104,
+            .peer_node_ids = &.{ 102, 103, 104 },
+            .serving_state = .replaying,
+            .relocation_source_node_id = 102,
+            .relocation_source_store_id = 102,
+            .relocation_doc_count_watermark = 3,
+            .relocation_disk_bytes_watermark = 2048,
+        },
+    };
+    const stores = [_]table_manager.StoreRecord{
+        .{
+            .store_id = 101,
+            .node_id = 101,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{.{
+                .group_id = 2241,
+                .doc_count = 3,
+                .disk_bytes = 2048,
+                .empty = false,
+                .local_voter = true,
+                .voter_count = 3,
+            }})[0..]),
+        },
+        .{
+            .store_id = 102,
+            .node_id = 102,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{.{
+                .group_id = 2241,
+                .doc_count = 3,
+                .disk_bytes = 2048,
+                .empty = false,
+                .local_voter = true,
+                .voter_count = 3,
+            }})[0..]),
+        },
+        .{
+            .store_id = 103,
+            .node_id = 103,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{.{
+                .group_id = 2241,
+                .doc_count = 3,
+                .disk_bytes = 2048,
+                .empty = false,
+                .local_leader = true,
+                .local_voter = true,
+                .voter_count = 3,
+                .replay_required = false,
+                .replay_caught_up = true,
+                .cutover_ready = true,
+                .reads_ready_after_cutover = true,
+            }})[0..]),
+        },
+        .{
+            .store_id = 104,
+            .node_id = 104,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{.{
+                .group_id = 2241,
+                .doc_count = 3,
+                .disk_bytes = 2048,
+                .empty = false,
+                .local_voter = true,
+                .voter_count = 3,
+                .replay_required = true,
+                .replay_caught_up = false,
+            }})[0..]),
+        },
+    };
+    const candidates = [_]@import("state.zig").CandidatePlacementInfo{
+        .{ .node_id = 102, .store_id = 102, .role = "data", .failure_domain = "rack-b", .retain_current = true },
+        .{ .node_id = 103, .store_id = 103, .role = "data", .failure_domain = "rack-c", .retain_current = true },
+        .{ .node_id = 104, .store_id = 104, .role = "data", .failure_domain = "rack-d", .retain_current = true },
+    };
+
+    var reconciler = Reconciler.init(std.testing.allocator);
+    var plan = try reconciler.computePlan(&manager, &.{ 102, 103, 104 }, &candidates, .{
+        .placement_intents = &current,
+        .stores = &stores,
+        .reallocate_requested = true,
+    });
+    defer plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), plan.placement_removals.len);
+    try std.testing.expectEqual(@as(u64, 2241), plan.placement_removals[0].group_id);
+    try std.testing.expectEqual(@as(u64, 101), plan.placement_removals[0].local_node_id);
+}
+
 test "metadata reconciler finalizes schema migration once every hosting node reports target schema progress" {
     var manager = table_manager.TableManager.init(std.testing.allocator);
     defer manager.deinit();
@@ -2248,6 +3280,97 @@ test "metadata reconciler plans an automatic split from fresh group status" {
     try std.testing.expectEqual(@as(u64, 4001), plan.split_upserts[0].source_group_id);
     try std.testing.expect(plan.split_upserts[0].destination_group_id != 0);
     try std.testing.expectEqualStrings("doc:m", plan.split_upserts[0].split_key.?);
+}
+
+test "metadata reconciler plans an automatic split from disk size when doc count is stale" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 410, .name = "docs" });
+    try manager.upsertRange(.{
+        .group_id = 4101,
+        .table_id = 410,
+        .start_key = "doc:a",
+        .end_key = "doc:z",
+    });
+
+    const tables = try manager.listTables(std.testing.allocator);
+    defer manager.freeTables(std.testing.allocator, tables);
+    const ranges = try manager.listRanges(std.testing.allocator);
+    defer manager.freeRanges(std.testing.allocator, ranges);
+
+    const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+    const stores = [_]table_manager.StoreRecord{
+        .{
+            .store_id = 1,
+            .node_id = 1,
+            .role = "data",
+            .health_class = "healthy",
+            .failure_domain = "rack-a",
+            .live = true,
+            .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{
+                .{
+                    .group_id = 4101,
+                    .doc_count = 0,
+                    .disk_bytes = 200,
+                    .empty = false,
+                    .updated_at_millis = now_ms,
+                    .local_leader = true,
+                },
+            })[0..]),
+        },
+    };
+
+    var lookup = TestMedianKeyLookup{ .median_key = "doc:m" };
+    var reconciler = Reconciler.initWithConfig(std.testing.allocator, .{
+        .max_shard_size_bytes = 100,
+        .max_shards_per_table = 8,
+        .median_key_lookup = lookup.iface(),
+    });
+    var plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{
+        .tables = tables,
+        .ranges = ranges,
+        .stores = &stores,
+    });
+    defer plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), plan.split_upserts.len);
+    try std.testing.expectEqual(@as(u64, 4101), plan.split_upserts[0].source_group_id);
+    try std.testing.expect(plan.split_upserts[0].destination_group_id != 0);
+    try std.testing.expectEqualStrings("doc:m", plan.split_upserts[0].split_key.?);
+}
+
+test "metadata reconciler keeps structurally valid automatic split intent across transient recompute miss" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 401, .name = "docs" });
+    try manager.upsertRange(.{
+        .group_id = 4011,
+        .table_id = 401,
+        .start_key = "doc:a",
+        .end_key = "doc:z",
+    });
+    try manager.requestSplit(.{
+        .transition_id = 40101,
+        .table_id = 401,
+        .source_group_id = 4011,
+        .destination_group_id = 4012,
+        .split_key = "doc:m",
+        .automatic = true,
+    });
+
+    try pruneAutomaticIntents(std.testing.allocator, &manager, .{}, &.{}, &.{});
+    try std.testing.expectEqual(@as(u32, 1), manager.split_intents.count());
+
+    try manager.upsertRange(.{
+        .group_id = 4011,
+        .table_id = 401,
+        .start_key = "doc:a",
+        .end_key = "doc:b",
+    });
+    try pruneAutomaticIntents(std.testing.allocator, &manager, .{}, &.{}, &.{});
+    try std.testing.expectEqual(@as(u32, 0), manager.split_intents.count());
 }
 
 test "metadata reconciler does not automatically split stale doc identity namespace" {
@@ -2711,6 +3834,44 @@ test "metadata reconciler plans an automatic merge from adjacent small fresh gro
     try std.testing.expectEqual(@as(usize, 1), plan.merge_upserts.len);
     try std.testing.expectEqual(@as(u64, 4102), plan.merge_upserts[0].donor_group_id);
     try std.testing.expectEqual(@as(u64, 4101), plan.merge_upserts[0].receiver_group_id);
+}
+
+test "metadata reconciler keeps structurally valid automatic merge intent across transient recompute miss" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 411, .name = "docs", .min_ranges = 1 });
+    try manager.upsertRange(.{
+        .group_id = 4111,
+        .table_id = 411,
+        .start_key = "doc:a",
+        .end_key = "doc:m",
+    });
+    try manager.upsertRange(.{
+        .group_id = 4112,
+        .table_id = 411,
+        .start_key = "doc:m",
+        .end_key = "doc:z",
+    });
+    try manager.requestMerge(.{
+        .transition_id = 41101,
+        .table_id = 411,
+        .donor_group_id = 4112,
+        .receiver_group_id = 4111,
+        .automatic = true,
+    });
+
+    try pruneAutomaticIntents(std.testing.allocator, &manager, .{}, &.{}, &.{});
+    try std.testing.expectEqual(@as(u32, 1), manager.merge_intents.count());
+
+    try manager.upsertRange(.{
+        .group_id = 4112,
+        .table_id = 411,
+        .start_key = "doc:n",
+        .end_key = "doc:z",
+    });
+    try pruneAutomaticIntents(std.testing.allocator, &manager, .{}, &.{}, &.{});
+    try std.testing.expectEqual(@as(u32, 0), manager.merge_intents.count());
 }
 
 test "metadata reconciler does not automatically merge incompatible doc identity namespaces" {

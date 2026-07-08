@@ -6,6 +6,7 @@ on:
       - "go/pkg/operator/v*"
 
 env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   GCP_REGION: us-central1
   GCP_PROJECT: antfly-image-artifacts
   GCP_REPOSITORY: containers

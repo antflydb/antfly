@@ -32,8 +32,10 @@ class QueryHit:
             rollup includes child chunks. Standard fields include `level`,
             `parent_doc_key`, optional `parent_unit_id`, `artifact`, `chunks`, and
             `ancestors` with response-local or requested DB-backed source/unit context when available.
-        field_sort (list[str] | Unset): Sort key values for this hit. Pass as search_after or search_before
-            to paginate to the next/previous page. Only present when order_by is specified.
+        field_sort (list[Any] | Unset): Sort key values for this hit. Pass as search_after or search_before
+            to paginate to the next/previous page. Values preserve their JSON
+            types. Present for ordered result pages, including cursor-only
+            requests whose effective order is `_id` ascending.
     """
 
     field_id: str
@@ -41,7 +43,7 @@ class QueryHit:
     field_index_scores: QueryHitIndexScores | Unset = UNSET
     field_source: QueryHitSource | Unset = UNSET
     hierarchy: QueryHitHierarchy | Unset = UNSET
-    field_sort: list[str] | Unset = UNSET
+    field_sort: list[Any] | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -61,7 +63,7 @@ class QueryHit:
         if not isinstance(self.hierarchy, Unset):
             hierarchy = self.hierarchy.to_dict()
 
-        field_sort: list[str] | Unset = UNSET
+        field_sort: list[Any] | Unset = UNSET
         if not isinstance(self.field_sort, Unset):
             field_sort = self.field_sort
 
@@ -116,7 +118,7 @@ class QueryHit:
         else:
             hierarchy = QueryHitHierarchy.from_dict(_hierarchy)
 
-        field_sort = cast(list[str], d.pop("_sort", UNSET))
+        field_sort = cast(list[Any], d.pop("_sort", UNSET))
 
         query_hit = cls(
             field_id=field_id,

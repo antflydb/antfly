@@ -4218,7 +4218,7 @@ pub const HttpHandler = struct {
         switch (sync_level) {
             .propose, .write => return,
             .full_text => {},
-            .enrichments, .aknn, .full_index => if (requires_background_materialization and self.runtime_metrics == null) {
+            .enrichments, .full_index => if (requires_background_materialization and self.runtime_metrics == null) {
                 return error.UnsupportedSyncLevel;
             },
         }
@@ -4291,7 +4291,7 @@ pub const HttpHandler = struct {
             .propose, .write => true,
             .full_text => fullTextSyncSatisfied(status),
             .enrichments => status.enrichment_complete,
-            .aknn, .full_index => status.enrichment_complete,
+            .full_index => fullIndexSyncSatisfied(status),
         };
     }
 
@@ -4311,6 +4311,31 @@ pub const HttpHandler = struct {
         return status.artifact_actions.full_text != .rebuild;
     }
 
+    fn fullIndexSyncSatisfied(status: catalog_types.BuildStatus) bool {
+        if (!status.enrichment_complete) return false;
+        if (!fullTextSyncSatisfied(status)) return false;
+        if (status.artifact_actions.dense_vector == .rebuild) return false;
+        if (status.artifact_actions.sparse_vector == .rebuild) return false;
+        if (status.artifact_actions.graph == .rebuild) return false;
+        if (hasPendingNamedPublication(status.vector_index_actions)) return false;
+        if (hasPendingNamedPublication(status.sparse_index_actions)) return false;
+        if (hasPendingNamedPublication(status.graph_index_actions)) return false;
+        if (status.pending_materialization_families.full_text) return false;
+        if (status.pending_materialization_families.dense_vector) return false;
+        if (status.pending_materialization_families.sparse_vector) return false;
+        if (status.pending_materialization_families.chunk_preview) return false;
+        if (status.pending_materialization_families.chunk_embeddings) return false;
+        if (status.pending_materialization_families.rerank_terms) return false;
+        return true;
+    }
+
+    fn hasPendingNamedPublication(actions: []const catalog_types.NamedArtifactPublicationAction) bool {
+        for (actions) |entry| {
+            if (entry.action == .rebuild) return true;
+        }
+        return false;
+    }
+
     fn executePublicTableQueryRequest(
         ptr: *anyopaque,
         alloc: Allocator,
@@ -4325,6 +4350,8 @@ pub const HttpHandler = struct {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             error.FileNotFound => return error.NotFound,
             error.DocIdentityUnavailable => return error.DocIdentityUnavailable,
+            error.UnsupportedExactSort => return error.UnsupportedExactSort,
+            error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
             else => {
                 std.log.err("serverless public table query failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
@@ -6005,6 +6032,7 @@ test "typed index status response rejects extended variant fields but raw json p
         \\{
         \\  "config": { "name": "graph_idx", "type": "graph" },
         \\  "status": {
+        \\    "index_type": "graph",
         \\    "rebuilding": false,
         \\    "backfill_active": false,
         \\    "doc_count": 0,
@@ -6794,7 +6822,7 @@ test "http handler serves public table joins on published heads" {
     const inner_response = parsed_inner.value.responses.?[0];
     const inner_hits = inner_response.hits.?.hits.?;
     try std.testing.expectEqual(@as(usize, 1), inner_hits.len);
-    try std.testing.expectEqual(@as(i64, 1), inner_response.hits.?.total.?);
+    try std.testing.expectEqual(@as(i64, 1), inner_response.hits.?.total.?.value);
     try std.testing.expectEqualStrings("Alice", testQueryHitSourcePathValue(inner_hits[0], "customers.name").?.string);
     try std.testing.expectEqualStrings("index_lookup", testJoinProfileFieldValue(inner_response, "strategy_used").?.string);
 
@@ -8239,7 +8267,7 @@ test "http handler serves the table public lifecycle and consistency routes" {
     defer parsed_public_search_via_query.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed_public_search_via_query.value.responses.?.len);
     try std.testing.expectEqualStrings("docs", parsed_public_search_via_query.value.responses.?[0].table.?);
-    try std.testing.expectEqual(@as(?i64, 1), parsed_public_search_via_query.value.responses.?[0].hits.?.total);
+    try std.testing.expectEqual(@as(i64, 1), parsed_public_search_via_query.value.responses.?[0].hits.?.total.?.value);
     try std.testing.expectEqualStrings("doc-a", parsed_public_search_via_query.value.responses.?[0].hits.?.hits.?[0]._id);
 
     var public_aggregated_query = try handler.handle(.{
@@ -8572,6 +8600,45 @@ test "http handler accepts structured table updates for metadata-only republish 
     try std.testing.expectEqual(@as(usize, 1), parsed_build_status.value.vector_index_actions.len);
     try std.testing.expectEqualStrings("semantic_idx", parsed_build_status.value.vector_index_actions[0].name);
     try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.rebuild, parsed_build_status.value.vector_index_actions[0].action);
+
+    var republish = try handler.handle(.{
+        .method = .post,
+        .path = "/internal/v1/tables/docs/build",
+    });
+    defer republish.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 202), republish.status);
+    var parsed_republish = try parseJsonTestBody(api_types.TableBuildResult, alloc, republish.body);
+    defer parsed_republish.deinit();
+    try std.testing.expect(parsed_republish.value.published);
+    try std.testing.expectEqual(@as(u64, 2), parsed_republish.value.version);
+    try std.testing.expectEqual(@as(u64, 1), parsed_republish.value.wal_end_lsn);
+
+    var after_status = try handler.handle(.{
+        .method = .get,
+        .path = "/internal/v1/tables/docs/build-status",
+    });
+    defer after_status.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), after_status.status);
+    var parsed_after_status = try parseJsonTestBody(api_types.TableBuildStatus, alloc, after_status.body);
+    defer parsed_after_status.deinit();
+    try std.testing.expect(!parsed_after_status.value.publish_recommended);
+    try std.testing.expect(!parsed_after_status.value.head_republish_recommended);
+    try std.testing.expectEqual(@as(u64, 2), parsed_after_status.value.head_version);
+    try std.testing.expectEqual(@as(u64, 1), parsed_after_status.value.published_wal_end_lsn);
+    try std.testing.expectEqual(@as(usize, 1), parsed_after_status.value.head_vector_index_actions.len);
+    try std.testing.expectEqualStrings("semantic_idx", parsed_after_status.value.head_vector_index_actions[0].name);
+    try std.testing.expectEqual(catalog_types.ArtifactPublicationAction.rebuild, parsed_after_status.value.head_vector_index_actions[0].action);
+
+    var semantic_index = try handler.handle(.{
+        .method = .get,
+        .path = "/tables/docs/indexes/semantic_idx",
+    });
+    defer semantic_index.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), semantic_index.status);
+    var parsed_semantic_index = try parseServerlessIndexStatusTestResponse(alloc, semantic_index.body, "semantic_idx");
+    defer parsed_semantic_index.deinit();
+    try std.testing.expectEqualStrings("rebuild", parsed_semantic_index.value.status.head_publication_action.?);
+    try std.testing.expectEqual(@as(?bool, false), parsed_semantic_index.value.status.materialization_blocked);
 }
 
 test "http handler query publication exposes vector compaction targets" {
@@ -8905,6 +8972,145 @@ test "http handler honors public serverless sync levels on table batch writes" {
     try std.testing.expect(std.mem.indexOf(u8, unsupported.body, "unsupported sync_level") != null);
 }
 
+test "serverless full_index sync waits for enrichment and index publication" {
+    var status = readyServerlessBuildStatusForSyncTest();
+    try std.testing.expect(HttpHandler.tableSyncLevelSatisfied(.full_index, 10, status));
+
+    status.enrichment_complete = false;
+    try std.testing.expect(!HttpHandler.tableSyncLevelSatisfied(.full_index, 10, status));
+    status.enrichment_complete = true;
+
+    var full_text_rebuild = [_]catalog_types.FullTextIndexPublicationAction{.{
+        .name = @constCast("full_text_index_v0"),
+        .action = .rebuild,
+    }};
+    status.full_text_index_actions = full_text_rebuild[0..];
+    try std.testing.expect(!HttpHandler.tableSyncLevelSatisfied(.full_index, 10, status));
+    status.full_text_index_actions = &.{};
+
+    var vector_rebuild = [_]catalog_types.NamedArtifactPublicationAction{.{
+        .name = @constCast("semantic_idx"),
+        .action = .rebuild,
+    }};
+    status.vector_index_actions = vector_rebuild[0..];
+    try std.testing.expect(!HttpHandler.tableSyncLevelSatisfied(.full_index, 10, status));
+    status.vector_index_actions = &.{};
+
+    var sparse_rebuild = [_]catalog_types.NamedArtifactPublicationAction{.{
+        .name = @constCast("sparse_idx"),
+        .action = .rebuild,
+    }};
+    status.sparse_index_actions = sparse_rebuild[0..];
+    try std.testing.expect(!HttpHandler.tableSyncLevelSatisfied(.full_index, 10, status));
+    status.sparse_index_actions = &.{};
+
+    var graph_rebuild = [_]catalog_types.NamedArtifactPublicationAction{.{
+        .name = @constCast("graph_idx"),
+        .action = .rebuild,
+    }};
+    status.graph_index_actions = graph_rebuild[0..];
+    try std.testing.expect(!HttpHandler.tableSyncLevelSatisfied(.full_index, 10, status));
+    status.graph_index_actions = &.{};
+
+    status.pending_materialization_families.chunk_embeddings = true;
+    try std.testing.expect(!HttpHandler.tableSyncLevelSatisfied(.full_index, 10, status));
+    status.pending_materialization_families.chunk_embeddings = false;
+
+    status.pending_materialization_families.rerank_terms = true;
+    try std.testing.expect(!HttpHandler.tableSyncLevelSatisfied(.full_index, 10, status));
+    status.pending_materialization_families.rerank_terms = false;
+
+    status.artifact_actions.dense_vector = .rebuild;
+    try std.testing.expect(!HttpHandler.tableSyncLevelSatisfied(.full_index, 10, status));
+    status.artifact_actions.dense_vector = .reuse;
+
+    try std.testing.expect(!HttpHandler.tableSyncLevelSatisfied(.full_index, 11, status));
+    try std.testing.expect(HttpHandler.tableSyncLevelSatisfied(.enrichments, 10, status));
+}
+
+fn readyServerlessBuildStatusForSyncTest() catalog_types.BuildStatus {
+    const ready_actions: catalog_types.ArtifactPublicationActions = .{
+        .document_segment = .reuse,
+        .full_text = .reuse,
+        .dense_vector = .reuse,
+        .sparse_vector = .reuse,
+        .graph = .reuse,
+    };
+    return .{
+        .namespace = @constCast("docs"),
+        .published_search_sources = .{},
+        .materialized_search_sources = .{},
+        .materialized_derived_outputs = .{},
+        .head_version = 1,
+        .published_wal_end_lsn = 10,
+        .latest_wal_lsn = 10,
+        .freshness_lag_records = 0,
+        .pending_records = 0,
+        .next_version = 1,
+        .publish_admitted = true,
+        .max_pending_records = 128,
+        .retained_versions = 1,
+        .retained_artifacts = 1,
+        .compaction_recommended = false,
+        .mutation_tail_resolution = .none,
+        .vector_compaction_driver_index_name = null,
+        .vector_compaction_distance_metric = null,
+        .vector_cluster_count = 0,
+        .vector_target_cluster_count = null,
+        .vector_base_probe_count = 0,
+        .vector_target_base_probe_count = null,
+        .vector_shortlist_multiplier = 0,
+        .vector_target_shortlist_multiplier = null,
+        .vector_cluster_imbalance = 0,
+        .vector_cluster_distance_span_max = 0,
+        .publish_recommended = false,
+        .next_publish_reason = null,
+        .head_document_publish_mode = null,
+        .next_document_publish_mode = null,
+        .document_base_version = 1,
+        .document_lineage_versions = 1,
+        .head_republish_recommended = false,
+        .pending_materialization_rebuild = false,
+        .pending_materialization_families = .{},
+        .head_artifact_actions = ready_actions,
+        .head_full_text_index_actions = &.{},
+        .head_vector_index_actions = &.{},
+        .head_sparse_index_actions = &.{},
+        .head_graph_index_actions = &.{},
+        .head_derived_output_actions = .{},
+        .artifact_actions = ready_actions,
+        .full_text_index_actions = &.{},
+        .vector_index_actions = &.{},
+        .sparse_index_actions = &.{},
+        .graph_index_actions = &.{},
+        .derived_output_actions = .{},
+        .derived_output_resolutions = .{},
+        .enrichment_enabled = false,
+        .lexical_sparse_model_preference = .prefer_model,
+        .lexical_sparse_complete = true,
+        .chunk_preview_enabled = false,
+        .chunk_preview_complete = true,
+        .chunk_embeddings_enabled = false,
+        .chunk_embeddings_model_preference = .prefer_model,
+        .chunk_embeddings_complete = true,
+        .rerank_terms_enabled = false,
+        .rerank_terms_complete = true,
+        .enrichment_failure_policy = .skip_document,
+        .enrichment_active_stage = null,
+        .enrichment_stage_source = null,
+        .enrichment_stage_state = null,
+        .enrichment_in_progress = false,
+        .enrichment_complete = true,
+        .enrichment_head_version = null,
+        .enrichment_doc_offset = 0,
+        .enrichment_total_document_count = 0,
+        .enrichment_pending_document_count = 0,
+        .enrichment_batch_size = 32,
+        .enrichment_publish_min_pending_records = 16,
+        .enrichment_pipeline_version = 1,
+    };
+}
+
 test "http handler serves published graph query endpoints" {
     const alloc = std.testing.allocator;
 
@@ -9149,7 +9355,7 @@ test "http handler serves published graph query endpoints" {
     var parsed_from_search = try parseJsonTestBody(metadata_openapi.QueryResponses, alloc, from_search.body);
     defer parsed_from_search.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed_from_search.value.responses.?.len);
-    try std.testing.expectEqual(@as(?i64, 1), parsed_from_search.value.responses.?[0].hits.?.total);
+    try std.testing.expectEqual(@as(i64, 1), parsed_from_search.value.responses.?[0].hits.?.total.?.value);
     const neighbors_from_search = parsed_from_search.value.responses.?[0].graph_results.?.map.get("neighbors_from_search").?;
     try std.testing.expectEqual(indexes_openapi.GraphQueryType.neighbors, neighbors_from_search.type);
     try std.testing.expectEqual(@as(i64, 2), neighbors_from_search.total);
@@ -9168,7 +9374,7 @@ test "http handler serves published graph query endpoints" {
     var parsed_from_fused = try parseJsonTestBody(metadata_openapi.QueryResponses, alloc, from_fused.body);
     defer parsed_from_fused.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed_from_fused.value.responses.?.len);
-    try std.testing.expectEqual(@as(?i64, 1), parsed_from_fused.value.responses.?[0].hits.?.total);
+    try std.testing.expectEqual(@as(i64, 1), parsed_from_fused.value.responses.?[0].hits.?.total.?.value);
     const neighbors_from_fused = parsed_from_fused.value.responses.?[0].graph_results.?.map.get("neighbors_from_fused").?;
     try std.testing.expectEqual(indexes_openapi.GraphQueryType.neighbors, neighbors_from_fused.type);
     try std.testing.expectEqual(@as(i64, 2), neighbors_from_fused.total);
@@ -9390,6 +9596,30 @@ test "http handler rejects ingest when namespace is backpressured" {
 
 test "serverless public graph seed total marks saturated pages incomplete" {
     try testPublicGraphSeedTotalHits();
+}
+
+test "serverless public graph query rejects exact sort controls" {
+    const alloc = std.testing.allocator;
+    var handler = HttpHandler{
+        .alloc = alloc,
+        .api = undefined,
+        .catalog = undefined,
+        .manifests = undefined,
+        .progress = undefined,
+        .query = undefined,
+        .runtime_status = undefined,
+    };
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, handler.handleTablePublicGraphQueryRequest(
+        "docs",
+        "docs",
+        "{\"graph_searches\":{\"related\":{\"type\":\"neighbors\",\"index_name\":\"graph_idx\",\"start_nodes\":{\"keys\":[\"doc:1\"]}}},\"order_by\":[{\"field\":\"created_at\"}]}",
+    ));
+    try std.testing.expectError(error.UnsupportedQueryRequest, handler.handleTablePublicGraphQueryRequest(
+        "docs",
+        "docs",
+        "{\"graph_searches\":{\"related\":{\"type\":\"neighbors\",\"index_name\":\"graph_idx\",\"start_nodes\":{\"keys\":[\"doc:1\"]}}},\"search_after\":[\"2026-01-01T00:00:00Z\",\"doc:1\"]}",
+    ));
 }
 
 var test_nonce: std.atomic.Value(u64) = .init(0);

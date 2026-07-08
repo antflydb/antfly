@@ -22,18 +22,26 @@ const docstore_mod = @import("../../docstore.zig");
 const internal_keys = @import("../../internal_keys.zig");
 const doc_set = @import("../doc_set.zig");
 const doc_identity = @import("../doc_identity.zig");
+const typed_dv_coverage = @import("../typed_doc_values_coverage.zig");
 const graph_exec = @import("graph_exec.zig");
 const result_shape = @import("result_shape.zig");
 const search_mod = @import("../../../search/search.zig");
+const query_mod = @import("../../../search/query.zig");
 const index_mod = @import("../../../index.zig");
 const segment_mod = @import("../../../segment.zig");
+const typed_dv = @import("../../../section/typed_doc_values.zig");
+const roaring = @import("../../../encoding/roaring.zig");
+const snappy = @import("../../../encoding/snappy.zig");
 const distributed_stats_mod = @import("../../../search/distributed_stats.zig");
 const analysis_mod = @import("../../../search/analysis.zig");
 const introducer_mod = @import("../../../introducer.zig");
 const mapper_mod = @import("../document_mapper.zig");
+const schema_api = @import("../../../schema/mod.zig");
+const persistent_mod = @import("../../persistent.zig");
 const platform_time = @import("../../../platform/time.zig");
 const platform = @import("antfly_platform");
 const vectorindex_mod = @import("antfly_vectorindex");
+const vector_mod = @import("antfly_vector").vector;
 const builtin = @import("builtin");
 const sparse_mod = if (builtin.os.tag == .freestanding)
     @import("../sparse_stub.zig")
@@ -45,10 +53,53 @@ fn getenv(name: [*:0]const u8) ?[]const u8 {
 }
 
 const default_balanced_search_effort: f32 = 0.5;
+const default_late_visibility_exact_candidate_budget: u32 = 100_000;
+const default_exact_native_filter_candidate_budget: u32 = 1024;
+const default_distributed_sort_shard_window_budget: u32 = 100_000;
+const default_sorted_segment_scan_budget: u64 = 100_000;
+const sorted_segment_deadline_check_interval: u64 = 1024;
+const default_match_all_primary_key_scan_batch_size: usize = 4096;
 var bench_query_profile_counter: std.atomic.Value(u64) = .init(0);
 const bench_query_profile_unknown = std.math.maxInt(u64);
 const bench_query_profile_disabled = std.math.maxInt(u64) - 1;
 var bench_query_profile_every_cache: std.atomic.Value(u64) = .init(bench_query_profile_unknown);
+
+pub const SortRejectionDiagnostic = struct {
+    field: []const u8 = "",
+    reason: []const u8 = "unsupported_exact_sort",
+    detail: []const u8 = "unsupported_exact_sort",
+};
+
+threadlocal var last_sort_rejection_diagnostic: ?SortRejectionDiagnostic = null;
+threadlocal var last_sort_rejection_field_buf: [256]u8 = undefined;
+
+pub fn resetLastSortRejectionDiagnostic() void {
+    last_sort_rejection_diagnostic = null;
+}
+
+pub fn takeLastSortRejectionDiagnostic() ?SortRejectionDiagnostic {
+    const diagnostic = last_sort_rejection_diagnostic;
+    last_sort_rejection_diagnostic = null;
+    return diagnostic;
+}
+
+pub fn peekLastSortRejectionDiagnostic() ?SortRejectionDiagnostic {
+    return last_sort_rejection_diagnostic;
+}
+
+pub fn recordSortRejectionDiagnostic(field: []const u8, reason: []const u8, detail: []const u8) void {
+    const field_len = @min(field.len, last_sort_rejection_field_buf.len);
+    if (field_len > 0) @memcpy(last_sort_rejection_field_buf[0..field_len], field[0..field_len]);
+    last_sort_rejection_diagnostic = .{
+        .field = last_sort_rejection_field_buf[0..field_len],
+        .reason = reason,
+        .detail = detail,
+    };
+}
+
+pub fn recordSortRejectionDiagnosticForTesting(field: []const u8, reason: []const u8, detail: []const u8) void {
+    recordSortRejectionDiagnostic(field, reason, detail);
+}
 
 pub const SearchTextDispatcher = struct {
     ctx: ?*anyopaque,
@@ -83,6 +134,16 @@ pub const SearchTextQueryExecutor = struct {
         doc_key: []const u8,
         raw: []const u8,
     ) anyerror![]u8,
+    load_stored: *const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        key: []const u8,
+    ) anyerror!?[]u8,
+    is_expired_key: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        key: []const u8,
+    ) anyerror!bool = null,
     resolve_doc_set_doc_ids: ?*const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -101,6 +162,14 @@ pub const SearchTextQueryExecutor = struct {
         set: *const doc_set.ResolvedDocSet,
         generation: ?u64,
     ) anyerror!doc_set.ResolvedDocSet = null,
+    all_docs_visible: ?*const fn (
+        ctx: ?*anyopaque,
+        generation: ?u64,
+    ) anyerror!bool = null,
+    requires_full_candidate_visibility_filter: ?*const fn (
+        ctx: ?*anyopaque,
+        generation: ?u64,
+    ) anyerror!bool = null,
     postprocess: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -328,6 +397,11 @@ pub const DenseSearchExecutor = struct {
         entry: *index_manager_mod.IndexManager.DenseIndex,
         req: vectorindex_mod.SearchRequest,
     ) anyerror!vectorindex_mod.ProfiledSearchResults,
+    exact_dense_search: ?*const fn (
+        ctx: ?*anyopaque,
+        entry: *index_manager_mod.IndexManager.DenseIndex,
+        req: vectorindex_mod.SearchRequest,
+    ) anyerror!vectorindex_mod.SearchResults = null,
     postprocess: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -506,13 +580,42 @@ pub const MatchAllCandidates = struct {
     }
 };
 
+pub const MatchAllCandidateCollectOptions = struct {
+    candidate_limit: ?u32 = null,
+    constraints: ?*const NativeDocIdConstraints = null,
+    scan_batch_size: ?usize = null,
+    primary_key_start_after: ?[]const u8 = null,
+    primary_key_stop_before: ?[]const u8 = null,
+    primary_key_reverse: bool = false,
+    stop_after_accepted: ?usize = null,
+};
+
+pub const MatchAllCandidateConsumer = *const fn (
+    ctx: ?*anyopaque,
+    candidate: MatchAllCandidate,
+) anyerror!void;
+
+pub const MatchAllCandidateStreamStats = struct {
+    accepted_count: usize = 0,
+    stopped_early: bool = false,
+};
+
 pub const MatchAllExecutor = struct {
     ctx: ?*anyopaque,
     collect_candidates: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
         req: types.SearchRequest,
+        options: MatchAllCandidateCollectOptions,
     ) anyerror!MatchAllCandidates,
+    collect_candidates_stream: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        options: MatchAllCandidateCollectOptions,
+        consumer_ctx: ?*anyopaque,
+        consumer: MatchAllCandidateConsumer,
+    ) anyerror!MatchAllCandidateStreamStats = null,
     text_index_entry: *const fn (
         ctx: ?*anyopaque,
         index_name: ?[]const u8,
@@ -541,6 +644,12 @@ pub const MatchAllExecutor = struct {
         req: types.SearchRequest,
         key: []const u8,
     ) anyerror![]u8,
+    load_projected_documents: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        keys: []const []const u8,
+    ) anyerror![]?[]u8 = null,
     load_stored: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -551,6 +660,11 @@ pub const MatchAllExecutor = struct {
         alloc: Allocator,
         keys: []const []const u8,
     ) anyerror![]?[]u8 = null,
+    is_expired_key: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        key: []const u8,
+    ) anyerror!bool = null,
 };
 
 pub const MatchAllCandidateCollector = struct {
@@ -561,6 +675,14 @@ pub const MatchAllCandidateCollector = struct {
         lower: []const u8,
         upper: []const u8,
     ) anyerror![]docstore_mod.OwnedKVPair,
+    scan_store_range_with_context: ?*const fn (
+        ctx: ?*anyopaque,
+        lower: []const u8,
+        upper: []const u8,
+        options: docstore_mod.DocStore.ScanOptions,
+        scan_ctx: ?*anyopaque,
+        callback: docstore_mod.DocStore.ScanWithContextCallback,
+    ) anyerror!void = null,
     is_expired_key: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -899,13 +1021,19 @@ pub fn searchComposed(
     req: types.SearchRequest,
     executor: ComposedSearchExecutor,
 ) !types.SearchResult {
+    resetLastSortRejectionDiagnostic();
+    try validateComposedSortPageOptions(req);
     const bench_query_profile = shouldLogBenchQueryProfile();
-    const composed_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
+    const collect_sort_profile = bench_query_profile or req.profile;
+    const collect_composed_timing = bench_query_profile or collect_sort_profile;
+    const composed_start_ns = if (collect_composed_timing) platform_time.monotonicNs() else 0;
     var text_ns: u64 = 0;
     var dense_ns: u64 = 0;
     var sparse_ns: u64 = 0;
     var fuse_ns: u64 = 0;
     var graph_ns: u64 = 0;
+    var composed_candidate_count: usize = 0;
+    var exact_component_sort_profile: ?types.SortProfile = null;
     var named_sets = std.ArrayListUnmanaged(graph_exec.NamedResultSet).empty;
     defer named_sets.deinit(alloc);
     var owned_results = std.ArrayListUnmanaged(types.SearchResult).empty;
@@ -942,12 +1070,20 @@ pub fn searchComposed(
     if (shared_text_filter) |*filter| {
         shared_req.resolved_text_doc_filter = filter;
     }
+    if (collect_sort_profile and requestHasSortPageOptions(shared_req)) {
+        shared_req.profile = true;
+    }
 
     if (shared_req.full_text_queries.len == 0) {
         if (shared_req.full_text) |text| {
             const phase_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
             const text_result = try executor.search_text_query(executor.ctx, alloc, shared_req, text);
             if (bench_query_profile) text_ns += platform_time.monotonicNs() - phase_start_ns;
+            composed_candidate_count += text_result.hits.len;
+            if (requestHasSortPageOptions(shared_req)) {
+                try validateComposedExactSortComponent(shared_req, text_result);
+                exact_component_sort_profile = text_result.sort_profile;
+            }
             const resolved_doc_set = try resolveComposedHitsToDocSet(alloc, shared_req, executor, &owned_resolved_sets, text_result.hits);
             try named_sets.append(alloc, .{
                 .name = "$full_text_results",
@@ -960,6 +1096,11 @@ pub fn searchComposed(
             const phase_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
             const text_result = try executor.search_text(executor.ctx, alloc, shared_req);
             if (bench_query_profile) text_ns += platform_time.monotonicNs() - phase_start_ns;
+            composed_candidate_count += text_result.hits.len;
+            if (requestHasSortPageOptions(shared_req)) {
+                try validateComposedExactSortComponent(shared_req, text_result);
+                exact_component_sort_profile = text_result.sort_profile;
+            }
             const resolved_doc_set = try resolveComposedHitsToDocSet(alloc, shared_req, executor, &owned_resolved_sets, text_result.hits);
             try named_sets.append(alloc, .{
                 .name = "$full_text_results",
@@ -976,6 +1117,11 @@ pub fn searchComposed(
             const phase_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
             const text_result = try executor.search_text_query(executor.ctx, alloc, text_req, full_text_query.query);
             if (bench_query_profile) text_ns += platform_time.monotonicNs() - phase_start_ns;
+            composed_candidate_count += text_result.hits.len;
+            if (requestHasSortPageOptions(shared_req)) {
+                try validateComposedExactSortComponent(shared_req, text_result);
+                exact_component_sort_profile = text_result.sort_profile;
+            }
             const resolved_doc_set = try resolveComposedHitsToDocSet(alloc, shared_req, executor, &owned_resolved_sets, text_result.hits);
             try named_sets.append(alloc, .{
                 .name = full_text_query.name,
@@ -994,6 +1140,7 @@ pub fn searchComposed(
         const phase_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
         const dense_result = try executor.search_dense(executor.ctx, alloc, vector_req, vector_req.dense.?);
         if (bench_query_profile) dense_ns += platform_time.monotonicNs() - phase_start_ns;
+        composed_candidate_count += dense_result.hits.len;
         const resolved_doc_set = try resolveComposedHitsToDocSet(alloc, shared_req, executor, &owned_resolved_sets, dense_result.hits);
         try named_sets.append(alloc, .{
             .name = if (vector_req.sparse == null) "$embeddings_results" else "dense",
@@ -1009,6 +1156,7 @@ pub fn searchComposed(
             const phase_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
             const dense_result = try executor.search_dense(executor.ctx, alloc, dense_req, dense_query.query);
             if (bench_query_profile) dense_ns += platform_time.monotonicNs() - phase_start_ns;
+            composed_candidate_count += dense_result.hits.len;
             const resolved_doc_set = try resolveComposedHitsToDocSet(alloc, shared_req, executor, &owned_resolved_sets, dense_result.hits);
             try named_sets.append(alloc, .{
                 .name = dense_query.name,
@@ -1024,6 +1172,7 @@ pub fn searchComposed(
         const phase_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
         const sparse_result = try executor.search_sparse(executor.ctx, alloc, vector_req, vector_req.sparse.?);
         if (bench_query_profile) sparse_ns += platform_time.monotonicNs() - phase_start_ns;
+        composed_candidate_count += sparse_result.hits.len;
         const resolved_doc_set = try resolveComposedHitsToDocSet(alloc, shared_req, executor, &owned_resolved_sets, sparse_result.hits);
         try named_sets.append(alloc, .{
             .name = if (vector_req.dense == null) "$embeddings_results" else "sparse",
@@ -1039,6 +1188,7 @@ pub fn searchComposed(
             const phase_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
             const sparse_result = try executor.search_sparse(executor.ctx, alloc, sparse_req, sparse_query.query);
             if (bench_query_profile) sparse_ns += platform_time.monotonicNs() - phase_start_ns;
+            composed_candidate_count += sparse_result.hits.len;
             const resolved_doc_set = try resolveComposedHitsToDocSet(alloc, shared_req, executor, &owned_resolved_sets, sparse_result.hits);
             try named_sets.append(alloc, .{
                 .name = sparse_query.name,
@@ -1053,7 +1203,7 @@ pub fn searchComposed(
     const fuse_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
     var base = if (named_sets.items.len == 0)
         try emptySearchResult(alloc)
-    else if (named_sets.items.len == 1 and shared_req.merge_config == null)
+    else if (named_sets.items.len == 1)
         try executor.clone_named_set(executor.ctx, alloc, named_sets.items[0], shared_req.include_stored)
     else
         try executor.fuse_named_sets(executor.ctx, alloc, shared_req, named_sets.items);
@@ -1075,6 +1225,12 @@ pub fn searchComposed(
         try executor.attach_graph_results(executor.ctx, alloc, shared_req, &base, named_sets.items);
         if (bench_query_profile) graph_ns = platform_time.monotonicNs() - graph_start_ns;
     }
+    if (collect_sort_profile) {
+        base.sort_profile = if (requestHasSortPageOptions(shared_req))
+            composedExactSortProfileOrFallback(shared_req, exact_component_sort_profile, composed_candidate_count, base.hits.len, platform_time.monotonicNs() - composed_start_ns)
+        else
+            composedScoreTopKSortProfile(shared_req, composed_candidate_count, base.hits.len, platform_time.monotonicNs() - composed_start_ns);
+    }
     if (bench_query_profile) {
         std.log.info(
             "antfly_bench_composed_query text_us={d} dense_us={d} sparse_us={d} fuse_us={d} graph_us={d} total_us={d} named_sets={d} hits={d} total_hits={d}",
@@ -1092,6 +1248,93 @@ pub fn searchComposed(
         );
     }
     return base;
+}
+
+fn validateComposedExactSortComponent(req: types.SearchRequest, result: types.SearchResult) !void {
+    const field_count = effectiveSortFieldCountForRequest(req);
+    const plan = SortExecutionPlan{ .kind = .native_doc_values_top_n };
+    for (result.hits, 0..) |hit, i| {
+        if (hit.sort_values.len != field_count) {
+            recordComposedSortTupleRejection("*", "incomplete_sort_tuple");
+            return error.InvalidQueryRequest;
+        }
+        for (0..field_count) |field_index| {
+            const field = effectiveSortFieldAtForRequest(req, field_index);
+            _ = sortValueFromSortJson(plan, field, hit.sort_values[field_index]) catch |err| {
+                if (err == error.InvalidQueryRequest) recordComposedSortTupleRejection(field.field, "invalid_doc_value_type");
+                return err;
+            };
+            if (sortFieldIsId(field)) {
+                const sort_id = switch (hit.sort_values[field_index]) {
+                    .string => |value| value,
+                    else => {
+                        recordComposedSortTupleRejection(field.field, "invalid_doc_value_type");
+                        return error.InvalidQueryRequest;
+                    },
+                };
+                if (!std.mem.eql(u8, sort_id, hit.id)) {
+                    recordComposedSortTupleRejection(field.field, "id_tiebreaker_mismatch");
+                    return error.InvalidQueryRequest;
+                }
+            }
+        }
+        if (i > 0) {
+            const order = compareSearchHitSortValues(req, plan, result.hits[i - 1], hit) catch |err| {
+                if (err == error.InvalidQueryRequest) recordComposedSortTupleRejection("*", "invalid_doc_value_type");
+                return err;
+            };
+            if (order == .gt) {
+                recordComposedSortTupleRejection("*", "unsorted_component_window");
+                return error.InvalidQueryRequest;
+            }
+        }
+    }
+}
+
+fn recordComposedSortTupleRejection(field: []const u8, detail: []const u8) void {
+    logNativeSortPlanRejection(field, nativeSortPlanRejectionReasonName(.invalid_doc_value_type), detail);
+}
+
+fn composedExactSortProfileOrFallback(
+    req: types.SearchRequest,
+    component_profile: ?types.SortProfile,
+    candidate_count: usize,
+    selected_count: usize,
+    total_ns: u64,
+) types.SortProfile {
+    if (component_profile) |profile| return profile;
+    logNativeSortPlanRejection("*", "unsupported_exact_sort", "component_sort_profile_missing");
+    defer resetLastSortRejectionDiagnostic();
+    return sortResultProfile(req, .{
+        .kind = .unsupported_exact_sort,
+    }, false, .{
+        .candidate_source = "composed",
+        .candidate_count = @intCast(candidate_count),
+        .selected_count = @intCast(selected_count),
+        .total_ns = total_ns,
+        .window_capacity = sortWindowCapacity(req),
+        .window_len = selected_count,
+    });
+}
+
+fn composedScoreTopKSortProfile(
+    req: types.SearchRequest,
+    candidate_count: usize,
+    selected_count: usize,
+    total_ns: u64,
+) types.SortProfile {
+    return sortResultProfile(req, .{
+        .kind = .score_top_k,
+        .exactness = if (composedEmbeddingSourceCount(req) > 0) .approximate else .exact,
+    }, false, .{
+        .candidate_source = "composed",
+        .candidate_count = @intCast(candidate_count),
+        .admitted_count = @intCast(candidate_count),
+        .selected_count = @intCast(selected_count),
+        .total_ns = total_ns,
+        .window_capacity = sortWindowCapacity(req),
+        .window_len = selected_count,
+    });
 }
 
 fn resolveComposedHitsToDocSet(
@@ -1139,7 +1382,9 @@ fn appendEmbeddingsResultAlias(
         return;
     }
 
-    var embeddings_result = try executor.fuse_named_sets(executor.ctx, alloc, req, embedding_sets.items);
+    var embeddings_req = req;
+    embeddings_req.merge_config = null;
+    var embeddings_result = try executor.fuse_named_sets(executor.ctx, alloc, embeddings_req, embedding_sets.items);
     errdefer embeddings_result.deinit();
     const resolved_doc_set = try resolveComposedHitsToDocSet(alloc, req, executor, owned_resolved_sets, embeddings_result.hits);
     try named_sets.append(alloc, .{
@@ -1181,6 +1426,195 @@ fn hasSearchRequestFullTextResults(req: types.SearchRequest) bool {
     return !isDefaultMatchAll(req.query) and isTextQuery(req.query);
 }
 
+fn requestHasSortPageOptions(req: types.SearchRequest) bool {
+    return req.order_by.len > 0 or req.search_after.len > 0 or req.search_before.len > 0;
+}
+
+pub fn requestHasVectorScoreOrderOnly(req: types.SearchRequest) bool {
+    if (req.search_after.len > 0 or req.search_before.len > 0) return false;
+    if (req.order_by.len == 0) return false;
+    var seen_score = false;
+    for (req.order_by, 0..) |field, i| {
+        if (sortFieldIsScore(field)) {
+            if (seen_score or !field.desc) return false;
+            seen_score = true;
+            continue;
+        }
+        if (sortFieldIsId(field)) {
+            if (i + 1 != req.order_by.len or field.desc) return false;
+            continue;
+        }
+        return false;
+    }
+    return seen_score;
+}
+
+fn approximateSortPageDiagnosticField(req: types.SearchRequest) []const u8 {
+    for (req.order_by) |field| {
+        if (sortFieldIsScore(field) or sortFieldIsId(field)) continue;
+        return field.field;
+    }
+    if (req.order_by.len > 0) return req.order_by[0].field;
+    return "*";
+}
+
+fn sortFieldIsId(field: types.SortField) bool {
+    return std.mem.eql(u8, field.field, "_id");
+}
+
+fn sortFieldIsScore(field: types.SortField) bool {
+    return std.mem.eql(u8, field.field, "_score");
+}
+
+fn sortScoreNumber(hit: types.SearchHit) !f64 {
+    const score = hit.score orelse {
+        logNativeSortPlanRejection(
+            "_score",
+            nativeSortPlanRejectionReasonName(.invalid_score_value),
+            "missing_score",
+        );
+        return error.UnsupportedQueryRequest;
+    };
+    if (!std.math.isFinite(score)) {
+        logNativeSortPlanRejection(
+            "_score",
+            nativeSortPlanRejectionReasonName(.invalid_score_value),
+            "non_finite_score",
+        );
+        return error.UnsupportedQueryRequest;
+    }
+    return @floatCast(score);
+}
+
+fn sortFieldNeedsNativeValue(field: types.SortField) bool {
+    return !sortFieldIsId(field) and !sortFieldIsScore(field);
+}
+
+fn validateSortIdTiebreaker(order_by: []const types.SortField) !void {
+    for (order_by, 0..) |field, i| {
+        for (order_by[0..i]) |prior| {
+            if (std.mem.eql(u8, prior.field, field.field)) return error.InvalidQueryRequest;
+        }
+        if (!sortFieldIsId(field)) continue;
+        if (i + 1 != order_by.len or field.desc) return error.InvalidQueryRequest;
+    }
+}
+
+fn sortFieldsNeedImplicitIdTiebreaker(order_by: []const types.SortField) bool {
+    if (order_by.len == 0) return false;
+    return !sortFieldIsId(order_by[order_by.len - 1]);
+}
+
+fn sortRequestNeedsDefaultIdOrder(req: types.SearchRequest) bool {
+    return req.order_by.len == 0 and (req.search_after.len > 0 or req.search_before.len > 0);
+}
+
+fn effectiveSortFieldCountForRequest(req: types.SearchRequest) usize {
+    if (sortRequestNeedsDefaultIdOrder(req)) return 1;
+    return effectiveSortFieldCount(req.order_by);
+}
+
+fn effectiveSortFieldAtForRequest(req: types.SearchRequest, index: usize) types.SortField {
+    if (sortRequestNeedsDefaultIdOrder(req)) return .{ .field = "_id", .desc = false };
+    return effectiveSortFieldAt(req.order_by, index);
+}
+
+fn effectiveSortFieldCount(order_by: []const types.SortField) usize {
+    return order_by.len + @as(usize, if (sortFieldsNeedImplicitIdTiebreaker(order_by)) 1 else 0);
+}
+
+fn effectiveSortFieldAt(order_by: []const types.SortField, index: usize) types.SortField {
+    if (index < order_by.len) return order_by[index];
+    return .{ .field = "_id", .desc = false };
+}
+
+const EffectiveSortRequest = struct {
+    req: types.SearchRequest,
+    owned_order_by: []types.SortField = &.{},
+
+    fn deinit(self: *EffectiveSortRequest, alloc: Allocator) void {
+        if (self.owned_order_by.len > 0) alloc.free(self.owned_order_by);
+    }
+};
+
+fn effectiveSortRequestAlloc(alloc: Allocator, req: types.SearchRequest) !EffectiveSortRequest {
+    try validateSortIdTiebreaker(req.order_by);
+    if (sortRequestNeedsDefaultIdOrder(req)) {
+        const order_by = try alloc.alloc(types.SortField, 1);
+        order_by[0] = .{ .field = "_id", .desc = false };
+        var effective_req = req;
+        effective_req.order_by = order_by;
+        return .{ .req = effective_req, .owned_order_by = order_by };
+    }
+    if (!sortFieldsNeedImplicitIdTiebreaker(req.order_by)) return .{ .req = req };
+
+    const order_by = try alloc.alloc(types.SortField, req.order_by.len + 1);
+    @memcpy(order_by[0..req.order_by.len], req.order_by);
+    order_by[req.order_by.len] = .{ .field = "_id", .desc = false };
+    var effective_req = req;
+    effective_req.order_by = order_by;
+    return .{ .req = effective_req, .owned_order_by = order_by };
+}
+
+fn rejectApproximateSortPageOptions(req: types.SearchRequest) !void {
+    if (requestHasSortPageOptions(req)) {
+        logNativeSortPlanRejection(
+            approximateSortPageDiagnosticField(req),
+            nativeSortPlanRejectionReasonName(.approximate_candidate_source),
+            nativeSortPlanRejectionDetailName(.approximate_candidate_source),
+        );
+        return error.UnsupportedQueryRequest;
+    }
+}
+
+fn validateSortPageOptions(req: types.SearchRequest) !void {
+    if (!requestHasSortPageOptions(req)) return;
+    if (req.count_only) {
+        logNativeSortPlanRejection(
+            "*",
+            "unsupported_exact_sort",
+            "count_only_ordered_page",
+        );
+        return error.UnsupportedQueryRequest;
+    }
+    try validateSortCursorContract(req);
+}
+
+fn composedTextSourceCount(req: types.SearchRequest) usize {
+    if (req.full_text_queries.len > 0) return req.full_text_queries.len;
+    if (req.full_text != null) return 1;
+    if (!isDefaultMatchAll(req.query) and isTextQuery(req.query)) return 1;
+    return 0;
+}
+
+fn composedEmbeddingSourceCount(req: types.SearchRequest) usize {
+    var count: usize = 0;
+    count += if (req.dense_queries.len > 0) req.dense_queries.len else if (req.dense != null) @as(usize, 1) else 0;
+    count += if (req.sparse_queries.len > 0) req.sparse_queries.len else if (req.sparse != null) @as(usize, 1) else 0;
+    return count;
+}
+
+fn validateComposedSortPageOptions(req: types.SearchRequest) !void {
+    try validateSortPageOptions(req);
+    if (!requestHasSortPageOptions(req)) return;
+    if (composedEmbeddingSourceCount(req) > 0) {
+        logNativeSortPlanRejection(
+            "*",
+            nativeSortPlanRejectionReasonName(.approximate_candidate_source),
+            nativeSortPlanRejectionDetailName(.approximate_candidate_source),
+        );
+        return error.UnsupportedQueryRequest;
+    }
+    if (composedTextSourceCount(req) != 1) {
+        logNativeSortPlanRejection(
+            "*",
+            "unsupported_exact_sort",
+            "unsupported_composed_sort_source",
+        );
+        return error.UnsupportedQueryRequest;
+    }
+}
+
 const ComponentPaging = struct {
     offset: u32,
     limit: u32,
@@ -1188,10 +1622,7 @@ const ComponentPaging = struct {
 
 fn componentPaging(req: types.SearchRequest) ComponentPaging {
     var limit = req.limit +| req.offset;
-    const needs_component_window =
-        req.merge_config != null or
-        req.pruner != null or
-        req.reranker != null;
+    const needs_component_window = requestHasPostprocessPageTransforms(req);
 
     if (!needs_component_window) {
         return .{
@@ -1215,6 +1646,12 @@ fn componentPaging(req: types.SearchRequest) ComponentPaging {
     };
 }
 
+fn requestHasPostprocessPageTransforms(req: types.SearchRequest) bool {
+    return req.merge_config != null or
+        req.pruner != null or
+        req.reranker != null;
+}
+
 fn hasStoredPatternFilters(req: types.SearchRequest) bool {
     return req.filter_query_json.len > 0 or req.exclusion_query_json.len > 0;
 }
@@ -1225,6 +1662,30 @@ fn requestWithoutResolvedStoredFilters(req: types.SearchRequest, filter_query_js
     if (filter_query_json_resolved) next.filter_query_json = "";
     if (exclusion_query_json_resolved) next.exclusion_query_json = "";
     return next;
+}
+
+fn rejectSortedQueryWithUnresolvedStoredFilters(
+    req: types.SearchRequest,
+    filter_query_json_resolved: bool,
+    exclusion_query_json_resolved: bool,
+) error{UnsupportedQueryRequest}!void {
+    if (!requestHasSortPageOptions(req)) return;
+    if (req.filter_query_json.len > 0 and !filter_query_json_resolved) {
+        logNativeSortPlanRejection(
+            "*",
+            nativeSortPlanRejectionReasonName(.missing_native_filter_coverage),
+            "filter_query_json_unresolved",
+        );
+        return error.UnsupportedQueryRequest;
+    }
+    if (req.exclusion_query_json.len > 0 and !exclusion_query_json_resolved) {
+        logNativeSortPlanRejection(
+            "*",
+            nativeSortPlanRejectionReasonName(.missing_native_filter_coverage),
+            "exclusion_query_json_unresolved",
+        );
+        return error.UnsupportedQueryRequest;
+    }
 }
 
 const NativeDenseConstraints = struct {
@@ -2192,6 +2653,5749 @@ fn docNumsForResolvedDocSetAlloc(
     };
 }
 
+fn searchTextNeedsLateVisibilityFilter(
+    executor: SearchTextQueryExecutor,
+    can_apply_live_all_docs: bool,
+    has_native_positive_filter: bool,
+    generation: ?u64,
+) !bool {
+    if (executor.requires_full_candidate_visibility_filter) |requires| {
+        if (try requires(executor.ctx, generation)) return true;
+    }
+    if (has_native_positive_filter) return false;
+    if (can_apply_live_all_docs) return false;
+    if (executor.live_filter_doc_set == null) return false;
+    if (executor.all_docs_visible) |all_visible| {
+        return !(try all_visible(executor.ctx, generation));
+    }
+    return true;
+}
+
+fn lateVisibilityExactCandidateBudgetFromRaw(raw: ?[]const u8) u32 {
+    const value = raw orelse return default_late_visibility_exact_candidate_budget;
+    if (value.len == 0) return default_late_visibility_exact_candidate_budget;
+    const parsed = std.fmt.parseUnsigned(u32, value, 10) catch return default_late_visibility_exact_candidate_budget;
+    return if (parsed == 0) std.math.maxInt(u32) else parsed;
+}
+
+fn lateVisibilityExactCandidateBudget() u32 {
+    return lateVisibilityExactCandidateBudgetFromRaw(getenv("ANTFLY_TEXT_LATE_VISIBILITY_EXACT_CANDIDATE_BUDGET"));
+}
+
+fn distributedSortShardWindowBudgetFromRaw(raw: ?[]const u8) u32 {
+    const value = raw orelse return default_distributed_sort_shard_window_budget;
+    if (value.len == 0) return default_distributed_sort_shard_window_budget;
+    const parsed = std.fmt.parseUnsigned(u32, value, 10) catch return default_distributed_sort_shard_window_budget;
+    return if (parsed == 0) std.math.maxInt(u32) else parsed;
+}
+
+fn distributedSortShardWindowBudget() u32 {
+    return distributedSortShardWindowBudgetFromRaw(getenv("ANTFLY_DISTRIBUTED_SORT_SHARD_WINDOW_BUDGET"));
+}
+
+fn sortedSegmentScanBudgetFromRaw(raw: ?[]const u8) u64 {
+    const value = raw orelse return default_sorted_segment_scan_budget;
+    if (value.len == 0) return default_sorted_segment_scan_budget;
+    const parsed = std.fmt.parseUnsigned(u64, value, 10) catch return default_sorted_segment_scan_budget;
+    return if (parsed == 0) std.math.maxInt(u64) else parsed;
+}
+
+fn sortedSegmentScanBudget() u64 {
+    return sortedSegmentScanBudgetFromRaw(getenv("ANTFLY_SORTED_SEGMENT_SCAN_BUDGET"));
+}
+
+fn boundedU32(count: anytype) u32 {
+    return @intCast(@min(count, @as(@TypeOf(count), std.math.maxInt(u32))));
+}
+
+fn effectiveTextCandidateLimit(snapshot_doc_count: u64, constraints: NativeDocIdConstraints) u32 {
+    if (constraints.positive_filter) return boundedU32(constraints.filter_doc_nums.len);
+    return boundedU32(snapshot_doc_count);
+}
+
+fn enforceLateVisibilityExactCandidateBudget(candidate_limit: u32, budget: u32) !void {
+    if (candidate_limit <= budget) return;
+    return error.QueryCandidateBudgetExceeded;
+}
+
+const ExactSortBudgetRejectionReason = enum {
+    text_exact_late_visibility_totals,
+    text_field_sort_candidate_window,
+    match_all_candidate_collect_limit,
+    match_all_exact_candidate_window,
+    distributed_merge_shard_window,
+    sorted_segment_scan_window,
+};
+
+fn exactSortBudgetRejectionReasonName(reason: ExactSortBudgetRejectionReason) []const u8 {
+    return switch (reason) {
+        .text_exact_late_visibility_totals => "text_exact_late_visibility_totals",
+        .text_field_sort_candidate_window => "text_field_sort_candidate_window",
+        .match_all_candidate_collect_limit => "match_all_candidate_collect_limit",
+        .match_all_exact_candidate_window => "match_all_exact_candidate_window",
+        .distributed_merge_shard_window => "distributed_merge_shard_window",
+        .sorted_segment_scan_window => "sorted_segment_scan_window",
+    };
+}
+
+fn logExactSortBudgetRejection(
+    source: []const u8,
+    reason: ExactSortBudgetRejectionReason,
+    index_name: ?[]const u8,
+    candidates: u32,
+    budget: u32,
+    plan: ?SortExecutionPlan,
+) void {
+    const reason_name = exactSortBudgetRejectionReasonName(reason);
+    recordSortRejectionDiagnostic(
+        index_name orelse "",
+        "candidate_budget_exceeded",
+        reason_name,
+    );
+    std.log.warn(
+        "antfly_exact_sort_budget_reject source={s} reason={s} budget_rejection_reason={s} index={s} candidates={d} budget={d} plan={s} exactness={s}",
+        .{
+            source,
+            reason_name,
+            reason_name,
+            index_name orelse "",
+            candidates,
+            budget,
+            if (plan) |p| sortExecutionPlanKindName(p.kind) else "none",
+            if (plan) |p| sortPlanExactnessName(sortExecutionPlanExactness(p)) else "unspecified",
+        },
+    );
+}
+
+fn checkSearchRequestDeadline(req: types.SearchRequest) !void {
+    const deadline_ns = req.execution_deadline_ns orelse return;
+    if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+}
+
+test "exact sort budget rejection reason names are stable for diagnostics" {
+    try std.testing.expectEqualStrings("text_exact_late_visibility_totals", exactSortBudgetRejectionReasonName(.text_exact_late_visibility_totals));
+    try std.testing.expectEqualStrings("text_field_sort_candidate_window", exactSortBudgetRejectionReasonName(.text_field_sort_candidate_window));
+    try std.testing.expectEqualStrings("match_all_candidate_collect_limit", exactSortBudgetRejectionReasonName(.match_all_candidate_collect_limit));
+    try std.testing.expectEqualStrings("match_all_exact_candidate_window", exactSortBudgetRejectionReasonName(.match_all_exact_candidate_window));
+    try std.testing.expectEqualStrings("distributed_merge_shard_window", exactSortBudgetRejectionReasonName(.distributed_merge_shard_window));
+}
+
+test "exact sort budget rejection records public diagnostic class and detailed budget" {
+    resetLastSortRejectionDiagnostic();
+    logExactSortBudgetRejection(
+        "text",
+        .text_field_sort_candidate_window,
+        "full_text_index_v0",
+        101,
+        100,
+        .{ .kind = .native_doc_values_top_n },
+    );
+    const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("full_text_index_v0", diagnostic.field);
+    try std.testing.expectEqualStrings("candidate_budget_exceeded", diagnostic.reason);
+    try std.testing.expectEqualStrings("text_field_sort_candidate_window", diagnostic.detail);
+}
+
+test "text late visibility requirement overrides positive native filter" {
+    const callbacks = struct {
+        fn requiresFullCandidateVisibilityFilter(_: ?*anyopaque, _: ?u64) anyerror!bool {
+            return true;
+        }
+    };
+
+    const needs_late_filter = try searchTextNeedsLateVisibilityFilter(.{
+        .ctx = null,
+        .text_index_entry = undefined,
+        .text_index_is_chunk_backed = undefined,
+        .search_match_all = undefined,
+        .project_stored_search = undefined,
+        .load_stored = undefined,
+        .requires_full_candidate_visibility_filter = callbacks.requiresFullCandidateVisibilityFilter,
+        .postprocess = undefined,
+    }, true, true, null);
+    try std.testing.expect(needs_late_filter);
+}
+
+test "text late visibility candidate limit uses positive native filter bound" {
+    try std.testing.expectEqual(@as(u32, 2), effectiveTextCandidateLimit(1_000_000, .{
+        .positive_filter = true,
+        .filter_doc_nums = &.{ 10, 20 },
+    }));
+    try std.testing.expectEqual(std.math.maxInt(u32), effectiveTextCandidateLimit(@as(u64, std.math.maxInt(u32)) + 99, .{}));
+}
+
+test "text late visibility exact candidate budget parses disabled and fallback values" {
+    try std.testing.expectEqual(default_late_visibility_exact_candidate_budget, lateVisibilityExactCandidateBudgetFromRaw(null));
+    try std.testing.expectEqual(default_late_visibility_exact_candidate_budget, lateVisibilityExactCandidateBudgetFromRaw(""));
+    try std.testing.expectEqual(default_late_visibility_exact_candidate_budget, lateVisibilityExactCandidateBudgetFromRaw("bad"));
+    try std.testing.expectEqual(@as(u32, 42), lateVisibilityExactCandidateBudgetFromRaw("42"));
+    try std.testing.expectEqual(std.math.maxInt(u32), lateVisibilityExactCandidateBudgetFromRaw("0"));
+}
+
+test "distributed sort shard window budget parses disabled and fallback values" {
+    try std.testing.expectEqual(default_distributed_sort_shard_window_budget, distributedSortShardWindowBudgetFromRaw(null));
+    try std.testing.expectEqual(default_distributed_sort_shard_window_budget, distributedSortShardWindowBudgetFromRaw(""));
+    try std.testing.expectEqual(default_distributed_sort_shard_window_budget, distributedSortShardWindowBudgetFromRaw("bad"));
+    try std.testing.expectEqual(@as(u32, 42), distributedSortShardWindowBudgetFromRaw("42"));
+    try std.testing.expectEqual(std.math.maxInt(u32), distributedSortShardWindowBudgetFromRaw("0"));
+
+    try std.testing.expectEqual(default_sorted_segment_scan_budget, sortedSegmentScanBudgetFromRaw(null));
+    try std.testing.expectEqual(default_sorted_segment_scan_budget, sortedSegmentScanBudgetFromRaw(""));
+    try std.testing.expectEqual(default_sorted_segment_scan_budget, sortedSegmentScanBudgetFromRaw("bad"));
+    try std.testing.expectEqual(@as(u64, 42), sortedSegmentScanBudgetFromRaw("42"));
+    try std.testing.expectEqual(std.math.maxInt(u64), sortedSegmentScanBudgetFromRaw("0"));
+}
+
+test "text late visibility exact candidate budget rejects oversized exact windows" {
+    try enforceLateVisibilityExactCandidateBudget(100, 100);
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, enforceLateVisibilityExactCandidateBudget(101, 100));
+}
+
+fn paginateSearchResultInPlace(result: *types.SearchResult, offset: u32, limit: u32) !void {
+    const alloc = result.alloc;
+    const available: u32 = @intCast(@min(result.hits.len, @as(usize, std.math.maxInt(u32))));
+    const start = @min(offset, available);
+    const end_u64 = @min(@as(u64, start) + @as(u64, limit), @as(u64, available));
+    const start_usize: usize = @intCast(start);
+    const end_usize: usize = @intCast(end_u64);
+    if (start_usize == 0 and end_usize == result.hits.len) return;
+
+    const selected = try alloc.alloc(types.SearchHit, end_usize - start_usize);
+    errdefer alloc.free(selected);
+    for (result.hits, 0..) |*hit, i| {
+        if (i >= start_usize and i < end_usize) {
+            selected[i - start_usize] = hit.*;
+            hit.* = undefined;
+        } else {
+            hit.deinit(alloc);
+        }
+    }
+    if (result.hits.len > 0) alloc.free(result.hits);
+    result.hits = selected;
+}
+
+const SortValue = union(enum) {
+    null_value,
+    bool_value: bool,
+    integer: i64,
+    u64_value: u64,
+    number: f64,
+    number_string: []const u8,
+    string: []const u8,
+
+    fn deinit(self: @This(), alloc: Allocator) void {
+        switch (self) {
+            .string, .number_string => |text| alloc.free(@constCast(text)),
+            else => {},
+        }
+    }
+};
+
+const NativeSortValueLoader = struct {
+    ctx: ?*anyopaque = null,
+    require_native: bool = false,
+    load: *const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        hit: types.SearchHit,
+        field: []const u8,
+    ) anyerror!?SortValue,
+};
+
+const SortExecutionPlanKind = enum {
+    none,
+    id_only,
+    id_seek,
+    sorted_segment_seek,
+    score_top_k,
+    native_doc_values_top_n,
+    distributed_k_way_merge,
+    stored_json_debug,
+    unsupported_exact_sort,
+};
+
+fn sortExecutionPlanKindName(kind: SortExecutionPlanKind) []const u8 {
+    return switch (kind) {
+        .none => "none",
+        .id_only => "id_only",
+        .id_seek => "id_seek",
+        .sorted_segment_seek => "sorted_segment_seek",
+        .score_top_k => "score_top_k",
+        .native_doc_values_top_n => "native_doc_values_top_n",
+        .distributed_k_way_merge => "distributed_k_way_merge",
+        .stored_json_debug => "stored_json_debug",
+        .unsupported_exact_sort => "unsupported_exact_sort",
+    };
+}
+
+const SortPlanExactness = enum {
+    unspecified,
+    none,
+    exact,
+    bounded_exact,
+    approximate,
+    unsupported,
+};
+
+fn sortPlanExactnessName(exactness: SortPlanExactness) []const u8 {
+    return switch (exactness) {
+        .unspecified => "unspecified",
+        .none => "none",
+        .exact => "exact",
+        .bounded_exact => "bounded_exact",
+        .approximate => "approximate",
+        .unsupported => "unsupported",
+    };
+}
+
+const SortPlanSource = enum {
+    unspecified,
+    none,
+    candidate_collector,
+    primary_key_scan,
+    sorted_segment_scan,
+    score_top_k,
+    doc_values_collector,
+    distributed_merge,
+    stored_json_debug,
+    unsupported,
+};
+
+fn sortPlanSourceName(source: SortPlanSource) []const u8 {
+    return switch (source) {
+        .unspecified => "unspecified",
+        .none => "none",
+        .candidate_collector => "candidate_collector",
+        .primary_key_scan => "primary_key_scan",
+        .sorted_segment_scan => "sorted_segment_scan",
+        .score_top_k => "score_top_k",
+        .doc_values_collector => "doc_values_collector",
+        .distributed_merge => "distributed_merge",
+        .stored_json_debug => "stored_json_debug",
+        .unsupported => "unsupported",
+    };
+}
+
+const SortPlanCursorSupport = enum {
+    unspecified,
+    none,
+    comparator,
+    segment_seek,
+    distributed_seek,
+    unsupported,
+};
+
+fn sortPlanCursorSupportName(cursor_support: SortPlanCursorSupport) []const u8 {
+    return switch (cursor_support) {
+        .unspecified => "unspecified",
+        .none => "none",
+        .comparator => "comparator",
+        .segment_seek => "segment_seek",
+        .distributed_seek => "distributed_seek",
+        .unsupported => "unsupported",
+    };
+}
+
+const SortPlanSourceLoad = enum {
+    unspecified,
+    none,
+    source_free,
+    projected_source_after_page,
+    stored_source_required,
+    unsupported,
+};
+
+fn sortPlanSourceLoadName(source_load: SortPlanSourceLoad) []const u8 {
+    return switch (source_load) {
+        .unspecified => "unspecified",
+        .none => "none",
+        .source_free => "source_free",
+        .projected_source_after_page => "projected_source_after_page",
+        .stored_source_required => "stored_source_required",
+        .unsupported => "unsupported",
+    };
+}
+
+const SortPlanDistributedBehavior = enum {
+    unspecified,
+    none,
+    shard_local_only,
+    coordinator_merge,
+    unsupported,
+};
+
+fn sortPlanDistributedBehaviorName(distributed_behavior: SortPlanDistributedBehavior) []const u8 {
+    return switch (distributed_behavior) {
+        .unspecified => "unspecified",
+        .none => "none",
+        .shard_local_only => "shard_local_only",
+        .coordinator_merge => "coordinator_merge",
+        .unsupported => "unsupported",
+    };
+}
+
+test "sort execution plan kind names are stable for profiles" {
+    try std.testing.expectEqualStrings("none", sortExecutionPlanKindName(.none));
+    try std.testing.expectEqualStrings("id_only", sortExecutionPlanKindName(.id_only));
+    try std.testing.expectEqualStrings("id_seek", sortExecutionPlanKindName(.id_seek));
+    try std.testing.expectEqualStrings("sorted_segment_seek", sortExecutionPlanKindName(.sorted_segment_seek));
+    try std.testing.expectEqualStrings("score_top_k", sortExecutionPlanKindName(.score_top_k));
+    try std.testing.expectEqualStrings("native_doc_values_top_n", sortExecutionPlanKindName(.native_doc_values_top_n));
+    try std.testing.expectEqualStrings("distributed_k_way_merge", sortExecutionPlanKindName(.distributed_k_way_merge));
+    try std.testing.expectEqualStrings("stored_json_debug", sortExecutionPlanKindName(.stored_json_debug));
+    try std.testing.expectEqualStrings("unsupported_exact_sort", sortExecutionPlanKindName(.unsupported_exact_sort));
+}
+
+test "sort execution plan dimension names are stable for profiles" {
+    try std.testing.expectEqualStrings("exact", sortPlanExactnessName(.exact));
+    try std.testing.expectEqualStrings("bounded_exact", sortPlanExactnessName(.bounded_exact));
+    try std.testing.expectEqualStrings("approximate", sortPlanExactnessName(.approximate));
+    try std.testing.expectEqualStrings("candidate_collector", sortPlanSourceName(.candidate_collector));
+    try std.testing.expectEqualStrings("score_top_k", sortPlanSourceName(.score_top_k));
+    try std.testing.expectEqualStrings("doc_values_collector", sortPlanSourceName(.doc_values_collector));
+    try std.testing.expectEqualStrings("primary_key_scan", sortPlanSourceName(.primary_key_scan));
+    try std.testing.expectEqualStrings("sorted_segment_scan", sortPlanSourceName(.sorted_segment_scan));
+    try std.testing.expectEqualStrings("distributed_merge", sortPlanSourceName(.distributed_merge));
+    try std.testing.expectEqualStrings("comparator", sortPlanCursorSupportName(.comparator));
+    try std.testing.expectEqualStrings("segment_seek", sortPlanCursorSupportName(.segment_seek));
+    try std.testing.expectEqualStrings("distributed_seek", sortPlanCursorSupportName(.distributed_seek));
+    try std.testing.expectEqualStrings("projected_source_after_page", sortPlanSourceLoadName(.projected_source_after_page));
+    try std.testing.expectEqualStrings("stored_source_required", sortPlanSourceLoadName(.stored_source_required));
+    try std.testing.expectEqualStrings("shard_local_only", sortPlanDistributedBehaviorName(.shard_local_only));
+    try std.testing.expectEqualStrings("coordinator_merge", sortPlanDistributedBehaviorName(.coordinator_merge));
+}
+
+const SortExecutionPlan = struct {
+    kind: SortExecutionPlanKind,
+    require_native: bool = false,
+    exactness: SortPlanExactness = .unspecified,
+    source: SortPlanSource = .unspecified,
+    cursor_support: SortPlanCursorSupport = .unspecified,
+    source_load: SortPlanSourceLoad = .unspecified,
+    distributed_behavior: SortPlanDistributedBehavior = .unspecified,
+    runtime_schema: ?runtime_schema_mod.TableSchema = null,
+    sort_lifecycle_state: []const u8 = "",
+    native_doc_values_coverage: []const u8 = "",
+    index_sort_coverage: []const u8 = "",
+    index_sort_match: bool = false,
+    sorted_segment_executor_available: bool = false,
+    sorted_segment_bounds_available: bool = false,
+    selective_filter_doc_values_preferred: bool = false,
+    cost_model_live_docs: u64 = 0,
+    cost_model_candidate_count: u64 = 0,
+    cost_model_selective_limit: u64 = 0,
+};
+
+fn defaultSortPlanExactness(kind: SortExecutionPlanKind) SortPlanExactness {
+    return switch (kind) {
+        .none => .none,
+        .id_only, .id_seek, .score_top_k, .native_doc_values_top_n => .exact,
+        .sorted_segment_seek, .distributed_k_way_merge, .stored_json_debug => .bounded_exact,
+        .unsupported_exact_sort => .unsupported,
+    };
+}
+
+fn defaultSortPlanSource(kind: SortExecutionPlanKind) SortPlanSource {
+    return switch (kind) {
+        .none => .none,
+        .id_only => .candidate_collector,
+        .id_seek => .primary_key_scan,
+        .sorted_segment_seek => .sorted_segment_scan,
+        .score_top_k => .score_top_k,
+        .native_doc_values_top_n => .doc_values_collector,
+        .distributed_k_way_merge => .distributed_merge,
+        .stored_json_debug => .stored_json_debug,
+        .unsupported_exact_sort => .unsupported,
+    };
+}
+
+fn defaultSortPlanCursorSupport(kind: SortExecutionPlanKind) SortPlanCursorSupport {
+    return switch (kind) {
+        .none => .none,
+        .id_only, .score_top_k => .comparator,
+        .id_seek, .sorted_segment_seek => .segment_seek,
+        .native_doc_values_top_n, .stored_json_debug => .comparator,
+        .distributed_k_way_merge => .distributed_seek,
+        .unsupported_exact_sort => .unsupported,
+    };
+}
+
+fn defaultSortPlanSourceLoad(kind: SortExecutionPlanKind) SortPlanSourceLoad {
+    return switch (kind) {
+        .none => .none,
+        .id_only, .id_seek, .sorted_segment_seek, .score_top_k, .native_doc_values_top_n, .distributed_k_way_merge => .projected_source_after_page,
+        .stored_json_debug => .stored_source_required,
+        .unsupported_exact_sort => .unsupported,
+    };
+}
+
+fn defaultSortPlanDistributedBehavior(kind: SortExecutionPlanKind) SortPlanDistributedBehavior {
+    return switch (kind) {
+        .none => .none,
+        .id_only, .id_seek, .sorted_segment_seek, .score_top_k, .native_doc_values_top_n, .stored_json_debug => .shard_local_only,
+        .distributed_k_way_merge => .coordinator_merge,
+        .unsupported_exact_sort => .unsupported,
+    };
+}
+
+fn sortExecutionPlanExactness(plan: SortExecutionPlan) SortPlanExactness {
+    return if (plan.exactness == .unspecified) defaultSortPlanExactness(plan.kind) else plan.exactness;
+}
+
+fn sortExecutionPlanSource(plan: SortExecutionPlan) SortPlanSource {
+    return if (plan.source == .unspecified) defaultSortPlanSource(plan.kind) else plan.source;
+}
+
+fn sortExecutionPlanCursorSupport(plan: SortExecutionPlan) SortPlanCursorSupport {
+    return if (plan.cursor_support == .unspecified) defaultSortPlanCursorSupport(plan.kind) else plan.cursor_support;
+}
+
+fn sortExecutionPlanSourceLoad(plan: SortExecutionPlan) SortPlanSourceLoad {
+    return if (plan.source_load == .unspecified) defaultSortPlanSourceLoad(plan.kind) else plan.source_load;
+}
+
+fn sortExecutionPlanSourceLoadForRequest(plan: SortExecutionPlan, req: types.SearchRequest) SortPlanSourceLoad {
+    const source_load = sortExecutionPlanSourceLoad(plan);
+    return switch (source_load) {
+        .projected_source_after_page => if (req.include_stored) .projected_source_after_page else .source_free,
+        else => source_load,
+    };
+}
+
+fn sortExecutionPlanDistributedBehavior(plan: SortExecutionPlan) SortPlanDistributedBehavior {
+    return if (plan.distributed_behavior == .unspecified) defaultSortPlanDistributedBehavior(plan.kind) else plan.distributed_behavior;
+}
+
+test "sort execution plan dimensions default from kind unless explicit" {
+    const text_id_plan = SortExecutionPlan{ .kind = .id_only };
+    try std.testing.expectEqual(SortPlanExactness.exact, sortExecutionPlanExactness(text_id_plan));
+    try std.testing.expectEqual(SortPlanSource.candidate_collector, sortExecutionPlanSource(text_id_plan));
+    try std.testing.expectEqual(SortPlanCursorSupport.comparator, sortExecutionPlanCursorSupport(text_id_plan));
+
+    const match_all_id_plan = SortExecutionPlan{ .kind = .id_seek };
+    try std.testing.expectEqual(SortPlanSource.primary_key_scan, sortExecutionPlanSource(match_all_id_plan));
+    try std.testing.expectEqual(SortPlanCursorSupport.segment_seek, sortExecutionPlanCursorSupport(match_all_id_plan));
+
+    const sorted_seek_plan = SortExecutionPlan{ .kind = .sorted_segment_seek };
+    try std.testing.expectEqual(SortPlanExactness.bounded_exact, sortExecutionPlanExactness(sorted_seek_plan));
+    try std.testing.expectEqual(SortPlanSource.sorted_segment_scan, sortExecutionPlanSource(sorted_seek_plan));
+    try std.testing.expectEqual(SortPlanCursorSupport.segment_seek, sortExecutionPlanCursorSupport(sorted_seek_plan));
+    try std.testing.expectEqual(SortPlanDistributedBehavior.shard_local_only, sortExecutionPlanDistributedBehavior(sorted_seek_plan));
+
+    const native_plan = SortExecutionPlan{ .kind = .native_doc_values_top_n };
+    try std.testing.expectEqual(SortPlanSource.doc_values_collector, sortExecutionPlanSource(native_plan));
+    try std.testing.expectEqual(SortPlanSourceLoad.projected_source_after_page, sortExecutionPlanSourceLoad(native_plan));
+    try std.testing.expectEqual(SortPlanSourceLoad.source_free, sortExecutionPlanSourceLoadForRequest(native_plan, .{
+        .include_stored = false,
+    }));
+    try std.testing.expectEqual(SortPlanSourceLoad.projected_source_after_page, sortExecutionPlanSourceLoadForRequest(native_plan, .{
+        .include_stored = true,
+    }));
+
+    const debug_plan = SortExecutionPlan{ .kind = .stored_json_debug };
+    try std.testing.expectEqual(SortPlanSourceLoad.stored_source_required, sortExecutionPlanSourceLoadForRequest(debug_plan, .{
+        .include_stored = false,
+    }));
+
+    const score_plan = SortExecutionPlan{ .kind = .score_top_k };
+    try std.testing.expectEqual(SortPlanExactness.exact, sortExecutionPlanExactness(score_plan));
+    try std.testing.expectEqual(SortPlanSource.score_top_k, sortExecutionPlanSource(score_plan));
+    try std.testing.expectEqual(SortPlanCursorSupport.comparator, sortExecutionPlanCursorSupport(score_plan));
+
+    const distributed_plan = SortExecutionPlan{ .kind = .distributed_k_way_merge };
+    try std.testing.expectEqual(SortPlanExactness.bounded_exact, sortExecutionPlanExactness(distributed_plan));
+    try std.testing.expectEqual(SortPlanSource.distributed_merge, sortExecutionPlanSource(distributed_plan));
+    try std.testing.expectEqual(SortPlanCursorSupport.distributed_seek, sortExecutionPlanCursorSupport(distributed_plan));
+    try std.testing.expectEqual(SortPlanDistributedBehavior.coordinator_merge, sortExecutionPlanDistributedBehavior(distributed_plan));
+}
+
+test "sort result profile classifies budget rejection without stale diagnostic" {
+    resetLastSortRejectionDiagnostic();
+    logNativeSortPlanRejection(
+        "created_at",
+        nativeSortPlanRejectionReasonName(.missing_doc_values_capability),
+        "missing_doc_values_section",
+    );
+    defer resetLastSortRejectionDiagnostic();
+
+    const profile = sortResultProfile(.{
+        .order_by = &.{.{ .field = "_id" }},
+        .profile = true,
+    }, .{
+        .kind = .id_seek,
+    }, false, .{
+        .budget_rejection_reason = exactSortBudgetRejectionReasonName(.match_all_candidate_collect_limit),
+    });
+
+    try std.testing.expectEqualStrings("id_seek", profile.plan);
+    try std.testing.expectEqualStrings("queryable", profile.sort_lifecycle_state);
+    try std.testing.expectEqualStrings("match_all_candidate_collect_limit", profile.budget_rejection_reason);
+    try std.testing.expectEqualStrings("candidate_budget_exceeded", profile.sort_rejection_reason);
+    try std.testing.expectEqualStrings("match_all_candidate_collect_limit", profile.sort_rejection_detail);
+    try std.testing.expectEqualStrings("", profile.sort_rejection_field.slice());
+
+    logNativeSortPlanRejection(
+        "other_field",
+        nativeSortPlanRejectionReasonName(.unmapped_field),
+        nativeSortPlanRejectionDetailName(.unmapped_field),
+    );
+    try std.testing.expectEqualStrings("", profile.sort_rejection_field.slice());
+}
+
+test "sort result profile reports requested sort lifecycle state" {
+    const field_order = [_]types.SortField{.{ .field = "created_at", .desc = true }};
+    const queryable = sortResultProfile(.{
+        .order_by = &field_order,
+        .profile = true,
+    }, .{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .native_doc_values_coverage = "covered",
+    }, true, .{});
+    try std.testing.expectEqualStrings("queryable", queryable.sort_lifecycle_state);
+
+    const index_sort_unavailable = sortResultProfile(.{
+        .order_by = &field_order,
+        .profile = true,
+    }, .{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .native_doc_values_coverage = "covered",
+        .index_sort_match = true,
+        .sorted_segment_executor_available = false,
+    }, true, .{});
+    try std.testing.expectEqualStrings("queryable", index_sort_unavailable.sort_lifecycle_state);
+
+    const accelerated = sortResultProfile(.{
+        .order_by = &field_order,
+        .profile = true,
+    }, .{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .native_doc_values_coverage = "covered",
+        .index_sort_match = true,
+        .sorted_segment_executor_available = true,
+    }, true, .{});
+    try std.testing.expectEqualStrings("accelerated", accelerated.sort_lifecycle_state);
+
+    const unsupported = sortResultProfile(.{
+        .order_by = &field_order,
+        .profile = true,
+    }, .{
+        .kind = .unsupported_exact_sort,
+        .native_doc_values_coverage = "covered",
+        .index_sort_match = true,
+        .sorted_segment_executor_available = true,
+    }, false, .{});
+    try std.testing.expectEqualStrings("unsupported", unsupported.sort_lifecycle_state);
+
+    const debug = sortResultProfile(.{
+        .order_by = &field_order,
+        .profile = true,
+    }, .{
+        .kind = .stored_json_debug,
+        .native_doc_values_coverage = "covered",
+        .index_sort_match = true,
+        .sorted_segment_executor_available = true,
+    }, false, .{});
+    try std.testing.expectEqualStrings("unsupported", debug.sort_lifecycle_state);
+
+    const score = vectorScoreTopKSortProfile(.{
+        .profile = true,
+        .limit = 1,
+    }, true, .exact, 1, 1, 1_000) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("", score.sort_lifecycle_state);
+}
+
+const DecoratedSortHit = struct {
+    hit: types.SearchHit,
+    keys: []SortValue,
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        self.hit.deinit(alloc);
+        freeSortValues(alloc, self.keys);
+        self.* = undefined;
+    }
+};
+
+const SortCollectorProfile = struct {
+    candidate_count: u64 = 0,
+    cursor_rejected_count: u64 = 0,
+    admitted_count: u64 = 0,
+    replaced_count: u64 = 0,
+    discarded_count: u64 = 0,
+    selected_count: u64 = 0,
+    decorate_ns: u64 = 0,
+    native_doc_value_load_ns: u64 = 0,
+    native_doc_value_hit_count: u64 = 0,
+    native_doc_value_miss_count: u64 = 0,
+    stored_json_load_ns: u64 = 0,
+    stored_json_load_count: u64 = 0,
+    final_sort_ns: u64 = 0,
+    total_ns: u64 = 0,
+    candidate_source: []const u8 = "none",
+    sorted_segment_scanned_count: u64 = 0,
+    sorted_segment_scan_budget: u64 = 0,
+    window_capacity: usize = 0,
+    window_len: usize = 0,
+    collector_heap_peak: usize = 0,
+    native_filter_mode: []const u8 = "none",
+    native_filter_candidate_count: u64 = 0,
+    native_filter_exclusion_count: u64 = 0,
+    distributed_shard_count: usize = 0,
+    distributed_shard_window: usize = 0,
+    budget_rejection_reason: []const u8 = "",
+};
+
+fn observeSortCollectorHeap(profile: ?*SortCollectorProfile, heap_len: usize) void {
+    if (profile) |p| p.collector_heap_peak = @max(p.collector_heap_peak, heap_len);
+}
+
+fn observeSortCandidateSource(profile: ?*SortCollectorProfile, source: []const u8) void {
+    if (profile) |p| p.candidate_source = source;
+}
+
+fn matchAllCandidateSourceForConstraints(constraints: ?*const NativeDocIdConstraints) []const u8 {
+    const c = constraints orelse return "match_all";
+    if (c.positive_filter or nativeFilterExclusionCount(c) > 0) return "native_filter";
+    return "match_all";
+}
+
+fn sortedSegmentCandidateSourceForConstraints(constraints: *const NativeDocIdConstraints, membership: ?*const SortedSegmentDocMembership) []const u8 {
+    if (membership != null) return "sorted_segment_membership";
+    if (constraints.positive_filter or nativeFilterExclusionCount(constraints) > 0) return "native_filter";
+    return "match_all";
+}
+
+fn nativeFilterConstraintCount(constraints: *const NativeDocIdConstraints) u64 {
+    return @as(u64, @intCast(constraints.filter_doc_ids.len)) +| @as(u64, @intCast(constraints.filter_doc_nums.len));
+}
+
+fn nativeFilterExclusionCount(constraints: *const NativeDocIdConstraints) u64 {
+    return @as(u64, @intCast(constraints.exclude_doc_ids.len)) +| @as(u64, @intCast(constraints.exclude_doc_nums.len));
+}
+
+fn nativeFilterModeForConstraints(constraints: *const NativeDocIdConstraints) []const u8 {
+    const has_doc_ids = constraints.filter_doc_ids.len > 0;
+    const has_doc_nums = constraints.filter_doc_nums.len > 0;
+    const has_exclusions = nativeFilterExclusionCount(constraints) > 0;
+    if (constraints.positive_filter) {
+        if (!has_doc_ids and !has_doc_nums) return "empty";
+        if (has_doc_ids and has_doc_nums) return "mixed";
+        if (has_doc_nums) return "doc_nums";
+        return "doc_ids";
+    }
+    return if (has_exclusions) "exclusion_only" else "none";
+}
+
+fn observeNativeFilterConstraints(profile: ?*SortCollectorProfile, constraints: ?*const NativeDocIdConstraints) void {
+    const p = profile orelse return;
+    const c = constraints orelse return;
+    p.native_filter_mode = nativeFilterModeForConstraints(c);
+    p.native_filter_candidate_count = nativeFilterConstraintCount(c);
+    p.native_filter_exclusion_count = nativeFilterExclusionCount(c);
+}
+
+fn sortPlanSelectionReason(plan: SortExecutionPlan) []const u8 {
+    return switch (plan.kind) {
+        .none => "none",
+        .unsupported_exact_sort => "unsupported_exact_sort",
+        .distributed_k_way_merge => "distributed_k_way_merge",
+        .stored_json_debug => "stored_json_debug",
+        .id_only => "id_candidate_order",
+        .id_seek => "id_primary_key_seek",
+        .score_top_k => "score_top_k",
+        .sorted_segment_seek => if (plan.index_sort_match and plan.sorted_segment_executor_available)
+            "index_sort_sorted_segment_seek"
+        else
+            "sorted_segment_seek",
+        .native_doc_values_top_n => if (plan.index_sort_match)
+            if (plan.selective_filter_doc_values_preferred)
+                "selective_filter_doc_values_collector"
+            else if (plan.sorted_segment_executor_available)
+                "caller_selected_doc_values_collector"
+            else
+                "index_sort_unavailable_doc_values_collector"
+        else
+            "doc_values_collector",
+    };
+}
+
+test "sort execution plan selection reasons are stable for diagnostics" {
+    try std.testing.expectEqualStrings("id_primary_key_seek", sortPlanSelectionReason(.{ .kind = .id_seek }));
+    try std.testing.expectEqualStrings("score_top_k", sortPlanSelectionReason(.{ .kind = .score_top_k }));
+    try std.testing.expectEqualStrings("doc_values_collector", sortPlanSelectionReason(.{ .kind = .native_doc_values_top_n }));
+    try std.testing.expectEqualStrings("index_sort_unavailable_doc_values_collector", sortPlanSelectionReason(.{
+        .kind = .native_doc_values_top_n,
+        .index_sort_match = true,
+        .sorted_segment_executor_available = false,
+    }));
+    try std.testing.expectEqualStrings("caller_selected_doc_values_collector", sortPlanSelectionReason(.{
+        .kind = .native_doc_values_top_n,
+        .index_sort_match = true,
+        .sorted_segment_executor_available = true,
+    }));
+    try std.testing.expectEqualStrings("selective_filter_doc_values_collector", sortPlanSelectionReason(.{
+        .kind = .native_doc_values_top_n,
+        .index_sort_match = true,
+        .sorted_segment_executor_available = true,
+        .selective_filter_doc_values_preferred = true,
+    }));
+    try std.testing.expectEqualStrings("index_sort_sorted_segment_seek", sortPlanSelectionReason(.{
+        .kind = .sorted_segment_seek,
+        .index_sort_match = true,
+        .sorted_segment_executor_available = true,
+    }));
+    try std.testing.expectEqualStrings("distributed_k_way_merge", sortPlanSelectionReason(.{ .kind = .distributed_k_way_merge }));
+}
+
+const SortCostModelDecision = struct {
+    live_docs: usize = 0,
+    candidate_count: usize = 0,
+    selective_limit: usize = 0,
+    prefer_doc_values: bool = false,
+};
+
+fn applySortCostModelDecision(plan: *SortExecutionPlan, decision: SortCostModelDecision) void {
+    plan.cost_model_live_docs = @intCast(@min(decision.live_docs, @as(usize, std.math.maxInt(u64))));
+    plan.cost_model_candidate_count = @intCast(@min(decision.candidate_count, @as(usize, std.math.maxInt(u64))));
+    plan.cost_model_selective_limit = @intCast(@min(decision.selective_limit, @as(usize, std.math.maxInt(u64))));
+}
+
+fn sortResultProfile(
+    req: types.SearchRequest,
+    plan: SortExecutionPlan,
+    native_loader_enabled: bool,
+    profile: SortCollectorProfile,
+) types.SortProfile {
+    const rejection = if (sortExecutionPlanExactness(plan) == .unsupported)
+        peekLastSortRejectionDiagnostic()
+    else blk: {
+        resetLastSortRejectionDiagnostic();
+        break :blk null;
+    };
+    const budget_rejected = profile.budget_rejection_reason.len > 0;
+    const sort_rejection_reason = if (rejection) |item|
+        item.reason
+    else if (budget_rejected)
+        "candidate_budget_exceeded"
+    else
+        "";
+    const sort_rejection_detail = if (rejection) |item|
+        item.detail
+    else if (budget_rejected)
+        profile.budget_rejection_reason
+    else
+        "";
+    return .{
+        .plan = sortExecutionPlanKindName(plan.kind),
+        .exactness = sortPlanExactnessName(sortExecutionPlanExactness(plan)),
+        .source = sortPlanSourceName(sortExecutionPlanSource(plan)),
+        .candidate_source = profile.candidate_source,
+        .cursor_support = sortPlanCursorSupportName(sortExecutionPlanCursorSupport(plan)),
+        .source_load = sortPlanSourceLoadName(sortExecutionPlanSourceLoadForRequest(plan, req)),
+        .distributed_behavior = sortPlanDistributedBehaviorName(sortExecutionPlanDistributedBehavior(plan)),
+        .selection_reason = sortPlanSelectionReason(plan),
+        .require_native = plan.require_native,
+        .native_loader = native_loader_enabled,
+        .sort_lifecycle_state = sortExecutionPlanLifecycleState(plan),
+        .native_filter_mode = profile.native_filter_mode,
+        .native_filter_candidate_count = profile.native_filter_candidate_count,
+        .native_filter_exclusion_count = profile.native_filter_exclusion_count,
+        .selective_filter_doc_values_preferred = plan.selective_filter_doc_values_preferred,
+        .cost_model_live_docs = plan.cost_model_live_docs,
+        .cost_model_candidate_count = plan.cost_model_candidate_count,
+        .cost_model_selective_limit = plan.cost_model_selective_limit,
+        .native_doc_values_coverage = plan.native_doc_values_coverage,
+        .index_sort_coverage = plan.index_sort_coverage,
+        .index_sort_match = plan.index_sort_match,
+        .sorted_segment_executor_available = plan.sorted_segment_executor_available,
+        .sorted_segment_bounds_available = plan.sorted_segment_bounds_available,
+        .sorted_segment_scanned_count = profile.sorted_segment_scanned_count,
+        .sorted_segment_scan_budget = profile.sorted_segment_scan_budget,
+        .candidate_count = profile.candidate_count,
+        .cursor_rejected_count = profile.cursor_rejected_count,
+        .admitted_count = profile.admitted_count,
+        .replaced_count = profile.replaced_count,
+        .discarded_count = profile.discarded_count,
+        .selected_count = profile.selected_count,
+        .decorate_us = nsToUs(profile.decorate_ns),
+        .native_doc_value_load_us = nsToUs(profile.native_doc_value_load_ns),
+        .native_doc_value_hit_count = profile.native_doc_value_hit_count,
+        .native_doc_value_miss_count = profile.native_doc_value_miss_count,
+        .stored_json_load_us = nsToUs(profile.stored_json_load_ns),
+        .stored_json_load_count = profile.stored_json_load_count,
+        .projected_source_load_us = 0,
+        .projected_source_load_count = 0,
+        .final_sort_us = nsToUs(profile.final_sort_ns),
+        .total_us = nsToUs(profile.total_ns),
+        .window_capacity = profile.window_capacity,
+        .window_len = profile.window_len,
+        .collector_heap_peak = profile.collector_heap_peak,
+        .distributed_shard_count = profile.distributed_shard_count,
+        .distributed_shard_window = profile.distributed_shard_window,
+        .budget_rejection_reason = profile.budget_rejection_reason,
+        .sort_rejection_reason = sort_rejection_reason,
+        .sort_rejection_detail = sort_rejection_detail,
+        .sort_rejection_field = if (rejection) |item| types.SortProfileField.init(item.field) else .{},
+    };
+}
+
+fn sortExecutionPlanLifecycleState(plan: SortExecutionPlan) []const u8 {
+    switch (plan.kind) {
+        .unsupported_exact_sort, .stored_json_debug => return "unsupported",
+        else => {},
+    }
+    if (plan.sort_lifecycle_state.len > 0) return plan.sort_lifecycle_state;
+    return switch (plan.kind) {
+        .none, .score_top_k => "",
+        .id_only, .id_seek => "queryable",
+        .sorted_segment_seek => if (plan.index_sort_match and plan.sorted_segment_executor_available) "accelerated" else "queryable",
+        .distributed_k_way_merge => "queryable",
+        .native_doc_values_top_n => sortLifecycleStateFromCoverage(plan),
+        .stored_json_debug, .unsupported_exact_sort => unreachable,
+    };
+}
+
+fn sortLifecycleStateFromCoverage(plan: SortExecutionPlan) []const u8 {
+    if (std.mem.eql(u8, plan.native_doc_values_coverage, "covered")) {
+        return if (plan.index_sort_match and plan.sorted_segment_executor_available) "accelerated" else "queryable";
+    }
+    if (std.mem.eql(u8, plan.native_doc_values_coverage, "identity_metadata")) return "queryable";
+    if (std.mem.eql(u8, plan.native_doc_values_coverage, "observed_declared")) return "indexed";
+    if (std.mem.eql(u8, plan.native_doc_values_coverage, "schema_declared") or
+        std.mem.eql(u8, plan.native_doc_values_coverage, "not_declared"))
+    {
+        return "declared";
+    }
+    return "";
+}
+
+fn vectorScoreTopKSortProfile(
+    req: types.SearchRequest,
+    collect_sort_profile: bool,
+    exactness: SortPlanExactness,
+    candidate_count: usize,
+    selected_count: usize,
+    total_ns: u64,
+) ?types.SortProfile {
+    if (!collect_sort_profile) return null;
+    return sortResultProfile(req, .{
+        .kind = .score_top_k,
+        .exactness = exactness,
+    }, false, .{
+        .candidate_source = "vector_top_k",
+        .candidate_count = @intCast(candidate_count),
+        .admitted_count = @intCast(candidate_count),
+        .selected_count = @intCast(selected_count),
+        .total_ns = total_ns,
+        .window_capacity = sortWindowCapacity(req),
+        .window_len = selected_count,
+    });
+}
+
+test "vector score top k sort profile uses common sort vocabulary" {
+    const profile = vectorScoreTopKSortProfile(.{
+        .include_stored = false,
+        .profile = true,
+        .offset = 3,
+        .limit = 2,
+    }, true, .approximate, 7, 2, 9_000) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqualStrings("score_top_k", profile.plan);
+    try std.testing.expectEqualStrings("score_top_k", profile.source);
+    try std.testing.expectEqualStrings("approximate", profile.exactness);
+    try std.testing.expectEqualStrings("comparator", profile.cursor_support);
+    try std.testing.expectEqualStrings("source_free", profile.source_load);
+    try std.testing.expectEqualStrings("shard_local_only", profile.distributed_behavior);
+    try std.testing.expectEqual(@as(u64, 7), profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 7), profile.admitted_count);
+    try std.testing.expectEqual(@as(u64, 2), profile.selected_count);
+    try std.testing.expectEqual(@as(usize, 5), profile.window_capacity);
+    try std.testing.expectEqual(@as(usize, 2), profile.window_len);
+    try std.testing.expectEqual(@as(u64, 9), profile.total_us);
+}
+
+test "vector score top k profile collection is independent of public profile flag" {
+    try std.testing.expect(vectorScoreTopKSortProfile(.{ .profile = false }, false, .approximate, 1, 1, 1_000) == null);
+
+    const profile = vectorScoreTopKSortProfile(.{
+        .include_stored = false,
+        .profile = false,
+        .limit = 1,
+    }, true, .approximate, 3, 1, 2_000) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqualStrings("score_top_k", profile.plan);
+    try std.testing.expectEqualStrings("approximate", profile.exactness);
+    try std.testing.expectEqual(@as(u64, 3), profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 1), profile.selected_count);
+    try std.testing.expectEqual(@as(u64, 2), profile.total_us);
+}
+
+test "vector score top k profile can report exact bounded scoring" {
+    const profile = vectorScoreTopKSortProfile(.{
+        .include_stored = false,
+        .profile = true,
+        .limit = 2,
+    }, true, .exact, 2, 2, 3_000) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqualStrings("score_top_k", profile.plan);
+    try std.testing.expectEqualStrings("exact", profile.exactness);
+    try std.testing.expectEqual(@as(u64, 2), profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 2), profile.selected_count);
+}
+
+test "successful sort profiles suppress stale rejection diagnostics" {
+    resetLastSortRejectionDiagnostic();
+    logNativeSortPlanRejection("stale", "stale_reason", "stale_detail");
+
+    const profile = sortResultProfile(.{}, .{ .kind = .id_only }, false, .{});
+
+    try std.testing.expectEqualStrings("", profile.sort_rejection_reason);
+    try std.testing.expectEqualStrings("", profile.sort_rejection_detail);
+    try std.testing.expectEqualStrings("", profile.sort_rejection_field.slice());
+    try std.testing.expect(takeLastSortRejectionDiagnostic() == null);
+}
+
+test "unsupported sort profiles retain rejection diagnostics" {
+    resetLastSortRejectionDiagnostic();
+    logNativeSortPlanRejection("created_at", "unsupported_exact_sort", "missing_doc_values_capability");
+    defer resetLastSortRejectionDiagnostic();
+
+    const profile = sortResultProfile(.{}, .{ .kind = .unsupported_exact_sort }, false, .{});
+
+    try std.testing.expectEqualStrings("unsupported_exact_sort", profile.sort_rejection_reason);
+    try std.testing.expectEqualStrings("missing_doc_values_capability", profile.sort_rejection_detail);
+    try std.testing.expectEqualStrings("created_at", profile.sort_rejection_field.slice());
+}
+
+fn validateSortExecutionPlanForRuntimeMode(
+    plan: SortExecutionPlan,
+    native_loader: ?NativeSortValueLoader,
+    is_test_runtime: bool,
+) !void {
+    switch (plan.kind) {
+        .none => return error.InvalidQueryRequest,
+        .distributed_k_way_merge => return rejectUnsupportedSortPlan("distributed_merge_unsupported", "distributed_merge_unsupported"),
+        .unsupported_exact_sort => return rejectUnsupportedSortPlan("unsupported_exact_sort", "unsupported_exact_sort"),
+        .sorted_segment_seek, .native_doc_values_top_n => {
+            if (native_loader == null) return rejectUnsupportedSortPlan("missing_doc_values_coverage", "native_sort_loader_unavailable");
+            if (plan.kind == .sorted_segment_seek and !plan.sorted_segment_executor_available) {
+                return rejectUnsupportedSortPlan("unsupported_exact_sort", "sorted_segment_executor_unavailable");
+            }
+        },
+        .stored_json_debug => if (!is_test_runtime) return rejectUnsupportedSortPlan("stored_json_sort_disabled", "stored_json_sort_disabled"),
+        .id_only, .id_seek, .score_top_k => {},
+    }
+}
+
+fn sortedSegmentBoundsRequired(req: types.SearchRequest) bool {
+    return req.search_after.len > 0 or req.search_before.len > 0;
+}
+
+fn rejectUnsupportedSortPlan(reason: []const u8, detail: []const u8) error{UnsupportedQueryRequest} {
+    logNativeSortPlanRejection("*", reason, detail);
+    return error.UnsupportedQueryRequest;
+}
+
+fn rejectSortCandidateStreamUnavailable(plan: SortExecutionPlan) error{UnsupportedQueryRequest} {
+    const detail: []const u8 = switch (plan.kind) {
+        .id_seek => "primary_key_stream_unavailable",
+        .native_doc_values_top_n, .sorted_segment_seek => "native_candidate_stream_unavailable",
+        else => "candidate_stream_unavailable",
+    };
+    return rejectUnsupportedSortPlan("unsupported_exact_sort", detail);
+}
+
+fn boundedCandidateCollectorSortPlanForUnavailableStream(plan: SortExecutionPlan) SortExecutionPlan {
+    return switch (plan.kind) {
+        .id_seek => .{
+            .kind = .id_only,
+            .exactness = .bounded_exact,
+            .source = .candidate_collector,
+            .cursor_support = .comparator,
+            .source_load = plan.source_load,
+            .distributed_behavior = plan.distributed_behavior,
+            .runtime_schema = plan.runtime_schema,
+            .sort_lifecycle_state = plan.sort_lifecycle_state,
+            .native_doc_values_coverage = plan.native_doc_values_coverage,
+            .index_sort_coverage = plan.index_sort_coverage,
+        },
+        .native_doc_values_top_n => blk: {
+            var out = plan;
+            out.exactness = .bounded_exact;
+            break :blk out;
+        },
+        else => plan,
+    };
+}
+
+fn sortRequestIsOnlyIdSeek(req: types.SearchRequest) bool {
+    return req.order_by.len == 1 and sortFieldIsId(req.order_by[0]) and !req.order_by[0].desc;
+}
+
+fn validateSortExecutionPlanMatchesRequest(plan: SortExecutionPlan, req: types.SearchRequest) !void {
+    switch (plan.kind) {
+        .none, .distributed_k_way_merge, .unsupported_exact_sort => {},
+        .sorted_segment_seek => if (!requestNeedsNativeSortValues(req) or !plan.index_sort_match) return rejectUnsupportedSortPlan("unsupported_exact_sort", "incompatible_sort_plan"),
+        .id_only => if (requestHasScoreSort(req) or requestNeedsNativeSortValues(req)) return rejectUnsupportedSortPlan("unsupported_exact_sort", "incompatible_sort_plan"),
+        .id_seek => if (!sortRequestIsOnlyIdSeek(req)) return rejectUnsupportedSortPlan("unsupported_exact_sort", "incompatible_sort_plan"),
+        .score_top_k => if (!requestHasScoreSort(req) or requestNeedsNativeSortValues(req)) return rejectUnsupportedSortPlan("unsupported_exact_sort", "incompatible_sort_plan"),
+        .native_doc_values_top_n => if (!requestNeedsNativeSortValues(req)) return rejectUnsupportedSortPlan("unsupported_exact_sort", "incompatible_sort_plan"),
+        .stored_json_debug => if (requestHasScoreSort(req) or !requestNeedsNativeSortValues(req)) return rejectUnsupportedSortPlan("unsupported_exact_sort", "incompatible_sort_plan"),
+    }
+}
+
+fn validateNativeDocValuesRuntimeMappings(plan: SortExecutionPlan, req: types.SearchRequest) !void {
+    if (plan.kind != .native_doc_values_top_n and plan.kind != .sorted_segment_seek) return;
+    const schema = plan.runtime_schema orelse {
+        logNativeSortPlanRejection(
+            "*",
+            nativeSortPlanRejectionReasonName(.missing_runtime_mapping),
+            nativeSortPlanRejectionDetailName(.missing_runtime_mapping),
+        );
+        return error.UnsupportedExactSort;
+    };
+    const cursor = activeSortCursor(req);
+    for (req.order_by, 0..) |field, i| {
+        if (!sortFieldNeedsNativeValue(field)) continue;
+        const mapping = sortFieldMapping(schema, field.field) orelse {
+            logNativeSortPlanRejection(
+                field.field,
+                nativeSortPlanRejectionReasonName(.unmapped_field),
+                nativeSortPlanRejectionDetailName(.unmapped_field),
+            );
+            return error.UnsupportedExactSort;
+        };
+        if (mappedSortFieldRejectionReason(mapping)) |reason| {
+            logNativeSortPlanRejection(
+                field.field,
+                nativeSortPlanRejectionReasonName(reason),
+                nativeSortPlanRejectionDetailName(reason),
+            );
+            return error.UnsupportedExactSort;
+        }
+        if (cursor.len > 0) {
+            if (mappedSortCursorRejectionReason(mapping, cursor[i])) |reason| {
+                logNativeSortPlanRejection(
+                    field.field,
+                    nativeSortPlanRejectionReasonName(reason),
+                    nativeSortPlanRejectionDetailName(reason),
+                );
+                return error.InvalidQueryRequest;
+            }
+        }
+    }
+}
+
+fn validateSortExecutionPlanForRuntime(req: types.SearchRequest, plan: SortExecutionPlan, native_loader: ?NativeSortValueLoader) !void {
+    try validateSortExecutionPlanMatchesRequest(plan, req);
+    try validateSortExecutionPlanForRuntimeMode(plan, native_loader, builtin.is_test);
+    if (plan.kind == .sorted_segment_seek and sortedSegmentBoundsRequired(req) and !plan.sorted_segment_bounds_available) {
+        return rejectUnsupportedSortPlan("unsupported_exact_sort", "sorted_segment_bounds_unavailable");
+    }
+    try validateNativeDocValuesRuntimeMappings(plan, req);
+}
+
+fn rejectUnexpectedVectorScoreStoredSortLoad(_: ?*anyopaque, _: Allocator, _: []const u8) anyerror!?[]u8 {
+    return error.UnsupportedQueryRequest;
+}
+
+fn decorateVectorScoreOrderIfRequested(result: *types.SearchResult, req: types.SearchRequest) !void {
+    if (!requestHasVectorScoreOrderOnly(req)) return;
+    var sort_req = req;
+    sort_req.profile = false;
+    sort_req.offset = 0;
+    try sortAndPageSearchResultInPlace(
+        result,
+        sort_req,
+        null,
+        rejectUnexpectedVectorScoreStoredSortLoad,
+        .{ .kind = .score_top_k },
+        null,
+    );
+}
+
+fn logSearchResultExactCandidateBudgetRejection(
+    req: types.SearchRequest,
+    plan: SortExecutionPlan,
+    candidate_count: u32,
+    budget: u32,
+) void {
+    if (req.full_text != null) {
+        logExactSortBudgetRejection(
+            "text",
+            .text_field_sort_candidate_window,
+            req.index_name,
+            candidate_count,
+            budget,
+            plan,
+        );
+        return;
+    }
+    logExactSortBudgetRejection(
+        "match_all",
+        .match_all_exact_candidate_window,
+        req.index_name,
+        candidate_count,
+        budget,
+        plan,
+    );
+}
+
+fn freeSortValues(alloc: Allocator, values: []SortValue) void {
+    for (values) |value| value.deinit(alloc);
+    if (values.len > 0) alloc.free(values);
+}
+
+fn deinitSortValues(values: []SortValue, alloc: Allocator) void {
+    for (values) |value| value.deinit(alloc);
+}
+
+fn sortValueRank(value: SortValue) u8 {
+    return switch (value) {
+        .null_value => 0,
+        .bool_value => 1,
+        .integer, .u64_value, .number, .number_string => 2,
+        .string => 3,
+    };
+}
+
+const NumericSortValue = union(enum) {
+    integer: i64,
+    u64_value: u64,
+    number: f64,
+};
+
+const SortTupleScalarClass = enum {
+    bool_value,
+    numeric,
+    string,
+};
+
+fn numericSortValue(value: SortValue) NumericSortValue {
+    return switch (value) {
+        .integer => |v| .{ .integer = v },
+        .u64_value => |v| .{ .u64_value = v },
+        .number => |v| .{ .number = v },
+        .number_string => |v| blk: {
+            if (std.fmt.parseInt(i64, v, 10)) |parsed| {
+                break :blk .{ .integer = parsed };
+            } else |_| {}
+            if (std.fmt.parseInt(u64, v, 10)) |parsed| {
+                break :blk .{ .u64_value = parsed };
+            } else |_| {}
+            break :blk .{ .number = std.fmt.parseFloat(f64, v) catch std.math.nan(f64) };
+        },
+        else => .{ .number = std.math.nan(f64) },
+    };
+}
+
+fn compareFloatSortValues(a: f64, b: f64) std.math.Order {
+    const a_nan = std.math.isNan(a);
+    const b_nan = std.math.isNan(b);
+    if (a_nan or b_nan) {
+        if (a_nan and b_nan) return .eq;
+        return if (a_nan) .gt else .lt;
+    }
+    return std.math.order(a, b);
+}
+
+fn compareIntToFloatSortValue(a: i64, b: f64) std.math.Order {
+    if (std.math.isNan(b)) return .lt;
+
+    const min_i64_f = -9223372036854775808.0;
+    const max_i64_plus_one_f = 9223372036854775808.0;
+    if (b < min_i64_f) return .gt;
+    if (b >= max_i64_plus_one_f) return .lt;
+    if (b == min_i64_f) return std.math.order(a, std.math.minInt(i64));
+
+    const truncated: i64 = @intFromFloat(b);
+    const truncated_f: f64 = @floatFromInt(truncated);
+    if (b == truncated_f) return std.math.order(a, truncated);
+    if (b > 0) return if (a <= truncated) .lt else .gt;
+    return if (a < truncated) .lt else .gt;
+}
+
+fn compareU64ToFloatSortValue(a: u64, b: f64) std.math.Order {
+    if (std.math.isNan(b)) return .lt;
+    if (b < 0) return .gt;
+    if (b >= 18446744073709551616.0) return .lt;
+
+    const truncated: u64 = @intFromFloat(b);
+    const truncated_f: f64 = @floatFromInt(truncated);
+    if (b == truncated_f) return std.math.order(a, truncated);
+    return if (a <= truncated) .lt else .gt;
+}
+
+fn compareNumericSortValues(a: NumericSortValue, b: NumericSortValue) std.math.Order {
+    return switch (a) {
+        .integer => |av| switch (b) {
+            .integer => |bv| std.math.order(av, bv),
+            .u64_value => |bv| if (av < 0) .lt else std.math.order(@as(u64, @intCast(av)), bv),
+            .number => |bv| compareIntToFloatSortValue(av, bv),
+        },
+        .u64_value => |av| switch (b) {
+            .integer => |bv| if (bv < 0) .gt else std.math.order(av, @as(u64, @intCast(bv))),
+            .u64_value => |bv| std.math.order(av, bv),
+            .number => |bv| compareU64ToFloatSortValue(av, bv),
+        },
+        .number => |av| switch (b) {
+            .integer => |bv| switch (compareIntToFloatSortValue(bv, av)) {
+                .lt => .gt,
+                .eq => .eq,
+                .gt => .lt,
+            },
+            .u64_value => |bv| switch (compareU64ToFloatSortValue(bv, av)) {
+                .lt => .gt,
+                .eq => .eq,
+                .gt => .lt,
+            },
+            .number => |bv| compareFloatSortValues(av, bv),
+        },
+    };
+}
+
+fn compareNumberSortValues(a: SortValue, b: SortValue) std.math.Order {
+    return compareNumericSortValues(numericSortValue(a), numericSortValue(b));
+}
+
+fn compareSortValues(a: SortValue, b: SortValue) std.math.Order {
+    const ar = sortValueRank(a);
+    const br = sortValueRank(b);
+    if (ar != br) return std.math.order(ar, br);
+    return switch (a) {
+        .null_value => .eq,
+        .bool_value => |av| std.math.order(@intFromBool(av), @intFromBool(b.bool_value)),
+        .integer, .u64_value, .number, .number_string => compareNumberSortValues(a, b),
+        .string => |av| std.mem.order(u8, av, b.string),
+    };
+}
+
+test "sort value comparison defines canonical scalar order" {
+    try std.testing.expectEqual(std.math.Order.eq, compareSortValues(.null_value, .null_value));
+    try std.testing.expectEqual(std.math.Order.lt, compareSortValues(.null_value, .{ .bool_value = false }));
+
+    try std.testing.expectEqual(std.math.Order.lt, compareSortValues(.{ .bool_value = false }, .{ .bool_value = true }));
+    try std.testing.expectEqual(std.math.Order.gt, compareSortValues(.{ .bool_value = true }, .{ .bool_value = false }));
+
+    try std.testing.expectEqual(std.math.Order.lt, compareSortValues(.{ .integer = -1 }, .{ .u64_value = 0 }));
+    try std.testing.expectEqual(std.math.Order.eq, compareSortValues(.{ .integer = 42 }, .{ .u64_value = 42 }));
+    try std.testing.expectEqual(std.math.Order.lt, compareSortValues(.{ .integer = std.math.maxInt(i64) }, .{ .u64_value = @as(u64, @intCast(std.math.maxInt(i64))) + 1 }));
+    try std.testing.expectEqual(std.math.Order.eq, compareSortValues(.{ .u64_value = std.math.maxInt(u64) }, .{ .number_string = "18446744073709551615" }));
+    try std.testing.expectEqual(std.math.Order.lt, compareSortValues(.{ .number_string = "10.25" }, .{ .number = 10.5 }));
+
+    try std.testing.expectEqual(std.math.Order.lt, compareSortValues(.{ .string = "alpha" }, .{ .string = "beta" }));
+    try std.testing.expectEqual(std.math.Order.gt, compareSortValues(.{ .string = "beta" }, .{ .string = "alpha" }));
+    try std.testing.expectEqual(std.math.Order.lt, compareSortValues(.{ .bool_value = true }, .{ .integer = 0 }));
+    try std.testing.expectEqual(std.math.Order.lt, compareSortValues(.{ .integer = 0 }, .{ .string = "" }));
+}
+
+test "sort value numeric comparison preserves integer precision and nan policy" {
+    try std.testing.expectEqual(std.math.Order.lt, compareSortValues(
+        .{ .integer = std.math.maxInt(i64) },
+        .{ .number = 9223372036854775808.0 },
+    ));
+    try std.testing.expectEqual(std.math.Order.gt, compareSortValues(
+        .{ .integer = std.math.minInt(i64) + 1 },
+        .{ .number = -9223372036854775808.0 },
+    ));
+    try std.testing.expectEqual(std.math.Order.lt, compareSortValues(
+        .{ .integer = 1 },
+        .{ .number = 1.25 },
+    ));
+    try std.testing.expectEqual(std.math.Order.gt, compareSortValues(
+        .{ .integer = -1 },
+        .{ .number = -1.25 },
+    ));
+    try std.testing.expectEqual(std.math.Order.gt, compareSortValues(
+        .{ .number = std.math.nan(f64) },
+        .{ .number = 1.0 },
+    ));
+    try std.testing.expectEqual(std.math.Order.eq, compareSortValues(
+        .{ .number = std.math.nan(f64) },
+        .{ .number = std.math.nan(f64) },
+    ));
+}
+
+test "json sort values reject non-replayable numeric values at API boundaries" {
+    try std.testing.expectError(error.InvalidQueryRequest, sortValueFromJson(.{ .float = std.math.nan(f64) }));
+    try std.testing.expectError(error.InvalidQueryRequest, sortValueFromJson(.{ .float = std.math.inf(f64) }));
+    try std.testing.expectError(error.InvalidQueryRequest, sortValueFromJson(.{ .number_string = "nan" }));
+    try std.testing.expectError(error.InvalidQueryRequest, sortValueFromJson(.{ .number_string = "inf" }));
+    try std.testing.expectError(error.InvalidQueryRequest, sortValueFromJson(.{ .number_string = "not-a-number" }));
+    try std.testing.expectError(error.InvalidQueryRequest, sortValueFromSortJson(.{
+        .kind = .distributed_k_way_merge,
+    }, .{ .field = "rank" }, .{ .float = std.math.nan(f64) }));
+    try std.testing.expectError(error.InvalidQueryRequest, sortValueFromSortJson(.{
+        .kind = .distributed_k_way_merge,
+    }, .{ .field = "rank" }, .{ .number_string = "nan" }));
+    try std.testing.expectError(error.InvalidQueryRequest, sortValueFromSortJson(.{
+        .kind = .score_top_k,
+    }, .{ .field = "_score", .desc = true }, .{ .float = std.math.inf(f64) }));
+}
+
+fn testSortedHitAlloc(alloc: Allocator, id: []const u8, rank: i64) !types.SearchHit {
+    const values = try alloc.alloc(std.json.Value, 2);
+    errdefer alloc.free(values);
+    values[0] = .{ .integer = rank };
+    values[1] = .{ .string = try alloc.dupe(u8, id) };
+    errdefer types.deinitJsonValue(alloc, &values[1]);
+    return .{
+        .id = try alloc.dupe(u8, id),
+        .sort_values = values,
+    };
+}
+
+fn testDateSortedHitAlloc(alloc: Allocator, id: []const u8, created_at_ns: u64) !types.SearchHit {
+    const values = try alloc.alloc(std.json.Value, 2);
+    errdefer alloc.free(values);
+    values[0] = .{ .string = try runtime_schema_mod.formatDateTimeNsAlloc(alloc, created_at_ns) };
+    errdefer types.deinitJsonValue(alloc, &values[0]);
+    values[1] = .{ .string = try alloc.dupe(u8, id) };
+    errdefer types.deinitJsonValue(alloc, &values[1]);
+    return .{
+        .id = try alloc.dupe(u8, id),
+        .sort_values = values,
+    };
+}
+
+fn testIdSortedHitAlloc(alloc: Allocator, id: []const u8) !types.SearchHit {
+    const values = try alloc.alloc(std.json.Value, 1);
+    errdefer alloc.free(values);
+    values[0] = .{ .string = try alloc.dupe(u8, id) };
+    errdefer types.deinitJsonValue(alloc, &values[0]);
+    return .{
+        .id = try alloc.dupe(u8, id),
+        .sort_values = values,
+    };
+}
+
+fn testScoreSortedHitAlloc(alloc: Allocator, id: []const u8, score: f32) !types.SearchHit {
+    const values = try alloc.alloc(std.json.Value, 2);
+    errdefer alloc.free(values);
+    values[0] = .{ .float = @floatCast(score) };
+    values[1] = .{ .string = try alloc.dupe(u8, id) };
+    errdefer types.deinitJsonValue(alloc, &values[1]);
+    return .{
+        .id = try alloc.dupe(u8, id),
+        .score = score,
+        .sort_values = values,
+    };
+}
+
+fn testNumericRankRuntimeSchema() runtime_schema_mod.TableSchema {
+    const templates = struct {
+        const values = [_]runtime_schema_mod.DynamicTemplate{.{
+            .name = "rank",
+            .path_match = "rank",
+            .mapping = .{
+                .field_type = .numeric,
+                .doc_values = true,
+                .sortable = true,
+                .analyzer = "keyword",
+            },
+        }};
+    }.values;
+    return .{ .dynamic_templates = &templates };
+}
+
+fn testDeinitFixedHits(alloc: Allocator, hits: []types.SearchHit) void {
+    for (hits) |*hit| hit.deinit(alloc);
+}
+
+fn testFreeOwnedHits(alloc: Allocator, hits: []types.SearchHit) void {
+    for (hits) |*hit| hit.deinit(alloc);
+    if (hits.len > 0) alloc.free(hits);
+}
+
+test "distributed sorted hit merge uses typed sort tuple ordering and cursors" {
+    const alloc = std.testing.allocator;
+    const plan = SortExecutionPlan{
+        .kind = .distributed_k_way_merge,
+        .runtime_schema = testNumericRankRuntimeSchema(),
+    };
+
+    var asc_left = [_]types.SearchHit{
+        try testSortedHitAlloc(alloc, "doc:a", 1),
+        try testSortedHitAlloc(alloc, "doc:c", 3),
+        try testSortedHitAlloc(alloc, "doc:e", 5),
+    };
+    defer testDeinitFixedHits(alloc, &asc_left);
+    var asc_right = [_]types.SearchHit{
+        try testSortedHitAlloc(alloc, "doc:b", 2),
+        try testSortedHitAlloc(alloc, "doc:d", 4),
+    };
+    defer testDeinitFixedHits(alloc, &asc_right);
+    const asc_shards = [_]DistributedSortedShard{
+        .{ .hits = &asc_left, .total_hits = asc_left.len },
+        .{ .hits = &asc_right, .total_hits = asc_right.len },
+    };
+    const rank_asc = [_]types.SortField{.{ .field = "rank" }};
+    try std.testing.expectEqual(@as(u32, 5), distributedShardWindowCandidateCount(&asc_shards));
+    try enforceDistributedSortShardWindowBudget(&asc_shards, 5);
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, enforceDistributedSortShardWindowBudget(&asc_shards, 4));
+
+    const first_page = try mergeDistributedSortedHitsAlloc(alloc, .{
+        .order_by = &rank_asc,
+        .limit = 4,
+    }, plan, &asc_shards);
+    defer testFreeOwnedHits(alloc, first_page);
+    try std.testing.expectEqual(@as(usize, 4), first_page.len);
+    try std.testing.expectEqualStrings("doc:a", first_page[0].id);
+    try std.testing.expectEqualStrings("doc:b", first_page[1].id);
+    try std.testing.expectEqualStrings("doc:c", first_page[2].id);
+    try std.testing.expectEqualStrings("doc:d", first_page[3].id);
+
+    const after_cursor = [_]std.json.Value{
+        .{ .integer = 2 },
+        .{ .string = "doc:b" },
+    };
+    const after_shards = [_]DistributedSortedShard{
+        .{ .hits = asc_left[1..], .total_hits = asc_left[1..].len },
+        .{ .hits = asc_right[1..], .total_hits = asc_right[1..].len },
+    };
+    const after_page = try mergeDistributedSortedHitsAlloc(alloc, .{
+        .order_by = &rank_asc,
+        .search_after = &after_cursor,
+        .limit = 2,
+    }, plan, &after_shards);
+    defer testFreeOwnedHits(alloc, after_page);
+    try std.testing.expectEqual(@as(usize, 2), after_page.len);
+    try std.testing.expectEqualStrings("doc:c", after_page[0].id);
+    try std.testing.expectEqualStrings("doc:d", after_page[1].id);
+
+    const profiled_page = try mergeDistributedSortedHitsWithProfileAlloc(alloc, .{
+        .order_by = &rank_asc,
+        .search_after = &after_cursor,
+        .limit = 2,
+        .profile = true,
+    }, plan, &after_shards);
+    defer testFreeOwnedHits(alloc, profiled_page.hits);
+    try std.testing.expectEqual(@as(usize, 2), profiled_page.hits.len);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, profiled_page.total_hits_relation);
+    const sort_profile = profiled_page.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("distributed_k_way_merge", sort_profile.plan);
+    try std.testing.expectEqualStrings("bounded_exact", sort_profile.exactness);
+    try std.testing.expectEqualStrings("distributed_shards", sort_profile.candidate_source);
+    try std.testing.expectEqualStrings("queryable", sort_profile.sort_lifecycle_state);
+    try std.testing.expectEqualStrings("distributed_merge", sort_profile.source);
+    try std.testing.expectEqualStrings("distributed_seek", sort_profile.cursor_support);
+    try std.testing.expectEqualStrings("coordinator_merge", sort_profile.distributed_behavior);
+    try std.testing.expectEqual(@as(u64, 2), sort_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 0), sort_profile.cursor_rejected_count);
+    try std.testing.expectEqual(@as(u64, 2), sort_profile.selected_count);
+    try std.testing.expect(sort_profile.final_sort_us <= sort_profile.total_us);
+    try std.testing.expectEqual(@as(usize, 2), sort_profile.window_capacity);
+    try std.testing.expectEqual(@as(usize, 2), sort_profile.window_len);
+    try std.testing.expectEqual(@as(usize, 2), sort_profile.collector_heap_peak);
+    try std.testing.expectEqual(@as(usize, 2), sort_profile.distributed_shard_count);
+    try std.testing.expectEqual(@as(usize, 2), sort_profile.distributed_shard_window);
+
+    {
+        const after_shards_limit_one = [_]DistributedSortedShard{
+            .{ .hits = asc_left[1..2], .total_hits = asc_left[1..2].len },
+            .{ .hits = asc_right[1..2], .total_hits = asc_right[1..2].len },
+        };
+        bench_query_profile_every_cache.store(2, .monotonic);
+        bench_query_profile_counter.store(1, .monotonic);
+        defer {
+            bench_query_profile_every_cache.store(bench_query_profile_unknown, .monotonic);
+            bench_query_profile_counter.store(0, .monotonic);
+        }
+        const internally_profiled_page = try mergeDistributedSortedHitsWithProfileAlloc(alloc, .{
+            .order_by = &rank_asc,
+            .search_after = &after_cursor,
+            .limit = 1,
+            .profile = false,
+        }, plan, &after_shards_limit_one);
+        defer testFreeOwnedHits(alloc, internally_profiled_page.hits);
+        try std.testing.expectEqual(@as(usize, 1), internally_profiled_page.hits.len);
+        const internal_sort_profile = internally_profiled_page.sort_profile orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("distributed_k_way_merge", internal_sort_profile.plan);
+        try std.testing.expectEqualStrings("bounded_exact", internal_sort_profile.exactness);
+        try std.testing.expectEqualStrings("distributed_merge", internal_sort_profile.source);
+        try std.testing.expectEqual(@as(usize, 2), internal_sort_profile.distributed_shard_count);
+    }
+
+    var asc_right_with_tail = [_]types.SearchHit{
+        try testSortedHitAlloc(alloc, "doc:b", 2),
+        try testSortedHitAlloc(alloc, "doc:d", 4),
+        try testSortedHitAlloc(alloc, "doc:f", 6),
+    };
+    defer testDeinitFixedHits(alloc, &asc_right_with_tail);
+    const gte_shards = [_]DistributedSortedShard{
+        .{ .hits = &asc_left, .total_hits = asc_left.len },
+        .{ .hits = &asc_right_with_tail, .total_hits = asc_right_with_tail.len, .total_hits_relation = .gte },
+    };
+    const gte_page = try mergeDistributedSortedHitsWithProfileAlloc(alloc, .{
+        .order_by = &rank_asc,
+        .limit = 3,
+    }, plan, &gte_shards);
+    defer testFreeOwnedHits(alloc, gte_page.hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.gte, gte_page.total_hits_relation);
+    try std.testing.expectEqual(@as(usize, 3), gte_page.hits.len);
+    try std.testing.expectEqualStrings("doc:a", gte_page.hits[0].id);
+    try std.testing.expectEqualStrings("doc:b", gte_page.hits[1].id);
+    try std.testing.expectEqualStrings("doc:c", gte_page.hits[2].id);
+
+    const before_cursor = [_]std.json.Value{
+        .{ .integer = 5 },
+        .{ .string = "doc:e" },
+    };
+    const before_shards = [_]DistributedSortedShard{
+        .{ .hits = asc_left[0..2], .total_hits = asc_left[0..2].len },
+        .{ .hits = &asc_right, .total_hits = asc_right.len },
+    };
+    const before_page = try mergeDistributedSortedHitsAlloc(alloc, .{
+        .order_by = &rank_asc,
+        .search_before = &before_cursor,
+        .limit = 2,
+    }, plan, &before_shards);
+    defer testFreeOwnedHits(alloc, before_page);
+    try std.testing.expectEqual(@as(usize, 2), before_page.len);
+    try std.testing.expectEqualStrings("doc:c", before_page[0].id);
+    try std.testing.expectEqualStrings("doc:d", before_page[1].id);
+
+    var desc_left = [_]types.SearchHit{
+        try testSortedHitAlloc(alloc, "doc:d", 4),
+        try testSortedHitAlloc(alloc, "doc:b", 2),
+    };
+    defer testDeinitFixedHits(alloc, &desc_left);
+    var desc_right = [_]types.SearchHit{
+        try testSortedHitAlloc(alloc, "doc:c", 3),
+        try testSortedHitAlloc(alloc, "doc:a", 1),
+    };
+    defer testDeinitFixedHits(alloc, &desc_right);
+    const desc_shards = [_]DistributedSortedShard{
+        .{ .hits = &desc_left, .total_hits = desc_left.len },
+        .{ .hits = &desc_right, .total_hits = desc_right.len },
+    };
+    const rank_desc = [_]types.SortField{.{ .field = "rank", .desc = true }};
+    const desc_page = try mergeDistributedSortedHitsAlloc(alloc, .{
+        .order_by = &rank_desc,
+        .limit = 3,
+    }, plan, &desc_shards);
+    defer testFreeOwnedHits(alloc, desc_page);
+    try std.testing.expectEqual(@as(usize, 3), desc_page.len);
+    try std.testing.expectEqualStrings("doc:d", desc_page[0].id);
+    try std.testing.expectEqualStrings("doc:c", desc_page[1].id);
+    try std.testing.expectEqualStrings("doc:b", desc_page[2].id);
+
+    var bad_hit = try testSortedHitAlloc(alloc, "doc:x", 1);
+    defer bad_hit.deinit(alloc);
+    types.deinitJsonValue(alloc, &bad_hit.sort_values[1]);
+    alloc.free(bad_hit.sort_values);
+    bad_hit.sort_values = try alloc.alloc(std.json.Value, 1);
+    bad_hit.sort_values[0] = .{ .integer = 1 };
+    const bad_shards = [_]DistributedSortedShard{.{ .hits = &.{bad_hit} }};
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.InvalidQueryRequest, mergeDistributedSortedHitsAlloc(alloc, .{
+        .order_by = &rank_asc,
+        .limit = 1,
+    }, plan, &bad_shards));
+    var invalid_tuple_diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", invalid_tuple_diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_doc_value_type", invalid_tuple_diagnostic.reason);
+    try std.testing.expectEqualStrings("incomplete_sort_tuple", invalid_tuple_diagnostic.detail);
+
+    var bad_id_hit = try testSortedHitAlloc(alloc, "doc:x", 1);
+    defer bad_id_hit.deinit(alloc);
+    types.deinitJsonValue(alloc, &bad_id_hit.sort_values[1]);
+    bad_id_hit.sort_values[1] = .{ .string = try alloc.dupe(u8, "doc:y") };
+    const bad_id_shards = [_]DistributedSortedShard{.{ .hits = &.{bad_id_hit} }};
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.InvalidQueryRequest, mergeDistributedSortedHitsAlloc(alloc, .{
+        .order_by = &rank_asc,
+        .limit = 1,
+    }, plan, &bad_id_shards));
+    invalid_tuple_diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("_id", invalid_tuple_diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_doc_value_type", invalid_tuple_diagnostic.reason);
+    try std.testing.expectEqualStrings("id_tiebreaker_mismatch", invalid_tuple_diagnostic.detail);
+
+    var mixed_domain_hit = try testSortedHitAlloc(alloc, "doc:f", 6);
+    defer mixed_domain_hit.deinit(alloc);
+    mixed_domain_hit.sort_values[0] = .{ .string = try alloc.dupe(u8, "six") };
+    const mixed_domain_shards = [_]DistributedSortedShard{
+        .{ .hits = &asc_left },
+        .{ .hits = &.{mixed_domain_hit} },
+    };
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.InvalidQueryRequest, mergeDistributedSortedHitsAlloc(alloc, .{
+        .order_by = &rank_asc,
+        .limit = 1,
+    }, plan, &mixed_domain_shards));
+    invalid_tuple_diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("rank", invalid_tuple_diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_doc_value_type", invalid_tuple_diagnostic.reason);
+    try std.testing.expectEqualStrings("invalid_doc_value_type", invalid_tuple_diagnostic.detail);
+
+    var non_finite_hit = try testSortedHitAlloc(alloc, "doc:g", 7);
+    defer non_finite_hit.deinit(alloc);
+    non_finite_hit.sort_values[0] = .{ .float = std.math.nan(f64) };
+    const non_finite_shards = [_]DistributedSortedShard{.{ .hits = &.{non_finite_hit} }};
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.InvalidQueryRequest, mergeDistributedSortedHitsAlloc(alloc, .{
+        .order_by = &rank_asc,
+        .limit = 1,
+    }, plan, &non_finite_shards));
+    invalid_tuple_diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("rank", invalid_tuple_diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_doc_value_type", invalid_tuple_diagnostic.reason);
+    try std.testing.expectEqualStrings("invalid_doc_value_type", invalid_tuple_diagnostic.detail);
+
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeDistributedSortedHitsAlloc(alloc, .{
+        .order_by = &rank_asc,
+        .limit = 1,
+    }, .{ .kind = .native_doc_values_top_n }, &asc_shards));
+    const unsupported_distributed_diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", unsupported_distributed_diagnostic.field);
+    try std.testing.expectEqualStrings("distributed_merge_unsupported", unsupported_distributed_diagnostic.reason);
+    try std.testing.expectEqualStrings("distributed_merge_plan_required", unsupported_distributed_diagnostic.detail);
+
+    var unsorted_hits = [_]types.SearchHit{
+        try testSortedHitAlloc(alloc, "doc:z", 9),
+        try testSortedHitAlloc(alloc, "doc:y", 8),
+    };
+    defer testDeinitFixedHits(alloc, &unsorted_hits);
+    const unsorted_shards = [_]DistributedSortedShard{.{ .hits = &unsorted_hits }};
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.InvalidQueryRequest, mergeDistributedSortedHitsAlloc(alloc, .{
+        .order_by = &rank_asc,
+        .limit = 2,
+    }, plan, &unsorted_shards));
+    invalid_tuple_diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", invalid_tuple_diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_doc_value_type", invalid_tuple_diagnostic.reason);
+    try std.testing.expectEqualStrings("unsorted_shard_window", invalid_tuple_diagnostic.detail);
+}
+
+test "distributed merge cursor-only request uses implicit id order" {
+    const alloc = std.testing.allocator;
+    var left_hits = [_]types.SearchHit{
+        try testIdSortedHitAlloc(alloc, "doc:a"),
+        try testIdSortedHitAlloc(alloc, "doc:c"),
+    };
+    defer testDeinitFixedHits(alloc, &left_hits);
+    var right_hits = [_]types.SearchHit{
+        try testIdSortedHitAlloc(alloc, "doc:b"),
+        try testIdSortedHitAlloc(alloc, "doc:d"),
+    };
+    defer testDeinitFixedHits(alloc, &right_hits);
+
+    const left = types.SearchResult{ .alloc = alloc, .hits = &left_hits, .total_hits = 2 };
+    const right = types.SearchResult{ .alloc = alloc, .hits = &right_hits, .total_hits = 2 };
+    const left_after = types.SearchResult{ .alloc = alloc, .hits = left_hits[1..], .total_hits = 1 };
+    const right_after = types.SearchResult{ .alloc = alloc, .hits = right_hits[1..], .total_hits = 1 };
+    const cursor = [_]std.json.Value{.{ .string = "doc:b" }};
+
+    const direct_shards = [_]DistributedSortedShard{
+        .{ .hits = &left_hits },
+        .{ .hits = &right_hits },
+    };
+    try validateDistributedSortedShards(alloc, .{
+        .search_after = &cursor,
+        .limit = 2,
+    }, .{
+        .kind = .distributed_k_way_merge,
+    }, &direct_shards);
+
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeDistributedSortedSearchResultHitsWithRuntimeSchemaAlloc(alloc, .{
+        .search_after = &cursor,
+        .limit = 2,
+    }, &.{ left, right }, null));
+    const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", diagnostic.reason);
+    try std.testing.expectEqualStrings("distributed_shard_cursor_window_invalid", diagnostic.detail);
+
+    const hits = try mergeDistributedSortedSearchResultHitsWithRuntimeSchemaAlloc(alloc, .{
+        .search_after = &cursor,
+        .limit = 2,
+    }, &.{ left_after, right_after }, null);
+    defer testFreeOwnedHits(alloc, hits);
+    try std.testing.expectEqual(@as(usize, 2), hits.len);
+    try std.testing.expectEqualStrings("doc:c", hits[0].id);
+    try std.testing.expectEqualStrings("doc:d", hits[1].id);
+    try std.testing.expectEqualStrings("doc:c", hits[0].sort_values[0].string);
+    try std.testing.expectEqualStrings("doc:d", hits[1].sort_values[0].string);
+
+    const merged = try mergeDistributedSortedSearchResultsWithRuntimeSchemaAlloc(alloc, .{
+        .search_after = &cursor,
+        .limit = 1,
+        .profile = true,
+    }, &.{ left_after, right_after }, null);
+    defer testFreeOwnedHits(alloc, merged.hits);
+    try std.testing.expectEqual(@as(usize, 1), merged.hits.len);
+    try std.testing.expectEqualStrings("doc:c", merged.hits[0].id);
+    const profile = merged.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("distributed_k_way_merge", profile.plan);
+    try std.testing.expectEqualStrings("bounded_exact", profile.exactness);
+    try std.testing.expectEqualStrings("distributed_seek", profile.cursor_support);
+    try std.testing.expectEqualStrings("distributed_merge", profile.source);
+    try std.testing.expectEqual(@as(u64, 0), profile.cursor_rejected_count);
+}
+
+test "distributed shard validation rejects mixed scalar sort domains" {
+    const alloc = std.testing.allocator;
+    const order_by = [_]types.SortField{.{ .field = "opaque_rank" }};
+
+    var numeric = [_]types.SearchHit{try testSortedHitAlloc(alloc, "doc:a", 1)};
+    defer testDeinitFixedHits(alloc, &numeric);
+    var string_hit = types.SearchHit{
+        .id = try alloc.dupe(u8, "doc:b"),
+        .sort_values = try alloc.alloc(std.json.Value, 2),
+    };
+    string_hit.sort_values[0] = .{ .string = try alloc.dupe(u8, "two") };
+    string_hit.sort_values[1] = .{ .string = try alloc.dupe(u8, "doc:b") };
+    var string_hits = [_]types.SearchHit{string_hit};
+    defer testDeinitFixedHits(alloc, &string_hits);
+
+    const shards = [_]DistributedSortedShard{
+        .{ .hits = &numeric, .total_hits = numeric.len },
+        .{ .hits = &string_hits, .total_hits = string_hits.len },
+    };
+
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.InvalidQueryRequest, validateDistributedSortedShards(alloc, .{
+        .order_by = &order_by,
+        .limit = 10,
+    }, .{ .kind = .distributed_k_way_merge }, &shards));
+    const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("opaque_rank", diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_doc_value_type", diagnostic.reason);
+    try std.testing.expectEqualStrings("mixed_sort_value_domain", diagnostic.detail);
+}
+
+test "distributed field sort requires runtime mappings" {
+    const alloc = std.testing.allocator;
+    var hits = [_]types.SearchHit{try testSortedHitAlloc(alloc, "doc:a", 1)};
+    defer testDeinitFixedHits(alloc, &hits);
+    const shards = [_]DistributedSortedShard{.{ .hits = &hits }};
+    const order_by = [_]types.SortField{.{ .field = "rank" }};
+
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeDistributedSortedHitsAlloc(alloc, .{
+        .order_by = &order_by,
+        .limit = 1,
+    }, .{ .kind = .distributed_k_way_merge }, &shards));
+    const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("missing_runtime_mapping", diagnostic.reason);
+    try std.testing.expectEqualStrings("missing_runtime_mapping", diagnostic.detail);
+}
+
+test "distributed merge rejects provably incomplete exact shard windows" {
+    const alloc = std.testing.allocator;
+    const order_by = [_]types.SortField{.{ .field = "rank" }};
+    const schema = testNumericRankRuntimeSchema();
+
+    var hits = [_]types.SearchHit{try testSortedHitAlloc(alloc, "doc:a", 1)};
+    defer testDeinitFixedHits(alloc, &hits);
+    const missing_total_shards = [_]DistributedSortedShard{
+        .{ .hits = &hits },
+    };
+
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeDistributedSortedHitsAlloc(alloc, .{
+        .order_by = &order_by,
+        .offset = 1,
+        .limit = 1,
+    }, .{
+        .kind = .distributed_k_way_merge,
+        .runtime_schema = schema,
+    }, &missing_total_shards));
+    var diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", diagnostic.reason);
+    try std.testing.expectEqualStrings("distributed_shard_window_incomplete", diagnostic.detail);
+
+    const incomplete = types.SearchResult{
+        .alloc = alloc,
+        .hits = &hits,
+        .total_hits = 3,
+        .total_hits_relation = .exact,
+    };
+
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeDistributedSortedSearchResultsWithRuntimeSchemaAlloc(alloc, .{
+        .order_by = &order_by,
+        .offset = 1,
+        .limit = 1,
+    }, &.{incomplete}, schema));
+    diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", diagnostic.reason);
+    try std.testing.expectEqualStrings("distributed_shard_window_incomplete", diagnostic.detail);
+
+    const lower_bound_short = types.SearchResult{
+        .alloc = alloc,
+        .hits = &hits,
+        .total_hits = 1,
+        .total_hits_relation = .gte,
+    };
+
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeDistributedSortedSearchResultsWithRuntimeSchemaAlloc(alloc, .{
+        .order_by = &order_by,
+        .offset = 1,
+        .limit = 1,
+    }, &.{lower_bound_short}, schema));
+    diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", diagnostic.reason);
+    try std.testing.expectEqualStrings("distributed_shard_window_incomplete", diagnostic.detail);
+
+    const empty_with_possible_hits = types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 1,
+        .total_hits_relation = .gte,
+    };
+
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeDistributedSortedSearchResultsWithRuntimeSchemaAlloc(alloc, .{
+        .order_by = &order_by,
+        .limit = 1,
+    }, &.{empty_with_possible_hits}, schema));
+    diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", diagnostic.reason);
+    try std.testing.expectEqualStrings("distributed_shard_window_incomplete", diagnostic.detail);
+
+    const cursor = [_]std.json.Value{
+        .{ .integer = 0 },
+        .{ .string = "doc:0" },
+    };
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeDistributedSortedSearchResultsWithRuntimeSchemaAlloc(alloc, .{
+        .order_by = &order_by,
+        .search_after = &cursor,
+        .limit = 2,
+    }, &.{incomplete}, schema));
+    diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", diagnostic.reason);
+    try std.testing.expectEqualStrings("distributed_shard_window_incomplete", diagnostic.detail);
+
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeDistributedSortedSearchResultsWithRuntimeSchemaAlloc(alloc, .{
+        .order_by = &order_by,
+        .search_after = &cursor,
+        .limit = 2,
+    }, &.{lower_bound_short}, schema));
+    diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", diagnostic.reason);
+    try std.testing.expectEqualStrings("distributed_shard_window_incomplete", diagnostic.detail);
+}
+
+test "distributed merge rejects oversized shard windows" {
+    const alloc = std.testing.allocator;
+    const order_by = [_]types.SortField{.{ .field = "rank" }};
+    const schema = testNumericRankRuntimeSchema();
+
+    var hits = [_]types.SearchHit{
+        try testSortedHitAlloc(alloc, "doc:a", 1),
+        try testSortedHitAlloc(alloc, "doc:b", 2),
+        try testSortedHitAlloc(alloc, "doc:c", 3),
+    };
+    defer testDeinitFixedHits(alloc, &hits);
+    const oversized = types.SearchResult{
+        .alloc = alloc,
+        .hits = &hits,
+        .total_hits = 3,
+        .total_hits_relation = .exact,
+    };
+
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, mergeDistributedSortedSearchResultsWithRuntimeSchemaAlloc(alloc, .{
+        .order_by = &order_by,
+        .limit = 2,
+    }, &.{oversized}, schema));
+    var diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("", diagnostic.field);
+    try std.testing.expectEqualStrings("candidate_budget_exceeded", diagnostic.reason);
+    try std.testing.expectEqualStrings("distributed_merge_shard_window", diagnostic.detail);
+
+    const cursor = [_]std.json.Value{
+        .{ .integer = 1 },
+        .{ .string = "doc:a" },
+    };
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, mergeDistributedSortedSearchResultsWithRuntimeSchemaAlloc(alloc, .{
+        .order_by = &order_by,
+        .search_after = &cursor,
+        .limit = 2,
+    }, &.{oversized}, schema));
+    diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("", diagnostic.field);
+    try std.testing.expectEqualStrings("candidate_budget_exceeded", diagnostic.reason);
+    try std.testing.expectEqualStrings("distributed_merge_shard_window", diagnostic.detail);
+}
+
+test "distributed score sort requires finite hit score matching sort tuple" {
+    const alloc = std.testing.allocator;
+    const plan = SortExecutionPlan{ .kind = .distributed_k_way_merge };
+    const score_desc = [_]types.SortField{.{ .field = "_score", .desc = true }};
+    const score_req = types.SearchRequest{
+        .order_by = &score_desc,
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+    };
+
+    var left = [_]types.SearchHit{
+        try testScoreSortedHitAlloc(alloc, "doc:a", 3.0),
+        try testScoreSortedHitAlloc(alloc, "doc:c", 1.0),
+    };
+    defer testDeinitFixedHits(alloc, &left);
+    var right = [_]types.SearchHit{
+        try testScoreSortedHitAlloc(alloc, "doc:b", 2.0),
+    };
+    defer testDeinitFixedHits(alloc, &right);
+    const shards = [_]DistributedSortedShard{
+        .{ .hits = &left, .total_hits = left.len, .total_hits_relation = .exact },
+        .{ .hits = &right, .total_hits = right.len, .total_hits_relation = .exact },
+    };
+
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeDistributedSortedHitsAlloc(alloc, .{
+        .order_by = &score_desc,
+        .limit = 3,
+    }, plan, &shards));
+    var diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("_score", diagnostic.field);
+    try std.testing.expectEqualStrings("non_score_bearing_source", diagnostic.reason);
+    try std.testing.expectEqualStrings("non_score_bearing_source", diagnostic.detail);
+
+    var valid_req = score_req;
+    valid_req.limit = 3;
+    const page = try mergeDistributedSortedHitsAlloc(alloc, valid_req, plan, &shards);
+    defer testFreeOwnedHits(alloc, page);
+    try std.testing.expectEqual(@as(usize, 3), page.len);
+    try std.testing.expectEqualStrings("doc:a", page[0].id);
+    try std.testing.expectEqualStrings("doc:b", page[1].id);
+    try std.testing.expectEqualStrings("doc:c", page[2].id);
+
+    var missing_score = try testScoreSortedHitAlloc(alloc, "doc:missing", 1.0);
+    defer missing_score.deinit(alloc);
+    missing_score.score = null;
+    const missing_shards = [_]DistributedSortedShard{.{ .hits = &.{missing_score} }};
+    resetLastSortRejectionDiagnostic();
+    var invalid_req = score_req;
+    invalid_req.limit = 1;
+    try std.testing.expectError(error.InvalidQueryRequest, mergeDistributedSortedHitsAlloc(alloc, invalid_req, plan, &missing_shards));
+    diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("_score", diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_score_value", diagnostic.reason);
+    try std.testing.expectEqualStrings("missing_score", diagnostic.detail);
+
+    var non_finite_score = try testScoreSortedHitAlloc(alloc, "doc:nan", 1.0);
+    defer non_finite_score.deinit(alloc);
+    non_finite_score.score = std.math.nan(f32);
+    const non_finite_shards = [_]DistributedSortedShard{.{ .hits = &.{non_finite_score} }};
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.InvalidQueryRequest, mergeDistributedSortedHitsAlloc(alloc, invalid_req, plan, &non_finite_shards));
+    diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("_score", diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_score_value", diagnostic.reason);
+    try std.testing.expectEqualStrings("non_finite_score", diagnostic.detail);
+
+    var mismatched_tuple = try testScoreSortedHitAlloc(alloc, "doc:mismatch", 1.0);
+    defer mismatched_tuple.deinit(alloc);
+    mismatched_tuple.sort_values[0] = .{ .float = 2.0 };
+    const mismatched_shards = [_]DistributedSortedShard{.{ .hits = &.{mismatched_tuple} }};
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.InvalidQueryRequest, mergeDistributedSortedHitsAlloc(alloc, invalid_req, plan, &mismatched_shards));
+    diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("_score", diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_score_value", diagnostic.reason);
+    try std.testing.expectEqualStrings("score_sort_tuple_mismatch", diagnostic.detail);
+}
+
+test "distributed merge uses runtime schema for typed date cursors" {
+    const alloc = std.testing.allocator;
+
+    const created_at_mapping = runtime_schema_mod.DynamicTemplate{
+        .name = "created_at",
+        .path_match = "created_at",
+        .mapping = .{
+            .field_type = .datetime,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    };
+    const templates = [_]runtime_schema_mod.DynamicTemplate{created_at_mapping};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+
+    const ts_a = runtime_schema_mod.parseDateTimeToNs("2026-01-01T00:00:00Z") orelse return error.TestExpectedEqual;
+    const ts_b = runtime_schema_mod.parseDateTimeToNs("2026-01-02T00:00:00Z") orelse return error.TestExpectedEqual;
+    const ts_c = runtime_schema_mod.parseDateTimeToNs("2026-01-03T00:00:00Z") orelse return error.TestExpectedEqual;
+    const ts_d = runtime_schema_mod.parseDateTimeToNs("2026-01-04T00:00:00Z") orelse return error.TestExpectedEqual;
+
+    var left_hits = [_]types.SearchHit{
+        try testDateSortedHitAlloc(alloc, "doc:a", ts_a),
+        try testDateSortedHitAlloc(alloc, "doc:c", ts_c),
+    };
+    defer testDeinitFixedHits(alloc, &left_hits);
+    var right_hits = [_]types.SearchHit{
+        try testDateSortedHitAlloc(alloc, "doc:b", ts_b),
+        try testDateSortedHitAlloc(alloc, "doc:d", ts_d),
+    };
+    defer testDeinitFixedHits(alloc, &right_hits);
+
+    const left_after = types.SearchResult{ .alloc = alloc, .hits = left_hits[1..], .total_hits = 1 };
+    const right_after = types.SearchResult{ .alloc = alloc, .hits = right_hits[1..], .total_hits = 1 };
+    const order_by = [_]types.SortField{.{ .field = "created_at" }};
+    const after_cursor = [_]std.json.Value{
+        .{ .number_string = try std.fmt.allocPrint(alloc, "{d}", .{ts_b}) },
+        .{ .string = "doc:b" },
+    };
+    defer alloc.free(after_cursor[0].number_string);
+
+    const merged = try mergeDistributedSortedSearchResultsWithRuntimeSchemaAlloc(alloc, .{
+        .order_by = &order_by,
+        .search_after = &after_cursor,
+        .limit = 2,
+        .profile = true,
+    }, &.{ left_after, right_after }, schema);
+    defer testFreeOwnedHits(alloc, merged.hits);
+
+    try std.testing.expectEqual(@as(usize, 2), merged.hits.len);
+    try std.testing.expectEqualStrings("doc:c", merged.hits[0].id);
+    try std.testing.expectEqualStrings("doc:d", merged.hits[1].id);
+    const sort_profile = merged.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("distributed_k_way_merge", sort_profile.plan);
+    try std.testing.expectEqualStrings("bounded_exact", sort_profile.exactness);
+    try std.testing.expectEqualStrings("distributed_seek", sort_profile.cursor_support);
+
+    const float_cursor = [_]std.json.Value{
+        .{ .float = @floatFromInt(ts_b) },
+        .{ .string = "doc:b" },
+    };
+    try std.testing.expectError(error.InvalidQueryRequest, mergeDistributedSortedSearchResultsWithRuntimeSchemaAlloc(alloc, .{
+        .order_by = &order_by,
+        .search_after = &float_cursor,
+        .limit = 2,
+    }, &.{ left_after, right_after }, schema));
+}
+
+test "distributed merge rejects cursor outside concrete shard sort tuple domain" {
+    const alloc = std.testing.allocator;
+
+    const rank_mapping = runtime_schema_mod.DynamicTemplate{
+        .name = "rank",
+        .path_match = "rank",
+        .mapping = .{
+            .field_type = .numeric,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    };
+    const templates = [_]runtime_schema_mod.DynamicTemplate{rank_mapping};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+
+    var hits = [_]types.SearchHit{
+        try testSortedHitAlloc(alloc, "doc:a", 1),
+        try testSortedHitAlloc(alloc, "doc:b", 2),
+    };
+    defer testDeinitFixedHits(alloc, &hits);
+    const after_result = types.SearchResult{ .alloc = alloc, .hits = hits[1..], .total_hits = 1 };
+    const order_by = [_]types.SortField{.{ .field = "rank" }};
+
+    const valid_cursor = [_]std.json.Value{
+        .{ .number_string = "1" },
+        .{ .string = "doc:a" },
+    };
+    const page = try mergeDistributedSortedSearchResultsWithRuntimeSchemaAlloc(alloc, .{
+        .order_by = &order_by,
+        .search_after = &valid_cursor,
+        .limit = 1,
+    }, &.{after_result}, schema);
+    defer testFreeOwnedHits(alloc, page.hits);
+    try std.testing.expectEqual(@as(usize, 1), page.hits.len);
+    try std.testing.expectEqualStrings("doc:b", page.hits[0].id);
+
+    const fractional_cursor = [_]std.json.Value{
+        .{ .number_string = "1.5" },
+        .{ .string = "doc:a" },
+    };
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.InvalidQueryRequest, mergeDistributedSortedSearchResultsWithRuntimeSchemaAlloc(alloc, .{
+        .order_by = &order_by,
+        .search_after = &fractional_cursor,
+        .limit = 1,
+    }, &.{after_result}, schema));
+    const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("rank", diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.reason);
+    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
+}
+
+test "sorted segment bounds reject cursor outside concrete bound domain" {
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "rank",
+        .path_match = "rank",
+        .mapping = .{
+            .field_type = .numeric,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+    const plan = SortExecutionPlan{
+        .kind = .sorted_segment_seek,
+        .require_native = true,
+        .runtime_schema = schema,
+        .index_sort_match = true,
+        .sorted_segment_executor_available = true,
+        .sorted_segment_bounds_available = true,
+    };
+    const order_by = [_]types.SortField{
+        .{ .field = "rank" },
+        .{ .field = "_id" },
+    };
+    const bounds = [_]segment_mod.SegmentIndexSortBoundValue{
+        .{ .i64_val = 10 },
+        .{ .id = "doc:a" },
+    };
+
+    const valid_cursor = [_]std.json.Value{
+        .{ .number_string = "10" },
+        .{ .string = "doc:a" },
+    };
+    try std.testing.expectEqual(std.math.Order.eq, try compareSortedSegmentBoundToCursor(.{
+        .order_by = &order_by,
+    }, plan, bounds[0..], valid_cursor[0..]));
+
+    const fractional_cursor = [_]std.json.Value{
+        .{ .number_string = "10.5" },
+        .{ .string = "doc:a" },
+    };
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.InvalidQueryRequest, compareSortedSegmentBoundToCursor(.{
+        .order_by = &order_by,
+    }, plan, bounds[0..], fractional_cursor[0..]));
+    const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("rank", diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.reason);
+    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
+}
+
+test "distributed merge validates mapped sort fields when runtime schema is present" {
+    const alloc = std.testing.allocator;
+
+    const sortable_mapping = runtime_schema_mod.DynamicTemplate{
+        .name = "rank",
+        .path_match = "rank",
+        .mapping = .{
+            .field_type = .numeric,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    };
+    const non_sortable_mapping = runtime_schema_mod.DynamicTemplate{
+        .name = "title",
+        .path_match = "title",
+        .mapping = .{
+            .field_type = .text,
+            .doc_values = true,
+            .sortable = false,
+        },
+    };
+    const missing_doc_values_mapping = runtime_schema_mod.DynamicTemplate{
+        .name = "price",
+        .path_match = "price",
+        .mapping = .{
+            .field_type = .numeric,
+            .doc_values = false,
+            .sortable = true,
+        },
+    };
+    const templates = [_]runtime_schema_mod.DynamicTemplate{
+        sortable_mapping,
+        non_sortable_mapping,
+        missing_doc_values_mapping,
+    };
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+
+    var hits = [_]types.SearchHit{try testSortedHitAlloc(alloc, "doc:a", 1)};
+    defer testDeinitFixedHits(alloc, &hits);
+    const result = types.SearchResult{ .alloc = alloc, .hits = &hits, .total_hits = 1 };
+
+    const unmapped_order = [_]types.SortField{.{ .field = "unknown" }};
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeDistributedSortedSearchResultsWithRuntimeSchemaAlloc(alloc, .{
+        .order_by = &unmapped_order,
+        .limit = 1,
+    }, &.{result}, schema));
+    var diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("unknown", diagnostic.field);
+    try std.testing.expectEqualStrings("unmapped_sort_field", diagnostic.reason);
+    try std.testing.expectEqualStrings("unmapped_field", diagnostic.detail);
+
+    const non_sortable_order = [_]types.SortField{.{ .field = "title" }};
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeDistributedSortedSearchResultsWithRuntimeSchemaAlloc(alloc, .{
+        .order_by = &non_sortable_order,
+        .limit = 1,
+    }, &.{result}, schema));
+    diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("title", diagnostic.field);
+    try std.testing.expectEqualStrings("non_sortable_sort_field", diagnostic.reason);
+    try std.testing.expectEqualStrings("non_scalar_field", diagnostic.detail);
+
+    const missing_doc_values_order = [_]types.SortField{.{ .field = "price" }};
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeDistributedSortedSearchResultsWithRuntimeSchemaAlloc(alloc, .{
+        .order_by = &missing_doc_values_order,
+        .limit = 1,
+    }, &.{result}, schema));
+    diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("price", diagnostic.field);
+    try std.testing.expectEqualStrings("missing_doc_values_coverage", diagnostic.reason);
+    try std.testing.expectEqualStrings("missing_doc_values_capability", diagnostic.detail);
+
+    const valid_order = [_]types.SortField{.{ .field = "rank" }};
+    const bad_cursor = [_]std.json.Value{
+        .{ .string = "not-a-number" },
+        .{ .string = "doc:a" },
+    };
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.InvalidQueryRequest, mergeDistributedSortedSearchResultsWithRuntimeSchemaAlloc(alloc, .{
+        .order_by = &valid_order,
+        .search_after = &bad_cursor,
+        .limit = 1,
+    }, &.{result}, schema));
+    diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("rank", diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.reason);
+    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
+}
+
+test "stored json debug sort plan is rejected outside test runtime" {
+    try validateSortExecutionPlanForRuntimeMode(.{ .kind = .stored_json_debug }, null, true);
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(
+        error.UnsupportedQueryRequest,
+        validateSortExecutionPlanForRuntimeMode(.{ .kind = .stored_json_debug }, null, false),
+    );
+    const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("stored_json_sort_disabled", diagnostic.reason);
+    try std.testing.expectEqualStrings("stored_json_sort_disabled", diagnostic.detail);
+}
+
+test "sort execution plans require runtime support before execution" {
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(
+        error.UnsupportedQueryRequest,
+        validateSortExecutionPlanForRuntimeMode(.{ .kind = .sorted_segment_seek }, null, true),
+    );
+    var diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("missing_doc_values_coverage", diagnostic.reason);
+    try std.testing.expectEqualStrings("native_sort_loader_unavailable", diagnostic.detail);
+
+    const Loader = struct {
+        fn load(_: ?*anyopaque, _: Allocator, _: types.SearchHit, _: []const u8) anyerror!?SortValue {
+            return null;
+        }
+    };
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(
+        error.UnsupportedQueryRequest,
+        validateSortExecutionPlanForRuntimeMode(.{ .kind = .sorted_segment_seek }, .{ .load = Loader.load }, true),
+    );
+    diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", diagnostic.reason);
+    try std.testing.expectEqualStrings("sorted_segment_executor_unavailable", diagnostic.detail);
+
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(
+        error.UnsupportedQueryRequest,
+        validateSortExecutionPlanForRuntimeMode(.{ .kind = .distributed_k_way_merge }, null, true),
+    );
+    diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("distributed_merge_unsupported", diagnostic.reason);
+    try std.testing.expectEqualStrings("distributed_merge_unsupported", diagnostic.detail);
+}
+
+test "sorted segment seek requires bounds metadata for cursor pagination" {
+    const rank_order = [_]types.SortField{.{ .field = "rank" }};
+    const cursor = [_]std.json.Value{ .{ .integer = 42 }, .{ .string = "doc:42" } };
+    const Loader = struct {
+        fn load(_: ?*anyopaque, _: Allocator, _: types.SearchHit, _: []const u8) anyerror!?SortValue {
+            return .{ .integer = 42 };
+        }
+    };
+    const loader = NativeSortValueLoader{ .require_native = true, .load = Loader.load };
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "rank",
+        .path_match = "rank",
+        .mapping = .{
+            .field_type = .numeric,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+    const unbounded_plan = SortExecutionPlan{
+        .kind = .sorted_segment_seek,
+        .require_native = true,
+        .runtime_schema = schema,
+        .index_sort_match = true,
+        .sorted_segment_executor_available = true,
+        .sorted_segment_bounds_available = false,
+    };
+
+    try validateSortExecutionPlanForRuntime(.{
+        .order_by = &rank_order,
+    }, unbounded_plan, loader);
+
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, validateSortExecutionPlanForRuntime(.{
+        .order_by = &rank_order,
+        .search_after = &cursor,
+    }, unbounded_plan, loader));
+    const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", diagnostic.reason);
+    try std.testing.expectEqualStrings("sorted_segment_bounds_unavailable", diagnostic.detail);
+
+    var bounded_plan = unbounded_plan;
+    bounded_plan.sorted_segment_bounds_available = true;
+    try validateSortExecutionPlanForRuntime(.{
+        .order_by = &rank_order,
+        .search_after = &cursor,
+    }, bounded_plan, loader);
+}
+
+test "sort execution plans reject incompatible order_by shapes" {
+    const id_order = [_]types.SortField{.{ .field = "_id" }};
+    const score_order = [_]types.SortField{.{ .field = "_score", .desc = true }};
+    const field_order = [_]types.SortField{.{ .field = "rank" }};
+
+    try validateSortExecutionPlanMatchesRequest(.{ .kind = .id_seek }, .{ .order_by = &id_order });
+    try validateSortExecutionPlanMatchesRequest(.{ .kind = .score_top_k }, .{ .order_by = &score_order });
+    try validateSortExecutionPlanMatchesRequest(.{ .kind = .stored_json_debug }, .{ .order_by = &field_order });
+
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, validateSortExecutionPlanMatchesRequest(.{ .kind = .id_seek }, .{ .order_by = &score_order }));
+    const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", diagnostic.reason);
+    try std.testing.expectEqualStrings("incompatible_sort_plan", diagnostic.detail);
+    try std.testing.expectError(error.UnsupportedQueryRequest, validateSortExecutionPlanMatchesRequest(.{ .kind = .score_top_k }, .{ .order_by = &field_order }));
+    try std.testing.expectError(error.UnsupportedQueryRequest, validateSortExecutionPlanMatchesRequest(.{ .kind = .id_only }, .{ .order_by = &score_order }));
+    try std.testing.expectError(error.UnsupportedQueryRequest, validateSortExecutionPlanMatchesRequest(.{ .kind = .native_doc_values_top_n }, .{ .order_by = &id_order }));
+    try std.testing.expectError(error.UnsupportedQueryRequest, validateSortExecutionPlanMatchesRequest(.{ .kind = .stored_json_debug }, .{ .order_by = &id_order }));
+    try std.testing.expectError(error.UnsupportedQueryRequest, validateSortExecutionPlanMatchesRequest(.{ .kind = .stored_json_debug }, .{ .order_by = &score_order }));
+}
+
+test "native doc values runtime plan validates mappings" {
+    const rank_order = [_]types.SortField{.{ .field = "rank" }};
+    const cursor = [_]std.json.Value{ .{ .string = "wrong" }, .{ .string = "doc:a" } };
+    const Loader = struct {
+        fn load(_: ?*anyopaque, _: Allocator, _: types.SearchHit, _: []const u8) anyerror!?SortValue {
+            return .{ .integer = 1 };
+        }
+    };
+    const loader = NativeSortValueLoader{ .require_native = true, .load = Loader.load };
+
+    const non_sortable_templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "rank",
+        .path_match = "rank",
+        .mapping = .{
+            .field_type = .numeric,
+            .doc_values = true,
+            .sortable = false,
+            .analyzer = "keyword",
+        },
+    }};
+    const non_sortable_schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &non_sortable_templates };
+    try std.testing.expectError(error.UnsupportedExactSort, validateSortExecutionPlanForRuntime(.{
+        .order_by = &rank_order,
+    }, .{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .runtime_schema = non_sortable_schema,
+    }, loader));
+
+    const sortable_templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "rank",
+        .path_match = "rank",
+        .mapping = .{
+            .field_type = .numeric,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const sortable_schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &sortable_templates };
+    try std.testing.expectError(error.InvalidQueryRequest, validateSortExecutionPlanForRuntime(.{
+        .order_by = &rank_order,
+        .search_after = &cursor,
+    }, .{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .runtime_schema = sortable_schema,
+    }, loader));
+
+    try std.testing.expectError(error.UnsupportedExactSort, validateSortExecutionPlanForRuntime(.{
+        .order_by = &rank_order,
+    }, .{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .runtime_schema = .{},
+    }, loader));
+}
+
+fn compareDecoratedSortHits(req: types.SearchRequest, a: DecoratedSortHit, b: DecoratedSortHit) std.math.Order {
+    for (req.order_by, 0..) |field, i| {
+        const order = compareSortValues(a.keys[i], b.keys[i]);
+        if (order != .eq) {
+            if (field.desc) {
+                return switch (order) {
+                    .lt => .gt,
+                    .eq => .eq,
+                    .gt => .lt,
+                };
+            }
+            return order;
+        }
+    }
+    return .eq;
+}
+
+fn decoratedLessThan(req: types.SearchRequest, a: DecoratedSortHit, b: DecoratedSortHit) bool {
+    return compareDecoratedSortHits(req, a, b) == .lt;
+}
+
+fn sortValueFromSortJson(plan: SortExecutionPlan, field: types.SortField, value: std.json.Value) !SortValue {
+    if (!sortCursorValueIsReplayable(value)) return error.InvalidQueryRequest;
+    if (sortFieldIsScore(field) and !jsonValueIsNumeric(value)) return error.InvalidQueryRequest;
+    if (sortFieldIsId(field) and value != .string) return error.InvalidQueryRequest;
+    return try sortValueFromCursorJson(plan, field.field, value);
+}
+
+fn compareSearchHitSortValues(req: types.SearchRequest, plan: SortExecutionPlan, a: types.SearchHit, b: types.SearchHit) !std.math.Order {
+    const field_count = effectiveSortFieldCountForRequest(req);
+    if (a.sort_values.len != field_count or b.sort_values.len != field_count) return error.InvalidQueryRequest;
+    for (0..field_count) |i| {
+        const field = effectiveSortFieldAtForRequest(req, i);
+        const a_value = try sortValueFromSortJson(plan, field, a.sort_values[i]);
+        const b_value = try sortValueFromSortJson(plan, field, b.sort_values[i]);
+        const order = compareSortValues(a_value, b_value);
+        if (order != .eq) {
+            if (field.desc) {
+                return switch (order) {
+                    .lt => .gt,
+                    .eq => .eq,
+                    .gt => .lt,
+                };
+            }
+            return order;
+        }
+    }
+    return .eq;
+}
+
+fn searchHitAllowedByCursor(req: types.SearchRequest, plan: SortExecutionPlan, hit: types.SearchHit) !bool {
+    const field_count = effectiveSortFieldCountForRequest(req);
+    if (hit.sort_values.len != field_count) return error.InvalidQueryRequest;
+    const cursor = activeSortCursor(req);
+    if (cursor.len == 0) return true;
+    for (0..field_count) |i| {
+        const field = effectiveSortFieldAtForRequest(req, i);
+        const hit_value = try sortValueFromSortJson(plan, field, hit.sort_values[i]);
+        const cursor_value = try sortValueFromCursorJsonForSortKey(plan, field.field, hit_value, cursor[i]);
+        const order = compareSortValues(hit_value, cursor_value);
+        if (order != .eq) {
+            const effective_order = if (field.desc) switch (order) {
+                .lt => std.math.Order.gt,
+                .eq => std.math.Order.eq,
+                .gt => std.math.Order.lt,
+            } else order;
+            if (req.search_after.len > 0) return effective_order == .gt;
+            if (req.search_before.len > 0) return effective_order == .lt;
+            return true;
+        }
+    }
+    return false;
+}
+
+const DistributedSortedShard = struct {
+    hits: []const types.SearchHit = &.{},
+    total_hits: ?u32 = null,
+    total_hits_relation: types.TotalHitsRelation = .exact,
+};
+
+const DistributedMergeHeapEntry = struct {
+    shard_index: usize,
+    hit_index: usize,
+};
+
+fn distributedMergeEntryLess(
+    req: types.SearchRequest,
+    plan: SortExecutionPlan,
+    shards: []const DistributedSortedShard,
+    a: DistributedMergeHeapEntry,
+    b: DistributedMergeHeapEntry,
+) !bool {
+    const order = try compareSearchHitSortValues(req, plan, shards[a.shard_index].hits[a.hit_index], shards[b.shard_index].hits[b.hit_index]);
+    if (order != .eq) return order == .lt;
+    if (a.shard_index != b.shard_index) return a.shard_index < b.shard_index;
+    return a.hit_index < b.hit_index;
+}
+
+fn distributedMergeHeapSwap(heap: []DistributedMergeHeapEntry, a: usize, b: usize) void {
+    const tmp = heap[a];
+    heap[a] = heap[b];
+    heap[b] = tmp;
+}
+
+fn distributedMergeHeapSiftUp(
+    req: types.SearchRequest,
+    plan: SortExecutionPlan,
+    shards: []const DistributedSortedShard,
+    heap: []DistributedMergeHeapEntry,
+    start_index: usize,
+) !void {
+    var index = start_index;
+    while (index > 0) {
+        const parent = (index - 1) / 2;
+        if (!(try distributedMergeEntryLess(req, plan, shards, heap[index], heap[parent]))) break;
+        distributedMergeHeapSwap(heap, index, parent);
+        index = parent;
+    }
+}
+
+fn distributedMergeHeapSiftDown(
+    req: types.SearchRequest,
+    plan: SortExecutionPlan,
+    shards: []const DistributedSortedShard,
+    heap: []DistributedMergeHeapEntry,
+) !void {
+    var index: usize = 0;
+    while (true) {
+        const left = index * 2 + 1;
+        if (left >= heap.len) break;
+        const right = left + 1;
+        var best = left;
+        if (right < heap.len and try distributedMergeEntryLess(req, plan, shards, heap[right], heap[left])) {
+            best = right;
+        }
+        if (!(try distributedMergeEntryLess(req, plan, shards, heap[best], heap[index]))) break;
+        distributedMergeHeapSwap(heap, index, best);
+        index = best;
+    }
+}
+
+fn distributedMergeHeapPush(
+    req: types.SearchRequest,
+    plan: SortExecutionPlan,
+    shards: []const DistributedSortedShard,
+    heap: []DistributedMergeHeapEntry,
+    heap_len: *usize,
+    entry: DistributedMergeHeapEntry,
+) !void {
+    heap[heap_len.*] = entry;
+    heap_len.* += 1;
+    try distributedMergeHeapSiftUp(req, plan, shards, heap[0..heap_len.*], heap_len.* - 1);
+}
+
+fn distributedMergeHeapPop(
+    req: types.SearchRequest,
+    plan: SortExecutionPlan,
+    shards: []const DistributedSortedShard,
+    heap: []DistributedMergeHeapEntry,
+    heap_len: *usize,
+) !DistributedMergeHeapEntry {
+    const out = heap[0];
+    heap_len.* -= 1;
+    if (heap_len.* > 0) {
+        heap[0] = heap[heap_len.*];
+        try distributedMergeHeapSiftDown(req, plan, shards, heap[0..heap_len.*]);
+    }
+    return out;
+}
+
+fn validateDistributedSortedShards(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    plan: SortExecutionPlan,
+    shards: []const DistributedSortedShard,
+) !void {
+    const field_count = effectiveSortFieldCountForRequest(req);
+    const field_classes = try alloc.alloc(?SortTupleScalarClass, field_count);
+    defer alloc.free(field_classes);
+    @memset(field_classes, null);
+
+    for (shards) |shard| {
+        if (shard.hits.len == 0) continue;
+        try validateDistributedSortedHitTuple(req, plan, shard.hits[0], field_count, field_classes);
+        for (shard.hits[1..], 1..) |hit, i| {
+            try validateDistributedSortedHitTuple(req, plan, hit, field_count, field_classes);
+            const order = try compareSearchHitSortValues(req, plan, shard.hits[i - 1], hit);
+            if (order == .gt) {
+                recordDistributedSortTupleRejection("*", "unsorted_shard_window");
+                return error.InvalidQueryRequest;
+            }
+        }
+    }
+}
+
+fn validateDistributedShardWindowsCompleteForRequestedPage(
+    req: types.SearchRequest,
+    shards: []const DistributedSortedShard,
+) !void {
+    const required_window = distributedRequestedShardWindow(req);
+    if (required_window == 0) return;
+    for (shards) |shard| {
+        const returned_window: u64 = @intCast(shard.hits.len);
+        if (returned_window >= required_window) continue;
+        const total_hits = shard.total_hits orelse {
+            logNativeSortPlanRejection("*", "unsupported_exact_sort", "distributed_shard_window_incomplete");
+            return error.UnsupportedQueryRequest;
+        };
+        if (shard.total_hits_relation == .exact and @as(u64, total_hits) <= returned_window) {
+            continue;
+        }
+        logNativeSortPlanRejection("*", "unsupported_exact_sort", "distributed_shard_window_incomplete");
+        return error.UnsupportedQueryRequest;
+    }
+}
+
+fn distributedRequestedShardWindow(req: types.SearchRequest) u64 {
+    if (req.search_after.len > 0 or req.search_before.len > 0) return req.limit;
+    return @as(u64, req.offset) +| @as(u64, req.limit);
+}
+
+fn validateDistributedShardWindowsBoundedForRequestedPage(
+    req: types.SearchRequest,
+    shards: []const DistributedSortedShard,
+) !void {
+    const requested_window = distributedRequestedShardWindow(req);
+    for (shards) |shard| {
+        const returned_window: u64 = @intCast(shard.hits.len);
+        if (returned_window <= requested_window) continue;
+        logExactSortBudgetRejection(
+            "distributed_merge",
+            .distributed_merge_shard_window,
+            null,
+            boundedU32(shard.hits.len),
+            boundedU32(requested_window),
+            .{ .kind = .distributed_k_way_merge },
+        );
+        return error.QueryCandidateBudgetExceeded;
+    }
+}
+
+fn validateDistributedShardWindowsSoughtForCursor(
+    req: types.SearchRequest,
+    plan: SortExecutionPlan,
+    shards: []const DistributedSortedShard,
+) !void {
+    if (req.search_after.len == 0 and req.search_before.len == 0) return;
+    for (shards) |shard| {
+        for (shard.hits) |hit| {
+            if (try searchHitAllowedByCursor(req, plan, hit)) continue;
+            logNativeSortPlanRejection("*", "unsupported_exact_sort", "distributed_shard_cursor_window_invalid");
+            return error.UnsupportedQueryRequest;
+        }
+    }
+}
+
+fn validateDistributedSortRuntimeMappings(plan: SortExecutionPlan, req: types.SearchRequest) !void {
+    if (plan.kind != .distributed_k_way_merge) return;
+    const schema = plan.runtime_schema orelse {
+        if (!requestNeedsNativeSortValues(req)) return;
+        logNativeSortPlanRejection(
+            "*",
+            nativeSortPlanRejectionReasonName(.missing_runtime_mapping),
+            nativeSortPlanRejectionDetailName(.missing_runtime_mapping),
+        );
+        return error.UnsupportedQueryRequest;
+    };
+    const cursor = activeSortCursor(req);
+    for (req.order_by, 0..) |field, i| {
+        if (!sortFieldNeedsNativeValue(field)) continue;
+        const mapping = sortFieldMapping(schema, field.field) orelse {
+            logNativeSortPlanRejection(
+                field.field,
+                nativeSortPlanRejectionReasonName(.unmapped_field),
+                nativeSortPlanRejectionDetailName(.unmapped_field),
+            );
+            return error.UnsupportedQueryRequest;
+        };
+        if (mappedSortFieldRejectionReason(mapping)) |reason| {
+            logNativeSortPlanRejection(
+                field.field,
+                nativeSortPlanRejectionReasonName(reason),
+                nativeSortPlanRejectionDetailName(reason),
+            );
+            return error.UnsupportedQueryRequest;
+        }
+        if (cursor.len > 0) {
+            if (mappedSortCursorRejectionReason(mapping, cursor[i])) |reason| {
+                logNativeSortPlanRejection(
+                    field.field,
+                    nativeSortPlanRejectionReasonName(reason),
+                    nativeSortPlanRejectionDetailName(reason),
+                );
+                return error.InvalidQueryRequest;
+            }
+        }
+    }
+}
+
+fn validateDistributedSortedHitTuple(
+    req: types.SearchRequest,
+    plan: SortExecutionPlan,
+    hit: types.SearchHit,
+    field_count: usize,
+    field_classes: []?SortTupleScalarClass,
+) !void {
+    if (hit.sort_values.len != field_count) {
+        recordDistributedSortTupleRejection("*", "incomplete_sort_tuple");
+        return error.InvalidQueryRequest;
+    }
+    for (0..field_count) |i| {
+        const field = effectiveSortFieldAtForRequest(req, i);
+        const sort_value = sortValueFromSortJson(plan, field, hit.sort_values[i]) catch |err| {
+            if (err == error.InvalidQueryRequest) recordDistributedSortTupleRejection(field.field, "invalid_doc_value_type");
+            return err;
+        };
+        if (sortFieldNeedsNativeValue(field)) {
+            if (nativeSortValueRejectionReasonForPlanField(plan, field.field, sort_value)) |reason| {
+                logNativeSortPlanRejection(
+                    field.field,
+                    nativeSortPlanRejectionReasonName(reason),
+                    nativeSortPlanRejectionDetailName(reason),
+                );
+                return error.InvalidQueryRequest;
+            }
+        }
+        const value_class = distributedSortTupleScalarClass(sort_value) orelse {
+            recordDistributedSortTupleRejection(field.field, "invalid_doc_value_type");
+            return error.InvalidQueryRequest;
+        };
+        if (sortFieldIsScore(field)) {
+            try validateDistributedScoreSortTuple(hit, sort_value);
+        }
+        if (field_classes[i]) |expected| {
+            if (expected != value_class) {
+                recordDistributedSortTupleRejection(field.field, "mixed_sort_value_domain");
+                return error.InvalidQueryRequest;
+            }
+        } else {
+            field_classes[i] = value_class;
+        }
+        if (sortFieldIsId(field)) {
+            const sort_id = switch (hit.sort_values[i]) {
+                .string => |value| value,
+                else => {
+                    recordDistributedSortTupleRejection(field.field, "invalid_doc_value_type");
+                    return error.InvalidQueryRequest;
+                },
+            };
+            if (!std.mem.eql(u8, sort_id, hit.id)) {
+                recordDistributedSortTupleRejection(field.field, "id_tiebreaker_mismatch");
+                return error.InvalidQueryRequest;
+            }
+        }
+    }
+}
+
+fn validateDistributedScoreSortTuple(hit: types.SearchHit, sort_value: SortValue) !void {
+    const score = hit.score orelse {
+        logNativeSortPlanRejection(
+            "_score",
+            nativeSortPlanRejectionReasonName(.invalid_score_value),
+            "missing_score",
+        );
+        return error.InvalidQueryRequest;
+    };
+    if (!std.math.isFinite(score)) {
+        logNativeSortPlanRejection(
+            "_score",
+            nativeSortPlanRejectionReasonName(.invalid_score_value),
+            "non_finite_score",
+        );
+        return error.InvalidQueryRequest;
+    }
+    if (compareSortValues(.{ .number = @floatCast(score) }, sort_value) != .eq) {
+        logNativeSortPlanRejection(
+            "_score",
+            nativeSortPlanRejectionReasonName(.invalid_score_value),
+            "score_sort_tuple_mismatch",
+        );
+        return error.InvalidQueryRequest;
+    }
+}
+
+fn recordDistributedSortTupleRejection(field: []const u8, detail: []const u8) void {
+    logNativeSortPlanRejection(field, nativeSortPlanRejectionReasonName(.invalid_doc_value_type), detail);
+}
+
+fn distributedSortTupleScalarClass(value: SortValue) ?SortTupleScalarClass {
+    return switch (value) {
+        .null_value => null,
+        .bool_value => .bool_value,
+        .integer, .u64_value, .number => .numeric,
+        .number_string => |text| if (jsonNumberStringIsNumeric(text)) .numeric else null,
+        .string => .string,
+    };
+}
+
+fn appendDistributedMergedHit(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(types.SearchHit),
+    source: types.SearchHit,
+    selected_count: *usize,
+    skip_count: usize,
+    limit: usize,
+) !bool {
+    if (selected_count.* < skip_count) {
+        selected_count.* += 1;
+        return false;
+    }
+    if (out.items.len >= limit) return true;
+    try out.append(alloc, try source.clone(alloc));
+    selected_count.* += 1;
+    return out.items.len >= limit;
+}
+
+fn retainDistributedPreviousHit(
+    alloc: Allocator,
+    ring: []types.SearchHit,
+    ring_start: *usize,
+    ring_len: *usize,
+    source: types.SearchHit,
+) !void {
+    if (ring.len == 0) return;
+    const cloned = try source.clone(alloc);
+    errdefer {
+        var owned = cloned;
+        owned.deinit(alloc);
+    }
+    if (ring_len.* < ring.len) {
+        ring[(ring_start.* + ring_len.*) % ring.len] = cloned;
+        ring_len.* += 1;
+        return;
+    }
+    ring[ring_start.*].deinit(alloc);
+    ring[ring_start.*] = cloned;
+    ring_start.* = (ring_start.* + 1) % ring.len;
+}
+
+pub const DistributedSortedMergeResult = struct {
+    hits: []types.SearchHit,
+    total_hits_relation: types.TotalHitsRelation = .exact,
+    sort_profile: ?types.SortProfile = null,
+};
+
+fn maxDistributedShardWindow(shards: []const DistributedSortedShard) usize {
+    var max_window: usize = 0;
+    for (shards) |shard| max_window = @max(max_window, shard.hits.len);
+    return max_window;
+}
+
+fn distributedShardWindowCandidateCount(shards: []const DistributedSortedShard) u32 {
+    var count: u32 = 0;
+    for (shards) |shard| {
+        count = count +| boundedU32(shard.hits.len);
+    }
+    return count;
+}
+
+fn distributedShardTotalHitsRelation(shards: []const DistributedSortedShard) types.TotalHitsRelation {
+    for (shards) |shard| {
+        if (shard.total_hits_relation == .gte) return .gte;
+    }
+    return .exact;
+}
+
+fn enforceDistributedSortShardWindowBudget(shards: []const DistributedSortedShard, budget: u32) !void {
+    const candidate_count = distributedShardWindowCandidateCount(shards);
+    if (candidate_count <= budget) return;
+    logExactSortBudgetRejection(
+        "distributed_merge",
+        .distributed_merge_shard_window,
+        null,
+        candidate_count,
+        budget,
+        .{ .kind = .distributed_k_way_merge },
+    );
+    return error.QueryCandidateBudgetExceeded;
+}
+
+fn mergeDistributedSortedHitsWithProfileAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    plan: SortExecutionPlan,
+    shards: []const DistributedSortedShard,
+) !DistributedSortedMergeResult {
+    resetLastSortRejectionDiagnostic();
+    if (plan.kind != .distributed_k_way_merge) {
+        logNativeSortPlanRejection("*", "distributed_merge_unsupported", "distributed_merge_plan_required");
+        return error.UnsupportedQueryRequest;
+    }
+
+    var effective = try effectiveSortRequestAlloc(alloc, req);
+    defer effective.deinit(alloc);
+    const effective_req = effective.req;
+
+    try validateSortPageOptions(effective_req);
+    try validateSortCursorContract(effective_req);
+    if (effective_req.order_by.len == 0) return error.InvalidQueryRequest;
+    if (effective_req.search_before.len > 0 and effective_req.offset != 0) return error.InvalidQueryRequest;
+    try validateScoreSortHasScoreBearingTextSource(effective_req);
+    try validateDistributedSortRuntimeMappings(plan, effective_req);
+    try validateDistributedSortedShards(alloc, effective_req, plan, shards);
+    try validateDistributedShardWindowsCompleteForRequestedPage(effective_req, shards);
+    try validateDistributedShardWindowsBoundedForRequestedPage(effective_req, shards);
+    try validateDistributedShardWindowsSoughtForCursor(effective_req, plan, shards);
+    try enforceDistributedSortShardWindowBudget(shards, distributedSortShardWindowBudget());
+    const total_hits_relation = distributedShardTotalHitsRelation(shards);
+
+    const bench_query_profile = shouldLogBenchQueryProfile();
+    const collect_sort_profile = bench_query_profile or effective_req.profile;
+    const merge_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
+    var profile = SortCollectorProfile{};
+    if (collect_sort_profile) {
+        profile.candidate_source = "distributed_shards";
+        profile.window_capacity = if (effective_req.search_after.len > 0 or effective_req.search_before.len > 0)
+            @intCast(effective_req.limit)
+        else
+            @intCast(@as(u64, effective_req.offset) +| @as(u64, effective_req.limit));
+        profile.distributed_shard_count = shards.len;
+        profile.distributed_shard_window = maxDistributedShardWindow(shards);
+    }
+
+    const heap: []DistributedMergeHeapEntry = if (shards.len > 0)
+        try alloc.alloc(DistributedMergeHeapEntry, shards.len)
+    else
+        &.{};
+    defer if (heap.len > 0) alloc.free(heap);
+    var heap_len: usize = 0;
+    for (shards, 0..) |shard, shard_index| {
+        if (shard.hits.len == 0) continue;
+        try distributedMergeHeapPush(effective_req, plan, shards, heap, &heap_len, .{
+            .shard_index = shard_index,
+            .hit_index = 0,
+        });
+        observeSortCollectorHeap(if (collect_sort_profile) &profile else null, heap_len);
+    }
+
+    const limit: usize = @intCast(effective_req.limit);
+    if (effective_req.search_before.len > 0) {
+        var ring: []types.SearchHit = if (limit > 0) try alloc.alloc(types.SearchHit, limit) else &.{};
+        var ring_start: usize = 0;
+        var ring_len: usize = 0;
+        errdefer {
+            for (0..ring_len) |i| ring[(ring_start + i) % ring.len].deinit(alloc);
+            if (ring.len > 0) alloc.free(ring);
+        }
+        const merge_loop_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
+        while (heap_len > 0) {
+            const entry = try distributedMergeHeapPop(effective_req, plan, shards, heap, &heap_len);
+            const hit = shards[entry.shard_index].hits[entry.hit_index];
+            if (collect_sort_profile) profile.candidate_count += 1;
+            if (try searchHitAllowedByCursor(effective_req, plan, hit)) {
+                if (collect_sort_profile) profile.admitted_count += 1;
+                try retainDistributedPreviousHit(alloc, ring, &ring_start, &ring_len, hit);
+            } else if (collect_sort_profile) {
+                profile.cursor_rejected_count += 1;
+            }
+            const next_index = entry.hit_index + 1;
+            if (next_index < shards[entry.shard_index].hits.len) {
+                try distributedMergeHeapPush(effective_req, plan, shards, heap, &heap_len, .{
+                    .shard_index = entry.shard_index,
+                    .hit_index = next_index,
+                });
+                observeSortCollectorHeap(if (collect_sort_profile) &profile else null, heap_len);
+            }
+        }
+        if (collect_sort_profile) profile.final_sort_ns = platform_time.monotonicNs() - merge_loop_start_ns;
+        const out = try alloc.alloc(types.SearchHit, ring_len);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |*hit| hit.deinit(alloc);
+            if (out.len > 0) alloc.free(out);
+        }
+        for (0..ring_len) |i| {
+            const ring_index = (ring_start + i) % ring.len;
+            out[i] = ring[ring_index];
+            ring[ring_index] = undefined;
+            initialized += 1;
+        }
+        if (ring.len > 0) alloc.free(ring);
+        if (collect_sort_profile) {
+            profile.selected_count = out.len;
+            profile.window_len = out.len;
+            profile.total_ns = platform_time.monotonicNs() - merge_start_ns;
+        }
+        if (bench_query_profile) {
+            logBenchSortCollectorProfile(effective_req, plan, false, profile);
+        }
+        return .{
+            .hits = out,
+            .total_hits_relation = total_hits_relation,
+            .sort_profile = if (collect_sort_profile) sortResultProfile(effective_req, plan, false, profile) else null,
+        };
+    }
+
+    var out = std.ArrayListUnmanaged(types.SearchHit).empty;
+    errdefer {
+        for (out.items) |*hit| hit.deinit(alloc);
+        out.deinit(alloc);
+    }
+    const skip_count: usize = if (effective_req.search_after.len > 0) 0 else @intCast(effective_req.offset);
+    var selected_count: usize = 0;
+    const merge_loop_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
+    while (heap_len > 0 and out.items.len < limit) {
+        const entry = try distributedMergeHeapPop(effective_req, plan, shards, heap, &heap_len);
+        const hit = shards[entry.shard_index].hits[entry.hit_index];
+        if (collect_sort_profile) profile.candidate_count += 1;
+        if (try searchHitAllowedByCursor(effective_req, plan, hit)) {
+            if (collect_sort_profile) profile.admitted_count += 1;
+            if (try appendDistributedMergedHit(alloc, &out, hit, &selected_count, skip_count, limit)) break;
+        } else if (collect_sort_profile) {
+            profile.cursor_rejected_count += 1;
+        }
+        const next_index = entry.hit_index + 1;
+        if (next_index < shards[entry.shard_index].hits.len) {
+            try distributedMergeHeapPush(effective_req, plan, shards, heap, &heap_len, .{
+                .shard_index = entry.shard_index,
+                .hit_index = next_index,
+            });
+            observeSortCollectorHeap(if (collect_sort_profile) &profile else null, heap_len);
+        }
+    }
+    if (collect_sort_profile) profile.final_sort_ns = platform_time.monotonicNs() - merge_loop_start_ns;
+    const hits = try out.toOwnedSlice(alloc);
+    if (collect_sort_profile) {
+        profile.selected_count = hits.len;
+        profile.window_len = hits.len;
+        profile.total_ns = platform_time.monotonicNs() - merge_start_ns;
+    }
+    if (bench_query_profile) {
+        logBenchSortCollectorProfile(effective_req, plan, false, profile);
+    }
+    return .{
+        .hits = hits,
+        .total_hits_relation = total_hits_relation,
+        .sort_profile = if (collect_sort_profile) sortResultProfile(effective_req, plan, false, profile) else null,
+    };
+}
+
+fn mergeDistributedSortedHitsAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    plan: SortExecutionPlan,
+    shards: []const DistributedSortedShard,
+) ![]types.SearchHit {
+    return (try mergeDistributedSortedHitsWithProfileAlloc(alloc, req, plan, shards)).hits;
+}
+
+pub fn mergeDistributedSortedSearchResultHitsAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    results: []const types.SearchResult,
+) ![]types.SearchHit {
+    return try mergeDistributedSortedSearchResultHitsWithRuntimeSchemaAlloc(alloc, req, results, null);
+}
+
+pub fn mergeDistributedSortedSearchResultHitsWithRuntimeSchemaAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    results: []const types.SearchResult,
+    runtime_schema: ?runtime_schema_mod.TableSchema,
+) ![]types.SearchHit {
+    var effective = if (requestHasSortPageOptions(req))
+        try effectiveSortRequestAlloc(alloc, req)
+    else
+        EffectiveSortRequest{ .req = req };
+    defer effective.deinit(alloc);
+    const effective_req = effective.req;
+    if (effective_req.order_by.len == 0) return error.InvalidQueryRequest;
+
+    var shards = try alloc.alloc(DistributedSortedShard, results.len);
+    defer alloc.free(shards);
+    var available_hits: usize = 0;
+    for (results, 0..) |result, i| {
+        shards[i] = .{
+            .hits = result.hits,
+            .total_hits = result.total_hits,
+            .total_hits_relation = result.total_hits_relation,
+        };
+        available_hits += result.hits.len;
+    }
+
+    var merge_req = effective_req;
+    if (merge_req.limit == 0) {
+        merge_req.limit = @intCast(@min(available_hits, @as(usize, std.math.maxInt(u32))));
+    }
+    return try mergeDistributedSortedHitsAlloc(alloc, merge_req, .{
+        .kind = .distributed_k_way_merge,
+        .runtime_schema = runtime_schema,
+    }, shards);
+}
+
+pub fn mergeDistributedSortedSearchResultsAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    results: []const types.SearchResult,
+) !DistributedSortedMergeResult {
+    return try mergeDistributedSortedSearchResultsWithRuntimeSchemaAlloc(alloc, req, results, null);
+}
+
+pub fn mergeDistributedSortedSearchResultsWithRuntimeSchemaAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    results: []const types.SearchResult,
+    runtime_schema: ?runtime_schema_mod.TableSchema,
+) !DistributedSortedMergeResult {
+    var effective = if (requestHasSortPageOptions(req))
+        try effectiveSortRequestAlloc(alloc, req)
+    else
+        EffectiveSortRequest{ .req = req };
+    defer effective.deinit(alloc);
+    const effective_req = effective.req;
+    if (effective_req.order_by.len == 0) return error.InvalidQueryRequest;
+
+    var shards = try alloc.alloc(DistributedSortedShard, results.len);
+    defer alloc.free(shards);
+    var available_hits: usize = 0;
+    for (results, 0..) |result, i| {
+        shards[i] = .{
+            .hits = result.hits,
+            .total_hits = result.total_hits,
+            .total_hits_relation = result.total_hits_relation,
+        };
+        available_hits += result.hits.len;
+    }
+
+    var merge_req = effective_req;
+    if (merge_req.limit == 0) {
+        merge_req.limit = @intCast(@min(available_hits, @as(usize, std.math.maxInt(u32))));
+    }
+    return try mergeDistributedSortedHitsWithProfileAlloc(alloc, merge_req, .{
+        .kind = .distributed_k_way_merge,
+        .runtime_schema = runtime_schema,
+    }, shards);
+}
+
+fn jsonFieldValue(value: std.json.Value, field: []const u8) ?std.json.Value {
+    var current = value;
+    var parts = std.mem.splitScalar(u8, field, '.');
+    while (parts.next()) |part| {
+        if (part.len == 0) return null;
+        if (current != .object) return null;
+        current = current.object.get(part) orelse return null;
+    }
+    return current;
+}
+
+fn sortValueFromJson(value: ?std.json.Value) !SortValue {
+    const actual = value orelse return .null_value;
+    return switch (actual) {
+        .null => .null_value,
+        .bool => |v| .{ .bool_value = v },
+        .integer => |v| .{ .integer = v },
+        .float => |v| if (std.math.isFinite(v)) .{ .number = v } else error.InvalidQueryRequest,
+        .number_string => |v| if (jsonNumberStringIsNumeric(v)) .{ .number_string = v } else error.InvalidQueryRequest,
+        .string => |v| .{ .string = v },
+        .array, .object => error.UnsupportedQueryRequest,
+    };
+}
+
+fn ownedSortValueFromJson(alloc: Allocator, value: ?std.json.Value) !SortValue {
+    const sort_value = try sortValueFromJson(value);
+    return switch (sort_value) {
+        .string => |text| .{ .string = try alloc.dupe(u8, text) },
+        .number_string => |text| .{ .number_string = try alloc.dupe(u8, text) },
+        else => sort_value,
+    };
+}
+
+fn ownedSortValueFromJsonForPlanFieldAlloc(
+    alloc: Allocator,
+    plan: SortExecutionPlan,
+    field: []const u8,
+    value: ?std.json.Value,
+) !SortValue {
+    if (plan.runtime_schema) |schema| {
+        if (sortFieldMapping(schema, field)) |mapping| {
+            if (mapping.field_type == .datetime) {
+                if (value) |actual| {
+                    if (actual != .null) {
+                        if (datetimeCursorValueAsNs(actual)) |ns| return .{ .u64_value = ns };
+                    }
+                }
+            }
+        }
+    }
+    return try ownedSortValueFromJson(alloc, value);
+}
+
+fn nativeSortValueMatchesMappedField(value: SortValue, mapping: runtime_schema_mod.FieldMapping) bool {
+    if (nativeSortValueRejectionReason(mapping, value) != null) return false;
+    return true;
+}
+
+fn nativeSortValueRejectionReason(mapping: runtime_schema_mod.FieldMapping, value: SortValue) ?NativeSortPlanRejectionReason {
+    if (value == .null_value) return switch (mapping.missing_null_policy) {
+        .missing_rejected => .missing_null_policy,
+    };
+    return switch (mapping.field_type) {
+        .keyword, .link => if (value == .string) null else .invalid_doc_value_type,
+        .numeric => switch (value) {
+            .integer, .u64_value => null,
+            .number => |number| if (std.math.isFinite(number)) null else .invalid_doc_value_type,
+            else => .invalid_doc_value_type,
+        },
+        .boolean => if (value == .bool_value) null else .invalid_doc_value_type,
+        .datetime => if (sortValueAsU64(value) != null) null else .invalid_doc_value_type,
+        else => .non_scalar_field,
+    };
+}
+
+fn nativeSortValueMatchesPlanField(plan: SortExecutionPlan, field: []const u8, value: SortValue) bool {
+    const schema = plan.runtime_schema orelse return true;
+    const mapping = sortFieldMapping(schema, field) orelse return false;
+    return nativeSortValueMatchesMappedField(value, mapping);
+}
+
+fn nativeSortValueRejectionReasonForPlanField(plan: SortExecutionPlan, field: []const u8, value: SortValue) ?NativeSortPlanRejectionReason {
+    const schema = plan.runtime_schema orelse return null;
+    const mapping = sortFieldMapping(schema, field) orelse return .unmapped_field;
+    return nativeSortValueRejectionReason(mapping, value);
+}
+
+fn validateSortValueForPlanField(plan: SortExecutionPlan, field: types.SortField, value: SortValue) !void {
+    if (!sortFieldNeedsNativeValue(field)) return;
+    if (nativeSortValueRejectionReasonForPlanField(plan, field.field, value)) |reason| {
+        logNativeSortPlanRejection(
+            field.field,
+            nativeSortPlanRejectionReasonName(reason),
+            nativeSortPlanRejectionDetailName(reason),
+        );
+        return error.UnsupportedExactSort;
+    }
+}
+
+fn sortValueAsU64(value: SortValue) ?u64 {
+    return switch (value) {
+        .integer => |v| if (v >= 0) @intCast(v) else null,
+        .u64_value => |v| v,
+        .number => |v| blk: {
+            if (std.math.isNan(v) or v < 0) break :blk null;
+            if (v >= 18446744073709551616.0) break :blk null;
+            const int_value: u64 = @intFromFloat(v);
+            if (@as(f64, @floatFromInt(int_value)) != v) break :blk null;
+            break :blk int_value;
+        },
+        .number_string => |v| std.fmt.parseInt(u64, v, 10) catch null,
+        else => null,
+    };
+}
+
+fn sortValueJsonForFieldAlloc(alloc: Allocator, plan: SortExecutionPlan, field: []const u8, value: SortValue) !std.json.Value {
+    if (plan.runtime_schema) |schema| {
+        if (sortFieldMapping(schema, field)) |mapping| {
+            if (mapping.field_type == .datetime) {
+                if (sortValueAsU64(value)) |ns| {
+                    return .{ .string = try runtime_schema_mod.formatDateTimeNsAlloc(alloc, ns) };
+                }
+                return error.UnsupportedQueryRequest;
+            }
+        }
+    }
+    return switch (value) {
+        .null_value => .null,
+        .bool_value => |v| .{ .bool = v },
+        .integer => |v| .{ .integer = v },
+        .u64_value => |v| if (v <= @as(u64, @intCast(std.math.maxInt(i64))))
+            .{ .integer = @intCast(v) }
+        else
+            .{ .number_string = try std.fmt.allocPrint(alloc, "{d}", .{v}) },
+        .number => |v| .{ .float = v },
+        .number_string => |v| .{ .number_string = try alloc.dupe(u8, v) },
+        .string => |v| .{ .string = try alloc.dupe(u8, v) },
+    };
+}
+
+fn datetimeCursorValueAsNs(value: std.json.Value) ?u64 {
+    return switch (value) {
+        .integer => |v| if (v >= 0) @intCast(v) else null,
+        .number_string => |v| std.fmt.parseInt(u64, v, 10) catch null,
+        .string => |v| runtime_schema_mod.parseDateTimeToNs(v),
+        else => null,
+    };
+}
+
+fn appendSortValueJson(alloc: Allocator, values: *std.ArrayListUnmanaged(std.json.Value), plan: SortExecutionPlan, field: []const u8, value: SortValue) !void {
+    const json_value = try sortValueJsonForFieldAlloc(alloc, plan, field, value);
+    errdefer {
+        var owned = json_value;
+        types.deinitJsonValue(alloc, &owned);
+    }
+    try values.append(alloc, json_value);
+}
+
+fn sortValueFromCursorJson(plan: SortExecutionPlan, field: []const u8, value: std.json.Value) !SortValue {
+    if (plan.runtime_schema) |schema| {
+        if (sortFieldMapping(schema, field)) |mapping| {
+            if (!mappedSortCursorValueIsValid(mapping, value)) return error.InvalidQueryRequest;
+            if (mapping.field_type == .datetime) {
+                return .{ .u64_value = datetimeCursorValueAsNs(value) orelse return error.InvalidQueryRequest };
+            }
+        }
+    }
+    return sortValueFromJson(value) catch error.InvalidQueryRequest;
+}
+
+fn nativeSortPlanUsesConcreteSortKeys(plan: SortExecutionPlan) bool {
+    return plan.kind == .native_doc_values_top_n or
+        plan.kind == .sorted_segment_seek or
+        plan.kind == .distributed_k_way_merge;
+}
+
+fn cursorRejectionReasonForConcreteSortKey(
+    plan: SortExecutionPlan,
+    field: []const u8,
+    sort_key: SortValue,
+    cursor_value: std.json.Value,
+) ?NativeSortPlanRejectionReason {
+    if (!nativeSortPlanUsesConcreteSortKeys(plan)) return null;
+    if (std.mem.eql(u8, field, "_id")) return if (cursor_value == .string) null else .invalid_cursor_type;
+    if (std.mem.eql(u8, field, "_score")) return if (jsonValueIsNumeric(cursor_value)) null else .invalid_cursor_type;
+    const schema = plan.runtime_schema orelse return null;
+    const mapping = sortFieldMapping(schema, field) orelse return .unmapped_field;
+    if (mapping.field_type == .datetime) return mappedSortCursorRejectionReason(mapping, cursor_value);
+    if (cursor_value == .null) return switch (mapping.missing_null_policy) {
+        .missing_rejected => .missing_null_policy,
+    };
+    return switch (sort_key) {
+        .null_value => .missing_null_policy,
+        .bool_value => if (cursor_value == .bool) null else .invalid_cursor_type,
+        .integer => switch (cursor_value) {
+            .integer => null,
+            .number_string => |text| if (std.fmt.parseInt(i64, text, 10)) |_| null else |_| .invalid_cursor_type,
+            else => .invalid_cursor_type,
+        },
+        .u64_value => switch (cursor_value) {
+            .integer => |v| if (v >= 0) null else .invalid_cursor_type,
+            .number_string => |text| if (std.fmt.parseInt(u64, text, 10)) |_| null else |_| .invalid_cursor_type,
+            else => .invalid_cursor_type,
+        },
+        .number => if (jsonValueIsNumeric(cursor_value)) null else .invalid_cursor_type,
+        .number_string => if (jsonValueIsNumeric(cursor_value)) null else .invalid_cursor_type,
+        .string => if (cursor_value == .string) null else .invalid_cursor_type,
+    };
+}
+
+fn sortValueFromCursorJsonForSortKey(plan: SortExecutionPlan, field: []const u8, sort_key: SortValue, value: std.json.Value) !SortValue {
+    if (cursorRejectionReasonForConcreteSortKey(plan, field, sort_key, value)) |reason| {
+        logNativeSortPlanRejection(
+            field,
+            nativeSortPlanRejectionReasonName(reason),
+            nativeSortPlanRejectionDetailName(reason),
+        );
+        return error.InvalidQueryRequest;
+    }
+    return sortValueFromCursorJson(plan, field, value);
+}
+
+fn compareDecoratedHitToCursor(req: types.SearchRequest, plan: SortExecutionPlan, hit: DecoratedSortHit, cursor: []const std.json.Value) !std.math.Order {
+    for (req.order_by, 0..) |field, i| {
+        const cursor_value = try sortValueFromCursorJsonForSortKey(plan, field.field, hit.keys[i], cursor[i]);
+        const order = compareSortValues(hit.keys[i], cursor_value);
+        if (order != .eq) {
+            if (field.desc) {
+                return switch (order) {
+                    .lt => .gt,
+                    .eq => .eq,
+                    .gt => .lt,
+                };
+            }
+            return order;
+        }
+    }
+    return .eq;
+}
+
+fn sortCursorValueIsReplayable(value: std.json.Value) bool {
+    return switch (value) {
+        .float => |v| std.math.isFinite(v),
+        .number_string => |v| jsonNumberStringIsNumeric(v),
+        .bool, .integer, .string => true,
+        .null => false,
+        .array, .object => false,
+    };
+}
+
+fn sortCursorContractRejectionReason(req: types.SearchRequest) !?NativeSortPlanRejectionReason {
+    try validateSortIdTiebreaker(req.order_by);
+    const field_count = effectiveSortFieldCountForRequest(req);
+    if (req.search_after.len > 0 and req.search_before.len > 0) return .invalid_cursor_arity;
+    if ((req.search_after.len > 0 or req.search_before.len > 0) and req.offset != 0) return .invalid_cursor_arity;
+    if (req.search_after.len > 0 and req.search_after.len != field_count) return .invalid_cursor_arity;
+    if (req.search_before.len > 0 and req.search_before.len != field_count) return .invalid_cursor_arity;
+    const cursor = activeSortCursor(req);
+    for (0..field_count) |i| {
+        const field = effectiveSortFieldAtForRequest(req, i);
+        if (cursor.len > 0 and !sortCursorValueIsReplayable(cursor[i])) {
+            return .invalid_cursor_type;
+        }
+        if (sortFieldIsScore(field) and cursor.len > 0 and !jsonValueIsNumeric(cursor[i])) {
+            return .invalid_cursor_type;
+        }
+        if (std.mem.eql(u8, field.field, "_id") and cursor.len > 0 and cursor[i] != .string) {
+            return .invalid_cursor_type;
+        }
+    }
+    return null;
+}
+
+fn sortCursorContractDiagnosticField(req: types.SearchRequest, reason: NativeSortPlanRejectionReason) []const u8 {
+    if (reason == .invalid_cursor_arity) return "*";
+    const cursor = activeSortCursor(req);
+    const field_count = effectiveSortFieldCountForRequest(req);
+    const check_count = @min(field_count, cursor.len);
+    for (0..check_count) |i| {
+        const field = effectiveSortFieldAtForRequest(req, i);
+        if (!sortCursorValueIsReplayable(cursor[i])) return field.field;
+        if (sortFieldIsScore(field) and !jsonValueIsNumeric(cursor[i])) return field.field;
+        if (std.mem.eql(u8, field.field, "_id") and cursor[i] != .string) return field.field;
+    }
+    return "*";
+}
+
+fn validateSortCursorContract(req: types.SearchRequest) !void {
+    if (try sortCursorContractRejectionReason(req)) |reason| {
+        logNativeSortPlanRejection(
+            sortCursorContractDiagnosticField(req, reason),
+            nativeSortPlanRejectionReasonName(reason),
+            nativeSortPlanRejectionDetailName(reason),
+        );
+        return error.InvalidQueryRequest;
+    }
+}
+
+test "sort cursor contract classifies arity separately from type" {
+    const order_by = [_]types.SortField{
+        .{ .field = "rank" },
+        .{ .field = "_id" },
+    };
+    const short_cursor = [_]std.json.Value{.{ .integer = 1 }};
+    const full_cursor = [_]std.json.Value{
+        .{ .integer = 1 },
+        .{ .string = "doc:a" },
+    };
+    const bad_id_cursor = [_]std.json.Value{
+        .{ .integer = 1 },
+        .{ .integer = 7 },
+    };
+    const null_cursor = [_]std.json.Value{
+        .null,
+        .{ .string = "doc:a" },
+    };
+    const non_finite_cursor = [_]std.json.Value{
+        .{ .number_string = "nan" },
+        .{ .string = "doc:a" },
+    };
+    const score_order = [_]types.SortField{
+        .{ .field = "_score", .desc = true },
+        .{ .field = "_id" },
+    };
+    const duplicate_order = [_]types.SortField{
+        .{ .field = "rank" },
+        .{ .field = "rank" },
+    };
+    const bad_score_cursor = [_]std.json.Value{
+        .{ .string = "not-a-score" },
+        .{ .string = "doc:a" },
+    };
+    const id_cursor = [_]std.json.Value{.{ .string = "doc:a" }};
+    const bad_default_id_cursor = [_]std.json.Value{.{ .integer = 7 }};
+
+    try std.testing.expectEqual(NativeSortPlanRejectionReason.invalid_cursor_arity, (try sortCursorContractRejectionReason(.{
+        .order_by = &order_by,
+        .search_after = &short_cursor,
+    })).?);
+    try std.testing.expectEqual(NativeSortPlanRejectionReason.invalid_cursor_arity, (try sortCursorContractRejectionReason(.{
+        .order_by = &order_by,
+        .search_after = &full_cursor,
+        .search_before = &full_cursor,
+    })).?);
+    try std.testing.expectEqual(NativeSortPlanRejectionReason.invalid_cursor_arity, (try sortCursorContractRejectionReason(.{
+        .order_by = &order_by,
+        .search_after = &full_cursor,
+        .offset = 1,
+    })).?);
+    try std.testing.expectEqual(NativeSortPlanRejectionReason.invalid_cursor_type, (try sortCursorContractRejectionReason(.{
+        .order_by = &order_by,
+        .search_after = &bad_id_cursor,
+    })).?);
+    try std.testing.expectEqual(NativeSortPlanRejectionReason.invalid_cursor_type, (try sortCursorContractRejectionReason(.{
+        .order_by = &order_by,
+        .search_after = &null_cursor,
+    })).?);
+    try std.testing.expectEqual(NativeSortPlanRejectionReason.invalid_cursor_type, (try sortCursorContractRejectionReason(.{
+        .order_by = &order_by,
+        .search_after = &non_finite_cursor,
+    })).?);
+    try std.testing.expectEqual(NativeSortPlanRejectionReason.invalid_cursor_type, (try sortCursorContractRejectionReason(.{
+        .order_by = &score_order,
+        .search_after = &bad_score_cursor,
+    })).?);
+    try std.testing.expectError(error.InvalidQueryRequest, sortCursorContractRejectionReason(.{
+        .order_by = &duplicate_order,
+    }));
+    try std.testing.expect((try sortCursorContractRejectionReason(.{
+        .order_by = &order_by,
+        .search_after = &full_cursor,
+    })) == null);
+    try std.testing.expect((try sortCursorContractRejectionReason(.{
+        .search_after = &id_cursor,
+    })) == null);
+    try std.testing.expectEqual(NativeSortPlanRejectionReason.invalid_cursor_arity, (try sortCursorContractRejectionReason(.{
+        .search_after = &full_cursor,
+    })).?);
+    try std.testing.expectEqual(NativeSortPlanRejectionReason.invalid_cursor_type, (try sortCursorContractRejectionReason(.{
+        .search_after = &bad_default_id_cursor,
+    })).?);
+    try std.testing.expectEqualStrings("_id", sortCursorContractDiagnosticField(.{
+        .search_after = &bad_default_id_cursor,
+    }, .invalid_cursor_type));
+
+    var effective = try effectiveSortRequestAlloc(std.testing.allocator, .{
+        .search_after = &id_cursor,
+    });
+    defer effective.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), effective.req.order_by.len);
+    try std.testing.expectEqualStrings("_id", effective.req.order_by[0].field);
+    try std.testing.expect(!effective.req.order_by[0].desc);
+
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.InvalidQueryRequest, validateSortCursorContract(.{
+        .order_by = &order_by,
+        .search_after = &short_cursor,
+    }));
+    var diagnostic = takeLastSortRejectionDiagnostic().?;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.reason);
+    try std.testing.expectEqualStrings("invalid_cursor_arity", diagnostic.detail);
+
+    try std.testing.expectError(error.InvalidQueryRequest, validateSortCursorContract(.{
+        .order_by = &order_by,
+        .search_after = &bad_id_cursor,
+    }));
+    diagnostic = takeLastSortRejectionDiagnostic().?;
+    try std.testing.expectEqualStrings("_id", diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.reason);
+    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
+}
+
+test "sort page validation records count-only ordered page diagnostic" {
+    const order_by = [_]types.SortField{
+        .{ .field = "rank" },
+        .{ .field = "_id" },
+    };
+
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, validateSortPageOptions(.{
+        .count_only = true,
+        .order_by = &order_by,
+    }));
+    const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", diagnostic.reason);
+    try std.testing.expectEqualStrings("count_only_ordered_page", diagnostic.detail);
+}
+
+test "composed sort validation records approximate source diagnostic" {
+    const order_by = [_]types.SortField{
+        .{ .field = "rank" },
+        .{ .field = "_id" },
+    };
+    const dense_queries = [_]types.NamedDenseQuery{.{
+        .name = "dense",
+        .index_name = "embedding",
+        .query = .{ .vector = &[_]f32{1.0} },
+    }};
+
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, validateComposedSortPageOptions(.{
+        .order_by = &order_by,
+        .dense_queries = &dense_queries,
+    }));
+    const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.reason);
+    try std.testing.expectEqualStrings("approximate_candidate_source", diagnostic.detail);
+}
+
+fn activeSortCursor(req: types.SearchRequest) []const std.json.Value {
+    if (req.search_after.len > 0) return req.search_after;
+    if (req.search_before.len > 0) return req.search_before;
+    return &.{};
+}
+
+fn sortWindowCapacity(req: types.SearchRequest) usize {
+    if (req.search_after.len > 0 or req.search_before.len > 0) return @intCast(req.limit);
+    const wanted = @as(u64, req.offset) +| @as(u64, req.limit);
+    return @intCast(@min(wanted, @as(u64, std.math.maxInt(usize))));
+}
+
+fn decoratedHitAllowedByCursor(req: types.SearchRequest, plan: SortExecutionPlan, hit: DecoratedSortHit) !bool {
+    if (req.search_after.len > 0) return (try compareDecoratedHitToCursor(req, plan, hit, req.search_after)) == .gt;
+    if (req.search_before.len > 0) return (try compareDecoratedHitToCursor(req, plan, hit, req.search_before)) == .lt;
+    return true;
+}
+
+fn decoratedHitBetterThanWorst(req: types.SearchRequest, candidate: DecoratedSortHit, worst: DecoratedSortHit, keep_previous_page: bool) bool {
+    const order = compareDecoratedSortHits(req, candidate, worst);
+    if (keep_previous_page) return order == .gt;
+    return order == .lt;
+}
+
+fn decoratedHitWorseThan(req: types.SearchRequest, candidate: DecoratedSortHit, other: DecoratedSortHit, keep_previous_page: bool) bool {
+    const order = compareDecoratedSortHits(req, candidate, other);
+    if (keep_previous_page) return order == .lt;
+    return order == .gt;
+}
+
+fn sortWindowHeapSiftUp(req: types.SearchRequest, window: []DecoratedSortHit, child_index: usize, keep_previous_page: bool) void {
+    var child = child_index;
+    while (child > 0) {
+        const parent = (child - 1) / 2;
+        if (!decoratedHitWorseThan(req, window[child], window[parent], keep_previous_page)) break;
+        std.mem.swap(DecoratedSortHit, &window[child], &window[parent]);
+        child = parent;
+    }
+}
+
+fn sortWindowHeapSiftDown(req: types.SearchRequest, window: []DecoratedSortHit, root_index: usize, keep_previous_page: bool) void {
+    var root = root_index;
+    while (true) {
+        const left = root * 2 + 1;
+        if (left >= window.len) return;
+        const right = left + 1;
+        var worst_child = left;
+        if (right < window.len and decoratedHitWorseThan(req, window[right], window[left], keep_previous_page)) {
+            worst_child = right;
+        }
+        if (!decoratedHitWorseThan(req, window[worst_child], window[root], keep_previous_page)) return;
+        std.mem.swap(DecoratedSortHit, &window[root], &window[worst_child]);
+        root = worst_child;
+    }
+}
+
+fn admitDecoratedSortHitIntoWindow(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    window: []DecoratedSortHit,
+    window_len: *usize,
+    keep_previous_page: bool,
+    profile: ?*SortCollectorProfile,
+    decorated: DecoratedSortHit,
+    allowed_by_cursor: bool,
+) void {
+    if (!allowed_by_cursor or window.len == 0) {
+        if (profile) |p| {
+            if (!allowed_by_cursor) {
+                p.cursor_rejected_count += 1;
+            } else {
+                p.discarded_count += 1;
+            }
+        }
+        var owned = decorated;
+        owned.deinit(alloc);
+        return;
+    }
+    if (window_len.* < window.len) {
+        window[window_len.*] = decorated;
+        window_len.* += 1;
+        sortWindowHeapSiftUp(req, window[0..window_len.*], window_len.* - 1, keep_previous_page);
+        if (profile) |p| {
+            p.admitted_count += 1;
+            p.collector_heap_peak = @max(p.collector_heap_peak, window_len.*);
+        }
+        return;
+    }
+
+    if (decoratedHitBetterThanWorst(req, decorated, window[0], keep_previous_page)) {
+        window[0].deinit(alloc);
+        window[0] = decorated;
+        sortWindowHeapSiftDown(req, window[0..window_len.*], 0, keep_previous_page);
+        if (profile) |p| {
+            p.replaced_count += 1;
+            p.admitted_count += 1;
+            p.collector_heap_peak = @max(p.collector_heap_peak, window_len.*);
+        }
+    } else {
+        if (profile) |p| p.discarded_count += 1;
+        var owned = decorated;
+        owned.deinit(alloc);
+    }
+}
+
+fn testDecoratedSortHitAlloc(alloc: Allocator, id: []const u8, rank: i64) !DecoratedSortHit {
+    const keys = try alloc.alloc(SortValue, 2);
+    errdefer alloc.free(keys);
+    keys[0] = .{ .integer = rank };
+    keys[1] = .{ .string = try alloc.dupe(u8, id) };
+    errdefer keys[1].deinit(alloc);
+
+    const sort_values = try alloc.alloc(std.json.Value, 2);
+    errdefer alloc.free(sort_values);
+    sort_values[0] = .{ .integer = rank };
+    sort_values[1] = .{ .string = try alloc.dupe(u8, id) };
+    errdefer types.deinitJsonValue(alloc, &sort_values[1]);
+
+    return .{
+        .hit = .{
+            .id = try alloc.dupe(u8, id),
+            .sort_values = sort_values,
+        },
+        .keys = keys,
+    };
+}
+
+test "sort collector window uses bounded heap replacement for next and previous pages" {
+    const alloc = std.testing.allocator;
+    const order_by = [_]types.SortField{
+        .{ .field = "rank" },
+        .{ .field = "_id" },
+    };
+    const req = types.SearchRequest{
+        .order_by = &order_by,
+        .limit = 2,
+    };
+
+    var next_window = try alloc.alloc(DecoratedSortHit, 2);
+    defer alloc.free(next_window);
+    var next_len: usize = 0;
+    var next_profile = SortCollectorProfile{};
+    const next_inputs = [_]struct { id: []const u8, rank: i64 }{
+        .{ .id = "doc:4", .rank = 4 },
+        .{ .id = "doc:1", .rank = 1 },
+        .{ .id = "doc:3", .rank = 3 },
+        .{ .id = "doc:2", .rank = 2 },
+    };
+    for (next_inputs) |input| {
+        admitDecoratedSortHitIntoWindow(
+            alloc,
+            req,
+            next_window,
+            &next_len,
+            false,
+            &next_profile,
+            try testDecoratedSortHitAlloc(alloc, input.id, input.rank),
+            true,
+        );
+    }
+    defer for (next_window[0..next_len]) |*item| item.deinit(alloc);
+    std.sort.pdq(DecoratedSortHit, next_window[0..next_len], req, decoratedLessThan);
+    try std.testing.expectEqual(@as(usize, 2), next_len);
+    try std.testing.expectEqual(@as(i64, 1), next_window[0].keys[0].integer);
+    try std.testing.expectEqualStrings("doc:1", next_window[0].keys[1].string);
+    try std.testing.expectEqual(@as(i64, 2), next_window[1].keys[0].integer);
+    try std.testing.expectEqualStrings("doc:2", next_window[1].keys[1].string);
+    try std.testing.expectEqual(@as(u64, 2), next_profile.replaced_count);
+    try std.testing.expectEqual(@as(u64, 0), next_profile.discarded_count);
+
+    var previous_window = try alloc.alloc(DecoratedSortHit, 2);
+    defer alloc.free(previous_window);
+    var previous_len: usize = 0;
+    var previous_profile = SortCollectorProfile{};
+    for (next_inputs) |input| {
+        admitDecoratedSortHitIntoWindow(
+            alloc,
+            req,
+            previous_window,
+            &previous_len,
+            true,
+            &previous_profile,
+            try testDecoratedSortHitAlloc(alloc, input.id, input.rank),
+            true,
+        );
+    }
+    defer for (previous_window[0..previous_len]) |*item| item.deinit(alloc);
+    std.sort.pdq(DecoratedSortHit, previous_window[0..previous_len], req, decoratedLessThan);
+    try std.testing.expectEqual(@as(usize, 2), previous_len);
+    try std.testing.expectEqual(@as(i64, 3), previous_window[0].keys[0].integer);
+    try std.testing.expectEqualStrings("doc:3", previous_window[0].keys[1].string);
+    try std.testing.expectEqual(@as(i64, 4), previous_window[1].keys[0].integer);
+    try std.testing.expectEqualStrings("doc:4", previous_window[1].keys[1].string);
+    try std.testing.expectEqual(@as(u64, 1), previous_profile.replaced_count);
+    try std.testing.expectEqual(@as(u64, 1), previous_profile.discarded_count);
+}
+
+fn searchHitSortStoredJsonAlloc(
+    alloc: Allocator,
+    hit: *types.SearchHit,
+    load_ctx: ?*anyopaque,
+    load_stored: *const fn (?*anyopaque, Allocator, []const u8) anyerror!?[]u8,
+) !std.json.Parsed(std.json.Value) {
+    if (hit.stored_data == null) {
+        hit.stored_data = (try load_stored(load_ctx, alloc, hit.id)) orelse return error.StoredDocMissing;
+    }
+    return try std.json.parseFromSlice(std.json.Value, alloc, hit.stored_data.?, .{});
+}
+
+const TextDocValueSortContext = struct {
+    snapshot: *const index_mod.IndexSnapshot,
+    ordinal_to_text_doc_id: ?*const std.AutoHashMapUnmanaged(doc_set.DocOrdinal, u32) = null,
+};
+
+const TextDocValueSortPlanContext = struct {
+    plan: SortExecutionPlan,
+    ctx: TextDocValueSortContext,
+};
+
+fn logNativeDocValueLoadFailure(field: []const u8, detail: []const u8) void {
+    logNativeSortPlanRejection(
+        field,
+        nativeSortPlanRejectionReasonName(.missing_doc_values_capability),
+        detail,
+    );
+}
+
+fn nativeSortValueFromTextDocValuesAlloc(
+    alloc: Allocator,
+    snapshot: *const index_mod.IndexSnapshot,
+    native_text_doc_id: u32,
+    field: []const u8,
+) !?SortValue {
+    const resolved = snapshot.resolveDocId(native_text_doc_id) orelse return null;
+    const segment = &snapshot.segments[resolved.seg_idx];
+    const section_data = segment.reader.getSection(field, .typed_doc_values) orelse {
+        logNativeDocValueLoadFailure(field, "missing_doc_values_section");
+        return error.UnsupportedExactSort;
+    };
+    var reader = typed_dv.TypedDocValuesReader.init(alloc, section_data) catch {
+        logNativeDocValueLoadFailure(field, "malformed_doc_values_section");
+        return error.UnsupportedExactSort;
+    };
+    return switch (reader.value_type) {
+        .u64_val => {
+            const value = reader.getU64(resolved.local_id) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    logNativeDocValueLoadFailure(field, "malformed_doc_values_section");
+                    return error.UnsupportedExactSort;
+                },
+            } orelse {
+                logNativeDocValueLoadFailure(field, "sparse_live_doc_values");
+                return error.UnsupportedExactSort;
+            };
+            return .{ .u64_value = value };
+        },
+        .i64_val => {
+            const value = reader.getI64(resolved.local_id) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    logNativeDocValueLoadFailure(field, "malformed_doc_values_section");
+                    return error.UnsupportedExactSort;
+                },
+            } orelse {
+                logNativeDocValueLoadFailure(field, "sparse_live_doc_values");
+                return error.UnsupportedExactSort;
+            };
+            return .{ .integer = value };
+        },
+        .f64_val => {
+            const value = reader.getF64(resolved.local_id) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    logNativeDocValueLoadFailure(field, "malformed_doc_values_section");
+                    return error.UnsupportedExactSort;
+                },
+            } orelse {
+                logNativeDocValueLoadFailure(field, "sparse_live_doc_values");
+                return error.UnsupportedExactSort;
+            };
+            return .{ .number = value };
+        },
+        .bool_val => {
+            const value = reader.getBool(resolved.local_id) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    logNativeDocValueLoadFailure(field, "malformed_doc_values_section");
+                    return error.UnsupportedExactSort;
+                },
+            } orelse {
+                logNativeDocValueLoadFailure(field, "sparse_live_doc_values");
+                return error.UnsupportedExactSort;
+            };
+            return .{ .bool_value = value };
+        },
+        .bytes_val => {
+            const value = reader.getBytesAlloc(resolved.local_id) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    logNativeDocValueLoadFailure(field, "malformed_doc_values_section");
+                    return error.UnsupportedExactSort;
+                },
+            } orelse {
+                logNativeDocValueLoadFailure(field, "sparse_live_doc_values");
+                return error.UnsupportedExactSort;
+            };
+            return .{ .string = value };
+        },
+        .geo_point => {
+            logNativeDocValueLoadFailure(field, "unsupported_doc_values_type");
+            return error.UnsupportedExactSort;
+        },
+    };
+}
+
+fn loadTextDocValueSortValue(
+    ctx: ?*anyopaque,
+    alloc: Allocator,
+    hit: types.SearchHit,
+    field: []const u8,
+) anyerror!?SortValue {
+    const sort_ctx: *const TextDocValueSortContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+    const native_text_doc_id = hit.native_text_doc_id orelse blk: {
+        const ordinal = hit.doc_ordinal orelse return null;
+        const ordinal_map = sort_ctx.ordinal_to_text_doc_id orelse return null;
+        break :blk ordinal_map.get(ordinal) orelse return null;
+    };
+    return try nativeSortValueFromTextDocValuesAlloc(alloc, sort_ctx.snapshot, native_text_doc_id, field);
+}
+
+fn decorateSortHitAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    plan: SortExecutionPlan,
+    hit: types.SearchHit,
+    load_ctx: ?*anyopaque,
+    load_stored: *const fn (?*anyopaque, Allocator, []const u8) anyerror!?[]u8,
+    native_loader: ?NativeSortValueLoader,
+    profile: ?*SortCollectorProfile,
+) !DecoratedSortHit {
+    var owned_hit = hit;
+    errdefer owned_hit.deinit(alloc);
+
+    const keys = try alloc.alloc(SortValue, req.order_by.len);
+    var keys_initialized: usize = 0;
+    var values = std.ArrayListUnmanaged(std.json.Value).empty;
+    errdefer {
+        for (values.items) |*value| types.deinitJsonValue(alloc, value);
+        values.deinit(alloc);
+        deinitSortValues(keys[0..keys_initialized], alloc);
+        alloc.free(keys);
+    }
+
+    var parsed_doc: ?std.json.Parsed(std.json.Value) = null;
+    defer if (parsed_doc) |*parsed| parsed.deinit();
+    for (req.order_by, 0..) |field, i| {
+        const sort_value: SortValue = if (std.mem.eql(u8, field.field, "_id"))
+            .{ .string = try alloc.dupe(u8, owned_hit.id) }
+        else if (std.mem.eql(u8, field.field, "_score"))
+            .{ .number = try sortScoreNumber(owned_hit) }
+        else blk: {
+            if (native_loader) |loader| {
+                const native_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
+                const loaded_native = try loader.load(loader.ctx, alloc, owned_hit, field.field);
+                if (profile) |p| {
+                    p.native_doc_value_load_ns += platform_time.monotonicNs() - native_start_ns;
+                    if (loaded_native != null) {
+                        p.native_doc_value_hit_count += 1;
+                    } else {
+                        p.native_doc_value_miss_count += 1;
+                    }
+                }
+                if (loaded_native) |native_value| break :blk native_value;
+                if (plan.kind == .native_doc_values_top_n or plan.require_native or loader.require_native) {
+                    logNativeSortPlanRejection(
+                        field.field,
+                        nativeSortPlanRejectionReasonName(.missing_doc_values_capability),
+                        nativeSortPlanRejectionDetailName(.missing_doc_values_capability),
+                    );
+                    return error.UnsupportedExactSort;
+                }
+            }
+            if (parsed_doc == null) {
+                const stored_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
+                parsed_doc = try searchHitSortStoredJsonAlloc(alloc, &owned_hit, load_ctx, load_stored);
+                if (profile) |p| {
+                    p.stored_json_load_ns += platform_time.monotonicNs() - stored_start_ns;
+                    p.stored_json_load_count += 1;
+                }
+            }
+            break :blk try ownedSortValueFromJsonForPlanFieldAlloc(alloc, plan, field.field, jsonFieldValue(parsed_doc.?.value, field.field));
+        };
+        validateSortValueForPlanField(plan, field, sort_value) catch |err| {
+            sort_value.deinit(alloc);
+            return err;
+        };
+        keys[i] = sort_value;
+        keys_initialized += 1;
+        try appendSortValueJson(alloc, &values, plan, field.field, sort_value);
+    }
+    owned_hit.sort_values = try values.toOwnedSlice(alloc);
+    return .{ .hit = owned_hit, .keys = keys };
+}
+
+fn sortAndPageSearchResultInPlace(
+    result: *types.SearchResult,
+    req: types.SearchRequest,
+    load_ctx: ?*anyopaque,
+    load_stored: *const fn (?*anyopaque, Allocator, []const u8) anyerror!?[]u8,
+    plan: SortExecutionPlan,
+    native_loader: ?NativeSortValueLoader,
+) !void {
+    var effective = try effectiveSortRequestAlloc(result.alloc, req);
+    defer effective.deinit(result.alloc);
+    const effective_req = effective.req;
+
+    try validateSortPageOptions(effective_req);
+    if (effective_req.order_by.len == 0) return;
+    if (plan.kind == .none) return;
+    try validateSortExecutionPlanForRuntime(effective_req, plan, native_loader);
+    try checkSearchRequestDeadline(effective_req);
+    const bench_query_profile = shouldLogBenchQueryProfile();
+    const collect_sort_profile = bench_query_profile or effective_req.profile;
+    if (effective_req.limit == 0) {
+        const zero_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
+        const alloc = result.alloc;
+        const candidate_count = result.hits.len;
+        for (result.hits) |*hit| hit.deinit(alloc);
+        if (result.hits.len > 0) alloc.free(result.hits);
+        result.hits = &.{};
+        var profile = SortCollectorProfile{};
+        observeSortCandidateSource(if (collect_sort_profile) &profile else null, "existing_hits");
+        if (collect_sort_profile) {
+            profile.candidate_count = @intCast(@min(candidate_count, @as(usize, std.math.maxInt(u64))));
+            profile.window_capacity = 0;
+            profile.window_len = 0;
+            profile.total_ns = platform_time.monotonicNs() - zero_start_ns;
+            result.sort_profile = sortResultProfile(effective_req, plan, native_loader != null, profile);
+        }
+        if (bench_query_profile) {
+            logBenchSortCollectorProfile(effective_req, plan, native_loader != null, profile);
+        }
+        return;
+    }
+    const exact_candidate_budget = lateVisibilityExactCandidateBudget();
+    const candidate_count = boundedU32(result.hits.len);
+    enforceLateVisibilityExactCandidateBudget(candidate_count, exact_candidate_budget) catch |err| {
+        logSearchResultExactCandidateBudgetRejection(
+            effective_req,
+            plan,
+            candidate_count,
+            exact_candidate_budget,
+        );
+        return err;
+    };
+
+    const sort_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
+    var profile = SortCollectorProfile{};
+    observeSortCandidateSource(if (collect_sort_profile) &profile else null, "existing_hits");
+    const alloc = result.alloc;
+    const input_hits = result.hits;
+    result.hits = &.{};
+    const window_capacity = sortWindowCapacity(effective_req);
+    if (collect_sort_profile) profile.window_capacity = window_capacity;
+    const keep_previous_page = effective_req.search_before.len > 0;
+    var window: []DecoratedSortHit = if (window_capacity > 0)
+        try alloc.alloc(DecoratedSortHit, window_capacity)
+    else
+        &.{};
+    var window_len: usize = 0;
+    var processed_hits: usize = 0;
+    var input_owned = true;
+    var window_drained_prefix: usize = 0;
+    errdefer {
+        for (window[window_drained_prefix..window_len]) |*item| item.deinit(alloc);
+        if (window.len > 0) alloc.free(window);
+        if (input_owned) {
+            for (input_hits[processed_hits..]) |*hit| hit.deinit(alloc);
+            if (input_hits.len > 0) alloc.free(input_hits);
+        }
+    }
+    for (input_hits, 0..) |*hit, i| {
+        if (i % 1024 == 0) try checkSearchRequestDeadline(effective_req);
+        if (collect_sort_profile) profile.candidate_count += 1;
+        const raw_hit = hit.*;
+        hit.* = undefined;
+        processed_hits = i + 1;
+        const decorate_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
+        var decorated = try decorateSortHitAlloc(
+            alloc,
+            effective_req,
+            plan,
+            raw_hit,
+            load_ctx,
+            load_stored,
+            native_loader,
+            if (collect_sort_profile) &profile else null,
+        );
+        var decorated_owned = true;
+        errdefer if (decorated_owned) decorated.deinit(alloc);
+        if (collect_sort_profile) profile.decorate_ns += platform_time.monotonicNs() - decorate_start_ns;
+
+        const allowed_by_cursor = try decoratedHitAllowedByCursor(effective_req, plan, decorated);
+        admitDecoratedSortHitIntoWindow(
+            alloc,
+            effective_req,
+            window,
+            &window_len,
+            keep_previous_page,
+            if (collect_sort_profile) &profile else null,
+            decorated,
+            allowed_by_cursor,
+        );
+        decorated_owned = false;
+    }
+    if (input_hits.len > 0) alloc.free(input_hits);
+    input_owned = false;
+
+    try checkSearchRequestDeadline(effective_req);
+    const final_sort_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
+    std.sort.pdq(DecoratedSortHit, window[0..window_len], effective_req, decoratedLessThan);
+    if (collect_sort_profile) profile.final_sort_ns = platform_time.monotonicNs() - final_sort_start_ns;
+    try checkSearchRequestDeadline(effective_req);
+
+    var start: usize = 0;
+    var end: usize = window_len;
+    if (effective_req.search_after.len == 0 and effective_req.search_before.len == 0) {
+        start = @min(@as(usize, @intCast(effective_req.offset)), window_len);
+        end = @min(start + @as(usize, @intCast(effective_req.limit)), window_len);
+    }
+
+    const selected = try alloc.alloc(types.SearchHit, end - start);
+    var selected_initialized: usize = 0;
+    errdefer {
+        for (selected[0..selected_initialized]) |*hit| hit.deinit(alloc);
+        if (selected.len > 0) alloc.free(selected);
+    }
+    for (window[0..window_len], 0..) |*item, i| {
+        if (i % 1024 == 0) try checkSearchRequestDeadline(effective_req);
+        if (i >= start and i < end) {
+            selected[selected_initialized] = item.hit;
+            item.hit = undefined;
+            selected_initialized += 1;
+            if (collect_sort_profile) profile.selected_count += 1;
+        } else {
+            item.hit.deinit(alloc);
+        }
+        freeSortValues(alloc, item.keys);
+        window_drained_prefix = i + 1;
+    }
+    if (window.len > 0) alloc.free(window);
+    result.hits = selected;
+    if (collect_sort_profile) {
+        profile.window_len = window_len;
+        profile.total_ns = platform_time.monotonicNs() - sort_start_ns;
+        result.sort_profile = sortResultProfile(effective_req, plan, native_loader != null, profile);
+    }
+    if (bench_query_profile) {
+        logBenchSortCollectorProfile(effective_req, plan, native_loader != null, profile);
+    }
+}
+
+fn sortAndPageMatchAllCandidatesAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    candidates: *MatchAllCandidates,
+    load_ctx: ?*anyopaque,
+    load_stored: *const fn (?*anyopaque, Allocator, []const u8) anyerror!?[]u8,
+    plan: SortExecutionPlan,
+    native_loader: ?NativeSortValueLoader,
+) !types.SearchResult {
+    var effective = try effectiveSortRequestAlloc(alloc, req);
+    defer effective.deinit(alloc);
+    const effective_req = effective.req;
+
+    try validateSortPageOptions(effective_req);
+    if (effective_req.order_by.len == 0) return error.InvalidQueryRequest;
+    try validateMatchAllSortDoesNotUseScore(effective_req);
+    try validateSortExecutionPlanForRuntime(effective_req, plan, native_loader);
+    try checkSearchRequestDeadline(effective_req);
+    const bench_query_profile = shouldLogBenchQueryProfile();
+    const collect_sort_profile = bench_query_profile or effective_req.profile;
+    if (effective_req.limit == 0) {
+        const zero_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
+        var profile = SortCollectorProfile{};
+        observeSortCandidateSource(if (collect_sort_profile) &profile else null, "match_all");
+        if (collect_sort_profile) {
+            profile.candidate_count = @intCast(@min(candidates.items.len, @as(usize, std.math.maxInt(u64))));
+            profile.window_capacity = 0;
+            profile.window_len = 0;
+            profile.total_ns = platform_time.monotonicNs() - zero_start_ns;
+        }
+        if (bench_query_profile) {
+            logBenchSortCollectorProfile(effective_req, plan, native_loader != null, profile);
+        }
+        return .{
+            .alloc = alloc,
+            .hits = &.{},
+            .total_hits = @intCast(@min(candidates.items.len, @as(usize, std.math.maxInt(u32)))),
+            .total_hits_relation = .exact,
+            .sort_profile = if (collect_sort_profile) sortResultProfile(effective_req, plan, native_loader != null, profile) else null,
+            .graph_results = &.{},
+        };
+    }
+    const exact_candidate_budget = lateVisibilityExactCandidateBudget();
+    const candidate_count = boundedU32(candidates.items.len);
+    enforceLateVisibilityExactCandidateBudget(candidate_count, exact_candidate_budget) catch |err| {
+        logExactSortBudgetRejection(
+            "match_all",
+            .match_all_exact_candidate_window,
+            effective_req.index_name,
+            candidate_count,
+            exact_candidate_budget,
+            plan,
+        );
+        return err;
+    };
+
+    const sort_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
+    var profile = SortCollectorProfile{};
+    observeSortCandidateSource(if (collect_sort_profile) &profile else null, "match_all");
+    const window_capacity = sortWindowCapacity(effective_req);
+    if (collect_sort_profile) profile.window_capacity = window_capacity;
+    const keep_previous_page = effective_req.search_before.len > 0;
+    var window: []DecoratedSortHit = if (window_capacity > 0)
+        try alloc.alloc(DecoratedSortHit, window_capacity)
+    else
+        &.{};
+    var window_len: usize = 0;
+    var window_drained_prefix: usize = 0;
+    errdefer {
+        for (window[window_drained_prefix..window_len]) |*item| item.deinit(alloc);
+        if (window.len > 0) alloc.free(window);
+    }
+
+    for (candidates.items, 0..) |*candidate, i| {
+        if (i % 1024 == 0) try checkSearchRequestDeadline(effective_req);
+        if (collect_sort_profile) profile.candidate_count += 1;
+        const raw_hit = types.SearchHit{
+            .id = candidate.id,
+            .doc_ordinal = candidate.ordinal,
+            .score = 1.0,
+            .stored_data = null,
+        };
+        candidate.id = @constCast(&[_]u8{});
+
+        const decorate_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
+        var decorated = try decorateSortHitAlloc(
+            alloc,
+            effective_req,
+            plan,
+            raw_hit,
+            load_ctx,
+            load_stored,
+            native_loader,
+            if (collect_sort_profile) &profile else null,
+        );
+        var decorated_owned = true;
+        errdefer if (decorated_owned) decorated.deinit(alloc);
+        if (collect_sort_profile) profile.decorate_ns += platform_time.monotonicNs() - decorate_start_ns;
+
+        const allowed_by_cursor = try decoratedHitAllowedByCursor(effective_req, plan, decorated);
+        admitDecoratedSortHitIntoWindow(
+            alloc,
+            effective_req,
+            window,
+            &window_len,
+            keep_previous_page,
+            if (collect_sort_profile) &profile else null,
+            decorated,
+            allowed_by_cursor,
+        );
+        decorated_owned = false;
+    }
+
+    try checkSearchRequestDeadline(effective_req);
+    const final_sort_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
+    std.sort.pdq(DecoratedSortHit, window[0..window_len], effective_req, decoratedLessThan);
+    if (collect_sort_profile) profile.final_sort_ns = platform_time.monotonicNs() - final_sort_start_ns;
+    try checkSearchRequestDeadline(effective_req);
+
+    var start: usize = 0;
+    var end: usize = window_len;
+    if (effective_req.search_after.len == 0 and effective_req.search_before.len == 0) {
+        start = @min(@as(usize, @intCast(effective_req.offset)), window_len);
+        end = @min(start + @as(usize, @intCast(effective_req.limit)), window_len);
+    }
+
+    const selected = try alloc.alloc(types.SearchHit, end - start);
+    var selected_initialized: usize = 0;
+    errdefer {
+        for (selected[0..selected_initialized]) |*hit| hit.deinit(alloc);
+        if (selected.len > 0) alloc.free(selected);
+    }
+    for (window[0..window_len], 0..) |*item, i| {
+        if (i % 1024 == 0) try checkSearchRequestDeadline(effective_req);
+        if (i >= start and i < end) {
+            selected[selected_initialized] = item.hit;
+            item.hit = undefined;
+            selected_initialized += 1;
+            if (collect_sort_profile) profile.selected_count += 1;
+        } else {
+            item.hit.deinit(alloc);
+        }
+        freeSortValues(alloc, item.keys);
+        window_drained_prefix = i + 1;
+    }
+    if (window.len > 0) alloc.free(window);
+    if (collect_sort_profile) {
+        profile.window_len = window_len;
+        profile.total_ns = platform_time.monotonicNs() - sort_start_ns;
+    }
+    if (bench_query_profile) {
+        logBenchSortCollectorProfile(effective_req, plan, native_loader != null, profile);
+    }
+
+    return .{
+        .alloc = alloc,
+        .hits = selected,
+        .total_hits = @intCast(@min(candidates.items.len, @as(usize, std.math.maxInt(u32)))),
+        .sort_profile = if (collect_sort_profile) sortResultProfile(effective_req, plan, native_loader != null, profile) else null,
+        .graph_results = &.{},
+    };
+}
+
+const MatchAllSortStreamContext = struct {
+    alloc: Allocator,
+    req: types.SearchRequest,
+    plan: SortExecutionPlan,
+    load_ctx: ?*anyopaque,
+    load_stored: *const fn (?*anyopaque, Allocator, []const u8) anyerror!?[]u8,
+    native_loader: ?NativeSortValueLoader,
+    window: []DecoratedSortHit,
+    window_len: usize = 0,
+    keep_previous_page: bool,
+    profile: ?*SortCollectorProfile,
+    exact_candidate_budget: u32,
+    total_hits: u32 = 0,
+};
+
+const MatchAllCountStreamContext = struct {
+    alloc: Allocator,
+    req: types.SearchRequest,
+    accepted_count: usize = 0,
+};
+
+fn countMatchAllSortCandidate(ctx: ?*anyopaque, candidate: MatchAllCandidate) !void {
+    const count_ctx: *MatchAllCountStreamContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+    var owned_candidate = candidate;
+    defer owned_candidate.deinit(count_ctx.alloc);
+
+    count_ctx.accepted_count += 1;
+    if (count_ctx.accepted_count % 1024 == 0) try checkSearchRequestDeadline(count_ctx.req);
+}
+
+fn consumeMatchAllSortCandidate(ctx: ?*anyopaque, candidate: MatchAllCandidate) !void {
+    const stream_ctx: *MatchAllSortStreamContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+    const alloc = stream_ctx.alloc;
+    const next_candidate_count = stream_ctx.total_hits +| 1;
+    enforceLateVisibilityExactCandidateBudget(next_candidate_count, stream_ctx.exact_candidate_budget) catch |err| {
+        logExactSortBudgetRejection(
+            "match_all",
+            .match_all_exact_candidate_window,
+            stream_ctx.req.index_name,
+            next_candidate_count,
+            stream_ctx.exact_candidate_budget,
+            stream_ctx.plan,
+        );
+        return err;
+    };
+    if (stream_ctx.profile) |profile| profile.candidate_count += 1;
+    stream_ctx.total_hits = next_candidate_count;
+
+    var owned_candidate = candidate;
+    const raw_hit = types.SearchHit{
+        .id = owned_candidate.id,
+        .doc_ordinal = owned_candidate.ordinal,
+        .score = 1.0,
+        .stored_data = null,
+    };
+    owned_candidate.id = @constCast(&[_]u8{});
+
+    const decorate_start_ns = if (stream_ctx.profile != null) platform_time.monotonicNs() else 0;
+    var decorated = try decorateSortHitAlloc(
+        alloc,
+        stream_ctx.req,
+        stream_ctx.plan,
+        raw_hit,
+        stream_ctx.load_ctx,
+        stream_ctx.load_stored,
+        stream_ctx.native_loader,
+        stream_ctx.profile,
+    );
+    var decorated_owned = true;
+    errdefer if (decorated_owned) decorated.deinit(alloc);
+    if (stream_ctx.profile) |profile| profile.decorate_ns += platform_time.monotonicNs() - decorate_start_ns;
+
+    const allowed_by_cursor = try decoratedHitAllowedByCursor(stream_ctx.req, stream_ctx.plan, decorated);
+    admitDecoratedSortHitIntoWindow(
+        alloc,
+        stream_ctx.req,
+        stream_ctx.window,
+        &stream_ctx.window_len,
+        stream_ctx.keep_previous_page,
+        stream_ctx.profile,
+        decorated,
+        allowed_by_cursor,
+    );
+    decorated_owned = false;
+}
+
+fn sortAndPageMatchAllCandidateStreamAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: MatchAllExecutor,
+    options: MatchAllCandidateCollectOptions,
+    plan: SortExecutionPlan,
+    native_loader: ?NativeSortValueLoader,
+) !types.SearchResult {
+    var effective = try effectiveSortRequestAlloc(alloc, req);
+    defer effective.deinit(alloc);
+    const effective_req = effective.req;
+
+    try validateSortPageOptions(effective_req);
+    if (effective_req.order_by.len == 0) return error.InvalidQueryRequest;
+    try validateMatchAllSortDoesNotUseScore(effective_req);
+    try validateSortExecutionPlanForRuntime(effective_req, plan, native_loader);
+    try checkSearchRequestDeadline(effective_req);
+
+    const collect_stream = executor.collect_candidates_stream orelse return rejectSortCandidateStreamUnavailable(plan);
+    const bench_query_profile = shouldLogBenchQueryProfile();
+    const collect_sort_profile = bench_query_profile or effective_req.profile;
+    if (effective_req.limit == 0) {
+        const count_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
+        var count_ctx = MatchAllCountStreamContext{
+            .alloc = alloc,
+            .req = effective_req,
+        };
+        var count_options = options;
+        count_options.candidate_limit = null;
+        count_options.stop_after_accepted = null;
+        const stream_stats = try collect_stream(executor.ctx, alloc, effective_req, count_options, &count_ctx, countMatchAllSortCandidate);
+        try checkSearchRequestDeadline(effective_req);
+        const total_hits = boundedU32(count_ctx.accepted_count);
+        var profile = SortCollectorProfile{};
+        observeSortCandidateSource(if (collect_sort_profile) &profile else null, matchAllCandidateSourceForConstraints(options.constraints));
+        observeNativeFilterConstraints(if (collect_sort_profile) &profile else null, options.constraints);
+        if (collect_sort_profile) {
+            profile.candidate_count = @intCast(@min(count_ctx.accepted_count, @as(usize, std.math.maxInt(u64))));
+            profile.window_capacity = 0;
+            profile.window_len = 0;
+            profile.total_ns = platform_time.monotonicNs() - count_start_ns;
+        }
+        if (bench_query_profile) {
+            logBenchSortCollectorProfile(effective_req, plan, native_loader != null, profile);
+        }
+        return .{
+            .alloc = alloc,
+            .hits = &.{},
+            .total_hits = total_hits,
+            .total_hits_relation = if (stream_stats.stopped_early or count_options.primary_key_stop_before != null or count_ctx.accepted_count > std.math.maxInt(u32)) .gte else .exact,
+            .sort_profile = if (collect_sort_profile) sortResultProfile(effective_req, plan, native_loader != null, profile) else null,
+            .graph_results = &.{},
+        };
+    }
+
+    const sort_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
+    var profile = SortCollectorProfile{};
+    observeSortCandidateSource(if (collect_sort_profile) &profile else null, matchAllCandidateSourceForConstraints(options.constraints));
+    observeNativeFilterConstraints(if (collect_sort_profile) &profile else null, options.constraints);
+    const window_capacity = sortWindowCapacity(effective_req);
+    if (collect_sort_profile) profile.window_capacity = window_capacity;
+    const keep_previous_page = effective_req.search_before.len > 0;
+    var window: []DecoratedSortHit = if (window_capacity > 0)
+        try alloc.alloc(DecoratedSortHit, window_capacity)
+    else
+        &.{};
+    var stream_ctx = MatchAllSortStreamContext{
+        .alloc = alloc,
+        .req = effective_req,
+        .plan = plan,
+        .load_ctx = executor.ctx,
+        .load_stored = executor.load_stored,
+        .native_loader = native_loader,
+        .window = window,
+        .keep_previous_page = keep_previous_page,
+        .profile = if (collect_sort_profile) &profile else null,
+        .exact_candidate_budget = lateVisibilityExactCandidateBudget(),
+    };
+    var window_drained_prefix: usize = 0;
+    errdefer {
+        for (window[window_drained_prefix..stream_ctx.window_len]) |*item| item.deinit(alloc);
+        if (window.len > 0) alloc.free(window);
+    }
+
+    const stream_stats = try collect_stream(executor.ctx, alloc, req, options, &stream_ctx, consumeMatchAllSortCandidate);
+
+    try checkSearchRequestDeadline(effective_req);
+    const final_sort_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
+    std.sort.pdq(DecoratedSortHit, stream_ctx.window[0..stream_ctx.window_len], effective_req, decoratedLessThan);
+    if (collect_sort_profile) profile.final_sort_ns = platform_time.monotonicNs() - final_sort_start_ns;
+    try checkSearchRequestDeadline(effective_req);
+
+    var start: usize = 0;
+    var end: usize = stream_ctx.window_len;
+    if (effective_req.search_after.len == 0 and effective_req.search_before.len == 0) {
+        start = @min(@as(usize, @intCast(effective_req.offset)), stream_ctx.window_len);
+        end = @min(start + @as(usize, @intCast(effective_req.limit)), stream_ctx.window_len);
+    }
+
+    const selected = try alloc.alloc(types.SearchHit, end - start);
+    var selected_initialized: usize = 0;
+    errdefer {
+        for (selected[0..selected_initialized]) |*hit| hit.deinit(alloc);
+        if (selected.len > 0) alloc.free(selected);
+    }
+    for (stream_ctx.window[0..stream_ctx.window_len], 0..) |*item, i| {
+        if (i % 1024 == 0) try checkSearchRequestDeadline(effective_req);
+        if (i >= start and i < end) {
+            selected[selected_initialized] = item.hit;
+            item.hit = undefined;
+            selected_initialized += 1;
+            if (collect_sort_profile) profile.selected_count += 1;
+        } else {
+            item.hit.deinit(alloc);
+        }
+        freeSortValues(alloc, item.keys);
+        window_drained_prefix = i + 1;
+    }
+    if (window.len > 0) alloc.free(window);
+    if (collect_sort_profile) {
+        profile.window_len = stream_ctx.window_len;
+        profile.total_ns = platform_time.monotonicNs() - sort_start_ns;
+    }
+    if (bench_query_profile) {
+        logBenchSortCollectorProfile(effective_req, plan, native_loader != null, profile);
+    }
+
+    return .{
+        .alloc = alloc,
+        .hits = selected,
+        .total_hits = stream_ctx.total_hits,
+        .total_hits_relation = if (stream_stats.stopped_early or options.primary_key_stop_before != null) .gte else .exact,
+        .sort_profile = if (collect_sort_profile) sortResultProfile(effective_req, plan, native_loader != null, profile) else null,
+        .graph_results = &.{},
+    };
+}
+
+const MatchAllIdSeekContext = struct {
+    alloc: Allocator,
+    req: types.SearchRequest,
+    skip_count: usize,
+    limit: usize,
+    hits: std.ArrayListUnmanaged(types.SearchHit) = .empty,
+    accepted_count: usize = 0,
+
+    fn deinitHits(self: *@This()) void {
+        for (self.hits.items) |*hit| hit.deinit(self.alloc);
+        self.hits.deinit(self.alloc);
+    }
+};
+
+fn consumeMatchAllIdSeekCandidate(ctx: ?*anyopaque, candidate: MatchAllCandidate) !void {
+    const seek_ctx: *MatchAllIdSeekContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+    const alloc = seek_ctx.alloc;
+
+    var owned_candidate = candidate;
+    errdefer owned_candidate.deinit(alloc);
+
+    seek_ctx.accepted_count += 1;
+    if (seek_ctx.accepted_count <= seek_ctx.skip_count) {
+        owned_candidate.deinit(alloc);
+        return;
+    }
+    if (seek_ctx.hits.items.len >= seek_ctx.limit) {
+        owned_candidate.deinit(alloc);
+        return;
+    }
+
+    const sort_values = try alloc.alloc(std.json.Value, 1);
+    errdefer alloc.free(sort_values);
+    sort_values[0] = .{ .string = try alloc.dupe(u8, owned_candidate.id) };
+    errdefer types.deinitJsonValue(alloc, &sort_values[0]);
+
+    try seek_ctx.hits.append(alloc, .{
+        .id = owned_candidate.id,
+        .doc_ordinal = owned_candidate.ordinal,
+        .score = 1.0,
+        .sort_values = sort_values,
+        .stored_data = null,
+    });
+    owned_candidate.id = @constCast(&[_]u8{});
+}
+
+fn idOnlySearchAfterCursor(req: types.SearchRequest) ?[]const u8 {
+    if (req.search_after.len == 0) return null;
+    return req.search_after[0].string;
+}
+
+fn idOnlySearchBeforeCursor(req: types.SearchRequest) ?[]const u8 {
+    if (req.search_before.len == 0) return null;
+    return req.search_before[0].string;
+}
+
+fn sortAndPageMatchAllIdSeekAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: MatchAllExecutor,
+    constraints: *const NativeDocIdConstraints,
+    plan: SortExecutionPlan,
+) !types.SearchResult {
+    var effective = try effectiveSortRequestAlloc(alloc, req);
+    defer effective.deinit(alloc);
+    const effective_req = effective.req;
+
+    try validateSortPageOptions(effective_req);
+    if (effective_req.order_by.len != 1 or !sortFieldIsId(effective_req.order_by[0])) {
+        return error.InvalidQueryRequest;
+    }
+
+    const collect_stream = executor.collect_candidates_stream orelse return rejectSortCandidateStreamUnavailable(plan);
+    const reverse = effective_req.search_before.len > 0;
+    const skip_count: usize = if (effective_req.search_after.len == 0)
+        @intCast(effective_req.offset)
+    else
+        0;
+    const requested_limit: usize = @intCast(effective_req.limit);
+    const bench_query_profile = shouldLogBenchQueryProfile();
+    const collect_sort_profile = bench_query_profile or effective_req.profile;
+    if (requested_limit == 0) {
+        const count_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
+        var count_ctx = MatchAllCountStreamContext{
+            .alloc = alloc,
+            .req = effective_req,
+        };
+        const stats = try collect_stream(executor.ctx, alloc, effective_req, .{
+            .constraints = constraints,
+            .primary_key_start_after = idOnlySearchAfterCursor(effective_req),
+            .primary_key_stop_before = idOnlySearchBeforeCursor(effective_req),
+            .primary_key_reverse = reverse,
+            .scan_batch_size = default_match_all_primary_key_scan_batch_size,
+        }, &count_ctx, countMatchAllSortCandidate);
+        try checkSearchRequestDeadline(effective_req);
+        var profile = SortCollectorProfile{};
+        observeSortCandidateSource(if (collect_sort_profile) &profile else null, "primary_key");
+        observeNativeFilterConstraints(if (collect_sort_profile) &profile else null, constraints);
+        if (collect_sort_profile) {
+            profile.candidate_count = @intCast(@min(count_ctx.accepted_count, @as(usize, std.math.maxInt(u64))));
+            profile.window_capacity = 0;
+            profile.window_len = 0;
+            profile.total_ns = platform_time.monotonicNs() - count_start_ns;
+        }
+        if (bench_query_profile) {
+            logBenchSortCollectorProfile(effective_req, plan, false, profile);
+        }
+        return .{
+            .alloc = alloc,
+            .hits = &.{},
+            .total_hits = boundedU32(count_ctx.accepted_count),
+            .total_hits_relation = if (stats.stopped_early or count_ctx.accepted_count > std.math.maxInt(u32)) .gte else .exact,
+            .sort_profile = if (collect_sort_profile) sortResultProfile(effective_req, plan, false, profile) else null,
+            .graph_results = &.{},
+        };
+    }
+
+    const sort_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
+    const stop_after = if (reverse) requested_limit else skip_count +| requested_limit;
+    var profile = SortCollectorProfile{};
+    observeSortCandidateSource(if (collect_sort_profile) &profile else null, "primary_key");
+    observeNativeFilterConstraints(if (collect_sort_profile) &profile else null, constraints);
+    if (collect_sort_profile) profile.window_capacity = stop_after;
+    var seek_ctx = MatchAllIdSeekContext{
+        .alloc = alloc,
+        .req = effective_req,
+        .skip_count = skip_count,
+        .limit = requested_limit,
+    };
+    errdefer seek_ctx.deinitHits();
+
+    const stats = try collect_stream(executor.ctx, alloc, req, .{
+        .constraints = constraints,
+        .primary_key_start_after = idOnlySearchAfterCursor(effective_req),
+        .primary_key_stop_before = idOnlySearchBeforeCursor(effective_req),
+        .primary_key_reverse = reverse,
+        .stop_after_accepted = stop_after,
+        .scan_batch_size = @max(@min(stop_after, default_match_all_primary_key_scan_batch_size), 1),
+    }, &seek_ctx, consumeMatchAllIdSeekCandidate);
+
+    const hits = try seek_ctx.hits.toOwnedSlice(alloc);
+    if (reverse and hits.len > 1) std.mem.reverse(types.SearchHit, hits);
+    if (collect_sort_profile) {
+        profile.candidate_count = stats.accepted_count;
+        profile.selected_count = hits.len;
+        profile.window_len = hits.len;
+        profile.total_ns = platform_time.monotonicNs() - sort_start_ns;
+    }
+    if (bench_query_profile) {
+        logBenchSortCollectorProfile(effective_req, plan, false, profile);
+    }
+    return .{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = @intCast(@min(stats.accepted_count, @as(usize, std.math.maxInt(u32)))),
+        .total_hits_relation = if (stats.stopped_early or reverse) .gte else .exact,
+        .sort_profile = if (collect_sort_profile) sortResultProfile(effective_req, plan, false, profile) else null,
+        .graph_results = &.{},
+    };
+}
+
+const SortedSegmentIterator = struct {
+    segment_index: usize,
+    doc_base: u32,
+    next_doc: i64,
+};
+
+const SortedSegmentHead = struct {
+    iterator_index: usize,
+    decorated: DecoratedSortHit,
+};
+
+const SortedSegmentHeadHeapContext = struct {
+    req: types.SearchRequest,
+    reverse: bool = false,
+};
+
+fn sortedSegmentHeadOrder(ctx: SortedSegmentHeadHeapContext, a: SortedSegmentHead, b: SortedSegmentHead) std.math.Order {
+    var order = compareDecoratedSortHits(ctx.req, a.decorated, b.decorated);
+    if (ctx.reverse) {
+        order = switch (order) {
+            .lt => .gt,
+            .eq => .eq,
+            .gt => .lt,
+        };
+    }
+    if (order != .eq) return order;
+    return std.math.order(a.iterator_index, b.iterator_index);
+}
+
+fn deinitSortedSegmentHeads(alloc: Allocator, heads: []SortedSegmentHead) void {
+    for (heads) |*head| head.decorated.deinit(alloc);
+}
+
+fn sortedSegmentIteratorDone(snapshot: *const index_mod.IndexSnapshot, iterator: SortedSegmentIterator, reverse: bool) bool {
+    const segment = &snapshot.segments[iterator.segment_index];
+    if (reverse) return iterator.next_doc < 0;
+    return iterator.next_doc >= segment.reader.doc_count;
+}
+
+fn sortedSegmentIteratorAdvance(iterator: *SortedSegmentIterator, reverse: bool) void {
+    if (reverse) {
+        iterator.next_doc -= 1;
+    } else {
+        iterator.next_doc += 1;
+    }
+}
+
+fn sortedSegmentLocalDocDeleted(segment: *const index_mod.SegmentEntry, local_doc_id: u32) bool {
+    if (segment.shared.deleted) |deleted| return deleted.contains(local_doc_id);
+    return false;
+}
+
+const SortedSegmentDocMembership = struct {
+    segments: []roaring.RoaringBitmap,
+    candidate_count: usize = 0,
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        for (self.segments) |*bitmap| bitmap.deinit();
+        if (self.segments.len > 0) alloc.free(self.segments);
+        self.* = undefined;
+    }
+
+    fn contains(self: *const @This(), segment_index: usize, local_doc_id: u32) bool {
+        if (segment_index >= self.segments.len) return false;
+        return self.segments[segment_index].contains(local_doc_id);
+    }
+};
+
+fn buildSortedSegmentDocMembershipAlloc(
+    alloc: Allocator,
+    snapshot: *const index_mod.IndexSnapshot,
+    filter: query_mod.Filter,
+) !SortedSegmentDocMembership {
+    const bitmaps = try alloc.alloc(roaring.RoaringBitmap, snapshot.segments.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (bitmaps[0..initialized]) |*bitmap| bitmap.deinit();
+        alloc.free(bitmaps);
+    }
+
+    var doc_base: u32 = 0;
+    var candidate_count: usize = 0;
+    for (snapshot.segments, 0..) |*segment, i| {
+        defer doc_base += segment.reader.doc_count;
+        bitmaps[i] = try filter.executeWithOffset(alloc, segment, doc_base);
+        candidate_count += bitmaps[i].cardinality();
+        initialized += 1;
+    }
+
+    return .{ .segments = bitmaps, .candidate_count = candidate_count };
+}
+
+fn sortedSegmentDocMembershipDocNumsAlloc(
+    alloc: Allocator,
+    snapshot: *const index_mod.IndexSnapshot,
+    membership: *const SortedSegmentDocMembership,
+) ![]const u32 {
+    var out = try std.ArrayListUnmanaged(u32).initCapacity(alloc, membership.candidate_count);
+    errdefer out.deinit(alloc);
+
+    var doc_base: u32 = 0;
+    for (snapshot.segments, 0..) |*segment, segment_index| {
+        defer doc_base += segment.reader.doc_count;
+        if (segment_index >= membership.segments.len) continue;
+        var iter = membership.segments[segment_index].iterator();
+        while (iter.next()) |local_doc_id| {
+            if (local_doc_id >= segment.reader.doc_count) continue;
+            try out.append(alloc, doc_base + local_doc_id);
+        }
+    }
+
+    return try out.toOwnedSlice(alloc);
+}
+
+fn sortedSegmentConstraintsAreEmpty(constraints: *const NativeDocIdConstraints) bool {
+    return !constraints.positive_filter and
+        constraints.filter_doc_ids.len == 0 and
+        constraints.filter_doc_nums.len == 0 and
+        constraints.exclude_doc_ids.len == 0 and
+        constraints.exclude_doc_nums.len == 0;
+}
+
+fn sortedSegmentConstraintsAreKnownEmpty(constraints: *const NativeDocIdConstraints) bool {
+    return constraints.positive_filter and constraints.filter_doc_ids.len == 0 and constraints.filter_doc_nums.len == 0;
+}
+
+fn sortedSegmentLiveDocCount(snapshot: *const index_mod.IndexSnapshot) usize {
+    var count: usize = 0;
+    for (snapshot.segments) |*segment| count +|= segment.liveDocCount();
+    return count;
+}
+
+fn decorateSortedSegmentDocAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    plan: SortExecutionPlan,
+    snapshot: *const index_mod.IndexSnapshot,
+    segment_index: usize,
+    doc_base: u32,
+    local_doc_id: u32,
+    native_loader: NativeSortValueLoader,
+    load_ctx: ?*anyopaque,
+    load_stored: *const fn (?*anyopaque, Allocator, []const u8) anyerror!?[]u8,
+    profile: ?*SortCollectorProfile,
+) !DecoratedSortHit {
+    const segment = &snapshot.segments[segment_index];
+    const stored = segment.reader.storedDoc(local_doc_id) orelse return error.InvalidSegment;
+    const ordinal = try segment.reader.docOrdinal(local_doc_id);
+    const global_doc_id = doc_base + local_doc_id;
+    const raw_hit = types.SearchHit{
+        .id = try alloc.dupe(u8, stored.id),
+        .doc_ordinal = ordinal,
+        .native_text_doc_id = global_doc_id,
+        .score = 1.0,
+        .stored_data = null,
+    };
+    const decorate_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
+    const decorated = try decorateSortHitAlloc(
+        alloc,
+        req,
+        plan,
+        raw_hit,
+        load_ctx,
+        load_stored,
+        native_loader,
+        profile,
+    );
+    if (profile) |p| p.decorate_ns += platform_time.monotonicNs() - decorate_start_ns;
+    return decorated;
+}
+
+fn compareSortedSegmentDocToCursorAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    plan: SortExecutionPlan,
+    snapshot: *const index_mod.IndexSnapshot,
+    iterator: SortedSegmentIterator,
+    local_doc_id: u32,
+    cursor: []const std.json.Value,
+    native_loader: NativeSortValueLoader,
+    load_ctx: ?*anyopaque,
+    load_stored: *const fn (?*anyopaque, Allocator, []const u8) anyerror!?[]u8,
+) !std.math.Order {
+    var decorated = try decorateSortedSegmentDocAlloc(
+        alloc,
+        req,
+        plan,
+        snapshot,
+        iterator.segment_index,
+        iterator.doc_base,
+        local_doc_id,
+        native_loader,
+        load_ctx,
+        load_stored,
+        null,
+    );
+    defer decorated.deinit(alloc);
+    return try compareDecoratedHitToCursor(req, plan, decorated, cursor);
+}
+
+fn sortValueFromSegmentBoundValue(value: segment_mod.SegmentIndexSortBoundValue) SortValue {
+    return switch (value) {
+        .u64_val => |v| .{ .u64_value = v },
+        .i64_val => |v| .{ .integer = v },
+        .f64_val => |v| .{ .number = v },
+        .bool_val => |v| .{ .bool_value = v },
+        .bytes_val => |v| .{ .string = v },
+        .id => |v| .{ .string = v },
+    };
+}
+
+fn compareSortedSegmentBoundToCursor(
+    req: types.SearchRequest,
+    plan: SortExecutionPlan,
+    bound: []const segment_mod.SegmentIndexSortBoundValue,
+    cursor: []const std.json.Value,
+) !std.math.Order {
+    if (bound.len != req.order_by.len or cursor.len != req.order_by.len) return error.InvalidSegment;
+    for (req.order_by, 0..) |field, i| {
+        const bound_value = sortValueFromSegmentBoundValue(bound[i]);
+        const cursor_value = try sortValueFromCursorJsonForSortKey(plan, field.field, bound_value, cursor[i]);
+        const order = compareSortValues(bound_value, cursor_value);
+        if (order != .eq) {
+            if (field.desc) {
+                return switch (order) {
+                    .lt => .gt,
+                    .eq => .eq,
+                    .gt => .lt,
+                };
+            }
+            return order;
+        }
+    }
+    return .eq;
+}
+
+fn sortedSegmentSeekStartDocAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    plan: SortExecutionPlan,
+    snapshot: *const index_mod.IndexSnapshot,
+    iterator: SortedSegmentIterator,
+    native_loader: NativeSortValueLoader,
+    load_ctx: ?*anyopaque,
+    load_stored: *const fn (?*anyopaque, Allocator, []const u8) anyerror!?[]u8,
+    reverse: bool,
+) !i64 {
+    const segment = &snapshot.segments[iterator.segment_index];
+    const doc_count = segment.reader.doc_count;
+    if (doc_count == 0) return -1;
+    const cursor = activeSortCursor(req);
+    if (cursor.len == 0) {
+        return if (reverse) @as(i64, @intCast(doc_count)) - 1 else 0;
+    }
+
+    if (plan.sorted_segment_bounds_available) {
+        if (try segment.reader.indexSortBoundsAlloc(alloc)) |bounds| {
+            var owned_bounds = bounds;
+            defer owned_bounds.deinit(alloc);
+            const first_order = try compareSortedSegmentBoundToCursor(req, plan, owned_bounds.first, cursor);
+            const last_order = try compareSortedSegmentBoundToCursor(req, plan, owned_bounds.last, cursor);
+            if (!reverse) {
+                if (last_order != .gt) return @intCast(doc_count);
+                if (first_order == .gt) return 0;
+            } else {
+                if (first_order != .lt) return -1;
+                if (last_order == .lt) return @as(i64, @intCast(doc_count)) - 1;
+            }
+        }
+    }
+
+    var low: u32 = 0;
+    var high: u32 = doc_count;
+    if (!reverse) {
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            const order = try compareSortedSegmentDocToCursorAlloc(
+                alloc,
+                req,
+                plan,
+                snapshot,
+                iterator,
+                mid,
+                cursor,
+                native_loader,
+                load_ctx,
+                load_stored,
+            );
+            if (order == .gt) {
+                high = mid;
+            } else {
+                low = mid + 1;
+            }
+        }
+        return @intCast(low);
+    }
+
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        const order = try compareSortedSegmentDocToCursorAlloc(
+            alloc,
+            req,
+            plan,
+            snapshot,
+            iterator,
+            mid,
+            cursor,
+            native_loader,
+            load_ctx,
+            load_stored,
+        );
+        if (order == .lt) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    if (low == 0) return -1;
+    return @as(i64, @intCast(low)) - 1;
+}
+
+fn nextSortedSegmentHeadAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    plan: SortExecutionPlan,
+    snapshot: *const index_mod.IndexSnapshot,
+    iterator_index: usize,
+    iterators: []SortedSegmentIterator,
+    constraints: *const NativeDocIdConstraints,
+    constraint_membership: ?*const NativeDocIdConstraintMembership,
+    membership: ?*const SortedSegmentDocMembership,
+    executor: MatchAllExecutor,
+    native_loader: NativeSortValueLoader,
+    profile: ?*SortCollectorProfile,
+    reverse: bool,
+    scanned_count: *u64,
+    scan_budget: u64,
+) !?SortedSegmentHead {
+    const iterator = &iterators[iterator_index];
+    const segment = &snapshot.segments[iterator.segment_index];
+    while (!sortedSegmentIteratorDone(snapshot, iterator.*, reverse)) {
+        const local_doc_id: u32 = @intCast(iterator.next_doc);
+        sortedSegmentIteratorAdvance(iterator, reverse);
+        scanned_count.* +|= 1;
+        if (scanned_count.* == 1 or scanned_count.* % sorted_segment_deadline_check_interval == 0) {
+            try checkSearchRequestDeadline(req);
+        }
+        if (profile) |p| {
+            p.sorted_segment_scanned_count = scanned_count.*;
+            p.sorted_segment_scan_budget = scan_budget;
+        }
+        if (scanned_count.* > scan_budget) {
+            logExactSortBudgetRejection(
+                "sorted_segment",
+                .sorted_segment_scan_window,
+                req.index_name,
+                boundedU32(scanned_count.*),
+                boundedU32(scan_budget),
+                plan,
+            );
+            if (profile) |p| p.budget_rejection_reason = exactSortBudgetRejectionReasonName(.sorted_segment_scan_window);
+            return error.QueryCandidateBudgetExceeded;
+        }
+        if (local_doc_id >= segment.reader.doc_count) continue;
+        if (sortedSegmentLocalDocDeleted(segment, local_doc_id)) continue;
+        if (membership) |m| {
+            if (!m.contains(iterator.segment_index, local_doc_id)) continue;
+        }
+        const stored = segment.reader.storedDoc(local_doc_id) orelse return error.InvalidSegment;
+        if (executor.is_expired_key) |is_expired| {
+            if (try is_expired(executor.ctx, alloc, stored.id)) continue;
+        }
+        const ordinal = try segment.reader.docOrdinal(local_doc_id);
+        const candidate = MatchAllCandidate{
+            .id = @constCast(stored.id),
+            .ordinal = ordinal,
+        };
+        if (!matchAllCandidateAllowedWithMembership(candidate, constraints, constraint_membership)) continue;
+        if (profile) |p| p.candidate_count += 1;
+
+        var decorated = try decorateSortedSegmentDocAlloc(
+            alloc,
+            req,
+            plan,
+            snapshot,
+            iterator.segment_index,
+            iterator.doc_base,
+            local_doc_id,
+            native_loader,
+            executor.ctx,
+            executor.load_stored,
+            profile,
+        );
+        errdefer decorated.deinit(alloc);
+
+        if (!(try decoratedHitAllowedByCursor(req, plan, decorated))) {
+            if (profile) |p| p.cursor_rejected_count += 1;
+            decorated.deinit(alloc);
+            continue;
+        }
+        return .{
+            .iterator_index = iterator_index,
+            .decorated = decorated,
+        };
+    }
+    return null;
+}
+
+fn countSortedSegmentVisibleCandidatesWithoutSortValuesAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: MatchAllExecutor,
+    constraints: *const NativeDocIdConstraints,
+    snapshot: *const index_mod.IndexSnapshot,
+    plan: SortExecutionPlan,
+    membership: ?*const SortedSegmentDocMembership,
+    profile: ?*SortCollectorProfile,
+) !usize {
+    const scan_budget = sortedSegmentScanBudget();
+    var scanned_count: u64 = 0;
+    if (profile) |p| p.sorted_segment_scan_budget = scan_budget;
+    var constraint_membership = try NativeDocIdConstraintMembership.initAlloc(alloc, constraints);
+    defer constraint_membership.deinit(alloc);
+
+    var count: usize = 0;
+    for (snapshot.segments, 0..) |*segment, segment_index| {
+        if (segment.liveDocCount() == 0) continue;
+        for (0..segment.reader.doc_count) |local_doc_id_usize| {
+            const local_doc_id: u32 = @intCast(local_doc_id_usize);
+            scanned_count +|= 1;
+            if (scanned_count == 1 or scanned_count % sorted_segment_deadline_check_interval == 0) {
+                try checkSearchRequestDeadline(req);
+            }
+            if (profile) |p| {
+                p.sorted_segment_scanned_count = scanned_count;
+                p.sorted_segment_scan_budget = scan_budget;
+            }
+            if (scanned_count > scan_budget) {
+                logExactSortBudgetRejection(
+                    "sorted_segment",
+                    .sorted_segment_scan_window,
+                    req.index_name,
+                    boundedU32(scanned_count),
+                    boundedU32(scan_budget),
+                    plan,
+                );
+                if (profile) |p| p.budget_rejection_reason = exactSortBudgetRejectionReasonName(.sorted_segment_scan_window);
+                return error.QueryCandidateBudgetExceeded;
+            }
+            if (sortedSegmentLocalDocDeleted(segment, local_doc_id)) continue;
+            if (membership) |m| {
+                if (!m.contains(segment_index, local_doc_id)) continue;
+            }
+            const stored = segment.reader.storedDoc(local_doc_id) orelse return error.InvalidSegment;
+            if (executor.is_expired_key) |is_expired| {
+                if (try is_expired(executor.ctx, alloc, stored.id)) continue;
+            }
+            const candidate = MatchAllCandidate{
+                .id = @constCast(stored.id),
+                .ordinal = try segment.reader.docOrdinal(local_doc_id),
+            };
+            if (!matchAllCandidateAllowedWithMembership(candidate, constraints, &constraint_membership)) continue;
+            count +|= 1;
+        }
+    }
+    return count;
+}
+
+fn countSortedSegmentVisibleCandidatesFromSeekAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: MatchAllExecutor,
+    constraints: *const NativeDocIdConstraints,
+    snapshot: *const index_mod.IndexSnapshot,
+    plan: SortExecutionPlan,
+    iterators: []SortedSegmentIterator,
+    membership: ?*const SortedSegmentDocMembership,
+    reverse: bool,
+    profile: ?*SortCollectorProfile,
+) !usize {
+    const scan_budget = sortedSegmentScanBudget();
+    var scanned_count: u64 = 0;
+    if (profile) |p| p.sorted_segment_scan_budget = scan_budget;
+    var constraint_membership = try NativeDocIdConstraintMembership.initAlloc(alloc, constraints);
+    defer constraint_membership.deinit(alloc);
+
+    var count: usize = 0;
+    for (iterators) |*iterator| {
+        const segment = &snapshot.segments[iterator.segment_index];
+        while (!sortedSegmentIteratorDone(snapshot, iterator.*, reverse)) {
+            const local_doc_id: u32 = @intCast(iterator.next_doc);
+            sortedSegmentIteratorAdvance(iterator, reverse);
+            scanned_count +|= 1;
+            if (scanned_count == 1 or scanned_count % sorted_segment_deadline_check_interval == 0) {
+                try checkSearchRequestDeadline(req);
+            }
+            if (profile) |p| {
+                p.sorted_segment_scanned_count = scanned_count;
+                p.sorted_segment_scan_budget = scan_budget;
+            }
+            if (scanned_count > scan_budget) {
+                logExactSortBudgetRejection(
+                    "sorted_segment",
+                    .sorted_segment_scan_window,
+                    req.index_name,
+                    boundedU32(scanned_count),
+                    boundedU32(scan_budget),
+                    plan,
+                );
+                if (profile) |p| p.budget_rejection_reason = exactSortBudgetRejectionReasonName(.sorted_segment_scan_window);
+                return error.QueryCandidateBudgetExceeded;
+            }
+            if (local_doc_id >= segment.reader.doc_count) continue;
+            if (sortedSegmentLocalDocDeleted(segment, local_doc_id)) continue;
+            if (membership) |m| {
+                if (!m.contains(iterator.segment_index, local_doc_id)) continue;
+            }
+            const stored = segment.reader.storedDoc(local_doc_id) orelse return error.InvalidSegment;
+            if (executor.is_expired_key) |is_expired| {
+                if (try is_expired(executor.ctx, alloc, stored.id)) continue;
+            }
+            const candidate = MatchAllCandidate{
+                .id = @constCast(stored.id),
+                .ordinal = try segment.reader.docOrdinal(local_doc_id),
+            };
+            if (!matchAllCandidateAllowedWithMembership(candidate, constraints, &constraint_membership)) continue;
+            count +|= 1;
+        }
+    }
+    return count;
+}
+
+fn countSortedSegmentVisibleCandidatesAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: MatchAllExecutor,
+    constraints: *const NativeDocIdConstraints,
+    text_entry: *index_manager_mod.IndexManager.TextIndex,
+    plan: SortExecutionPlan,
+    native_loader: NativeSortValueLoader,
+    membership: ?*const SortedSegmentDocMembership,
+    profile: ?*SortCollectorProfile,
+) !usize {
+    if (sortedSegmentConstraintsAreKnownEmpty(constraints)) return 0;
+
+    const snapshot = text_entry.persistent.snapshot();
+    const cursor = activeSortCursor(req);
+    if (cursor.len == 0 and
+        membership == null and
+        executor.is_expired_key == null and
+        sortedSegmentConstraintsAreEmpty(constraints))
+    {
+        return sortedSegmentLiveDocCount(snapshot);
+    }
+    if (cursor.len == 0) {
+        return try countSortedSegmentVisibleCandidatesWithoutSortValuesAlloc(
+            alloc,
+            req,
+            executor,
+            constraints,
+            snapshot,
+            plan,
+            membership,
+            profile,
+        );
+    }
+
+    const reverse = req.search_before.len > 0;
+
+    var iterators = std.ArrayListUnmanaged(SortedSegmentIterator).empty;
+    defer iterators.deinit(alloc);
+    var doc_base: u32 = 0;
+    for (snapshot.segments, 0..) |*segment, segment_index| {
+        defer doc_base += segment.reader.doc_count;
+        if (segment.liveDocCount() == 0) continue;
+        var iterator = SortedSegmentIterator{
+            .segment_index = segment_index,
+            .doc_base = doc_base,
+            .next_doc = 0,
+        };
+        iterator.next_doc = try sortedSegmentSeekStartDocAlloc(
+            alloc,
+            req,
+            plan,
+            snapshot,
+            iterator,
+            native_loader,
+            executor.ctx,
+            executor.load_stored,
+            reverse,
+        );
+        if (sortedSegmentIteratorDone(snapshot, iterator, reverse)) continue;
+        try iterators.append(alloc, iterator);
+    }
+
+    return try countSortedSegmentVisibleCandidatesFromSeekAlloc(
+        alloc,
+        req,
+        executor,
+        constraints,
+        snapshot,
+        plan,
+        iterators.items,
+        membership,
+        reverse,
+        profile,
+    );
+}
+
+fn appendSortedSegmentSelectedHit(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged(types.SearchHit),
+    head: *SortedSegmentHead,
+    selected_count: *usize,
+    skip_count: usize,
+    limit: usize,
+    profile: ?*SortCollectorProfile,
+) !bool {
+    if (selected_count.* < skip_count) {
+        selected_count.* += 1;
+        head.decorated.deinit(alloc);
+        return false;
+    }
+    if (out.items.len >= limit) {
+        head.decorated.deinit(alloc);
+        return true;
+    }
+    try out.append(alloc, head.decorated.hit);
+    head.decorated.hit = undefined;
+    freeSortValues(alloc, head.decorated.keys);
+    head.decorated.keys = &.{};
+    selected_count.* += 1;
+    if (profile) |p| p.selected_count += 1;
+    return out.items.len >= limit;
+}
+
+fn sortAndPageMatchAllSortedSegmentsAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: MatchAllExecutor,
+    constraints: *const NativeDocIdConstraints,
+    text_entry: *index_manager_mod.IndexManager.TextIndex,
+    plan: SortExecutionPlan,
+    native_loader: NativeSortValueLoader,
+    membership: ?*const SortedSegmentDocMembership,
+) !types.SearchResult {
+    var effective = try effectiveSortRequestAlloc(alloc, req);
+    defer effective.deinit(alloc);
+    const effective_req = effective.req;
+
+    try validateSortPageOptions(effective_req);
+    if (effective_req.search_before.len > 0 and effective_req.offset != 0) return error.InvalidQueryRequest;
+    try validateMatchAllSortDoesNotUseScore(effective_req);
+    try validateSortExecutionPlanForRuntime(effective_req, plan, native_loader);
+    try checkSearchRequestDeadline(effective_req);
+
+    const snapshot = text_entry.persistent.snapshot();
+    const bench_query_profile = shouldLogBenchQueryProfile();
+    const collect_sort_profile = bench_query_profile or effective_req.profile;
+    if (effective_req.limit == 0) {
+        const zero_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
+        var zero_profile = SortCollectorProfile{};
+        observeSortCandidateSource(if (collect_sort_profile) &zero_profile else null, sortedSegmentCandidateSourceForConstraints(constraints, membership));
+        observeNativeFilterConstraints(if (collect_sort_profile) &zero_profile else null, constraints);
+        zero_profile.window_capacity = 0;
+        zero_profile.sorted_segment_scan_budget = sortedSegmentScanBudget();
+        const visible_total = try countSortedSegmentVisibleCandidatesAlloc(
+            alloc,
+            effective_req,
+            executor,
+            constraints,
+            text_entry,
+            plan,
+            native_loader,
+            membership,
+            if (collect_sort_profile) &zero_profile else null,
+        );
+        if (collect_sort_profile) {
+            zero_profile.candidate_count = @intCast(@min(visible_total, @as(usize, std.math.maxInt(u64))));
+        }
+        zero_profile.total_ns = if (collect_sort_profile) platform_time.monotonicNs() - zero_start_ns else 0;
+        if (bench_query_profile) {
+            logBenchSortCollectorProfile(effective_req, plan, true, zero_profile);
+        }
+        return .{
+            .alloc = alloc,
+            .hits = &.{},
+            .total_hits = boundedU32(visible_total),
+            .total_hits_relation = if (visible_total > std.math.maxInt(u32)) .gte else .exact,
+            .sort_profile = if (collect_sort_profile) sortResultProfile(effective_req, plan, true, zero_profile) else null,
+            .graph_results = &.{},
+        };
+    }
+
+    const reverse = effective_req.search_before.len > 0;
+    const sort_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
+    var profile = SortCollectorProfile{};
+    observeSortCandidateSource(if (collect_sort_profile) &profile else null, sortedSegmentCandidateSourceForConstraints(constraints, membership));
+    observeNativeFilterConstraints(if (collect_sort_profile) &profile else null, constraints);
+    const scan_budget = sortedSegmentScanBudget();
+    var scanned_count: u64 = 0;
+    if (collect_sort_profile) {
+        profile.window_capacity = sortWindowCapacity(effective_req);
+        profile.sorted_segment_scan_budget = scan_budget;
+    }
+    var constraint_membership = try NativeDocIdConstraintMembership.initAlloc(alloc, constraints);
+    defer constraint_membership.deinit(alloc);
+
+    var iterators = std.ArrayListUnmanaged(SortedSegmentIterator).empty;
+    defer iterators.deinit(alloc);
+    var doc_base: u32 = 0;
+    for (snapshot.segments, 0..) |*segment, segment_index| {
+        defer doc_base += segment.reader.doc_count;
+        if (segment.liveDocCount() == 0) continue;
+        var iterator = SortedSegmentIterator{
+            .segment_index = segment_index,
+            .doc_base = doc_base,
+            .next_doc = 0,
+        };
+        iterator.next_doc = try sortedSegmentSeekStartDocAlloc(
+            alloc,
+            effective_req,
+            plan,
+            snapshot,
+            iterator,
+            native_loader,
+            executor.ctx,
+            executor.load_stored,
+            reverse,
+        );
+        if (sortedSegmentIteratorDone(snapshot, iterator, reverse)) continue;
+        try iterators.append(alloc, iterator);
+    }
+
+    var heap = std.PriorityQueue(SortedSegmentHead, SortedSegmentHeadHeapContext, sortedSegmentHeadOrder).initContext(.{
+        .req = effective_req,
+        .reverse = reverse,
+    });
+    defer heap.deinit(alloc);
+    defer deinitSortedSegmentHeads(alloc, heap.items);
+
+    for (iterators.items, 0..) |_, iterator_index| {
+        if (try nextSortedSegmentHeadAlloc(
+            alloc,
+            effective_req,
+            plan,
+            snapshot,
+            iterator_index,
+            iterators.items,
+            constraints,
+            &constraint_membership,
+            membership,
+            executor,
+            native_loader,
+            if (collect_sort_profile) &profile else null,
+            reverse,
+            &scanned_count,
+            scan_budget,
+        )) |head| {
+            try heap.push(alloc, head);
+            observeSortCollectorHeap(if (collect_sort_profile) &profile else null, heap.items.len);
+        }
+    }
+
+    const limit: usize = @intCast(effective_req.limit);
+    const skip_count: usize = if (effective_req.search_after.len > 0 or effective_req.search_before.len > 0)
+        0
+    else
+        @intCast(effective_req.offset);
+    const stop_after = skip_count +| limit;
+    var selected_count: usize = 0;
+    var out = std.ArrayListUnmanaged(types.SearchHit).empty;
+    errdefer {
+        for (out.items) |*hit| hit.deinit(alloc);
+        out.deinit(alloc);
+    }
+    var stopped_early = false;
+
+    while (heap.pop()) |popped| {
+        var head = popped;
+        const iterator_index = head.iterator_index;
+        if (try appendSortedSegmentSelectedHit(
+            alloc,
+            &out,
+            &head,
+            &selected_count,
+            skip_count,
+            limit,
+            if (collect_sort_profile) &profile else null,
+        )) {
+            stopped_early = true;
+            break;
+        }
+        if (selected_count >= stop_after) {
+            stopped_early = true;
+            break;
+        }
+        if (try nextSortedSegmentHeadAlloc(
+            alloc,
+            effective_req,
+            plan,
+            snapshot,
+            iterator_index,
+            iterators.items,
+            constraints,
+            &constraint_membership,
+            membership,
+            executor,
+            native_loader,
+            if (collect_sort_profile) &profile else null,
+            reverse,
+            &scanned_count,
+            scan_budget,
+        )) |next| {
+            try heap.push(alloc, next);
+            observeSortCollectorHeap(if (collect_sort_profile) &profile else null, heap.items.len);
+        }
+        if (selected_count % 1024 == 0) try checkSearchRequestDeadline(effective_req);
+    }
+
+    if (reverse and out.items.len > 1) std.mem.reverse(types.SearchHit, out.items);
+    const hits = try out.toOwnedSlice(alloc);
+    if (collect_sort_profile) {
+        profile.window_len = hits.len;
+        profile.total_ns = platform_time.monotonicNs() - sort_start_ns;
+    }
+    if (bench_query_profile) {
+        logBenchSortCollectorProfile(effective_req, plan, true, profile);
+    }
+    return .{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = @intCast(@min(selected_count, @as(usize, std.math.maxInt(u32)))),
+        .total_hits_relation = if (stopped_early or heap.items.len > 0) .gte else .exact,
+        .sort_profile = if (collect_sort_profile) sortResultProfile(effective_req, plan, true, profile) else null,
+        .graph_results = &.{},
+    };
+}
+
+fn sortCursorMode(req: types.SearchRequest) []const u8 {
+    if (req.search_after.len > 0) return "after";
+    if (req.search_before.len > 0) return "before";
+    return "none";
+}
+
+fn logBenchSortCollectorProfile(
+    req: types.SearchRequest,
+    plan: SortExecutionPlan,
+    native_loader_enabled: bool,
+    profile: SortCollectorProfile,
+) void {
+    const rejection = peekLastSortRejectionDiagnostic();
+    std.log.info(
+        "antfly_bench_sort_collector total_us={d} decorate_us={d} native_doc_value_load_us={d} native_doc_value_hits={d} native_doc_value_misses={d} stored_json_load_us={d} stored_json_loads={d} final_sort_us={d} candidates={d} cursor_rejected={d} admitted={d} replaced={d} discarded={d} selected={d} window_capacity={d} window_len={d} collector_heap_peak={d} order_fields={d} cursor={s} plan={s} exactness={s} source={s} candidate_source={s} cursor_support={s} source_load={s} distributed={s} selection_reason={s} require_native={} native_loader={} index_sort_match={} sorted_segment_executor_available={} sorted_segment_bounds_available={}",
+        .{
+            nsToUs(profile.total_ns),
+            nsToUs(profile.decorate_ns),
+            nsToUs(profile.native_doc_value_load_ns),
+            profile.native_doc_value_hit_count,
+            profile.native_doc_value_miss_count,
+            nsToUs(profile.stored_json_load_ns),
+            profile.stored_json_load_count,
+            nsToUs(profile.final_sort_ns),
+            profile.candidate_count,
+            profile.cursor_rejected_count,
+            profile.admitted_count,
+            profile.replaced_count,
+            profile.discarded_count,
+            profile.selected_count,
+            profile.window_capacity,
+            profile.window_len,
+            profile.collector_heap_peak,
+            req.order_by.len,
+            sortCursorMode(req),
+            sortExecutionPlanKindName(plan.kind),
+            sortPlanExactnessName(sortExecutionPlanExactness(plan)),
+            sortPlanSourceName(sortExecutionPlanSource(plan)),
+            profile.candidate_source,
+            sortPlanCursorSupportName(sortExecutionPlanCursorSupport(plan)),
+            sortPlanSourceLoadName(sortExecutionPlanSourceLoadForRequest(plan, req)),
+            sortPlanDistributedBehaviorName(sortExecutionPlanDistributedBehavior(plan)),
+            sortPlanSelectionReason(plan),
+            plan.require_native,
+            native_loader_enabled,
+            plan.index_sort_match,
+            plan.sorted_segment_executor_available,
+            plan.sorted_segment_bounds_available,
+        },
+    );
+    if (profile.sorted_segment_scanned_count > 0 or profile.sorted_segment_scan_budget > 0) {
+        std.log.info(
+            "antfly_bench_sort_sorted_segment scanned={d} scan_budget={d}",
+            .{
+                profile.sorted_segment_scanned_count,
+                profile.sorted_segment_scan_budget,
+            },
+        );
+    }
+    std.log.info(
+        "antfly_bench_sort_collector_plan sort_lifecycle_state={s} native_filter_mode={s} native_filter_candidate_count={d} native_filter_exclusion_count={d} selective_filter_doc_values_preferred={} cost_model_live_docs={d} cost_model_candidate_count={d} cost_model_selective_limit={d} native_doc_values_coverage={s} index_sort_coverage={s} index_sort_match={} sorted_segment_executor_available={} sorted_segment_bounds_available={}",
+        .{
+            sortExecutionPlanLifecycleState(plan),
+            profile.native_filter_mode,
+            profile.native_filter_candidate_count,
+            profile.native_filter_exclusion_count,
+            plan.selective_filter_doc_values_preferred,
+            plan.cost_model_live_docs,
+            plan.cost_model_candidate_count,
+            plan.cost_model_selective_limit,
+            plan.native_doc_values_coverage,
+            plan.index_sort_coverage,
+            plan.index_sort_match,
+            plan.sorted_segment_executor_available,
+            plan.sorted_segment_bounds_available,
+        },
+    );
+    std.log.info(
+        "antfly_bench_sort_collector_rejection budget_rejection_reason={s} sort_rejection_reason={s} sort_rejection_detail={s} sort_rejection_field={s}",
+        .{
+            profile.budget_rejection_reason,
+            if (rejection) |item| item.reason else "",
+            if (rejection) |item| item.detail else "",
+            if (rejection) |item| item.field else "",
+        },
+    );
+    if (profile.native_doc_value_hit_count > 0 or profile.native_doc_value_miss_count > 0 or profile.stored_json_load_count > 0) {
+        std.log.info(
+            "antfly_bench_sort_values native_doc_value_hits={d} native_doc_value_misses={d} stored_json_loads={d}",
+            .{
+                profile.native_doc_value_hit_count,
+                profile.native_doc_value_miss_count,
+                profile.stored_json_load_count,
+            },
+        );
+    }
+}
+
 fn collectStructuredFilterResolvedDocSetAlloc(
     alloc: Allocator,
     req: types.SearchRequest,
@@ -2324,9 +8528,16 @@ fn resolvedDocSetForTextHitsFromOrdinalSidecarAlloc(
     hits: []const search_mod.ScoredHit,
     executor: StructuredFilterResolverExecutor,
 ) !?doc_set.ResolvedDocSet {
+    var seen = std.AutoHashMapUnmanaged(u32, void).empty;
+    defer seen.deinit(alloc);
+
     var doc_nums = std.ArrayListUnmanaged(u32).empty;
     defer doc_nums.deinit(alloc);
-    for (hits) |hit| try appendDocNum(alloc, &doc_nums, hit.doc_id);
+    for (hits) |hit| {
+        const gop = try seen.getOrPut(alloc, hit.doc_id);
+        if (gop.found_existing) continue;
+        try doc_nums.append(alloc, hit.doc_id);
+    }
 
     return try resolvedDocSetForTextDocNumsFromOrdinalSidecarAlloc(alloc, snapshot, doc_nums.items, executor);
 }
@@ -2434,14 +8645,16 @@ fn searchQueryCanUseSnapshot(
         .term => |item| (try queryFieldUsesKeywordAnalyzer(item.field, text_analysis, runtime_schema)) and
             try snapshot.hasInvertedField(item.field),
         .fuzzy => |item| try snapshot.hasInvertedField(item.field),
-        .numeric_range => |item| try snapshot.hasInvertedField(item.field),
-        .date_range => |item| try snapshot.hasInvertedField(item.field),
-        .bool_field => |item| try snapshot.hasInvertedField(item.field),
-        .geo_distance => |item| try snapshot.hasInvertedField(item.field),
-        .geo_bbox => |item| try snapshot.hasInvertedField(item.field),
-        .term_range => |item| try snapshot.hasInvertedField(item.field),
-        .ip_range => |item| try snapshot.hasInvertedField(item.field),
-        .geo_shape => |item| try snapshot.hasInvertedField(item.field),
+        .numeric_range => |item| try searchQueryCanUseMappedDocValues(snapshot, item.field, runtime_schema, .numeric),
+        .date_range => |item| try searchQueryCanUseMappedDocValues(snapshot, item.field, runtime_schema, .datetime),
+        .bool_field => |item| try searchQueryCanUseMappedDocValues(snapshot, item.field, runtime_schema, .boolean),
+        .geo_distance => |item| try searchQueryCanUseMappedGeoDocValues(snapshot, item.field, runtime_schema),
+        .geo_bbox => |item| try searchQueryCanUseMappedGeoDocValues(snapshot, item.field, runtime_schema),
+        .term_range => |item| (try queryFieldUsesKeywordAnalyzer(item.field, text_analysis, runtime_schema)) and
+            try snapshot.hasInvertedField(item.field),
+        .ip_range => |item| (try queryFieldUsesKeywordAnalyzer(item.field, text_analysis, runtime_schema)) and
+            try snapshot.hasInvertedField(item.field),
+        .geo_shape => |item| try searchQueryCanUseMappedGeoDocValues(snapshot, item.field, runtime_schema),
         .prefix => |item| try snapshot.hasInvertedField(item.field),
         .wildcard => |item| try snapshot.hasInvertedField(item.field),
         .regexp => |item| try snapshot.hasInvertedField(item.field),
@@ -2458,6 +8671,33 @@ fn searchQueryCanUseSnapshot(
             return true;
         },
     };
+}
+
+fn searchQueryCanUseMappedDocValues(
+    snapshot: *const index_mod.IndexSnapshot,
+    field: []const u8,
+    runtime_schema: ?runtime_schema_mod.TableSchema,
+    expected_type: runtime_schema_mod.AntflyType,
+) !bool {
+    const schema = runtime_schema orelse return false;
+    const mapping = runtime_schema_mod.resolveDeclaredFieldType(schema, field) orelse return false;
+    if (mapping.field_type != expected_type) return false;
+    if (!runtime_schema_mod.mappingHasNativeDocValues(mapping)) return false;
+    return try snapshotTypedDocValuesCoverageForMapping(snapshot, field, mapping) == .covered;
+}
+
+fn searchQueryCanUseMappedGeoDocValues(
+    snapshot: *const index_mod.IndexSnapshot,
+    field: []const u8,
+    runtime_schema: ?runtime_schema_mod.TableSchema,
+) !bool {
+    if (runtime_schema) |schema| {
+        if (runtime_schema_mod.resolveDeclaredFieldType(schema, field)) |mapping| {
+            if (mapping.field_type != .geopoint) return false;
+            if (!runtime_schema_mod.mappingHasNativeDocValues(mapping)) return false;
+        }
+    }
+    return try snapshotGeoPointDocValuesCoverage(snapshot, field) == .covered;
 }
 
 fn queryFieldUsesKeywordAnalyzer(
@@ -2485,25 +8725,46 @@ fn resolveFilterTextIndexEntry(
 }
 
 fn dupeDocIdSliceAlloc(alloc: Allocator, doc_ids: []const []const u8) ![]const []const u8 {
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(alloc);
+
     var out = std.ArrayListUnmanaged([]const u8).empty;
     errdefer freeDocIdArrayList(alloc, &out);
-    for (doc_ids) |doc_id| try appendOwnedDocId(alloc, &out, doc_id);
+    for (doc_ids) |doc_id| {
+        if (seen.contains(doc_id)) continue;
+        try seen.put(alloc, doc_id, {});
+        try appendOwnedDocIdUnchecked(alloc, &out, doc_id);
+    }
     return try out.toOwnedSlice(alloc);
 }
 
 fn unionDocIdsAlloc(alloc: Allocator, left: []const []const u8, right: []const []const u8) ![]const []const u8 {
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(alloc);
+
     var out = std.ArrayListUnmanaged([]const u8).empty;
     errdefer freeDocIdArrayList(alloc, &out);
-    for (left) |id| try appendOwnedDocId(alloc, &out, id);
-    for (right) |id| try appendOwnedDocId(alloc, &out, id);
+    for (left) |id| {
+        if (seen.contains(id)) continue;
+        try seen.put(alloc, id, {});
+        try appendOwnedDocIdUnchecked(alloc, &out, id);
+    }
+    for (right) |id| {
+        if (seen.contains(id)) continue;
+        try seen.put(alloc, id, {});
+        try appendOwnedDocIdUnchecked(alloc, &out, id);
+    }
     return try out.toOwnedSlice(alloc);
 }
 
 fn intersectDocIdsAlloc(alloc: Allocator, left: []const []const u8, right: []const []const u8) ![]const []const u8 {
+    var right_set = try BorrowedDocIdSet.initAlloc(alloc, right);
+    defer right_set.deinit(alloc);
+
     var out = std.ArrayListUnmanaged([]const u8).empty;
     errdefer freeDocIdArrayList(alloc, &out);
     for (left) |id| {
-        if (!containsDocId(right, id)) continue;
+        if (!right_set.contains(id)) continue;
         try appendOwnedDocId(alloc, &out, id);
     }
     return try out.toOwnedSlice(alloc);
@@ -2571,7 +8832,33 @@ fn appendOwnedDocId(alloc: Allocator, out: *std.ArrayListUnmanaged([]const u8), 
     for (out.items) |existing| {
         if (std.mem.eql(u8, existing, id)) return;
     }
+    try appendOwnedDocIdUnchecked(alloc, out, id);
+}
+
+fn appendOwnedDocIdUnchecked(alloc: Allocator, out: *std.ArrayListUnmanaged([]const u8), id: []const u8) !void {
     try out.append(alloc, try alloc.dupe(u8, id));
+}
+
+test "doc id slice helpers preserve first-seen unique order" {
+    const alloc = std.testing.allocator;
+
+    const source = [_][]const u8{ "doc:b", "doc:a", "doc:b", "doc:c", "doc:a" };
+    const duped = try dupeDocIdSliceAlloc(alloc, &source);
+    defer freeDocIdSlice(alloc, duped);
+    try std.testing.expectEqual(@as(usize, 3), duped.len);
+    try std.testing.expectEqualStrings("doc:b", duped[0]);
+    try std.testing.expectEqualStrings("doc:a", duped[1]);
+    try std.testing.expectEqualStrings("doc:c", duped[2]);
+
+    const left = [_][]const u8{ "doc:c", "doc:a", "doc:c" };
+    const right = [_][]const u8{ "doc:b", "doc:a", "doc:d" };
+    const unioned = try unionDocIdsAlloc(alloc, &left, &right);
+    defer freeDocIdSlice(alloc, unioned);
+    try std.testing.expectEqual(@as(usize, 4), unioned.len);
+    try std.testing.expectEqualStrings("doc:c", unioned[0]);
+    try std.testing.expectEqualStrings("doc:a", unioned[1]);
+    try std.testing.expectEqualStrings("doc:b", unioned[2]);
+    try std.testing.expectEqualStrings("doc:d", unioned[3]);
 }
 
 fn freeDocIdArrayList(alloc: Allocator, out: *std.ArrayListUnmanaged([]const u8)) void {
@@ -2590,6 +8877,91 @@ fn containsDocId(doc_ids: []const []const u8, expected: []const u8) bool {
     }
     return false;
 }
+
+const BorrowedDocIdSet = struct {
+    map: std.StringHashMapUnmanaged(void) = .empty,
+
+    fn initAlloc(alloc: Allocator, doc_ids: []const []const u8) !BorrowedDocIdSet {
+        var out = BorrowedDocIdSet{};
+        errdefer out.deinit(alloc);
+        for (doc_ids) |doc_id| try out.map.put(alloc, doc_id, {});
+        return out;
+    }
+
+    fn deinit(self: *BorrowedDocIdSet, alloc: Allocator) void {
+        self.map.deinit(alloc);
+        self.* = undefined;
+    }
+
+    fn contains(self: *const BorrowedDocIdSet, doc_id: []const u8) bool {
+        return self.map.contains(doc_id);
+    }
+};
+
+const BorrowedDocNumSet = struct {
+    map: std.AutoHashMapUnmanaged(u32, void) = .empty,
+
+    fn initAlloc(alloc: Allocator, doc_nums: []const u32) !BorrowedDocNumSet {
+        var out = BorrowedDocNumSet{};
+        errdefer out.deinit(alloc);
+        for (doc_nums) |doc_num| try out.map.put(alloc, doc_num, {});
+        return out;
+    }
+
+    fn deinit(self: *BorrowedDocNumSet, alloc: Allocator) void {
+        self.map.deinit(alloc);
+        self.* = undefined;
+    }
+
+    fn contains(self: *const BorrowedDocNumSet, doc_num: u32) bool {
+        return self.map.contains(doc_num);
+    }
+};
+
+const NativeDocIdConstraintMembership = struct {
+    filter_doc_ids: ?BorrowedDocIdSet = null,
+    exclude_doc_ids: ?BorrowedDocIdSet = null,
+    filter_doc_nums: ?BorrowedDocNumSet = null,
+    exclude_doc_nums: ?BorrowedDocNumSet = null,
+
+    fn initAlloc(alloc: Allocator, constraints: *const NativeDocIdConstraints) !NativeDocIdConstraintMembership {
+        var out = NativeDocIdConstraintMembership{};
+        errdefer out.deinit(alloc);
+        if (constraints.filter_doc_ids.len > 0) out.filter_doc_ids = try BorrowedDocIdSet.initAlloc(alloc, constraints.filter_doc_ids);
+        if (constraints.exclude_doc_ids.len > 0) out.exclude_doc_ids = try BorrowedDocIdSet.initAlloc(alloc, constraints.exclude_doc_ids);
+        if (constraints.filter_doc_nums.len > 0) out.filter_doc_nums = try BorrowedDocNumSet.initAlloc(alloc, constraints.filter_doc_nums);
+        if (constraints.exclude_doc_nums.len > 0) out.exclude_doc_nums = try BorrowedDocNumSet.initAlloc(alloc, constraints.exclude_doc_nums);
+        return out;
+    }
+
+    fn deinit(self: *NativeDocIdConstraintMembership, alloc: Allocator) void {
+        if (self.filter_doc_ids) |*set| set.deinit(alloc);
+        if (self.exclude_doc_ids) |*set| set.deinit(alloc);
+        if (self.filter_doc_nums) |*set| set.deinit(alloc);
+        if (self.exclude_doc_nums) |*set| set.deinit(alloc);
+        self.* = undefined;
+    }
+
+    fn containsFilterDocId(self: *const NativeDocIdConstraintMembership, id: []const u8) bool {
+        if (self.filter_doc_ids) |*set| return set.contains(id);
+        return false;
+    }
+
+    fn containsExcludeDocId(self: *const NativeDocIdConstraintMembership, id: []const u8) bool {
+        if (self.exclude_doc_ids) |*set| return set.contains(id);
+        return false;
+    }
+
+    fn containsFilterDocNum(self: *const NativeDocIdConstraintMembership, doc_num: u32) bool {
+        if (self.filter_doc_nums) |*set| return set.contains(doc_num);
+        return false;
+    }
+
+    fn containsExcludeDocNum(self: *const NativeDocIdConstraintMembership, doc_num: u32) bool {
+        if (self.exclude_doc_nums) |*set| return set.contains(doc_num);
+        return false;
+    }
+};
 
 fn containsDocNum(doc_nums: []const u32, expected: u32) bool {
     for (doc_nums) |doc_num| {
@@ -2665,7 +9037,9 @@ fn patternFilterValueToSearchQuery(
             .auto_fuzzy = field_fuzzy.auto_fuzzy,
         } };
     }
+    if (value.object.get("range")) |range_query| return try parseStandardRangeQuery(range_query, runtime_schema);
     if (value.object.get("numeric_range")) |range_query| return .{ .numeric_range = try parseNumericRangeQuery(range_query) };
+    if (value.object.get("date_range")) |range_query| return .{ .date_range = try parseDateRangeQuery(range_query) };
     if (value.object.get("bool_field")) |bool_query| return .{ .bool_field = try parseBoolFieldQuery(bool_query) };
     if (value.object.get("term_range")) |range_query| return .{ .term_range = try parseTermRangeQuery(range_query) };
     if (value.object.get("ip_range")) |range_query| return .{ .ip_range = try parseIpRangeQuery(range_query) };
@@ -2914,6 +9288,303 @@ test "pattern bool filter clauses are merged into required search clauses" {
     try std.testing.expectEqualStrings("doc:must", query.bool_query.must[1].doc_id.ids[0]);
 }
 
+test "pattern date range filter lowers public date and timestamp bounds" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const parsed_dates = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"date_range":{"path":"created_at","start":"2026-01-03T00:00:00Z","end":"2026-01-05","inclusive_start":false,"inclusive_end":true}}
+    , .{});
+    const date_query = try patternFilterValueToSearchQuery(alloc, parsed_dates.value, .{}, null);
+    try std.testing.expect(date_query == .date_range);
+    try std.testing.expectEqualStrings("created_at", date_query.date_range.field);
+    try std.testing.expectEqual(runtime_schema_mod.parseDateTimeToNs("2026-01-03T00:00:00Z").?, date_query.date_range.start_ns.?);
+    try std.testing.expectEqual(runtime_schema_mod.parseDateTimeToNs("2026-01-05").?, date_query.date_range.end_ns.?);
+    try std.testing.expect(!date_query.date_range.inclusive_start);
+    try std.testing.expect(date_query.date_range.inclusive_end);
+
+    const parsed_ns = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"date_range":{"field":"created_at","start_ns":1767398400000000000,"end_ns":1767571200000000000}}
+    , .{});
+    const ns_query = try patternFilterValueToSearchQuery(alloc, parsed_ns.value, .{}, null);
+    try std.testing.expect(ns_query == .date_range);
+    try std.testing.expectEqual(@as(u64, 1767398400000000000), ns_query.date_range.start_ns.?);
+    try std.testing.expectEqual(@as(u64, 1767571200000000000), ns_query.date_range.end_ns.?);
+}
+
+test "pattern typed structured filters accept explicit path alias" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const parsed_numeric = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"numeric_range":{"path":"score","min":10,"max":20,"inclusive_min":false,"inclusive_max":true}}
+    , .{});
+    const numeric_query = try patternFilterValueToSearchQuery(alloc, parsed_numeric.value, .{}, null);
+    try std.testing.expect(numeric_query == .numeric_range);
+    try std.testing.expectEqualStrings("score", numeric_query.numeric_range.field);
+    try std.testing.expectEqual(@as(?f64, 10), numeric_query.numeric_range.min);
+    try std.testing.expectEqual(@as(?f64, 20), numeric_query.numeric_range.max);
+    try std.testing.expect(!numeric_query.numeric_range.inclusive_min);
+    try std.testing.expect(numeric_query.numeric_range.inclusive_max);
+
+    const parsed_bool = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"bool_field":{"path":"published","value":true}}
+    , .{});
+    const bool_query = try patternFilterValueToSearchQuery(alloc, parsed_bool.value, .{}, null);
+    try std.testing.expect(bool_query == .bool_field);
+    try std.testing.expectEqualStrings("published", bool_query.bool_field.field);
+    try std.testing.expect(bool_query.bool_field.value);
+
+    const parsed_term = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"term_range":{"path":"category","min":"a","max":"m","inclusive_min":true,"inclusive_max":false}}
+    , .{});
+    const term_query = try patternFilterValueToSearchQuery(alloc, parsed_term.value, .{}, null);
+    try std.testing.expect(term_query == .term_range);
+    try std.testing.expectEqualStrings("category", term_query.term_range.field);
+    try std.testing.expectEqualStrings("a", term_query.term_range.min.?);
+    try std.testing.expectEqualStrings("m", term_query.term_range.max.?);
+
+    const parsed_ip = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"ip_range":{"path":"client_ip","cidr":"10.0.0.0/8"}}
+    , .{});
+    const ip_query = try patternFilterValueToSearchQuery(alloc, parsed_ip.value, .{}, null);
+    try std.testing.expect(ip_query == .ip_range);
+    try std.testing.expectEqualStrings("client_ip", ip_query.ip_range.field);
+    try std.testing.expectEqualStrings("10.0.0.0/8", ip_query.ip_range.cidr);
+
+    const parsed_distance = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"geo_distance":{"path":"location","lat":37.7749,"lon":-122.4194,"radius_meters":1000}}
+    , .{});
+    const distance_query = try patternFilterValueToSearchQuery(alloc, parsed_distance.value, .{}, null);
+    try std.testing.expect(distance_query == .geo_distance);
+    try std.testing.expectEqualStrings("location", distance_query.geo_distance.field);
+    try std.testing.expectEqual(@as(f64, 37.7749), distance_query.geo_distance.center.lat);
+    try std.testing.expectEqual(@as(f64, -122.4194), distance_query.geo_distance.center.lon);
+    try std.testing.expectEqual(@as(f64, 1000), distance_query.geo_distance.radius_meters);
+
+    const parsed_bbox = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"geo_bbox":{"path":"location","min_lat":37.7,"min_lon":-122.5,"max_lat":37.8,"max_lon":-122.3}}
+    , .{});
+    const bbox_query = try patternFilterValueToSearchQuery(alloc, parsed_bbox.value, .{}, null);
+    try std.testing.expect(bbox_query == .geo_bbox);
+    try std.testing.expectEqualStrings("location", bbox_query.geo_bbox.field);
+    try std.testing.expectEqual(@as(f64, 37.7), bbox_query.geo_bbox.min_lat);
+    try std.testing.expectEqual(@as(f64, -122.5), bbox_query.geo_bbox.min_lon);
+    try std.testing.expectEqual(@as(f64, 37.8), bbox_query.geo_bbox.max_lat);
+    try std.testing.expectEqual(@as(f64, -122.3), bbox_query.geo_bbox.max_lon);
+
+    const parsed_wrapped_bbox = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"geo_bbox":{"path":"location","min_lat":-1.0,"min_lon":179.5,"max_lat":1.0,"max_lon":-179.5}}
+    , .{});
+    const wrapped_bbox_query = try patternFilterValueToSearchQuery(alloc, parsed_wrapped_bbox.value, .{}, null);
+    try std.testing.expect(wrapped_bbox_query == .geo_bbox);
+    try std.testing.expectEqual(@as(f64, 179.5), wrapped_bbox_query.geo_bbox.min_lon);
+    try std.testing.expectEqual(@as(f64, -179.5), wrapped_bbox_query.geo_bbox.max_lon);
+}
+
+test "pattern typed structured filters reject ambiguous field and path aliases" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"numeric_range":{"field":"score","path":"rank","min":10}}
+    , .{});
+    try std.testing.expectError(error.InvalidArgument, patternFilterValueToSearchQuery(alloc, parsed.value, .{}, null));
+}
+
+test "pattern typed structured filters reject malformed and unbounded ranges" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const malformed_numeric = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"numeric_range":{"path":"score","min":"bad"}}
+    , .{});
+    try std.testing.expectError(error.InvalidArgument, patternFilterValueToSearchQuery(alloc, malformed_numeric.value, .{}, null));
+
+    const unbounded_numeric = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"numeric_range":{"path":"score"}}
+    , .{});
+    try std.testing.expectError(error.InvalidArgument, patternFilterValueToSearchQuery(alloc, unbounded_numeric.value, .{}, null));
+
+    const malformed_numeric_flag = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"numeric_range":{"path":"score","min":10,"inclusive_min":"yes"}}
+    , .{});
+    try std.testing.expectError(error.InvalidArgument, patternFilterValueToSearchQuery(alloc, malformed_numeric_flag.value, .{}, null));
+
+    const malformed_term = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"term_range":{"path":"category","min":10}}
+    , .{});
+    try std.testing.expectError(error.InvalidArgument, patternFilterValueToSearchQuery(alloc, malformed_term.value, .{}, null));
+
+    const unbounded_term = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"term_range":{"path":"category"}}
+    , .{});
+    try std.testing.expectError(error.InvalidArgument, patternFilterValueToSearchQuery(alloc, unbounded_term.value, .{}, null));
+
+    const malformed_date_flag = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"date_range":{"path":"created_at","start_ns":1767398400000000000,"inclusive_start":"yes"}}
+    , .{});
+    try std.testing.expectError(error.InvalidArgument, patternFilterValueToSearchQuery(alloc, malformed_date_flag.value, .{}, null));
+}
+
+test "native string range filters require exact keyword-style postings coverage" {
+    const alloc = std.testing.allocator;
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+
+    const keyword_schema = runtime_schema_mod.TableSchema{
+        .dynamic_templates = &.{
+            .{
+                .name = "client_ip",
+                .path_match = "client_ip",
+                .mapping = .{
+                    .field_type = .keyword,
+                    .do_index = true,
+                    .analyzer = "keyword",
+                },
+            },
+        },
+    };
+    const keyword_segment = (try mapper_mod.buildTextSegmentFromDocuments(alloc, &.{
+        .{ .key = "doc:1", .value = "{\"client_ip\":\"10.1.2.3\"}" },
+    }, text_analysis, keyword_schema)).?;
+    defer alloc.free(keyword_segment);
+
+    var keyword_writer = try index_mod.IndexWriter.init(alloc);
+    defer keyword_writer.deinit();
+    try keyword_writer.addSegment(keyword_segment);
+    const keyword_snapshot = keyword_writer.snapshot();
+
+    const ip_query = search_mod.SearchQuery{ .ip_range = .{
+        .field = "client_ip",
+        .cidr = "10.1.0.0/16",
+    } };
+    const term_range_query = search_mod.SearchQuery{ .term_range = .{
+        .field = "client_ip",
+        .min = "10.1",
+        .max = "10.2",
+    } };
+    try std.testing.expect(try searchQueryCanUseSnapshot(
+        keyword_snapshot,
+        ip_query,
+        text_analysis,
+        keyword_schema,
+    ));
+    try std.testing.expect(try searchQueryCanUseSnapshot(
+        keyword_snapshot,
+        term_range_query,
+        text_analysis,
+        keyword_schema,
+    ));
+
+    const text_schema = runtime_schema_mod.TableSchema{
+        .dynamic_templates = &.{
+            .{
+                .name = "client_ip",
+                .path_match = "client_ip",
+                .mapping = .{
+                    .field_type = .text,
+                    .do_index = true,
+                    .analyzer = "standard",
+                },
+            },
+        },
+    };
+    const text_segment = (try mapper_mod.buildTextSegmentFromDocuments(alloc, &.{
+        .{ .key = "doc:1", .value = "{\"client_ip\":\"10.1.2.3\"}" },
+    }, text_analysis, text_schema)).?;
+    defer alloc.free(text_segment);
+
+    var text_writer = try index_mod.IndexWriter.init(alloc);
+    defer text_writer.deinit();
+    try text_writer.addSegment(text_segment);
+    const text_snapshot = text_writer.snapshot();
+
+    try std.testing.expect(!(try searchQueryCanUseSnapshot(
+        text_snapshot,
+        ip_query,
+        text_analysis,
+        text_schema,
+    )));
+    try std.testing.expect(!(try searchQueryCanUseSnapshot(
+        text_snapshot,
+        term_range_query,
+        text_analysis,
+        text_schema,
+    )));
+}
+
+test "pattern geo structured filters reject invalid coordinates" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const invalid_distance = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"geo_distance":{"path":"location","lat":91.0,"lon":-122.4194,"radius_meters":1000}}
+    , .{});
+    try std.testing.expectError(error.InvalidArgument, patternFilterValueToSearchQuery(alloc, invalid_distance.value, .{}, null));
+
+    const invalid_radius = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"geo_distance":{"path":"location","lat":37.7749,"lon":-122.4194,"radius_meters":-1}}
+    , .{});
+    try std.testing.expectError(error.InvalidArgument, patternFilterValueToSearchQuery(alloc, invalid_radius.value, .{}, null));
+
+    const invalid_bbox = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"geo_bbox":{"path":"location","min_lat":38.0,"min_lon":-122.5,"max_lat":37.8,"max_lon":-122.3}}
+    , .{});
+    try std.testing.expectError(error.InvalidArgument, patternFilterValueToSearchQuery(alloc, invalid_bbox.value, .{}, null));
+}
+
+test "pattern standard range filter lowers through runtime scalar mappings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const schema = runtime_schema_mod.TableSchema{
+        .dynamic_templates = &.{
+            .{ .name = "score", .path_match = "score", .mapping = .{ .field_type = .numeric, .doc_values = true, .sortable = true } },
+            .{ .name = "created_at", .path_match = "created_at", .mapping = .{ .field_type = .datetime, .doc_values = true, .sortable = true } },
+            .{ .name = "category", .path_match = "category", .mapping = .{ .field_type = .keyword, .do_index = true, .doc_values = true, .sortable = true, .analyzer = "keyword" } },
+        },
+    };
+
+    const parsed_numeric = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"range":{"score":{"gte":10,"lt":20}}}
+    , .{});
+    const numeric_query = try patternFilterValueToSearchQuery(alloc, parsed_numeric.value, .{}, schema);
+    try std.testing.expect(numeric_query == .numeric_range);
+    try std.testing.expectEqualStrings("score", numeric_query.numeric_range.field);
+    try std.testing.expectEqual(@as(?f64, 10), numeric_query.numeric_range.min);
+    try std.testing.expectEqual(@as(?f64, 20), numeric_query.numeric_range.max);
+    try std.testing.expect(numeric_query.numeric_range.inclusive_min);
+    try std.testing.expect(!numeric_query.numeric_range.inclusive_max);
+
+    const parsed_date = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"range":{"field":"created_at","from":"2026-01-02","to":"2026-01-04T00:00:00Z","include_lower":false,"include_upper":true}}
+    , .{});
+    const date_query = try patternFilterValueToSearchQuery(alloc, parsed_date.value, .{}, schema);
+    try std.testing.expect(date_query == .date_range);
+    try std.testing.expectEqualStrings("created_at", date_query.date_range.field);
+    try std.testing.expectEqual(runtime_schema_mod.parseDateTimeToNs("2026-01-02").?, date_query.date_range.start_ns.?);
+    try std.testing.expectEqual(runtime_schema_mod.parseDateTimeToNs("2026-01-04T00:00:00Z").?, date_query.date_range.end_ns.?);
+    try std.testing.expect(!date_query.date_range.inclusive_start);
+    try std.testing.expect(date_query.date_range.inclusive_end);
+
+    const parsed_keyword = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"range":{"category":{"gte":"beta","lt":"delta"}}}
+    , .{});
+    const keyword_query = try patternFilterValueToSearchQuery(alloc, parsed_keyword.value, .{}, schema);
+    try std.testing.expect(keyword_query == .term_range);
+    try std.testing.expectEqualStrings("category", keyword_query.term_range.field);
+    try std.testing.expectEqualStrings("beta", keyword_query.term_range.min.?);
+    try std.testing.expectEqualStrings("delta", keyword_query.term_range.max.?);
+    try std.testing.expect(keyword_query.term_range.inclusive_min);
+    try std.testing.expect(!keyword_query.term_range.inclusive_max);
+}
+
 fn parseFuzzyOptions(object: anytype, out: *FieldFuzzy) !void {
     if (object.get("max_edits")) |edits| out.max_edits = jsonU8(edits) orelse return error.InvalidArgument;
     if (object.get("prefix_length")) |prefix| out.prefix_len = jsonU8(prefix) orelse return error.InvalidArgument;
@@ -2949,68 +9620,219 @@ fn jsonScalarTermAlloc(alloc: Allocator, value: std.json.Value) ![]const u8 {
     };
 }
 
+const JsonRangeBound = struct {
+    value: std.json.Value,
+    inclusive: bool,
+};
+
+fn parseStandardRangeQuery(
+    value: std.json.Value,
+    runtime_schema: ?runtime_schema_mod.TableSchema,
+) !search_mod.SearchQuery {
+    if (value != .object) return error.InvalidArgument;
+    if (value.object.get("field") orelse value.object.get("path")) |field_value| {
+        const field = jsonString(field_value) orelse return error.InvalidArgument;
+        return try parseStandardRangeObject(field, value.object, runtime_schema);
+    }
+
+    if (value.object.count() != 1) return error.InvalidArgument;
+    var it = value.object.iterator();
+    const entry = it.next() orelse return error.InvalidArgument;
+    if (entry.value_ptr.* != .object) return error.InvalidArgument;
+    return try parseStandardRangeObject(entry.key_ptr.*, entry.value_ptr.object, runtime_schema);
+}
+
+fn parseStandardRangeObject(
+    field: []const u8,
+    object: anytype,
+    runtime_schema: ?runtime_schema_mod.TableSchema,
+) !search_mod.SearchQuery {
+    const schema = runtime_schema orelse return error.InvalidArgument;
+    const mapping = runtime_schema_mod.resolveDeclaredFieldType(schema, field) orelse return error.InvalidArgument;
+    const lower = try standardRangeLowerBound(object);
+    const upper = try standardRangeUpperBound(object);
+    if (lower == null and upper == null) return error.InvalidArgument;
+
+    return switch (mapping.field_type) {
+        .numeric => .{ .numeric_range = .{
+            .field = field,
+            .min = if (lower) |bound| try jsonOptionalF64Strict(bound.value) else null,
+            .max = if (upper) |bound| try jsonOptionalF64Strict(bound.value) else null,
+            .inclusive_min = if (lower) |bound| bound.inclusive else true,
+            .inclusive_max = if (upper) |bound| bound.inclusive else false,
+        } },
+        .datetime => .{ .date_range = .{
+            .field = field,
+            .start_ns = if (lower) |bound| try jsonOptionalDateOrNs(bound.value) else null,
+            .end_ns = if (upper) |bound| try jsonOptionalDateOrNs(bound.value) else null,
+            .inclusive_start = if (lower) |bound| bound.inclusive else true,
+            .inclusive_end = if (upper) |bound| bound.inclusive else false,
+        } },
+        .keyword, .link => .{ .term_range = .{
+            .field = field,
+            .min = if (lower) |bound| try jsonOptionalStringStrict(bound.value) else null,
+            .max = if (upper) |bound| try jsonOptionalStringStrict(bound.value) else null,
+            .inclusive_min = if (lower) |bound| bound.inclusive else true,
+            .inclusive_max = if (upper) |bound| bound.inclusive else false,
+        } },
+        else => error.InvalidArgument,
+    };
+}
+
+fn standardRangeLowerBound(object: anytype) !?JsonRangeBound {
+    var found: ?JsonRangeBound = null;
+    if (object.get("gte")) |value| try setJsonRangeBound(&found, value, true);
+    if (object.get("gt")) |value| try setJsonRangeBound(&found, value, false);
+    if (object.get("from")) |value| try setJsonRangeBound(&found, value, (try jsonOptionalBoolStrict(object.get("include_lower"))) orelse true);
+    if (object.get("min")) |value| try setJsonRangeBound(&found, value, (try jsonOptionalBoolStrict(object.get("inclusive_min"))) orelse true);
+    return found;
+}
+
+fn standardRangeUpperBound(object: anytype) !?JsonRangeBound {
+    var found: ?JsonRangeBound = null;
+    if (object.get("lte")) |value| try setJsonRangeBound(&found, value, true);
+    if (object.get("lt")) |value| try setJsonRangeBound(&found, value, false);
+    if (object.get("to")) |value| try setJsonRangeBound(&found, value, (try jsonOptionalBoolStrict(object.get("include_upper"))) orelse true);
+    if (object.get("max")) |value| try setJsonRangeBound(&found, value, (try jsonOptionalBoolStrict(object.get("inclusive_max"))) orelse false);
+    return found;
+}
+
+fn setJsonRangeBound(found: *?JsonRangeBound, value: std.json.Value, inclusive: bool) !void {
+    if (found.* != null) return error.InvalidArgument;
+    found.* = .{ .value = value, .inclusive = inclusive };
+}
+
 fn parseNumericRangeQuery(value: std.json.Value) !search_mod.NumericRangeQuery {
     if (value != .object) return error.InvalidArgument;
-    const field = jsonString(value.object.get("field") orelse return error.InvalidArgument) orelse return error.InvalidArgument;
+    const field = try requiredFieldOrPath(value.object);
+    const min = try jsonOptionalF64StrictNullable(value.object.get("min"));
+    const max = try jsonOptionalF64StrictNullable(value.object.get("max"));
+    if (min == null and max == null) return error.InvalidArgument;
     return .{
         .field = field,
-        .min = jsonOptionalF64(value.object.get("min")),
-        .max = jsonOptionalF64(value.object.get("max")),
-        .inclusive_min = jsonOptionalBool(value.object.get("inclusive_min")) orelse true,
-        .inclusive_max = jsonOptionalBool(value.object.get("inclusive_max")) orelse false,
+        .min = min,
+        .max = max,
+        .inclusive_min = (try jsonOptionalBoolStrict(value.object.get("inclusive_min"))) orelse true,
+        .inclusive_max = (try jsonOptionalBoolStrict(value.object.get("inclusive_max"))) orelse false,
+    };
+}
+
+fn parseDateRangeQuery(value: std.json.Value) !search_mod.DateRangeQuery {
+    if (value != .object) return error.InvalidArgument;
+    const field = try requiredFieldOrPath(value.object);
+    const start_ns = if (value.object.get("start_ns") != null)
+        try jsonOptionalU64(value.object.get("start_ns"))
+    else
+        try jsonOptionalDateTimeNs(value.object.get("start"));
+    const end_ns = if (value.object.get("end_ns") != null)
+        try jsonOptionalU64(value.object.get("end_ns"))
+    else
+        try jsonOptionalDateTimeNs(value.object.get("end"));
+    if (start_ns == null and end_ns == null) return error.InvalidArgument;
+    return .{
+        .field = field,
+        .start_ns = start_ns,
+        .end_ns = end_ns,
+        .inclusive_start = (try jsonOptionalBoolStrict(value.object.get("inclusive_start"))) orelse true,
+        .inclusive_end = (try jsonOptionalBoolStrict(value.object.get("inclusive_end"))) orelse false,
     };
 }
 
 fn parseBoolFieldQuery(value: std.json.Value) !search_mod.BoolFieldQuery {
     if (value != .object) return error.InvalidArgument;
-    const field = jsonString(value.object.get("field") orelse return error.InvalidArgument) orelse return error.InvalidArgument;
-    const bool_value = jsonOptionalBool(value.object.get("value")) orelse return error.InvalidArgument;
+    const field = try requiredFieldOrPath(value.object);
+    const bool_value = (try jsonOptionalBoolStrict(value.object.get("value"))) orelse return error.InvalidArgument;
     return .{ .field = field, .value = bool_value };
 }
 
 fn parseTermRangeQuery(value: std.json.Value) !search_mod.TermRangeQuery {
     if (value != .object) return error.InvalidArgument;
-    const field = jsonString(value.object.get("field") orelse return error.InvalidArgument) orelse return error.InvalidArgument;
+    const field = try requiredFieldOrPath(value.object);
+    const min = try jsonOptionalStringStrictNullable(value.object.get("min"));
+    const max = try jsonOptionalStringStrictNullable(value.object.get("max"));
+    if (min == null and max == null) return error.InvalidArgument;
     return .{
         .field = field,
-        .min = jsonString(value.object.get("min") orelse .null),
-        .max = jsonString(value.object.get("max") orelse .null),
-        .inclusive_min = jsonOptionalBool(value.object.get("inclusive_min")) orelse true,
-        .inclusive_max = jsonOptionalBool(value.object.get("inclusive_max")) orelse false,
+        .min = min,
+        .max = max,
+        .inclusive_min = (try jsonOptionalBoolStrict(value.object.get("inclusive_min"))) orelse true,
+        .inclusive_max = (try jsonOptionalBoolStrict(value.object.get("inclusive_max"))) orelse false,
     };
 }
 
 fn parseIpRangeQuery(value: std.json.Value) !search_mod.IPRangeQuery {
     if (value != .object) return error.InvalidArgument;
-    const field = jsonString(value.object.get("field") orelse return error.InvalidArgument) orelse return error.InvalidArgument;
+    const field = try requiredFieldOrPath(value.object);
     const cidr = jsonString(value.object.get("cidr") orelse return error.InvalidArgument) orelse return error.InvalidArgument;
     return .{ .field = field, .cidr = cidr };
 }
 
 fn parseGeoDistanceQuery(value: std.json.Value) !search_mod.GeoDistanceQuery {
     if (value != .object) return error.InvalidArgument;
-    const field = jsonString(value.object.get("field") orelse return error.InvalidArgument) orelse return error.InvalidArgument;
-    const lon = jsonOptionalF64(value.object.get("lon")) orelse return error.InvalidArgument;
-    const lat = jsonOptionalF64(value.object.get("lat")) orelse return error.InvalidArgument;
-    const radius_meters = jsonOptionalF64(value.object.get("radius_meters")) orelse return error.InvalidArgument;
+    const field = try requiredFieldOrPath(value.object);
+    const lon = try jsonRequiredLongitude(value.object.get("lon"));
+    const lat = try jsonRequiredLatitude(value.object.get("lat"));
+    const radius_meters = try jsonRequiredNonNegativeFiniteF64(value.object.get("radius_meters"));
     return .{ .field = field, .center = .{ .lon = lon, .lat = lat }, .radius_meters = radius_meters };
 }
 
 fn parseGeoBBoxQuery(value: std.json.Value) !search_mod.GeoBBoxQuery {
     if (value != .object) return error.InvalidArgument;
-    const field = jsonString(value.object.get("field") orelse return error.InvalidArgument) orelse return error.InvalidArgument;
+    const field = try requiredFieldOrPath(value.object);
+    const min_lat = try jsonRequiredLatitude(value.object.get("min_lat"));
+    const min_lon = try jsonRequiredLongitude(value.object.get("min_lon"));
+    const max_lat = try jsonRequiredLatitude(value.object.get("max_lat"));
+    const max_lon = try jsonRequiredLongitude(value.object.get("max_lon"));
+    if (min_lat > max_lat) return error.InvalidArgument;
     return .{
         .field = field,
-        .min_lat = jsonOptionalF64(value.object.get("min_lat")) orelse return error.InvalidArgument,
-        .min_lon = jsonOptionalF64(value.object.get("min_lon")) orelse return error.InvalidArgument,
-        .max_lat = jsonOptionalF64(value.object.get("max_lat")) orelse return error.InvalidArgument,
-        .max_lon = jsonOptionalF64(value.object.get("max_lon")) orelse return error.InvalidArgument,
+        .min_lat = min_lat,
+        .min_lon = min_lon,
+        .max_lat = max_lat,
+        .max_lon = max_lon,
     };
+}
+
+fn requiredFieldOrPath(object: anytype) ![]const u8 {
+    const field_value = object.get("field");
+    const path_value = object.get("path");
+    if (field_value != null and path_value != null) {
+        const field = jsonString(field_value.?) orelse return error.InvalidArgument;
+        const path = jsonString(path_value.?) orelse return error.InvalidArgument;
+        if (!std.mem.eql(u8, field, path)) return error.InvalidArgument;
+        return field;
+    }
+    return jsonString(field_value orelse path_value orelse return error.InvalidArgument) orelse return error.InvalidArgument;
+}
+
+fn jsonRequiredLatitude(value: ?std.json.Value) !f64 {
+    const parsed = try jsonRequiredFiniteF64(value);
+    if (parsed < -90.0 or parsed > 90.0) return error.InvalidArgument;
+    return parsed;
+}
+
+fn jsonRequiredLongitude(value: ?std.json.Value) !f64 {
+    const parsed = try jsonRequiredFiniteF64(value);
+    if (parsed < -180.0 or parsed > 180.0) return error.InvalidArgument;
+    return parsed;
+}
+
+fn jsonRequiredNonNegativeFiniteF64(value: ?std.json.Value) !f64 {
+    const parsed = try jsonRequiredFiniteF64(value);
+    if (parsed < 0) return error.InvalidArgument;
+    return parsed;
+}
+
+fn jsonRequiredFiniteF64(value: ?std.json.Value) !f64 {
+    const parsed = jsonOptionalF64(value) orelse return error.InvalidArgument;
+    if (!std.math.isFinite(parsed)) return error.InvalidArgument;
+    return parsed;
 }
 
 fn jsonString(value: std.json.Value) ?[]const u8 {
     return switch (value) {
         .string => |text| text,
+        .null => null,
         else => null,
     };
 }
@@ -3020,6 +9842,8 @@ fn jsonOptionalF64(value: ?std.json.Value) ?f64 {
     return switch (actual) {
         .integer => |number| @floatFromInt(number),
         .float => |number| number,
+        .number_string => |text| std.fmt.parseFloat(f64, text) catch null,
+        .null => null,
         else => null,
     };
 }
@@ -3028,7 +9852,77 @@ fn jsonOptionalBool(value: ?std.json.Value) ?bool {
     const actual = value orelse return null;
     return switch (actual) {
         .bool => |boolean| boolean,
+        .null => null,
         else => null,
+    };
+}
+
+fn jsonOptionalF64Strict(value: std.json.Value) !?f64 {
+    const parsed: ?f64 = switch (value) {
+        .integer => |number| @floatFromInt(number),
+        .float => |number| number,
+        .number_string => |text| std.fmt.parseFloat(f64, text) catch return error.InvalidArgument,
+        .null => null,
+        else => return error.InvalidArgument,
+    };
+    if (parsed) |number| {
+        if (!std.math.isFinite(number)) return error.InvalidArgument;
+    }
+    return parsed;
+}
+
+fn jsonOptionalF64StrictNullable(value: ?std.json.Value) !?f64 {
+    return try jsonOptionalF64Strict(value orelse return null);
+}
+
+fn jsonOptionalStringStrict(value: std.json.Value) !?[]const u8 {
+    return switch (value) {
+        .string => |text| text,
+        .null => null,
+        else => error.InvalidArgument,
+    };
+}
+
+fn jsonOptionalStringStrictNullable(value: ?std.json.Value) !?[]const u8 {
+    return try jsonOptionalStringStrict(value orelse return null);
+}
+
+fn jsonOptionalBoolStrict(value: ?std.json.Value) !?bool {
+    const actual = value orelse return null;
+    return switch (actual) {
+        .bool => |boolean| boolean,
+        .null => null,
+        else => error.InvalidArgument,
+    };
+}
+
+fn jsonOptionalU64(value: ?std.json.Value) !?u64 {
+    const actual = value orelse return null;
+    return switch (actual) {
+        .integer => |number| if (number >= 0) @intCast(number) else error.InvalidArgument,
+        .null => null,
+        else => error.InvalidArgument,
+    };
+}
+
+fn jsonOptionalDateOrNs(value: std.json.Value) !?u64 {
+    return switch (value) {
+        .integer => |number| if (number >= 0) @intCast(number) else error.InvalidArgument,
+        .number_string => |text| std.fmt.parseInt(u64, text, 10) catch {
+            return runtime_schema_mod.parseDateTimeToNs(text) orelse error.InvalidArgument;
+        },
+        .string => |text| runtime_schema_mod.parseDateTimeToNs(text) orelse std.fmt.parseInt(u64, text, 10) catch return error.InvalidArgument,
+        .null => null,
+        else => error.InvalidArgument,
+    };
+}
+
+fn jsonOptionalDateTimeNs(value: ?std.json.Value) !?u64 {
+    const actual = value orelse return null;
+    return switch (actual) {
+        .string => |text| runtime_schema_mod.parseDateTimeToNs(text) orelse error.InvalidArgument,
+        .null => null,
+        else => error.InvalidArgument,
     };
 }
 
@@ -3377,6 +10271,7 @@ pub fn searchText(
     req: types.SearchRequest,
     dispatcher: SearchTextDispatcher,
 ) !types.SearchResult {
+    resetLastSortRejectionDiagnostic();
     return switch (req.query) {
         .match_none => try dispatcher.func(dispatcher.ctx, alloc, req, .{ .match_none = {} }),
         .match_all => try dispatcher.func(dispatcher.ctx, alloc, req, .{ .match_all = {} }),
@@ -3499,30 +10394,329 @@ pub fn searchText(
     };
 }
 
+fn sortAndPageTextDocValueFilterAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    snapshot: *const index_mod.IndexSnapshot,
+    filter: query_mod.Filter,
+    executor: SearchTextQueryExecutor,
+    plan: SortExecutionPlan,
+) !types.SearchResult {
+    const doc_nums = try snapshot.executeFilter(alloc, filter);
+    defer alloc.free(doc_nums);
+    return try sortAndPageTextDocValueDocNumsAlloc(alloc, req, snapshot, doc_nums, executor, plan);
+}
+
+fn sortAndPageTextDocValueDocNumsAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    snapshot: *const index_mod.IndexSnapshot,
+    doc_nums: []const u32,
+    executor: SearchTextQueryExecutor,
+    plan: SortExecutionPlan,
+) !types.SearchResult {
+    var effective = try effectiveSortRequestAlloc(alloc, req);
+    defer effective.deinit(alloc);
+    const effective_req = effective.req;
+
+    try validateSortPageOptions(effective_req);
+    if (effective_req.order_by.len == 0) return error.InvalidQueryRequest;
+    try validateSortExecutionPlanForRuntime(effective_req, plan, .{
+        .require_native = plan.require_native,
+        .load = loadTextDocValueSortValue,
+    });
+    try checkSearchRequestDeadline(effective_req);
+
+    const bench_query_profile = shouldLogBenchQueryProfile();
+    const collect_sort_profile = bench_query_profile or effective_req.profile;
+    if (effective_req.limit == 0) {
+        const zero_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
+        var profile = SortCollectorProfile{};
+        observeSortCandidateSource(if (collect_sort_profile) &profile else null, "text_postings");
+        const visible_total = if (activeSortCursor(effective_req).len > 0)
+            try visibleTextDocNumCountAfterCursorAlloc(
+                alloc,
+                effective_req,
+                snapshot,
+                doc_nums,
+                executor,
+                plan,
+                if (collect_sort_profile) &profile else null,
+            )
+        else
+            try visibleTextDocNumCount(alloc, effective_req, snapshot, doc_nums, executor);
+        if (collect_sort_profile and activeSortCursor(effective_req).len == 0) {
+            profile.candidate_count = @intCast(@min(visible_total, @as(usize, std.math.maxInt(u64))));
+        }
+        if (collect_sort_profile) {
+            profile.window_capacity = 0;
+            profile.window_len = 0;
+            profile.total_ns = platform_time.monotonicNs() - zero_start_ns;
+        }
+        if (bench_query_profile) {
+            logBenchSortCollectorProfile(effective_req, plan, true, profile);
+        }
+        return .{
+            .alloc = alloc,
+            .hits = &.{},
+            .total_hits = boundedU32(visible_total),
+            .total_hits_relation = if (visible_total > std.math.maxInt(u32)) .gte else .exact,
+            .sort_profile = if (collect_sort_profile) sortResultProfile(effective_req, plan, true, profile) else null,
+            .graph_results = &.{},
+        };
+    }
+
+    const exact_candidate_budget = lateVisibilityExactCandidateBudget();
+    const candidate_count = boundedU32(doc_nums.len);
+    enforceLateVisibilityExactCandidateBudget(candidate_count, exact_candidate_budget) catch |err| {
+        logExactSortBudgetRejection(
+            "text",
+            .text_field_sort_candidate_window,
+            effective_req.index_name,
+            candidate_count,
+            exact_candidate_budget,
+            plan,
+        );
+        return err;
+    };
+
+    const sort_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
+    var profile = SortCollectorProfile{};
+    observeSortCandidateSource(if (collect_sort_profile) &profile else null, "text_postings");
+    const window_capacity = sortWindowCapacity(effective_req);
+    if (collect_sort_profile) profile.window_capacity = window_capacity;
+    const keep_previous_page = effective_req.search_before.len > 0;
+    var window: []DecoratedSortHit = if (window_capacity > 0)
+        try alloc.alloc(DecoratedSortHit, window_capacity)
+    else
+        &.{};
+    var window_len: usize = 0;
+    var window_drained_prefix: usize = 0;
+    errdefer {
+        for (window[window_drained_prefix..window_len]) |*item| item.deinit(alloc);
+        if (window.len > 0) alloc.free(window);
+    }
+
+    const native_sort_ctx = TextDocValueSortContext{ .snapshot = snapshot };
+    const native_loader = NativeSortValueLoader{
+        .ctx = @constCast(&native_sort_ctx),
+        .require_native = plan.require_native,
+        .load = loadTextDocValueSortValue,
+    };
+    var visible_candidate_count: usize = 0;
+    for (doc_nums, 0..) |doc_num, i| {
+        if (i % 1024 == 0) try checkSearchRequestDeadline(effective_req);
+        const stored = snapshot.storedDoc(doc_num) orelse return error.StoredDocMissing;
+        if (executor.is_expired_key) |is_expired| {
+            if (try is_expired(executor.ctx, alloc, stored.id)) continue;
+        }
+        visible_candidate_count += 1;
+        if (collect_sort_profile) profile.candidate_count += 1;
+        const raw_hit = types.SearchHit{
+            .id = try alloc.dupe(u8, stored.id),
+            .doc_ordinal = try snapshot.docOrdinal(doc_num),
+            .native_text_doc_id = doc_num,
+            .score = 1.0,
+            .stored_data = null,
+        };
+        const decorate_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
+        var decorated = try decorateSortHitAlloc(
+            alloc,
+            effective_req,
+            plan,
+            raw_hit,
+            executor.ctx,
+            executor.load_stored,
+            native_loader,
+            if (collect_sort_profile) &profile else null,
+        );
+        var decorated_owned = true;
+        errdefer if (decorated_owned) decorated.deinit(alloc);
+        if (collect_sort_profile) profile.decorate_ns += platform_time.monotonicNs() - decorate_start_ns;
+
+        const allowed_by_cursor = try decoratedHitAllowedByCursor(effective_req, plan, decorated);
+        admitDecoratedSortHitIntoWindow(
+            alloc,
+            effective_req,
+            window,
+            &window_len,
+            keep_previous_page,
+            if (collect_sort_profile) &profile else null,
+            decorated,
+            allowed_by_cursor,
+        );
+        decorated_owned = false;
+    }
+
+    try checkSearchRequestDeadline(effective_req);
+    const final_sort_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
+    std.sort.pdq(DecoratedSortHit, window[0..window_len], effective_req, decoratedLessThan);
+    if (collect_sort_profile) profile.final_sort_ns = platform_time.monotonicNs() - final_sort_start_ns;
+    try checkSearchRequestDeadline(effective_req);
+
+    var start: usize = 0;
+    var end: usize = window_len;
+    if (effective_req.search_after.len == 0 and effective_req.search_before.len == 0) {
+        start = @min(@as(usize, @intCast(effective_req.offset)), window_len);
+        end = @min(start + @as(usize, @intCast(effective_req.limit)), window_len);
+    }
+
+    const selected = try alloc.alloc(types.SearchHit, end - start);
+    var selected_initialized: usize = 0;
+    errdefer {
+        for (selected[0..selected_initialized]) |*hit| hit.deinit(alloc);
+        if (selected.len > 0) alloc.free(selected);
+    }
+    for (window[0..window_len], 0..) |*item, i| {
+        if (i % 1024 == 0) try checkSearchRequestDeadline(effective_req);
+        if (i >= start and i < end) {
+            selected[selected_initialized] = item.hit;
+            item.hit = undefined;
+            selected_initialized += 1;
+            if (collect_sort_profile) profile.selected_count += 1;
+        } else {
+            item.hit.deinit(alloc);
+        }
+        freeSortValues(alloc, item.keys);
+        window_drained_prefix = i + 1;
+    }
+    if (window.len > 0) alloc.free(window);
+    if (collect_sort_profile) {
+        profile.window_len = window_len;
+        profile.total_ns = platform_time.monotonicNs() - sort_start_ns;
+    }
+    if (bench_query_profile) {
+        logBenchSortCollectorProfile(effective_req, plan, true, profile);
+    }
+
+    var out = types.SearchResult{
+        .alloc = alloc,
+        .hits = selected,
+        .total_hits = boundedU32(visible_candidate_count),
+        .total_hits_relation = if (visible_candidate_count > std.math.maxInt(u32)) .gte else .exact,
+        .sort_profile = if (collect_sort_profile) sortResultProfile(effective_req, plan, true, profile) else null,
+        .graph_results = &.{},
+    };
+    errdefer out.deinit();
+
+    if (effective_req.include_stored) {
+        const source_profile = try loadMissingProjectedTextHitDocuments(alloc, effective_req, executor, out.hits);
+        applyProjectedSourceLoadProfileToSortProfile(&out, source_profile);
+        logBenchProjectedSourceLoadProfile(effective_req, plan, "text", source_profile);
+    }
+    return out;
+}
+
+fn visibleTextDocNumCountAfterCursorAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    snapshot: *const index_mod.IndexSnapshot,
+    doc_nums: []const u32,
+    executor: SearchTextQueryExecutor,
+    plan: SortExecutionPlan,
+    profile: ?*SortCollectorProfile,
+) !usize {
+    var native_sort_ctx = TextDocValueSortContext{ .snapshot = snapshot };
+    const native_loader = NativeSortValueLoader{
+        .ctx = &native_sort_ctx,
+        .require_native = plan.require_native,
+        .load = loadTextDocValueSortValue,
+    };
+
+    var visible_count: usize = 0;
+    for (doc_nums, 0..) |doc_num, i| {
+        if (i % 1024 == 0) try checkSearchRequestDeadline(req);
+        const stored = snapshot.storedDoc(doc_num) orelse return error.StoredDocMissing;
+        if (executor.is_expired_key) |is_expired| {
+            if (try is_expired(executor.ctx, alloc, stored.id)) continue;
+        }
+        if (profile) |p| p.candidate_count += 1;
+        const raw_hit = types.SearchHit{
+            .id = try alloc.dupe(u8, stored.id),
+            .doc_ordinal = try snapshot.docOrdinal(doc_num),
+            .native_text_doc_id = doc_num,
+            .score = 1.0,
+            .stored_data = null,
+        };
+        const decorate_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
+        var decorated = try decorateSortHitAlloc(
+            alloc,
+            req,
+            plan,
+            raw_hit,
+            executor.ctx,
+            executor.load_stored,
+            native_loader,
+            profile,
+        );
+        defer decorated.deinit(alloc);
+        if (profile) |p| p.decorate_ns += platform_time.monotonicNs() - decorate_start_ns;
+
+        if (try decoratedHitAllowedByCursor(req, plan, decorated)) {
+            visible_count += 1;
+        } else if (profile) |p| {
+            p.cursor_rejected_count += 1;
+        }
+    }
+    return visible_count;
+}
+
+fn visibleTextDocNumCount(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    snapshot: *const index_mod.IndexSnapshot,
+    doc_nums: []const u32,
+    executor: SearchTextQueryExecutor,
+) !usize {
+    if (executor.is_expired_key == null) return doc_nums.len;
+
+    var visible_count: usize = 0;
+    for (doc_nums, 0..) |doc_num, i| {
+        if (i % 1024 == 0) try checkSearchRequestDeadline(req);
+        const stored = snapshot.storedDoc(doc_num) orelse return error.StoredDocMissing;
+        if (try executor.is_expired_key.?(executor.ctx, alloc, stored.id)) continue;
+        visible_count += 1;
+    }
+    return visible_count;
+}
+
 pub fn searchTextQuery(
     alloc: Allocator,
     req: types.SearchRequest,
     text_query: types.TextQuery,
     executor: SearchTextQueryExecutor,
 ) !types.SearchResult {
+    resetLastSortRejectionDiagnostic();
+    try checkSearchRequestDeadline(req);
+    var effective_sort_request = if (requestHasSortPageOptions(req))
+        try effectiveSortRequestAlloc(alloc, req)
+    else
+        EffectiveSortRequest{ .req = req };
+    defer effective_sort_request.deinit(alloc);
+    var effective_req = effective_sort_request.req;
+
     const bench_query_profile = shouldLogBenchQueryProfile();
-    const total_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
-    const text_entry = (try executor.text_index_entry(executor.ctx, req.index_name)) orelse return switch (text_query) {
-        .match_all => executor.search_match_all(executor.ctx, alloc, req),
+    const collect_sort_profile = bench_query_profile or effective_req.profile;
+    const collect_score_profile = collect_sort_profile and textQueryIsScoreBearing(text_query);
+    const collect_score_timing = bench_query_profile or collect_score_profile;
+    const total_start_ns = if (bench_query_profile or collect_score_profile) platform_time.monotonicNs() else 0;
+    const text_entry = (try executor.text_index_entry(executor.ctx, effective_req.index_name)) orelse return switch (text_query) {
+        .match_all => executor.search_match_all(executor.ctx, alloc, effective_req),
         else => error.IndexNotFound,
     };
-    var effective_req = req;
     if (effective_req.index_name == null) effective_req.index_name = text_entry.config.name;
     const text_index = &text_entry.persistent;
     const chunk_backed = try executor.text_index_is_chunk_backed(executor.ctx, alloc, effective_req.index_name);
     const group_chunk_parents = shouldGroupChunkParents(effective_req, chunk_backed);
     const paging = componentPaging(effective_req);
+    effective_req.full_text = text_query;
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const arena_alloc = arena.allocator();
     const base_search_query = try textQueryToSearchQuery(arena_alloc, text_query, text_entry.text_analysis, text_entry.runtime_schema);
     const snapshot = text_index.snapshot();
+    const can_apply_live_all_docs = !chunk_backed or snapshot.hasDocOrdinalCoverage();
     const constraints_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
     var constraint_req = effective_req;
     constraint_req.resolved_doc_filter = null;
@@ -3535,12 +10729,11 @@ pub fn searchTextQuery(
         .live_filter_doc_set = executor.live_filter_doc_set,
         .project_ordinals_to_doc_ids = false,
         .text_snapshot_for_doc_num_projection = snapshot,
-        .apply_live_all_docs = !chunk_backed or snapshot.hasDocOrdinalCoverage(),
+        .apply_live_all_docs = can_apply_live_all_docs,
     });
     defer native_constraints.deinit(alloc);
     const derive_constraints_ns = if (bench_query_profile) platform_time.monotonicNs() - constraints_start_ns else 0;
 
-    const collect_all_hits = group_chunk_parents;
     const resolved_filter_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
     if (resolvedTextDocNumFilterFromRequest(effective_req)) |filter| {
         try applyResolvedTextDocNumFilterAlloc(alloc, &native_constraints, filter);
@@ -3557,123 +10750,374 @@ pub fn searchTextQuery(
     }
     const resolved_filter_ns = if (bench_query_profile) platform_time.monotonicNs() - resolved_filter_start_ns else 0;
     const convert_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
-    try convertNativeDocIdsToTextDocNumsAlloc(alloc, snapshot, &native_constraints);
+    try convertNativeDocIdsToTextDocNumsAlloc(alloc, effective_req, snapshot, &native_constraints);
     try normalizeNativeDocNumConstraintsAlloc(alloc, &native_constraints);
     const convert_constraints_ns = if (bench_query_profile) platform_time.monotonicNs() - convert_start_ns else 0;
+    const unresolved_stored_filters =
+        (effective_req.filter_query_json.len > 0 and !native_constraints.filter_query_json_resolved) or
+        (effective_req.exclusion_query_json.len > 0 and !native_constraints.exclusion_query_json_resolved);
+    try rejectSortedQueryWithUnresolvedStoredFilters(
+        effective_req,
+        native_constraints.filter_query_json_resolved,
+        native_constraints.exclusion_query_json_resolved,
+    );
 
     if (native_constraints.positive_filter and native_constraints.filter_doc_ids.len == 0 and native_constraints.filter_doc_nums.len == 0) {
+        const score_profile = if (collect_score_profile) sortResultProfile(effective_req, .{
+            .kind = .score_top_k,
+        }, false, .{
+            .candidate_source = "native_filter",
+            .window_capacity = @intCast(paging.limit),
+            .window_len = 0,
+            .total_ns = platform_time.monotonicNs() - total_start_ns,
+        }) else null;
         return executor.postprocess(executor.ctx, alloc, effective_req, .{
             .alloc = alloc,
             .hits = &.{},
             .total_hits = 0,
+            .sort_profile = score_profile,
             .graph_results = &.{},
         }, chunk_backed);
     }
+    const late_visibility_paginate = try searchTextNeedsLateVisibilityFilter(
+        executor,
+        can_apply_live_all_docs,
+        native_constraints.positive_filter,
+        effective_req.identity_read_generation,
+    );
+    const full_candidate_limit = effectiveTextCandidateLimit(snapshot.global_doc_count, native_constraints);
+    const requires_field_sort = effective_req.order_by.len > 0;
     const search_query = try textSearchQueryWithNativeDocIdsAlloc(arena_alloc, base_search_query, native_constraints, effective_req.count_only);
+    const load_stored_in_search_engine = effective_req.include_stored and !chunk_backed and !requires_field_sort;
+    var field_sort_plan = SortExecutionPlan{ .kind = .none };
+    if (requires_field_sort) field_sort_plan = try planTextNativeSortFields(effective_req, snapshot, text_entry.runtime_schema);
+    if (requires_field_sort and
+        field_sort_plan.sorted_segment_executor_available and
+        !chunk_backed and
+        !group_chunk_parents and
+        !late_visibility_paginate and
+        !unresolved_stored_filters and
+        !effective_req.count_only and
+        !requestHasPostprocessPageTransforms(effective_req) and
+        effective_req.aggregations_json.len == 0 and
+        effective_req.graph_queries.len == 0 and
+        effective_req.full_text_queries.len == 0)
+    {
+        const sorted_membership_query = try textSearchQueryWithNativeDocIdsAlloc(arena_alloc, base_search_query, native_constraints, true);
+        const membership_filter = search_mod.searchQueryToFilterArena(arena_alloc, sorted_membership_query) catch |err| switch (err) {
+            error.InvalidArgument => null,
+            else => return err,
+        };
+        if (membership_filter) |filter| {
+            var membership = try buildSortedSegmentDocMembershipAlloc(alloc, snapshot, filter);
+            defer membership.deinit(alloc);
 
-    const execute_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
-    var result = if (effective_req.count_only)
-        try search_mod.executeCountCandidates(alloc, snapshot, search_query)
-    else
-        try search_mod.execute(alloc, snapshot, .{
-            .query = search_query,
-            .k = if (collect_all_hits) @intCast(snapshot.global_doc_count) else paging.limit,
-            .offset = if (collect_all_hits) 0 else paging.offset,
-            .include_stored = effective_req.include_stored,
-            .distributed_text_stats = effective_req.distributed_text_stats,
-            .filter_doc_nums = native_constraints.filter_doc_nums,
-            .filter_doc_nums_positive = native_constraints.positive_filter,
-            .exclude_doc_nums = native_constraints.exclude_doc_nums,
-        });
-    defer result.deinit();
-    const execute_ns = if (bench_query_profile) platform_time.monotonicNs() - execute_start_ns else 0;
+            const cost_decision = sortedSegmentSelectiveCandidateDocValuesDecision(effective_req, membership.candidate_count, snapshot);
+            if (cost_decision.prefer_doc_values) {
+                const doc_nums = try sortedSegmentDocMembershipDocNumsAlloc(alloc, snapshot, &membership);
+                defer alloc.free(doc_nums);
+                var doc_values_plan = docValuesCollectorPlanForSelectiveFilter(field_sort_plan);
+                applySortCostModelDecision(&doc_values_plan, cost_decision);
+                return try sortAndPageTextDocValueDocNumsAlloc(
+                    alloc,
+                    effective_req,
+                    snapshot,
+                    doc_nums,
+                    executor,
+                    doc_values_plan,
+                );
+            }
 
-    const hits_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
-    var hits = try alloc.alloc(types.SearchHit, result.hits.len);
-    var initialized: usize = 0;
-    var owns_hits = true;
-    errdefer {
-        if (owns_hits) {
-            for (hits[0..initialized]) |*hit| hit.deinit(alloc);
-            alloc.free(hits);
+            var sorted_plan = field_sort_plan;
+            applySortCostModelDecision(&sorted_plan, cost_decision);
+            sorted_plan.kind = .sorted_segment_seek;
+            sorted_plan.exactness = .bounded_exact;
+            sorted_plan.source = .sorted_segment_scan;
+            sorted_plan.cursor_support = .segment_seek;
+            sorted_plan.source_load = .projected_source_after_page;
+            sorted_plan.distributed_behavior = .shard_local_only;
+
+            var sorted_req = effective_req;
+            sorted_req.include_stored = false;
+            const native_sort_ctx = TextDocValueSortContext{ .snapshot = snapshot };
+            const native_sort_loader = NativeSortValueLoader{
+                .ctx = @constCast(&native_sort_ctx),
+                .require_native = true,
+                .load = loadTextDocValueSortValue,
+            };
+            const sorted_executor = MatchAllExecutor{
+                .ctx = executor.ctx,
+                .collect_candidates = undefined,
+                .text_index_entry = undefined,
+                .load_projected_document = undefined,
+                .load_stored = executor.load_stored,
+                .is_expired_key = executor.is_expired_key,
+            };
+            const empty_constraints = NativeDocIdConstraints{};
+            var out = try sortAndPageMatchAllSortedSegmentsAlloc(
+                alloc,
+                sorted_req,
+                sorted_executor,
+                &empty_constraints,
+                text_entry,
+                sorted_plan,
+                native_sort_loader,
+                &membership,
+            );
+            errdefer out.deinit();
+            if (effective_req.include_stored) {
+                const source_profile = try loadMissingProjectedTextHitDocuments(alloc, effective_req, executor, out.hits);
+                applyProjectedSourceLoadProfileToSortProfile(&out, source_profile);
+                logBenchProjectedSourceLoadProfile(effective_req, sorted_plan, "text", source_profile);
+            }
+            return out;
         }
     }
+    if (requires_field_sort and
+        field_sort_plan.kind == .native_doc_values_top_n and
+        !requestHasScoreSort(effective_req) and
+        !chunk_backed and
+        !group_chunk_parents and
+        !late_visibility_paginate and
+        !unresolved_stored_filters and
+        !effective_req.count_only and
+        !requestHasPostprocessPageTransforms(effective_req) and
+        effective_req.aggregations_json.len == 0 and
+        effective_req.graph_queries.len == 0 and
+        effective_req.full_text_queries.len == 0)
+    {
+        const doc_value_filter_query = try textSearchQueryWithNativeDocIdsAlloc(arena_alloc, base_search_query, native_constraints, true);
+        const doc_value_filter = search_mod.searchQueryToFilterArena(arena_alloc, doc_value_filter_query) catch |err| switch (err) {
+            error.InvalidArgument => null,
+            else => return err,
+        };
+        if (doc_value_filter) |filter| {
+            return try sortAndPageTextDocValueFilterAlloc(
+                alloc,
+                effective_req,
+                snapshot,
+                filter,
+                executor,
+                field_sort_plan,
+            );
+        }
+    }
+    const exact_late_visibility_totals = late_visibility_paginate and
+        (effective_req.count_only or
+            effective_req.limit == 0 or
+            effective_req.aggregations_json.len != 0 or
+            effective_req.graph_queries.len != 0 or
+            group_chunk_parents);
+    const exact_candidate_budget = lateVisibilityExactCandidateBudget();
+    if (exact_late_visibility_totals) {
+        enforceLateVisibilityExactCandidateBudget(full_candidate_limit, exact_candidate_budget) catch |err| {
+            logExactSortBudgetRejection(
+                "text",
+                .text_exact_late_visibility_totals,
+                effective_req.index_name,
+                full_candidate_limit,
+                exact_candidate_budget,
+                if (requires_field_sort) field_sort_plan else null,
+            );
+            return err;
+        };
+    }
+    const adaptive_late_visibility = late_visibility_paginate and !exact_late_visibility_totals;
+    const requested_visible_end = effective_req.offset +| effective_req.limit;
+    const collect_window_candidates = group_chunk_parents or late_visibility_paginate or requires_field_sort;
+    var candidate_limit: u32 = if (collect_window_candidates)
+        if (requires_field_sort)
+            @min(full_candidate_limit, exact_candidate_budget)
+        else if (adaptive_late_visibility)
+            @min(full_candidate_limit, @max(@as(u32, 1), @max(paging.limit, requested_visible_end)))
+        else
+            full_candidate_limit
+    else
+        paging.limit;
+    var candidate_iterations: u32 = 0;
+    var execute_ns: u64 = 0;
+    var hits_ns: u64 = 0;
+    var postprocess_ns: u64 = 0;
 
-    for (result.hits, 0..) |hit, i| {
-        const doc_ordinal = try snapshot.docOrdinal(hit.doc_id);
-        const id = hit.id orelse {
-            const stored = snapshot.storedDoc(hit.doc_id) orelse return error.StoredDocMissing;
+    while (true) {
+        try checkSearchRequestDeadline(effective_req);
+        candidate_iterations += 1;
+        var postprocess_req = effective_req;
+        if (late_visibility_paginate or requires_field_sort) {
+            postprocess_req.offset = 0;
+            postprocess_req.limit = candidate_limit;
+        }
+
+        const execute_start_ns = if (collect_score_timing) platform_time.monotonicNs() else 0;
+        var result = if (effective_req.count_only)
+            try search_mod.executeCountCandidates(alloc, snapshot, search_query)
+        else
+            try search_mod.execute(alloc, snapshot, .{
+                .query = search_query,
+                .k = if (collect_window_candidates) candidate_limit else paging.limit,
+                .offset = if (collect_window_candidates) 0 else paging.offset,
+                .include_stored = load_stored_in_search_engine,
+                .distributed_text_stats = effective_req.distributed_text_stats,
+                .filter_doc_nums = native_constraints.filter_doc_nums,
+                .filter_doc_nums_positive = native_constraints.positive_filter,
+                .exclude_doc_nums = native_constraints.exclude_doc_nums,
+            });
+        defer result.deinit();
+        if (collect_score_timing) execute_ns += platform_time.monotonicNs() - execute_start_ns;
+
+        const candidates_exhausted = !collect_window_candidates or
+            candidate_limit >= full_candidate_limit or
+            (result.total_hits_relation == .exact and result.total_hits <= candidate_limit);
+
+        const hits_start_ns = if (collect_score_timing) platform_time.monotonicNs() else 0;
+        var hits = try alloc.alloc(types.SearchHit, result.hits.len);
+        var initialized: usize = 0;
+        var owns_hits = true;
+        errdefer {
+            if (owns_hits) {
+                for (hits[0..initialized]) |*hit| hit.deinit(alloc);
+                alloc.free(hits);
+            }
+        }
+
+        for (result.hits, 0..) |hit, i| {
+            if (i % 1024 == 0) try checkSearchRequestDeadline(effective_req);
+            const doc_ordinal = try snapshot.docOrdinal(hit.doc_id);
+            const id = hit.id orelse {
+                const stored = snapshot.storedDoc(hit.doc_id) orelse return error.StoredDocMissing;
+                var materialized = types.SearchHit{
+                    .id = try alloc.dupe(u8, stored.id),
+                    .doc_ordinal = doc_ordinal,
+                    .native_text_doc_id = hit.doc_id,
+                    .score = hit.score,
+                    .stored_data = null,
+                };
+                var assigned = false;
+                errdefer if (!assigned) materialized.deinit(alloc);
+                materialized.index_scores = try types.cloneIndexScores(alloc, hit.index_scores);
+                hits[i] = materialized;
+                assigned = true;
+                initialized += 1;
+                continue;
+            };
+
             var materialized = types.SearchHit{
-                .id = try alloc.dupe(u8, stored.id),
+                .id = try alloc.dupe(u8, id),
                 .doc_ordinal = doc_ordinal,
+                .native_text_doc_id = hit.doc_id,
                 .score = hit.score,
                 .stored_data = null,
             };
             var assigned = false;
             errdefer if (!assigned) materialized.deinit(alloc);
             materialized.index_scores = try types.cloneIndexScores(alloc, hit.index_scores);
+            materialized.stored_data = if (load_stored_in_search_engine and hit.stored_data != null)
+                try executor.project_stored_search(executor.ctx, alloc, effective_req, id, hit.stored_data.?)
+            else
+                null;
             hits[i] = materialized;
             assigned = true;
             initialized += 1;
-            continue;
-        };
+        }
+        if (collect_score_timing) hits_ns += platform_time.monotonicNs() - hits_start_ns;
 
-        var materialized = types.SearchHit{
-            .id = try alloc.dupe(u8, id),
-            .doc_ordinal = doc_ordinal,
-            .score = hit.score,
-            .stored_data = null,
-        };
-        var assigned = false;
-        errdefer if (!assigned) materialized.deinit(alloc);
-        materialized.index_scores = try types.cloneIndexScores(alloc, hit.index_scores);
-        materialized.stored_data = if (effective_req.include_stored and hit.stored_data != null)
-            try executor.project_stored_search(executor.ctx, alloc, effective_req, id, hit.stored_data.?)
-        else
-            null;
-        hits[i] = materialized;
-        assigned = true;
-        initialized += 1;
-    }
-    const hits_ns = if (bench_query_profile) platform_time.monotonicNs() - hits_start_ns else 0;
-
-    owns_hits = false;
-    const postprocess_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
-    const out = try executor.postprocess(executor.ctx, alloc, effective_req, .{
-        .alloc = alloc,
-        .hits = hits,
-        .total_hits = result.total_hits,
-        .total_hits_relation = switch (result.total_hits_relation) {
-            .exact => .exact,
-            .gte => .gte,
-        },
-        .graph_results = &.{},
-    }, chunk_backed);
-    if (bench_query_profile) {
-        const postprocess_ns = platform_time.monotonicNs() - postprocess_start_ns;
-        std.log.info(
-            "antfly_bench_text_query index={s} total_us={d} derive_constraints_us={d} apply_resolved_us={d} convert_constraints_us={d} execute_us={d} hits_us={d} postprocess_us={d} positive_filter={} filter_doc_nums={d} filter_doc_ids={d} exclude_doc_nums={d} exclude_doc_ids={d} snapshot_docs={d} hits={d} total_hits={d}",
-            .{
-                effective_req.index_name orelse "",
-                nsToUs(platform_time.monotonicNs() - total_start_ns),
-                nsToUs(derive_constraints_ns),
-                nsToUs(resolved_filter_ns),
-                nsToUs(convert_constraints_ns),
-                nsToUs(execute_ns),
-                nsToUs(hits_ns),
-                nsToUs(postprocess_ns),
-                native_constraints.positive_filter,
-                native_constraints.filter_doc_nums.len,
-                native_constraints.filter_doc_ids.len,
-                native_constraints.exclude_doc_nums.len,
-                native_constraints.exclude_doc_ids.len,
-                snapshot.global_doc_count,
-                out.hits.len,
-                out.total_hits,
+        owns_hits = false;
+        const postprocess_start_ns = if (collect_score_timing) platform_time.monotonicNs() else 0;
+        var out = try executor.postprocess(executor.ctx, alloc, postprocess_req, .{
+            .alloc = alloc,
+            .hits = hits,
+            .total_hits = result.total_hits,
+            .total_hits_relation = switch (result.total_hits_relation) {
+                .exact => .exact,
+                .gte => .gte,
             },
-        );
+            .graph_results = &.{},
+        }, chunk_backed);
+        errdefer out.deinit();
+        if (collect_score_timing) postprocess_ns += platform_time.monotonicNs() - postprocess_start_ns;
+
+        const visible_candidate_count: u32 = @intCast(@min(out.hits.len, @as(usize, std.math.maxInt(u32))));
+        if (adaptive_late_visibility and !candidates_exhausted and visible_candidate_count < requested_visible_end) {
+            out.deinit();
+            const grown_limit = @min(full_candidate_limit, @max(candidate_limit +| 1, candidate_limit *| 2));
+            if (grown_limit == candidate_limit) return error.InvalidQueryRequest;
+            candidate_limit = grown_limit;
+            continue;
+        }
+        if (adaptive_late_visibility and !candidates_exhausted) {
+            out.total_hits = visible_candidate_count;
+            out.total_hits_relation = .gte;
+        }
+        if (requires_field_sort and !candidates_exhausted) {
+            logExactSortBudgetRejection(
+                "text",
+                .text_field_sort_candidate_window,
+                effective_req.index_name,
+                result.total_hits,
+                candidate_limit,
+                field_sort_plan,
+            );
+            return error.QueryCandidateBudgetExceeded;
+        }
+        try checkSearchRequestDeadline(effective_req);
+        if (requires_field_sort) {
+            if (field_sort_plan.kind == .native_doc_values_top_n) {
+                const native_sort_ctx = TextDocValueSortContext{ .snapshot = snapshot };
+                try sortAndPageSearchResultInPlace(&out, effective_req, executor.ctx, executor.load_stored, field_sort_plan, .{
+                    .ctx = @constCast(&native_sort_ctx),
+                    .require_native = field_sort_plan.require_native,
+                    .load = loadTextDocValueSortValue,
+                });
+            } else {
+                try sortAndPageSearchResultInPlace(&out, effective_req, executor.ctx, executor.load_stored, field_sort_plan, null);
+            }
+            if (effective_req.include_stored and !chunk_backed) {
+                const source_profile = try loadMissingProjectedTextHitDocuments(alloc, effective_req, executor, out.hits);
+                applyProjectedSourceLoadProfileToSortProfile(&out, source_profile);
+                logBenchProjectedSourceLoadProfile(effective_req, field_sort_plan, "text", source_profile);
+            }
+        } else if (late_visibility_paginate and !effective_req.count_only) {
+            try paginateSearchResultInPlace(&out, effective_req.offset, effective_req.limit);
+        }
+        if (!requires_field_sort and !effective_req.count_only and collect_score_profile) {
+            out.sort_profile = sortResultProfile(effective_req, .{ .kind = .score_top_k }, false, .{
+                .candidate_source = "text_postings",
+                .candidate_count = @intCast(result.hits.len),
+                .admitted_count = @intCast(result.hits.len),
+                .selected_count = @intCast(out.hits.len),
+                .window_capacity = @intCast(paging.limit),
+                .window_len = out.hits.len,
+                .total_ns = execute_ns + hits_ns + postprocess_ns,
+            });
+        }
+        if (bench_query_profile) {
+            std.log.info(
+                "antfly_bench_text_query index={s} total_us={d} derive_constraints_us={d} apply_resolved_us={d} convert_constraints_us={d} execute_us={d} hits_us={d} postprocess_us={d} positive_filter={} filter_doc_nums={d} filter_doc_ids={d} exclude_doc_nums={d} exclude_doc_ids={d} snapshot_docs={d} candidate_window={d} candidate_iterations={d} late_visibility={} hits={d} total_hits={d}",
+                .{
+                    effective_req.index_name orelse "",
+                    nsToUs(platform_time.monotonicNs() - total_start_ns),
+                    nsToUs(derive_constraints_ns),
+                    nsToUs(resolved_filter_ns),
+                    nsToUs(convert_constraints_ns),
+                    nsToUs(execute_ns),
+                    nsToUs(hits_ns),
+                    nsToUs(postprocess_ns),
+                    native_constraints.positive_filter,
+                    native_constraints.filter_doc_nums.len,
+                    native_constraints.filter_doc_ids.len,
+                    native_constraints.exclude_doc_nums.len,
+                    native_constraints.exclude_doc_ids.len,
+                    snapshot.global_doc_count,
+                    candidate_limit,
+                    candidate_iterations,
+                    late_visibility_paginate,
+                    out.hits.len,
+                    out.total_hits,
+                },
+            );
+        }
+        return out;
     }
-    return out;
 }
 
 fn textSearchQueryWithNativeDocIdsAlloc(
@@ -3733,11 +11177,12 @@ fn textSearchQueryWithNativeDocIdsAlloc(
 
 fn convertNativeDocIdsToTextDocNumsAlloc(
     alloc: Allocator,
+    req: types.SearchRequest,
     snapshot: *const index_mod.IndexSnapshot,
     constraints: *NativeDocIdConstraints,
 ) !void {
     if (constraints.filter_doc_ids.len > 0) {
-        const mapped = try textDocNumsForDocIdsAlloc(alloc, snapshot, constraints.filter_doc_ids);
+        const mapped = try textDocNumsForDocIdsAlloc(alloc, req, snapshot, constraints.filter_doc_ids);
         if (constraints.filter_doc_nums.len > 0) {
             const intersected = try intersectDocNumsAlloc(alloc, constraints.filter_doc_nums, mapped);
             if (constraints.filter_doc_nums_owned and constraints.filter_doc_nums.len > 0) alloc.free(@constCast(constraints.filter_doc_nums));
@@ -3753,7 +11198,7 @@ fn convertNativeDocIdsToTextDocNumsAlloc(
     }
 
     if (constraints.exclude_doc_ids.len > 0) {
-        const mapped = try textDocNumsForDocIdsAlloc(alloc, snapshot, constraints.exclude_doc_ids);
+        const mapped = try textDocNumsForDocIdsAlloc(alloc, req, snapshot, constraints.exclude_doc_ids);
         if (constraints.exclude_doc_nums.len > 0) {
             const merged = try unionDocNumsAlloc(alloc, constraints.exclude_doc_nums, mapped);
             if (constraints.exclude_doc_nums_owned and constraints.exclude_doc_nums.len > 0) alloc.free(@constCast(constraints.exclude_doc_nums));
@@ -3800,25 +11245,56 @@ fn normalizeNativeDocNumSliceAlloc(
 
 fn textDocNumsForDocIdsAlloc(
     alloc: Allocator,
+    req: types.SearchRequest,
     snapshot: *const index_mod.IndexSnapshot,
     doc_ids: []const []const u8,
 ) ![]const u32 {
+    var doc_id_set = try BorrowedDocIdSet.initAlloc(alloc, doc_ids);
+    defer doc_id_set.deinit(alloc);
+    var doc_num_set = std.AutoHashMapUnmanaged(u32, void).empty;
+    defer doc_num_set.deinit(alloc);
+
     var out = std.ArrayListUnmanaged(u32).empty;
     errdefer out.deinit(alloc);
     var doc_offset: u32 = 0;
+    var scanned_count: u64 = 0;
     for (snapshot.segments) |*seg| {
         for (0..seg.reader.doc_count) |local_doc_usize| {
+            scanned_count +|= 1;
+            if (scanned_count == 1 or scanned_count % 1024 == 0) try checkSearchRequestDeadline(req);
             const local_doc: u32 = @intCast(local_doc_usize);
             if (seg.shared.deleted) |deleted| {
                 if (deleted.contains(local_doc)) continue;
             }
             const stored = seg.reader.storedDoc(local_doc) orelse continue;
-            if (!containsDocId(doc_ids, stored.id)) continue;
-            try appendDocNum(alloc, &out, doc_offset + local_doc);
+            if (!doc_id_set.contains(stored.id)) continue;
+            const doc_num = doc_offset + local_doc;
+            const gop = try doc_num_set.getOrPut(alloc, doc_num);
+            if (gop.found_existing) continue;
+            try out.append(alloc, doc_num);
         }
         doc_offset += seg.reader.doc_count;
     }
     return try out.toOwnedSlice(alloc);
+}
+
+test "text doc id conversion checks deadline while scanning" {
+    const alloc = std.testing.allocator;
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    try seg_writer.addStoredDoc("doc:a", "{\"title\":\"alpha\"}");
+    const seg_bytes = try seg_writer.build();
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+    const snapshot = writer.snapshot();
+
+    try std.testing.expectError(error.Timeout, textDocNumsForDocIdsAlloc(alloc, .{
+        .execution_deadline_ns = 0,
+    }, snapshot, &.{"doc:a"}));
 }
 
 pub fn collectSearchRequestTextStats(
@@ -4405,6 +11881,8 @@ fn searchDenseInternal(
     profile: *DenseSearchProfile,
     include_hbc_profile: bool,
 ) !types.SearchResult {
+    resetLastSortRejectionDiagnostic();
+    try rejectApproximateSortPageOptions(req);
     const total_start = platform_time.monotonicNs();
 
     const index_lookup_start = total_start;
@@ -4428,16 +11906,18 @@ fn searchDenseInternal(
         native_constraints.exclusion_query_json_resolved,
     );
     const full_candidate_window = group_chunk_parents or unresolved_stored_filters;
+    const page_candidate_window = pagingCandidateWindow(paging);
     const effective_k: u32 = if (full_candidate_window)
         @intCast(index_stats.active_count)
     else
-        @max(dense.k, paging.limit);
+        scoreOrderCandidateWindowK(dense.k, paging);
     const effort = resolvedSearchEffort(req.search_effort);
     const resolved_search_width = resolveSearchWidth(dense.k, effort, index_stats);
     const resolved_epsilon = resolveSearchEpsilon(effort);
     profile.resolved_search_width = resolved_search_width;
     profile.resolved_epsilon = resolved_epsilon;
     const bench_query_profile = shouldLogBenchQueryProfile();
+    const collect_sort_profile = bench_query_profile or req.profile;
     const collect_hbc_profile = include_hbc_profile or bench_query_profile;
 
     if (native_constraints.positive_filter and native_constraints.filter_ids.len == 0) {
@@ -4447,6 +11927,7 @@ fn searchDenseInternal(
             .alloc = alloc,
             .hits = &.{},
             .total_hits = 0,
+            .sort_profile = vectorScoreTopKSortProfile(req, collect_sort_profile, .exact, 0, 0, profile.total_ns),
             .graph_results = &.{},
         };
     }
@@ -4457,29 +11938,101 @@ fn searchDenseInternal(
         @intCast(@min(native_constraints.filter_ids.len, std.math.maxInt(u32)))
     else
         @intCast(index_stats.active_count);
-    const stored_filter_candidate_window: u32 = @min(
-        bounded_full_candidate_count,
-        @max(paging.limit *| 32, @as(u32, 1024)),
-    );
-    const hbc_effective_k: u32 = if (full_candidate_window) stored_filter_candidate_window else effective_k;
+    var candidate_window: u32 = if (full_candidate_window)
+        initialDenseFullCandidateWindow(bounded_full_candidate_count, paging)
+    else
+        effective_k;
 
-    const hbc_req: vectorindex_mod.SearchRequest = .{
-        .query = dense.vector,
-        .k = hbc_effective_k,
-        .rerank_k = if (full_candidate_window) @as(usize, @intCast(@min(paging.offset +| paging.limit, hbc_effective_k))) else null,
-        .search_width = resolved_search_width,
-        .epsilon = resolved_epsilon,
-        .rerank_factor = resolveRerankFactor(effort),
-        .filter_prefix = req.filter_prefix,
-        .distance_over = req.distance_over,
-        .distance_under = req.distance_under,
-        .filter_ids = effective_filter_ids,
-        .exclude_ids = effective_exclude_ids,
-    };
+    while (true) {
+        var score_exactness = SortPlanExactness.approximate;
+        var projected_source_profile = ProjectedSourceLoadProfile{};
+        const hbc_effective_k: u32 = if (full_candidate_window) candidate_window else effective_k;
+        const hbc_req: vectorindex_mod.SearchRequest = .{
+            .query = dense.vector,
+            .k = hbc_effective_k,
+            .rerank_k = if (full_candidate_window) @as(usize, @intCast(@min(paging.offset +| paging.limit, hbc_effective_k))) else null,
+            .search_width = resolved_search_width,
+            .epsilon = resolved_epsilon,
+            .rerank_factor = resolveRerankFactor(effort),
+            .filter_prefix = req.filter_prefix,
+            .distance_over = req.distance_over,
+            .distance_under = req.distance_under,
+            .filter_ids = effective_filter_ids,
+            .exclude_ids = effective_exclude_ids,
+        };
 
-    const hbc_search_start = platform_time.monotonicNs();
-    var results = if (collect_hbc_profile) blk: {
-        const profiled = executor.hbc_search_profiled(executor.ctx, entry, hbc_req) catch |err| switch (err) {
+        const hbc_search_start = platform_time.monotonicNs();
+        const use_exact_native_filter = shouldExactScoreNativeDenseFilter(native_constraints, paging);
+        var results = if (use_exact_native_filter) blk: {
+            const exact = if (executor.exact_dense_search) |exact_search|
+                try exact_search(executor.ctx, entry, hbc_req)
+            else
+                try exactScoreNativeDenseFilter(alloc, entry, hbc_req);
+            profile.hbc_exact_vectors_scored = @intCast(native_constraints.filter_ids.len);
+            score_exactness = .exact;
+            break :blk exact;
+        } else if (collect_hbc_profile) blk: {
+            const profiled = executor.hbc_search_profiled(executor.ctx, entry, hbc_req) catch |err| switch (err) {
+                error.NotFound => {
+                    profile.returned_hit_count = 0;
+                    profile.total_ns = platform_time.monotonicNs() - total_start;
+                    return .{
+                        .alloc = alloc,
+                        .hits = &.{},
+                        .total_hits = 0,
+                        .sort_profile = vectorScoreTopKSortProfile(req, collect_sort_profile, .approximate, 0, 0, profile.total_ns),
+                        .graph_results = &.{},
+                    };
+                },
+                else => return err,
+            };
+            profile.hbc_runtime_txn_ns = profiled.profile.runtime_txn_ns;
+            profile.hbc_scratch_acquire_ns = profiled.profile.scratch_acquire_ns;
+            profile.hbc_node_cache_lookup_ns = profiled.profile.node_cache_lookup_ns;
+            profile.hbc_quantized_cache_lookup_ns = profiled.profile.quantized_cache_lookup_ns;
+            profile.hbc_nodes_visited = profiled.profile.nodes_visited;
+            profile.hbc_leaves_explored = profiled.profile.leaves_explored;
+            profile.hbc_approx_vectors_scored = profiled.profile.approx_vectors_scored;
+            profile.hbc_exact_vectors_scored = profiled.profile.exact_vectors_scored;
+            profile.hbc_leaf_payload_stale = profiled.profile.leaf_payload_stale;
+            profile.hbc_leaf_payload_missing = profiled.profile.leaf_payload_missing;
+            profile.hbc_reranked_vectors = profiled.profile.reranked_vectors;
+            profile.hbc_approx_candidate_count = profiled.profile.approx_candidate_count;
+            profile.hbc_rerank_candidate_count = profiled.profile.rerank_candidate_count;
+            profile.hbc_ambiguous_top_k_pairs = profiled.profile.ambiguous_top_k_pairs;
+            profile.hbc_ambiguous_boundary_pairs = profiled.profile.ambiguous_boundary_pairs;
+            profile.hbc_ambiguous_distance_over_hits = profiled.profile.ambiguous_distance_over_hits;
+            profile.hbc_ambiguous_distance_under_hits = profiled.profile.ambiguous_distance_under_hits;
+            profile.hbc_full_rerank_due_to_threshold = profiled.profile.full_rerank_due_to_threshold;
+            profile.hbc_top_k_count = profiled.profile.top_k_count;
+            profile.hbc_min_distance_gap_top_k = profiled.profile.min_distance_gap_top_k;
+            profile.hbc_min_interval_gap_top_k = profiled.profile.min_interval_gap_top_k;
+            profile.hbc_closest_pair_top_k = if (profiled.profile.closest_pair_top_k) |pair| mapDebugPair(pair) else null;
+            profile.hbc_boundary_pair = if (profiled.profile.boundary_pair) |pair| mapDebugPair(pair) else null;
+            profile.hbc_boundary_tail_error_avg = profiled.profile.boundary_tail_error_avg;
+            profile.hbc_boundary_tail_error_max = profiled.profile.boundary_tail_error_max;
+            profile.hbc_boundary_tail_distance_gap_avg = profiled.profile.boundary_tail_distance_gap_avg;
+            profile.hbc_boundary_tail_distance_gap_min = profiled.profile.boundary_tail_distance_gap_min;
+            profile.hbc_boundary_tail_distance_gap_max = profiled.profile.boundary_tail_distance_gap_max;
+            profile.hbc_boundary_tail_interval_gap_avg = profiled.profile.boundary_tail_interval_gap_avg;
+            profile.hbc_boundary_tail_interval_gap_min = profiled.profile.boundary_tail_interval_gap_min;
+            profile.hbc_boundary_tail_interval_gap_max = profiled.profile.boundary_tail_interval_gap_max;
+            profile.hbc_approx_top_count = profiled.profile.approx_top_count;
+            for (profiled.profile.approx_top, 0..) |hit, i| {
+                profile.hbc_approx_top[i] = mapDebugHit(hit);
+            }
+            profile.hbc_rerank_external_score_ns = profiled.profile.rerank_vector_load_ns;
+            profile.hbc_rerank_vector_load_ns = profiled.profile.rerank_vector_load_ns;
+            profile.hbc_rerank_metadata_lookup_ns = profiled.profile.rerank_metadata_lookup_ns;
+            profile.hbc_rerank_artifact_key_ns = profiled.profile.rerank_artifact_key_ns;
+            profile.hbc_rerank_artifact_read_ns = profiled.profile.rerank_artifact_read_ns;
+            profile.hbc_rerank_artifact_decode_ns = profiled.profile.rerank_artifact_decode_ns;
+            profile.hbc_rerank_artifact_distance_ns = profiled.profile.rerank_artifact_distance_ns;
+            profile.hbc_rerank_lsm_cache_hits = profiled.profile.rerank_lsm_cache_hits;
+            profile.hbc_rerank_lsm_cache_misses = profiled.profile.rerank_lsm_cache_misses;
+            profile.hbc_rerank_distance_ns = profiled.profile.rerank_distance_ns;
+            break :blk profiled.results;
+        } else executor.hbc_search(executor.ctx, entry, hbc_req) catch |err| switch (err) {
             error.NotFound => {
                 profile.returned_hit_count = 0;
                 profile.total_ns = platform_time.monotonicNs() - total_start;
@@ -4487,161 +12040,124 @@ fn searchDenseInternal(
                     .alloc = alloc,
                     .hits = &.{},
                     .total_hits = 0,
+                    .sort_profile = vectorScoreTopKSortProfile(req, collect_sort_profile, .approximate, 0, 0, profile.total_ns),
                     .graph_results = &.{},
                 };
             },
             else => return err,
         };
-        profile.hbc_runtime_txn_ns = profiled.profile.runtime_txn_ns;
-        profile.hbc_scratch_acquire_ns = profiled.profile.scratch_acquire_ns;
-        profile.hbc_node_cache_lookup_ns = profiled.profile.node_cache_lookup_ns;
-        profile.hbc_quantized_cache_lookup_ns = profiled.profile.quantized_cache_lookup_ns;
-        profile.hbc_nodes_visited = profiled.profile.nodes_visited;
-        profile.hbc_leaves_explored = profiled.profile.leaves_explored;
-        profile.hbc_approx_vectors_scored = profiled.profile.approx_vectors_scored;
-        profile.hbc_exact_vectors_scored = profiled.profile.exact_vectors_scored;
-        profile.hbc_leaf_payload_stale = profiled.profile.leaf_payload_stale;
-        profile.hbc_leaf_payload_missing = profiled.profile.leaf_payload_missing;
-        profile.hbc_reranked_vectors = profiled.profile.reranked_vectors;
-        profile.hbc_approx_candidate_count = profiled.profile.approx_candidate_count;
-        profile.hbc_rerank_candidate_count = profiled.profile.rerank_candidate_count;
-        profile.hbc_ambiguous_top_k_pairs = profiled.profile.ambiguous_top_k_pairs;
-        profile.hbc_ambiguous_boundary_pairs = profiled.profile.ambiguous_boundary_pairs;
-        profile.hbc_ambiguous_distance_over_hits = profiled.profile.ambiguous_distance_over_hits;
-        profile.hbc_ambiguous_distance_under_hits = profiled.profile.ambiguous_distance_under_hits;
-        profile.hbc_full_rerank_due_to_threshold = profiled.profile.full_rerank_due_to_threshold;
-        profile.hbc_top_k_count = profiled.profile.top_k_count;
-        profile.hbc_min_distance_gap_top_k = profiled.profile.min_distance_gap_top_k;
-        profile.hbc_min_interval_gap_top_k = profiled.profile.min_interval_gap_top_k;
-        profile.hbc_closest_pair_top_k = if (profiled.profile.closest_pair_top_k) |pair| mapDebugPair(pair) else null;
-        profile.hbc_boundary_pair = if (profiled.profile.boundary_pair) |pair| mapDebugPair(pair) else null;
-        profile.hbc_boundary_tail_error_avg = profiled.profile.boundary_tail_error_avg;
-        profile.hbc_boundary_tail_error_max = profiled.profile.boundary_tail_error_max;
-        profile.hbc_boundary_tail_distance_gap_avg = profiled.profile.boundary_tail_distance_gap_avg;
-        profile.hbc_boundary_tail_distance_gap_min = profiled.profile.boundary_tail_distance_gap_min;
-        profile.hbc_boundary_tail_distance_gap_max = profiled.profile.boundary_tail_distance_gap_max;
-        profile.hbc_boundary_tail_interval_gap_avg = profiled.profile.boundary_tail_interval_gap_avg;
-        profile.hbc_boundary_tail_interval_gap_min = profiled.profile.boundary_tail_interval_gap_min;
-        profile.hbc_boundary_tail_interval_gap_max = profiled.profile.boundary_tail_interval_gap_max;
-        profile.hbc_approx_top_count = profiled.profile.approx_top_count;
-        for (profiled.profile.approx_top, 0..) |hit, i| {
-            profile.hbc_approx_top[i] = mapDebugHit(hit);
+        profile.hbc_search_ns += platform_time.monotonicNs() - hbc_search_start;
+        defer results.deinit();
+
+        const raw_hits = results.getHits();
+        profile.raw_hit_count = @intCast(raw_hits.len);
+        const candidate_window_incomplete = denseCandidateWindowIncomplete(hbc_effective_k, bounded_full_candidate_count, raw_hits.len);
+        const start: u32 = if (full_candidate_window) 0 else @min(paging.offset, @as(u32, @intCast(raw_hits.len)));
+        const end: u32 = if (full_candidate_window) @intCast(raw_hits.len) else @min(start + paging.limit, @as(u32, @intCast(raw_hits.len)));
+
+        var hits = std.ArrayListUnmanaged(types.SearchHit).empty;
+        var hit_vector_ids = std.ArrayListUnmanaged(u64).empty;
+        defer hit_vector_ids.deinit(alloc);
+        errdefer {
+            for (hits.items) |*hit| hit.deinit(alloc);
+            hits.deinit(alloc);
         }
-        profile.hbc_rerank_external_score_ns = profiled.profile.rerank_vector_load_ns;
-        profile.hbc_rerank_vector_load_ns = profiled.profile.rerank_vector_load_ns;
-        profile.hbc_rerank_metadata_lookup_ns = profiled.profile.rerank_metadata_lookup_ns;
-        profile.hbc_rerank_artifact_key_ns = profiled.profile.rerank_artifact_key_ns;
-        profile.hbc_rerank_artifact_read_ns = profiled.profile.rerank_artifact_read_ns;
-        profile.hbc_rerank_artifact_decode_ns = profiled.profile.rerank_artifact_decode_ns;
-        profile.hbc_rerank_artifact_distance_ns = profiled.profile.rerank_artifact_distance_ns;
-        profile.hbc_rerank_lsm_cache_hits = profiled.profile.rerank_lsm_cache_hits;
-        profile.hbc_rerank_lsm_cache_misses = profiled.profile.rerank_lsm_cache_misses;
-        profile.hbc_rerank_distance_ns = profiled.profile.rerank_distance_ns;
-        break :blk profiled.results;
-    } else executor.hbc_search(executor.ctx, entry, hbc_req) catch |err| switch (err) {
-        error.NotFound => {
-            profile.returned_hit_count = 0;
-            profile.total_ns = platform_time.monotonicNs() - total_start;
-            return .{
-                .alloc = alloc,
-                .hits = &.{},
-                .total_hits = 0,
-                .graph_results = &.{},
-            };
-        },
-        else => return err,
-    };
-    profile.hbc_search_ns = platform_time.monotonicNs() - hbc_search_start;
-    defer results.deinit();
 
-    const raw_hits = results.getHits();
-    profile.raw_hit_count = @intCast(raw_hits.len);
-    const start: u32 = if (full_candidate_window) 0 else @min(paging.offset, @as(u32, @intCast(raw_hits.len)));
-    const end: u32 = if (full_candidate_window) @intCast(raw_hits.len) else @min(start + paging.limit, @as(u32, @intCast(raw_hits.len)));
-
-    var hits = std.ArrayListUnmanaged(types.SearchHit).empty;
-    var hit_vector_ids = std.ArrayListUnmanaged(u64).empty;
-    defer hit_vector_ids.deinit(alloc);
-    errdefer {
-        for (hits.items) |*hit| hit.deinit(alloc);
-        hits.deinit(alloc);
-    }
-
-    for (raw_hits[@intCast(start)..@intCast(end)], 0..) |hit, i| {
-        const result_index: usize = @as(usize, @intCast(start)) + i;
-        const resolve_start = platform_time.monotonicNs();
-        const doc_key = if (results.takeMetadata(result_index)) |metadata| blk: {
-            profile.inline_metadata_hits += 1;
-            break :blk metadata;
-        } else blk: {
-            if (try entry.index.getMetadata(hit.vector_id)) |metadata| {
-                profile.fetched_metadata_hits += 1;
+        for (raw_hits[@intCast(start)..@intCast(end)], 0..) |hit, i| {
+            const result_index: usize = @as(usize, @intCast(start)) + i;
+            const resolve_start = platform_time.monotonicNs();
+            const doc_key = if (results.takeMetadata(result_index)) |metadata| blk: {
+                profile.inline_metadata_hits += 1;
                 break :blk metadata;
-            }
-            const looked_up = (try executor.lookup_doc_key(
-                executor.ctx,
-                req.index_name orelse entry.config.name,
-                hit.vector_id,
-            )) orelse {
-                profile.doc_key_resolve_ns += platform_time.monotonicNs() - resolve_start;
-                continue;
+            } else blk: {
+                if (try entry.index.getMetadata(hit.vector_id)) |metadata| {
+                    profile.fetched_metadata_hits += 1;
+                    break :blk metadata;
+                }
+                const looked_up = (try executor.lookup_doc_key(
+                    executor.ctx,
+                    req.index_name orelse entry.config.name,
+                    hit.vector_id,
+                )) orelse {
+                    profile.doc_key_resolve_ns += platform_time.monotonicNs() - resolve_start;
+                    continue;
+                };
+                profile.lookup_doc_key_hits += 1;
+                break :blk looked_up;
             };
-            profile.lookup_doc_key_hits += 1;
-            break :blk looked_up;
-        };
-        profile.doc_key_resolve_ns += platform_time.monotonicNs() - resolve_start;
-        var doc_key_owned = true;
-        errdefer if (doc_key_owned) alloc.free(doc_key);
+            profile.doc_key_resolve_ns += platform_time.monotonicNs() - resolve_start;
+            var doc_key_owned = true;
+            errdefer if (doc_key_owned) alloc.free(doc_key);
 
-        var stored_data: ?[]u8 = null;
-        var stored_data_owned = false;
-        errdefer if (stored_data_owned) {
-            if (stored_data) |data| alloc.free(data);
-        };
-        const load_stored_before_postprocess = postprocess_req.include_stored and
-            !(chunk_backed and group_chunk_parents) and
-            !unresolved_stored_filters;
-        if (load_stored_before_postprocess) {
-            const load_start = platform_time.monotonicNs();
-            stored_data = try executor.load_projected_document(executor.ctx, alloc, postprocess_req, doc_key);
-            stored_data_owned = true;
-            profile.load_projected_document_ns += platform_time.monotonicNs() - load_start;
+            var stored_data: ?[]u8 = null;
+            var stored_data_owned = false;
+            errdefer if (stored_data_owned) {
+                if (stored_data) |data| alloc.free(data);
+            };
+            const load_stored_before_postprocess = postprocess_req.include_stored and
+                !(chunk_backed and group_chunk_parents) and
+                !unresolved_stored_filters;
+            if (load_stored_before_postprocess) {
+                const load_profile_total_before = projected_source_profile.total_ns;
+                stored_data = try loadProjectedDenseDocumentWithProfile(alloc, postprocess_req, executor, doc_key, &projected_source_profile);
+                stored_data_owned = true;
+                profile.load_projected_document_ns += projected_source_profile.total_ns - load_profile_total_before;
+            }
+            try hit_vector_ids.append(alloc, hit.vector_id);
+            try hits.append(alloc, .{
+                .id = doc_key,
+                .doc_ordinal = null,
+                .score = hit.distance,
+                .stored_data = stored_data,
+            });
+            doc_key_owned = false;
+            stored_data_owned = false;
         }
-        try hit_vector_ids.append(alloc, hit.vector_id);
-        try hits.append(alloc, .{
-            .id = doc_key,
-            .doc_ordinal = null,
-            .score = hit.distance,
-            .stored_data = stored_data,
-        });
-        doc_key_owned = false;
-        stored_data_owned = false;
-    }
-    const ordinal_lookup_start = platform_time.monotonicNs();
-    try lookupDenseHitDocOrdinals(alloc, postprocess_req, executor, hit_vector_ids.items, hits.items);
-    profile.doc_ordinal_lookup_ns = platform_time.monotonicNs() - ordinal_lookup_start;
+        const ordinal_lookup_start = platform_time.monotonicNs();
+        try lookupDenseHitDocOrdinals(alloc, postprocess_req, executor, hit_vector_ids.items, hits.items);
+        profile.doc_ordinal_lookup_ns += platform_time.monotonicNs() - ordinal_lookup_start;
 
-    const postprocess_start = platform_time.monotonicNs();
-    var result = try executor.postprocess(executor.ctx, alloc, postprocess_req, .{
-        .alloc = alloc,
-        .hits = try hits.toOwnedSlice(alloc),
-        .total_hits = @intCast(hits.items.len),
-        .graph_results = &.{},
-    }, chunk_backed);
-    errdefer result.deinit();
-    if (unresolved_stored_filters) {
-        result = try pageSearchResultInPlace(alloc, result, paging);
+        const postprocess_start = platform_time.monotonicNs();
+        const dense_hits_total: u32 = @intCast(@min(raw_hits.len, @as(usize, std.math.maxInt(u32))));
+        const dense_hits = try hits.toOwnedSlice(alloc);
+        var result = try executor.postprocess(executor.ctx, alloc, postprocess_req, .{
+            .alloc = alloc,
+            .hits = dense_hits,
+            .total_hits = dense_hits_total,
+            .total_hits_relation = if (candidate_window_incomplete) .gte else .exact,
+            .graph_results = &.{},
+        }, chunk_backed);
+        errdefer result.deinit();
+
+        const visible_candidate_count = result.total_hits;
+        if (full_candidate_window and candidate_window_incomplete and visible_candidate_count < page_candidate_window) {
+            result.deinit();
+            const grown_window = growDenseFullCandidateWindow(candidate_window, bounded_full_candidate_count, page_candidate_window);
+            if (grown_window == candidate_window) return error.InvalidQueryRequest;
+            candidate_window = grown_window;
+            continue;
+        }
+        if (candidate_window_incomplete) result.total_hits_relation = .gte;
+        if (unresolved_stored_filters) {
+            result = try pageSearchResultInPlace(alloc, result, paging);
+        }
+        profile.postprocess_ns += platform_time.monotonicNs() - postprocess_start;
+        if (postprocess_req.include_stored and !(chunk_backed and group_chunk_parents)) {
+            const source_profile = try loadMissingProjectedDenseHitDocuments(alloc, postprocess_req, executor, result.hits);
+            profile.load_projected_document_ns += source_profile.total_ns;
+            projected_source_profile.requested_count += source_profile.requested_count;
+            projected_source_profile.loaded_count += source_profile.loaded_count;
+            projected_source_profile.batch_count += source_profile.batch_count;
+            projected_source_profile.total_ns +|= source_profile.total_ns;
+        }
+        profile.returned_hit_count = result.total_hits;
+        profile.total_ns = platform_time.monotonicNs() - total_start;
+        result.sort_profile = vectorScoreTopKSortProfile(req, collect_sort_profile, score_exactness, raw_hits.len, result.hits.len, profile.total_ns);
+        applyProjectedSourceLoadProfileToSortProfile(&result, projected_source_profile);
+        try decorateVectorScoreOrderIfRequested(&result, req);
+        if (bench_query_profile) logBenchDenseQueryProfile(req, dense, index_stats, profile);
+        return result;
     }
-    profile.postprocess_ns = platform_time.monotonicNs() - postprocess_start;
-    if (postprocess_req.include_stored and !(chunk_backed and group_chunk_parents)) {
-        const load_start = platform_time.monotonicNs();
-        try loadMissingProjectedDenseHitDocuments(alloc, postprocess_req, executor, result.hits);
-        profile.load_projected_document_ns += platform_time.monotonicNs() - load_start;
-    }
-    profile.returned_hit_count = result.total_hits;
-    profile.total_ns = platform_time.monotonicNs() - total_start;
-    if (bench_query_profile) logBenchDenseQueryProfile(req, dense, index_stats, profile);
-    return result;
 }
 
 fn shouldLogBenchQueryProfile() bool {
@@ -4649,6 +12165,111 @@ fn shouldLogBenchQueryProfile() bool {
     if (every == 0) return false;
     const current = bench_query_profile_counter.fetchAdd(1, .monotonic) + 1;
     return current % every == 0;
+}
+
+fn shouldExactScoreNativeDenseFilter(
+    native_constraints: NativeDenseConstraints,
+    paging: ComponentPaging,
+) bool {
+    if (!native_constraints.positive_filter) return false;
+    if (native_constraints.filter_ids.len == 0) return false;
+    const paging_budget = pagingCandidateWindow(paging) *| 32;
+    const budget = @max(paging_budget, default_exact_native_filter_candidate_budget);
+    return native_constraints.filter_ids.len <= budget;
+}
+
+fn pagingCandidateWindow(paging: ComponentPaging) u32 {
+    return paging.offset +| paging.limit;
+}
+
+fn scoreOrderCandidateWindowK(requested_k: u32, paging: ComponentPaging) u32 {
+    return @max(requested_k, pagingCandidateWindow(paging));
+}
+
+fn scoreOrderWindowTotalHitsRelation(effective_k: u32, bounded_candidate_count: u64, raw_hit_count: usize) types.TotalHitsRelation {
+    if (@as(u64, effective_k) < bounded_candidate_count and raw_hit_count >= @as(usize, @intCast(effective_k))) return .gte;
+    return .exact;
+}
+
+fn initialDenseFullCandidateWindow(bounded_full_candidate_count: u32, paging: ComponentPaging) u32 {
+    if (bounded_full_candidate_count == 0) return 0;
+    const overfetch_window = @max(paging.limit *| 32, @as(u32, 1024));
+    return @min(bounded_full_candidate_count, @max(overfetch_window, pagingCandidateWindow(paging)));
+}
+
+fn growDenseFullCandidateWindow(current: u32, bounded_full_candidate_count: u32, requested_visible_end: u32) u32 {
+    if (current >= bounded_full_candidate_count) return current;
+    const grown = @max(current +| 1, @max(current *| 2, requested_visible_end));
+    return @min(bounded_full_candidate_count, grown);
+}
+
+fn denseCandidateWindowIncomplete(candidate_window: u32, bounded_full_candidate_count: u32, raw_hits_len: usize) bool {
+    _ = raw_hits_len;
+    return candidate_window < bounded_full_candidate_count;
+}
+
+test "dense full candidate window covers requested offset page and grows bounded" {
+    const paging = ComponentPaging{ .offset = 1024, .limit = 1 };
+    try std.testing.expectEqual(@as(u32, 1025), scoreOrderCandidateWindowK(10, paging));
+    try std.testing.expectEqual(@as(u32, 4096), scoreOrderCandidateWindowK(4096, paging));
+    try std.testing.expectEqual(std.math.maxInt(u32), scoreOrderCandidateWindowK(10, .{
+        .offset = std.math.maxInt(u32),
+        .limit = 1,
+    }));
+    try std.testing.expectEqual(types.TotalHitsRelation.gte, scoreOrderWindowTotalHitsRelation(2, 3, 2));
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, scoreOrderWindowTotalHitsRelation(2, 3, 1));
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, scoreOrderWindowTotalHitsRelation(3, 3, 3));
+    try std.testing.expectEqual(@as(u32, 1025), initialDenseFullCandidateWindow(2000, paging));
+    try std.testing.expectEqual(@as(u32, 2000), growDenseFullCandidateWindow(1025, 2000, 1025));
+    try std.testing.expect(denseCandidateWindowIncomplete(1025, 2000, 1025));
+    try std.testing.expect(!denseCandidateWindowIncomplete(2000, 2000, 1025));
+    try std.testing.expectEqual(@as(u32, 7), initialDenseFullCandidateWindow(7, paging));
+}
+
+fn exactScoreNativeDenseFilter(
+    alloc: Allocator,
+    entry: *index_manager_mod.IndexManager.DenseIndex,
+    req: vectorindex_mod.SearchRequest,
+) !vectorindex_mod.SearchResults {
+    var results = try vectorindex_mod.SearchResults.initCapacity(
+        alloc,
+        req.k,
+        req.k,
+        @min(req.k, req.filter_ids.len),
+    );
+    errdefer results.deinit();
+
+    var txn = try entry.index.beginReadTxn();
+    defer txn.abort();
+
+    const vector_scratch = try alloc.alloc(f32, entry.dims);
+    defer alloc.free(vector_scratch);
+    const query_measure = vector_mod.norm(req.query);
+
+    for (req.filter_ids) |vector_id| {
+        if (containsVectorId(req.exclude_ids, vector_id)) continue;
+        const vector = entry.index.getVectorViewOrScratch(&txn, vector_id, vector_scratch) catch |err| switch (err) {
+            error.NotFound => continue,
+            else => return err,
+        };
+        if (vector.len != req.query.len) return error.DimensionMismatch;
+
+        const distance = vector_mod.distanceToQuery(req.query, query_measure, vector, entry.metric);
+        if (!std.math.isFinite(distance)) continue;
+        if (req.distance_over) |threshold| {
+            if (distance <= threshold) continue;
+        }
+        if (req.distance_under) |threshold| {
+            if (distance >= threshold) continue;
+        }
+        if (req.filter_prefix.len > 0) {
+            const metadata = (try entry.index.getMetadataInTxn(&txn, vector_id)) orelse continue;
+            if (!std.mem.startsWith(u8, metadata, req.filter_prefix)) continue;
+        }
+        results.addResult(vector_id, distance, 0);
+    }
+    results.sort();
+    return results;
 }
 
 fn benchQueryProfileEvery() ?u64 {
@@ -4700,11 +12321,35 @@ fn loadMissingProjectedDenseHitDocuments(
     req: types.SearchRequest,
     executor: DenseSearchExecutor,
     hits: []types.SearchHit,
-) !void {
-    for (hits) |*hit| {
+) !ProjectedSourceLoadProfile {
+    const start_ns = platform_time.monotonicNs();
+    var profile = ProjectedSourceLoadProfile{};
+    try checkSearchRequestDeadline(req);
+    for (hits, 0..) |*hit, i| {
         if (hit.stored_data != null) continue;
-        hit.stored_data = try executor.load_projected_document(executor.ctx, alloc, req, hit.id);
+        if (i % 1024 == 0) try checkSearchRequestDeadline(req);
+        hit.stored_data = try loadProjectedDenseDocumentWithProfile(alloc, req, executor, hit.id, &profile);
     }
+    profile.total_ns = platform_time.monotonicNs() - start_ns;
+    return profile;
+}
+
+fn loadProjectedDenseDocumentWithProfile(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: DenseSearchExecutor,
+    id: []const u8,
+    profile: *ProjectedSourceLoadProfile,
+) ![]u8 {
+    try checkSearchRequestDeadline(req);
+    const load_start = platform_time.monotonicNs();
+    profile.requested_count += 1;
+    const data = try executor.load_projected_document(executor.ctx, alloc, req, id);
+    const load_ns = platform_time.monotonicNs() - load_start;
+    profile.loaded_count += 1;
+    profile.batch_count += 1;
+    profile.total_ns +|= load_ns;
+    return data;
 }
 
 fn lookupDenseHitDocOrdinals(
@@ -5003,13 +12648,18 @@ pub fn searchSparse(
     sparse: types.SparseKnnQuery,
     executor: SparseSearchExecutor,
 ) !types.SearchResult {
+    resetLastSortRejectionDiagnostic();
+    try rejectApproximateSortPageOptions(req);
     const bench_query_profile = shouldLogBenchQueryProfile();
-    const total_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
+    const collect_sort_profile = bench_query_profile or req.profile;
+    const collect_total_timing = bench_query_profile or collect_sort_profile;
+    const total_start_ns = if (collect_total_timing) platform_time.monotonicNs() else 0;
     var constraint_ns: u64 = 0;
     var index_search_ns: u64 = 0;
     var hit_build_ns: u64 = 0;
     var postprocess_ns: u64 = 0;
     var page_ns: u64 = 0;
+    var projected_source_profile = ProjectedSourceLoadProfile{};
     const entry = (try executor.sparse_index(executor.ctx, req.index_name)) orelse return error.IndexNotFound;
     const chunk_backed = entry.chunk_name != null;
     const group_chunk_parents = shouldGroupChunkParents(req, chunk_backed);
@@ -5038,19 +12688,25 @@ pub fn searchSparse(
         native_constraints.exclusion_query_json_resolved,
     );
     const full_candidate_window = group_chunk_parents or unresolved_stored_filters;
+    const bounded_sparse_candidate_count: u64 = if (native_constraints.positive_filter)
+        @as(u64, native_constraints.filter_doc_ids.len) +| @as(u64, native_constraints.filter_doc_nums.len)
+    else
+        entry.index.next_doc_num;
     const effective_k: u32 = if (full_candidate_window)
         @intCast(entry.index.next_doc_num)
     else
-        @max(sparse.k, paging.limit);
+        scoreOrderCandidateWindowK(sparse.k, paging);
     const query = sparse_mod.SparseVector{
         .indices = sparse.indices,
         .values = sparse.values,
     };
     if (native_constraints.positive_filter and native_constraints.filter_doc_ids.len == 0 and native_constraints.filter_doc_nums.len == 0) {
+        const total_ns = if (collect_sort_profile) platform_time.monotonicNs() - total_start_ns else 0;
         return .{
             .alloc = alloc,
             .hits = &.{},
             .total_hits = 0,
+            .sort_profile = vectorScoreTopKSortProfile(req, collect_sort_profile, .exact, 0, 0, total_ns),
             .graph_results = &.{},
         };
     }
@@ -5122,6 +12778,7 @@ pub fn searchSparse(
         .alloc = alloc,
         .hits = hits,
         .total_hits = @intCast(raw_hits.len),
+        .total_hits_relation = scoreOrderWindowTotalHitsRelation(effective_k, bounded_sparse_candidate_count, raw_hits.len),
         .graph_results = &.{},
     }, chunk_backed);
     if (bench_query_profile) postprocess_ns = platform_time.monotonicNs() - postprocess_start_ns;
@@ -5132,10 +12789,14 @@ pub fn searchSparse(
         if (bench_query_profile) page_ns = platform_time.monotonicNs() - page_start_ns;
     }
     if (postprocess_req.include_stored and !(chunk_backed and group_chunk_parents)) {
-        const load_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
-        try loadMissingProjectedSparseHitDocuments(alloc, postprocess_req, executor, result.hits);
-        if (bench_query_profile) hit_build_ns += platform_time.monotonicNs() - load_start_ns;
+        projected_source_profile = try loadMissingProjectedSparseHitDocuments(alloc, postprocess_req, executor, result.hits);
+        if (bench_query_profile) hit_build_ns += projected_source_profile.total_ns;
     }
+    if (collect_sort_profile) {
+        result.sort_profile = vectorScoreTopKSortProfile(req, collect_sort_profile, .exact, raw_hits.len, result.hits.len, platform_time.monotonicNs() - total_start_ns);
+        applyProjectedSourceLoadProfileToSortProfile(&result, projected_source_profile);
+    }
+    try decorateVectorScoreOrderIfRequested(&result, req);
     if (bench_query_profile) {
         std.log.info(
             "antfly_bench_sparse_query total_us={d} constraint_us={d} index_search_us={d} hit_build_us={d} postprocess_us={d} page_us={d} raw_hits={d} returned_hits={d} filter_doc_nums={d} exclude_doc_nums={d}",
@@ -5161,14 +12822,22 @@ fn loadMissingProjectedSparseHitDocuments(
     req: types.SearchRequest,
     executor: SparseSearchExecutor,
     hits: []types.SearchHit,
-) !void {
+) !ProjectedSourceLoadProfile {
+    const start_ns = platform_time.monotonicNs();
+    var profile = ProjectedSourceLoadProfile{};
+    try checkSearchRequestDeadline(req);
     var missing_count: usize = 0;
     for (hits) |hit| {
         if (hit.stored_data == null) missing_count += 1;
     }
-    if (missing_count == 0) return;
+    profile.requested_count = missing_count;
+    if (missing_count == 0) {
+        profile.total_ns = platform_time.monotonicNs() - start_ns;
+        return profile;
+    }
 
     if (executor.load_projected_documents) |load_many| {
+        try checkSearchRequestDeadline(req);
         const keys = try alloc.alloc([]const u8, missing_count);
         defer alloc.free(keys);
         var key_count: usize = 0;
@@ -5179,24 +12848,33 @@ fn loadMissingProjectedSparseHitDocuments(
         }
 
         var loaded = try load_many(executor.ctx, alloc, req, keys);
+        profile.batch_count += 1;
         defer freeOptionalOwnedBytes(alloc, loaded);
         if (loaded.len != keys.len) return error.InvalidSearchResult;
 
         var loaded_index: usize = 0;
-        for (hits) |*hit| {
+        for (hits, 0..) |*hit, i| {
             if (hit.stored_data != null) continue;
+            if (i % 1024 == 0) try checkSearchRequestDeadline(req);
             const stored = loaded[loaded_index] orelse return error.StoredDocMissing;
             hit.stored_data = stored;
             loaded[loaded_index] = null;
+            profile.loaded_count += 1;
             loaded_index += 1;
         }
-        return;
+        profile.total_ns = platform_time.monotonicNs() - start_ns;
+        return profile;
     }
 
-    for (hits) |*hit| {
+    for (hits, 0..) |*hit, i| {
         if (hit.stored_data != null) continue;
+        if (i % 1024 == 0) try checkSearchRequestDeadline(req);
         hit.stored_data = try executor.load_projected_document(executor.ctx, alloc, req, hit.id);
+        profile.loaded_count += 1;
+        profile.batch_count += 1;
     }
+    profile.total_ns = platform_time.monotonicNs() - start_ns;
+    return profile;
 }
 
 fn freeOptionalOwnedBytes(alloc: Allocator, values: []?[]u8) void {
@@ -5204,6 +12882,1501 @@ fn freeOptionalOwnedBytes(alloc: Allocator, values: []?[]u8) void {
         if (value) |bytes| alloc.free(bytes);
     }
     alloc.free(values);
+}
+
+const ProjectedSourceLoadProfile = struct {
+    requested_count: usize = 0,
+    loaded_count: usize = 0,
+    batch_count: usize = 0,
+    total_ns: u64 = 0,
+};
+
+fn logBenchProjectedSourceLoadProfile(
+    req: types.SearchRequest,
+    plan: SortExecutionPlan,
+    source: []const u8,
+    profile: ProjectedSourceLoadProfile,
+) void {
+    if (!shouldLogBenchQueryProfile()) return;
+    std.log.info(
+        "antfly_bench_projected_source_load source={s} total_us={d} requested={d} loaded={d} batches={d} order_fields={d} cursor={s} plan={s} source_load={s}",
+        .{
+            source,
+            nsToUs(profile.total_ns),
+            profile.requested_count,
+            profile.loaded_count,
+            profile.batch_count,
+            req.order_by.len,
+            sortCursorMode(req),
+            sortExecutionPlanKindName(plan.kind),
+            sortPlanSourceLoadName(sortExecutionPlanSourceLoadForRequest(plan, req)),
+        },
+    );
+}
+
+fn applyProjectedSourceLoadProfileToSortProfile(
+    result: *types.SearchResult,
+    source_profile: ProjectedSourceLoadProfile,
+) void {
+    if (result.sort_profile) |*sort_profile| {
+        sort_profile.projected_source_load_us +|= nsToUs(source_profile.total_ns);
+        sort_profile.projected_source_load_count +|= @intCast(source_profile.loaded_count);
+    }
+}
+
+fn loadMissingProjectedMatchAllHitDocuments(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: MatchAllExecutor,
+    hits: []types.SearchHit,
+) !ProjectedSourceLoadProfile {
+    const start_ns = platform_time.monotonicNs();
+    var profile = ProjectedSourceLoadProfile{};
+    errdefer profile.total_ns = platform_time.monotonicNs() - start_ns;
+
+    try checkSearchRequestDeadline(req);
+    var missing_count: usize = 0;
+    for (hits) |hit| {
+        if (hit.stored_data == null) missing_count += 1;
+    }
+    profile.requested_count = missing_count;
+    if (missing_count == 0) {
+        profile.total_ns = platform_time.monotonicNs() - start_ns;
+        return profile;
+    }
+
+    if (executor.load_projected_documents) |load_many| {
+        try checkSearchRequestDeadline(req);
+        const keys = try alloc.alloc([]const u8, missing_count);
+        defer alloc.free(keys);
+        var key_count: usize = 0;
+        for (hits) |hit| {
+            if (hit.stored_data != null) continue;
+            keys[key_count] = hit.id;
+            key_count += 1;
+        }
+
+        var loaded = try load_many(executor.ctx, alloc, req, keys);
+        profile.batch_count += 1;
+        defer freeOptionalOwnedBytes(alloc, loaded);
+        if (loaded.len != keys.len) return error.InvalidSearchResult;
+
+        var loaded_index: usize = 0;
+        for (hits, 0..) |*hit, i| {
+            if (hit.stored_data != null) continue;
+            if (i % 1024 == 0) try checkSearchRequestDeadline(req);
+            const stored = loaded[loaded_index] orelse return error.StoredDocMissing;
+            hit.stored_data = stored;
+            loaded[loaded_index] = null;
+            profile.loaded_count += 1;
+            loaded_index += 1;
+        }
+        profile.total_ns = platform_time.monotonicNs() - start_ns;
+        return profile;
+    }
+
+    for (hits, 0..) |*hit, i| {
+        if (hit.stored_data != null) continue;
+        if (i % 1024 == 0) try checkSearchRequestDeadline(req);
+        hit.stored_data = try executor.load_projected_document(executor.ctx, alloc, req, hit.id);
+        profile.loaded_count += 1;
+        profile.batch_count += 1;
+    }
+    profile.total_ns = platform_time.monotonicNs() - start_ns;
+    return profile;
+}
+
+fn loadMissingProjectedTextHitDocuments(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: SearchTextQueryExecutor,
+    hits: []types.SearchHit,
+) !ProjectedSourceLoadProfile {
+    const start_ns = platform_time.monotonicNs();
+    var profile = ProjectedSourceLoadProfile{};
+    try checkSearchRequestDeadline(req);
+    for (hits, 0..) |*hit, i| {
+        if (hit.stored_data != null) continue;
+        if (i % 1024 == 0) try checkSearchRequestDeadline(req);
+        profile.requested_count += 1;
+        const stored = (try executor.load_stored(executor.ctx, alloc, hit.id)) orelse return error.StoredDocMissing;
+        defer alloc.free(stored);
+        hit.stored_data = try executor.project_stored_search(executor.ctx, alloc, req, hit.id, stored);
+        profile.loaded_count += 1;
+        profile.batch_count += 1;
+    }
+    profile.total_ns = platform_time.monotonicNs() - start_ns;
+    return profile;
+}
+
+fn requestNeedsNativeSortValues(req: types.SearchRequest) bool {
+    for (req.order_by) |field| {
+        if (sortFieldNeedsNativeValue(field)) return true;
+    }
+    return false;
+}
+
+fn requestHasScoreSort(req: types.SearchRequest) bool {
+    for (req.order_by) |field| {
+        if (sortFieldIsScore(field)) return true;
+    }
+    return false;
+}
+
+fn textQueryIsScoreBearing(query: types.TextQuery) bool {
+    return switch (query) {
+        .phrase,
+        .multi_phrase,
+        .term,
+        .match,
+        .multi_match_bool_prefix,
+        .match_phrase,
+        .fuzzy,
+        .prefix,
+        .wildcard,
+        .regexp,
+        => true,
+        .bool_query => |bool_query| textBoolQueryIsScoreBearing(bool_query),
+        .match_none,
+        .match_all,
+        .numeric_range,
+        .date_range,
+        .term_range,
+        .doc_id,
+        .bool_field,
+        .geo_distance,
+        .geo_bbox,
+        .ip_range,
+        .geo_shape,
+        => false,
+    };
+}
+
+fn textBoolQueryIsScoreBearing(query: types.TextBoolQuery) bool {
+    for (query.must) |child| {
+        if (textQueryIsScoreBearing(child)) return true;
+    }
+    for (query.should) |child| {
+        if (textQueryIsScoreBearing(child)) return true;
+    }
+    return false;
+}
+
+pub fn searchRequestHasScoreBearingTextSource(req: types.SearchRequest) bool {
+    if (req.full_text) |query| {
+        if (textQueryIsScoreBearing(query)) return true;
+    }
+    for (req.full_text_queries) |query| {
+        if (textQueryIsScoreBearing(query.query)) return true;
+    }
+    return false;
+}
+
+pub fn searchRequestHasScoreBearingVectorSource(req: types.SearchRequest) bool {
+    return req.dense != null or
+        req.sparse != null or
+        req.dense_queries.len > 0 or
+        req.sparse_queries.len > 0;
+}
+
+pub fn searchRequestHasScoreBearingSource(req: types.SearchRequest) bool {
+    return searchRequestHasScoreBearingTextSource(req) or searchRequestHasScoreBearingVectorSource(req);
+}
+
+fn validateScoreSortHasScoreBearingTextSource(req: types.SearchRequest) !void {
+    if (requestHasScoreSort(req) and !searchRequestHasScoreBearingTextSource(req)) {
+        logNativeSortPlanRejection(
+            "_score",
+            nativeSortPlanRejectionReasonName(.non_score_bearing_source),
+            nativeSortPlanRejectionDetailName(.non_score_bearing_source),
+        );
+        return error.UnsupportedQueryRequest;
+    }
+}
+
+fn validateMatchAllSortDoesNotUseScore(req: types.SearchRequest) !void {
+    if (requestHasScoreSort(req)) {
+        logNativeSortPlanRejection(
+            "_score",
+            nativeSortPlanRejectionReasonName(.non_score_bearing_source),
+            nativeSortPlanRejectionDetailName(.non_score_bearing_source),
+        );
+        return error.UnsupportedQueryRequest;
+    }
+}
+
+test "score sort source detection rejects non-scoring text queries" {
+    const score_order = [_]types.SortField{.{ .field = "_score", .desc = true }};
+    const range_only = [_]types.TextQuery{
+        .{ .numeric_range = .{ .field = "rank", .min = 1 } },
+        .{ .term_range = .{ .field = "title", .min = "a", .max = "z" } },
+    };
+    const match_child = [_]types.TextQuery{.{ .match = .{ .field = "body", .text = "alpha" } }};
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, validateScoreSortHasScoreBearingTextSource(.{
+        .order_by = &score_order,
+        .full_text = .{ .match_all = {} },
+    }));
+    try std.testing.expectError(error.UnsupportedQueryRequest, validateScoreSortHasScoreBearingTextSource(.{
+        .order_by = &score_order,
+        .full_text = .{ .bool_query = .{ .must = &range_only } },
+    }));
+    try validateScoreSortHasScoreBearingTextSource(.{
+        .order_by = &score_order,
+        .full_text = .{ .bool_query = .{ .should = &match_child } },
+    });
+}
+
+test "vector score order helper is limited to internal score tuple decoration" {
+    const score_order = [_]types.SortField{.{ .field = "_score", .desc = true }};
+    const effective_score_order = [_]types.SortField{
+        .{ .field = "_score", .desc = true },
+        .{ .field = "_id", .desc = false },
+    };
+    const ascending_score_order = [_]types.SortField{.{ .field = "_score", .desc = false }};
+    const field_order = [_]types.SortField{.{ .field = "created_at", .desc = true }};
+    const score_cursor = [_]std.json.Value{
+        .{ .float = 0.5 },
+        .{ .string = "doc:a" },
+    };
+    const vector = [_]f32{ 0.1, 0.2 };
+    const named_dense = [_]types.NamedDenseQuery{.{
+        .name = "semantic",
+        .index_name = "semantic_idx",
+        .query = .{ .vector = &vector, .k = 10 },
+    }};
+
+    try std.testing.expect(searchRequestHasScoreBearingSource(.{
+        .order_by = &score_order,
+        .dense = .{ .vector = &vector, .k = 10 },
+    }));
+    try std.testing.expect(searchRequestHasScoreBearingSource(.{
+        .order_by = &score_order,
+        .dense_queries = &named_dense,
+    }));
+    try std.testing.expect(!searchRequestHasScoreBearingSource(.{
+        .order_by = &score_order,
+        .full_text = .{ .match_all = {} },
+    }));
+    try std.testing.expect(requestHasVectorScoreOrderOnly(.{ .order_by = &effective_score_order }));
+    try std.testing.expect(!requestHasVectorScoreOrderOnly(.{ .order_by = &ascending_score_order }));
+    try std.testing.expect(!requestHasVectorScoreOrderOnly(.{ .order_by = &field_order }));
+    try std.testing.expect(!requestHasVectorScoreOrderOnly(.{
+        .order_by = &effective_score_order,
+        .search_after = &score_cursor,
+    }));
+}
+
+fn typedDocValuesTypeMatchesMappedSortField(
+    value_type: typed_dv.ValueType,
+    mapping: runtime_schema_mod.FieldMapping,
+) bool {
+    return switch (mapping.field_type) {
+        .keyword, .link => value_type == .bytes_val,
+        .numeric => value_type == .u64_val or value_type == .i64_val or value_type == .f64_val,
+        .boolean => value_type == .bool_val,
+        .datetime => value_type == .u64_val,
+        else => false,
+    };
+}
+
+const TypedDocValuesCoverageStatus = typed_dv_coverage.Status;
+
+const TypedDocValuesCoverage = struct {
+    status: TypedDocValuesCoverageStatus,
+    value_type: ?typed_dv.ValueType = null,
+};
+
+fn typedDocValuesCoverageStatusName(status: TypedDocValuesCoverageStatus) []const u8 {
+    return typed_dv_coverage.statusName(status);
+}
+
+fn typedDocValuesCoverageRejectionReason(status: TypedDocValuesCoverageStatus) ?NativeSortPlanRejectionReason {
+    return switch (status) {
+        .covered => null,
+        .missing_doc_values_section,
+        .malformed_doc_values_section,
+        .doc_values_kind_mismatch,
+        .invalid_doc_value_doc_id,
+        .duplicate_doc_value_doc_id,
+        => .missing_doc_values_capability,
+        .sparse_live_doc_values => .missing_null_policy,
+    };
+}
+
+test "typed doc values coverage status names are stable for diagnostics" {
+    try std.testing.expectEqualStrings("covered", typedDocValuesCoverageStatusName(.covered));
+    try std.testing.expectEqualStrings("missing_doc_values_section", typedDocValuesCoverageStatusName(.missing_doc_values_section));
+    try std.testing.expectEqualStrings("malformed_doc_values_section", typedDocValuesCoverageStatusName(.malformed_doc_values_section));
+    try std.testing.expectEqualStrings("doc_values_kind_mismatch", typedDocValuesCoverageStatusName(.doc_values_kind_mismatch));
+    try std.testing.expectEqualStrings("sparse_live_doc_values", typedDocValuesCoverageStatusName(.sparse_live_doc_values));
+    try std.testing.expectEqualStrings("invalid_doc_value_doc_id", typedDocValuesCoverageStatusName(.invalid_doc_value_doc_id));
+    try std.testing.expectEqualStrings("duplicate_doc_value_doc_id", typedDocValuesCoverageStatusName(.duplicate_doc_value_doc_id));
+}
+
+test "typed doc values coverage rejection reasons distinguish missing policy from coverage" {
+    try std.testing.expect(typedDocValuesCoverageRejectionReason(.covered) == null);
+    try std.testing.expectEqual(
+        NativeSortPlanRejectionReason.missing_doc_values_capability,
+        typedDocValuesCoverageRejectionReason(.missing_doc_values_section).?,
+    );
+    try std.testing.expectEqual(
+        NativeSortPlanRejectionReason.missing_doc_values_capability,
+        typedDocValuesCoverageRejectionReason(.malformed_doc_values_section).?,
+    );
+    try std.testing.expectEqual(
+        NativeSortPlanRejectionReason.missing_doc_values_capability,
+        typedDocValuesCoverageRejectionReason(.doc_values_kind_mismatch).?,
+    );
+    try std.testing.expectEqual(
+        NativeSortPlanRejectionReason.missing_null_policy,
+        typedDocValuesCoverageRejectionReason(.sparse_live_doc_values).?,
+    );
+    try std.testing.expectEqual(
+        NativeSortPlanRejectionReason.missing_doc_values_capability,
+        typedDocValuesCoverageRejectionReason(.invalid_doc_value_doc_id).?,
+    );
+    try std.testing.expectEqual(
+        NativeSortPlanRejectionReason.missing_doc_values_capability,
+        typedDocValuesCoverageRejectionReason(.duplicate_doc_value_doc_id).?,
+    );
+}
+
+fn logNativeSortPlanRejection(field: []const u8, reason: []const u8, detail: []const u8) void {
+    recordSortRejectionDiagnostic(field, reason, detail);
+    if (!shouldLogBenchQueryProfile()) return;
+    std.log.info(
+        "antfly_bench_sort_plan_reject field={s} reason={s} detail={s}",
+        .{ field, reason, detail },
+    );
+}
+
+fn snapshotTypedDocValuesCoverageDetailsForMapping(
+    snapshot: *const index_mod.IndexSnapshot,
+    field: []const u8,
+    mapping: runtime_schema_mod.FieldMapping,
+) !TypedDocValuesCoverage {
+    var expected_value_type: ?typed_dv.ValueType = null;
+    for (snapshot.segments) |*segment| {
+        if (segment.liveDocCount() == 0) continue;
+        const section_data = segment.reader.getSection(field, .typed_doc_values) orelse return .{ .status = .missing_doc_values_section };
+        const reader = typed_dv.TypedDocValuesReader.init(snapshot.alloc, section_data) catch return .{ .status = .malformed_doc_values_section };
+        if (!typedDocValuesTypeMatchesMappedSortField(reader.value_type, mapping)) return .{ .status = .doc_values_kind_mismatch };
+        if (expected_value_type) |expected| {
+            if (reader.value_type != expected) return .{ .status = .doc_values_kind_mismatch };
+        } else {
+            expected_value_type = reader.value_type;
+        }
+        const live_status = try typed_dv_coverage.readerCoversLiveDocsAlloc(snapshot.alloc, segment, &reader);
+        if (live_status != .covered) return .{ .status = live_status, .value_type = expected_value_type };
+    }
+    return .{ .status = .covered, .value_type = expected_value_type };
+}
+
+fn snapshotTypedDocValuesCoverageForMapping(
+    snapshot: *const index_mod.IndexSnapshot,
+    field: []const u8,
+    mapping: runtime_schema_mod.FieldMapping,
+) !TypedDocValuesCoverageStatus {
+    return (try snapshotTypedDocValuesCoverageDetailsForMapping(snapshot, field, mapping)).status;
+}
+
+fn snapshotGeoPointDocValuesCoverage(
+    snapshot: *const index_mod.IndexSnapshot,
+    field: []const u8,
+) !TypedDocValuesCoverageStatus {
+    for (snapshot.segments) |*segment| {
+        if (segment.liveDocCount() == 0) continue;
+        const section_data = segment.reader.getSection(field, .typed_doc_values) orelse return .missing_doc_values_section;
+        const reader = typed_dv.TypedDocValuesReader.init(snapshot.alloc, section_data) catch return .malformed_doc_values_section;
+        if (reader.value_type != .geo_point) return .doc_values_kind_mismatch;
+        const live_status = try typed_dv_coverage.readerCoversLiveDocsAlloc(snapshot.alloc, segment, &reader);
+        if (live_status != .covered) return live_status;
+    }
+    return .covered;
+}
+
+fn sortFieldMapping(schema: runtime_schema_mod.TableSchema, field: []const u8) ?runtime_schema_mod.FieldMapping {
+    return runtime_schema_mod.resolveDeclaredFieldType(schema, field);
+}
+
+const NativeSortPlanRejectionReason = enum {
+    missing_runtime_mapping,
+    unmapped_field,
+    non_scalar_field,
+    non_sortable_field,
+    missing_doc_values_capability,
+    invalid_cursor_arity,
+    invalid_cursor_type,
+    invalid_doc_value_type,
+    missing_null_policy,
+    missing_native_filter_coverage,
+    approximate_candidate_source,
+    non_score_bearing_source,
+    invalid_score_value,
+};
+
+fn nativeSortPlanRejectionReasonName(reason: NativeSortPlanRejectionReason) []const u8 {
+    return switch (reason) {
+        .missing_runtime_mapping => "missing_runtime_mapping",
+        .unmapped_field => "unmapped_sort_field",
+        .non_scalar_field => "non_sortable_sort_field",
+        .non_sortable_field => "non_sortable_sort_field",
+        .missing_doc_values_capability => "missing_doc_values_coverage",
+        .invalid_cursor_arity => "invalid_cursor_arity",
+        .invalid_cursor_type => "invalid_cursor_type",
+        .invalid_doc_value_type => "invalid_doc_value_type",
+        .missing_null_policy => "missing_null_policy",
+        .missing_native_filter_coverage => "missing_native_filter_coverage",
+        .approximate_candidate_source => "approximate_candidate_source",
+        .non_score_bearing_source => "non_score_bearing_source",
+        .invalid_score_value => "invalid_score_value",
+    };
+}
+
+fn nativeSortPlanRejectionDetailName(reason: NativeSortPlanRejectionReason) []const u8 {
+    return switch (reason) {
+        .missing_runtime_mapping => "missing_runtime_mapping",
+        .unmapped_field => "unmapped_field",
+        .non_scalar_field => "non_scalar_field",
+        .non_sortable_field => "non_sortable_field",
+        .missing_doc_values_capability => "missing_doc_values_capability",
+        .invalid_cursor_arity => "invalid_cursor_arity",
+        .invalid_cursor_type => "invalid_cursor_type",
+        .invalid_doc_value_type => "invalid_doc_value_type",
+        .missing_null_policy => "missing_null_policy",
+        .missing_native_filter_coverage => "missing_native_filter_coverage",
+        .approximate_candidate_source => "approximate_candidate_source",
+        .non_score_bearing_source => "non_score_bearing_source",
+        .invalid_score_value => "invalid_score_value",
+    };
+}
+
+test "native sort plan rejection reason names are stable for diagnostics" {
+    try std.testing.expectEqualStrings("missing_runtime_mapping", nativeSortPlanRejectionReasonName(.missing_runtime_mapping));
+    try std.testing.expectEqualStrings("unmapped_sort_field", nativeSortPlanRejectionReasonName(.unmapped_field));
+    try std.testing.expectEqualStrings("non_sortable_sort_field", nativeSortPlanRejectionReasonName(.non_scalar_field));
+    try std.testing.expectEqualStrings("non_sortable_sort_field", nativeSortPlanRejectionReasonName(.non_sortable_field));
+    try std.testing.expectEqualStrings("missing_doc_values_coverage", nativeSortPlanRejectionReasonName(.missing_doc_values_capability));
+    try std.testing.expectEqualStrings("invalid_cursor_arity", nativeSortPlanRejectionReasonName(.invalid_cursor_arity));
+    try std.testing.expectEqualStrings("invalid_cursor_type", nativeSortPlanRejectionReasonName(.invalid_cursor_type));
+    try std.testing.expectEqualStrings("invalid_doc_value_type", nativeSortPlanRejectionReasonName(.invalid_doc_value_type));
+    try std.testing.expectEqualStrings("missing_null_policy", nativeSortPlanRejectionReasonName(.missing_null_policy));
+    try std.testing.expectEqualStrings("missing_native_filter_coverage", nativeSortPlanRejectionReasonName(.missing_native_filter_coverage));
+    try std.testing.expectEqualStrings("approximate_candidate_source", nativeSortPlanRejectionReasonName(.approximate_candidate_source));
+    try std.testing.expectEqualStrings("non_score_bearing_source", nativeSortPlanRejectionReasonName(.non_score_bearing_source));
+    try std.testing.expectEqualStrings("invalid_score_value", nativeSortPlanRejectionReasonName(.invalid_score_value));
+
+    try std.testing.expectEqualStrings("unmapped_field", nativeSortPlanRejectionDetailName(.unmapped_field));
+    try std.testing.expectEqualStrings("non_scalar_field", nativeSortPlanRejectionDetailName(.non_scalar_field));
+    try std.testing.expectEqualStrings("non_sortable_field", nativeSortPlanRejectionDetailName(.non_sortable_field));
+    try std.testing.expectEqualStrings("missing_doc_values_capability", nativeSortPlanRejectionDetailName(.missing_doc_values_capability));
+    try std.testing.expectEqualStrings("invalid_cursor_arity", nativeSortPlanRejectionDetailName(.invalid_cursor_arity));
+    try std.testing.expectEqualStrings("missing_native_filter_coverage", nativeSortPlanRejectionDetailName(.missing_native_filter_coverage));
+    try std.testing.expectEqualStrings("approximate_candidate_source", nativeSortPlanRejectionDetailName(.approximate_candidate_source));
+    try std.testing.expectEqualStrings("non_score_bearing_source", nativeSortPlanRejectionDetailName(.non_score_bearing_source));
+    try std.testing.expectEqualStrings("invalid_score_value", nativeSortPlanRejectionDetailName(.invalid_score_value));
+}
+
+test "native sort plan rejection diagnostics are request local and stable" {
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expect(takeLastSortRejectionDiagnostic() == null);
+
+    logNativeSortPlanRejection(
+        "created_at",
+        nativeSortPlanRejectionReasonName(.missing_doc_values_capability),
+        "missing_doc_values_section",
+    );
+    const diagnostic = takeLastSortRejectionDiagnostic().?;
+    try std.testing.expectEqualStrings("created_at", diagnostic.field);
+    try std.testing.expectEqualStrings("missing_doc_values_coverage", diagnostic.reason);
+    try std.testing.expectEqualStrings("missing_doc_values_section", diagnostic.detail);
+    try std.testing.expect(takeLastSortRejectionDiagnostic() == null);
+
+    const long_field = "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz";
+    logNativeSortPlanRejection(
+        long_field,
+        nativeSortPlanRejectionReasonName(.unmapped_field),
+        nativeSortPlanRejectionDetailName(.unmapped_field),
+    );
+    const truncated = takeLastSortRejectionDiagnostic().?;
+    try std.testing.expectEqual(@as(usize, 256), truncated.field.len);
+    try std.testing.expect(std.mem.startsWith(u8, long_field, truncated.field));
+    try std.testing.expectEqualStrings("unmapped_sort_field", truncated.reason);
+}
+
+fn mappedSortFieldRejectionReason(mapping: runtime_schema_mod.FieldMapping) ?NativeSortPlanRejectionReason {
+    if (!runtime_schema_mod.fieldTypeIsSortableScalar(mapping.field_type)) return .non_scalar_field;
+    if (!mapping.sortable) return .non_sortable_field;
+    if (!mapping.doc_values) return .missing_doc_values_capability;
+    return null;
+}
+
+fn jsonValueIsNumeric(value: std.json.Value) bool {
+    return switch (value) {
+        .integer => true,
+        .float => |number| std.math.isFinite(number),
+        .number_string => |text| jsonNumberStringIsNumeric(text),
+        else => false,
+    };
+}
+
+fn jsonNumberStringIsNumeric(text: []const u8) bool {
+    if (std.fmt.parseInt(i64, text, 10)) |_| return true else |_| {}
+    if (std.fmt.parseInt(u64, text, 10)) |_| return true else |_| {}
+    const value = std.fmt.parseFloat(f64, text) catch return false;
+    return std.math.isFinite(value);
+}
+
+fn mappedSortCursorRejectionReason(mapping: runtime_schema_mod.FieldMapping, value: std.json.Value) ?NativeSortPlanRejectionReason {
+    if (value == .null) return switch (mapping.missing_null_policy) {
+        .missing_rejected => .missing_null_policy,
+    };
+    return switch (mapping.field_type) {
+        .keyword, .link => if (value == .string) null else .invalid_cursor_type,
+        .numeric => if (jsonValueIsNumeric(value)) null else .invalid_cursor_type,
+        .datetime => if (datetimeCursorValueAsNs(value) != null) null else .invalid_cursor_type,
+        .boolean => if (value == .bool) null else .invalid_cursor_type,
+        else => .non_scalar_field,
+    };
+}
+
+fn mappedSortCursorRejectionReasonForDocValueType(
+    mapping: runtime_schema_mod.FieldMapping,
+    value_type: typed_dv.ValueType,
+    value: std.json.Value,
+) ?NativeSortPlanRejectionReason {
+    if (value == .null) return switch (mapping.missing_null_policy) {
+        .missing_rejected => .missing_null_policy,
+    };
+    if (mapping.field_type == .datetime) {
+        return if (datetimeCursorValueAsNs(value) != null) null else .invalid_cursor_type;
+    }
+    return switch (value_type) {
+        .u64_val => switch (value) {
+            .integer => |v| if (v >= 0) null else .invalid_cursor_type,
+            .number_string => |text| if (std.fmt.parseInt(u64, text, 10)) |_| null else |_| .invalid_cursor_type,
+            else => .invalid_cursor_type,
+        },
+        .i64_val => switch (value) {
+            .integer => null,
+            .number_string => |text| if (std.fmt.parseInt(i64, text, 10)) |_| null else |_| .invalid_cursor_type,
+            else => .invalid_cursor_type,
+        },
+        .f64_val => if (jsonValueIsNumeric(value)) null else .invalid_cursor_type,
+        .bool_val => if (value == .bool) null else .invalid_cursor_type,
+        .bytes_val => if (value == .string) null else .invalid_cursor_type,
+        .geo_point => .invalid_cursor_type,
+    };
+}
+
+fn mappedSortCursorValueIsValid(mapping: runtime_schema_mod.FieldMapping, value: std.json.Value) bool {
+    return mappedSortCursorRejectionReason(mapping, value) == null;
+}
+
+fn sortFieldMatchesIndexSortField(requested: types.SortField, configured: runtime_schema_mod.IndexSortField) bool {
+    return requested.desc == configured.desc and std.mem.eql(u8, requested.field, configured.field);
+}
+
+fn sortSchemaIndexSortFieldIsValid(schema: runtime_schema_mod.TableSchema, field: runtime_schema_mod.IndexSortField) bool {
+    if (field.field.len == 0) return false;
+    if (std.mem.eql(u8, field.field, "_id")) return true;
+    const mapping = sortFieldMapping(schema, field.field) orelse return false;
+    return mappedSortFieldRejectionReason(mapping) == null;
+}
+
+fn schemaIndexSortValidForPlanning(schema: runtime_schema_mod.TableSchema) bool {
+    if (schema.index_sort.len == 0) return false;
+    const last = schema.index_sort[schema.index_sort.len - 1];
+    if (!std.mem.eql(u8, last.field, "_id") or last.desc) return false;
+
+    for (schema.index_sort, 0..) |field, i| {
+        if (!sortSchemaIndexSortFieldIsValid(schema, field)) return false;
+        for (schema.index_sort[0..i]) |prior| {
+            if (std.mem.eql(u8, prior.field, field.field)) return false;
+        }
+    }
+    return true;
+}
+
+fn sortRequestMatchesIndexSort(req: types.SearchRequest, schema: runtime_schema_mod.TableSchema) bool {
+    if (!requestHasSortPageOptions(req) or !schemaIndexSortValidForPlanning(schema)) return false;
+    const field_count = effectiveSortFieldCountForRequest(req);
+    if (field_count > schema.index_sort.len) return false;
+    if (!std.mem.eql(u8, effectiveSortFieldAtForRequest(req, field_count - 1).field, "_id")) return false;
+    for (0..field_count) |i| {
+        const configured = schema.index_sort[i];
+        const requested = effectiveSortFieldAtForRequest(req, i);
+        if (!sortFieldMatchesIndexSortField(requested, configured)) return false;
+    }
+    return true;
+}
+
+const IndexSortCoverageStatus = enum {
+    request_mismatch,
+    no_live_segments,
+    missing_segment_index_sort,
+    covered_without_bounds,
+    covered_with_bounds,
+};
+
+fn indexSortCoverageStatusName(status: IndexSortCoverageStatus) []const u8 {
+    return switch (status) {
+        .request_mismatch => "request_mismatch",
+        .no_live_segments => "no_live_segments",
+        .missing_segment_index_sort => "missing_segment_index_sort",
+        .covered_without_bounds => "covered_without_bounds",
+        .covered_with_bounds => "covered_with_bounds",
+    };
+}
+
+fn indexSortCoverageHasExecutor(status: IndexSortCoverageStatus) bool {
+    return status == .covered_without_bounds or status == .covered_with_bounds;
+}
+
+fn indexSortCoverageHasBounds(status: IndexSortCoverageStatus) bool {
+    return status == .covered_with_bounds;
+}
+
+fn snapshotHasLiveSegments(snapshot: *const index_mod.IndexSnapshot) bool {
+    for (snapshot.segments) |*segment| {
+        if (segment.liveDocCount() > 0) return true;
+    }
+    return false;
+}
+
+test "index sort coverage status names are stable for diagnostics" {
+    try std.testing.expectEqualStrings("request_mismatch", indexSortCoverageStatusName(.request_mismatch));
+    try std.testing.expectEqualStrings("no_live_segments", indexSortCoverageStatusName(.no_live_segments));
+    try std.testing.expectEqualStrings("missing_segment_index_sort", indexSortCoverageStatusName(.missing_segment_index_sort));
+    try std.testing.expectEqualStrings("covered_without_bounds", indexSortCoverageStatusName(.covered_without_bounds));
+    try std.testing.expectEqualStrings("covered_with_bounds", indexSortCoverageStatusName(.covered_with_bounds));
+}
+
+fn segmentIndexSortMatchesSchemaAlloc(
+    alloc: Allocator,
+    reader: *const segment_mod.SegmentReader,
+    schema: runtime_schema_mod.TableSchema,
+) !bool {
+    const fields = reader.indexSortFieldsAlloc(alloc) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return false;
+    } orelse return false;
+    defer {
+        for (fields) |*field| field.deinit(alloc);
+        alloc.free(fields);
+    }
+
+    if (fields.len != schema.index_sort.len) return false;
+    for (schema.index_sort, 0..) |configured, i| {
+        const field = fields[i];
+        if (field.desc != configured.desc) return false;
+        if (!std.mem.eql(u8, field.field, configured.field)) return false;
+    }
+    return true;
+}
+
+fn snapshotSegmentsHaveIndexSortAlloc(
+    alloc: Allocator,
+    snapshot: *const index_mod.IndexSnapshot,
+    schema: runtime_schema_mod.TableSchema,
+) !bool {
+    if (schema.index_sort.len == 0) return false;
+    var covered_live_segments = false;
+    for (snapshot.segments) |*segment| {
+        if (segment.liveDocCount() == 0) continue;
+        covered_live_segments = true;
+        if (!try segmentIndexSortMatchesSchemaAlloc(alloc, &segment.reader, schema)) return false;
+    }
+    return covered_live_segments;
+}
+
+fn snapshotIndexSortCoverageStatusAlloc(
+    alloc: Allocator,
+    snapshot: *const index_mod.IndexSnapshot,
+    schema: runtime_schema_mod.TableSchema,
+    request_matches_index_sort: bool,
+) !IndexSortCoverageStatus {
+    if (!request_matches_index_sort) return .request_mismatch;
+    if (!snapshotHasLiveSegments(snapshot)) return .no_live_segments;
+    if (!try snapshotSegmentsHaveIndexSortAlloc(alloc, snapshot, schema)) return .missing_segment_index_sort;
+    if (try snapshotSegmentsHaveIndexSortBoundsAlloc(alloc, snapshot, schema)) return .covered_with_bounds;
+    return .covered_without_bounds;
+}
+
+fn indexSortBoundValueMatchesField(
+    schema: runtime_schema_mod.TableSchema,
+    field: runtime_schema_mod.IndexSortField,
+    value: segment_mod.SegmentIndexSortBoundValue,
+) bool {
+    if (std.mem.eql(u8, field.field, "_id")) return value == .id;
+    const mapping = sortFieldMapping(schema, field.field) orelse return false;
+    return switch (mapping.field_type) {
+        .datetime => value == .u64_val,
+        .numeric => switch (value) {
+            .f64_val => |v| std.math.isFinite(v),
+            .u64_val, .i64_val => true,
+            else => false,
+        },
+        .boolean => value == .bool_val,
+        .keyword, .link => value == .bytes_val,
+        else => false,
+    };
+}
+
+fn indexSortBoundsMatchSchema(
+    schema: runtime_schema_mod.TableSchema,
+    bounds: segment_mod.SegmentIndexSortBounds,
+) bool {
+    if (bounds.first.len != schema.index_sort.len or bounds.last.len != schema.index_sort.len) return false;
+    for (schema.index_sort, 0..) |field, i| {
+        if (!indexSortBoundValueMatchesField(schema, field, bounds.first[i])) return false;
+        if (!indexSortBoundValueMatchesField(schema, field, bounds.last[i])) return false;
+    }
+    if (!indexSortBoundsAreOrdered(schema, bounds)) return false;
+    return true;
+}
+
+fn indexSortBoundsAreOrdered(
+    schema: runtime_schema_mod.TableSchema,
+    bounds: segment_mod.SegmentIndexSortBounds,
+) bool {
+    for (schema.index_sort, 0..) |field, i| {
+        const first_value = sortValueFromSegmentBoundValue(bounds.first[i]);
+        const last_value = sortValueFromSegmentBoundValue(bounds.last[i]);
+        var order = compareSortValues(first_value, last_value);
+        if (field.desc) {
+            order = switch (order) {
+                .lt => .gt,
+                .eq => .eq,
+                .gt => .lt,
+            };
+        }
+        if (order == .gt) return false;
+        if (order == .lt) return true;
+    }
+    return true;
+}
+
+fn snapshotSegmentsHaveIndexSortBoundsAlloc(
+    alloc: Allocator,
+    snapshot: *const index_mod.IndexSnapshot,
+    schema: runtime_schema_mod.TableSchema,
+) !bool {
+    if (schema.index_sort.len == 0) return false;
+    var covered_live_segments = false;
+    for (snapshot.segments) |*segment| {
+        if (segment.liveDocCount() == 0) continue;
+        covered_live_segments = true;
+        const bounds = segment.reader.indexSortBoundsAlloc(alloc) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return false;
+        } orelse return false;
+        var owned_bounds = bounds;
+        defer owned_bounds.deinit(alloc);
+        if (!indexSortBoundsMatchSchema(schema, owned_bounds)) return false;
+    }
+    return covered_live_segments;
+}
+
+fn planTextNativeSortFields(
+    req: types.SearchRequest,
+    snapshot: *const index_mod.IndexSnapshot,
+    runtime_schema: ?runtime_schema_mod.TableSchema,
+) !SortExecutionPlan {
+    var effective = try effectiveSortRequestAlloc(snapshot.alloc, req);
+    defer effective.deinit(snapshot.alloc);
+    const effective_req = effective.req;
+
+    try validateSortPageOptions(effective_req);
+    if (effective_req.order_by.len == 0) return .{ .kind = .none };
+    const cursor = activeSortCursor(effective_req);
+    try validateScoreSortHasScoreBearingTextSource(effective_req);
+    if (!requestNeedsNativeSortValues(effective_req)) return .{
+        .kind = if (requestHasScoreSort(effective_req)) .score_top_k else .id_only,
+        .exactness = .exact,
+        .source = .candidate_collector,
+        .cursor_support = .comparator,
+        .source_load = .projected_source_after_page,
+        .distributed_behavior = .shard_local_only,
+    };
+    const schema = runtime_schema orelse {
+        logNativeSortPlanRejection(
+            "*",
+            nativeSortPlanRejectionReasonName(.missing_runtime_mapping),
+            nativeSortPlanRejectionDetailName(.missing_runtime_mapping),
+        );
+        return error.UnsupportedExactSort;
+    };
+    for (effective_req.order_by, 0..) |field, i| {
+        if (std.mem.eql(u8, field.field, "_id") or std.mem.eql(u8, field.field, "_score")) continue;
+        const mapping = sortFieldMapping(schema, field.field) orelse {
+            logNativeSortPlanRejection(
+                field.field,
+                nativeSortPlanRejectionReasonName(.unmapped_field),
+                nativeSortPlanRejectionDetailName(.unmapped_field),
+            );
+            return error.UnsupportedExactSort;
+        };
+        if (mappedSortFieldRejectionReason(mapping)) |reason| {
+            logNativeSortPlanRejection(
+                field.field,
+                nativeSortPlanRejectionReasonName(reason),
+                nativeSortPlanRejectionDetailName(reason),
+            );
+            return error.UnsupportedExactSort;
+        }
+        if (cursor.len > 0) {
+            if (mappedSortCursorRejectionReason(mapping, cursor[i])) |reason| {
+                logNativeSortPlanRejection(
+                    field.field,
+                    nativeSortPlanRejectionReasonName(reason),
+                    nativeSortPlanRejectionDetailName(reason),
+                );
+                return error.InvalidQueryRequest;
+            }
+        }
+        if (snapshot.global_doc_count == 0) continue;
+        const coverage = try snapshotTypedDocValuesCoverageDetailsForMapping(snapshot, field.field, mapping);
+        if (coverage.status != .covered) {
+            const reason = typedDocValuesCoverageRejectionReason(coverage.status) orelse .missing_doc_values_capability;
+            logNativeSortPlanRejection(
+                field.field,
+                nativeSortPlanRejectionReasonName(reason),
+                typedDocValuesCoverageStatusName(coverage.status),
+            );
+            return error.UnsupportedExactSort;
+        }
+        if (cursor.len > 0) {
+            if (coverage.value_type) |value_type| {
+                if (mappedSortCursorRejectionReasonForDocValueType(mapping, value_type, cursor[i])) |reason| {
+                    logNativeSortPlanRejection(
+                        field.field,
+                        nativeSortPlanRejectionReasonName(reason),
+                        nativeSortPlanRejectionDetailName(reason),
+                    );
+                    return error.InvalidQueryRequest;
+                }
+            }
+        }
+    }
+    const exact_index_sort_match = sortRequestMatchesIndexSort(effective_req, schema);
+    const index_sort_coverage = try snapshotIndexSortCoverageStatusAlloc(snapshot.alloc, snapshot, schema, exact_index_sort_match);
+    const sorted_segment_available = indexSortCoverageHasExecutor(index_sort_coverage);
+    const sorted_segment_bounds_available = indexSortCoverageHasBounds(index_sort_coverage);
+    return .{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .exactness = .exact,
+        .source = .doc_values_collector,
+        .cursor_support = .comparator,
+        .source_load = .projected_source_after_page,
+        .distributed_behavior = .shard_local_only,
+        .runtime_schema = runtime_schema,
+        .sort_lifecycle_state = if (sorted_segment_available) "accelerated" else "queryable",
+        .native_doc_values_coverage = typedDocValuesCoverageStatusName(.covered),
+        .index_sort_coverage = indexSortCoverageStatusName(index_sort_coverage),
+        .index_sort_match = exact_index_sort_match,
+        .sorted_segment_executor_available = sorted_segment_available,
+        .sorted_segment_bounds_available = sorted_segment_bounds_available,
+    };
+}
+
+fn validateTextNativeSortFields(
+    req: types.SearchRequest,
+    snapshot: *const index_mod.IndexSnapshot,
+    runtime_schema: ?runtime_schema_mod.TableSchema,
+) !void {
+    _ = try planTextNativeSortFields(req, snapshot, runtime_schema);
+}
+
+fn buildOrdinalTextDocIdMapAlloc(
+    alloc: Allocator,
+    snapshot: *const index_mod.IndexSnapshot,
+    candidates: []const MatchAllCandidate,
+    ordinal_to_text_doc_id: *std.AutoHashMapUnmanaged(doc_set.DocOrdinal, u32),
+) !bool {
+    if (!snapshot.hasDocOrdinalCoverage()) return false;
+
+    var ordinals = std.ArrayListUnmanaged(doc_set.DocOrdinal).empty;
+    defer ordinals.deinit(alloc);
+    for (candidates) |candidate| {
+        const ordinal = candidate.ordinal orelse continue;
+        try ordinals.append(alloc, ordinal);
+    }
+    if (ordinals.items.len == 0) return false;
+
+    const doc_nums = try snapshot.docNumsForOrdinalsAlloc(alloc, ordinals.items);
+    defer alloc.free(doc_nums);
+    for (doc_nums) |doc_num| {
+        const ordinal = (try snapshot.docOrdinal(doc_num)) orelse continue;
+        try ordinal_to_text_doc_id.put(alloc, ordinal, doc_num);
+    }
+    return ordinal_to_text_doc_id.count() > 0;
+}
+
+fn buildAllOrdinalTextDocIdMapAlloc(
+    alloc: Allocator,
+    snapshot: *const index_mod.IndexSnapshot,
+    ordinal_to_text_doc_id: *std.AutoHashMapUnmanaged(doc_set.DocOrdinal, u32),
+) !bool {
+    if (!snapshot.hasDocOrdinalCoverage()) return false;
+
+    var doc_offset: u32 = 0;
+    var saw_live_doc = false;
+    for (snapshot.segments) |*segment| {
+        for (0..segment.reader.doc_count) |local_usize| {
+            const local_doc: u32 = @intCast(local_usize);
+            if (segment.shared.deleted) |deleted| {
+                if (deleted.contains(local_doc)) continue;
+            }
+            saw_live_doc = true;
+            const ordinal = (try segment.reader.docOrdinal(local_doc)) orelse return false;
+            try ordinal_to_text_doc_id.put(alloc, ordinal, doc_offset + local_doc);
+        }
+        doc_offset += segment.reader.doc_count;
+    }
+    return !saw_live_doc or ordinal_to_text_doc_id.count() > 0;
+}
+
+fn matchAllDocOrdinalsForDocIdsAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    snapshot: *const index_mod.IndexSnapshot,
+    doc_ids: []const []const u8,
+) ![]const u32 {
+    var doc_id_set = try BorrowedDocIdSet.initAlloc(alloc, doc_ids);
+    defer doc_id_set.deinit(alloc);
+    var doc_num_set = std.AutoHashMapUnmanaged(u32, void).empty;
+    defer doc_num_set.deinit(alloc);
+
+    var out = std.ArrayListUnmanaged(u32).empty;
+    errdefer out.deinit(alloc);
+    var scanned_count: u64 = 0;
+    for (snapshot.segments) |*segment| {
+        for (0..segment.reader.doc_count) |local_usize| {
+            scanned_count +|= 1;
+            if (scanned_count == 1 or scanned_count % 1024 == 0) try checkSearchRequestDeadline(req);
+            const local_doc: u32 = @intCast(local_usize);
+            if (segment.shared.deleted) |deleted| {
+                if (deleted.contains(local_doc)) continue;
+            }
+            const stored = segment.reader.storedDoc(local_doc) orelse continue;
+            if (!doc_id_set.contains(stored.id)) continue;
+            const ordinal = (try segment.reader.docOrdinal(local_doc)) orelse {
+                logNativeSortPlanRejection(
+                    "*",
+                    nativeSortPlanRejectionReasonName(.missing_doc_values_capability),
+                    "doc_ordinal_projection_unavailable",
+                );
+                return error.UnsupportedQueryRequest;
+            };
+            const gop = try doc_num_set.getOrPut(alloc, ordinal);
+            if (gop.found_existing) continue;
+            try out.append(alloc, ordinal);
+        }
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn convertNativeDocIdsToMatchAllDocOrdinalsAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    snapshot: *const index_mod.IndexSnapshot,
+    constraints: *NativeDocIdConstraints,
+) !void {
+    if (constraints.filter_doc_ids.len > 0) {
+        const mapped = try matchAllDocOrdinalsForDocIdsAlloc(alloc, req, snapshot, constraints.filter_doc_ids);
+        if (constraints.filter_doc_nums.len > 0) {
+            const intersected = try intersectDocNumsAlloc(alloc, constraints.filter_doc_nums, mapped);
+            if (constraints.filter_doc_nums_owned and constraints.filter_doc_nums.len > 0) alloc.free(@constCast(constraints.filter_doc_nums));
+            alloc.free(mapped);
+            constraints.filter_doc_nums = intersected;
+        } else {
+            constraints.filter_doc_nums = mapped;
+        }
+        constraints.filter_doc_nums_owned = true;
+        if (constraints.filter_doc_ids_owned) freeDocIdSlice(alloc, constraints.filter_doc_ids);
+        constraints.filter_doc_ids = &.{};
+        constraints.filter_doc_ids_owned = false;
+    }
+
+    if (constraints.exclude_doc_ids.len > 0) {
+        const mapped = try matchAllDocOrdinalsForDocIdsAlloc(alloc, req, snapshot, constraints.exclude_doc_ids);
+        if (constraints.exclude_doc_nums.len > 0) {
+            const merged = try unionDocNumsAlloc(alloc, constraints.exclude_doc_nums, mapped);
+            if (constraints.exclude_doc_nums_owned and constraints.exclude_doc_nums.len > 0) alloc.free(@constCast(constraints.exclude_doc_nums));
+            alloc.free(mapped);
+            constraints.exclude_doc_nums = merged;
+        } else {
+            constraints.exclude_doc_nums = mapped;
+        }
+        constraints.exclude_doc_nums_owned = true;
+        if (constraints.exclude_doc_ids_owned) freeDocIdSlice(alloc, constraints.exclude_doc_ids);
+        constraints.exclude_doc_ids = &.{};
+        constraints.exclude_doc_ids_owned = false;
+    }
+}
+
+fn sortAndPageMatchAllOrdinalDocValueCandidatesAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: MatchAllExecutor,
+    snapshot: *const index_mod.IndexSnapshot,
+    constraints: *const NativeDocIdConstraints,
+    plan: SortExecutionPlan,
+    ordinal_to_text_doc_id: *const std.AutoHashMapUnmanaged(doc_set.DocOrdinal, u32),
+) !types.SearchResult {
+    var effective = try effectiveSortRequestAlloc(alloc, req);
+    defer effective.deinit(alloc);
+    const effective_req = effective.req;
+
+    try validateSortPageOptions(effective_req);
+    if (effective_req.order_by.len == 0) return error.InvalidQueryRequest;
+    try validateMatchAllSortDoesNotUseScore(effective_req);
+    try validateSortExecutionPlanForRuntime(effective_req, plan, .{
+        .ctx = null,
+        .require_native = plan.require_native,
+        .load = loadTextDocValueSortValue,
+    });
+    try checkSearchRequestDeadline(effective_req);
+    const bench_query_profile = shouldLogBenchQueryProfile();
+    const collect_sort_profile = bench_query_profile or effective_req.profile;
+    if (effective_req.limit == 0) {
+        const zero_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
+        var profile = SortCollectorProfile{};
+        observeSortCandidateSource(if (collect_sort_profile) &profile else null, "native_filter");
+        observeNativeFilterConstraints(if (collect_sort_profile) &profile else null, constraints);
+        const visible_total = if (activeSortCursor(effective_req).len > 0)
+            try visibleMatchAllOrdinalDocValueCandidateCountAfterCursorAlloc(
+                alloc,
+                effective_req,
+                executor,
+                snapshot,
+                constraints,
+                plan,
+                ordinal_to_text_doc_id,
+                if (collect_sort_profile) &profile else null,
+            )
+        else
+            try visibleMatchAllOrdinalDocValueCandidateCount(
+                alloc,
+                effective_req,
+                executor,
+                snapshot,
+                constraints,
+                ordinal_to_text_doc_id,
+            );
+        if (collect_sort_profile and activeSortCursor(effective_req).len == 0) {
+            profile.candidate_count = @intCast(@min(visible_total, @as(usize, std.math.maxInt(u64))));
+        }
+        if (collect_sort_profile) {
+            profile.window_capacity = 0;
+            profile.window_len = 0;
+            profile.total_ns = platform_time.monotonicNs() - zero_start_ns;
+        }
+        if (bench_query_profile) {
+            logBenchSortCollectorProfile(effective_req, plan, true, profile);
+        }
+        return .{
+            .alloc = alloc,
+            .hits = &.{},
+            .total_hits = boundedU32(visible_total),
+            .total_hits_relation = if (visible_total > std.math.maxInt(u32)) .gte else .exact,
+            .sort_profile = if (collect_sort_profile) sortResultProfile(effective_req, plan, true, profile) else null,
+            .graph_results = &.{},
+        };
+    }
+
+    const exact_candidate_budget = lateVisibilityExactCandidateBudget();
+    const candidate_count = boundedU32(constraints.filter_doc_nums.len);
+    enforceLateVisibilityExactCandidateBudget(candidate_count, exact_candidate_budget) catch |err| {
+        logExactSortBudgetRejection(
+            "match_all",
+            .match_all_exact_candidate_window,
+            effective_req.index_name,
+            candidate_count,
+            exact_candidate_budget,
+            plan,
+        );
+        return err;
+    };
+
+    const sort_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
+    var profile = SortCollectorProfile{};
+    observeSortCandidateSource(if (collect_sort_profile) &profile else null, "native_filter");
+    observeNativeFilterConstraints(if (collect_sort_profile) &profile else null, constraints);
+    const window_capacity = sortWindowCapacity(effective_req);
+    if (collect_sort_profile) profile.window_capacity = window_capacity;
+    const keep_previous_page = effective_req.search_before.len > 0;
+    var window: []DecoratedSortHit = if (window_capacity > 0)
+        try alloc.alloc(DecoratedSortHit, window_capacity)
+    else
+        &.{};
+    var window_len: usize = 0;
+    var window_drained_prefix: usize = 0;
+    errdefer {
+        for (window[window_drained_prefix..window_len]) |*item| item.deinit(alloc);
+        if (window.len > 0) alloc.free(window);
+    }
+
+    var native_sort_ctx = TextDocValueSortContext{
+        .snapshot = snapshot,
+        .ordinal_to_text_doc_id = ordinal_to_text_doc_id,
+    };
+    const native_loader = NativeSortValueLoader{
+        .ctx = &native_sort_ctx,
+        .require_native = plan.require_native,
+        .load = loadTextDocValueSortValue,
+    };
+    var constraint_membership = try NativeDocIdConstraintMembership.initAlloc(alloc, constraints);
+    defer constraint_membership.deinit(alloc);
+
+    var total_hits: u32 = 0;
+    for (constraints.filter_doc_nums, 0..) |ordinal, i| {
+        if (i % 1024 == 0) try checkSearchRequestDeadline(effective_req);
+        const doc_num = ordinal_to_text_doc_id.get(ordinal) orelse {
+            logNativeSortPlanRejection(
+                "*",
+                nativeSortPlanRejectionReasonName(.missing_doc_values_capability),
+                "doc_ordinal_projection_unavailable",
+            );
+            return error.UnsupportedQueryRequest;
+        };
+        const stored = snapshot.storedDoc(doc_num) orelse return error.StoredDocMissing;
+        const candidate = MatchAllCandidate{
+            .id = @constCast(stored.id),
+            .ordinal = ordinal,
+        };
+        if (!matchAllCandidateAllowedWithMembership(candidate, constraints, &constraint_membership)) continue;
+        if (executor.is_expired_key) |is_expired| {
+            if (try is_expired(executor.ctx, alloc, stored.id)) continue;
+        }
+        total_hits +|= 1;
+        if (collect_sort_profile) profile.candidate_count += 1;
+        const raw_hit = types.SearchHit{
+            .id = try alloc.dupe(u8, stored.id),
+            .doc_ordinal = ordinal,
+            .native_text_doc_id = doc_num,
+            .score = 1.0,
+            .stored_data = null,
+        };
+        const decorate_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
+        var decorated = try decorateSortHitAlloc(
+            alloc,
+            effective_req,
+            plan,
+            raw_hit,
+            executor.ctx,
+            executor.load_stored,
+            native_loader,
+            if (collect_sort_profile) &profile else null,
+        );
+        var decorated_owned = true;
+        errdefer if (decorated_owned) decorated.deinit(alloc);
+        if (collect_sort_profile) profile.decorate_ns += platform_time.monotonicNs() - decorate_start_ns;
+
+        const allowed_by_cursor = try decoratedHitAllowedByCursor(effective_req, plan, decorated);
+        admitDecoratedSortHitIntoWindow(
+            alloc,
+            effective_req,
+            window,
+            &window_len,
+            keep_previous_page,
+            if (collect_sort_profile) &profile else null,
+            decorated,
+            allowed_by_cursor,
+        );
+        decorated_owned = false;
+    }
+
+    try checkSearchRequestDeadline(effective_req);
+    const final_sort_start_ns = if (collect_sort_profile) platform_time.monotonicNs() else 0;
+    std.sort.pdq(DecoratedSortHit, window[0..window_len], effective_req, decoratedLessThan);
+    if (collect_sort_profile) profile.final_sort_ns = platform_time.monotonicNs() - final_sort_start_ns;
+    try checkSearchRequestDeadline(effective_req);
+
+    var start: usize = 0;
+    var end: usize = window_len;
+    if (effective_req.search_after.len == 0 and effective_req.search_before.len == 0) {
+        start = @min(@as(usize, @intCast(effective_req.offset)), window_len);
+        end = @min(start + @as(usize, @intCast(effective_req.limit)), window_len);
+    }
+
+    const selected = try alloc.alloc(types.SearchHit, end - start);
+    var selected_initialized: usize = 0;
+    errdefer {
+        for (selected[0..selected_initialized]) |*hit| hit.deinit(alloc);
+        if (selected.len > 0) alloc.free(selected);
+    }
+    for (window[0..window_len], 0..) |*item, i| {
+        if (i % 1024 == 0) try checkSearchRequestDeadline(effective_req);
+        if (i >= start and i < end) {
+            selected[selected_initialized] = item.hit;
+            item.hit = undefined;
+            selected_initialized += 1;
+            if (collect_sort_profile) profile.selected_count += 1;
+        } else {
+            item.hit.deinit(alloc);
+        }
+        freeSortValues(alloc, item.keys);
+        window_drained_prefix = i + 1;
+    }
+    if (window.len > 0) alloc.free(window);
+    if (collect_sort_profile) {
+        profile.window_len = window_len;
+        profile.total_ns = platform_time.monotonicNs() - sort_start_ns;
+    }
+    if (bench_query_profile) {
+        logBenchSortCollectorProfile(effective_req, plan, true, profile);
+    }
+
+    var out = types.SearchResult{
+        .alloc = alloc,
+        .hits = selected,
+        .total_hits = total_hits,
+        .total_hits_relation = .exact,
+        .sort_profile = if (collect_sort_profile) sortResultProfile(effective_req, plan, true, profile) else null,
+        .graph_results = &.{},
+    };
+    errdefer out.deinit();
+
+    if (effective_req.include_stored) {
+        const source_profile = try loadMissingProjectedMatchAllHitDocuments(alloc, effective_req, executor, out.hits);
+        applyProjectedSourceLoadProfileToSortProfile(&out, source_profile);
+        logBenchProjectedSourceLoadProfile(effective_req, plan, "match_all", source_profile);
+    }
+    return out;
+}
+
+fn visibleMatchAllOrdinalDocValueCandidateCountAfterCursorAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: MatchAllExecutor,
+    snapshot: *const index_mod.IndexSnapshot,
+    constraints: *const NativeDocIdConstraints,
+    plan: SortExecutionPlan,
+    ordinal_to_text_doc_id: *const std.AutoHashMapUnmanaged(doc_set.DocOrdinal, u32),
+    profile: ?*SortCollectorProfile,
+) !usize {
+    var native_sort_ctx = TextDocValueSortContext{
+        .snapshot = snapshot,
+        .ordinal_to_text_doc_id = ordinal_to_text_doc_id,
+    };
+    const native_loader = NativeSortValueLoader{
+        .ctx = &native_sort_ctx,
+        .require_native = plan.require_native,
+        .load = loadTextDocValueSortValue,
+    };
+    var constraint_membership = try NativeDocIdConstraintMembership.initAlloc(alloc, constraints);
+    defer constraint_membership.deinit(alloc);
+
+    var visible_count: usize = 0;
+    for (constraints.filter_doc_nums, 0..) |ordinal, i| {
+        if (i % 1024 == 0) try checkSearchRequestDeadline(req);
+        const doc_num = ordinal_to_text_doc_id.get(ordinal) orelse {
+            logNativeSortPlanRejection(
+                "*",
+                nativeSortPlanRejectionReasonName(.missing_doc_values_capability),
+                "doc_ordinal_projection_unavailable",
+            );
+            return error.UnsupportedQueryRequest;
+        };
+        const stored = snapshot.storedDoc(doc_num) orelse return error.StoredDocMissing;
+        const candidate = MatchAllCandidate{
+            .id = @constCast(stored.id),
+            .ordinal = ordinal,
+        };
+        if (!matchAllCandidateAllowedWithMembership(candidate, constraints, &constraint_membership)) continue;
+        if (executor.is_expired_key) |is_expired| {
+            if (try is_expired(executor.ctx, alloc, stored.id)) continue;
+        }
+        if (profile) |p| p.candidate_count += 1;
+        const raw_hit = types.SearchHit{
+            .id = try alloc.dupe(u8, stored.id),
+            .doc_ordinal = ordinal,
+            .native_text_doc_id = doc_num,
+            .score = 1.0,
+            .stored_data = null,
+        };
+        const decorate_start_ns = if (profile != null) platform_time.monotonicNs() else 0;
+        var decorated = try decorateSortHitAlloc(
+            alloc,
+            req,
+            plan,
+            raw_hit,
+            executor.ctx,
+            executor.load_stored,
+            native_loader,
+            profile,
+        );
+        defer decorated.deinit(alloc);
+        if (profile) |p| p.decorate_ns += platform_time.monotonicNs() - decorate_start_ns;
+
+        if (try decoratedHitAllowedByCursor(req, plan, decorated)) {
+            visible_count += 1;
+        } else if (profile) |p| {
+            p.cursor_rejected_count += 1;
+        }
+    }
+    return visible_count;
+}
+
+fn visibleMatchAllOrdinalDocValueCandidateCount(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: MatchAllExecutor,
+    snapshot: *const index_mod.IndexSnapshot,
+    constraints: *const NativeDocIdConstraints,
+    ordinal_to_text_doc_id: *const std.AutoHashMapUnmanaged(doc_set.DocOrdinal, u32),
+) !usize {
+    var visible_count: usize = 0;
+    var constraint_membership = try NativeDocIdConstraintMembership.initAlloc(alloc, constraints);
+    defer constraint_membership.deinit(alloc);
+
+    for (constraints.filter_doc_nums, 0..) |ordinal, i| {
+        if (i % 1024 == 0) try checkSearchRequestDeadline(req);
+        const doc_num = ordinal_to_text_doc_id.get(ordinal) orelse {
+            logNativeSortPlanRejection(
+                "*",
+                nativeSortPlanRejectionReasonName(.missing_doc_values_capability),
+                "doc_ordinal_projection_unavailable",
+            );
+            return error.UnsupportedQueryRequest;
+        };
+        const stored = snapshot.storedDoc(doc_num) orelse return error.StoredDocMissing;
+        const candidate = MatchAllCandidate{
+            .id = @constCast(stored.id),
+            .ordinal = ordinal,
+        };
+        if (!matchAllCandidateAllowedWithMembership(candidate, constraints, &constraint_membership)) continue;
+        if (executor.is_expired_key) |is_expired| {
+            if (try is_expired(executor.ctx, alloc, stored.id)) continue;
+        }
+        visible_count += 1;
+    }
+    return visible_count;
+}
+
+fn planMatchAllSortBeforeCandidatesAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: MatchAllExecutor,
+) !SortExecutionPlan {
+    var effective = try effectiveSortRequestAlloc(alloc, req);
+    defer effective.deinit(alloc);
+    const effective_req = effective.req;
+
+    try validateSortPageOptions(effective_req);
+    if (effective_req.order_by.len == 0) return .{ .kind = .none };
+    try validateMatchAllSortDoesNotUseScore(effective_req);
+    if (!requestNeedsNativeSortValues(effective_req)) return .{
+        .kind = .id_seek,
+        .exactness = .exact,
+        .source = .primary_key_scan,
+        .cursor_support = .segment_seek,
+        .source_load = .projected_source_after_page,
+        .distributed_behavior = .shard_local_only,
+    };
+
+    const text_entry = (try executor.text_index_entry(executor.ctx, effective_req.index_name)) orelse {
+        logNativeSortPlanRejection(
+            "*",
+            nativeSortPlanRejectionReasonName(.missing_doc_values_capability),
+            "text_index_entry_unavailable",
+        );
+        return error.UnsupportedExactSort;
+    };
+    const plan = try planTextNativeSortFields(effective_req, text_entry.persistent.snapshot(), text_entry.runtime_schema);
+    if (plan.sorted_segment_executor_available) {
+        return .{
+            .kind = .sorted_segment_seek,
+            .require_native = true,
+            .exactness = .bounded_exact,
+            .source = .sorted_segment_scan,
+            .cursor_support = .segment_seek,
+            .source_load = .projected_source_after_page,
+            .distributed_behavior = .shard_local_only,
+            .runtime_schema = plan.runtime_schema,
+            .sort_lifecycle_state = plan.sort_lifecycle_state,
+            .native_doc_values_coverage = plan.native_doc_values_coverage,
+            .index_sort_coverage = plan.index_sort_coverage,
+            .index_sort_match = plan.index_sort_match,
+            .sorted_segment_executor_available = true,
+            .sorted_segment_bounds_available = plan.sorted_segment_bounds_available,
+        };
+    }
+    return plan;
+}
+
+fn sortedSegmentSelectiveCandidateDocValuesDecision(req: types.SearchRequest, candidate_count: usize, snapshot: *const index_mod.IndexSnapshot) SortCostModelDecision {
+    var live_docs: usize = 0;
+    for (snapshot.segments) |*segment| live_docs +|= segment.liveDocCount();
+
+    const window = @max(sortWindowCapacity(req), @as(usize, 1));
+    const page_selective_limit = window *| 8;
+    const absolute_selective_limit: usize = 4096;
+    const selective_limit = @max(page_selective_limit, absolute_selective_limit);
+    const prefer_doc_values =
+        live_docs > 0 and
+        candidate_count > 0 and
+        candidate_count < live_docs and
+        candidate_count <= selective_limit and
+        candidate_count *| 16 <= live_docs;
+    return .{
+        .live_docs = live_docs,
+        .candidate_count = candidate_count,
+        .selective_limit = selective_limit,
+        .prefer_doc_values = prefer_doc_values,
+    };
+}
+
+fn sortedSegmentSelectiveFilterDocValuesDecision(req: types.SearchRequest, constraints: *const NativeDocIdConstraints, snapshot: *const index_mod.IndexSnapshot) ?SortCostModelDecision {
+    if (!constraints.positive_filter) return null;
+    if (constraints.filter_doc_nums.len == 0 or constraints.filter_doc_ids.len > 0) return null;
+    return sortedSegmentSelectiveCandidateDocValuesDecision(req, constraints.filter_doc_nums.len, snapshot);
+}
+
+fn docValuesCollectorPlanForSelectiveFilter(plan: SortExecutionPlan) SortExecutionPlan {
+    var out = plan;
+    out.kind = .native_doc_values_top_n;
+    out.exactness = .exact;
+    out.source = .doc_values_collector;
+    out.cursor_support = .comparator;
+    out.source_load = .projected_source_after_page;
+    out.distributed_behavior = .shard_local_only;
+    out.selective_filter_doc_values_preferred = true;
+    return out;
+}
+
+fn buildMatchAllNativeSortContextAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    executor: MatchAllExecutor,
+    candidates: []const MatchAllCandidate,
+    ordinal_to_text_doc_id: *std.AutoHashMapUnmanaged(doc_set.DocOrdinal, u32),
+) !?TextDocValueSortPlanContext {
+    if (req.order_by.len == 0 or !requestNeedsNativeSortValues(req)) return null;
+    try validateMatchAllSortDoesNotUseScore(req);
+    const text_entry = (try executor.text_index_entry(executor.ctx, req.index_name)) orelse return null;
+    const snapshot = text_entry.persistent.snapshot();
+    const plan = try planTextNativeSortFields(req, snapshot, text_entry.runtime_schema);
+    if (plan.kind != .native_doc_values_top_n) return null;
+    if (candidates.len > 0 and !(try buildOrdinalTextDocIdMapAlloc(alloc, snapshot, candidates, ordinal_to_text_doc_id))) {
+        logNativeSortPlanRejection(
+            "*",
+            nativeSortPlanRejectionReasonName(.missing_doc_values_capability),
+            "doc_ordinal_projection_unavailable",
+        );
+        return error.UnsupportedQueryRequest;
+    }
+    return .{
+        .plan = plan,
+        .ctx = .{
+            .snapshot = snapshot,
+            .ordinal_to_text_doc_id = ordinal_to_text_doc_id,
+        },
+    };
 }
 
 fn pageSearchResultInPlace(
@@ -5250,10 +14423,21 @@ pub fn searchMatchAll(
     req: types.SearchRequest,
     executor: MatchAllExecutor,
 ) !types.SearchResult {
-    var candidates = try executor.collect_candidates(executor.ctx, alloc, req);
-    defer candidates.deinit(alloc);
+    resetLastSortRejectionDiagnostic();
+    try checkSearchRequestDeadline(req);
+    var effective_sort_request = if (requestHasSortPageOptions(req))
+        try effectiveSortRequestAlloc(alloc, req)
+    else
+        EffectiveSortRequest{ .req = req };
+    defer effective_sort_request.deinit(alloc);
+    const exec_req = effective_sort_request.req;
 
-    var native_constraints = try deriveNativeDocIdConstraintsAlloc(alloc, req, .{
+    var planned_sort = if (requestHasSortPageOptions(exec_req))
+        try planMatchAllSortBeforeCandidatesAlloc(alloc, exec_req, executor)
+    else
+        SortExecutionPlan{ .kind = .none };
+
+    var native_constraints = try deriveNativeDocIdConstraintsAlloc(alloc, exec_req, .{
         .ctx = executor.ctx,
         .text_index_entry = executor.text_index_entry,
         .resolve_doc_set_doc_ids = executor.resolve_doc_set_doc_ids,
@@ -5263,13 +14447,212 @@ pub fn searchMatchAll(
         .apply_live_all_docs = true,
     });
     defer native_constraints.deinit(alloc);
-    try applyMatchAllDocIdConstraintsAlloc(alloc, &candidates, &native_constraints);
 
-    const needs_stored_pattern_filter =
-        req.filter_query_json.len > 0 or
-        req.exclusion_query_json.len > 0 or
-        req.resolved_doc_filter != null;
-    if (needs_stored_pattern_filter) {
+    const exact_sort_budget = lateVisibilityExactCandidateBudget();
+    const unresolved_stored_filters =
+        (exec_req.filter_query_json.len > 0 and !native_constraints.filter_query_json_resolved) or
+        (exec_req.exclusion_query_json.len > 0 and !native_constraints.exclusion_query_json_resolved);
+    const postprocess_req = requestWithoutResolvedStoredFilters(
+        exec_req,
+        native_constraints.filter_query_json_resolved,
+        native_constraints.exclusion_query_json_resolved,
+    );
+    try rejectSortedQueryWithUnresolvedStoredFilters(
+        exec_req,
+        native_constraints.filter_query_json_resolved,
+        native_constraints.exclusion_query_json_resolved,
+    );
+
+    if (exec_req.order_by.len > 0 and
+        (planned_sort.kind == .sorted_segment_seek or planned_sort.kind == .native_doc_values_top_n) and
+        (native_constraints.filter_doc_ids.len > 0 or native_constraints.exclude_doc_ids.len > 0))
+    {
+        const text_entry = (try executor.text_index_entry(executor.ctx, exec_req.index_name)) orelse {
+            logNativeSortPlanRejection(
+                "*",
+                nativeSortPlanRejectionReasonName(.missing_doc_values_capability),
+                "text_index_entry_unavailable",
+            );
+            return error.UnsupportedQueryRequest;
+        };
+        try convertNativeDocIdsToMatchAllDocOrdinalsAlloc(alloc, exec_req, text_entry.persistent.snapshot(), &native_constraints);
+        try normalizeNativeDocNumConstraintsAlloc(alloc, &native_constraints);
+    }
+
+    if (exec_req.order_by.len > 0 and planned_sort.kind == .sorted_segment_seek and !unresolved_stored_filters) {
+        const text_entry = (try executor.text_index_entry(executor.ctx, exec_req.index_name)) orelse {
+            logNativeSortPlanRejection(
+                "*",
+                nativeSortPlanRejectionReasonName(.missing_doc_values_capability),
+                "text_index_entry_unavailable",
+            );
+            return error.UnsupportedQueryRequest;
+        };
+        if (sortedSegmentSelectiveFilterDocValuesDecision(postprocess_req, &native_constraints, text_entry.persistent.snapshot())) |cost_decision| {
+            applySortCostModelDecision(&planned_sort, cost_decision);
+            if (cost_decision.prefer_doc_values) {
+                planned_sort = docValuesCollectorPlanForSelectiveFilter(planned_sort);
+                applySortCostModelDecision(&planned_sort, cost_decision);
+            }
+        }
+        if (planned_sort.kind == .sorted_segment_seek) {
+            var native_sort_ctx = TextDocValueSortContext{
+                .snapshot = text_entry.persistent.snapshot(),
+            };
+            const native_sort_loader = NativeSortValueLoader{
+                .ctx = &native_sort_ctx,
+                .require_native = true,
+                .load = loadTextDocValueSortValue,
+            };
+            var out = try sortAndPageMatchAllSortedSegmentsAlloc(
+                alloc,
+                postprocess_req,
+                executor,
+                &native_constraints,
+                text_entry,
+                planned_sort,
+                native_sort_loader,
+                null,
+            );
+            errdefer out.deinit();
+            if (postprocess_req.include_stored) {
+                const source_profile = try loadMissingProjectedMatchAllHitDocuments(alloc, postprocess_req, executor, out.hits);
+                applyProjectedSourceLoadProfileToSortProfile(&out, source_profile);
+                logBenchProjectedSourceLoadProfile(postprocess_req, planned_sort, "match_all", source_profile);
+            }
+            return out;
+        }
+    }
+
+    if (exec_req.order_by.len > 0 and planned_sort.kind == .id_seek and !unresolved_stored_filters and executor.collect_candidates_stream != null) {
+        var out = try sortAndPageMatchAllIdSeekAlloc(alloc, postprocess_req, executor, &native_constraints, planned_sort);
+        errdefer out.deinit();
+        if (postprocess_req.include_stored) {
+            const source_profile = try loadMissingProjectedMatchAllHitDocuments(alloc, postprocess_req, executor, out.hits);
+            applyProjectedSourceLoadProfileToSortProfile(&out, source_profile);
+            logBenchProjectedSourceLoadProfile(postprocess_req, planned_sort, "match_all", source_profile);
+        }
+        return out;
+    }
+    if (exec_req.order_by.len > 0 and planned_sort.kind == .id_seek and executor.collect_candidates_stream == null) {
+        planned_sort = boundedCandidateCollectorSortPlanForUnavailableStream(planned_sort);
+    }
+    if (exec_req.order_by.len > 0 and planned_sort.kind == .native_doc_values_top_n and executor.collect_candidates_stream == null) {
+        planned_sort = boundedCandidateCollectorSortPlanForUnavailableStream(planned_sort);
+    }
+
+    if (exec_req.order_by.len > 0 and planned_sort.kind == .native_doc_values_top_n and !unresolved_stored_filters and executor.collect_candidates_stream != null) {
+        const text_entry = (try executor.text_index_entry(executor.ctx, exec_req.index_name)) orelse {
+            logNativeSortPlanRejection(
+                "*",
+                nativeSortPlanRejectionReasonName(.missing_doc_values_capability),
+                "text_index_entry_unavailable",
+            );
+            return error.UnsupportedQueryRequest;
+        };
+        var ordinal_to_text_doc_id = std.AutoHashMapUnmanaged(doc_set.DocOrdinal, u32).empty;
+        defer ordinal_to_text_doc_id.deinit(alloc);
+        if (!(try buildAllOrdinalTextDocIdMapAlloc(alloc, text_entry.persistent.snapshot(), &ordinal_to_text_doc_id))) {
+            logNativeSortPlanRejection(
+                "*",
+                nativeSortPlanRejectionReasonName(.missing_doc_values_capability),
+                "doc_ordinal_projection_unavailable",
+            );
+            return error.UnsupportedQueryRequest;
+        }
+        if (native_constraints.positive_filter and
+            native_constraints.filter_doc_nums.len > 0 and
+            native_constraints.filter_doc_ids.len == 0)
+        {
+            return try sortAndPageMatchAllOrdinalDocValueCandidatesAlloc(
+                alloc,
+                postprocess_req,
+                executor,
+                text_entry.persistent.snapshot(),
+                &native_constraints,
+                planned_sort,
+                &ordinal_to_text_doc_id,
+            );
+        }
+        var native_sort_ctx = TextDocValueSortContext{
+            .snapshot = text_entry.persistent.snapshot(),
+            .ordinal_to_text_doc_id = &ordinal_to_text_doc_id,
+        };
+        const native_sort_loader = NativeSortValueLoader{
+            .ctx = &native_sort_ctx,
+            .require_native = planned_sort.require_native,
+            .load = loadTextDocValueSortValue,
+        };
+        var out = try sortAndPageMatchAllCandidateStreamAlloc(alloc, postprocess_req, executor, .{
+            .constraints = &native_constraints,
+        }, planned_sort, native_sort_loader);
+        errdefer out.deinit();
+        if (postprocess_req.include_stored) {
+            const source_profile = try loadMissingProjectedMatchAllHitDocuments(alloc, postprocess_req, executor, out.hits);
+            applyProjectedSourceLoadProfileToSortProfile(&out, source_profile);
+            logBenchProjectedSourceLoadProfile(postprocess_req, planned_sort, "match_all", source_profile);
+        }
+        return out;
+    }
+
+    var candidates = executor.collect_candidates(executor.ctx, alloc, postprocess_req, if (postprocess_req.order_by.len > 0) .{
+        .candidate_limit = exact_sort_budget,
+        .constraints = &native_constraints,
+    } else .{}) catch |err| {
+        if (postprocess_req.order_by.len > 0 and err == error.QueryCandidateBudgetExceeded) {
+            logExactSortBudgetRejection(
+                "match_all",
+                .match_all_candidate_collect_limit,
+                postprocess_req.index_name,
+                exact_sort_budget +| 1,
+                exact_sort_budget,
+                planned_sort,
+            );
+        }
+        return err;
+    };
+    defer candidates.deinit(alloc);
+    try applyMatchAllDocIdConstraintsAlloc(alloc, &candidates, &native_constraints);
+    try checkSearchRequestDeadline(postprocess_req);
+    if (postprocess_req.order_by.len > 0) {
+        const candidate_count: u32 = @intCast(@min(candidates.items.len, @as(usize, std.math.maxInt(u32))));
+        enforceLateVisibilityExactCandidateBudget(candidate_count, exact_sort_budget) catch |err| {
+            logExactSortBudgetRejection(
+                "match_all",
+                .match_all_exact_candidate_window,
+                postprocess_req.index_name,
+                candidate_count,
+                exact_sort_budget,
+                planned_sort,
+            );
+            return err;
+        };
+    }
+
+    var ordinal_to_text_doc_id = std.AutoHashMapUnmanaged(doc_set.DocOrdinal, u32).empty;
+    defer ordinal_to_text_doc_id.deinit(alloc);
+    var native_sort_ctx: TextDocValueSortContext = undefined;
+    var native_sort_loader: ?NativeSortValueLoader = null;
+    var sort_plan = planned_sort;
+    if (try buildMatchAllNativeSortContextAlloc(alloc, postprocess_req, executor, candidates.items, &ordinal_to_text_doc_id)) |planned| {
+        const preserve_bounded_exact = sortExecutionPlanExactness(sort_plan) == .bounded_exact;
+        native_sort_ctx = planned.ctx;
+        sort_plan = planned.plan;
+        if (preserve_bounded_exact and sort_plan.kind == .native_doc_values_top_n) {
+            sort_plan.exactness = .bounded_exact;
+        }
+        native_sort_loader = .{
+            .ctx = &native_sort_ctx,
+            .require_native = planned.plan.require_native,
+            .load = loadTextDocValueSortValue,
+        };
+    }
+    if (sort_plan.kind == .stored_json_debug and candidates.items.len > 0) {
+        logNativeSortPlanRejection("*", "stored_json_sort_disabled", "stored_json_sort_disabled");
+        return error.UnsupportedQueryRequest;
+    }
+
+    if (unresolved_stored_filters) {
         var hits = try alloc.alloc(types.SearchHit, candidates.items.len);
         var initialized: usize = 0;
         errdefer {
@@ -5277,6 +14660,7 @@ pub fn searchMatchAll(
             if (hits.len > 0) alloc.free(hits);
         }
         for (candidates.items, 0..) |*candidate, i| {
+            if (i % 1024 == 0) try checkSearchRequestDeadline(req);
             hits[i] = .{
                 .id = candidate.id,
                 .doc_ordinal = candidate.ordinal,
@@ -5287,7 +14671,7 @@ pub fn searchMatchAll(
             initialized += 1;
         }
 
-        var filtered = try result_shape.applyStoredSearchPatternFilters(alloc, req, .{
+        var filtered = try result_shape.applyStoredSearchPatternFilters(alloc, postprocess_req, .{
             .alloc = alloc,
             .hits = hits,
             .total_hits = @intCast(hits.len),
@@ -5302,48 +14686,87 @@ pub fn searchMatchAll(
         var filtered_owned = true;
         errdefer if (filtered_owned) filtered.deinit();
 
-        var paged = try pageSearchResultInPlace(alloc, filtered, componentPaging(req));
+        if (postprocess_req.order_by.len > 0) {
+            try sortAndPageSearchResultInPlace(&filtered, postprocess_req, executor.ctx, executor.load_stored, sort_plan, native_sort_loader);
+            filtered_owned = false;
+            errdefer filtered.deinit();
+            if (postprocess_req.include_stored) {
+                const source_profile = try loadMissingProjectedMatchAllHitDocuments(alloc, postprocess_req, executor, filtered.hits);
+                applyProjectedSourceLoadProfileToSortProfile(&filtered, source_profile);
+                logBenchProjectedSourceLoadProfile(postprocess_req, sort_plan, "match_all", source_profile);
+            }
+            return filtered;
+        }
+
+        var paged = try pageSearchResultInPlace(alloc, filtered, componentPaging(postprocess_req));
         filtered_owned = false;
         errdefer paged.deinit();
-        if (req.include_stored) {
-            for (paged.hits) |*hit| {
-                hit.stored_data = try executor.load_projected_document(executor.ctx, alloc, req, hit.id);
-            }
+        if (postprocess_req.include_stored) {
+            _ = try loadMissingProjectedMatchAllHitDocuments(alloc, postprocess_req, executor, paged.hits);
         }
         return paged;
     }
 
-    const paging = componentPaging(req);
+    const paging = componentPaging(postprocess_req);
 
     const total_hits: u32 = @intCast(candidates.items.len);
-    const start = @min(paging.offset, total_hits);
-    const end = @min(start + paging.limit, total_hits);
+    if (postprocess_req.order_by.len > 0) {
+        var out = try sortAndPageMatchAllCandidatesAlloc(
+            alloc,
+            postprocess_req,
+            &candidates,
+            executor.ctx,
+            executor.load_stored,
+            sort_plan,
+            native_sort_loader,
+        );
+        errdefer out.deinit();
+        if (postprocess_req.include_stored) {
+            const source_profile = try loadMissingProjectedMatchAllHitDocuments(alloc, postprocess_req, executor, out.hits);
+            applyProjectedSourceLoadProfileToSortProfile(&out, source_profile);
+            logBenchProjectedSourceLoadProfile(postprocess_req, sort_plan, "match_all", source_profile);
+        }
+        return out;
+    }
+
+    const start = if (postprocess_req.order_by.len > 0) 0 else @min(paging.offset, total_hits);
+    const end = if (postprocess_req.order_by.len > 0) total_hits else @min(start + paging.limit, total_hits);
     const start_usize: usize = @intCast(start);
     const end_usize: usize = @intCast(end);
 
     var hits = try alloc.alloc(types.SearchHit, end_usize - start_usize);
-    errdefer alloc.free(hits);
+    var initialized: usize = 0;
+    errdefer {
+        for (hits[0..initialized]) |*hit| hit.deinit(alloc);
+        if (hits.len > 0) alloc.free(hits);
+    }
 
     for (candidates.items, 0..) |*candidate, i| {
+        if (i % 1024 == 0) try checkSearchRequestDeadline(req);
         if (i < start_usize or i >= end_usize) continue;
-        hits[i - start_usize] = .{
+        const out_index = i - start_usize;
+        hits[out_index] = .{
             .id = candidate.id,
             .doc_ordinal = candidate.ordinal,
             .score = 1.0,
-            .stored_data = if (req.include_stored)
-                try executor.load_projected_document(executor.ctx, alloc, req, candidate.id)
-            else
-                null,
+            .stored_data = null,
         };
+        initialized += 1;
         candidate.id = @constCast(&[_]u8{});
     }
 
-    return .{
+    var out = types.SearchResult{
         .alloc = alloc,
         .hits = hits,
         .total_hits = total_hits,
         .graph_results = &.{},
     };
+    initialized = 0;
+    errdefer out.deinit();
+    if (postprocess_req.include_stored) {
+        _ = try loadMissingProjectedMatchAllHitDocuments(alloc, postprocess_req, executor, out.hits);
+    }
+    return out;
 }
 
 fn applyMatchAllDocIdConstraintsAlloc(
@@ -5353,9 +14776,12 @@ fn applyMatchAllDocIdConstraintsAlloc(
 ) !void {
     if (!constraints.positive_filter and constraints.exclude_doc_ids.len == 0 and constraints.exclude_doc_nums.len == 0) return;
 
+    var membership = try NativeDocIdConstraintMembership.initAlloc(alloc, constraints);
+    defer membership.deinit(alloc);
+
     var keep_count: usize = 0;
     for (candidates.items) |candidate| {
-        if (matchAllCandidateAllowed(candidate, constraints)) keep_count += 1;
+        if (matchAllCandidateAllowedWithMembership(candidate, constraints, &membership)) keep_count += 1;
     }
     if (keep_count == candidates.items.len) return;
 
@@ -5367,7 +14793,7 @@ fn applyMatchAllDocIdConstraintsAlloc(
     }
 
     for (candidates.items) |*candidate| {
-        if (matchAllCandidateAllowed(candidate.*, constraints)) {
+        if (matchAllCandidateAllowedWithMembership(candidate.*, constraints, &membership)) {
             filtered[initialized] = candidate.*;
             candidate.id = @constCast(&[_]u8{});
             initialized += 1;
@@ -5384,19 +14810,79 @@ fn matchAllCandidateAllowed(
     candidate: MatchAllCandidate,
     constraints: *const NativeDocIdConstraints,
 ) bool {
+    return matchAllCandidateAllowedWithMembership(candidate, constraints, null);
+}
+
+fn matchAllCandidateAllowedWithMembership(
+    candidate: MatchAllCandidate,
+    constraints: *const NativeDocIdConstraints,
+    membership: ?*const NativeDocIdConstraintMembership,
+) bool {
     if (constraints.positive_filter) {
         if (constraints.filter_doc_ids.len == 0 and constraints.filter_doc_nums.len == 0) return false;
-        if (constraints.filter_doc_ids.len > 0 and !containsDocId(constraints.filter_doc_ids, candidate.id)) return false;
+        if (constraints.filter_doc_ids.len > 0) {
+            const contains = if (membership) |m|
+                m.containsFilterDocId(candidate.id)
+            else
+                containsDocId(constraints.filter_doc_ids, candidate.id);
+            if (!contains) return false;
+        }
         if (constraints.filter_doc_nums.len > 0) {
             const ordinal = candidate.ordinal orelse return false;
-            if (!containsDocNum(constraints.filter_doc_nums, ordinal)) return false;
+            const contains = if (membership) |m|
+                m.containsFilterDocNum(ordinal)
+            else
+                containsDocNum(constraints.filter_doc_nums, ordinal);
+            if (!contains) return false;
         }
     }
-    if (containsDocId(constraints.exclude_doc_ids, candidate.id)) return false;
+    if (constraints.exclude_doc_ids.len > 0) {
+        const excluded = if (membership) |m|
+            m.containsExcludeDocId(candidate.id)
+        else
+            containsDocId(constraints.exclude_doc_ids, candidate.id);
+        if (excluded) return false;
+    }
     if (candidate.ordinal) |ordinal| {
-        if (containsDocNum(constraints.exclude_doc_nums, ordinal)) return false;
+        if (constraints.exclude_doc_nums.len > 0) {
+            const excluded = if (membership) |m|
+                m.containsExcludeDocNum(ordinal)
+            else
+                containsDocNum(constraints.exclude_doc_nums, ordinal);
+            if (excluded) return false;
+        }
     }
     return true;
+}
+
+test "native doc id constraint membership matches candidate filtering semantics" {
+    const alloc = std.testing.allocator;
+
+    const filter_doc_ids = [_][]const u8{ "doc:a", "doc:c" };
+    const exclude_doc_ids = [_][]const u8{"doc:c"};
+    const filter_doc_nums = [_]u32{ 30, 10 };
+    const exclude_doc_nums = [_]u32{20};
+    const constraints = NativeDocIdConstraints{
+        .positive_filter = true,
+        .filter_doc_ids = &filter_doc_ids,
+        .exclude_doc_ids = &exclude_doc_ids,
+        .filter_doc_nums = &filter_doc_nums,
+        .exclude_doc_nums = &exclude_doc_nums,
+    };
+
+    var membership = try NativeDocIdConstraintMembership.initAlloc(alloc, &constraints);
+    defer membership.deinit(alloc);
+
+    const allowed = MatchAllCandidate{ .id = @constCast("doc:a"), .ordinal = 10 };
+    const excluded_by_id = MatchAllCandidate{ .id = @constCast("doc:c"), .ordinal = 30 };
+    const missing_id = MatchAllCandidate{ .id = @constCast("doc:b"), .ordinal = 10 };
+    const excluded_by_doc_num = MatchAllCandidate{ .id = @constCast("doc:a"), .ordinal = 20 };
+
+    try std.testing.expect(matchAllCandidateAllowed(allowed, &constraints));
+    try std.testing.expect(matchAllCandidateAllowedWithMembership(allowed, &constraints, &membership));
+    try std.testing.expect(!matchAllCandidateAllowedWithMembership(excluded_by_id, &constraints, &membership));
+    try std.testing.expect(!matchAllCandidateAllowedWithMembership(missing_id, &constraints, &membership));
+    try std.testing.expect(!matchAllCandidateAllowedWithMembership(excluded_by_doc_num, &constraints, &membership));
 }
 
 pub fn collectMatchAllCandidates(
@@ -5404,47 +14890,302 @@ pub fn collectMatchAllCandidates(
     req: types.SearchRequest,
     collector: MatchAllCandidateCollector,
 ) !MatchAllCandidates {
+    return try collectMatchAllCandidatesWithOptions(alloc, req, collector, .{});
+}
+
+pub fn collectMatchAllCandidatesWithOptions(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    collector: MatchAllCandidateCollector,
+    options: MatchAllCandidateCollectOptions,
+) !MatchAllCandidates {
+    var state = try collectMatchAllCandidateStateWithOptions(alloc, req, collector, options, null, null);
+    defer state.constraint_membership.deinit(alloc);
+    defer state.seen.deinit(alloc);
+    defer state.deinitSeenKeyStorage();
+    errdefer state.deinitCandidates();
+    return .{ .items = try state.candidates.toOwnedSlice(alloc) };
+}
+
+pub fn streamMatchAllCandidatesWithOptions(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    collector: MatchAllCandidateCollector,
+    options: MatchAllCandidateCollectOptions,
+    consumer_ctx: ?*anyopaque,
+    consumer: MatchAllCandidateConsumer,
+) !MatchAllCandidateStreamStats {
+    var state = try collectMatchAllCandidateStateWithOptions(alloc, req, collector, options, consumer_ctx, consumer);
+    defer state.constraint_membership.deinit(alloc);
+    defer state.seen.deinit(alloc);
+    defer state.deinitSeenKeyStorage();
+    state.deinitCandidates();
+    return .{
+        .accepted_count = state.accepted_count,
+        .stopped_early = state.stopped_early,
+    };
+}
+
+fn collectMatchAllCandidateStateWithOptions(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    collector: MatchAllCandidateCollector,
+    options: MatchAllCandidateCollectOptions,
+    consumer_ctx: ?*anyopaque,
+    consumer: ?MatchAllCandidateConsumer,
+) !MatchAllCandidateCollectState {
     _ = req.index_name;
 
-    const lower = try internal_keys.documentRangeLowerAlloc(alloc, "");
+    const lower = if (options.primary_key_start_after) |start_after|
+        (try internal_keys.documentRangeUpperAlloc(alloc, start_after)) orelse return error.InvalidInternalUserKey
+    else
+        try internal_keys.documentRangeLowerAlloc(alloc, "");
     defer alloc.free(lower);
+    const upper = if (options.primary_key_stop_before) |stop_before|
+        try internal_keys.documentRangeLowerAlloc(alloc, stop_before)
+    else
+        null;
+    defer if (upper) |buf| alloc.free(buf);
 
-    const docs = try collector.scan_store_range(collector.ctx, alloc, lower, "");
-    defer docstore_mod.DocStore.freeResults(alloc, docs);
-
-    var candidates = std.ArrayListUnmanaged(MatchAllCandidate).empty;
-    var seen = std.StringHashMapUnmanaged(void){};
-    defer seen.deinit(alloc);
+    var state = MatchAllCandidateCollectState{
+        .alloc = alloc,
+        .req = req,
+        .collector = collector,
+        .options = options,
+        .consumer_ctx = consumer_ctx,
+        .consumer = consumer,
+    };
     errdefer {
-        for (candidates.items) |*item| item.deinit(alloc);
-        candidates.deinit(alloc);
+        state.seen.deinit(alloc);
+        state.constraint_membership.deinit(alloc);
+        state.deinitSeenKeyStorage();
+        state.deinitCandidates();
+    }
+    if (options.constraints) |constraints| {
+        state.constraint_membership = try NativeDocIdConstraintMembership.initAlloc(alloc, constraints);
     }
 
-    for (docs) |doc| {
-        if (!internal_keys.isPrimaryDocumentKey(doc.key)) continue;
-        const raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, doc.key)) orelse continue;
-        errdefer alloc.free(raw_key);
-        if (try collector.is_expired_key(collector.ctx, alloc, raw_key)) {
-            alloc.free(raw_key);
-            continue;
+    if (collector.scan_store_range_with_context) |scan| {
+        var current_lower = try alloc.dupe(u8, lower);
+        defer alloc.free(current_lower);
+        var current_upper = if (upper) |buf| try alloc.dupe(u8, buf) else try alloc.dupe(u8, "");
+        defer alloc.free(current_upper);
+        const batch_size = @max(options.scan_batch_size orelse default_match_all_primary_key_scan_batch_size, 1);
+
+        while (true) {
+            var batch = MatchAllPrimaryKeyScanBatch{
+                .alloc = alloc,
+                .req = req,
+                .max_keys = batch_size,
+                .reverse = options.primary_key_reverse,
+            };
+            errdefer batch.deinit();
+
+            try scan(collector.ctx, current_lower, current_upper, .{ .reverse = options.primary_key_reverse }, &batch, MatchAllPrimaryKeyScanBatch.scanEntry);
+            for (batch.raw_keys.items) |*raw_key| {
+                const owned = raw_key.*;
+                raw_key.* = @constCast(&[_]u8{});
+                try state.consumeRawKey(owned);
+                if (state.shouldStopAfterAccepted()) {
+                    state.stopped_early = true;
+                    break;
+                }
+            }
+
+            const maybe_next_lower = batch.next_lower;
+            batch.next_lower = null;
+            const maybe_next_upper = batch.next_upper;
+            batch.next_upper = null;
+            batch.deinit();
+            if (state.stopped_early) break;
+            if (options.primary_key_reverse) {
+                const next_upper = maybe_next_upper orelse break;
+                alloc.free(current_upper);
+                current_upper = next_upper;
+            } else {
+                const next_lower = maybe_next_lower orelse break;
+                alloc.free(current_lower);
+                current_lower = next_lower;
+            }
         }
-        if (seen.contains(raw_key)) {
-            alloc.free(raw_key);
-            continue;
+    } else {
+        const docs = try collector.scan_store_range(collector.ctx, alloc, lower, if (upper) |buf| buf else "");
+        defer docstore_mod.DocStore.freeResults(alloc, docs);
+        if (options.primary_key_reverse) {
+            var i = docs.len;
+            while (i > 0) {
+                i -= 1;
+                try state.consumeStoreKey(docs[i].key);
+                if (state.shouldStopAfterAccepted()) {
+                    state.stopped_early = true;
+                    break;
+                }
+            }
+        } else {
+            for (docs) |doc| {
+                try state.consumeStoreKey(doc.key);
+                if (state.shouldStopAfterAccepted()) {
+                    state.stopped_early = true;
+                    break;
+                }
+            }
         }
-        const ordinal = if (collector.lookup_doc_ordinal) |lookup|
-            try lookup(collector.ctx, alloc, raw_key, req.identity_read_generation)
+    }
+
+    return state;
+}
+
+const MatchAllPrimaryKeyScanBatch = struct {
+    alloc: Allocator,
+    req: types.SearchRequest,
+    max_keys: usize,
+    raw_keys: std.ArrayListUnmanaged([]u8) = .empty,
+    next_lower: ?[]u8 = null,
+    next_upper: ?[]u8 = null,
+    scanned: usize = 0,
+    reverse: bool = false,
+
+    fn deinit(self: *@This()) void {
+        for (self.raw_keys.items) |key| {
+            if (key.len > 0) self.alloc.free(key);
+        }
+        self.raw_keys.deinit(self.alloc);
+        if (self.next_lower) |next| self.alloc.free(next);
+        if (self.next_upper) |next| self.alloc.free(next);
+        self.* = undefined;
+    }
+
+    fn scanEntry(ctx: ?*anyopaque, key: []const u8, _: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+        const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        self.scanned += 1;
+        if (self.scanned % 1024 == 0) try checkSearchRequestDeadline(self.req);
+
+        if (!internal_keys.isPrimaryDocumentKey(key)) return .@"continue";
+        var raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(self.alloc, key)) orelse return .@"continue";
+        errdefer self.alloc.free(raw_key);
+
+        try self.raw_keys.append(self.alloc, raw_key);
+        raw_key = @constCast(&[_]u8{});
+
+        if (self.raw_keys.items.len >= self.max_keys) {
+            if (self.reverse) {
+                self.next_upper = try self.alloc.dupe(u8, key);
+            } else {
+                self.next_lower = try exclusiveStoreScanResumeLowerAlloc(self.alloc, key);
+            }
+            return .stop;
+        }
+        return .@"continue";
+    }
+};
+
+fn exclusiveStoreScanResumeLowerAlloc(alloc: Allocator, key: []const u8) ![]u8 {
+    const out = try alloc.alloc(u8, key.len + 1);
+    @memcpy(out[0..key.len], key);
+    out[key.len] = 0;
+    return out;
+}
+
+const MatchAllCandidateCollectState = struct {
+    alloc: Allocator,
+    req: types.SearchRequest,
+    collector: MatchAllCandidateCollector,
+    options: MatchAllCandidateCollectOptions,
+    candidates: std.ArrayListUnmanaged(MatchAllCandidate) = .empty,
+    seen: std.StringHashMapUnmanaged(void) = .{},
+    seen_key_storage: std.ArrayListUnmanaged([]u8) = .empty,
+    constraint_membership: NativeDocIdConstraintMembership = .{},
+    consumer_ctx: ?*anyopaque = null,
+    consumer: ?MatchAllCandidateConsumer = null,
+    processed: usize = 0,
+    accepted_count: usize = 0,
+    stopped_early: bool = false,
+
+    fn deinitCandidates(self: *@This()) void {
+        for (self.candidates.items) |*item| item.deinit(self.alloc);
+        self.candidates.deinit(self.alloc);
+    }
+
+    fn deinitSeenKeyStorage(self: *@This()) void {
+        for (self.seen_key_storage.items) |key| self.alloc.free(key);
+        self.seen_key_storage.deinit(self.alloc);
+    }
+
+    fn shouldStopAfterAccepted(self: *const @This()) bool {
+        const limit = self.options.stop_after_accepted orelse return false;
+        return self.accepted_count >= limit;
+    }
+
+    fn consumeStoreKey(self: *@This(), store_key: []const u8) !void {
+        self.processed += 1;
+        if (self.processed % 1024 == 0) try checkSearchRequestDeadline(self.req);
+
+        if (!internal_keys.isPrimaryDocumentKey(store_key)) return;
+        var raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(self.alloc, store_key)) orelse return;
+        errdefer self.alloc.free(raw_key);
+
+        const owned = raw_key;
+        raw_key = @constCast(&[_]u8{});
+        try self.consumeRawKey(owned);
+    }
+
+    fn consumeRawKey(self: *@This(), raw_key_owned: []u8) !void {
+        var raw_key = raw_key_owned;
+        errdefer self.alloc.free(raw_key);
+
+        if (try self.collector.is_expired_key(self.collector.ctx, self.alloc, raw_key)) {
+            self.alloc.free(raw_key);
+            return;
+        }
+
+        if (self.seen.contains(raw_key)) {
+            self.alloc.free(raw_key);
+            return;
+        }
+
+        const ordinal = if (self.collector.lookup_doc_ordinal) |lookup|
+            try lookup(self.collector.ctx, self.alloc, raw_key, self.req.identity_read_generation)
         else
             null;
-        try seen.put(alloc, raw_key, {});
-        try candidates.append(alloc, .{
+
+        var candidate = MatchAllCandidate{
             .id = raw_key,
             .ordinal = ordinal,
-        });
-    }
+        };
+        raw_key = @constCast(&[_]u8{});
 
-    return .{ .items = try candidates.toOwnedSlice(alloc) };
-}
+        if (self.options.constraints) |constraints| {
+            if (!matchAllCandidateAllowedWithMembership(candidate, constraints, &self.constraint_membership)) {
+                candidate.deinit(self.alloc);
+                return;
+            }
+        }
+
+        if (self.options.candidate_limit) |limit| {
+            if (self.accepted_count >= limit) {
+                candidate.deinit(self.alloc);
+                return error.QueryCandidateBudgetExceeded;
+            }
+        }
+
+        errdefer candidate.deinit(self.alloc);
+        if (self.consumer) |consumer| {
+            const seen_key = try self.alloc.dupe(u8, candidate.id);
+            errdefer self.alloc.free(seen_key);
+            try self.seen.put(self.alloc, seen_key, {});
+            try self.seen_key_storage.append(self.alloc, seen_key);
+
+            try consumer(self.consumer_ctx, candidate);
+            candidate.id = @constCast(&[_]u8{});
+            self.accepted_count += 1;
+        } else {
+            try self.seen.put(self.alloc, candidate.id, {});
+            try self.candidates.append(self.alloc, candidate);
+            candidate.id = @constCast(&[_]u8{});
+            self.accepted_count += 1;
+        }
+    }
+};
 
 pub fn textQueryToSearchQuery(
     alloc: Allocator,
@@ -6110,6 +15851,146 @@ fn testDenseConstraintExecutor() DenseSearchExecutor {
     };
 }
 
+test "dense and sparse search reject unsupported exact sort page options" {
+    const alloc = std.testing.allocator;
+    const order_by = [_]types.SortField{
+        .{ .field = "created_at", .desc = true },
+        .{ .field = "_id" },
+    };
+    const dense_vector = [_]f32{1.0};
+    const sparse_indices = [_]u32{1};
+    const sparse_values = [_]f32{1.0};
+
+    recordSortRejectionDiagnostic("stale_field", "stale_reason", "stale_detail");
+    try std.testing.expectError(error.UnsupportedQueryRequest, searchDense(alloc, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 10,
+    }, .{
+        .vector = &dense_vector,
+        .k = 10,
+    }, testDenseConstraintExecutor()));
+    const dense_diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("created_at", dense_diagnostic.field);
+    try std.testing.expectEqualStrings("approximate_candidate_source", dense_diagnostic.reason);
+    try std.testing.expectEqualStrings("approximate_candidate_source", dense_diagnostic.detail);
+
+    const score_order = [_]types.SortField{.{ .field = "_score", .desc = true }};
+    recordSortRejectionDiagnostic("stale_field", "stale_reason", "stale_detail");
+    try std.testing.expectError(error.UnsupportedQueryRequest, searchDense(alloc, .{
+        .order_by = &score_order,
+        .include_stored = false,
+        .limit = 10,
+    }, .{
+        .vector = &dense_vector,
+        .k = 10,
+    }, testDenseConstraintExecutor()));
+    const score_diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("_score", score_diagnostic.field);
+    try std.testing.expectEqualStrings("approximate_candidate_source", score_diagnostic.reason);
+    try std.testing.expectEqualStrings("approximate_candidate_source", score_diagnostic.detail);
+
+    recordSortRejectionDiagnostic("stale_field", "stale_reason", "stale_detail");
+    try std.testing.expectError(error.UnsupportedQueryRequest, searchSparse(alloc, .{
+        .search_after = &.{.{ .integer = 1 }},
+        .include_stored = false,
+        .limit = 10,
+    }, .{
+        .indices = &sparse_indices,
+        .values = &sparse_values,
+        .k = 10,
+    }, undefined));
+    const sparse_diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", sparse_diagnostic.field);
+    try std.testing.expectEqualStrings("approximate_candidate_source", sparse_diagnostic.reason);
+    try std.testing.expectEqualStrings("approximate_candidate_source", sparse_diagnostic.detail);
+}
+
+test "dense projected source load rejects expired deadline before load" {
+    var profile = ProjectedSourceLoadProfile{};
+    try std.testing.expectError(error.Timeout, loadProjectedDenseDocumentWithProfile(std.testing.allocator, .{
+        .execution_deadline_ns = 0,
+    }, testDenseConstraintExecutor(), "doc:a", &profile));
+    try std.testing.expectEqual(@as(usize, 0), profile.requested_count);
+    try std.testing.expectEqual(@as(usize, 0), profile.loaded_count);
+    try std.testing.expectEqual(@as(usize, 0), profile.batch_count);
+}
+
+test "sparse score search fetches offset plus limit candidates" {
+    const alloc = std.testing.allocator;
+
+    var sparse_index = try sparse_mod.SparseIndex.open(alloc, "/tmp/antfly-search-exec-sparse-offset-test", .{ .backend = .mem });
+    defer sparse_index.close();
+    const writes = [_]sparse_mod.SparseWrite{
+        .{ .doc_id = "doc:a", .vec = .{ .indices = &.{1}, .values = &.{1.0} } },
+        .{ .doc_id = "doc:b", .vec = .{ .indices = &.{1}, .values = &.{0.9} } },
+        .{ .doc_id = "doc:c", .vec = .{ .indices = &.{1}, .values = &.{0.8} } },
+    };
+    try sparse_index.batch(&writes, &.{});
+
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var entry = index_manager_mod.IndexManager.SparseIndex{
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "sp", .kind = .sparse_vector, .config_json = "{}" },
+        .field_name = @constCast("sparse"),
+        .chunk_name = null,
+        .embedding_name = null,
+        .rebuild_root_path = @constCast(""),
+        .index = sparse_index,
+    };
+    defer entry.index = undefined;
+
+    const Harness = struct {
+        entry: *index_manager_mod.IndexManager.SparseIndex,
+
+        fn textIndexEntry(_: ?*anyopaque, _: ?[]const u8) anyerror!?*index_manager_mod.IndexManager.TextIndex {
+            return null;
+        }
+
+        fn sparseIndex(ctx: ?*anyopaque, _: ?[]const u8) anyerror!?*index_manager_mod.IndexManager.SparseIndex {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return self.entry;
+        }
+
+        fn loadProjectedDocument(_: ?*anyopaque, callback_alloc: Allocator, _: types.SearchRequest, key: []const u8) anyerror![]u8 {
+            try std.testing.expectEqualStrings("doc:b", key);
+            return try callback_alloc.dupe(u8, "{\"selected\":true}");
+        }
+
+        fn postprocess(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, raw: types.SearchResult, _: bool) anyerror!types.SearchResult {
+            return raw;
+        }
+    };
+    var harness = Harness{ .entry = &entry };
+    var result = try searchSparse(alloc, .{
+        .index_name = "sp",
+        .offset = 1,
+        .limit = 1,
+        .include_stored = true,
+        .profile = true,
+    }, .{
+        .indices = &.{1},
+        .values = &.{1.0},
+        .k = 1,
+    }, .{
+        .ctx = &harness,
+        .text_index_entry = Harness.textIndexEntry,
+        .sparse_index = Harness.sparseIndex,
+        .load_projected_document = Harness.loadProjectedDocument,
+        .postprocess = Harness.postprocess,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+    try std.testing.expect(result.hits[0].stored_data != null);
+    try std.testing.expectEqual(types.TotalHitsRelation.gte, result.total_hits_relation);
+    const profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("score_top_k", profile.plan);
+    try std.testing.expectEqualStrings("exact", profile.exactness);
+    try std.testing.expectEqual(@as(u64, 1), profile.projected_source_load_count);
+}
+
 test "native dense constraints derive safe doc-id filter and exclusion ids" {
     const alloc = std.testing.allocator;
     var constraints = try deriveNativeDenseConstraintsAlloc(alloc, .{
@@ -6209,35 +16090,177 @@ test "native sparse constraints preserve empty positive algebraic candidate sets
 const TestMatchAllCtx = struct {
     ids: []const []const u8,
     ordinals: []const ?doc_set.DocOrdinal = &.{},
+    collect_count: ?*usize = null,
+    stream_collect_count: ?*usize = null,
+    stream_accepted_count: ?*usize = null,
+    projected_load_count: ?*usize = null,
+    projected_batch_count: ?*usize = null,
+    projected_batch_doc_count: ?*usize = null,
 };
 
 fn testCollectMatchAllCandidatesCallback(
     ctx: ?*anyopaque,
     alloc: Allocator,
     _: types.SearchRequest,
+    options: MatchAllCandidateCollectOptions,
 ) anyerror!MatchAllCandidates {
     const test_ctx: *const TestMatchAllCtx = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-    var out = try alloc.alloc(MatchAllCandidate, test_ctx.ids.len);
+    if (test_ctx.collect_count) |counter| counter.* += 1;
+    var out = std.ArrayListUnmanaged(MatchAllCandidate).empty;
     var initialized: usize = 0;
     errdefer {
-        for (out[0..initialized]) |*candidate| candidate.deinit(alloc);
-        if (out.len > 0) alloc.free(out);
+        for (out.items[0..initialized]) |*candidate| candidate.deinit(alloc);
+        out.deinit(alloc);
     }
     for (test_ctx.ids, 0..) |id, i| {
         const ordinal = if (i < test_ctx.ordinals.len) test_ctx.ordinals[i] else null;
-        out[i] = .{ .id = try alloc.dupe(u8, id), .ordinal = ordinal };
+        var candidate = MatchAllCandidate{ .id = try alloc.dupe(u8, id), .ordinal = ordinal };
+        if (options.constraints) |constraints| {
+            if (!matchAllCandidateAllowed(candidate, constraints)) {
+                candidate.deinit(alloc);
+                continue;
+            }
+        }
+        if (options.candidate_limit) |limit| {
+            if (out.items.len >= limit) {
+                candidate.deinit(alloc);
+                return error.QueryCandidateBudgetExceeded;
+            }
+        }
+        try out.append(alloc, candidate);
+        candidate.id = @constCast(&[_]u8{});
         initialized += 1;
     }
-    return .{ .items = out };
+    return .{ .items = try out.toOwnedSlice(alloc) };
+}
+
+fn testStreamMatchAllCandidatesCallback(
+    ctx: ?*anyopaque,
+    alloc: Allocator,
+    req: types.SearchRequest,
+    options: MatchAllCandidateCollectOptions,
+    consumer_ctx: ?*anyopaque,
+    consumer: MatchAllCandidateConsumer,
+) anyerror!MatchAllCandidateStreamStats {
+    const test_ctx: *const TestMatchAllCtx = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+    if (test_ctx.stream_collect_count) |counter| counter.* += 1;
+    var accepted: usize = 0;
+    const Step = struct {
+        fn consume(
+            test_ctx_inner: *const TestMatchAllCtx,
+            alloc_inner: Allocator,
+            options_inner: MatchAllCandidateCollectOptions,
+            consumer_ctx_inner: ?*anyopaque,
+            consumer_inner: MatchAllCandidateConsumer,
+            accepted_inner: *usize,
+            id: []const u8,
+            i: usize,
+        ) !bool {
+            if (options_inner.primary_key_start_after) |start_after| {
+                if (std.mem.order(u8, id, start_after) != .gt) return false;
+            }
+            if (options_inner.primary_key_stop_before) |stop_before| {
+                if (std.mem.order(u8, id, stop_before) != .lt) return false;
+            }
+            const ordinal = if (i < test_ctx_inner.ordinals.len) test_ctx_inner.ordinals[i] else null;
+            var candidate = MatchAllCandidate{ .id = try alloc_inner.dupe(u8, id), .ordinal = ordinal };
+            errdefer candidate.deinit(alloc_inner);
+            if (options_inner.constraints) |constraints| {
+                if (!matchAllCandidateAllowed(candidate, constraints)) {
+                    candidate.deinit(alloc_inner);
+                    return false;
+                }
+            }
+            if (options_inner.candidate_limit) |limit| {
+                if (accepted_inner.* >= limit) return error.QueryCandidateBudgetExceeded;
+            }
+            try consumer_inner(consumer_ctx_inner, candidate);
+            candidate.id = @constCast(&[_]u8{});
+            accepted_inner.* += 1;
+            if (test_ctx_inner.stream_accepted_count) |counter| counter.* += 1;
+            return if (options_inner.stop_after_accepted) |limit| accepted_inner.* >= limit else false;
+        }
+    };
+
+    if (options.primary_key_reverse) {
+        var i = test_ctx.ids.len;
+        while (i > 0) {
+            i -= 1;
+            if (try Step.consume(test_ctx, alloc, options, consumer_ctx, consumer, &accepted, test_ctx.ids[i], i)) {
+                return .{ .accepted_count = accepted, .stopped_early = true };
+            }
+        }
+        _ = req;
+        return .{ .accepted_count = accepted, .stopped_early = false };
+    }
+
+    for (test_ctx.ids, 0..) |id, i| {
+        if (options.primary_key_start_after) |start_after| {
+            if (std.mem.order(u8, id, start_after) != .gt) continue;
+        }
+        if (options.primary_key_stop_before) |stop_before| {
+            if (std.mem.order(u8, id, stop_before) != .lt) break;
+        }
+        const ordinal = if (i < test_ctx.ordinals.len) test_ctx.ordinals[i] else null;
+        var candidate = MatchAllCandidate{ .id = try alloc.dupe(u8, id), .ordinal = ordinal };
+        errdefer candidate.deinit(alloc);
+        if (options.constraints) |constraints| {
+            if (!matchAllCandidateAllowed(candidate, constraints)) {
+                candidate.deinit(alloc);
+                continue;
+            }
+        }
+        if (options.candidate_limit) |limit| {
+            if (accepted >= limit) return error.QueryCandidateBudgetExceeded;
+        }
+        try consumer(consumer_ctx, candidate);
+        candidate.id = @constCast(&[_]u8{});
+        accepted += 1;
+        if (test_ctx.stream_accepted_count) |counter| counter.* += 1;
+        if (options.stop_after_accepted) |limit| {
+            if (accepted >= limit) return .{ .accepted_count = accepted, .stopped_early = true };
+        }
+    }
+    _ = req;
+    return .{ .accepted_count = accepted, .stopped_early = false };
 }
 
 fn testMatchAllLoadProjectedCallback(
-    _: ?*anyopaque,
-    _: Allocator,
+    ctx: ?*anyopaque,
+    alloc: Allocator,
     _: types.SearchRequest,
-    _: []const u8,
+    key: []const u8,
 ) anyerror![]u8 {
-    return error.UnexpectedTestCall;
+    const test_ctx: *const TestMatchAllCtx = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+    const counter = test_ctx.projected_load_count orelse return error.UnexpectedTestCall;
+    counter.* += 1;
+    return try std.fmt.allocPrint(alloc, "{{\"id\":\"{s}\"}}", .{key});
+}
+
+fn testMatchAllLoadProjectedManyCallback(
+    ctx: ?*anyopaque,
+    alloc: Allocator,
+    req: types.SearchRequest,
+    keys: []const []const u8,
+) anyerror![]?[]u8 {
+    const test_ctx: *const TestMatchAllCtx = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+    const batch_counter = test_ctx.projected_batch_count orelse return error.UnexpectedTestCall;
+    const doc_counter = test_ctx.projected_batch_doc_count orelse return error.UnexpectedTestCall;
+    batch_counter.* += 1;
+    doc_counter.* += keys.len;
+
+    const out = try alloc.alloc(?[]u8, keys.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |value| if (value) |bytes| alloc.free(bytes);
+        alloc.free(out);
+    }
+    _ = req;
+    for (keys, 0..) |key, i| {
+        out[i] = try std.fmt.allocPrint(alloc, "{{\"id\":\"{s}\"}}", .{key});
+        initialized += 1;
+    }
+    return out;
 }
 
 fn testMatchAllLoadStoredCallback(
@@ -6246,27 +16269,7265 @@ fn testMatchAllLoadStoredCallback(
     key: []const u8,
 ) anyerror!?[]u8 {
     const json = if (std.mem.eql(u8, key, "doc:a"))
-        "{\"tier\":\"gold\"}"
+        "{\"tier\":\"gold\",\"rank\":2,\"nested\":{\"created_at\":\"2026-01-02\"}}"
     else if (std.mem.eql(u8, key, "doc:b"))
-        "{\"tier\":\"silver\"}"
+        "{\"tier\":\"silver\",\"rank\":1,\"nested\":{\"created_at\":\"2026-01-01\"}}"
     else if (std.mem.eql(u8, key, "doc:c"))
-        "{\"tier\":\"gold\"}"
+        "{\"tier\":\"gold\",\"rank\":1,\"nested\":{\"created_at\":\"2026-01-03\"}}"
     else
         return null;
     return try alloc.dupe(u8, json);
+}
+
+fn testUnexpectedLoadStoredCallback(
+    _: ?*anyopaque,
+    _: Allocator,
+    _: []const u8,
+) anyerror!?[]u8 {
+    return error.UnexpectedTestCall;
+}
+
+test "sort uses native text doc values without stored json fallback" {
+    const alloc = std.testing.allocator;
+
+    var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .f64_val, 1024);
+    defer dv_writer.deinit();
+    try dv_writer.add(0, .{ .f64_val = 30.0 });
+    try dv_writer.add(1, .{ .f64_val = 10.0 });
+    try dv_writer.add(2, .{ .f64_val = 20.0 });
+    const dv_data = try dv_writer.build();
+    defer alloc.free(dv_data);
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    const price_idx = try seg_writer.addField("price");
+    try seg_writer.addSection(price_idx, .typed_doc_values, dv_data);
+    try seg_writer.addStoredDoc("doc:a", "{\"price\":30}");
+    try seg_writer.addStoredDoc("doc:b", "{\"price\":10}");
+    try seg_writer.addStoredDoc("doc:c", "{\"price\":20}");
+    const seg_bytes = try seg_writer.build();
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+    const snapshot = writer.snapshot();
+    const native_sort_ctx = TextDocValueSortContext{ .snapshot = snapshot };
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "price",
+        .path_match = "price",
+        .mapping = .{
+            .field_type = .numeric,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+
+    var hits = try alloc.alloc(types.SearchHit, 3);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .native_text_doc_id = 0, .score = 1.0 };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:b"), .native_text_doc_id = 1, .score = 1.0 };
+    hits[2] = .{ .id = try alloc.dupe(u8, "doc:c"), .native_text_doc_id = 2, .score = 1.0 };
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 3,
+        .graph_results = &.{},
+    };
+    defer result.deinit();
+
+    const order_by = [_]types.SortField{
+        .{ .field = "price", .desc = false },
+        .{ .field = "_id", .desc = false },
+    };
+    try sortAndPageSearchResultInPlace(&result, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 2,
+    }, null, testUnexpectedLoadStoredCallback, .{
+        .kind = .native_doc_values_top_n,
+        .require_native = false,
+        .runtime_schema = schema,
+    }, .{
+        .ctx = @constCast(&native_sort_ctx),
+        .load = loadTextDocValueSortValue,
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+    try std.testing.expectEqualStrings("doc:c", result.hits[1].id);
+    try std.testing.expectApproxEqAbs(@as(f64, 10.0), result.hits[0].sort_values[0].float, 0.001);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].sort_values[1].string);
+}
+
+test "in-place exact sort enforces candidate budget before stored json loads" {
+    const alloc = std.testing.allocator;
+
+    const Harness = struct {
+        load_count: usize = 0,
+
+        fn loadStored(ctx: ?*anyopaque, load_alloc: Allocator, key: []const u8) anyerror!?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.load_count += 1;
+            return try std.fmt.allocPrint(load_alloc, "{{\"rank\":1,\"id\":\"{s}\"}}", .{key});
+        }
+    };
+
+    var harness = Harness{};
+    var hits = try alloc.alloc(types.SearchHit, 3);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .score = 1.0 };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:b"), .score = 1.0 };
+    hits[2] = .{ .id = try alloc.dupe(u8, "doc:c"), .score = 1.0 };
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 3,
+        .graph_results = &.{},
+    };
+    defer result.deinit();
+
+    const c = struct {
+        extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    const budget_env = "ANTFLY_TEXT_LATE_VISIBILITY_EXACT_CANDIDATE_BUDGET";
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(budget_env, "2", 1));
+    defer _ = c.unsetenv(budget_env);
+
+    const order_by = [_]types.SortField{.{ .field = "rank" }};
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, sortAndPageSearchResultInPlace(
+        &result,
+        .{
+            .index_name = "ft",
+            .order_by = &order_by,
+            .include_stored = false,
+            .limit = 2,
+        },
+        &harness,
+        Harness.loadStored,
+        .{ .kind = .stored_json_debug },
+        null,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), harness.load_count);
+    try std.testing.expectEqual(@as(usize, 3), result.hits.len);
+    const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("ft", diagnostic.field);
+    try std.testing.expectEqualStrings("candidate_budget_exceeded", diagnostic.reason);
+    try std.testing.expectEqualStrings("match_all_exact_candidate_window", diagnostic.detail);
+}
+
+test "schema keyword doc values back native sort planner" {
+    const alloc = std.testing.allocator;
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+    const templates = [_]runtime_schema_mod.DynamicTemplate{
+        .{
+            .name = "tenant",
+            .path_match = "tenant",
+            .mapping = .{
+                .field_type = .keyword,
+                .doc_values = true,
+                .sortable = true,
+                .analyzer = "keyword",
+            },
+        },
+    };
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+
+    const segment = (try mapper_mod.buildTextSegmentFromDocuments(alloc, &.{
+        .{ .key = "doc:acme", .value = "{\"tenant\":\"acme\"}" },
+        .{ .key = "doc:beta", .value = "{\"tenant\":\"beta\"}" },
+    }, text_analysis, schema)).?;
+    defer alloc.free(segment);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(segment);
+    const snapshot = writer.snapshot();
+    const native_sort_ctx = TextDocValueSortContext{ .snapshot = snapshot };
+
+    var hits = try alloc.alloc(types.SearchHit, 2);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:beta"), .native_text_doc_id = 1, .score = 1.0 };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:acme"), .native_text_doc_id = 0, .score = 1.0 };
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 2,
+        .graph_results = &.{},
+    };
+    defer result.deinit();
+
+    const order_by = [_]types.SortField{
+        .{ .field = "tenant", .desc = false },
+        .{ .field = "_id", .desc = false },
+    };
+    try sortAndPageSearchResultInPlace(&result, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 2,
+    }, null, testUnexpectedLoadStoredCallback, .{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .runtime_schema = schema,
+    }, .{
+        .ctx = @constCast(&native_sort_ctx),
+        .load = loadTextDocValueSortValue,
+        .require_native = true,
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqualStrings("doc:acme", result.hits[0].id);
+    try std.testing.expectEqualStrings("acme", result.hits[0].sort_values[0].string);
+    try std.testing.expectEqualStrings("doc:acme", result.hits[0].sort_values[1].string);
+    try std.testing.expectEqualStrings("doc:beta", result.hits[1].id);
+}
+
+test "schema-derived keyword subfield backs native sort execution" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{
+        \\  "document_schemas": {
+        \\    "doc": {
+        \\      "schema": {
+        \\        "type": "object",
+        \\        "properties": {
+        \\          "title": {
+        \\            "type": "string",
+        \\            "x-antfly-field": {
+        \\              "type": "text",
+        \\              "fields": {
+        \\                "keyword": {"type":"keyword","sortable":true}
+        \\              }
+        \\            }
+        \\          }
+        \\        }
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema_mod.freeSchema(alloc, schema);
+
+    const segment = (try mapper_mod.buildTextSegmentFromDocuments(alloc, &.{
+        .{ .key = "doc:beta", .value = "{\"title\":\"Beta Phone\"}" },
+        .{ .key = "doc:acme", .value = "{\"title\":\"Acme Phone\"}" },
+    }, .{}, schema)).?;
+    defer alloc.free(segment);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(segment);
+    const snapshot = writer.snapshot();
+    const native_sort_ctx = TextDocValueSortContext{ .snapshot = snapshot };
+
+    const order_by = [_]types.SortField{
+        .{ .field = "title.keyword", .desc = false },
+        .{ .field = "_id", .desc = false },
+    };
+    try validateTextNativeSortFields(.{
+        .order_by = &order_by,
+        .limit = 2,
+    }, snapshot, schema);
+
+    var hits = try alloc.alloc(types.SearchHit, 2);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:beta"), .native_text_doc_id = 0, .score = 1.0 };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:acme"), .native_text_doc_id = 1, .score = 1.0 };
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 2,
+        .graph_results = &.{},
+    };
+    defer result.deinit();
+
+    try sortAndPageSearchResultInPlace(&result, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 2,
+    }, null, testUnexpectedLoadStoredCallback, .{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .runtime_schema = schema,
+    }, .{
+        .ctx = @constCast(&native_sort_ctx),
+        .load = loadTextDocValueSortValue,
+        .require_native = true,
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqualStrings("doc:acme", result.hits[0].id);
+    try std.testing.expectEqualStrings("Acme Phone", result.hits[0].sort_values[0].string);
+    try std.testing.expectEqualStrings("doc:acme", result.hits[0].sort_values[1].string);
+    try std.testing.expectEqualStrings("doc:beta", result.hits[1].id);
+    try std.testing.expectEqualStrings("Beta Phone", result.hits[1].sort_values[0].string);
+
+    const profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", profile.plan);
+    try std.testing.expectEqualStrings("doc_values_collector", profile.source);
+    try std.testing.expectEqualStrings("exact", profile.exactness);
+    try std.testing.expectEqual(@as(u64, 2), profile.native_doc_value_hit_count);
+    try std.testing.expectEqual(@as(u64, 0), profile.native_doc_value_miss_count);
+    try std.testing.expectEqual(@as(u64, 0), profile.stored_json_load_count);
+
+    const after_cursor = [_]std.json.Value{
+        .{ .string = "Acme Phone" },
+        .{ .string = "doc:acme" },
+    };
+    var after_hits = try alloc.alloc(types.SearchHit, 2);
+    after_hits[0] = .{ .id = try alloc.dupe(u8, "doc:beta"), .native_text_doc_id = 0, .score = 1.0 };
+    after_hits[1] = .{ .id = try alloc.dupe(u8, "doc:acme"), .native_text_doc_id = 1, .score = 1.0 };
+    var after_result = types.SearchResult{
+        .alloc = alloc,
+        .hits = after_hits,
+        .total_hits = 2,
+        .graph_results = &.{},
+    };
+    defer after_result.deinit();
+
+    try sortAndPageSearchResultInPlace(&after_result, .{
+        .order_by = &order_by,
+        .search_after = &after_cursor,
+        .include_stored = false,
+        .profile = true,
+        .limit = 1,
+    }, null, testUnexpectedLoadStoredCallback, .{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .runtime_schema = schema,
+    }, .{
+        .ctx = @constCast(&native_sort_ctx),
+        .load = loadTextDocValueSortValue,
+        .require_native = true,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), after_result.hits.len);
+    try std.testing.expectEqualStrings("doc:beta", after_result.hits[0].id);
+    try std.testing.expectEqualStrings("Beta Phone", after_result.hits[0].sort_values[0].string);
+    const after_profile = after_result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", after_profile.plan);
+    try std.testing.expectEqual(@as(u64, 1), after_profile.cursor_rejected_count);
+    try std.testing.expectEqual(@as(u64, 0), after_profile.stored_json_load_count);
+
+    const before_cursor = [_]std.json.Value{
+        .{ .string = "Beta Phone" },
+        .{ .string = "doc:beta" },
+    };
+    var before_hits = try alloc.alloc(types.SearchHit, 2);
+    before_hits[0] = .{ .id = try alloc.dupe(u8, "doc:beta"), .native_text_doc_id = 0, .score = 1.0 };
+    before_hits[1] = .{ .id = try alloc.dupe(u8, "doc:acme"), .native_text_doc_id = 1, .score = 1.0 };
+    var before_result = types.SearchResult{
+        .alloc = alloc,
+        .hits = before_hits,
+        .total_hits = 2,
+        .graph_results = &.{},
+    };
+    defer before_result.deinit();
+
+    try sortAndPageSearchResultInPlace(&before_result, .{
+        .order_by = &order_by,
+        .search_before = &before_cursor,
+        .include_stored = false,
+        .profile = true,
+        .limit = 1,
+    }, null, testUnexpectedLoadStoredCallback, .{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .runtime_schema = schema,
+    }, .{
+        .ctx = @constCast(&native_sort_ctx),
+        .load = loadTextDocValueSortValue,
+        .require_native = true,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), before_result.hits.len);
+    try std.testing.expectEqualStrings("doc:acme", before_result.hits[0].id);
+    try std.testing.expectEqualStrings("Acme Phone", before_result.hits[0].sort_values[0].string);
+    const before_profile = before_result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", before_profile.plan);
+    try std.testing.expectEqual(@as(u64, 1), before_profile.cursor_rejected_count);
+    try std.testing.expectEqual(@as(u64, 0), before_profile.stored_json_load_count);
+}
+
+test "schema link doc values back native sort planner" {
+    const alloc = std.testing.allocator;
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+    const templates = [_]runtime_schema_mod.DynamicTemplate{
+        .{
+            .name = "related_to",
+            .path_match = "related_to",
+            .mapping = .{
+                .field_type = .link,
+                .doc_values = true,
+                .sortable = true,
+                .analyzer = "keyword",
+            },
+        },
+    };
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+
+    const segment = (try mapper_mod.buildTextSegmentFromDocuments(alloc, &.{
+        .{ .key = "doc:late", .value = "{\"related_to\":\"doc:z\"}" },
+        .{ .key = "doc:early", .value = "{\"related_to\":\"doc:a\"}" },
+    }, text_analysis, schema)).?;
+    defer alloc.free(segment);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(segment);
+    const snapshot = writer.snapshot();
+    const native_sort_ctx = TextDocValueSortContext{ .snapshot = snapshot };
+
+    var hits = try alloc.alloc(types.SearchHit, 2);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:late"), .native_text_doc_id = 0, .score = 1.0 };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:early"), .native_text_doc_id = 1, .score = 1.0 };
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 2,
+        .graph_results = &.{},
+    };
+    defer result.deinit();
+
+    const order_by = [_]types.SortField{
+        .{ .field = "related_to", .desc = false },
+        .{ .field = "_id", .desc = false },
+    };
+    try sortAndPageSearchResultInPlace(&result, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 2,
+    }, null, testUnexpectedLoadStoredCallback, .{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .runtime_schema = schema,
+    }, .{
+        .ctx = @constCast(&native_sort_ctx),
+        .load = loadTextDocValueSortValue,
+        .require_native = true,
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqualStrings("doc:early", result.hits[0].id);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].sort_values[0].string);
+    try std.testing.expectEqualStrings("doc:early", result.hits[0].sort_values[1].string);
+    try std.testing.expectEqualStrings("doc:late", result.hits[1].id);
+    try std.testing.expectEqualStrings("doc:z", result.hits[1].sort_values[0].string);
+
+    var cursor_hits = try alloc.alloc(types.SearchHit, 2);
+    cursor_hits[0] = .{ .id = try alloc.dupe(u8, "doc:late"), .native_text_doc_id = 0, .score = 1.0 };
+    cursor_hits[1] = .{ .id = try alloc.dupe(u8, "doc:early"), .native_text_doc_id = 1, .score = 1.0 };
+    var cursor_result = types.SearchResult{
+        .alloc = alloc,
+        .hits = cursor_hits,
+        .total_hits = 2,
+        .graph_results = &.{},
+    };
+    defer cursor_result.deinit();
+    const after_cursor = [_]std.json.Value{
+        .{ .string = "doc:a" },
+        .{ .string = "doc:early" },
+    };
+    try sortAndPageSearchResultInPlace(&cursor_result, .{
+        .order_by = &order_by,
+        .search_after = &after_cursor,
+        .include_stored = false,
+        .limit = 1,
+    }, null, testUnexpectedLoadStoredCallback, .{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .runtime_schema = schema,
+    }, .{
+        .ctx = @constCast(&native_sort_ctx),
+        .load = loadTextDocValueSortValue,
+        .require_native = true,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), cursor_result.hits.len);
+    try std.testing.expectEqualStrings("doc:late", cursor_result.hits[0].id);
+    try std.testing.expectEqualStrings("doc:z", cursor_result.hits[0].sort_values[0].string);
+}
+
+test "schema numeric u64 doc values back native sort planner without rounding" {
+    const alloc = std.testing.allocator;
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+    const templates = [_]runtime_schema_mod.DynamicTemplate{
+        .{
+            .name = "rank",
+            .path_match = "rank",
+            .mapping = .{
+                .field_type = .numeric,
+                .doc_values = true,
+                .sortable = true,
+                .analyzer = "keyword",
+            },
+        },
+    };
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+
+    const segment = (try mapper_mod.buildTextSegmentFromDocuments(alloc, &.{
+        .{ .key = "doc:huge_a", .value = "{\"rank\":9223372036854775808}" },
+        .{ .key = "doc:huge_b", .value = "{\"rank\":9223372036854775809}" },
+    }, text_analysis, schema)).?;
+    defer alloc.free(segment);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(segment);
+    const snapshot = writer.snapshot();
+    const native_sort_ctx = TextDocValueSortContext{ .snapshot = snapshot };
+
+    var hits = try alloc.alloc(types.SearchHit, 2);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:huge_b"), .native_text_doc_id = 1, .score = 1.0 };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:huge_a"), .native_text_doc_id = 0, .score = 1.0 };
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 2,
+        .graph_results = &.{},
+    };
+    defer result.deinit();
+
+    const order_by = [_]types.SortField{
+        .{ .field = "rank", .desc = false },
+        .{ .field = "_id", .desc = false },
+    };
+    try sortAndPageSearchResultInPlace(&result, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 2,
+    }, null, testUnexpectedLoadStoredCallback, .{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .runtime_schema = schema,
+    }, .{
+        .ctx = @constCast(&native_sort_ctx),
+        .load = loadTextDocValueSortValue,
+        .require_native = true,
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqualStrings("doc:huge_a", result.hits[0].id);
+    try std.testing.expectEqualStrings("9223372036854775808", result.hits[0].sort_values[0].number_string);
+    try std.testing.expectEqualStrings("doc:huge_b", result.hits[1].id);
+    try std.testing.expectEqualStrings("9223372036854775809", result.hits[1].sort_values[0].number_string);
+
+    var cursor_hits = try alloc.alloc(types.SearchHit, 2);
+    cursor_hits[0] = .{ .id = try alloc.dupe(u8, "doc:huge_b"), .native_text_doc_id = 1, .score = 1.0 };
+    cursor_hits[1] = .{ .id = try alloc.dupe(u8, "doc:huge_a"), .native_text_doc_id = 0, .score = 1.0 };
+    var cursor_result = types.SearchResult{
+        .alloc = alloc,
+        .hits = cursor_hits,
+        .total_hits = 2,
+        .graph_results = &.{},
+    };
+    defer cursor_result.deinit();
+    const after_cursor = [_]std.json.Value{
+        .{ .number_string = "9223372036854775808" },
+        .{ .string = "doc:huge_a" },
+    };
+    try sortAndPageSearchResultInPlace(&cursor_result, .{
+        .order_by = &order_by,
+        .search_after = &after_cursor,
+        .include_stored = false,
+        .limit = 1,
+    }, null, testUnexpectedLoadStoredCallback, .{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .runtime_schema = schema,
+    }, .{
+        .ctx = @constCast(&native_sort_ctx),
+        .load = loadTextDocValueSortValue,
+        .require_native = true,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), cursor_result.hits.len);
+    try std.testing.expectEqualStrings("doc:huge_b", cursor_result.hits[0].id);
+    try std.testing.expectEqualStrings("9223372036854775809", cursor_result.hits[0].sort_values[0].number_string);
+}
+
+test "schema numeric i64 doc values back native sort planner" {
+    const alloc = std.testing.allocator;
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+    const templates = [_]runtime_schema_mod.DynamicTemplate{
+        .{
+            .name = "rank",
+            .path_match = "rank",
+            .mapping = .{
+                .field_type = .numeric,
+                .doc_values = true,
+                .sortable = true,
+                .analyzer = "keyword",
+            },
+        },
+    };
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+
+    const segment = (try mapper_mod.buildTextSegmentFromDocuments(alloc, &.{
+        .{ .key = "doc:negative", .value = "{\"rank\":-9007199254740993}" },
+        .{ .key = "doc:positive", .value = "{\"rank\":42}" },
+    }, text_analysis, schema)).?;
+    defer alloc.free(segment);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(segment);
+    const snapshot = writer.snapshot();
+    const native_sort_ctx = TextDocValueSortContext{ .snapshot = snapshot };
+
+    var hits = try alloc.alloc(types.SearchHit, 2);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:positive"), .native_text_doc_id = 1, .score = 1.0 };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:negative"), .native_text_doc_id = 0, .score = 1.0 };
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 2,
+        .graph_results = &.{},
+    };
+    defer result.deinit();
+
+    const order_by = [_]types.SortField{
+        .{ .field = "rank", .desc = false },
+        .{ .field = "_id", .desc = false },
+    };
+    try sortAndPageSearchResultInPlace(&result, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 2,
+    }, null, testUnexpectedLoadStoredCallback, .{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .runtime_schema = schema,
+    }, .{
+        .ctx = @constCast(&native_sort_ctx),
+        .load = loadTextDocValueSortValue,
+        .require_native = true,
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqualStrings("doc:negative", result.hits[0].id);
+    try std.testing.expectEqual(@as(i64, -9007199254740993), result.hits[0].sort_values[0].integer);
+    try std.testing.expectEqualStrings("doc:positive", result.hits[1].id);
+    try std.testing.expectEqual(@as(i64, 42), result.hits[1].sort_values[0].integer);
+
+    var cursor_hits = try alloc.alloc(types.SearchHit, 2);
+    cursor_hits[0] = .{ .id = try alloc.dupe(u8, "doc:positive"), .native_text_doc_id = 1, .score = 1.0 };
+    cursor_hits[1] = .{ .id = try alloc.dupe(u8, "doc:negative"), .native_text_doc_id = 0, .score = 1.0 };
+    var cursor_result = types.SearchResult{
+        .alloc = alloc,
+        .hits = cursor_hits,
+        .total_hits = 2,
+        .graph_results = &.{},
+    };
+    defer cursor_result.deinit();
+    const after_cursor = [_]std.json.Value{
+        .{ .integer = -9007199254740993 },
+        .{ .string = "doc:negative" },
+    };
+    try sortAndPageSearchResultInPlace(&cursor_result, .{
+        .order_by = &order_by,
+        .search_after = &after_cursor,
+        .include_stored = false,
+        .limit = 1,
+    }, null, testUnexpectedLoadStoredCallback, .{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .runtime_schema = schema,
+    }, .{
+        .ctx = @constCast(&native_sort_ctx),
+        .load = loadTextDocValueSortValue,
+        .require_native = true,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), cursor_result.hits.len);
+    try std.testing.expectEqualStrings("doc:positive", cursor_result.hits[0].id);
+    try std.testing.expectEqual(@as(i64, 42), cursor_result.hits[0].sort_values[0].integer);
+}
+
+test "schema boolean doc values back native sort planner" {
+    const alloc = std.testing.allocator;
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+    const templates = [_]runtime_schema_mod.DynamicTemplate{
+        .{
+            .name = "published",
+            .path_match = "published",
+            .mapping = .{
+                .field_type = .boolean,
+                .doc_values = true,
+                .sortable = true,
+                .analyzer = "keyword",
+            },
+        },
+    };
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+
+    const segment = (try mapper_mod.buildTextSegmentFromDocuments(alloc, &.{
+        .{ .key = "doc:false", .value = "{\"published\":false}" },
+        .{ .key = "doc:true", .value = "{\"published\":true}" },
+    }, text_analysis, schema)).?;
+    defer alloc.free(segment);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(segment);
+    const snapshot = writer.snapshot();
+    const native_sort_ctx = TextDocValueSortContext{ .snapshot = snapshot };
+
+    var hits = try alloc.alloc(types.SearchHit, 2);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:true"), .native_text_doc_id = 1, .score = 1.0 };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:false"), .native_text_doc_id = 0, .score = 1.0 };
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 2,
+        .graph_results = &.{},
+    };
+    defer result.deinit();
+
+    const order_by = [_]types.SortField{
+        .{ .field = "published", .desc = false },
+        .{ .field = "_id", .desc = false },
+    };
+    try sortAndPageSearchResultInPlace(&result, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 2,
+    }, null, testUnexpectedLoadStoredCallback, .{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .runtime_schema = schema,
+    }, .{
+        .ctx = @constCast(&native_sort_ctx),
+        .load = loadTextDocValueSortValue,
+        .require_native = true,
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqualStrings("doc:false", result.hits[0].id);
+    try std.testing.expectEqual(false, result.hits[0].sort_values[0].bool);
+    try std.testing.expectEqualStrings("doc:false", result.hits[0].sort_values[1].string);
+    try std.testing.expectEqualStrings("doc:true", result.hits[1].id);
+    try std.testing.expectEqual(true, result.hits[1].sort_values[0].bool);
+
+    var cursor_hits = try alloc.alloc(types.SearchHit, 2);
+    cursor_hits[0] = .{ .id = try alloc.dupe(u8, "doc:true"), .native_text_doc_id = 1, .score = 1.0 };
+    cursor_hits[1] = .{ .id = try alloc.dupe(u8, "doc:false"), .native_text_doc_id = 0, .score = 1.0 };
+    var cursor_result = types.SearchResult{
+        .alloc = alloc,
+        .hits = cursor_hits,
+        .total_hits = 2,
+        .graph_results = &.{},
+    };
+    defer cursor_result.deinit();
+    const after_cursor = [_]std.json.Value{
+        .{ .bool = false },
+        .{ .string = "doc:false" },
+    };
+    try sortAndPageSearchResultInPlace(&cursor_result, .{
+        .order_by = &order_by,
+        .search_after = &after_cursor,
+        .include_stored = false,
+        .limit = 1,
+    }, null, testUnexpectedLoadStoredCallback, .{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .runtime_schema = schema,
+    }, .{
+        .ctx = @constCast(&native_sort_ctx),
+        .load = loadTextDocValueSortValue,
+        .require_native = true,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), cursor_result.hits.len);
+    try std.testing.expectEqualStrings("doc:true", cursor_result.hits[0].id);
+    try std.testing.expectEqual(true, cursor_result.hits[0].sort_values[0].bool);
+}
+
+test "sort resolves match_all doc ordinals to native text doc values" {
+    const alloc = std.testing.allocator;
+
+    var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .f64_val, 1024);
+    defer dv_writer.deinit();
+    try dv_writer.add(0, .{ .f64_val = 30.0 });
+    try dv_writer.add(1, .{ .f64_val = 10.0 });
+    try dv_writer.add(2, .{ .f64_val = 20.0 });
+    const dv_data = try dv_writer.build();
+    defer alloc.free(dv_data);
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    const price_idx = try seg_writer.addField("price");
+    try seg_writer.addSection(price_idx, .typed_doc_values, dv_data);
+    try seg_writer.addStoredDoc("doc:a", "{\"price\":30}");
+    try seg_writer.addStoredDoc("doc:b", "{\"price\":10}");
+    try seg_writer.addStoredDoc("doc:c", "{\"price\":20}");
+    try seg_writer.addDocOrdinals(&.{ 101, 102, 103 });
+    const seg_bytes = try seg_writer.build();
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+    const snapshot = writer.snapshot();
+
+    var ordinal_to_text_doc_id = std.AutoHashMapUnmanaged(doc_set.DocOrdinal, u32).empty;
+    defer ordinal_to_text_doc_id.deinit(alloc);
+    const candidates = [_]MatchAllCandidate{
+        .{ .id = @constCast("doc:a"), .ordinal = 101 },
+        .{ .id = @constCast("doc:b"), .ordinal = 102 },
+        .{ .id = @constCast("doc:c"), .ordinal = 103 },
+    };
+    try std.testing.expect(try buildOrdinalTextDocIdMapAlloc(alloc, snapshot, &candidates, &ordinal_to_text_doc_id));
+    const native_sort_ctx = TextDocValueSortContext{
+        .snapshot = snapshot,
+        .ordinal_to_text_doc_id = &ordinal_to_text_doc_id,
+    };
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "price",
+        .path_match = "price",
+        .mapping = .{
+            .field_type = .numeric,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+
+    var hits = try alloc.alloc(types.SearchHit, 3);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .doc_ordinal = 101, .score = 1.0 };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:b"), .doc_ordinal = 102, .score = 1.0 };
+    hits[2] = .{ .id = try alloc.dupe(u8, "doc:c"), .doc_ordinal = 103, .score = 1.0 };
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 3,
+        .graph_results = &.{},
+    };
+    defer result.deinit();
+
+    const order_by = [_]types.SortField{.{ .field = "price", .desc = false }};
+    try sortAndPageSearchResultInPlace(&result, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 3,
+    }, null, testUnexpectedLoadStoredCallback, .{
+        .kind = .native_doc_values_top_n,
+        .require_native = false,
+        .runtime_schema = schema,
+    }, .{
+        .ctx = @constCast(&native_sort_ctx),
+        .load = loadTextDocValueSortValue,
+    });
+
+    try std.testing.expectEqual(@as(usize, 3), result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+    try std.testing.expectEqualStrings("doc:c", result.hits[1].id);
+    try std.testing.expectEqualStrings("doc:a", result.hits[2].id);
+}
+
+test "native match_all ordinal map allows all-deleted covered snapshots" {
+    const alloc = std.testing.allocator;
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    try seg_writer.addStoredDoc("doc:deleted", "{\"price\":10}");
+    try seg_writer.addDocOrdinals(&.{101});
+    const seg_bytes = try seg_writer.build();
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+    try std.testing.expect(try writer.deleteById("doc:deleted"));
+    const snapshot = writer.snapshot();
+
+    var ordinal_to_text_doc_id = std.AutoHashMapUnmanaged(doc_set.DocOrdinal, u32).empty;
+    defer ordinal_to_text_doc_id.deinit(alloc);
+    try std.testing.expect(try buildAllOrdinalTextDocIdMapAlloc(alloc, snapshot, &ordinal_to_text_doc_id));
+    try std.testing.expectEqual(@as(usize, 0), ordinal_to_text_doc_id.count());
+}
+
+test "match_all native doc values sort streams candidates without exact candidate cap" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/native-sort-stream", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .f64_val, 1024);
+    defer dv_writer.deinit();
+    try dv_writer.add(0, .{ .f64_val = 40.0 });
+    try dv_writer.add(1, .{ .f64_val = 10.0 });
+    try dv_writer.add(2, .{ .f64_val = 30.0 });
+    try dv_writer.add(3, .{ .f64_val = 20.0 });
+    const dv_data = try dv_writer.build();
+    defer alloc.free(dv_data);
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    const price_idx = try seg_writer.addField("price");
+    try seg_writer.addSection(price_idx, .typed_doc_values, dv_data);
+    try seg_writer.addStoredDoc("doc:a", "{\"price\":40}");
+    try seg_writer.addStoredDoc("doc:b", "{\"price\":10}");
+    try seg_writer.addStoredDoc("doc:c", "{\"price\":30}");
+    try seg_writer.addStoredDoc("doc:d", "{\"price\":20}");
+    try seg_writer.addDocOrdinals(&.{ 101, 102, 103, 104 });
+    const seg_bytes = try seg_writer.build();
+    defer alloc.free(seg_bytes);
+
+    var persistent = try persistent_mod.PersistentIndex.open(alloc, .{
+        .path = path_z.ptr,
+        .main_backend = .lsm_memory,
+    });
+    var persistent_owned = true;
+    errdefer if (persistent_owned) persistent.close();
+    try persistent.writer.addSegment(seg_bytes);
+
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "price",
+        .path_match = "price",
+        .mapping = .{
+            .field_type = .numeric,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
+        .chunk_name = null,
+        .text_analysis = .{},
+        .runtime_schema = schema,
+        .rebuild_root_path = "",
+        .persistent = persistent,
+    };
+    persistent_owned = false;
+    defer text_entry.persistent.close();
+
+    const Harness = struct {
+        text_entry: *index_manager_mod.IndexManager.TextIndex,
+        collect_count: usize = 0,
+        stream_count: usize = 0,
+        expired_doc: ?[]const u8 = null,
+        expired_checks: usize = 0,
+        stream_accepted: usize = 0,
+
+        fn collectCandidates(
+            ctx: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: MatchAllCandidateCollectOptions,
+        ) anyerror!MatchAllCandidates {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.collect_count += 1;
+            return error.UnexpectedTestCall;
+        }
+
+        fn streamCandidates(
+            ctx: ?*anyopaque,
+            alloc_inner: Allocator,
+            _: types.SearchRequest,
+            options: MatchAllCandidateCollectOptions,
+            consumer_ctx: ?*anyopaque,
+            consumer: MatchAllCandidateConsumer,
+        ) anyerror!MatchAllCandidateStreamStats {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.stream_count += 1;
+            try std.testing.expect(options.candidate_limit == null);
+            const ids = [_][]const u8{ "doc:a", "doc:b", "doc:c", "doc:d" };
+            const ordinals = [_]doc_set.DocOrdinal{ 101, 102, 103, 104 };
+            var accepted: usize = 0;
+            for (ids, 0..) |id, i| {
+                var candidate = MatchAllCandidate{
+                    .id = try alloc_inner.dupe(u8, id),
+                    .ordinal = ordinals[i],
+                };
+                errdefer candidate.deinit(alloc_inner);
+                if (options.constraints) |constraints| {
+                    if (!matchAllCandidateAllowed(candidate, constraints)) {
+                        candidate.deinit(alloc_inner);
+                        continue;
+                    }
+                }
+                try consumer(consumer_ctx, candidate);
+                candidate.id = @constCast(&[_]u8{});
+                accepted += 1;
+            }
+            self.stream_accepted += accepted;
+            return .{ .accepted_count = accepted, .stopped_early = false };
+        }
+
+        fn textIndexEntry(
+            ctx: ?*anyopaque,
+            _: ?[]const u8,
+        ) anyerror!?*index_manager_mod.IndexManager.TextIndex {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return self.text_entry;
+        }
+
+        fn loadProjectedDocument(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: []const u8,
+        ) anyerror![]u8 {
+            return error.UnexpectedTestCall;
+        }
+
+        fn isExpiredKey(
+            ctx: ?*anyopaque,
+            _: Allocator,
+            key: []const u8,
+        ) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.expired_checks += 1;
+            const expired_doc = self.expired_doc orelse return false;
+            return std.mem.eql(u8, key, expired_doc);
+        }
+    };
+
+    var harness = Harness{ .text_entry = &text_entry };
+    const order_by = [_]types.SortField{.{ .field = "price" }};
+    var result = try searchMatchAll(alloc, .{
+        .index_name = "ft",
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 2,
+    }, .{
+        .ctx = &harness,
+        .collect_candidates = Harness.collectCandidates,
+        .collect_candidates_stream = Harness.streamCandidates,
+        .text_index_entry = Harness.textIndexEntry,
+        .load_projected_document = Harness.loadProjectedDocument,
+        .load_stored = testUnexpectedLoadStoredCallback,
+        .is_expired_key = Harness.isExpiredKey,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), harness.collect_count);
+    try std.testing.expectEqual(@as(usize, 1), harness.stream_count);
+    try std.testing.expectEqual(@as(usize, 4), harness.stream_accepted);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, result.total_hits_relation);
+    try std.testing.expectEqual(@as(u32, 4), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+    try std.testing.expectApproxEqAbs(@as(f64, 10.0), result.hits[0].sort_values[0].float, 0.001);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].sort_values[1].string);
+    try std.testing.expectEqualStrings("doc:d", result.hits[1].id);
+    try std.testing.expectApproxEqAbs(@as(f64, 20.0), result.hits[1].sort_values[0].float, 0.001);
+
+    const profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", profile.plan);
+    try std.testing.expectEqualStrings("doc_values_collector", profile.source);
+    try std.testing.expectEqualStrings("exact", profile.exactness);
+    try std.testing.expectEqual(@as(u64, 4), profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 2), profile.selected_count);
+    try std.testing.expectEqual(@as(u64, 4), profile.native_doc_value_hit_count);
+    try std.testing.expectEqual(@as(u64, 0), profile.stored_json_load_count);
+}
+
+test "match_all native doc values sort consumes selective ordinal candidates directly" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/native-sort-ordinal-candidates", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .f64_val, 1024);
+    defer dv_writer.deinit();
+    try dv_writer.add(0, .{ .f64_val = 40.0 });
+    try dv_writer.add(1, .{ .f64_val = 10.0 });
+    try dv_writer.add(2, .{ .f64_val = 30.0 });
+    try dv_writer.add(3, .{ .f64_val = 20.0 });
+    const dv_data = try dv_writer.build();
+    defer alloc.free(dv_data);
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    const price_idx = try seg_writer.addField("price");
+    try seg_writer.addSection(price_idx, .typed_doc_values, dv_data);
+    try seg_writer.addStoredDoc("doc:a", "{\"price\":40}");
+    try seg_writer.addStoredDoc("doc:b", "{\"price\":10}");
+    try seg_writer.addStoredDoc("doc:c", "{\"price\":30}");
+    try seg_writer.addStoredDoc("doc:d", "{\"price\":20}");
+    try seg_writer.addDocOrdinals(&.{ 101, 102, 103, 104 });
+    const seg_bytes = try seg_writer.build();
+    defer alloc.free(seg_bytes);
+
+    var persistent = try persistent_mod.PersistentIndex.open(alloc, .{
+        .path = path_z.ptr,
+        .main_backend = .lsm_memory,
+    });
+    var persistent_owned = true;
+    errdefer if (persistent_owned) persistent.close();
+    try persistent.writer.addSegment(seg_bytes);
+
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "price",
+        .path_match = "price",
+        .mapping = .{
+            .field_type = .numeric,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
+        .chunk_name = null,
+        .text_analysis = .{},
+        .runtime_schema = schema,
+        .rebuild_root_path = "",
+        .persistent = persistent,
+    };
+    persistent_owned = false;
+    defer text_entry.persistent.close();
+
+    const Harness = struct {
+        text_entry: *index_manager_mod.IndexManager.TextIndex,
+        collect_count: usize = 0,
+        stream_count: usize = 0,
+
+        fn collectCandidates(
+            ctx: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: MatchAllCandidateCollectOptions,
+        ) anyerror!MatchAllCandidates {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.collect_count += 1;
+            return error.UnexpectedTestCall;
+        }
+
+        fn streamCandidates(
+            ctx: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: MatchAllCandidateCollectOptions,
+            _: ?*anyopaque,
+            _: MatchAllCandidateConsumer,
+        ) anyerror!MatchAllCandidateStreamStats {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.stream_count += 1;
+            return error.UnexpectedTestCall;
+        }
+
+        fn textIndexEntry(
+            ctx: ?*anyopaque,
+            _: ?[]const u8,
+        ) anyerror!?*index_manager_mod.IndexManager.TextIndex {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return self.text_entry;
+        }
+
+        fn loadProjectedDocument(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: []const u8,
+        ) anyerror![]u8 {
+            return error.UnexpectedTestCall;
+        }
+
+        fn isExpiredKey(
+            ctx: ?*anyopaque,
+            _: Allocator,
+            key: []const u8,
+        ) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.expired_checks += 1;
+            const expired_doc = self.expired_doc orelse return false;
+            return std.mem.eql(u8, key, expired_doc);
+        }
+    };
+
+    var filter = doc_set.ResolvedDocFilter{
+        .include = try doc_set.fromOrdinalsAlloc(alloc, &.{ 101, 103, 104 }),
+        .exclude = try doc_set.fromOrdinalsAlloc(alloc, &.{103}),
+    };
+    defer filter.deinit(alloc);
+
+    var harness = Harness{ .text_entry = &text_entry };
+    const order_by = [_]types.SortField{.{ .field = "price" }};
+    var result = try searchMatchAll(alloc, .{
+        .index_name = "ft",
+        .resolved_doc_filter = &filter,
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 10,
+    }, .{
+        .ctx = &harness,
+        .collect_candidates = Harness.collectCandidates,
+        .collect_candidates_stream = Harness.streamCandidates,
+        .text_index_entry = Harness.textIndexEntry,
+        .load_projected_document = Harness.loadProjectedDocument,
+        .load_stored = testUnexpectedLoadStoredCallback,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), harness.collect_count);
+    try std.testing.expectEqual(@as(usize, 0), harness.stream_count);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, result.total_hits_relation);
+    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqualStrings("doc:d", result.hits[0].id);
+    try std.testing.expectApproxEqAbs(@as(f64, 20.0), result.hits[0].sort_values[0].float, 0.001);
+    try std.testing.expectEqualStrings("doc:a", result.hits[1].id);
+    try std.testing.expectApproxEqAbs(@as(f64, 40.0), result.hits[1].sort_values[0].float, 0.001);
+
+    const profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", profile.plan);
+    try std.testing.expectEqualStrings("doc_values_collector", profile.source);
+    try std.testing.expectEqual(@as(u64, 2), profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 2), profile.selected_count);
+    try std.testing.expectEqual(@as(u64, 2), profile.native_doc_value_hit_count);
+    try std.testing.expectEqual(@as(usize, 10), profile.window_capacity);
+    try std.testing.expectEqual(@as(usize, 2), profile.window_len);
+    try std.testing.expectEqual(@as(usize, 2), profile.collector_heap_peak);
+
+    const after_cursor = [_]std.json.Value{
+        .{ .float = 20.0 },
+        .{ .string = "doc:d" },
+    };
+    var after_page = try searchMatchAll(alloc, .{
+        .index_name = "ft",
+        .resolved_doc_filter = &filter,
+        .order_by = &order_by,
+        .search_after = &after_cursor,
+        .include_stored = false,
+        .profile = true,
+        .limit = 10,
+    }, .{
+        .ctx = &harness,
+        .collect_candidates = Harness.collectCandidates,
+        .collect_candidates_stream = Harness.streamCandidates,
+        .text_index_entry = Harness.textIndexEntry,
+        .load_projected_document = Harness.loadProjectedDocument,
+        .load_stored = testUnexpectedLoadStoredCallback,
+    });
+    defer after_page.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), harness.collect_count);
+    try std.testing.expectEqual(@as(usize, 0), harness.stream_count);
+    try std.testing.expectEqual(@as(u32, 2), after_page.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), after_page.hits.len);
+    try std.testing.expectEqualStrings("doc:a", after_page.hits[0].id);
+    const after_profile = after_page.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 2), after_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 1), after_profile.cursor_rejected_count);
+    try std.testing.expectEqual(@as(u64, 1), after_profile.selected_count);
+    try std.testing.expectEqual(@as(usize, 1), after_profile.window_len);
+
+    const before_cursor = [_]std.json.Value{
+        .{ .float = 40.0 },
+        .{ .string = "doc:a" },
+    };
+    var before_page = try searchMatchAll(alloc, .{
+        .index_name = "ft",
+        .resolved_doc_filter = &filter,
+        .order_by = &order_by,
+        .search_before = &before_cursor,
+        .include_stored = false,
+        .profile = true,
+        .limit = 10,
+    }, .{
+        .ctx = &harness,
+        .collect_candidates = Harness.collectCandidates,
+        .collect_candidates_stream = Harness.streamCandidates,
+        .text_index_entry = Harness.textIndexEntry,
+        .load_projected_document = Harness.loadProjectedDocument,
+        .load_stored = testUnexpectedLoadStoredCallback,
+    });
+    defer before_page.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), harness.collect_count);
+    try std.testing.expectEqual(@as(usize, 0), harness.stream_count);
+    try std.testing.expectEqual(@as(u32, 2), before_page.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), before_page.hits.len);
+    try std.testing.expectEqualStrings("doc:d", before_page.hits[0].id);
+    const before_profile = before_page.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 2), before_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 1), before_profile.cursor_rejected_count);
+    try std.testing.expectEqual(@as(u64, 1), before_profile.selected_count);
+    try std.testing.expectEqual(@as(usize, 1), before_profile.window_len);
+
+    const direct_filter_doc_ids = [_][]const u8{ "doc:a", "doc:d" };
+    const direct_exclude_doc_ids = [_][]const u8{"doc:d"};
+    var direct_id_page = try searchMatchAll(alloc, .{
+        .index_name = "ft",
+        .filter_doc_ids = &direct_filter_doc_ids,
+        .filter_doc_ids_positive = true,
+        .exclude_doc_ids = &direct_exclude_doc_ids,
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 10,
+    }, .{
+        .ctx = &harness,
+        .collect_candidates = Harness.collectCandidates,
+        .collect_candidates_stream = Harness.streamCandidates,
+        .text_index_entry = Harness.textIndexEntry,
+        .load_projected_document = Harness.loadProjectedDocument,
+        .load_stored = testUnexpectedLoadStoredCallback,
+    });
+    defer direct_id_page.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), harness.collect_count);
+    try std.testing.expectEqual(@as(usize, 0), harness.stream_count);
+    try std.testing.expectEqual(@as(u32, 1), direct_id_page.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), direct_id_page.hits.len);
+    try std.testing.expectEqualStrings("doc:a", direct_id_page.hits[0].id);
+    const direct_id_profile = direct_id_page.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", direct_id_profile.plan);
+    try std.testing.expectEqualStrings("native_filter", direct_id_profile.candidate_source);
+    try std.testing.expectEqualStrings("doc_nums", direct_id_profile.native_filter_mode);
+    try std.testing.expectEqual(@as(u64, 2), direct_id_profile.native_filter_candidate_count);
+    try std.testing.expectEqual(@as(u64, 1), direct_id_profile.native_filter_exclusion_count);
+    try std.testing.expectEqual(@as(u64, 1), direct_id_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 1), direct_id_profile.selected_count);
+    try std.testing.expectEqual(@as(u64, 1), direct_id_profile.native_doc_value_hit_count);
+
+    const exclude_doc_ids = [_][]const u8{"doc:d"};
+    var exclude_id_page = try searchMatchAll(alloc, .{
+        .index_name = "ft",
+        .resolved_doc_filter = &filter,
+        .exclude_doc_ids = &exclude_doc_ids,
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 10,
+    }, .{
+        .ctx = &harness,
+        .collect_candidates = Harness.collectCandidates,
+        .collect_candidates_stream = Harness.streamCandidates,
+        .text_index_entry = Harness.textIndexEntry,
+        .load_projected_document = Harness.loadProjectedDocument,
+        .load_stored = testUnexpectedLoadStoredCallback,
+    });
+    defer exclude_id_page.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), harness.collect_count);
+    try std.testing.expectEqual(@as(usize, 0), harness.stream_count);
+    try std.testing.expectEqual(@as(u32, 1), exclude_id_page.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), exclude_id_page.hits.len);
+    try std.testing.expectEqualStrings("doc:a", exclude_id_page.hits[0].id);
+    const exclude_id_profile = exclude_id_page.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", exclude_id_profile.plan);
+    try std.testing.expectEqualStrings("native_filter", exclude_id_profile.candidate_source);
+    try std.testing.expectEqualStrings("doc_nums", exclude_id_profile.native_filter_mode);
+    try std.testing.expectEqual(@as(u64, 3), exclude_id_profile.native_filter_candidate_count);
+    try std.testing.expectEqual(@as(u64, 2), exclude_id_profile.native_filter_exclusion_count);
+    try std.testing.expectEqual(@as(u64, 1), exclude_id_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 1), exclude_id_profile.selected_count);
+    try std.testing.expectEqual(@as(u64, 1), exclude_id_profile.native_doc_value_hit_count);
+
+    var exclude_id_zero_limit = try searchMatchAll(alloc, .{
+        .index_name = "ft",
+        .resolved_doc_filter = &filter,
+        .exclude_doc_ids = &exclude_doc_ids,
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 0,
+    }, .{
+        .ctx = &harness,
+        .collect_candidates = Harness.collectCandidates,
+        .collect_candidates_stream = Harness.streamCandidates,
+        .text_index_entry = Harness.textIndexEntry,
+        .load_projected_document = Harness.loadProjectedDocument,
+        .load_stored = testUnexpectedLoadStoredCallback,
+    });
+    defer exclude_id_zero_limit.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), harness.collect_count);
+    try std.testing.expectEqual(@as(usize, 0), harness.stream_count);
+    try std.testing.expectEqual(@as(u32, 1), exclude_id_zero_limit.total_hits);
+    try std.testing.expectEqual(@as(usize, 0), exclude_id_zero_limit.hits.len);
+    const zero_profile = exclude_id_zero_limit.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", zero_profile.plan);
+    try std.testing.expectEqual(@as(u64, 1), zero_profile.candidate_count);
+    try std.testing.expectEqual(@as(usize, 0), zero_profile.window_capacity);
+    try std.testing.expectEqual(@as(usize, 0), zero_profile.window_len);
+}
+
+test "required native sort does not fall back to stored json on doc value miss" {
+    const alloc = std.testing.allocator;
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    try seg_writer.addStoredDoc("doc:a", "{\"price\":30}");
+    const seg_bytes = try seg_writer.build();
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+    const snapshot = writer.snapshot();
+    const native_sort_ctx = TextDocValueSortContext{ .snapshot = snapshot };
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "price",
+        .path_match = "price",
+        .mapping = .{
+            .field_type = .numeric,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+
+    var hits = try alloc.alloc(types.SearchHit, 1);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .score = 1.0 };
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 1,
+        .graph_results = &.{},
+    };
+    defer result.deinit();
+
+    const order_by = [_]types.SortField{.{ .field = "price", .desc = false }};
+    try std.testing.expectError(error.UnsupportedExactSort, sortAndPageSearchResultInPlace(&result, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 1,
+    }, null, testUnexpectedLoadStoredCallback, .{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .runtime_schema = schema,
+    }, .{
+        .ctx = @constCast(&native_sort_ctx),
+        .require_native = true,
+        .load = loadTextDocValueSortValue,
+    }));
+}
+
+test "native doc values plan enforces native values even with non-requiring loader" {
+    const alloc = std.testing.allocator;
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    try seg_writer.addStoredDoc("doc:a", "{\"price\":30}");
+    const seg_bytes = try seg_writer.build();
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+    const snapshot = writer.snapshot();
+    const native_sort_ctx = TextDocValueSortContext{ .snapshot = snapshot };
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "price",
+        .path_match = "price",
+        .mapping = .{
+            .field_type = .numeric,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+
+    var hits = try alloc.alloc(types.SearchHit, 1);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .score = 1.0 };
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 1,
+        .graph_results = &.{},
+    };
+    defer result.deinit();
+
+    const order_by = [_]types.SortField{.{ .field = "price", .desc = false }};
+    try std.testing.expectError(error.UnsupportedExactSort, sortAndPageSearchResultInPlace(&result, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 1,
+    }, null, testUnexpectedLoadStoredCallback, .{
+        .kind = .native_doc_values_top_n,
+        .require_native = false,
+        .runtime_schema = schema,
+    }, .{
+        .ctx = @constCast(&native_sort_ctx),
+        .require_native = false,
+        .load = loadTextDocValueSortValue,
+    }));
+}
+
+test "native doc values plan rejects runtime value kind mismatch" {
+    const alloc = std.testing.allocator;
+
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "title",
+        .path_match = "title",
+        .mapping = .{
+            .field_type = .keyword,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+
+    var hits = try alloc.alloc(types.SearchHit, 1);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .score = 1.0 };
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 1,
+        .graph_results = &.{},
+    };
+    defer result.deinit();
+
+    const Loader = struct {
+        fn load(_: ?*anyopaque, _: Allocator, _: types.SearchHit, field: []const u8) anyerror!?SortValue {
+            try std.testing.expectEqualStrings("title", field);
+            return .{ .number = 42.0 };
+        }
+    };
+
+    const order_by = [_]types.SortField{.{ .field = "title", .desc = false }};
+    try std.testing.expectError(error.UnsupportedExactSort, sortAndPageSearchResultInPlace(&result, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 1,
+    }, null, testUnexpectedLoadStoredCallback, .{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .runtime_schema = schema,
+    }, .{
+        .require_native = true,
+        .load = Loader.load,
+    }));
+}
+
+test "required native sort fails on absent physical doc value section" {
+    const alloc = std.testing.allocator;
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    try seg_writer.addStoredDoc("doc:a", "{\"price\":30}");
+    const seg_bytes = try seg_writer.build();
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+    const snapshot = writer.snapshot();
+    const native_sort_ctx = TextDocValueSortContext{ .snapshot = snapshot };
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "price",
+        .path_match = "price",
+        .mapping = .{
+            .field_type = .numeric,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+
+    var hits = try alloc.alloc(types.SearchHit, 1);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .native_text_doc_id = 0, .score = 1.0 };
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 1,
+        .graph_results = &.{},
+    };
+    defer result.deinit();
+
+    const order_by = [_]types.SortField{.{ .field = "price", .desc = false }};
+    try std.testing.expectError(error.UnsupportedExactSort, sortAndPageSearchResultInPlace(&result, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 1,
+    }, null, testUnexpectedLoadStoredCallback, .{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .runtime_schema = schema,
+    }, .{
+        .ctx = @constCast(&native_sort_ctx),
+        .require_native = true,
+        .load = loadTextDocValueSortValue,
+    }));
+}
+
+test "required native sort fails on sparse doc value entry miss" {
+    const alloc = std.testing.allocator;
+
+    var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .f64_val, 1024);
+    defer dv_writer.deinit();
+    try dv_writer.add(0, .{ .f64_val = 30.0 });
+    const dv_data = try dv_writer.build();
+    defer alloc.free(dv_data);
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    const price_idx = try seg_writer.addField("price");
+    try seg_writer.addSection(price_idx, .typed_doc_values, dv_data);
+    try seg_writer.addStoredDoc("doc:a", "{\"price\":30}");
+    try seg_writer.addStoredDoc("doc:b", "{\"price\":20}");
+    const seg_bytes = try seg_writer.build();
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+    const snapshot = writer.snapshot();
+    const native_sort_ctx = TextDocValueSortContext{ .snapshot = snapshot };
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "price",
+        .path_match = "price",
+        .mapping = .{
+            .field_type = .numeric,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+
+    var hits = try alloc.alloc(types.SearchHit, 2);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .native_text_doc_id = 0, .score = 1.0 };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:b"), .native_text_doc_id = 1, .score = 1.0 };
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 2,
+        .graph_results = &.{},
+    };
+    defer result.deinit();
+
+    const order_by = [_]types.SortField{.{ .field = "price", .desc = false }};
+    try std.testing.expectError(error.UnsupportedExactSort, sortAndPageSearchResultInPlace(&result, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 2,
+    }, null, testUnexpectedLoadStoredCallback, .{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .runtime_schema = schema,
+    }, .{
+        .ctx = @constCast(&native_sort_ctx),
+        .require_native = true,
+        .load = loadTextDocValueSortValue,
+    }));
+}
+
+test "sort paging rejects count-only ordered requests" {
+    const alloc = std.testing.allocator;
+
+    var hits = try alloc.alloc(types.SearchHit, 1);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .score = 1.0 };
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 1,
+        .graph_results = &.{},
+    };
+    defer result.deinit();
+
+    const order_by = [_]types.SortField{.{ .field = "_id", .desc = false }};
+    try std.testing.expectError(error.UnsupportedQueryRequest, sortAndPageSearchResultInPlace(&result, .{
+        .order_by = &order_by,
+        .count_only = true,
+        .limit = 1,
+    }, null, testUnexpectedLoadStoredCallback, .{ .kind = .id_only }, null));
+}
+
+test "native text sort validation rejects fields without typed doc values" {
+    const alloc = std.testing.allocator;
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    try seg_writer.addStoredDoc("doc:a", "{\"title\":\"alpha\"}");
+    const seg_bytes = try seg_writer.build();
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+    const snapshot = writer.snapshot();
+
+    const invalid_order_by = [_]types.SortField{.{ .field = "title", .desc = false }};
+    try std.testing.expectError(error.UnsupportedExactSort, validateTextNativeSortFields(.{
+        .order_by = &invalid_order_by,
+        .limit = 10,
+    }, snapshot, null));
+
+    const id_order_by = [_]types.SortField{.{ .field = "_id", .desc = false }};
+    try validateTextNativeSortFields(.{
+        .order_by = &id_order_by,
+        .limit = 10,
+    }, snapshot, null);
+
+    const id_plan = try planTextNativeSortFields(.{
+        .order_by = &id_order_by,
+        .limit = 10,
+    }, snapshot, null);
+    try std.testing.expectEqual(SortExecutionPlanKind.id_only, id_plan.kind);
+    try std.testing.expect(!id_plan.require_native);
+    try std.testing.expectEqual(SortPlanExactness.exact, id_plan.exactness);
+    try std.testing.expectEqual(SortPlanSource.candidate_collector, id_plan.source);
+    try std.testing.expectEqual(SortPlanCursorSupport.comparator, id_plan.cursor_support);
+    try std.testing.expectEqual(SortPlanSourceLoad.projected_source_after_page, id_plan.source_load);
+    try std.testing.expectEqual(SortPlanDistributedBehavior.shard_local_only, id_plan.distributed_behavior);
+
+    const id_cursor = [_]std.json.Value{.{ .string = "doc:a" }};
+    try validateTextNativeSortFields(.{
+        .search_after = &id_cursor,
+        .limit = 10,
+    }, snapshot, null);
+    const cursor_only_plan = try planTextNativeSortFields(.{
+        .search_after = &id_cursor,
+        .limit = 10,
+    }, snapshot, null);
+    try std.testing.expectEqual(SortExecutionPlanKind.id_only, cursor_only_plan.kind);
+    try std.testing.expect(!cursor_only_plan.require_native);
+    try std.testing.expectEqual(SortPlanExactness.exact, cursor_only_plan.exactness);
+    try std.testing.expectEqual(SortPlanSource.candidate_collector, cursor_only_plan.source);
+    try std.testing.expectEqual(SortPlanCursorSupport.comparator, cursor_only_plan.cursor_support);
+    try std.testing.expectEqual(SortPlanSourceLoad.projected_source_after_page, cursor_only_plan.source_load);
+    try std.testing.expectEqual(SortPlanDistributedBehavior.shard_local_only, cursor_only_plan.distributed_behavior);
+
+    const bad_id_cursor = [_]std.json.Value{.{ .integer = 7 }};
+    try std.testing.expectError(error.InvalidQueryRequest, validateTextNativeSortFields(.{
+        .search_after = &bad_id_cursor,
+        .limit = 10,
+    }, snapshot, null));
+
+    const score_order_by = [_]types.SortField{.{ .field = "_score", .desc = true }};
+    try std.testing.expectError(error.UnsupportedQueryRequest, planTextNativeSortFields(.{
+        .order_by = &score_order_by,
+        .limit = 10,
+    }, snapshot, null));
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, planTextNativeSortFields(.{
+        .full_text = .{ .match_all = {} },
+        .order_by = &score_order_by,
+        .limit = 10,
+    }, snapshot, null));
+
+    const score_plan = try planTextNativeSortFields(.{
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .order_by = &score_order_by,
+        .limit = 10,
+    }, snapshot, null);
+    try std.testing.expectEqual(SortExecutionPlanKind.score_top_k, score_plan.kind);
+    try std.testing.expect(!score_plan.require_native);
+    try std.testing.expectEqual(SortPlanExactness.exact, score_plan.exactness);
+    try std.testing.expectEqual(SortPlanSource.candidate_collector, score_plan.source);
+    try std.testing.expectEqual(SortPlanCursorSupport.comparator, score_plan.cursor_support);
+    try std.testing.expectEqual(SortPlanSourceLoad.projected_source_after_page, score_plan.source_load);
+    try std.testing.expectEqual(SortPlanDistributedBehavior.shard_local_only, score_plan.distributed_behavior);
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, validateTextNativeSortFields(.{
+        .order_by = &id_order_by,
+        .count_only = true,
+        .limit = 10,
+    }, snapshot, null));
+}
+
+test "native text sort validation uses runtime sortable mappings" {
+    const alloc = std.testing.allocator;
+
+    var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .u64_val, 1024);
+    defer dv_writer.deinit();
+    try dv_writer.add(0, .{ .u64_val = 1 });
+    const dv_data = try dv_writer.build();
+    defer alloc.free(dv_data);
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    const created_idx = try seg_writer.addField("created_at");
+    try seg_writer.addSection(created_idx, .typed_doc_values, dv_data);
+    try seg_writer.addStoredDoc("doc:a", "{\"created_at\":\"1970-01-01T00:00:00.000000001Z\",\"title\":\"alpha\"}");
+    const seg_bytes = try seg_writer.build();
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+    const snapshot = writer.snapshot();
+
+    const templates = [_]runtime_schema_mod.DynamicTemplate{
+        .{
+            .name = "created_at",
+            .path_match = "created_at",
+            .mapping = .{
+                .field_type = .datetime,
+                .doc_values = true,
+                .sortable = true,
+                .analyzer = "keyword",
+            },
+        },
+        .{
+            .name = "title",
+            .path_match = "title",
+            .mapping = .{
+                .field_type = .keyword,
+                .doc_values = true,
+                .sortable = false,
+                .analyzer = "keyword",
+            },
+        },
+    };
+    const index_sort = [_]runtime_schema_mod.IndexSortField{
+        .{ .field = "created_at", .desc = true },
+        .{ .field = "_id", .desc = false },
+    };
+    const schema = runtime_schema_mod.TableSchema{
+        .dynamic_templates = &templates,
+        .index_sort = &index_sort,
+    };
+
+    const valid_order_by = [_]types.SortField{.{ .field = "created_at", .desc = true }};
+    try validateTextNativeSortFields(.{
+        .order_by = &valid_order_by,
+        .limit = 10,
+    }, snapshot, schema);
+    const native_plan = try planTextNativeSortFields(.{
+        .order_by = &valid_order_by,
+        .limit = 10,
+    }, snapshot, schema);
+    try std.testing.expectEqual(SortExecutionPlanKind.native_doc_values_top_n, native_plan.kind);
+    try std.testing.expect(native_plan.require_native);
+    try std.testing.expect(native_plan.index_sort_match);
+    try std.testing.expect(!native_plan.sorted_segment_executor_available);
+    try std.testing.expectEqualStrings("queryable", native_plan.sort_lifecycle_state);
+    try std.testing.expectEqualStrings("covered", native_plan.native_doc_values_coverage);
+    try std.testing.expectEqualStrings("missing_segment_index_sort", native_plan.index_sort_coverage);
+
+    const valid_cursor = [_]std.json.Value{
+        .{ .integer = 123 },
+        .{ .string = "doc:a" },
+    };
+    try validateTextNativeSortFields(.{
+        .order_by = &valid_order_by,
+        .search_after = &valid_cursor,
+        .limit = 10,
+    }, snapshot, schema);
+
+    const valid_date_cursor = [_]std.json.Value{
+        .{ .string = "2026-01-01T00:00:00Z" },
+        .{ .string = "doc:a" },
+    };
+    try validateTextNativeSortFields(.{
+        .order_by = &valid_order_by,
+        .search_after = &valid_date_cursor,
+        .limit = 10,
+    }, snapshot, schema);
+
+    const invalid_cursor = [_]std.json.Value{
+        .{ .string = "not-a-date" },
+        .{ .string = "doc:a" },
+    };
+    try std.testing.expectError(error.InvalidQueryRequest, validateTextNativeSortFields(.{
+        .order_by = &valid_order_by,
+        .search_after = &invalid_cursor,
+        .limit = 10,
+    }, snapshot, schema));
+
+    const null_cursor = [_]std.json.Value{
+        .null,
+        .{ .string = "doc:a" },
+    };
+    try std.testing.expectError(error.InvalidQueryRequest, validateTextNativeSortFields(.{
+        .order_by = &valid_order_by,
+        .search_after = &null_cursor,
+        .limit = 10,
+    }, snapshot, schema));
+
+    const invalid_order_by = [_]types.SortField{.{ .field = "title", .desc = false }};
+    try std.testing.expectError(error.UnsupportedExactSort, validateTextNativeSortFields(.{
+        .order_by = &invalid_order_by,
+        .limit = 10,
+    }, snapshot, schema));
+
+    const unknown_order_by = [_]types.SortField{.{ .field = "unknown", .desc = false }};
+    try std.testing.expectError(error.UnsupportedExactSort, validateTextNativeSortFields(.{
+        .order_by = &unknown_order_by,
+        .limit = 10,
+    }, snapshot, schema));
+}
+
+test "native text sort planner requires live segment index sort coverage for sorted executor" {
+    const alloc = std.testing.allocator;
+
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "created_at",
+        .path_match = "created_at",
+        .mapping = .{
+            .field_type = .datetime,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const index_sort = [_]runtime_schema_mod.IndexSortField{
+        .{ .field = "created_at", .desc = true },
+        .{ .field = "_id", .desc = false },
+    };
+    const schema = runtime_schema_mod.TableSchema{
+        .dynamic_templates = &templates,
+        .index_sort = &index_sort,
+    };
+    const order_by = [_]types.SortField{.{ .field = "created_at", .desc = true }};
+
+    var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .u64_val, 1024);
+    defer dv_writer.deinit();
+    try dv_writer.add(0, .{ .u64_val = 1 });
+    const dv_data = try dv_writer.build();
+    defer alloc.free(dv_data);
+
+    var sorted_seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer sorted_seg_writer.deinit();
+    const sorted_created_idx = try sorted_seg_writer.addField("created_at");
+    try sorted_seg_writer.addSection(sorted_created_idx, .typed_doc_values, dv_data);
+    try sorted_seg_writer.addStoredDoc("doc:a", "{\"created_at\":\"1970-01-01T00:00:00.000000001Z\"}");
+    try sorted_seg_writer.addIndexSortMetadata(&.{
+        .{ .field = "created_at", .desc = true },
+        .{ .field = "_id", .desc = false },
+    });
+    const sorted_seg = try sorted_seg_writer.build();
+    defer alloc.free(sorted_seg);
+
+    var sorted_writer = try index_mod.IndexWriter.init(alloc);
+    defer sorted_writer.deinit();
+    try sorted_writer.addSegment(sorted_seg);
+    const sorted_snapshot = sorted_writer.snapshot();
+
+    const sorted_plan = try planTextNativeSortFields(.{
+        .order_by = &order_by,
+        .limit = 10,
+    }, sorted_snapshot, schema);
+    try std.testing.expect(sorted_plan.index_sort_match);
+    try std.testing.expect(sorted_plan.sorted_segment_executor_available);
+    try std.testing.expect(!sorted_plan.sorted_segment_bounds_available);
+    try std.testing.expectEqualStrings("accelerated", sorted_plan.sort_lifecycle_state);
+    try std.testing.expectEqualStrings("covered", sorted_plan.native_doc_values_coverage);
+    try std.testing.expectEqualStrings("covered_without_bounds", sorted_plan.index_sort_coverage);
+
+    var bounded_seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer bounded_seg_writer.deinit();
+    const bounded_created_idx = try bounded_seg_writer.addField("created_at");
+    try bounded_seg_writer.addSection(bounded_created_idx, .typed_doc_values, dv_data);
+    try bounded_seg_writer.addStoredDoc("doc:a", "{\"created_at\":\"1970-01-01T00:00:00.000000001Z\"}");
+    var first_bounds = [_]segment_mod.SegmentIndexSortBoundValue{
+        .{ .u64_val = 1 },
+        .{ .id = "doc:a" },
+    };
+    var last_bounds = [_]segment_mod.SegmentIndexSortBoundValue{
+        .{ .u64_val = 1 },
+        .{ .id = "doc:a" },
+    };
+    try bounded_seg_writer.addIndexSortMetadataWithBounds(&.{
+        .{ .field = "created_at", .desc = true },
+        .{ .field = "_id", .desc = false },
+    }, .{
+        .first = first_bounds[0..],
+        .last = last_bounds[0..],
+    });
+    const bounded_seg = try bounded_seg_writer.build();
+    defer alloc.free(bounded_seg);
+
+    var bounded_writer = try index_mod.IndexWriter.init(alloc);
+    defer bounded_writer.deinit();
+    try bounded_writer.addSegment(bounded_seg);
+    const bounded_plan = try planTextNativeSortFields(.{
+        .order_by = &order_by,
+        .limit = 10,
+    }, bounded_writer.snapshot(), schema);
+    try std.testing.expect(bounded_plan.index_sort_match);
+    try std.testing.expect(bounded_plan.sorted_segment_executor_available);
+    try std.testing.expect(bounded_plan.sorted_segment_bounds_available);
+    try std.testing.expectEqualStrings("accelerated", bounded_plan.sort_lifecycle_state);
+    try std.testing.expectEqualStrings("covered_with_bounds", bounded_plan.index_sort_coverage);
+
+    var bad_bounds_seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer bad_bounds_seg_writer.deinit();
+    const bad_bounds_created_idx = try bad_bounds_seg_writer.addField("created_at");
+    try bad_bounds_seg_writer.addSection(bad_bounds_created_idx, .typed_doc_values, dv_data);
+    try bad_bounds_seg_writer.addStoredDoc("doc:a", "{\"created_at\":\"1970-01-01T00:00:00.000000001Z\"}");
+    var bad_first_bounds = [_]segment_mod.SegmentIndexSortBoundValue{
+        .{ .f64_val = 1.0 },
+        .{ .id = "doc:a" },
+    };
+    var bad_last_bounds = [_]segment_mod.SegmentIndexSortBoundValue{
+        .{ .f64_val = 1.0 },
+        .{ .id = "doc:a" },
+    };
+    try bad_bounds_seg_writer.addIndexSortMetadataWithBounds(&.{
+        .{ .field = "created_at", .desc = true },
+        .{ .field = "_id", .desc = false },
+    }, .{
+        .first = bad_first_bounds[0..],
+        .last = bad_last_bounds[0..],
+    });
+    const bad_bounds_seg = try bad_bounds_seg_writer.build();
+    defer alloc.free(bad_bounds_seg);
+
+    var bad_bounds_writer = try index_mod.IndexWriter.init(alloc);
+    defer bad_bounds_writer.deinit();
+    try bad_bounds_writer.addSegment(bad_bounds_seg);
+    const bad_bounds_plan = try planTextNativeSortFields(.{
+        .order_by = &order_by,
+        .limit = 10,
+    }, bad_bounds_writer.snapshot(), schema);
+    try std.testing.expect(bad_bounds_plan.index_sort_match);
+    try std.testing.expect(bad_bounds_plan.sorted_segment_executor_available);
+    try std.testing.expect(!bad_bounds_plan.sorted_segment_bounds_available);
+    try std.testing.expectEqualStrings("covered_without_bounds", bad_bounds_plan.index_sort_coverage);
+
+    var reversed_bounds_seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer reversed_bounds_seg_writer.deinit();
+    const reversed_bounds_created_idx = try reversed_bounds_seg_writer.addField("created_at");
+    var reversed_dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .u64_val, 1024);
+    defer reversed_dv_writer.deinit();
+    try reversed_dv_writer.add(0, .{ .u64_val = 2 });
+    try reversed_dv_writer.add(1, .{ .u64_val = 1 });
+    const reversed_dv_data = try reversed_dv_writer.build();
+    defer alloc.free(reversed_dv_data);
+    try reversed_bounds_seg_writer.addSection(reversed_bounds_created_idx, .typed_doc_values, reversed_dv_data);
+    try reversed_bounds_seg_writer.addStoredDoc("doc:a", "{\"created_at\":\"1970-01-01T00:00:00.000000002Z\"}");
+    try reversed_bounds_seg_writer.addStoredDoc("doc:b", "{\"created_at\":\"1970-01-01T00:00:00.000000001Z\"}");
+    var reversed_first_bounds = [_]segment_mod.SegmentIndexSortBoundValue{
+        .{ .u64_val = 1 },
+        .{ .id = "doc:b" },
+    };
+    var reversed_last_bounds = [_]segment_mod.SegmentIndexSortBoundValue{
+        .{ .u64_val = 2 },
+        .{ .id = "doc:a" },
+    };
+    try reversed_bounds_seg_writer.addIndexSortMetadataWithBounds(&.{
+        .{ .field = "created_at", .desc = true },
+        .{ .field = "_id", .desc = false },
+    }, .{
+        .first = reversed_first_bounds[0..],
+        .last = reversed_last_bounds[0..],
+    });
+    const reversed_bounds_seg = try reversed_bounds_seg_writer.build();
+    defer alloc.free(reversed_bounds_seg);
+
+    var reversed_bounds_writer = try index_mod.IndexWriter.init(alloc);
+    defer reversed_bounds_writer.deinit();
+    try reversed_bounds_writer.addSegment(reversed_bounds_seg);
+    const reversed_bounds_plan = try planTextNativeSortFields(.{
+        .order_by = &order_by,
+        .limit = 10,
+    }, reversed_bounds_writer.snapshot(), schema);
+    try std.testing.expect(reversed_bounds_plan.index_sort_match);
+    try std.testing.expect(reversed_bounds_plan.sorted_segment_executor_available);
+    try std.testing.expect(!reversed_bounds_plan.sorted_segment_bounds_available);
+    try std.testing.expectEqualStrings("covered_without_bounds", reversed_bounds_plan.index_sort_coverage);
+
+    var mismatched_seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer mismatched_seg_writer.deinit();
+    const mismatched_created_idx = try mismatched_seg_writer.addField("created_at");
+    try mismatched_seg_writer.addSection(mismatched_created_idx, .typed_doc_values, dv_data);
+    try mismatched_seg_writer.addStoredDoc("doc:a", "{\"created_at\":\"1970-01-01T00:00:00.000000001Z\"}");
+    try mismatched_seg_writer.addIndexSortMetadata(&.{
+        .{ .field = "created_at", .desc = false },
+        .{ .field = "_id", .desc = false },
+    });
+    const mismatched_seg = try mismatched_seg_writer.build();
+    defer alloc.free(mismatched_seg);
+
+    var mismatched_writer = try index_mod.IndexWriter.init(alloc);
+    defer mismatched_writer.deinit();
+    try mismatched_writer.addSegment(mismatched_seg);
+    const mismatched_snapshot = mismatched_writer.snapshot();
+
+    const mismatched_plan = try planTextNativeSortFields(.{
+        .order_by = &order_by,
+        .limit = 10,
+    }, mismatched_snapshot, schema);
+    try std.testing.expect(mismatched_plan.index_sort_match);
+    try std.testing.expect(!mismatched_plan.sorted_segment_executor_available);
+    try std.testing.expectEqualStrings("missing_segment_index_sort", mismatched_plan.index_sort_coverage);
+}
+
+test "native text sort planner ignores fully deleted legacy segments for index sort coverage" {
+    const alloc = std.testing.allocator;
+
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "created_at",
+        .path_match = "created_at",
+        .mapping = .{
+            .field_type = .datetime,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const index_sort = [_]runtime_schema_mod.IndexSortField{
+        .{ .field = "created_at", .desc = true },
+        .{ .field = "_id", .desc = false },
+    };
+    const schema = runtime_schema_mod.TableSchema{
+        .dynamic_templates = &templates,
+        .index_sort = &index_sort,
+    };
+    const order_by = [_]types.SortField{.{ .field = "created_at", .desc = true }};
+
+    var legacy_dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .u64_val, 1024);
+    defer legacy_dv_writer.deinit();
+    try legacy_dv_writer.add(0, .{ .u64_val = 1 });
+    const legacy_dv_data = try legacy_dv_writer.build();
+    defer alloc.free(legacy_dv_data);
+
+    var legacy_seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer legacy_seg_writer.deinit();
+    const legacy_created_idx = try legacy_seg_writer.addField("created_at");
+    try legacy_seg_writer.addSection(legacy_created_idx, .typed_doc_values, legacy_dv_data);
+    try legacy_seg_writer.addStoredDoc("doc:legacy", "{\"created_at\":\"1970-01-01T00:00:00.000000001Z\"}");
+    const legacy_seg = try legacy_seg_writer.build();
+    defer alloc.free(legacy_seg);
+
+    var sorted_dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .u64_val, 1024);
+    defer sorted_dv_writer.deinit();
+    try sorted_dv_writer.add(0, .{ .u64_val = 2 });
+    const sorted_dv_data = try sorted_dv_writer.build();
+    defer alloc.free(sorted_dv_data);
+
+    var sorted_seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer sorted_seg_writer.deinit();
+    const sorted_created_idx = try sorted_seg_writer.addField("created_at");
+    try sorted_seg_writer.addSection(sorted_created_idx, .typed_doc_values, sorted_dv_data);
+    try sorted_seg_writer.addStoredDoc("doc:sorted", "{\"created_at\":\"1970-01-01T00:00:00.000000002Z\"}");
+    try sorted_seg_writer.addIndexSortMetadata(&.{
+        .{ .field = "created_at", .desc = true },
+        .{ .field = "_id", .desc = false },
+    });
+    const sorted_seg = try sorted_seg_writer.build();
+    defer alloc.free(sorted_seg);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(legacy_seg);
+    try writer.addSegment(sorted_seg);
+    const snapshot = writer.snapshot();
+
+    var deleted = roaring.RoaringBitmap.init(alloc);
+    try deleted.add(0);
+    writer.setDeletionBitmap(snapshot.segments[0].id, deleted);
+
+    const plan = try planTextNativeSortFields(.{
+        .order_by = &order_by,
+        .limit = 10,
+    }, snapshot, schema);
+    try std.testing.expect(plan.index_sort_match);
+    try std.testing.expect(plan.sorted_segment_executor_available);
+    try std.testing.expect(!plan.sorted_segment_bounds_available);
+}
+
+test "sort planner detects exact index sort eligibility after implicit id normalization" {
+    const templates = [_]runtime_schema_mod.DynamicTemplate{
+        .{
+            .name = "created_at",
+            .path_match = "created_at",
+            .mapping = .{
+                .field_type = .datetime,
+                .doc_values = true,
+                .sortable = true,
+                .analyzer = "keyword",
+            },
+        },
+        .{
+            .name = "category",
+            .path_match = "category",
+            .mapping = .{
+                .field_type = .keyword,
+                .doc_values = true,
+                .sortable = true,
+                .analyzer = "keyword",
+            },
+        },
+    };
+    const exact_index_sort = [_]runtime_schema_mod.IndexSortField{
+        .{ .field = "created_at", .desc = true },
+        .{ .field = "_id", .desc = false },
+    };
+    const exact_schema = runtime_schema_mod.TableSchema{
+        .dynamic_templates = &templates,
+        .index_sort = &exact_index_sort,
+    };
+
+    const created_desc = [_]types.SortField{.{ .field = "created_at", .desc = true }};
+    try std.testing.expect(sortRequestMatchesIndexSort(.{
+        .order_by = &created_desc,
+    }, exact_schema));
+
+    const created_desc_with_id = [_]types.SortField{
+        .{ .field = "created_at", .desc = true },
+        .{ .field = "_id", .desc = false },
+    };
+    try std.testing.expect(sortRequestMatchesIndexSort(.{
+        .order_by = &created_desc_with_id,
+    }, exact_schema));
+
+    const id_index_sort = [_]runtime_schema_mod.IndexSortField{.{ .field = "_id", .desc = false }};
+    const id_schema = runtime_schema_mod.TableSchema{
+        .dynamic_templates = &templates,
+        .index_sort = &id_index_sort,
+    };
+    const id_cursor = [_]std.json.Value{.{ .string = "doc:a" }};
+    try std.testing.expect(sortRequestMatchesIndexSort(.{
+        .search_after = &id_cursor,
+    }, id_schema));
+
+    const wrong_direction = [_]types.SortField{.{ .field = "created_at", .desc = false }};
+    try std.testing.expect(!sortRequestMatchesIndexSort(.{
+        .order_by = &wrong_direction,
+    }, exact_schema));
+
+    const category_middle_index_sort = [_]runtime_schema_mod.IndexSortField{
+        .{ .field = "created_at", .desc = true },
+        .{ .field = "category", .desc = false },
+        .{ .field = "_id", .desc = false },
+    };
+    const category_schema = runtime_schema_mod.TableSchema{
+        .dynamic_templates = &templates,
+        .index_sort = &category_middle_index_sort,
+    };
+    try std.testing.expect(!sortRequestMatchesIndexSort(.{
+        .order_by = &created_desc,
+    }, category_schema));
+
+    const created_desc_category_asc = [_]types.SortField{
+        .{ .field = "created_at", .desc = true },
+        .{ .field = "category", .desc = false },
+    };
+    try std.testing.expect(sortRequestMatchesIndexSort(.{
+        .order_by = &created_desc_category_asc,
+    }, category_schema));
+
+    const category_only = [_]types.SortField{.{ .field = "category", .desc = false }};
+    try std.testing.expect(!sortRequestMatchesIndexSort(.{
+        .order_by = &category_only,
+    }, category_schema));
+
+    const missing_id_index_sort = [_]runtime_schema_mod.IndexSortField{
+        .{ .field = "created_at", .desc = true },
+    };
+    const missing_id_schema = runtime_schema_mod.TableSchema{
+        .dynamic_templates = &templates,
+        .index_sort = &missing_id_index_sort,
+    };
+    try std.testing.expect(!schemaIndexSortValidForPlanning(missing_id_schema));
+    try std.testing.expect(!sortRequestMatchesIndexSort(.{
+        .order_by = &created_desc,
+    }, missing_id_schema));
+
+    const descending_id_index_sort = [_]runtime_schema_mod.IndexSortField{
+        .{ .field = "created_at", .desc = true },
+        .{ .field = "_id", .desc = true },
+    };
+    const descending_id_schema = runtime_schema_mod.TableSchema{
+        .dynamic_templates = &templates,
+        .index_sort = &descending_id_index_sort,
+    };
+    try std.testing.expect(!schemaIndexSortValidForPlanning(descending_id_schema));
+    try std.testing.expect(!sortRequestMatchesIndexSort(.{
+        .order_by = &created_desc,
+    }, descending_id_schema));
+
+    const unmapped_index_sort = [_]runtime_schema_mod.IndexSortField{
+        .{ .field = "unknown", .desc = false },
+        .{ .field = "_id", .desc = false },
+    };
+    const unmapped_schema = runtime_schema_mod.TableSchema{
+        .dynamic_templates = &templates,
+        .index_sort = &unmapped_index_sort,
+    };
+    try std.testing.expect(!schemaIndexSortValidForPlanning(unmapped_schema));
+    try std.testing.expect(!sortRequestMatchesIndexSort(.{
+        .order_by = &.{.{ .field = "unknown", .desc = false }},
+    }, unmapped_schema));
+
+    const duplicate_index_sort = [_]runtime_schema_mod.IndexSortField{
+        .{ .field = "created_at", .desc = true },
+        .{ .field = "created_at", .desc = true },
+        .{ .field = "_id", .desc = false },
+    };
+    const duplicate_schema = runtime_schema_mod.TableSchema{
+        .dynamic_templates = &templates,
+        .index_sort = &duplicate_index_sort,
+    };
+    try std.testing.expect(!schemaIndexSortValidForPlanning(duplicate_schema));
+    try std.testing.expect(!sortRequestMatchesIndexSort(.{
+        .order_by = &created_desc,
+    }, duplicate_schema));
+}
+
+test "sort planner rejects non-finite numeric index sort bounds" {
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "rank",
+        .path_match = "rank",
+        .mapping = .{
+            .field_type = .numeric,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const index_sort = [_]runtime_schema_mod.IndexSortField{
+        .{ .field = "rank", .desc = false },
+        .{ .field = "_id", .desc = false },
+    };
+    const schema = runtime_schema_mod.TableSchema{
+        .dynamic_templates = &templates,
+        .index_sort = &index_sort,
+    };
+
+    var finite_first = [_]segment_mod.SegmentIndexSortBoundValue{
+        .{ .f64_val = 1.0 },
+        .{ .id = "doc:a" },
+    };
+    var finite_last = [_]segment_mod.SegmentIndexSortBoundValue{
+        .{ .f64_val = 2.0 },
+        .{ .id = "doc:b" },
+    };
+    try std.testing.expect(indexSortBoundsMatchSchema(schema, .{
+        .first = finite_first[0..],
+        .last = finite_last[0..],
+    }));
+
+    var nan_first = [_]segment_mod.SegmentIndexSortBoundValue{
+        .{ .f64_val = std.math.nan(f64) },
+        .{ .id = "doc:a" },
+    };
+    try std.testing.expect(!indexSortBoundsMatchSchema(schema, .{
+        .first = nan_first[0..],
+        .last = finite_last[0..],
+    }));
+
+    var inf_last = [_]segment_mod.SegmentIndexSortBoundValue{
+        .{ .f64_val = std.math.inf(f64) },
+        .{ .id = "doc:b" },
+    };
+    try std.testing.expect(!indexSortBoundsMatchSchema(schema, .{
+        .first = finite_first[0..],
+        .last = inf_last[0..],
+    }));
+}
+
+test "native text sort validation requires runtime mapping for non-id fields" {
+    const alloc = std.testing.allocator;
+
+    var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .u64_val, 1024);
+    defer dv_writer.deinit();
+    try dv_writer.add(0, .{ .u64_val = 1 });
+    const dv_data = try dv_writer.build();
+    defer alloc.free(dv_data);
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    const created_idx = try seg_writer.addField("created_at");
+    try seg_writer.addSection(created_idx, .typed_doc_values, dv_data);
+    try seg_writer.addStoredDoc("doc:a", "{\"created_at\":\"1970-01-01T00:00:00.000000001Z\"}");
+    const seg_bytes = try seg_writer.build();
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+    const snapshot = writer.snapshot();
+
+    const order_by = [_]types.SortField{.{ .field = "created_at", .desc = false }};
+    try std.testing.expectError(error.UnsupportedExactSort, validateTextNativeSortFields(.{
+        .order_by = &order_by,
+        .limit = 10,
+    }, snapshot, null));
+}
+
+test "native text sort validation rejects typed doc value kind mismatch" {
+    const alloc = std.testing.allocator;
+
+    var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .f64_val, 1024);
+    defer dv_writer.deinit();
+    try dv_writer.add(0, .{ .f64_val = 1.0 });
+    const dv_data = try dv_writer.build();
+    defer alloc.free(dv_data);
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    const created_idx = try seg_writer.addField("created_at");
+    try seg_writer.addSection(created_idx, .typed_doc_values, dv_data);
+    try seg_writer.addStoredDoc("doc:a", "{\"created_at\":\"1970-01-01T00:00:00.000000001Z\"}");
+    const seg_bytes = try seg_writer.build();
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+    const snapshot = writer.snapshot();
+
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "created_at",
+        .path_match = "created_at",
+        .mapping = .{
+            .field_type = .datetime,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+
+    const order_by = [_]types.SortField{.{ .field = "created_at", .desc = false }};
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedExactSort, validateTextNativeSortFields(.{
+        .order_by = &order_by,
+        .limit = 10,
+    }, snapshot, schema));
+    const diagnostic = takeLastSortRejectionDiagnostic().?;
+    try std.testing.expectEqualStrings("created_at", diagnostic.field);
+    try std.testing.expectEqualStrings("missing_doc_values_coverage", diagnostic.reason);
+    try std.testing.expectEqualStrings("doc_values_kind_mismatch", diagnostic.detail);
+}
+
+test "native text sort validation rejects cursors outside doc value column type" {
+    const alloc = std.testing.allocator;
+
+    var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .i64_val, 1024);
+    defer dv_writer.deinit();
+    try dv_writer.add(0, .{ .i64_val = 10 });
+    const dv_data = try dv_writer.build();
+    defer alloc.free(dv_data);
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    const rank_idx = try seg_writer.addField("rank");
+    try seg_writer.addSection(rank_idx, .typed_doc_values, dv_data);
+    try seg_writer.addStoredDoc("doc:a", "{\"rank\":10}");
+    const seg_bytes = try seg_writer.build();
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+    const snapshot = writer.snapshot();
+
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "rank",
+        .path_match = "rank",
+        .mapping = .{
+            .field_type = .numeric,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+
+    const order_by = [_]types.SortField{.{ .field = "rank", .desc = false }};
+    const valid_cursor = [_]std.json.Value{
+        .{ .number_string = "10" },
+        .{ .string = "doc:a" },
+    };
+    try validateTextNativeSortFields(.{
+        .order_by = &order_by,
+        .search_after = &valid_cursor,
+        .limit = 10,
+    }, snapshot, schema);
+
+    const fractional_cursor = [_]std.json.Value{
+        .{ .number_string = "10.5" },
+        .{ .string = "doc:a" },
+    };
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.InvalidQueryRequest, validateTextNativeSortFields(.{
+        .order_by = &order_by,
+        .search_after = &fractional_cursor,
+        .limit = 10,
+    }, snapshot, schema));
+    const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("rank", diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.reason);
+    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
+}
+
+test "native sort planner classifies mapping and cursor rejection reasons" {
+    const keyword_mapping = runtime_schema_mod.FieldMapping{
+        .field_type = .keyword,
+        .doc_values = true,
+        .sortable = true,
+        .analyzer = "keyword",
+    };
+    const text_mapping = runtime_schema_mod.FieldMapping{
+        .field_type = .text,
+        .doc_values = true,
+        .sortable = true,
+        .analyzer = "standard",
+    };
+    const non_sortable_mapping = runtime_schema_mod.FieldMapping{
+        .field_type = .keyword,
+        .doc_values = true,
+        .sortable = false,
+        .analyzer = "keyword",
+    };
+    const non_doc_valued_mapping = runtime_schema_mod.FieldMapping{
+        .field_type = .keyword,
+        .doc_values = false,
+        .sortable = true,
+        .analyzer = "keyword",
+    };
+    const datetime_mapping = runtime_schema_mod.FieldMapping{
+        .field_type = .datetime,
+        .doc_values = true,
+        .sortable = true,
+        .analyzer = "keyword",
+    };
+    const numeric_mapping = runtime_schema_mod.FieldMapping{
+        .field_type = .numeric,
+        .doc_values = true,
+        .sortable = true,
+        .analyzer = "keyword",
+    };
+
+    try std.testing.expect(mappedSortFieldRejectionReason(keyword_mapping) == null);
+    try std.testing.expectEqual(NativeSortPlanRejectionReason.non_scalar_field, mappedSortFieldRejectionReason(text_mapping).?);
+    try std.testing.expectEqual(NativeSortPlanRejectionReason.non_sortable_field, mappedSortFieldRejectionReason(non_sortable_mapping).?);
+    try std.testing.expectEqual(NativeSortPlanRejectionReason.missing_doc_values_capability, mappedSortFieldRejectionReason(non_doc_valued_mapping).?);
+
+    try std.testing.expect(mappedSortCursorValueIsValid(keyword_mapping, .{ .string = "doc:a" }));
+    try std.testing.expect(!mappedSortCursorValueIsValid(keyword_mapping, .{ .integer = 42 }));
+    try std.testing.expectEqual(NativeSortPlanRejectionReason.invalid_cursor_type, mappedSortCursorRejectionReason(keyword_mapping, .{ .integer = 42 }).?);
+    try std.testing.expect(!mappedSortCursorValueIsValid(keyword_mapping, .null));
+    try std.testing.expectEqual(NativeSortPlanRejectionReason.missing_null_policy, mappedSortCursorRejectionReason(keyword_mapping, .null).?);
+    try std.testing.expect(mappedSortCursorValueIsValid(datetime_mapping, .{ .string = "1970-01-01T00:00:00Z" }));
+    try std.testing.expect(mappedSortCursorValueIsValid(datetime_mapping, .{ .integer = 1_704_067_200_000_000_000 }));
+    try std.testing.expect(mappedSortCursorValueIsValid(datetime_mapping, .{ .number_string = "1704067200000000000" }));
+    try std.testing.expect(!mappedSortCursorValueIsValid(datetime_mapping, .{ .string = "not-a-date" }));
+    try std.testing.expectEqual(NativeSortPlanRejectionReason.invalid_cursor_type, mappedSortCursorRejectionReason(datetime_mapping, .{ .string = "not-a-date" }).?);
+    try std.testing.expect(!mappedSortCursorValueIsValid(datetime_mapping, .{ .float = 1_704_067_200_000_000_000.0 }));
+    try std.testing.expectEqual(NativeSortPlanRejectionReason.invalid_cursor_type, mappedSortCursorRejectionReason(datetime_mapping, .{ .float = 1_704_067_200_000_000_000.0 }).?);
+    try std.testing.expect(!mappedSortCursorValueIsValid(datetime_mapping, .{ .integer = -1 }));
+    try std.testing.expect(!mappedSortCursorValueIsValid(datetime_mapping, .null));
+    try std.testing.expectEqual(NativeSortPlanRejectionReason.missing_null_policy, mappedSortCursorRejectionReason(datetime_mapping, .null).?);
+    try std.testing.expect(mappedSortCursorValueIsValid(numeric_mapping, .{ .number_string = "9223372036854775808" }));
+    try std.testing.expect(mappedSortCursorValueIsValid(numeric_mapping, .{ .number_string = "-9007199254740993" }));
+    try std.testing.expect(mappedSortCursorValueIsValid(numeric_mapping, .{ .number_string = "10.5" }));
+    try std.testing.expect(!mappedSortCursorValueIsValid(numeric_mapping, .{ .number_string = "not-a-number" }));
+    try std.testing.expectEqual(NativeSortPlanRejectionReason.invalid_cursor_type, mappedSortCursorRejectionReason(numeric_mapping, .{ .number_string = "not-a-number" }).?);
+    try std.testing.expect(!mappedSortCursorValueIsValid(numeric_mapping, .{ .number_string = "nan" }));
+    try std.testing.expectEqual(NativeSortPlanRejectionReason.invalid_cursor_type, mappedSortCursorRejectionReason(numeric_mapping, .{ .number_string = "nan" }).?);
+    try std.testing.expect(!mappedSortCursorValueIsValid(numeric_mapping, .{ .float = std.math.nan(f64) }));
+    try std.testing.expectEqual(NativeSortPlanRejectionReason.invalid_cursor_type, mappedSortCursorRejectionReason(numeric_mapping, .{ .float = std.math.inf(f64) }).?);
+
+    try std.testing.expect(nativeSortValueRejectionReason(keyword_mapping, .{ .string = "open" }) == null);
+    try std.testing.expectEqual(NativeSortPlanRejectionReason.missing_null_policy, nativeSortValueRejectionReason(keyword_mapping, .null_value).?);
+    try std.testing.expectEqual(NativeSortPlanRejectionReason.invalid_doc_value_type, nativeSortValueRejectionReason(keyword_mapping, .{ .integer = 1 }).?);
+}
+
+fn buildDuplicateF64DocValuesSectionAlloc(alloc: Allocator) ![]u8 {
+    var chunk = std.ArrayListUnmanaged(u8).empty;
+    defer chunk.deinit(alloc);
+    try chunk.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 3))));
+    try chunk.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 0))));
+    try chunk.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 0))));
+    try chunk.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 1))));
+    try chunk.appendSlice(alloc, &@as([8]u8, @bitCast(@as(f64, 1.0))));
+    try chunk.appendSlice(alloc, &@as([8]u8, @bitCast(@as(f64, 1.5))));
+    try chunk.appendSlice(alloc, &@as([8]u8, @bitCast(@as(f64, 2.0))));
+
+    const compressed = try snappy.encode(alloc, chunk.items);
+    defer alloc.free(compressed);
+
+    var data = std.ArrayListUnmanaged(u8).empty;
+    defer data.deinit(alloc);
+    try data.append(alloc, @intFromEnum(typed_dv.ValueType.f64_val));
+    try data.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 1))));
+    const chunk_end: u64 = @intCast(5 + 8 + compressed.len);
+    try data.appendSlice(alloc, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, chunk_end))));
+    try data.appendSlice(alloc, compressed);
+    return try data.toOwnedSlice(alloc);
+}
+
+test "native sort coverage diagnostics classify physical doc value failures" {
+    const alloc = std.testing.allocator;
+    const numeric_mapping = runtime_schema_mod.FieldMapping{
+        .field_type = .numeric,
+        .doc_values = true,
+        .sortable = true,
+        .analyzer = "keyword",
+    };
+    const boolean_mapping = runtime_schema_mod.FieldMapping{
+        .field_type = .boolean,
+        .doc_values = true,
+        .sortable = true,
+        .analyzer = "keyword",
+    };
+
+    {
+        var seg_writer = segment_mod.SegmentWriter.init(alloc);
+        defer seg_writer.deinit();
+        try seg_writer.addStoredDoc("doc:a", "{\"price\":1}");
+        const seg_bytes = try seg_writer.build();
+        defer alloc.free(seg_bytes);
+
+        var writer = try index_mod.IndexWriter.init(alloc);
+        defer writer.deinit();
+        try writer.addSegment(seg_bytes);
+        const snapshot = writer.snapshot();
+
+        try std.testing.expectEqual(
+            TypedDocValuesCoverageStatus.missing_doc_values_section,
+            try snapshotTypedDocValuesCoverageForMapping(snapshot, "price", numeric_mapping),
+        );
+    }
+
+    {
+        var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .f64_val, 1024);
+        defer dv_writer.deinit();
+        try dv_writer.add(0, .{ .f64_val = 1.0 });
+        const dv_data = try dv_writer.build();
+        defer alloc.free(dv_data);
+
+        var seg_writer = segment_mod.SegmentWriter.init(alloc);
+        defer seg_writer.deinit();
+        const price_idx = try seg_writer.addField("price");
+        try seg_writer.addSection(price_idx, .typed_doc_values, dv_data);
+        try seg_writer.addStoredDoc("doc:a", "{\"price\":1}");
+        const seg_bytes = try seg_writer.build();
+        defer alloc.free(seg_bytes);
+
+        var writer = try index_mod.IndexWriter.init(alloc);
+        defer writer.deinit();
+        try writer.addSegment(seg_bytes);
+        const snapshot = writer.snapshot();
+
+        try std.testing.expectEqual(
+            TypedDocValuesCoverageStatus.doc_values_kind_mismatch,
+            try snapshotTypedDocValuesCoverageForMapping(snapshot, "price", boolean_mapping),
+        );
+    }
+
+    {
+        const malformed_data = [_]u8{ 0xff, 0x00, 0x01 };
+
+        var seg_writer = segment_mod.SegmentWriter.init(alloc);
+        defer seg_writer.deinit();
+        const price_idx = try seg_writer.addField("price");
+        try seg_writer.addSection(price_idx, .typed_doc_values, &malformed_data);
+        try seg_writer.addStoredDoc("doc:a", "{\"price\":1}");
+        const seg_bytes = try seg_writer.build();
+        defer alloc.free(seg_bytes);
+
+        var writer = try index_mod.IndexWriter.init(alloc);
+        defer writer.deinit();
+        try writer.addSegment(seg_bytes);
+        const snapshot = writer.snapshot();
+
+        try std.testing.expectEqual(
+            TypedDocValuesCoverageStatus.malformed_doc_values_section,
+            try snapshotTypedDocValuesCoverageForMapping(snapshot, "price", numeric_mapping),
+        );
+    }
+
+    {
+        var f64_writer = typed_dv.TypedDocValuesWriter.init(alloc, .f64_val, 1024);
+        defer f64_writer.deinit();
+        try f64_writer.add(0, .{ .f64_val = 1.0 });
+        const f64_data = try f64_writer.build();
+        defer alloc.free(f64_data);
+
+        var f64_seg_writer = segment_mod.SegmentWriter.init(alloc);
+        defer f64_seg_writer.deinit();
+        const f64_price_idx = try f64_seg_writer.addField("price");
+        try f64_seg_writer.addSection(f64_price_idx, .typed_doc_values, f64_data);
+        try f64_seg_writer.addStoredDoc("doc:a", "{\"price\":1.0}");
+        const f64_seg_bytes = try f64_seg_writer.build();
+        defer alloc.free(f64_seg_bytes);
+
+        var i64_writer = typed_dv.TypedDocValuesWriter.init(alloc, .i64_val, 1024);
+        defer i64_writer.deinit();
+        try i64_writer.add(0, .{ .i64_val = 2 });
+        const i64_data = try i64_writer.build();
+        defer alloc.free(i64_data);
+
+        var i64_seg_writer = segment_mod.SegmentWriter.init(alloc);
+        defer i64_seg_writer.deinit();
+        const i64_price_idx = try i64_seg_writer.addField("price");
+        try i64_seg_writer.addSection(i64_price_idx, .typed_doc_values, i64_data);
+        try i64_seg_writer.addStoredDoc("doc:b", "{\"price\":2}");
+        const i64_seg_bytes = try i64_seg_writer.build();
+        defer alloc.free(i64_seg_bytes);
+
+        var writer = try index_mod.IndexWriter.init(alloc);
+        defer writer.deinit();
+        try writer.addSegment(f64_seg_bytes);
+        try writer.addSegment(i64_seg_bytes);
+        const snapshot = writer.snapshot();
+
+        try std.testing.expectEqual(
+            TypedDocValuesCoverageStatus.doc_values_kind_mismatch,
+            try snapshotTypedDocValuesCoverageForMapping(snapshot, "price", numeric_mapping),
+        );
+    }
+
+    {
+        var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .f64_val, 1024);
+        defer dv_writer.deinit();
+        try dv_writer.add(0, .{ .f64_val = 1.0 });
+        const dv_data = try dv_writer.build();
+        defer alloc.free(dv_data);
+
+        var seg_writer = segment_mod.SegmentWriter.init(alloc);
+        defer seg_writer.deinit();
+        const price_idx = try seg_writer.addField("price");
+        try seg_writer.addSection(price_idx, .typed_doc_values, dv_data);
+        try seg_writer.addStoredDoc("doc:a", "{\"price\":1}");
+        try seg_writer.addStoredDoc("doc:b", "{\"price\":2}");
+        const seg_bytes = try seg_writer.build();
+        defer alloc.free(seg_bytes);
+
+        var writer = try index_mod.IndexWriter.init(alloc);
+        defer writer.deinit();
+        try writer.addSegment(seg_bytes);
+        const snapshot = writer.snapshot();
+
+        try std.testing.expectEqual(
+            TypedDocValuesCoverageStatus.sparse_live_doc_values,
+            try snapshotTypedDocValuesCoverageForMapping(snapshot, "price", numeric_mapping),
+        );
+    }
+
+    {
+        var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .f64_val, 1024);
+        defer dv_writer.deinit();
+        try dv_writer.add(7, .{ .f64_val = 1.0 });
+        const dv_data = try dv_writer.build();
+        defer alloc.free(dv_data);
+
+        var seg_writer = segment_mod.SegmentWriter.init(alloc);
+        defer seg_writer.deinit();
+        const price_idx = try seg_writer.addField("price");
+        try seg_writer.addSection(price_idx, .typed_doc_values, dv_data);
+        try seg_writer.addStoredDoc("doc:a", "{\"price\":1}");
+        const seg_bytes = try seg_writer.build();
+        defer alloc.free(seg_bytes);
+
+        var writer = try index_mod.IndexWriter.init(alloc);
+        defer writer.deinit();
+        try writer.addSegment(seg_bytes);
+        const snapshot = writer.snapshot();
+
+        try std.testing.expectEqual(
+            TypedDocValuesCoverageStatus.invalid_doc_value_doc_id,
+            try snapshotTypedDocValuesCoverageForMapping(snapshot, "price", numeric_mapping),
+        );
+    }
+
+    {
+        const dv_data = try buildDuplicateF64DocValuesSectionAlloc(alloc);
+        defer alloc.free(dv_data);
+
+        var seg_writer = segment_mod.SegmentWriter.init(alloc);
+        defer seg_writer.deinit();
+        const price_idx = try seg_writer.addField("price");
+        try seg_writer.addSection(price_idx, .typed_doc_values, dv_data);
+        try seg_writer.addStoredDoc("doc:a", "{\"price\":1}");
+        try seg_writer.addStoredDoc("doc:b", "{\"price\":2}");
+        const seg_bytes = try seg_writer.build();
+        defer alloc.free(seg_bytes);
+
+        var writer = try index_mod.IndexWriter.init(alloc);
+        defer writer.deinit();
+        try writer.addSegment(seg_bytes);
+        const snapshot = writer.snapshot();
+
+        try std.testing.expectEqual(
+            TypedDocValuesCoverageStatus.duplicate_doc_value_doc_id,
+            try snapshotTypedDocValuesCoverageForMapping(snapshot, "price", numeric_mapping),
+        );
+    }
+}
+
+test "geo structured filters require covered geo doc values for native filter planning" {
+    const alloc = std.testing.allocator;
+
+    var geo_writer = typed_dv.TypedDocValuesWriter.init(alloc, .geo_point, 1024);
+    defer geo_writer.deinit();
+    try geo_writer.add(0, .{ .geo_point = .{ .lat = 37.7749, .lon = -122.4194 } });
+    try geo_writer.add(1, .{ .geo_point = .{ .lat = 37.7750, .lon = -122.4195 } });
+    const geo_data = try geo_writer.build();
+    defer alloc.free(geo_data);
+
+    var geo_seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer geo_seg_writer.deinit();
+    const location_idx = try geo_seg_writer.addField("location");
+    try geo_seg_writer.addSection(location_idx, .typed_doc_values, geo_data);
+    try geo_seg_writer.addStoredDoc("doc:a", "{\"location\":{\"lat\":37.7749,\"lon\":-122.4194}}");
+    try geo_seg_writer.addStoredDoc("doc:b", "{\"location\":{\"lat\":37.7750,\"lon\":-122.4195}}");
+    const geo_seg_bytes = try geo_seg_writer.build();
+    defer alloc.free(geo_seg_bytes);
+
+    var geo_index = try index_mod.IndexWriter.init(alloc);
+    defer geo_index.deinit();
+    try geo_index.addSegment(geo_seg_bytes);
+    const geo_snapshot = geo_index.snapshot();
+
+    try std.testing.expectEqual(
+        TypedDocValuesCoverageStatus.covered,
+        try snapshotGeoPointDocValuesCoverage(geo_snapshot, "location"),
+    );
+    try std.testing.expect(try searchQueryCanUseMappedGeoDocValues(geo_snapshot, "location", null));
+
+    const geo_schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &[_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "location",
+        .path_match = "location",
+        .mapping = .{
+            .field_type = .geopoint,
+            .doc_values = true,
+            .sortable = false,
+            .analyzer = "standard",
+        },
+    }} };
+    try std.testing.expect(try searchQueryCanUseMappedGeoDocValues(geo_snapshot, "location", geo_schema));
+
+    const numeric_schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &[_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "location",
+        .path_match = "location",
+        .mapping = .{
+            .field_type = .numeric,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }} };
+    try std.testing.expect(!try searchQueryCanUseMappedGeoDocValues(geo_snapshot, "location", numeric_schema));
+
+    var missing_seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer missing_seg_writer.deinit();
+    try missing_seg_writer.addStoredDoc("doc:a", "{\"location\":{\"lat\":37.7749,\"lon\":-122.4194}}");
+    const missing_seg_bytes = try missing_seg_writer.build();
+    defer alloc.free(missing_seg_bytes);
+
+    var missing_index = try index_mod.IndexWriter.init(alloc);
+    defer missing_index.deinit();
+    try missing_index.addSegment(missing_seg_bytes);
+    try std.testing.expect(!try searchQueryCanUseMappedGeoDocValues(missing_index.snapshot(), "location", null));
+}
+
+test "native text sort validation rejects sparse typed doc values for live docs" {
+    const alloc = std.testing.allocator;
+
+    var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .f64_val, 1024);
+    defer dv_writer.deinit();
+    try dv_writer.add(0, .{ .f64_val = 1.0 });
+    const dv_data = try dv_writer.build();
+    defer alloc.free(dv_data);
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    const price_idx = try seg_writer.addField("price");
+    try seg_writer.addSection(price_idx, .typed_doc_values, dv_data);
+    try seg_writer.addStoredDoc("doc:a", "{\"price\":1}");
+    try seg_writer.addStoredDoc("doc:b", "{\"price\":2}");
+    const seg_bytes = try seg_writer.build();
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+    const snapshot = writer.snapshot();
+
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "price",
+        .path_match = "price",
+        .mapping = .{
+            .field_type = .numeric,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+
+    const order_by = [_]types.SortField{.{ .field = "price", .desc = false }};
+    try std.testing.expectError(error.UnsupportedExactSort, validateTextNativeSortFields(.{
+        .order_by = &order_by,
+        .limit = 10,
+    }, snapshot, schema));
+}
+
+test "native text sort validation honors full path mapping constraints" {
+    const alloc = std.testing.allocator;
+
+    var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .u64_val, 1024);
+    defer dv_writer.deinit();
+    try dv_writer.add(0, .{ .u64_val = 1 });
+    const dv_data = try dv_writer.build();
+    defer alloc.free(dv_data);
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    const created_idx = try seg_writer.addField("secret.created_at");
+    try seg_writer.addSection(created_idx, .typed_doc_values, dv_data);
+    try seg_writer.addStoredDoc("doc:a", "{\"secret\":{\"created_at\":\"1970-01-01T00:00:00.000000001Z\"}}");
+    const seg_bytes = try seg_writer.build();
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+    const snapshot = writer.snapshot();
+
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "dates",
+        .match_pattern = "*_at",
+        .path_unmatch = "secret.*",
+        .mapping = .{
+            .field_type = .datetime,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+
+    const order_by = [_]types.SortField{.{ .field = "secret.created_at", .desc = false }};
+    try std.testing.expectError(error.UnsupportedExactSort, validateTextNativeSortFields(.{
+        .order_by = &order_by,
+        .limit = 10,
+    }, snapshot, schema));
+}
+
+test "native text sort validation requires schema-backed physical doc values" {
+    const alloc = std.testing.allocator;
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    try seg_writer.addStoredDoc("doc:a", "{\"created_at\":\"1970-01-01T00:00:00.000000001Z\"}");
+    const seg_bytes = try seg_writer.build();
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+    const snapshot = writer.snapshot();
+
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "created_at",
+        .path_match = "created_at",
+        .mapping = .{
+            .field_type = .datetime,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{
+        .dynamic_templates = &templates,
+    };
+
+    const order_by = [_]types.SortField{.{ .field = "created_at", .desc = false }};
+    try std.testing.expectError(error.UnsupportedExactSort, validateTextNativeSortFields(.{
+        .order_by = &order_by,
+        .limit = 10,
+    }, snapshot, schema));
+}
+
+test "native text sort validation requires typed doc values on every live segment" {
+    const alloc = std.testing.allocator;
+
+    var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .f64_val, 1024);
+    defer dv_writer.deinit();
+    try dv_writer.add(0, .{ .f64_val = 10.0 });
+    const dv_data = try dv_writer.build();
+    defer alloc.free(dv_data);
+
+    var covered_seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer covered_seg_writer.deinit();
+    const covered_price_idx = try covered_seg_writer.addField("price");
+    try covered_seg_writer.addSection(covered_price_idx, .typed_doc_values, dv_data);
+    try covered_seg_writer.addStoredDoc("doc:a", "{\"price\":10}");
+    const covered_seg_bytes = try covered_seg_writer.build();
+    defer alloc.free(covered_seg_bytes);
+
+    var missing_seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer missing_seg_writer.deinit();
+    try missing_seg_writer.addStoredDoc("doc:b", "{\"price\":20}");
+    const missing_seg_bytes = try missing_seg_writer.build();
+    defer alloc.free(missing_seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(covered_seg_bytes);
+    try writer.addSegment(missing_seg_bytes);
+    const snapshot = writer.snapshot();
+
+    const order_by = [_]types.SortField{.{ .field = "price", .desc = false }};
+    try std.testing.expectError(error.UnsupportedExactSort, validateTextNativeSortFields(.{
+        .order_by = &order_by,
+        .limit = 10,
+    }, snapshot, null));
+}
+
+test "native text sort validation ignores fully deleted segments without typed doc values" {
+    const alloc = std.testing.allocator;
+
+    var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .f64_val, 1024);
+    defer dv_writer.deinit();
+    try dv_writer.add(0, .{ .f64_val = 10.0 });
+    const dv_data = try dv_writer.build();
+    defer alloc.free(dv_data);
+
+    var covered_seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer covered_seg_writer.deinit();
+    const covered_price_idx = try covered_seg_writer.addField("price");
+    try covered_seg_writer.addSection(covered_price_idx, .typed_doc_values, dv_data);
+    try covered_seg_writer.addStoredDoc("doc:live", "{\"price\":10}");
+    const covered_seg_bytes = try covered_seg_writer.build();
+    defer alloc.free(covered_seg_bytes);
+
+    var deleted_seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer deleted_seg_writer.deinit();
+    try deleted_seg_writer.addStoredDoc("doc:deleted", "{\"price\":20}");
+    const deleted_seg_bytes = try deleted_seg_writer.build();
+    defer alloc.free(deleted_seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(covered_seg_bytes);
+    try writer.addSegment(deleted_seg_bytes);
+    try std.testing.expect(try writer.deleteById("doc:deleted"));
+    const snapshot = writer.snapshot();
+
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "price",
+        .path_match = "price",
+        .mapping = .{
+            .field_type = .numeric,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+    const order_by = [_]types.SortField{.{ .field = "price", .desc = false }};
+    try validateTextNativeSortFields(.{
+        .order_by = &order_by,
+        .limit = 10,
+    }, snapshot, schema);
+}
+
+test "stored json debug sort can decorate bounded test results" {
+    const alloc = std.testing.allocator;
+
+    var hits = try alloc.alloc(types.SearchHit, 2);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .score = 1.0 };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:b"), .score = 1.0 };
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 2,
+        .graph_results = &.{},
+    };
+    defer result.deinit();
+
+    const order_by = [_]types.SortField{.{ .field = "rank", .desc = false }};
+    try sortAndPageSearchResultInPlace(&result, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 2,
+    }, null, testMatchAllLoadStoredCallback, .{ .kind = .stored_json_debug }, null);
+
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+    try std.testing.expectEqual(@as(i64, 1), result.hits[0].sort_values[0].integer);
+    try std.testing.expectEqualStrings("doc:a", result.hits[1].id);
+}
+
+test "stored json debug sort rejects non-scalar sort values" {
+    const alloc = std.testing.allocator;
+
+    const callbacks = struct {
+        fn loadStored(_: ?*anyopaque, load_alloc: Allocator, key: []const u8) anyerror!?[]u8 {
+            const json = if (std.mem.eql(u8, key, "doc:a"))
+                "{\"rank\":{\"nested\":1}}"
+            else if (std.mem.eql(u8, key, "doc:b"))
+                "{\"rank\":1}"
+            else
+                return null;
+            return try load_alloc.dupe(u8, json);
+        }
+    };
+
+    var hits = try alloc.alloc(types.SearchHit, 2);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .score = 1.0 };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:b"), .score = 1.0 };
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 2,
+        .graph_results = &.{},
+    };
+    defer result.deinit();
+
+    const order_by = [_]types.SortField{.{ .field = "rank", .desc = false }};
+    try std.testing.expectError(error.UnsupportedQueryRequest, sortAndPageSearchResultInPlace(&result, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 2,
+    }, null, callbacks.loadStored, .{ .kind = .stored_json_debug }, null));
+}
+
+test "stored json debug sort honors runtime missing null policy" {
+    const alloc = std.testing.allocator;
+
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "status",
+        .path_match = "status",
+        .mapping = .{
+            .field_type = .keyword,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+
+    const callbacks = struct {
+        fn loadStored(_: ?*anyopaque, load_alloc: Allocator, key: []const u8) anyerror!?[]u8 {
+            if (!std.mem.eql(u8, key, "doc:a")) return null;
+            return try load_alloc.dupe(u8, "{\"status\":null}");
+        }
+    };
+
+    var hits = try alloc.alloc(types.SearchHit, 1);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .score = 1.0 };
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 1,
+        .graph_results = &.{},
+    };
+    defer result.deinit();
+
+    const order_by = [_]types.SortField{.{ .field = "status", .desc = false }};
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedExactSort, sortAndPageSearchResultInPlace(&result, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 1,
+    }, null, callbacks.loadStored, .{
+        .kind = .stored_json_debug,
+        .runtime_schema = schema,
+    }, null));
+    const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("status", diagnostic.field);
+    try std.testing.expectEqualStrings("missing_null_policy", diagnostic.reason);
+    try std.testing.expectEqualStrings("missing_null_policy", diagnostic.detail);
+}
+
+test "stored json debug sort normalizes runtime datetime values" {
+    const alloc = std.testing.allocator;
+
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "created_at",
+        .path_match = "created_at",
+        .mapping = .{
+            .field_type = .datetime,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+
+    const callbacks = struct {
+        fn loadStored(_: ?*anyopaque, load_alloc: Allocator, key: []const u8) anyerror!?[]u8 {
+            const json = if (std.mem.eql(u8, key, "doc:a"))
+                "{\"created_at\":\"1970-01-01T00:00:00.000000002Z\"}"
+            else if (std.mem.eql(u8, key, "doc:b"))
+                "{\"created_at\":\"1970-01-01T00:00:00.000000001Z\"}"
+            else
+                return null;
+            return try load_alloc.dupe(u8, json);
+        }
+    };
+
+    var hits = try alloc.alloc(types.SearchHit, 2);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .score = 1.0 };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:b"), .score = 1.0 };
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 2,
+        .graph_results = &.{},
+    };
+    defer result.deinit();
+
+    const order_by = [_]types.SortField{.{ .field = "created_at", .desc = false }};
+    try sortAndPageSearchResultInPlace(&result, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 2,
+    }, null, callbacks.loadStored, .{
+        .kind = .stored_json_debug,
+        .runtime_schema = schema,
+    }, null);
+
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+    try std.testing.expectEqualStrings("1970-01-01T00:00:00.000000001Z", result.hits[0].sort_values[0].string);
+    try std.testing.expectEqualStrings("doc:a", result.hits[1].id);
+    try std.testing.expectEqualStrings("1970-01-01T00:00:00.000000002Z", result.hits[1].sort_values[0].string);
+}
+
+test "native sort zero limit avoids generic collector decoration" {
+    const alloc = std.testing.allocator;
+
+    const Loader = struct {
+        load_count: usize = 0,
+
+        fn load(ctx: ?*anyopaque, _: Allocator, _: types.SearchHit, field: []const u8) anyerror!?SortValue {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.load_count += 1;
+            try std.testing.expectEqualStrings("rank", field);
+            return error.UnexpectedTestCall;
+        }
+    };
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "rank",
+        .path_match = "rank",
+        .mapping = .{
+            .field_type = .numeric,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+
+    var hits = try alloc.alloc(types.SearchHit, 2);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .score = 1.0 };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:b"), .score = 1.0 };
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 2,
+        .graph_results = &.{},
+    };
+    defer result.deinit();
+
+    var loader = Loader{};
+    const order_by = [_]types.SortField{.{ .field = "rank", .desc = false }};
+    try sortAndPageSearchResultInPlace(&result, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 0,
+    }, null, testUnexpectedLoadStoredCallback, .{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .runtime_schema = schema,
+    }, .{
+        .ctx = &loader,
+        .require_native = true,
+        .load = Loader.load,
+    });
+
+    try std.testing.expectEqual(@as(usize, 0), result.hits.len);
+    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 0), loader.load_count);
+    const profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", profile.plan);
+    try std.testing.expectEqual(@as(u64, 2), profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 0), profile.native_doc_value_hit_count);
+    try std.testing.expectEqual(@as(u64, 0), profile.native_doc_value_miss_count);
+}
+
+test "score sort uses hit score and implicit id cursor" {
+    const alloc = std.testing.allocator;
+
+    var hits = try alloc.alloc(types.SearchHit, 3);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .score = 0.25 };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:b"), .score = 2.0 };
+    hits[2] = .{ .id = try alloc.dupe(u8, "doc:c"), .score = 1.0 };
+    var first_page = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 3,
+        .graph_results = &.{},
+    };
+    defer first_page.deinit();
+
+    const order_by = [_]types.SortField{.{ .field = "_score", .desc = true }};
+    try sortAndPageSearchResultInPlace(&first_page, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 2,
+    }, null, testUnexpectedLoadStoredCallback, .{ .kind = .score_top_k }, null);
+
+    try std.testing.expectEqual(@as(usize, 2), first_page.hits.len);
+    try std.testing.expectEqualStrings("doc:b", first_page.hits[0].id);
+    try std.testing.expectEqualStrings("doc:c", first_page.hits[1].id);
+    try std.testing.expectEqual(@as(usize, 2), first_page.hits[0].sort_values.len);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), first_page.hits[0].sort_values[0].float, 0.001);
+    try std.testing.expectEqualStrings("doc:b", first_page.hits[0].sort_values[1].string);
+
+    var next_hits = try alloc.alloc(types.SearchHit, 3);
+    next_hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .score = 0.25 };
+    next_hits[1] = .{ .id = try alloc.dupe(u8, "doc:b"), .score = 2.0 };
+    next_hits[2] = .{ .id = try alloc.dupe(u8, "doc:c"), .score = 1.0 };
+    var second_page = types.SearchResult{
+        .alloc = alloc,
+        .hits = next_hits,
+        .total_hits = 3,
+        .graph_results = &.{},
+    };
+    defer second_page.deinit();
+
+    try sortAndPageSearchResultInPlace(&second_page, .{
+        .order_by = &order_by,
+        .search_after = first_page.hits[1].sort_values,
+        .include_stored = false,
+        .limit = 2,
+    }, null, testUnexpectedLoadStoredCallback, .{ .kind = .score_top_k }, null);
+
+    try std.testing.expectEqual(@as(usize, 1), second_page.hits.len);
+    try std.testing.expectEqualStrings("doc:a", second_page.hits[0].id);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.25), second_page.hits[0].sort_values[0].float, 0.001);
+    try std.testing.expectEqualStrings("doc:a", second_page.hits[0].sort_values[1].string);
+}
+
+test "vector score order decoration emits replayable score tuple" {
+    const alloc = std.testing.allocator;
+
+    var hits = try alloc.alloc(types.SearchHit, 3);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .score = 0.25 };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:b"), .score = 2.0 };
+    hits[2] = .{ .id = try alloc.dupe(u8, "doc:c"), .score = 1.0 };
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 3,
+        .graph_results = &.{},
+        .sort_profile = .{ .plan = "score_top_k" },
+    };
+    defer result.deinit();
+
+    const order_by = [_]types.SortField{
+        .{ .field = "_score", .desc = true },
+        .{ .field = "_id", .desc = false },
+    };
+    try decorateVectorScoreOrderIfRequested(&result, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 2,
+        .profile = true,
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+    try std.testing.expectEqualStrings("doc:c", result.hits[1].id);
+    try std.testing.expectEqual(@as(usize, 2), result.hits[0].sort_values.len);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), result.hits[0].sort_values[0].float, 0.001);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].sort_values[1].string);
+    try std.testing.expectEqualStrings("score_top_k", result.sort_profile.?.plan);
+}
+
+test "score sort rejects hits without finite scores" {
+    const alloc = std.testing.allocator;
+    const order_by = [_]types.SortField{.{ .field = "_score", .desc = true }};
+
+    resetLastSortRejectionDiagnostic();
+    var missing_hits = try alloc.alloc(types.SearchHit, 1);
+    missing_hits[0] = .{ .id = try alloc.dupe(u8, "doc:missing") };
+    var missing_result = types.SearchResult{
+        .alloc = alloc,
+        .hits = missing_hits,
+        .total_hits = 1,
+        .graph_results = &.{},
+    };
+    defer missing_result.deinit();
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, sortAndPageSearchResultInPlace(&missing_result, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 1,
+    }, null, testUnexpectedLoadStoredCallback, .{ .kind = .score_top_k }, null));
+    var diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("_score", diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_score_value", diagnostic.reason);
+    try std.testing.expectEqualStrings("missing_score", diagnostic.detail);
+
+    var non_finite_hits = try alloc.alloc(types.SearchHit, 1);
+    non_finite_hits[0] = .{ .id = try alloc.dupe(u8, "doc:nan"), .score = std.math.nan(f32) };
+    var non_finite_result = types.SearchResult{
+        .alloc = alloc,
+        .hits = non_finite_hits,
+        .total_hits = 1,
+        .graph_results = &.{},
+    };
+    defer non_finite_result.deinit();
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, sortAndPageSearchResultInPlace(&non_finite_result, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 1,
+    }, null, testUnexpectedLoadStoredCallback, .{ .kind = .score_top_k }, null));
+    diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("_score", diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_score_value", diagnostic.reason);
+    try std.testing.expectEqualStrings("non_finite_score", diagnostic.detail);
+}
+
+test "stored sort appends implicit id tiebreaker for stable cursors" {
+    const alloc = std.testing.allocator;
+
+    var hits = try alloc.alloc(types.SearchHit, 3);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .score = 1.0 };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:b"), .score = 1.0 };
+    hits[2] = .{ .id = try alloc.dupe(u8, "doc:c"), .score = 1.0 };
+    var first_page = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 3,
+        .graph_results = &.{},
+    };
+    defer first_page.deinit();
+
+    const order_by = [_]types.SortField{.{ .field = "rank", .desc = false }};
+    try sortAndPageSearchResultInPlace(&first_page, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 2,
+    }, null, testMatchAllLoadStoredCallback, .{ .kind = .stored_json_debug }, null);
+
+    try std.testing.expectEqual(@as(usize, 2), first_page.hits.len);
+    try std.testing.expectEqualStrings("doc:b", first_page.hits[0].id);
+    try std.testing.expectEqualStrings("doc:c", first_page.hits[1].id);
+    try std.testing.expectEqual(@as(usize, 2), first_page.hits[0].sort_values.len);
+    try std.testing.expectEqual(@as(i64, 1), first_page.hits[0].sort_values[0].integer);
+    try std.testing.expectEqualStrings("doc:b", first_page.hits[0].sort_values[1].string);
+
+    var next_hits = try alloc.alloc(types.SearchHit, 3);
+    next_hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .score = 1.0 };
+    next_hits[1] = .{ .id = try alloc.dupe(u8, "doc:b"), .score = 1.0 };
+    next_hits[2] = .{ .id = try alloc.dupe(u8, "doc:c"), .score = 1.0 };
+    var second_page = types.SearchResult{
+        .alloc = alloc,
+        .hits = next_hits,
+        .total_hits = 3,
+        .graph_results = &.{},
+    };
+    defer second_page.deinit();
+
+    try sortAndPageSearchResultInPlace(&second_page, .{
+        .order_by = &order_by,
+        .search_after = first_page.hits[1].sort_values,
+        .include_stored = false,
+        .limit = 2,
+    }, null, testMatchAllLoadStoredCallback, .{ .kind = .stored_json_debug }, null);
+
+    try std.testing.expectEqual(@as(usize, 1), second_page.hits.len);
+    try std.testing.expectEqualStrings("doc:a", second_page.hits[0].id);
+    try std.testing.expectEqual(@as(i64, 2), second_page.hits[0].sort_values[0].integer);
+    try std.testing.expectEqualStrings("doc:a", second_page.hits[0].sort_values[1].string);
+}
+
+test "native datetime sort accepts iso string cursor" {
+    const alloc = std.testing.allocator;
+
+    var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .u64_val, 1024);
+    defer dv_writer.deinit();
+    try dv_writer.add(0, .{ .u64_val = 10 });
+    try dv_writer.add(1, .{ .u64_val = 20 });
+    try dv_writer.add(2, .{ .u64_val = 30 });
+    const dv_data = try dv_writer.build();
+    defer alloc.free(dv_data);
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    const created_idx = try seg_writer.addField("created_at");
+    try seg_writer.addSection(created_idx, .typed_doc_values, dv_data);
+    try seg_writer.addStoredDoc("doc:a", "{\"created_at\":\"1970-01-01T00:00:00.000000010Z\"}");
+    try seg_writer.addStoredDoc("doc:b", "{\"created_at\":\"1970-01-01T00:00:00.000000020Z\"}");
+    try seg_writer.addStoredDoc("doc:c", "{\"created_at\":\"1970-01-01T00:00:00.000000030Z\"}");
+    const seg_bytes = try seg_writer.build();
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+    const snapshot = writer.snapshot();
+    const native_sort_ctx = TextDocValueSortContext{ .snapshot = snapshot };
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "created_at",
+        .path_match = "created_at",
+        .mapping = .{
+            .field_type = .datetime,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+
+    var hits = try alloc.alloc(types.SearchHit, 3);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .native_text_doc_id = 0, .score = 1.0 };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:b"), .native_text_doc_id = 1, .score = 1.0 };
+    hits[2] = .{ .id = try alloc.dupe(u8, "doc:c"), .native_text_doc_id = 2, .score = 1.0 };
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 3,
+        .graph_results = &.{},
+    };
+    defer result.deinit();
+
+    const order_by = [_]types.SortField{
+        .{ .field = "created_at", .desc = false },
+        .{ .field = "_id", .desc = false },
+    };
+    const cursor = [_]std.json.Value{
+        .{ .string = "1970-01-01T00:00:00.000000015Z" },
+        .{ .string = "doc:a" },
+    };
+    try sortAndPageSearchResultInPlace(&result, .{
+        .order_by = &order_by,
+        .search_after = &cursor,
+        .include_stored = false,
+        .limit = 10,
+    }, null, testUnexpectedLoadStoredCallback, .{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .runtime_schema = schema,
+    }, .{
+        .ctx = @constCast(&native_sort_ctx),
+        .require_native = true,
+        .load = loadTextDocValueSortValue,
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+    try std.testing.expectEqualStrings("doc:c", result.hits[1].id);
+    try std.testing.expectEqualStrings("1970-01-01T00:00:00.000000020Z", result.hits[0].sort_values[0].string);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].sort_values[1].string);
+    try std.testing.expectEqualStrings("1970-01-01T00:00:00.000000030Z", result.hits[1].sort_values[0].string);
+    try std.testing.expectEqualStrings("doc:c", result.hits[1].sort_values[1].string);
+}
+
+test "native datetime sort search_before returns previous page in requested order" {
+    const alloc = std.testing.allocator;
+
+    var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .u64_val, 1024);
+    defer dv_writer.deinit();
+    try dv_writer.add(0, .{ .u64_val = 10 });
+    try dv_writer.add(1, .{ .u64_val = 20 });
+    try dv_writer.add(2, .{ .u64_val = 30 });
+    const dv_data = try dv_writer.build();
+    defer alloc.free(dv_data);
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    const created_idx = try seg_writer.addField("created_at");
+    try seg_writer.addSection(created_idx, .typed_doc_values, dv_data);
+    try seg_writer.addStoredDoc("doc:a", "{\"created_at\":\"1970-01-01T00:00:00.000000010Z\"}");
+    try seg_writer.addStoredDoc("doc:b", "{\"created_at\":\"1970-01-01T00:00:00.000000020Z\"}");
+    try seg_writer.addStoredDoc("doc:c", "{\"created_at\":\"1970-01-01T00:00:00.000000030Z\"}");
+    const seg_bytes = try seg_writer.build();
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+    const snapshot = writer.snapshot();
+    const native_sort_ctx = TextDocValueSortContext{ .snapshot = snapshot };
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "created_at",
+        .path_match = "created_at",
+        .mapping = .{
+            .field_type = .datetime,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+    const plan = SortExecutionPlan{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .runtime_schema = schema,
+    };
+    const native_loader = NativeSortValueLoader{
+        .ctx = @constCast(&native_sort_ctx),
+        .require_native = true,
+        .load = loadTextDocValueSortValue,
+    };
+
+    const asc_order = [_]types.SortField{.{ .field = "created_at", .desc = false }};
+    const asc_cursor = [_]std.json.Value{
+        .{ .string = "1970-01-01T00:00:00.000000030Z" },
+        .{ .string = "doc:c" },
+    };
+    var asc_hits = try alloc.alloc(types.SearchHit, 3);
+    asc_hits[0] = .{ .id = try alloc.dupe(u8, "doc:c"), .native_text_doc_id = 2, .score = 1.0 };
+    asc_hits[1] = .{ .id = try alloc.dupe(u8, "doc:a"), .native_text_doc_id = 0, .score = 1.0 };
+    asc_hits[2] = .{ .id = try alloc.dupe(u8, "doc:b"), .native_text_doc_id = 1, .score = 1.0 };
+    var asc_page = types.SearchResult{
+        .alloc = alloc,
+        .hits = asc_hits,
+        .total_hits = 3,
+        .graph_results = &.{},
+    };
+    defer asc_page.deinit();
+
+    try sortAndPageSearchResultInPlace(&asc_page, .{
+        .order_by = &asc_order,
+        .search_before = &asc_cursor,
+        .include_stored = false,
+        .limit = 2,
+    }, null, testUnexpectedLoadStoredCallback, plan, native_loader);
+
+    try std.testing.expectEqual(@as(usize, 2), asc_page.hits.len);
+    try std.testing.expectEqualStrings("doc:a", asc_page.hits[0].id);
+    try std.testing.expectEqualStrings("1970-01-01T00:00:00.000000010Z", asc_page.hits[0].sort_values[0].string);
+    try std.testing.expectEqualStrings("doc:a", asc_page.hits[0].sort_values[1].string);
+    try std.testing.expectEqualStrings("doc:b", asc_page.hits[1].id);
+    try std.testing.expectEqualStrings("1970-01-01T00:00:00.000000020Z", asc_page.hits[1].sort_values[0].string);
+    try std.testing.expectEqualStrings("doc:b", asc_page.hits[1].sort_values[1].string);
+
+    const desc_order = [_]types.SortField{.{ .field = "created_at", .desc = true }};
+    const desc_cursor = [_]std.json.Value{
+        .{ .string = "1970-01-01T00:00:00.000000010Z" },
+        .{ .string = "doc:a" },
+    };
+    var desc_hits = try alloc.alloc(types.SearchHit, 3);
+    desc_hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .native_text_doc_id = 0, .score = 1.0 };
+    desc_hits[1] = .{ .id = try alloc.dupe(u8, "doc:c"), .native_text_doc_id = 2, .score = 1.0 };
+    desc_hits[2] = .{ .id = try alloc.dupe(u8, "doc:b"), .native_text_doc_id = 1, .score = 1.0 };
+    var desc_page = types.SearchResult{
+        .alloc = alloc,
+        .hits = desc_hits,
+        .total_hits = 3,
+        .graph_results = &.{},
+    };
+    defer desc_page.deinit();
+
+    try sortAndPageSearchResultInPlace(&desc_page, .{
+        .order_by = &desc_order,
+        .search_before = &desc_cursor,
+        .include_stored = false,
+        .limit = 2,
+    }, null, testUnexpectedLoadStoredCallback, plan, native_loader);
+
+    try std.testing.expectEqual(@as(usize, 2), desc_page.hits.len);
+    try std.testing.expectEqualStrings("doc:c", desc_page.hits[0].id);
+    try std.testing.expectEqualStrings("1970-01-01T00:00:00.000000030Z", desc_page.hits[0].sort_values[0].string);
+    try std.testing.expectEqualStrings("doc:c", desc_page.hits[0].sort_values[1].string);
+    try std.testing.expectEqualStrings("doc:b", desc_page.hits[1].id);
+    try std.testing.expectEqualStrings("1970-01-01T00:00:00.000000020Z", desc_page.hits[1].sort_values[0].string);
+    try std.testing.expectEqualStrings("doc:b", desc_page.hits[1].sort_values[1].string);
+}
+
+test "native datetime sort preserves unsigned nanosecond precision across cursors" {
+    const alloc = std.testing.allocator;
+
+    const ts_a = runtime_schema_mod.parseDateTimeToNs("2262-12-31T00:00:00.000000001Z") orelse return error.TestExpectedEqual;
+    const ts_b = runtime_schema_mod.parseDateTimeToNs("2263-01-01T00:00:00.000000002Z") orelse return error.TestExpectedEqual;
+    const ts_c = runtime_schema_mod.parseDateTimeToNs("2263-01-02T00:00:00.000000003Z") orelse return error.TestExpectedEqual;
+    try std.testing.expect(ts_a > @as(u64, @intCast(std.math.maxInt(i64))));
+    try std.testing.expect(ts_b > @as(u64, @intCast(std.math.maxInt(i64))));
+    try std.testing.expect(ts_c > @as(u64, @intCast(std.math.maxInt(i64))));
+
+    var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .u64_val, 1024);
+    defer dv_writer.deinit();
+    try dv_writer.add(0, .{ .u64_val = ts_a });
+    try dv_writer.add(1, .{ .u64_val = ts_b });
+    try dv_writer.add(2, .{ .u64_val = ts_c });
+    const dv_data = try dv_writer.build();
+    defer alloc.free(dv_data);
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    const created_idx = try seg_writer.addField("created_at");
+    try seg_writer.addSection(created_idx, .typed_doc_values, dv_data);
+    try seg_writer.addStoredDoc("doc:a", "{\"created_at\":\"2262-12-31T00:00:00.000000001Z\"}");
+    try seg_writer.addStoredDoc("doc:b", "{\"created_at\":\"2263-01-01T00:00:00.000000002Z\"}");
+    try seg_writer.addStoredDoc("doc:c", "{\"created_at\":\"2263-01-02T00:00:00.000000003Z\"}");
+    const seg_bytes = try seg_writer.build();
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+    const snapshot = writer.snapshot();
+    const native_sort_ctx = TextDocValueSortContext{ .snapshot = snapshot };
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "created_at",
+        .path_match = "created_at",
+        .mapping = .{
+            .field_type = .datetime,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+    const order_by = [_]types.SortField{.{ .field = "created_at", .desc = false }};
+    const plan = SortExecutionPlan{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .runtime_schema = schema,
+    };
+    const native_loader = NativeSortValueLoader{
+        .ctx = @constCast(&native_sort_ctx),
+        .require_native = true,
+        .load = loadTextDocValueSortValue,
+    };
+
+    var first_hits = try alloc.alloc(types.SearchHit, 3);
+    first_hits[0] = .{ .id = try alloc.dupe(u8, "doc:c"), .native_text_doc_id = 2, .score = 1.0 };
+    first_hits[1] = .{ .id = try alloc.dupe(u8, "doc:a"), .native_text_doc_id = 0, .score = 1.0 };
+    first_hits[2] = .{ .id = try alloc.dupe(u8, "doc:b"), .native_text_doc_id = 1, .score = 1.0 };
+    var first_page = types.SearchResult{
+        .alloc = alloc,
+        .hits = first_hits,
+        .total_hits = 3,
+        .graph_results = &.{},
+    };
+    defer first_page.deinit();
+
+    try sortAndPageSearchResultInPlace(&first_page, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 2,
+    }, null, testUnexpectedLoadStoredCallback, plan, native_loader);
+
+    try std.testing.expectEqual(@as(usize, 2), first_page.hits.len);
+    try std.testing.expectEqualStrings("doc:a", first_page.hits[0].id);
+    try std.testing.expectEqualStrings("doc:b", first_page.hits[1].id);
+    try std.testing.expectEqualStrings("2262-12-31T00:00:00.000000001Z", first_page.hits[0].sort_values[0].string);
+    try std.testing.expectEqualStrings("doc:a", first_page.hits[0].sort_values[1].string);
+    try std.testing.expectEqualStrings("2263-01-01T00:00:00.000000002Z", first_page.hits[1].sort_values[0].string);
+    try std.testing.expectEqualStrings("doc:b", first_page.hits[1].sort_values[1].string);
+
+    var second_hits = try alloc.alloc(types.SearchHit, 3);
+    second_hits[0] = .{ .id = try alloc.dupe(u8, "doc:c"), .native_text_doc_id = 2, .score = 1.0 };
+    second_hits[1] = .{ .id = try alloc.dupe(u8, "doc:a"), .native_text_doc_id = 0, .score = 1.0 };
+    second_hits[2] = .{ .id = try alloc.dupe(u8, "doc:b"), .native_text_doc_id = 1, .score = 1.0 };
+    var second_page = types.SearchResult{
+        .alloc = alloc,
+        .hits = second_hits,
+        .total_hits = 3,
+        .graph_results = &.{},
+    };
+    defer second_page.deinit();
+
+    try sortAndPageSearchResultInPlace(&second_page, .{
+        .order_by = &order_by,
+        .search_after = first_page.hits[1].sort_values,
+        .include_stored = false,
+        .limit = 2,
+    }, null, testUnexpectedLoadStoredCallback, plan, native_loader);
+
+    try std.testing.expectEqual(@as(usize, 1), second_page.hits.len);
+    try std.testing.expectEqualStrings("doc:c", second_page.hits[0].id);
+    try std.testing.expectEqualStrings("2263-01-02T00:00:00.000000003Z", second_page.hits[0].sort_values[0].string);
+    try std.testing.expectEqualStrings("doc:c", second_page.hits[0].sort_values[1].string);
+}
+
+test "native sort runtime rejects cursor values that do not match mapping" {
+    const alloc = std.testing.allocator;
+
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "created_at",
+        .path_match = "created_at",
+        .mapping = .{
+            .field_type = .datetime,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+
+    var hits = try alloc.alloc(types.SearchHit, 1);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .score = 1.0 };
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 1,
+        .graph_results = &.{},
+    };
+    defer result.deinit();
+
+    const Loader = struct {
+        fn load(_: ?*anyopaque, _: Allocator, _: types.SearchHit, field: []const u8) anyerror!?SortValue {
+            try std.testing.expectEqualStrings("created_at", field);
+            return .{ .integer = 20 };
+        }
+    };
+
+    const order_by = [_]types.SortField{.{ .field = "created_at", .desc = false }};
+    const cursor = [_]std.json.Value{ .{ .string = "not-a-date" }, .{ .string = "doc:a" } };
+    try std.testing.expectError(error.InvalidQueryRequest, sortAndPageSearchResultInPlace(&result, .{
+        .order_by = &order_by,
+        .search_after = &cursor,
+        .include_stored = false,
+        .limit = 10,
+    }, null, testUnexpectedLoadStoredCallback, .{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .runtime_schema = schema,
+    }, .{
+        .require_native = true,
+        .load = Loader.load,
+    }));
+}
+
+test "native datetime sort rejects values that cannot serialize as timestamps" {
+    const alloc = std.testing.allocator;
+
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "created_at",
+        .path_match = "created_at",
+        .mapping = .{
+            .field_type = .datetime,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+
+    var hits = try alloc.alloc(types.SearchHit, 1);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .score = 1.0 };
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 1,
+        .graph_results = &.{},
+    };
+    defer result.deinit();
+
+    const Loader = struct {
+        fn load(_: ?*anyopaque, _: Allocator, _: types.SearchHit, field: []const u8) anyerror!?SortValue {
+            try std.testing.expectEqualStrings("created_at", field);
+            return .{ .number = 20.5 };
+        }
+    };
+
+    const order_by = [_]types.SortField{.{ .field = "created_at", .desc = false }};
+    try std.testing.expectError(error.UnsupportedExactSort, sortAndPageSearchResultInPlace(&result, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 10,
+    }, null, testUnexpectedLoadStoredCallback, .{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .runtime_schema = schema,
+    }, .{
+        .require_native = true,
+        .load = Loader.load,
+    }));
+}
+
+test "native sort execution rejects cursors outside concrete doc value key type" {
+    const alloc = std.testing.allocator;
+
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "rank",
+        .path_match = "rank",
+        .mapping = .{
+            .field_type = .numeric,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+
+    var hits = try alloc.alloc(types.SearchHit, 1);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .score = 1.0 };
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 1,
+        .graph_results = &.{},
+    };
+    defer result.deinit();
+
+    const Loader = struct {
+        fn load(_: ?*anyopaque, _: Allocator, _: types.SearchHit, field: []const u8) anyerror!?SortValue {
+            try std.testing.expectEqualStrings("rank", field);
+            return .{ .integer = 10 };
+        }
+    };
+
+    const order_by = [_]types.SortField{.{ .field = "rank", .desc = false }};
+    const cursor = [_]std.json.Value{
+        .{ .number_string = "10.5" },
+        .{ .string = "doc:a" },
+    };
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.InvalidQueryRequest, sortAndPageSearchResultInPlace(&result, .{
+        .order_by = &order_by,
+        .search_after = &cursor,
+        .include_stored = false,
+        .limit = 10,
+    }, null, testUnexpectedLoadStoredCallback, .{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .runtime_schema = schema,
+    }, .{
+        .require_native = true,
+        .load = Loader.load,
+    }));
+    const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("rank", diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.reason);
+    try std.testing.expectEqualStrings("invalid_cursor_type", diagnostic.detail);
+}
+
+test "native numeric sort rejects non-finite doc values" {
+    const alloc = std.testing.allocator;
+
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "rank",
+        .path_match = "rank",
+        .mapping = .{
+            .field_type = .numeric,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+
+    var hits = try alloc.alloc(types.SearchHit, 1);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .score = 1.0 };
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 1,
+        .graph_results = &.{},
+    };
+    defer result.deinit();
+
+    const Loader = struct {
+        fn load(_: ?*anyopaque, _: Allocator, _: types.SearchHit, field: []const u8) anyerror!?SortValue {
+            try std.testing.expectEqualStrings("rank", field);
+            return .{ .number = std.math.nan(f64) };
+        }
+    };
+
+    const order_by = [_]types.SortField{.{ .field = "rank", .desc = false }};
+    try std.testing.expectError(error.UnsupportedExactSort, sortAndPageSearchResultInPlace(&result, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 10,
+    }, null, testUnexpectedLoadStoredCallback, .{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .runtime_schema = schema,
+    }, .{
+        .require_native = true,
+        .load = Loader.load,
+    }));
+}
+
+test "native sort rejects null doc values according to missing policy" {
+    const alloc = std.testing.allocator;
+
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "status",
+        .path_match = "status",
+        .mapping = .{
+            .field_type = .keyword,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+
+    var hits = try alloc.alloc(types.SearchHit, 1);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .score = 1.0 };
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 1,
+        .graph_results = &.{},
+    };
+    defer result.deinit();
+
+    const Loader = struct {
+        fn load(_: ?*anyopaque, _: Allocator, _: types.SearchHit, field: []const u8) anyerror!?SortValue {
+            try std.testing.expectEqualStrings("status", field);
+            return .null_value;
+        }
+    };
+
+    const order_by = [_]types.SortField{.{ .field = "status", .desc = false }};
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedExactSort, sortAndPageSearchResultInPlace(&result, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 10,
+    }, null, testUnexpectedLoadStoredCallback, .{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .runtime_schema = schema,
+    }, .{
+        .require_native = true,
+        .load = Loader.load,
+    }));
+    const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("status", diagnostic.field);
+    try std.testing.expectEqualStrings("missing_null_policy", diagnostic.reason);
+    try std.testing.expectEqualStrings("missing_null_policy", diagnostic.detail);
+}
+
+test "native sort runtime fails closed on corrupt typed doc values" {
+    const alloc = std.testing.allocator;
+
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "rank",
+        .path_match = "rank",
+        .mapping = .{
+            .field_type = .numeric,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+
+    var corrupt_doc_values = [_]u8{
+        @intFromEnum(typed_dv.ValueType.u64_val),
+        1,
+        0,
+        0,
+        0,
+        14,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0xff,
+    };
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    const rank_idx = try seg_writer.addField("rank");
+    try seg_writer.addSection(rank_idx, .typed_doc_values, &corrupt_doc_values);
+    try seg_writer.addStoredDoc("doc:a", "{\"rank\":1}");
+    const segment = try seg_writer.build();
+    defer alloc.free(segment);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(segment);
+    const snapshot = writer.snapshot();
+
+    var hits = try alloc.alloc(types.SearchHit, 1);
+    hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .native_text_doc_id = 0,
+    };
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 1,
+        .graph_results = &.{},
+    };
+    defer result.deinit();
+
+    var native_sort_ctx = TextDocValueSortContext{ .snapshot = snapshot };
+    const order_by = [_]types.SortField{.{ .field = "rank", .desc = false }};
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedExactSort, sortAndPageSearchResultInPlace(&result, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 10,
+    }, null, testUnexpectedLoadStoredCallback, .{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .runtime_schema = schema,
+    }, .{
+        .ctx = &native_sort_ctx,
+        .require_native = true,
+        .load = loadTextDocValueSortValue,
+    }));
+    const diagnostic = takeLastSortRejectionDiagnostic().?;
+    try std.testing.expectEqualStrings("rank", diagnostic.field);
+    try std.testing.expectEqualStrings("missing_doc_values_coverage", diagnostic.reason);
+    try std.testing.expectEqualStrings("malformed_doc_values_section", diagnostic.detail);
+}
+
+const TestSortedPriceDoc = struct {
+    id: []const u8,
+    price: f64,
+    ordinal: u32,
+};
+
+fn buildTestSortedPriceSegmentAlloc(alloc: Allocator, docs: []const TestSortedPriceDoc) ![]u8 {
+    var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .f64_val, 1024);
+    defer dv_writer.deinit();
+    for (docs, 0..) |doc, i| try dv_writer.add(@intCast(i), .{ .f64_val = doc.price });
+    const dv_data = try dv_writer.build();
+    defer alloc.free(dv_data);
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    const price_idx = try seg_writer.addField("price");
+    try seg_writer.addSection(price_idx, .typed_doc_values, dv_data);
+    for (docs) |doc| {
+        const body = try std.fmt.allocPrint(alloc, "{{\"price\":{d}}}", .{doc.price});
+        defer alloc.free(body);
+        try seg_writer.addStoredDoc(doc.id, body);
+    }
+    const ordinals = try alloc.alloc(u32, docs.len);
+    defer alloc.free(ordinals);
+    for (docs, 0..) |doc, i| ordinals[i] = doc.ordinal;
+    try seg_writer.addDocOrdinals(ordinals);
+    const sort_fields = [_]segment_mod.SegmentIndexSortField{
+        .{ .field = "price" },
+        .{ .field = "_id" },
+    };
+    if (docs.len > 0) {
+        var first_bounds = [_]segment_mod.SegmentIndexSortBoundValue{
+            .{ .f64_val = docs[0].price },
+            .{ .id = docs[0].id },
+        };
+        var last_bounds = [_]segment_mod.SegmentIndexSortBoundValue{
+            .{ .f64_val = docs[docs.len - 1].price },
+            .{ .id = docs[docs.len - 1].id },
+        };
+        try seg_writer.addIndexSortMetadataWithBounds(&sort_fields, .{
+            .first = first_bounds[0..],
+            .last = last_bounds[0..],
+        });
+    } else {
+        try seg_writer.addIndexSortMetadata(&sort_fields);
+    }
+    return try seg_writer.build();
+}
+
+fn testSortedPriceSchema() runtime_schema_mod.TableSchema {
+    return .{
+        .dynamic_templates = &struct {
+            const value = [_]runtime_schema_mod.DynamicTemplate{.{
+                .name = "price",
+                .path_match = "price",
+                .mapping = .{
+                    .field_type = .numeric,
+                    .doc_values = true,
+                    .sortable = true,
+                    .analyzer = "keyword",
+                },
+            }};
+        }.value,
+        .index_sort = &struct {
+            const value = [_]runtime_schema_mod.IndexSortField{
+                .{ .field = "price" },
+                .{ .field = "_id" },
+            };
+        }.value,
+    };
+}
+
+test "match_all sorted segment seek merges sorted segments and applies cursors" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sorted-segment-seek", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var persistent = try persistent_mod.PersistentIndex.open(alloc, .{
+        .path = path_z.ptr,
+        .main_backend = .lsm_memory,
+    });
+    var persistent_owned = true;
+    errdefer if (persistent_owned) persistent.close();
+
+    const segment_a = try buildTestSortedPriceSegmentAlloc(alloc, &.{
+        .{ .id = "doc:a", .price = 1.0, .ordinal = 101 },
+        .{ .id = "doc:c", .price = 3.0, .ordinal = 103 },
+    });
+    defer alloc.free(segment_a);
+    try persistent.writer.addSegment(segment_a);
+    const segment_b = try buildTestSortedPriceSegmentAlloc(alloc, &.{
+        .{ .id = "doc:b", .price = 2.0, .ordinal = 102 },
+        .{ .id = "doc:d", .price = 4.0, .ordinal = 104 },
+    });
+    defer alloc.free(segment_b);
+    try persistent.writer.addSegment(segment_b);
+
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
+        .chunk_name = null,
+        .text_analysis = .{},
+        .runtime_schema = testSortedPriceSchema(),
+        .rebuild_root_path = "",
+        .persistent = persistent,
+    };
+    persistent_owned = false;
+    defer text_entry.persistent.close();
+
+    const order_by = [_]types.SortField{
+        .{ .field = "price" },
+        .{ .field = "_id" },
+    };
+    const plan = try planTextNativeSortFields(.{
+        .order_by = &order_by,
+        .limit = 2,
+    }, text_entry.persistent.snapshot(), text_entry.runtime_schema);
+    try std.testing.expect(plan.sorted_segment_executor_available);
+    const sorted_plan = SortExecutionPlan{
+        .kind = .sorted_segment_seek,
+        .require_native = true,
+        .runtime_schema = text_entry.runtime_schema,
+        .index_sort_match = true,
+        .sorted_segment_executor_available = true,
+        .sorted_segment_bounds_available = true,
+    };
+    const native_sort_ctx = TextDocValueSortContext{ .snapshot = text_entry.persistent.snapshot() };
+    const native_loader = NativeSortValueLoader{
+        .ctx = @constCast(&native_sort_ctx),
+        .require_native = true,
+        .load = loadTextDocValueSortValue,
+    };
+    const constraints = NativeDocIdConstraints{};
+    const executor = MatchAllExecutor{
+        .ctx = null,
+        .collect_candidates = undefined,
+        .text_index_entry = undefined,
+        .load_projected_document = undefined,
+        .load_stored = testUnexpectedLoadStoredCallback,
+    };
+
+    var first_page = try sortAndPageMatchAllSortedSegmentsAlloc(alloc, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 2,
+    }, executor, &constraints, &text_entry, sorted_plan, native_loader, null);
+    defer first_page.deinit();
+    try std.testing.expectEqual(@as(usize, 2), first_page.hits.len);
+    try std.testing.expectEqual(types.TotalHitsRelation.gte, first_page.total_hits_relation);
+    try std.testing.expectEqualStrings("doc:a", first_page.hits[0].id);
+    try std.testing.expectEqualStrings("doc:b", first_page.hits[1].id);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), first_page.hits[0].sort_values[0].float, 0.001);
+    try std.testing.expectEqualStrings("doc:a", first_page.hits[0].sort_values[1].string);
+    const first_profile = first_page.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("sorted_segment_seek", first_profile.plan);
+    try std.testing.expectEqualStrings("bounded_exact", first_profile.exactness);
+    try std.testing.expectEqualStrings("sorted_segment_scan", first_profile.source);
+    try std.testing.expectEqualStrings("match_all", first_profile.candidate_source);
+    try std.testing.expectEqual(@as(usize, 2), first_profile.collector_heap_peak);
+
+    const after_cursor = [_]std.json.Value{
+        .{ .float = 2.0 },
+        .{ .string = "doc:b" },
+    };
+    var after_page = try sortAndPageMatchAllSortedSegmentsAlloc(alloc, .{
+        .order_by = &order_by,
+        .search_after = &after_cursor,
+        .include_stored = false,
+        .limit = 2,
+    }, executor, &constraints, &text_entry, sorted_plan, native_loader, null);
+    defer after_page.deinit();
+    try std.testing.expectEqual(@as(usize, 2), after_page.hits.len);
+    try std.testing.expectEqualStrings("doc:c", after_page.hits[0].id);
+    try std.testing.expectEqualStrings("doc:d", after_page.hits[1].id);
+
+    var after_zero = try sortAndPageMatchAllSortedSegmentsAlloc(alloc, .{
+        .order_by = &order_by,
+        .search_after = &after_cursor,
+        .include_stored = false,
+        .profile = true,
+        .limit = 0,
+    }, executor, &constraints, &text_entry, sorted_plan, native_loader, null);
+    defer after_zero.deinit();
+    try std.testing.expectEqual(@as(usize, 0), after_zero.hits.len);
+    try std.testing.expectEqual(@as(u32, 2), after_zero.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, after_zero.total_hits_relation);
+    const after_zero_profile = after_zero.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("sorted_segment_seek", after_zero_profile.plan);
+    try std.testing.expectEqualStrings("bounded_exact", after_zero_profile.exactness);
+    try std.testing.expect(after_zero_profile.sorted_segment_scanned_count > 0);
+
+    const before_cursor = [_]std.json.Value{
+        .{ .float = 3.0 },
+        .{ .string = "doc:c" },
+    };
+    var before_page = try sortAndPageMatchAllSortedSegmentsAlloc(alloc, .{
+        .order_by = &order_by,
+        .search_before = &before_cursor,
+        .include_stored = false,
+        .limit = 2,
+    }, executor, &constraints, &text_entry, sorted_plan, native_loader, null);
+    defer before_page.deinit();
+    try std.testing.expectEqual(@as(usize, 2), before_page.hits.len);
+    try std.testing.expectEqualStrings("doc:a", before_page.hits[0].id);
+    try std.testing.expectEqualStrings("doc:b", before_page.hits[1].id);
+
+    var membership = SortedSegmentDocMembership{
+        .segments = try alloc.alloc(roaring.RoaringBitmap, 2),
+    };
+    var membership_initialized: usize = 0;
+    errdefer {
+        for (membership.segments[0..membership_initialized]) |*bitmap| bitmap.deinit();
+        alloc.free(membership.segments);
+    }
+    membership.segments[0] = roaring.RoaringBitmap.init(alloc);
+    membership_initialized += 1;
+    membership.segments[1] = roaring.RoaringBitmap.init(alloc);
+    membership_initialized += 1;
+    defer membership.deinit(alloc);
+    membership_initialized = 0;
+    try membership.segments[0].add(1);
+    try membership.segments[1].add(0);
+
+    var membership_page = try sortAndPageMatchAllSortedSegmentsAlloc(alloc, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 10,
+    }, executor, &constraints, &text_entry, sorted_plan, native_loader, &membership);
+    defer membership_page.deinit();
+    try std.testing.expectEqual(@as(usize, 2), membership_page.hits.len);
+    try std.testing.expectEqualStrings("doc:b", membership_page.hits[0].id);
+    try std.testing.expectEqualStrings("doc:c", membership_page.hits[1].id);
+
+    var membership_zero = try sortAndPageMatchAllSortedSegmentsAlloc(alloc, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 0,
+    }, executor, &constraints, &text_entry, sorted_plan, native_loader, &membership);
+    defer membership_zero.deinit();
+    try std.testing.expectEqual(@as(usize, 0), membership_zero.hits.len);
+    try std.testing.expectEqual(@as(u32, 2), membership_zero.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, membership_zero.total_hits_relation);
+
+    const ExpiryHarness = struct {
+        expired_checks: usize = 0,
+
+        fn isExpiredKey(ctx: ?*anyopaque, _: Allocator, key: []const u8) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.expired_checks += 1;
+            return std.mem.eql(u8, key, "doc:b");
+        }
+    };
+    var expiry_harness = ExpiryHarness{};
+    const expiring_executor = MatchAllExecutor{
+        .ctx = &expiry_harness,
+        .collect_candidates = undefined,
+        .text_index_entry = undefined,
+        .load_projected_document = undefined,
+        .load_stored = testUnexpectedLoadStoredCallback,
+        .is_expired_key = ExpiryHarness.isExpiredKey,
+    };
+    var expiring_page = try sortAndPageMatchAllSortedSegmentsAlloc(alloc, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 3,
+    }, expiring_executor, &constraints, &text_entry, sorted_plan, native_loader, null);
+    defer expiring_page.deinit();
+    try std.testing.expectEqual(@as(usize, 3), expiring_page.hits.len);
+    try std.testing.expectEqualStrings("doc:a", expiring_page.hits[0].id);
+    try std.testing.expectEqualStrings("doc:c", expiring_page.hits[1].id);
+    try std.testing.expectEqualStrings("doc:d", expiring_page.hits[2].id);
+    try std.testing.expect(expiry_harness.expired_checks >= 4);
+
+    expiry_harness.expired_checks = 0;
+    var expiring_zero = try sortAndPageMatchAllSortedSegmentsAlloc(alloc, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 0,
+    }, expiring_executor, &constraints, &text_entry, sorted_plan, native_loader, null);
+    defer expiring_zero.deinit();
+    try std.testing.expectEqual(@as(usize, 0), expiring_zero.hits.len);
+    try std.testing.expectEqual(@as(u32, 3), expiring_zero.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, expiring_zero.total_hits_relation);
+    try std.testing.expect(expiry_harness.expired_checks >= 4);
+
+    var filter = doc_set.ResolvedDocFilter{
+        .include = try doc_set.fromOrdinalsAlloc(alloc, &.{ 102, 104 }),
+    };
+    defer filter.deinit(alloc);
+
+    const Harness = struct {
+        text_entry: *index_manager_mod.IndexManager.TextIndex,
+        collect_count: usize = 0,
+
+        fn collectCandidates(
+            ctx: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: MatchAllCandidateCollectOptions,
+        ) anyerror!MatchAllCandidates {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.collect_count += 1;
+            return error.UnexpectedTestCall;
+        }
+
+        fn textIndexEntry(
+            ctx: ?*anyopaque,
+            _: ?[]const u8,
+        ) anyerror!?*index_manager_mod.IndexManager.TextIndex {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return self.text_entry;
+        }
+
+        fn resolveDocSetDocIds(
+            _: ?*anyopaque,
+            alloc_inner: Allocator,
+            set: *const doc_set.ResolvedDocSet,
+            _: ?u64,
+        ) anyerror!?[]const []const u8 {
+            var out = std.ArrayListUnmanaged([]const u8).empty;
+            errdefer freeDocIdArrayList(alloc_inner, &out);
+            switch (set.*) {
+                .ordinals => |ordinals| {
+                    for (ordinals) |ordinal| {
+                        const id: []const u8 = switch (ordinal) {
+                            102 => "doc:b",
+                            104 => "doc:d",
+                            else => return error.NotFound,
+                        };
+                        try appendOwnedDocId(alloc_inner, &out, id);
+                    }
+                    return try out.toOwnedSlice(alloc_inner);
+                },
+                else => return null,
+            }
+        }
+
+        fn loadProjectedDocument(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: []const u8,
+        ) anyerror![]u8 {
+            return error.UnexpectedTestCall;
+        }
+
+        fn isExpiredKey(
+            ctx: ?*anyopaque,
+            _: Allocator,
+            key: []const u8,
+        ) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.expired_checks += 1;
+            const expired_doc = self.expired_doc orelse return false;
+            return std.mem.eql(u8, key, expired_doc);
+        }
+    };
+
+    var harness = Harness{ .text_entry = &text_entry };
+    var filtered_page = try searchMatchAll(alloc, .{
+        .resolved_doc_filter = &filter,
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 10,
+    }, .{
+        .ctx = &harness,
+        .collect_candidates = Harness.collectCandidates,
+        .text_index_entry = Harness.textIndexEntry,
+        .resolve_doc_set_doc_ids = Harness.resolveDocSetDocIds,
+        .load_projected_document = Harness.loadProjectedDocument,
+        .load_stored = testUnexpectedLoadStoredCallback,
+    });
+    defer filtered_page.deinit();
+    try std.testing.expectEqual(@as(usize, 2), filtered_page.hits.len);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, filtered_page.total_hits_relation);
+    try std.testing.expectEqual(@as(usize, 0), harness.collect_count);
+    try std.testing.expectEqualStrings("doc:b", filtered_page.hits[0].id);
+    try std.testing.expectEqualStrings("doc:d", filtered_page.hits[1].id);
+}
+
+test "match_all sorted segment seek honors deleted old sort values after upsert" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sorted-segment-upsert-live-docs", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var persistent = try persistent_mod.PersistentIndex.open(alloc, .{
+        .path = path_z.ptr,
+        .main_backend = .lsm_memory,
+    });
+    var persistent_owned = true;
+    errdefer if (persistent_owned) persistent.close();
+
+    const original_segment = try buildTestSortedPriceSegmentAlloc(alloc, &.{
+        .{ .id = "doc:a", .price = 1.0, .ordinal = 101 },
+        .{ .id = "doc:b", .price = 5.0, .ordinal = 105 },
+    });
+    defer alloc.free(original_segment);
+    try persistent.writer.addSegment(original_segment);
+    try std.testing.expect(try persistent.writer.deleteById("doc:b"));
+
+    const upsert_segment = try buildTestSortedPriceSegmentAlloc(alloc, &.{
+        .{ .id = "doc:b", .price = 2.0, .ordinal = 102 },
+        .{ .id = "doc:c", .price = 3.0, .ordinal = 103 },
+    });
+    defer alloc.free(upsert_segment);
+    try persistent.writer.addSegment(upsert_segment);
+
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
+        .chunk_name = null,
+        .text_analysis = .{},
+        .runtime_schema = testSortedPriceSchema(),
+        .rebuild_root_path = "",
+        .persistent = persistent,
+    };
+    persistent_owned = false;
+    defer text_entry.persistent.close();
+
+    const Harness = struct {
+        text_entry: *index_manager_mod.IndexManager.TextIndex,
+        collect_count: usize = 0,
+        projected_load_count: usize = 0,
+
+        fn collectCandidates(
+            ctx: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: MatchAllCandidateCollectOptions,
+        ) anyerror!MatchAllCandidates {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.collect_count += 1;
+            return error.UnexpectedTestCall;
+        }
+
+        fn textIndexEntry(
+            ctx: ?*anyopaque,
+            _: ?[]const u8,
+        ) anyerror!?*index_manager_mod.IndexManager.TextIndex {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return self.text_entry;
+        }
+
+        fn loadProjectedDocument(
+            ctx: ?*anyopaque,
+            alloc_inner: Allocator,
+            _: types.SearchRequest,
+            id: []const u8,
+        ) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.projected_load_count += 1;
+            if (std.mem.eql(u8, id, "doc:c")) return error.UnexpectedTestCall;
+            return try std.fmt.allocPrint(alloc_inner, "{{\"id\":\"{s}\"}}", .{id});
+        }
+    };
+
+    var harness = Harness{ .text_entry = &text_entry };
+    const order_by = [_]types.SortField{
+        .{ .field = "price" },
+        .{ .field = "_id" },
+    };
+    var page = try searchMatchAll(alloc, .{
+        .index_name = "ft",
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 10,
+    }, .{
+        .ctx = &harness,
+        .collect_candidates = Harness.collectCandidates,
+        .text_index_entry = Harness.textIndexEntry,
+        .load_projected_document = Harness.loadProjectedDocument,
+        .load_stored = testUnexpectedLoadStoredCallback,
+    });
+    defer page.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), harness.collect_count);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, page.total_hits_relation);
+    try std.testing.expectEqual(@as(usize, 3), page.hits.len);
+    try std.testing.expectEqualStrings("doc:a", page.hits[0].id);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), page.hits[0].sort_values[0].float, 0.001);
+    try std.testing.expectEqualStrings("doc:b", page.hits[1].id);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), page.hits[1].sort_values[0].float, 0.001);
+    try std.testing.expectEqualStrings("doc:c", page.hits[2].id);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.0), page.hits[2].sort_values[0].float, 0.001);
+
+    const profile = page.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("sorted_segment_seek", profile.plan);
+    try std.testing.expectEqualStrings("bounded_exact", profile.exactness);
+    try std.testing.expectEqualStrings("sorted_segment_scan", profile.source);
+    try std.testing.expectEqualStrings("source_free", profile.source_load);
+    try std.testing.expectEqual(@as(u64, 0), profile.stored_json_load_count);
+    try std.testing.expectEqual(@as(u64, 0), profile.projected_source_load_count);
+    try std.testing.expectEqual(@as(usize, 0), harness.projected_load_count);
+
+    var stored_page = try searchMatchAll(alloc, .{
+        .index_name = "ft",
+        .order_by = &order_by,
+        .include_stored = true,
+        .profile = true,
+        .limit = 2,
+    }, .{
+        .ctx = &harness,
+        .collect_candidates = Harness.collectCandidates,
+        .text_index_entry = Harness.textIndexEntry,
+        .load_projected_document = Harness.loadProjectedDocument,
+        .load_stored = testUnexpectedLoadStoredCallback,
+    });
+    defer stored_page.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), stored_page.hits.len);
+    try std.testing.expectEqualStrings("doc:a", stored_page.hits[0].id);
+    try std.testing.expect(stored_page.hits[0].stored_data != null);
+    try std.testing.expectEqualStrings("doc:b", stored_page.hits[1].id);
+    try std.testing.expect(stored_page.hits[1].stored_data != null);
+    try std.testing.expectEqual(@as(usize, 2), harness.projected_load_count);
+    const stored_profile = stored_page.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("sorted_segment_seek", stored_profile.plan);
+    try std.testing.expectEqualStrings("bounded_exact", stored_profile.exactness);
+    try std.testing.expectEqualStrings("projected_source_after_page", stored_profile.source_load);
+    try std.testing.expectEqual(@as(u64, 0), stored_profile.stored_json_load_count);
+    try std.testing.expectEqual(@as(u64, 2), stored_profile.projected_source_load_count);
+}
+
+test "match_all index sort uses doc values collector for selective native filters" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sorted-segment-selective-filter-plan", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    const docs = try alloc.alloc(TestSortedPriceDoc, 128);
+    defer alloc.free(docs);
+    const doc_ids = try alloc.alloc([]u8, docs.len);
+    defer {
+        for (doc_ids) |id| alloc.free(id);
+        alloc.free(doc_ids);
+    }
+    for (docs, 0..) |*doc, i| {
+        doc_ids[i] = try std.fmt.allocPrint(alloc, "doc:{d:0>3}", .{i});
+        doc.* = .{
+            .id = doc_ids[i],
+            .price = @floatFromInt(i),
+            .ordinal = @intCast(1000 + i),
+        };
+    }
+
+    var persistent = try persistent_mod.PersistentIndex.open(alloc, .{
+        .path = path_z.ptr,
+        .main_backend = .lsm_memory,
+    });
+    var persistent_owned = true;
+    errdefer if (persistent_owned) persistent.close();
+
+    const segment = try buildTestSortedPriceSegmentAlloc(alloc, docs);
+    defer alloc.free(segment);
+    try persistent.writer.addSegment(segment);
+
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
+        .chunk_name = null,
+        .text_analysis = .{},
+        .runtime_schema = testSortedPriceSchema(),
+        .rebuild_root_path = "",
+        .persistent = persistent,
+    };
+    persistent_owned = false;
+    defer text_entry.persistent.close();
+
+    const Harness = struct {
+        text_entry: *index_manager_mod.IndexManager.TextIndex,
+        collect_count: usize = 0,
+        stream_count: usize = 0,
+        expired_doc: ?[]const u8 = null,
+        expired_checks: usize = 0,
+
+        fn collectCandidates(
+            ctx: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: MatchAllCandidateCollectOptions,
+        ) anyerror!MatchAllCandidates {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.collect_count += 1;
+            return error.UnexpectedTestCall;
+        }
+
+        fn streamCandidates(
+            ctx: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: MatchAllCandidateCollectOptions,
+            _: ?*anyopaque,
+            _: MatchAllCandidateConsumer,
+        ) anyerror!MatchAllCandidateStreamStats {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.stream_count += 1;
+            return error.UnexpectedTestCall;
+        }
+
+        fn textIndexEntry(
+            ctx: ?*anyopaque,
+            _: ?[]const u8,
+        ) anyerror!?*index_manager_mod.IndexManager.TextIndex {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return self.text_entry;
+        }
+
+        fn loadProjectedDocument(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: []const u8,
+        ) anyerror![]u8 {
+            return error.UnexpectedTestCall;
+        }
+
+        fn isExpiredKey(
+            ctx: ?*anyopaque,
+            _: Allocator,
+            key: []const u8,
+        ) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.expired_checks += 1;
+            const expired_doc = self.expired_doc orelse return false;
+            return std.mem.eql(u8, key, expired_doc);
+        }
+    };
+
+    var filter = doc_set.ResolvedDocFilter{
+        .include = try doc_set.fromOrdinalsAlloc(alloc, &.{ 1005, 1010 }),
+    };
+    defer filter.deinit(alloc);
+
+    var harness = Harness{ .text_entry = &text_entry };
+    const order_by = [_]types.SortField{.{ .field = "price" }};
+    var result = try searchMatchAll(alloc, .{
+        .index_name = "ft",
+        .resolved_doc_filter = &filter,
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 10,
+    }, .{
+        .ctx = &harness,
+        .collect_candidates = Harness.collectCandidates,
+        .collect_candidates_stream = Harness.streamCandidates,
+        .text_index_entry = Harness.textIndexEntry,
+        .load_projected_document = Harness.loadProjectedDocument,
+        .load_stored = testUnexpectedLoadStoredCallback,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), harness.collect_count);
+    try std.testing.expectEqual(@as(usize, 0), harness.stream_count);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, result.total_hits_relation);
+    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqualStrings("doc:005", result.hits[0].id);
+    try std.testing.expectEqualStrings("doc:010", result.hits[1].id);
+
+    const profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", profile.plan);
+    try std.testing.expectEqualStrings("exact", profile.exactness);
+    try std.testing.expectEqualStrings("doc_values_collector", profile.source);
+    try std.testing.expectEqualStrings("native_filter", profile.candidate_source);
+    try std.testing.expectEqualStrings("selective_filter_doc_values_collector", profile.selection_reason);
+    try std.testing.expect(profile.selective_filter_doc_values_preferred);
+    try std.testing.expectEqualStrings("doc_nums", profile.native_filter_mode);
+    try std.testing.expectEqual(@as(u64, 2), profile.native_filter_candidate_count);
+    try std.testing.expectEqual(@as(u64, 0), profile.native_filter_exclusion_count);
+    try std.testing.expectEqual(@as(u64, 128), profile.cost_model_live_docs);
+    try std.testing.expectEqual(@as(u64, 2), profile.cost_model_candidate_count);
+    try std.testing.expectEqual(@as(u64, 4096), profile.cost_model_selective_limit);
+    try std.testing.expectEqual(@as(u64, 2), profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 2), profile.selected_count);
+    try std.testing.expectEqual(@as(u64, 2), profile.native_doc_value_hit_count);
+
+    harness.expired_doc = "doc:005";
+    var expired_result = try searchMatchAll(alloc, .{
+        .index_name = "ft",
+        .resolved_doc_filter = &filter,
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 10,
+    }, .{
+        .ctx = &harness,
+        .collect_candidates = Harness.collectCandidates,
+        .collect_candidates_stream = Harness.streamCandidates,
+        .text_index_entry = Harness.textIndexEntry,
+        .load_projected_document = Harness.loadProjectedDocument,
+        .load_stored = testUnexpectedLoadStoredCallback,
+        .is_expired_key = Harness.isExpiredKey,
+    });
+    defer expired_result.deinit();
+
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, expired_result.total_hits_relation);
+    try std.testing.expectEqual(@as(u32, 1), expired_result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), expired_result.hits.len);
+    try std.testing.expectEqualStrings("doc:010", expired_result.hits[0].id);
+    const expired_profile = expired_result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("exact", expired_profile.exactness);
+    try std.testing.expectEqualStrings("selective_filter_doc_values_collector", expired_profile.selection_reason);
+    try std.testing.expect(expired_profile.selective_filter_doc_values_preferred);
+    try std.testing.expectEqualStrings("doc_nums", expired_profile.native_filter_mode);
+    try std.testing.expectEqual(@as(u64, 2), expired_profile.native_filter_candidate_count);
+    try std.testing.expectEqual(@as(u64, 0), expired_profile.native_filter_exclusion_count);
+    try std.testing.expectEqual(@as(u64, 1), expired_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 1), expired_profile.selected_count);
+    try std.testing.expectEqual(@as(u64, 1), expired_profile.native_doc_value_hit_count);
+    try std.testing.expect(harness.expired_checks >= 2);
+}
+
+test "text field sort uses exact native doc values filter path without index sort" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/text-native-doc-values-filter-sort", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var persistent = try persistent_mod.PersistentIndex.open(alloc, .{
+        .path = path_z.ptr,
+        .main_backend = .lsm_memory,
+    });
+    var persistent_owned = true;
+    errdefer if (persistent_owned) persistent.close();
+
+    const text_fields_alpha = [_]introducer_mod.TextField{.{ .field_name = "body", .text = "alpha" }};
+    const text_fields_beta = [_]introducer_mod.TextField{.{ .field_name = "body", .text = "beta" }};
+    const docs = [_]introducer_mod.TextDocument{
+        .{
+            .id = "doc:c",
+            .stored_data = "{\"price\":3,\"body\":\"alpha\"}",
+            .text_fields = &text_fields_alpha,
+            .doc_ordinal = 103,
+        },
+        .{
+            .id = "doc:b",
+            .stored_data = "{\"price\":2,\"body\":\"beta\"}",
+            .text_fields = &text_fields_beta,
+            .doc_ordinal = 102,
+        },
+        .{
+            .id = "doc:a",
+            .stored_data = "{\"price\":1,\"body\":\"alpha\"}",
+            .text_fields = &text_fields_alpha,
+            .doc_ordinal = 101,
+        },
+        .{
+            .id = "doc:d",
+            .stored_data = "{\"price\":4,\"body\":\"alpha\"}",
+            .text_fields = &text_fields_alpha,
+            .doc_ordinal = 104,
+        },
+    };
+    const segment = try introducer_mod.buildSegmentFromTextWithAnalysisOptions(alloc, &docs, &analysis_mod.default_analyzer, .{}, .{});
+    defer alloc.free(segment);
+    try persistent.writer.addSegment(segment);
+
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
+        .chunk_name = null,
+        .text_analysis = .{},
+        .runtime_schema = testSortedPriceSchema(),
+        .rebuild_root_path = "",
+        .persistent = persistent,
+    };
+    persistent_owned = false;
+    defer text_entry.persistent.close();
+
+    const Harness = struct {
+        text_entry: *index_manager_mod.IndexManager.TextIndex,
+        postprocess_count: usize = 0,
+        expired_doc: ?[]const u8 = null,
+        expired_checks: usize = 0,
+
+        fn textIndexEntry(
+            ctx: ?*anyopaque,
+            _: ?[]const u8,
+        ) anyerror!?*index_manager_mod.IndexManager.TextIndex {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return self.text_entry;
+        }
+
+        fn textIndexIsChunkBacked(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: ?[]const u8,
+        ) anyerror!bool {
+            return false;
+        }
+
+        fn searchMatchAll(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+        ) anyerror!types.SearchResult {
+            return error.UnexpectedTestCall;
+        }
+
+        fn projectStoredSearch(
+            _: ?*anyopaque,
+            project_alloc: Allocator,
+            _: types.SearchRequest,
+            _: []const u8,
+            raw: []const u8,
+        ) anyerror![]u8 {
+            return try project_alloc.dupe(u8, raw);
+        }
+
+        fn loadStored(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: []const u8,
+        ) anyerror!?[]u8 {
+            return error.UnexpectedTestCall;
+        }
+
+        fn isExpiredKey(
+            ctx: ?*anyopaque,
+            _: Allocator,
+            key: []const u8,
+        ) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.expired_checks += 1;
+            const expired_doc = self.expired_doc orelse return false;
+            return std.mem.eql(u8, key, expired_doc);
+        }
+
+        fn postprocess(
+            ctx: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            result: types.SearchResult,
+            _: bool,
+        ) anyerror!types.SearchResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.postprocess_count += 1;
+            return result;
+        }
+    };
+
+    var harness = Harness{ .text_entry = &text_entry };
+    const order_by = [_]types.SortField{.{ .field = "price" }};
+    var result = try searchTextQuery(alloc, .{
+        .index_name = "ft",
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 2,
+    }, .{ .term = .{ .field = "body", .term = "alpha" } }, .{
+        .ctx = &harness,
+        .text_index_entry = Harness.textIndexEntry,
+        .text_index_is_chunk_backed = Harness.textIndexIsChunkBacked,
+        .search_match_all = Harness.searchMatchAll,
+        .project_stored_search = Harness.projectStoredSearch,
+        .load_stored = Harness.loadStored,
+        .is_expired_key = Harness.isExpiredKey,
+        .postprocess = Harness.postprocess,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), harness.postprocess_count);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, result.total_hits_relation);
+    try std.testing.expectEqual(@as(u32, 3), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), result.hits[0].sort_values[0].float, 0.001);
+    try std.testing.expectEqualStrings("doc:c", result.hits[1].id);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.0), result.hits[1].sort_values[0].float, 0.001);
+
+    const profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", profile.plan);
+    try std.testing.expectEqualStrings("doc_values_collector", profile.source);
+    try std.testing.expectEqualStrings("exact", profile.exactness);
+    try std.testing.expectEqual(@as(u64, 3), profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 2), profile.selected_count);
+    try std.testing.expectEqual(@as(u64, 3), profile.native_doc_value_hit_count);
+    try std.testing.expectEqual(@as(u64, 0), profile.stored_json_load_count);
+    try std.testing.expectEqual(@as(usize, 2), profile.window_capacity);
+    try std.testing.expectEqual(@as(usize, 2), profile.window_len);
+    try std.testing.expectEqual(@as(usize, 2), profile.collector_heap_peak);
+
+    var zero_limit_result = try searchTextQuery(alloc, .{
+        .index_name = "ft",
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 0,
+    }, .{ .term = .{ .field = "body", .term = "alpha" } }, .{
+        .ctx = &harness,
+        .text_index_entry = Harness.textIndexEntry,
+        .text_index_is_chunk_backed = Harness.textIndexIsChunkBacked,
+        .search_match_all = Harness.searchMatchAll,
+        .project_stored_search = Harness.projectStoredSearch,
+        .load_stored = Harness.loadStored,
+        .is_expired_key = Harness.isExpiredKey,
+        .postprocess = Harness.postprocess,
+    });
+    defer zero_limit_result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), zero_limit_result.hits.len);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, zero_limit_result.total_hits_relation);
+    try std.testing.expectEqual(@as(u32, 3), zero_limit_result.total_hits);
+    const zero_limit_profile = zero_limit_result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", zero_limit_profile.plan);
+    try std.testing.expectEqualStrings("doc_values_collector", zero_limit_profile.source);
+    try std.testing.expectEqualStrings("exact", zero_limit_profile.exactness);
+    try std.testing.expectEqual(@as(u64, 3), zero_limit_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 0), zero_limit_profile.selected_count);
+    try std.testing.expectEqual(@as(u64, 0), zero_limit_profile.native_doc_value_hit_count);
+    try std.testing.expectEqual(@as(u64, 0), zero_limit_profile.stored_json_load_count);
+    try std.testing.expectEqual(@as(u64, 0), zero_limit_profile.window_capacity);
+    try std.testing.expectEqual(@as(u64, 0), zero_limit_profile.window_len);
+    try std.testing.expectEqual(@as(usize, 0), harness.postprocess_count);
+
+    var transformed_result = try searchTextQuery(alloc, .{
+        .index_name = "ft",
+        .order_by = &order_by,
+        .merge_config = .{},
+        .include_stored = false,
+        .profile = true,
+        .limit = 2,
+    }, .{ .term = .{ .field = "body", .term = "alpha" } }, .{
+        .ctx = &harness,
+        .text_index_entry = Harness.textIndexEntry,
+        .text_index_is_chunk_backed = Harness.textIndexIsChunkBacked,
+        .search_match_all = Harness.searchMatchAll,
+        .project_stored_search = Harness.projectStoredSearch,
+        .load_stored = Harness.loadStored,
+        .postprocess = Harness.postprocess,
+    });
+    defer transformed_result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), harness.postprocess_count);
+    try std.testing.expectEqual(@as(usize, 2), transformed_result.hits.len);
+    try std.testing.expectEqualStrings("doc:a", transformed_result.hits[0].id);
+    try std.testing.expectEqualStrings("doc:c", transformed_result.hits[1].id);
+    const transformed_profile = transformed_result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", transformed_profile.plan);
+
+    var cursor_harness = Harness{ .text_entry = &text_entry };
+    const cursor = [_]std.json.Value{.{ .string = "doc:a" }};
+    var cursor_result = try searchTextQuery(alloc, .{
+        .index_name = "ft",
+        .search_after = &cursor,
+        .include_stored = false,
+        .profile = true,
+        .limit = 1,
+    }, .{ .term = .{ .field = "body", .term = "alpha" } }, .{
+        .ctx = &cursor_harness,
+        .text_index_entry = Harness.textIndexEntry,
+        .text_index_is_chunk_backed = Harness.textIndexIsChunkBacked,
+        .search_match_all = Harness.searchMatchAll,
+        .project_stored_search = Harness.projectStoredSearch,
+        .load_stored = Harness.loadStored,
+        .postprocess = Harness.postprocess,
+    });
+    defer cursor_result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), cursor_harness.postprocess_count);
+    try std.testing.expectEqual(@as(usize, 1), cursor_result.hits.len);
+    try std.testing.expectEqualStrings("doc:c", cursor_result.hits[0].id);
+    try std.testing.expectEqualStrings("doc:c", cursor_result.hits[0].sort_values[0].string);
+    const cursor_profile = cursor_result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("id_only", cursor_profile.plan);
+    try std.testing.expectEqualStrings("candidate_collector", cursor_profile.source);
+    try std.testing.expectEqualStrings("comparator", cursor_profile.cursor_support);
+
+    const c = struct {
+        extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    const budget_env = "ANTFLY_TEXT_LATE_VISIBILITY_EXACT_CANDIDATE_BUDGET";
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(budget_env, "2", 1));
+    defer _ = c.unsetenv(budget_env);
+
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, searchTextQuery(alloc, .{
+        .index_name = "ft",
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 2,
+    }, .{ .term = .{ .field = "body", .term = "alpha" } }, .{
+        .ctx = &harness,
+        .text_index_entry = Harness.textIndexEntry,
+        .text_index_is_chunk_backed = Harness.textIndexIsChunkBacked,
+        .search_match_all = Harness.searchMatchAll,
+        .project_stored_search = Harness.projectStoredSearch,
+        .load_stored = Harness.loadStored,
+        .postprocess = Harness.postprocess,
+    }));
+    const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("ft", diagnostic.field);
+    try std.testing.expectEqualStrings("candidate_budget_exceeded", diagnostic.reason);
+    try std.testing.expectEqualStrings("text_field_sort_candidate_window", diagnostic.detail);
+}
+
+test "text score query exposes score top k sort profile" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/text-score-top-k-profile", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var persistent = try persistent_mod.PersistentIndex.open(alloc, .{
+        .path = path_z.ptr,
+        .main_backend = .lsm_memory,
+    });
+    var persistent_owned = true;
+    errdefer if (persistent_owned) persistent.close();
+
+    const text_fields_alpha = [_]introducer_mod.TextField{.{ .field_name = "body", .text = "alpha" }};
+    const text_fields_beta = [_]introducer_mod.TextField{.{ .field_name = "body", .text = "beta" }};
+    const docs = [_]introducer_mod.TextDocument{
+        .{
+            .id = "doc:a",
+            .stored_data = "{\"body\":\"alpha\"}",
+            .text_fields = &text_fields_alpha,
+            .doc_ordinal = 101,
+        },
+        .{
+            .id = "doc:b",
+            .stored_data = "{\"body\":\"alpha beta\"}",
+            .text_fields = &text_fields_beta,
+            .doc_ordinal = 102,
+        },
+    };
+    const segment = try introducer_mod.buildSegmentFromTextWithAnalysisOptions(alloc, &docs, &analysis_mod.default_analyzer, .{}, .{});
+    defer alloc.free(segment);
+    try persistent.writer.addSegment(segment);
+
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
+        .chunk_name = null,
+        .text_analysis = .{},
+        .runtime_schema = .{},
+        .rebuild_root_path = "",
+        .persistent = persistent,
+    };
+    persistent_owned = false;
+    defer text_entry.persistent.close();
+
+    const Harness = struct {
+        text_entry: *index_manager_mod.IndexManager.TextIndex,
+        postprocess_count: usize = 0,
+
+        fn textIndexEntry(
+            ctx: ?*anyopaque,
+            _: ?[]const u8,
+        ) anyerror!?*index_manager_mod.IndexManager.TextIndex {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return self.text_entry;
+        }
+
+        fn textIndexIsChunkBacked(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: ?[]const u8,
+        ) anyerror!bool {
+            return false;
+        }
+
+        fn searchMatchAll(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+        ) anyerror!types.SearchResult {
+            return error.UnexpectedTestCall;
+        }
+
+        fn projectStoredSearch(
+            _: ?*anyopaque,
+            project_alloc: Allocator,
+            _: types.SearchRequest,
+            _: []const u8,
+            raw: []const u8,
+        ) anyerror![]u8 {
+            return try project_alloc.dupe(u8, raw);
+        }
+
+        fn loadStored(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: []const u8,
+        ) anyerror!?[]u8 {
+            return error.UnexpectedTestCall;
+        }
+
+        fn isExpiredKey(
+            ctx: ?*anyopaque,
+            _: Allocator,
+            key: []const u8,
+        ) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.expired_checks += 1;
+            const expired_doc = self.expired_doc orelse return false;
+            return std.mem.eql(u8, key, expired_doc);
+        }
+
+        fn postprocess(
+            ctx: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            result: types.SearchResult,
+            _: bool,
+        ) anyerror!types.SearchResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.postprocess_count += 1;
+            return result;
+        }
+    };
+
+    logNativeSortPlanRejection("stale", "stale_reason", "stale_detail");
+    var harness = Harness{ .text_entry = &text_entry };
+    var result = try searchTextQuery(alloc, .{
+        .index_name = "ft",
+        .include_stored = false,
+        .profile = true,
+        .limit = 2,
+    }, .{ .term = .{ .field = "body", .term = "alpha" } }, .{
+        .ctx = &harness,
+        .text_index_entry = Harness.textIndexEntry,
+        .text_index_is_chunk_backed = Harness.textIndexIsChunkBacked,
+        .search_match_all = Harness.searchMatchAll,
+        .project_stored_search = Harness.projectStoredSearch,
+        .load_stored = Harness.loadStored,
+        .postprocess = Harness.postprocess,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), harness.postprocess_count);
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    const profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("score_top_k", profile.plan);
+    try std.testing.expectEqualStrings("score_top_k", profile.source);
+    try std.testing.expectEqualStrings("exact", profile.exactness);
+    try std.testing.expectEqualStrings("source_free", profile.source_load);
+    try std.testing.expectEqual(@as(u64, 1), profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 1), profile.selected_count);
+    try std.testing.expectEqualStrings("", profile.sort_rejection_reason);
+    try std.testing.expectEqualStrings("", profile.sort_rejection_detail);
+    try std.testing.expectEqualStrings("", profile.sort_rejection_field.slice());
+}
+
+test "text ordered query rejects unresolved stored pattern filters" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/text-ordered-unresolved-filter", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var persistent = try persistent_mod.PersistentIndex.open(alloc, .{
+        .path = path_z.ptr,
+        .main_backend = .lsm_memory,
+    });
+    var persistent_owned = true;
+    errdefer if (persistent_owned) persistent.close();
+
+    const text_fields_alpha = [_]introducer_mod.TextField{.{ .field_name = "body", .text = "alpha" }};
+    const docs = [_]introducer_mod.TextDocument{
+        .{
+            .id = "doc:a",
+            .stored_data = "{\"body\":\"alpha\",\"tier\":\"gold\"}",
+            .text_fields = &text_fields_alpha,
+            .doc_ordinal = 101,
+        },
+    };
+    const segment = try introducer_mod.buildSegmentFromTextWithAnalysisOptions(alloc, &docs, &analysis_mod.default_analyzer, .{}, .{});
+    defer alloc.free(segment);
+    try persistent.writer.addSegment(segment);
+
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
+        .chunk_name = null,
+        .text_analysis = .{},
+        .runtime_schema = .{},
+        .rebuild_root_path = "",
+        .persistent = persistent,
+    };
+    persistent_owned = false;
+    defer text_entry.persistent.close();
+
+    const Harness = struct {
+        text_entry: *index_manager_mod.IndexManager.TextIndex,
+        postprocess_count: usize = 0,
+
+        fn textIndexEntry(
+            ctx: ?*anyopaque,
+            _: ?[]const u8,
+        ) anyerror!?*index_manager_mod.IndexManager.TextIndex {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return self.text_entry;
+        }
+
+        fn textIndexIsChunkBacked(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: ?[]const u8,
+        ) anyerror!bool {
+            return false;
+        }
+
+        fn searchMatchAll(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+        ) anyerror!types.SearchResult {
+            return error.UnexpectedTestCall;
+        }
+
+        fn projectStoredSearch(
+            _: ?*anyopaque,
+            project_alloc: Allocator,
+            _: types.SearchRequest,
+            _: []const u8,
+            raw: []const u8,
+        ) anyerror![]u8 {
+            return try project_alloc.dupe(u8, raw);
+        }
+
+        fn loadStored(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: []const u8,
+        ) anyerror!?[]u8 {
+            return error.UnexpectedTestCall;
+        }
+
+        fn isExpiredKey(
+            ctx: ?*anyopaque,
+            _: Allocator,
+            key: []const u8,
+        ) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.expired_checks += 1;
+            const expired_doc = self.expired_doc orelse return false;
+            return std.mem.eql(u8, key, expired_doc);
+        }
+
+        fn postprocess(
+            ctx: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            result: types.SearchResult,
+            _: bool,
+        ) anyerror!types.SearchResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.postprocess_count += 1;
+            return result;
+        }
+    };
+
+    var harness = Harness{ .text_entry = &text_entry };
+    const order_by = [_]types.SortField{.{ .field = "_score", .desc = true }};
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, searchTextQuery(alloc, .{
+        .index_name = "ft",
+        .filter_query_json = "{\"term\":{\"tier\":\"gold\"}}",
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 1,
+    }, .{ .term = .{ .field = "body", .term = "alpha" } }, .{
+        .ctx = &harness,
+        .text_index_entry = Harness.textIndexEntry,
+        .text_index_is_chunk_backed = Harness.textIndexIsChunkBacked,
+        .search_match_all = Harness.searchMatchAll,
+        .project_stored_search = Harness.projectStoredSearch,
+        .load_stored = Harness.loadStored,
+        .postprocess = Harness.postprocess,
+    }));
+    const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("missing_native_filter_coverage", diagnostic.reason);
+    try std.testing.expectEqualStrings("filter_query_json_unresolved", diagnostic.detail);
+    try std.testing.expectEqual(@as(usize, 0), harness.postprocess_count);
+}
+
+test "text field sort uses sorted segment membership path when index sort matches" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/text-sorted-segment-membership", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var persistent = try persistent_mod.PersistentIndex.open(alloc, .{
+        .path = path_z.ptr,
+        .main_backend = .lsm_memory,
+    });
+    var persistent_owned = true;
+    errdefer if (persistent_owned) persistent.close();
+
+    const text_fields_alpha = [_]introducer_mod.TextField{.{ .field_name = "body", .text = "alpha" }};
+    const text_fields_beta = [_]introducer_mod.TextField{.{ .field_name = "body", .text = "beta" }};
+    const docs = [_]introducer_mod.TextDocument{
+        .{
+            .id = "doc:c",
+            .stored_data = "{\"price\":3,\"body\":\"alpha\"}",
+            .text_fields = &text_fields_alpha,
+            .doc_ordinal = 103,
+        },
+        .{
+            .id = "doc:b",
+            .stored_data = "{\"price\":2,\"body\":\"beta\"}",
+            .text_fields = &text_fields_beta,
+            .doc_ordinal = 102,
+        },
+        .{
+            .id = "doc:a",
+            .stored_data = "{\"price\":1,\"body\":\"alpha\"}",
+            .text_fields = &text_fields_alpha,
+            .doc_ordinal = 101,
+        },
+        .{
+            .id = "doc:d",
+            .stored_data = "{\"price\":4,\"body\":\"alpha\"}",
+            .text_fields = &text_fields_alpha,
+            .doc_ordinal = 104,
+        },
+    };
+    const index_sort = [_]segment_mod.SegmentIndexSortField{
+        .{ .field = "price" },
+        .{ .field = "_id" },
+    };
+    const segment = try introducer_mod.buildSegmentFromTextWithAnalysisOptions(alloc, &docs, &analysis_mod.default_analyzer, .{}, .{
+        .index_sort = &index_sort,
+    });
+    defer alloc.free(segment);
+    try persistent.writer.addSegment(segment);
+
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
+        .chunk_name = null,
+        .text_analysis = .{},
+        .runtime_schema = testSortedPriceSchema(),
+        .rebuild_root_path = "",
+        .persistent = persistent,
+    };
+    persistent_owned = false;
+    defer text_entry.persistent.close();
+
+    const Harness = struct {
+        text_entry: *index_manager_mod.IndexManager.TextIndex,
+        postprocess_count: usize = 0,
+        expired_doc: ?[]const u8 = null,
+        expired_checks: usize = 0,
+
+        fn textIndexEntry(
+            ctx: ?*anyopaque,
+            _: ?[]const u8,
+        ) anyerror!?*index_manager_mod.IndexManager.TextIndex {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return self.text_entry;
+        }
+
+        fn textIndexIsChunkBacked(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: ?[]const u8,
+        ) anyerror!bool {
+            return false;
+        }
+
+        fn searchMatchAll(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+        ) anyerror!types.SearchResult {
+            return error.UnexpectedTestCall;
+        }
+
+        fn projectStoredSearch(
+            _: ?*anyopaque,
+            project_alloc: Allocator,
+            _: types.SearchRequest,
+            _: []const u8,
+            raw: []const u8,
+        ) anyerror![]u8 {
+            return try project_alloc.dupe(u8, raw);
+        }
+
+        fn loadStored(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: []const u8,
+        ) anyerror!?[]u8 {
+            return error.UnexpectedTestCall;
+        }
+
+        fn isExpiredKey(
+            ctx: ?*anyopaque,
+            _: Allocator,
+            key: []const u8,
+        ) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.expired_checks += 1;
+            const expired_doc = self.expired_doc orelse return false;
+            return std.mem.eql(u8, key, expired_doc);
+        }
+
+        fn postprocess(
+            ctx: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            result: types.SearchResult,
+            _: bool,
+        ) anyerror!types.SearchResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.postprocess_count += 1;
+            return result;
+        }
+    };
+
+    var harness = Harness{ .text_entry = &text_entry };
+    const order_by = [_]types.SortField{
+        .{ .field = "price" },
+        .{ .field = "_id" },
+    };
+    var result = try searchTextQuery(alloc, .{
+        .index_name = "ft",
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 2,
+    }, .{ .term = .{ .field = "body", .term = "alpha" } }, .{
+        .ctx = &harness,
+        .text_index_entry = Harness.textIndexEntry,
+        .text_index_is_chunk_backed = Harness.textIndexIsChunkBacked,
+        .search_match_all = Harness.searchMatchAll,
+        .project_stored_search = Harness.projectStoredSearch,
+        .load_stored = Harness.loadStored,
+        .is_expired_key = Harness.isExpiredKey,
+        .postprocess = Harness.postprocess,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), harness.postprocess_count);
+    try std.testing.expectEqual(types.TotalHitsRelation.gte, result.total_hits_relation);
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), result.hits[0].sort_values[0].float, 0.001);
+    try std.testing.expectEqualStrings("doc:c", result.hits[1].id);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.0), result.hits[1].sort_values[0].float, 0.001);
+    const broad_profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("sorted_segment_seek", broad_profile.plan);
+    try std.testing.expectEqualStrings("sorted_segment_scan", broad_profile.source);
+    try std.testing.expectEqualStrings("index_sort_sorted_segment_seek", broad_profile.selection_reason);
+    try std.testing.expect(!broad_profile.selective_filter_doc_values_preferred);
+    try std.testing.expectEqual(@as(u64, 4), broad_profile.cost_model_live_docs);
+    try std.testing.expectEqual(@as(u64, 3), broad_profile.cost_model_candidate_count);
+    try std.testing.expectEqual(@as(u64, 4096), broad_profile.cost_model_selective_limit);
+    try std.testing.expectEqual(@as(u64, 0), broad_profile.stored_json_load_count);
+
+    var zero_limit_result = try searchTextQuery(alloc, .{
+        .index_name = "ft",
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 0,
+    }, .{ .term = .{ .field = "body", .term = "alpha" } }, .{
+        .ctx = &harness,
+        .text_index_entry = Harness.textIndexEntry,
+        .text_index_is_chunk_backed = Harness.textIndexIsChunkBacked,
+        .search_match_all = Harness.searchMatchAll,
+        .project_stored_search = Harness.projectStoredSearch,
+        .load_stored = Harness.loadStored,
+        .is_expired_key = Harness.isExpiredKey,
+        .postprocess = Harness.postprocess,
+    });
+    defer zero_limit_result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), zero_limit_result.hits.len);
+    try std.testing.expectEqual(@as(u32, 3), zero_limit_result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, zero_limit_result.total_hits_relation);
+    const zero_limit_profile = zero_limit_result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("sorted_segment_seek", zero_limit_profile.plan);
+    try std.testing.expectEqualStrings("bounded_exact", zero_limit_profile.exactness);
+    try std.testing.expectEqual(@as(u64, 3), zero_limit_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 0), zero_limit_profile.window_capacity);
+    try std.testing.expectEqual(@as(u64, 0), zero_limit_profile.window_len);
+    try std.testing.expectEqual(@as(u64, 0), zero_limit_profile.native_doc_value_hit_count);
+    try std.testing.expectEqual(@as(u64, 0), zero_limit_profile.native_doc_value_miss_count);
+    try std.testing.expectEqual(@as(u64, 0), zero_limit_profile.stored_json_load_count);
+    try std.testing.expectEqual(@as(usize, 0), harness.postprocess_count);
+
+    var transformed_result = try searchTextQuery(alloc, .{
+        .index_name = "ft",
+        .order_by = &order_by,
+        .merge_config = .{},
+        .include_stored = false,
+        .profile = true,
+        .limit = 2,
+    }, .{ .term = .{ .field = "body", .term = "alpha" } }, .{
+        .ctx = &harness,
+        .text_index_entry = Harness.textIndexEntry,
+        .text_index_is_chunk_backed = Harness.textIndexIsChunkBacked,
+        .search_match_all = Harness.searchMatchAll,
+        .project_stored_search = Harness.projectStoredSearch,
+        .load_stored = Harness.loadStored,
+        .is_expired_key = Harness.isExpiredKey,
+        .postprocess = Harness.postprocess,
+    });
+    defer transformed_result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), harness.postprocess_count);
+    try std.testing.expectEqual(@as(usize, 2), transformed_result.hits.len);
+    try std.testing.expectEqualStrings("doc:a", transformed_result.hits[0].id);
+    try std.testing.expectEqualStrings("doc:c", transformed_result.hits[1].id);
+    const transformed_profile = transformed_result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", transformed_profile.plan);
+
+    harness.expired_doc = "doc:a";
+    var expiring_result = try searchTextQuery(alloc, .{
+        .index_name = "ft",
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 2,
+    }, .{ .term = .{ .field = "body", .term = "alpha" } }, .{
+        .ctx = &harness,
+        .text_index_entry = Harness.textIndexEntry,
+        .text_index_is_chunk_backed = Harness.textIndexIsChunkBacked,
+        .search_match_all = Harness.searchMatchAll,
+        .project_stored_search = Harness.projectStoredSearch,
+        .load_stored = Harness.loadStored,
+        .is_expired_key = Harness.isExpiredKey,
+        .postprocess = Harness.postprocess,
+    });
+    defer expiring_result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), harness.postprocess_count);
+    try std.testing.expectEqual(types.TotalHitsRelation.gte, expiring_result.total_hits_relation);
+    try std.testing.expectEqual(@as(usize, 2), expiring_result.hits.len);
+    try std.testing.expectEqualStrings("doc:c", expiring_result.hits[0].id);
+    try std.testing.expectEqualStrings("doc:d", expiring_result.hits[1].id);
+    try std.testing.expect(harness.expired_checks >= 3);
+}
+
+test "text index sort uses doc values collector for selective term filters" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/text-selective-index-sort-doc-values", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var persistent = try persistent_mod.PersistentIndex.open(alloc, .{
+        .path = path_z.ptr,
+        .main_backend = .lsm_memory,
+    });
+    var persistent_owned = true;
+    errdefer if (persistent_owned) persistent.close();
+
+    const text_fields_alpha = [_]introducer_mod.TextField{.{ .field_name = "body", .text = "alpha" }};
+    const text_fields_beta = [_]introducer_mod.TextField{.{ .field_name = "body", .text = "beta" }};
+    const docs = try alloc.alloc(introducer_mod.TextDocument, 128);
+    defer alloc.free(docs);
+    const doc_ids = try alloc.alloc([]u8, docs.len);
+    defer {
+        for (doc_ids) |id| alloc.free(id);
+        alloc.free(doc_ids);
+    }
+    const stored_docs = try alloc.alloc([]u8, docs.len);
+    defer {
+        for (stored_docs) |stored| alloc.free(stored);
+        alloc.free(stored_docs);
+    }
+    for (docs, 0..) |*doc, i| {
+        const alpha = i == 5 or i == 10;
+        doc_ids[i] = try std.fmt.allocPrint(alloc, "doc:{d:0>3}", .{i});
+        stored_docs[i] = try std.fmt.allocPrint(
+            alloc,
+            "{{\"price\":{d},\"body\":\"{s}\"}}",
+            .{ i, if (alpha) "alpha" else "beta" },
+        );
+        doc.* = .{
+            .id = doc_ids[i],
+            .stored_data = stored_docs[i],
+            .text_fields = if (alpha) &text_fields_alpha else &text_fields_beta,
+            .doc_ordinal = @intCast(1000 + i),
+        };
+    }
+
+    const index_sort = [_]segment_mod.SegmentIndexSortField{
+        .{ .field = "price" },
+        .{ .field = "_id" },
+    };
+    const segment = try introducer_mod.buildSegmentFromTextWithAnalysisOptions(alloc, docs, &analysis_mod.default_analyzer, .{}, .{
+        .index_sort = &index_sort,
+    });
+    defer alloc.free(segment);
+    try persistent.writer.addSegment(segment);
+
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
+        .chunk_name = null,
+        .text_analysis = .{},
+        .runtime_schema = testSortedPriceSchema(),
+        .rebuild_root_path = "",
+        .persistent = persistent,
+    };
+    persistent_owned = false;
+    defer text_entry.persistent.close();
+
+    const Harness = struct {
+        text_entry: *index_manager_mod.IndexManager.TextIndex,
+        postprocess_count: usize = 0,
+        expired_doc: ?[]const u8 = null,
+        expired_checks: usize = 0,
+
+        fn textIndexEntry(
+            ctx: ?*anyopaque,
+            _: ?[]const u8,
+        ) anyerror!?*index_manager_mod.IndexManager.TextIndex {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return self.text_entry;
+        }
+
+        fn textIndexIsChunkBacked(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: ?[]const u8,
+        ) anyerror!bool {
+            return false;
+        }
+
+        fn searchMatchAll(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+        ) anyerror!types.SearchResult {
+            return error.UnexpectedTestCall;
+        }
+
+        fn projectStoredSearch(
+            _: ?*anyopaque,
+            project_alloc: Allocator,
+            _: types.SearchRequest,
+            _: []const u8,
+            raw: []const u8,
+        ) anyerror![]u8 {
+            return try project_alloc.dupe(u8, raw);
+        }
+
+        fn loadStored(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: []const u8,
+        ) anyerror!?[]u8 {
+            return error.UnexpectedTestCall;
+        }
+
+        fn isExpiredKey(
+            ctx: ?*anyopaque,
+            _: Allocator,
+            key: []const u8,
+        ) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.expired_checks += 1;
+            const expired_doc = self.expired_doc orelse return false;
+            return std.mem.eql(u8, key, expired_doc);
+        }
+
+        fn postprocess(
+            ctx: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            result: types.SearchResult,
+            _: bool,
+        ) anyerror!types.SearchResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.postprocess_count += 1;
+            return result;
+        }
+    };
+
+    var harness = Harness{ .text_entry = &text_entry };
+    const order_by = [_]types.SortField{.{ .field = "price" }};
+    var result = try searchTextQuery(alloc, .{
+        .index_name = "ft",
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 10,
+    }, .{ .term = .{ .field = "body", .term = "alpha" } }, .{
+        .ctx = &harness,
+        .text_index_entry = Harness.textIndexEntry,
+        .text_index_is_chunk_backed = Harness.textIndexIsChunkBacked,
+        .search_match_all = Harness.searchMatchAll,
+        .project_stored_search = Harness.projectStoredSearch,
+        .load_stored = Harness.loadStored,
+        .postprocess = Harness.postprocess,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), harness.postprocess_count);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, result.total_hits_relation);
+    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqualStrings("doc:005", result.hits[0].id);
+    try std.testing.expectEqualStrings("doc:010", result.hits[1].id);
+
+    const profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", profile.plan);
+    try std.testing.expectEqualStrings("exact", profile.exactness);
+    try std.testing.expectEqualStrings("doc_values_collector", profile.source);
+    try std.testing.expectEqualStrings("selective_filter_doc_values_collector", profile.selection_reason);
+    try std.testing.expectEqual(@as(u64, 128), profile.cost_model_live_docs);
+    try std.testing.expectEqual(@as(u64, 2), profile.cost_model_candidate_count);
+    try std.testing.expectEqual(@as(u64, 4096), profile.cost_model_selective_limit);
+    try std.testing.expectEqual(@as(u64, 2), profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 2), profile.selected_count);
+    try std.testing.expectEqual(@as(u64, 2), profile.native_doc_value_hit_count);
+
+    harness.expired_doc = "doc:005";
+    var expired_result = try searchTextQuery(alloc, .{
+        .index_name = "ft",
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 10,
+    }, .{ .term = .{ .field = "body", .term = "alpha" } }, .{
+        .ctx = &harness,
+        .text_index_entry = Harness.textIndexEntry,
+        .text_index_is_chunk_backed = Harness.textIndexIsChunkBacked,
+        .search_match_all = Harness.searchMatchAll,
+        .project_stored_search = Harness.projectStoredSearch,
+        .load_stored = Harness.loadStored,
+        .is_expired_key = Harness.isExpiredKey,
+        .postprocess = Harness.postprocess,
+    });
+    defer expired_result.deinit();
+
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, expired_result.total_hits_relation);
+    try std.testing.expectEqual(@as(u32, 1), expired_result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), expired_result.hits.len);
+    try std.testing.expectEqualStrings("doc:010", expired_result.hits[0].id);
+    const expired_profile = expired_result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("exact", expired_profile.exactness);
+    try std.testing.expectEqualStrings("selective_filter_doc_values_collector", expired_profile.selection_reason);
+    try std.testing.expectEqual(@as(u64, 1), expired_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 1), expired_profile.selected_count);
+    try std.testing.expectEqual(@as(u64, 1), expired_profile.native_doc_value_hit_count);
+    try std.testing.expect(harness.expired_checks >= 2);
+}
+
+test "match_all sorted segment seek uses cursor seek within each segment" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sorted-segment-cursor-seek", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    const docs = try alloc.alloc(TestSortedPriceDoc, 64);
+    defer {
+        for (docs) |doc| alloc.free(@constCast(doc.id));
+        alloc.free(docs);
+    }
+    for (docs, 0..) |*doc, i| {
+        doc.* = .{
+            .id = try std.fmt.allocPrint(alloc, "doc:{d:0>3}", .{i}),
+            .price = @floatFromInt(i),
+            .ordinal = @intCast(1000 + i),
+        };
+    }
+
+    var persistent = try persistent_mod.PersistentIndex.open(alloc, .{
+        .path = path_z.ptr,
+        .main_backend = .lsm_memory,
+    });
+    var persistent_owned = true;
+    errdefer if (persistent_owned) persistent.close();
+
+    const segment = try buildTestSortedPriceSegmentAlloc(alloc, docs);
+    defer alloc.free(segment);
+    try persistent.writer.addSegment(segment);
+
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
+        .chunk_name = null,
+        .text_analysis = .{},
+        .runtime_schema = testSortedPriceSchema(),
+        .rebuild_root_path = "",
+        .persistent = persistent,
+    };
+    persistent_owned = false;
+    defer text_entry.persistent.close();
+
+    const order_by = [_]types.SortField{
+        .{ .field = "price" },
+        .{ .field = "_id" },
+    };
+    const cursor = [_]std.json.Value{
+        .{ .float = 50.0 },
+        .{ .string = "doc:050" },
+    };
+    const sorted_plan = SortExecutionPlan{
+        .kind = .sorted_segment_seek,
+        .require_native = true,
+        .runtime_schema = text_entry.runtime_schema,
+        .index_sort_match = true,
+        .sorted_segment_executor_available = true,
+        .sorted_segment_bounds_available = true,
+    };
+    const NativeLoadCounter = struct {
+        inner: TextDocValueSortContext,
+        count: usize = 0,
+
+        fn load(ctx: ?*anyopaque, alloc_inner: Allocator, hit: types.SearchHit, field: []const u8) anyerror!?SortValue {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.count += 1;
+            return try loadTextDocValueSortValue(&self.inner, alloc_inner, hit, field);
+        }
+    };
+    var counter = NativeLoadCounter{
+        .inner = .{ .snapshot = text_entry.persistent.snapshot() },
+    };
+    const native_loader = NativeSortValueLoader{
+        .ctx = &counter,
+        .require_native = true,
+        .load = NativeLoadCounter.load,
+    };
+    const executor = MatchAllExecutor{
+        .ctx = null,
+        .collect_candidates = undefined,
+        .text_index_entry = undefined,
+        .load_projected_document = undefined,
+        .load_stored = testUnexpectedLoadStoredCallback,
+    };
+    const constraints = NativeDocIdConstraints{};
+
+    var first_page = try sortAndPageMatchAllSortedSegmentsAlloc(alloc, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 2,
+    }, executor, &constraints, &text_entry, sorted_plan, native_loader, null);
+    defer first_page.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), first_page.hits.len);
+    try std.testing.expectEqualStrings("doc:000", first_page.hits[0].id);
+    try std.testing.expectEqualStrings("doc:001", first_page.hits[1].id);
+    try std.testing.expectEqual(@as(usize, 2), counter.count);
+    const first_profile = first_page.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("bounded_exact", first_profile.exactness);
+    try std.testing.expectEqual(@as(u64, 2), first_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 2), first_profile.selected_count);
+    try std.testing.expectEqual(@as(usize, 1), first_profile.collector_heap_peak);
+
+    counter.count = 0;
+    var page = try sortAndPageMatchAllSortedSegmentsAlloc(alloc, .{
+        .order_by = &order_by,
+        .search_after = &cursor,
+        .include_stored = false,
+        .limit = 2,
+    }, executor, &constraints, &text_entry, sorted_plan, native_loader, null);
+    defer page.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), page.hits.len);
+    try std.testing.expectEqualStrings("doc:051", page.hits[0].id);
+    try std.testing.expectEqualStrings("doc:052", page.hits[1].id);
+    try std.testing.expect(counter.count < 16);
+
+    counter.count = 0;
+    var before_page = try sortAndPageMatchAllSortedSegmentsAlloc(alloc, .{
+        .order_by = &order_by,
+        .search_before = &cursor,
+        .include_stored = false,
+        .profile = true,
+        .limit = 2,
+    }, executor, &constraints, &text_entry, sorted_plan, native_loader, null);
+    defer before_page.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), before_page.hits.len);
+    try std.testing.expectEqualStrings("doc:048", before_page.hits[0].id);
+    try std.testing.expectEqualStrings("doc:049", before_page.hits[1].id);
+    try std.testing.expect(counter.count < 16);
+    const before_profile = before_page.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("sorted_segment_seek", before_profile.plan);
+    try std.testing.expectEqualStrings("bounded_exact", before_profile.exactness);
+    try std.testing.expectEqualStrings("sorted_segment_scan", before_profile.source);
+    try std.testing.expectEqual(@as(u64, 2), before_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 2), before_profile.selected_count);
+    try std.testing.expectEqual(@as(usize, 1), before_profile.collector_heap_peak);
+
+    const beyond_cursor = [_]std.json.Value{
+        .{ .float = 100.0 },
+        .{ .string = "doc:100" },
+    };
+    counter.count = 0;
+    var empty_page = try sortAndPageMatchAllSortedSegmentsAlloc(alloc, .{
+        .order_by = &order_by,
+        .search_after = &beyond_cursor,
+        .include_stored = false,
+        .limit = 2,
+    }, executor, &constraints, &text_entry, sorted_plan, native_loader, null);
+    defer empty_page.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), empty_page.hits.len);
+    try std.testing.expectEqual(@as(usize, 0), counter.count);
+
+    counter.count = 0;
+    var zero_after_page = try sortAndPageMatchAllSortedSegmentsAlloc(alloc, .{
+        .order_by = &order_by,
+        .search_after = &cursor,
+        .include_stored = false,
+        .profile = true,
+        .limit = 0,
+    }, executor, &constraints, &text_entry, sorted_plan, native_loader, null);
+    defer zero_after_page.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), zero_after_page.hits.len);
+    try std.testing.expectEqual(@as(u32, 13), zero_after_page.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, zero_after_page.total_hits_relation);
+    try std.testing.expect(counter.count < 10);
+    const zero_after_profile = zero_after_page.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("sorted_segment_seek", zero_after_profile.plan);
+    try std.testing.expectEqual(@as(u64, 13), zero_after_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 13), zero_after_profile.sorted_segment_scanned_count);
+    try std.testing.expectEqual(@as(u64, 0), zero_after_profile.native_doc_value_hit_count);
+    try std.testing.expectEqual(@as(u64, 0), zero_after_profile.native_doc_value_miss_count);
+}
+
+test "match_all sorted segment seek enforces scan budget" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sorted-segment-scan-budget", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    const docs = try alloc.alloc(TestSortedPriceDoc, 4);
+    defer {
+        for (docs) |doc| alloc.free(@constCast(doc.id));
+        alloc.free(docs);
+    }
+    for (docs, 0..) |*doc, i| {
+        doc.* = .{
+            .id = try std.fmt.allocPrint(alloc, "doc:{d:0>3}", .{i}),
+            .price = @floatFromInt(i),
+            .ordinal = @intCast(1000 + i),
+        };
+    }
+
+    var persistent = try persistent_mod.PersistentIndex.open(alloc, .{
+        .path = path_z.ptr,
+        .main_backend = .lsm_memory,
+    });
+    var persistent_owned = true;
+    errdefer if (persistent_owned) persistent.close();
+
+    const segment = try buildTestSortedPriceSegmentAlloc(alloc, docs);
+    defer alloc.free(segment);
+    try persistent.writer.addSegment(segment);
+
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
+        .chunk_name = null,
+        .text_analysis = .{},
+        .runtime_schema = testSortedPriceSchema(),
+        .rebuild_root_path = "",
+        .persistent = persistent,
+    };
+    persistent_owned = false;
+    defer text_entry.persistent.close();
+
+    const order_by = [_]types.SortField{
+        .{ .field = "price" },
+        .{ .field = "_id" },
+    };
+    const sorted_plan = SortExecutionPlan{
+        .kind = .sorted_segment_seek,
+        .require_native = true,
+        .runtime_schema = text_entry.runtime_schema,
+        .index_sort_match = true,
+        .sorted_segment_executor_available = true,
+        .sorted_segment_bounds_available = true,
+    };
+    const native_sort_ctx = TextDocValueSortContext{ .snapshot = text_entry.persistent.snapshot() };
+    const native_loader = NativeSortValueLoader{
+        .ctx = @constCast(&native_sort_ctx),
+        .require_native = true,
+        .load = loadTextDocValueSortValue,
+    };
+    const executor = MatchAllExecutor{
+        .ctx = null,
+        .collect_candidates = undefined,
+        .text_index_entry = undefined,
+        .load_projected_document = undefined,
+        .load_stored = testUnexpectedLoadStoredCallback,
+    };
+    const constraints = NativeDocIdConstraints{};
+
+    const c = struct {
+        extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    const budget_env = "ANTFLY_SORTED_SEGMENT_SCAN_BUDGET";
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(budget_env, "1", 1));
+    defer _ = c.unsetenv(budget_env);
+
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, sortAndPageMatchAllSortedSegmentsAlloc(alloc, .{
+        .index_name = "ft",
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 2,
+    }, executor, &constraints, &text_entry, sorted_plan, native_loader, null));
+    const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("ft", diagnostic.field);
+    try std.testing.expectEqualStrings("candidate_budget_exceeded", diagnostic.reason);
+    try std.testing.expectEqualStrings("sorted_segment_scan_window", diagnostic.detail);
+}
+
+test "match_all sorted segment seek checks deadline while scanning" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sorted-segment-scan-deadline", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var persistent = try persistent_mod.PersistentIndex.open(alloc, .{
+        .path = path_z.ptr,
+        .main_backend = .lsm_memory,
+    });
+    var persistent_owned = true;
+    errdefer if (persistent_owned) persistent.close();
+
+    const segment = try buildTestSortedPriceSegmentAlloc(alloc, &.{
+        .{ .id = "doc:000", .price = 0.0, .ordinal = 1000 },
+        .{ .id = "doc:001", .price = 1.0, .ordinal = 1001 },
+    });
+    defer alloc.free(segment);
+    try persistent.writer.addSegment(segment);
+
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
+        .chunk_name = null,
+        .text_analysis = .{},
+        .runtime_schema = testSortedPriceSchema(),
+        .rebuild_root_path = "",
+        .persistent = persistent,
+    };
+    persistent_owned = false;
+    defer text_entry.persistent.close();
+
+    const order_by = [_]types.SortField{
+        .{ .field = "price" },
+        .{ .field = "_id" },
+    };
+    const req = types.SearchRequest{
+        .index_name = "ft",
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 1,
+        .execution_deadline_ns = platform_time.monotonicNs(),
+    };
+    const sorted_plan = SortExecutionPlan{
+        .kind = .sorted_segment_seek,
+        .require_native = true,
+        .runtime_schema = text_entry.runtime_schema,
+        .index_sort_match = true,
+        .sorted_segment_executor_available = true,
+        .sorted_segment_bounds_available = true,
+    };
+    const snapshot = text_entry.persistent.snapshot();
+    const native_sort_ctx = TextDocValueSortContext{ .snapshot = snapshot };
+    const native_loader = NativeSortValueLoader{
+        .ctx = @constCast(&native_sort_ctx),
+        .require_native = true,
+        .load = loadTextDocValueSortValue,
+    };
+    const executor = MatchAllExecutor{
+        .ctx = null,
+        .collect_candidates = undefined,
+        .text_index_entry = undefined,
+        .load_projected_document = undefined,
+        .load_stored = testUnexpectedLoadStoredCallback,
+    };
+    const constraints = NativeDocIdConstraints{};
+    var iterators = [_]SortedSegmentIterator{.{
+        .segment_index = 0,
+        .doc_base = 0,
+        .next_doc = 0,
+    }};
+    var scanned_count: u64 = 0;
+
+    try std.testing.expectError(error.Timeout, nextSortedSegmentHeadAlloc(
+        alloc,
+        req,
+        sorted_plan,
+        snapshot,
+        0,
+        &iterators,
+        &constraints,
+        null,
+        null,
+        executor,
+        native_loader,
+        null,
+        false,
+        &scanned_count,
+        std.math.maxInt(u64),
+    ));
+    try std.testing.expectEqual(@as(u64, 1), scanned_count);
+}
+
+test "match_all sorted segment seek zero limit returns profile without scanning" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sorted-segment-zero-limit", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var persistent = try persistent_mod.PersistentIndex.open(alloc, .{
+        .path = path_z.ptr,
+        .main_backend = .lsm_memory,
+    });
+    var persistent_owned = true;
+    errdefer if (persistent_owned) persistent.close();
+
+    const segment = try buildTestSortedPriceSegmentAlloc(alloc, &.{
+        .{ .id = "doc:000", .price = 0.0, .ordinal = 1000 },
+    });
+    defer alloc.free(segment);
+    try persistent.writer.addSegment(segment);
+
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
+        .chunk_name = null,
+        .text_analysis = .{},
+        .runtime_schema = testSortedPriceSchema(),
+        .rebuild_root_path = "",
+        .persistent = persistent,
+    };
+    persistent_owned = false;
+    defer text_entry.persistent.close();
+
+    const order_by = [_]types.SortField{
+        .{ .field = "price" },
+        .{ .field = "_id" },
+    };
+    const sorted_plan = SortExecutionPlan{
+        .kind = .sorted_segment_seek,
+        .require_native = true,
+        .runtime_schema = text_entry.runtime_schema,
+        .index_sort_match = true,
+        .sorted_segment_executor_available = true,
+        .sorted_segment_bounds_available = true,
+    };
+    const native_sort_ctx = TextDocValueSortContext{ .snapshot = text_entry.persistent.snapshot() };
+    const native_loader = NativeSortValueLoader{
+        .ctx = @constCast(&native_sort_ctx),
+        .require_native = true,
+        .load = loadTextDocValueSortValue,
+    };
+    const executor = MatchAllExecutor{
+        .ctx = null,
+        .collect_candidates = undefined,
+        .text_index_entry = undefined,
+        .load_projected_document = undefined,
+        .load_stored = testUnexpectedLoadStoredCallback,
+    };
+    const constraints = NativeDocIdConstraints{};
+
+    var result = try sortAndPageMatchAllSortedSegmentsAlloc(alloc, .{
+        .index_name = "ft",
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 0,
+    }, executor, &constraints, &text_entry, sorted_plan, native_loader, null);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), result.hits.len);
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, result.total_hits_relation);
+    const profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("sorted_segment_seek", profile.plan);
+    try std.testing.expectEqual(@as(u64, 1), profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 0), profile.sorted_segment_scanned_count);
+    try std.testing.expect(profile.sorted_segment_scan_budget > 0);
+}
+
+test "match_all sorted segment seek rejects cursor when segment bounds are unavailable" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sorted-segment-invalid-bounds-fallback", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var persistent = try persistent_mod.PersistentIndex.open(alloc, .{
+        .path = path_z.ptr,
+        .main_backend = .lsm_memory,
+    });
+    var persistent_owned = true;
+    errdefer if (persistent_owned) persistent.close();
+
+    var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .f64_val, 1024);
+    defer dv_writer.deinit();
+    try dv_writer.add(0, .{ .f64_val = 0.0 });
+    try dv_writer.add(1, .{ .f64_val = 1.0 });
+    try dv_writer.add(2, .{ .f64_val = 2.0 });
+    try dv_writer.add(3, .{ .f64_val = 3.0 });
+    const dv_data = try dv_writer.build();
+    defer alloc.free(dv_data);
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    const price_idx = try seg_writer.addField("price");
+    try seg_writer.addSection(price_idx, .typed_doc_values, dv_data);
+    try seg_writer.addStoredDoc("doc:000", "{\"price\":0}");
+    try seg_writer.addStoredDoc("doc:001", "{\"price\":1}");
+    try seg_writer.addStoredDoc("doc:002", "{\"price\":2}");
+    try seg_writer.addStoredDoc("doc:003", "{\"price\":3}");
+    const ordinals = [_]u32{ 1000, 1001, 1002, 1003 };
+    try seg_writer.addDocOrdinals(&ordinals);
+    const sort_fields = [_]segment_mod.SegmentIndexSortField{
+        .{ .field = "price" },
+        .{ .field = "_id" },
+    };
+    var reversed_first_bounds = [_]segment_mod.SegmentIndexSortBoundValue{
+        .{ .f64_val = 3.0 },
+        .{ .id = "doc:003" },
+    };
+    var reversed_last_bounds = [_]segment_mod.SegmentIndexSortBoundValue{
+        .{ .f64_val = 0.0 },
+        .{ .id = "doc:000" },
+    };
+    try seg_writer.addIndexSortMetadataWithBounds(&sort_fields, .{
+        .first = reversed_first_bounds[0..],
+        .last = reversed_last_bounds[0..],
+    });
+    const segment = try seg_writer.build();
+    defer alloc.free(segment);
+    try persistent.writer.addSegment(segment);
+
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
+        .chunk_name = null,
+        .text_analysis = .{},
+        .runtime_schema = testSortedPriceSchema(),
+        .rebuild_root_path = "",
+        .persistent = persistent,
+    };
+    persistent_owned = false;
+    defer text_entry.persistent.close();
+
+    const order_by = [_]types.SortField{
+        .{ .field = "price" },
+        .{ .field = "_id" },
+    };
+    const cursor = [_]std.json.Value{
+        .{ .float = 1.5 },
+        .{ .string = "doc:001" },
+    };
+    const sorted_plan = SortExecutionPlan{
+        .kind = .sorted_segment_seek,
+        .require_native = true,
+        .runtime_schema = text_entry.runtime_schema,
+        .index_sort_match = true,
+        .sorted_segment_executor_available = true,
+        .sorted_segment_bounds_available = false,
+    };
+    const native_sort_ctx = TextDocValueSortContext{ .snapshot = text_entry.persistent.snapshot() };
+    const native_loader = NativeSortValueLoader{
+        .ctx = @constCast(&native_sort_ctx),
+        .require_native = true,
+        .load = loadTextDocValueSortValue,
+    };
+    const executor = MatchAllExecutor{
+        .ctx = null,
+        .collect_candidates = undefined,
+        .text_index_entry = undefined,
+        .load_projected_document = undefined,
+        .load_stored = testUnexpectedLoadStoredCallback,
+    };
+    const constraints = NativeDocIdConstraints{};
+
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, sortAndPageMatchAllSortedSegmentsAlloc(alloc, .{
+        .order_by = &order_by,
+        .search_after = &cursor,
+        .include_stored = false,
+        .limit = 2,
+    }, executor, &constraints, &text_entry, sorted_plan, native_loader, null));
+    const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", diagnostic.reason);
+    try std.testing.expectEqualStrings("sorted_segment_bounds_unavailable", diagnostic.detail);
+}
+
+test "match_all native ordinal doc values path enforces exact candidate budget" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/match-all-native-doc-values-budget", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    const docs = [_]TestSortedPriceDoc{
+        .{ .id = "doc:a", .price = 1.0, .ordinal = 1001 },
+        .{ .id = "doc:b", .price = 2.0, .ordinal = 1002 },
+        .{ .id = "doc:c", .price = 3.0, .ordinal = 1003 },
+    };
+
+    var persistent = try persistent_mod.PersistentIndex.open(alloc, .{
+        .path = path_z.ptr,
+        .main_backend = .lsm_memory,
+    });
+    var persistent_owned = true;
+    errdefer if (persistent_owned) persistent.close();
+
+    const segment = try buildTestSortedPriceSegmentAlloc(alloc, &docs);
+    defer alloc.free(segment);
+    try persistent.writer.addSegment(segment);
+
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
+        .chunk_name = null,
+        .text_analysis = .{},
+        .runtime_schema = testSortedPriceSchema(),
+        .rebuild_root_path = "",
+        .persistent = persistent,
+    };
+    persistent_owned = false;
+    defer text_entry.persistent.close();
+
+    var ordinal_to_text_doc_id = std.AutoHashMapUnmanaged(doc_set.DocOrdinal, u32).empty;
+    defer ordinal_to_text_doc_id.deinit(alloc);
+    try std.testing.expect(try buildAllOrdinalTextDocIdMapAlloc(alloc, text_entry.persistent.snapshot(), &ordinal_to_text_doc_id));
+
+    const filter_doc_nums = [_]u32{ 1001, 1002, 1003 };
+    const constraints = NativeDocIdConstraints{
+        .positive_filter = true,
+        .filter_doc_nums = &filter_doc_nums,
+    };
+    const order_by = [_]types.SortField{.{ .field = "price" }};
+    const plan = SortExecutionPlan{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .runtime_schema = text_entry.runtime_schema,
+    };
+    const executor = MatchAllExecutor{
+        .ctx = null,
+        .collect_candidates = undefined,
+        .text_index_entry = undefined,
+        .load_projected_document = undefined,
+        .load_stored = testUnexpectedLoadStoredCallback,
+    };
+
+    const c = struct {
+        extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    const budget_env = "ANTFLY_TEXT_LATE_VISIBILITY_EXACT_CANDIDATE_BUDGET";
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(budget_env, "2", 1));
+    defer _ = c.unsetenv(budget_env);
+
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, sortAndPageMatchAllOrdinalDocValueCandidatesAlloc(
+        alloc,
+        .{
+            .index_name = "ft",
+            .order_by = &order_by,
+            .include_stored = false,
+            .limit = 2,
+        },
+        executor,
+        text_entry.persistent.snapshot(),
+        &constraints,
+        plan,
+        &ordinal_to_text_doc_id,
+    ));
+    const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("ft", diagnostic.field);
+    try std.testing.expectEqualStrings("candidate_budget_exceeded", diagnostic.reason);
+    try std.testing.expectEqualStrings("match_all_exact_candidate_window", diagnostic.detail);
+}
+
+test "text doc values sort zero limit avoids budget and decoration" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/text-doc-values-zero-limit", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    const docs = [_]TestSortedPriceDoc{
+        .{ .id = "doc:a", .price = 1.0, .ordinal = 1001 },
+        .{ .id = "doc:b", .price = 2.0, .ordinal = 1002 },
+        .{ .id = "doc:c", .price = 3.0, .ordinal = 1003 },
+    };
+
+    var persistent = try persistent_mod.PersistentIndex.open(alloc, .{
+        .path = path_z.ptr,
+        .main_backend = .lsm_memory,
+    });
+    var persistent_owned = true;
+    errdefer if (persistent_owned) persistent.close();
+
+    const segment = try buildTestSortedPriceSegmentAlloc(alloc, &docs);
+    defer alloc.free(segment);
+    try persistent.writer.addSegment(segment);
+
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
+        .chunk_name = null,
+        .text_analysis = .{},
+        .runtime_schema = testSortedPriceSchema(),
+        .rebuild_root_path = "",
+        .persistent = persistent,
+    };
+    persistent_owned = false;
+    defer text_entry.persistent.close();
+
+    const doc_nums = [_]u32{ 0, 1, 2 };
+    const order_by = [_]types.SortField{.{ .field = "price" }};
+    const plan = SortExecutionPlan{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .runtime_schema = text_entry.runtime_schema,
+    };
+    const executor = SearchTextQueryExecutor{
+        .ctx = null,
+        .text_index_entry = undefined,
+        .text_index_is_chunk_backed = undefined,
+        .search_match_all = undefined,
+        .project_stored_search = undefined,
+        .load_stored = testUnexpectedLoadStoredCallback,
+        .postprocess = undefined,
+    };
+
+    const c = struct {
+        extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    const budget_env = "ANTFLY_TEXT_LATE_VISIBILITY_EXACT_CANDIDATE_BUDGET";
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(budget_env, "1", 1));
+    defer _ = c.unsetenv(budget_env);
+
+    var result = try sortAndPageTextDocValueDocNumsAlloc(
+        alloc,
+        .{
+            .index_name = "ft",
+            .order_by = &order_by,
+            .include_stored = false,
+            .profile = true,
+            .limit = 0,
+        },
+        text_entry.persistent.snapshot(),
+        &doc_nums,
+        executor,
+        plan,
+    );
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), result.hits.len);
+    try std.testing.expectEqual(@as(u32, 3), result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, result.total_hits_relation);
+    const profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", profile.plan);
+    try std.testing.expectEqual(@as(u64, 3), profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 0), profile.native_doc_value_hit_count);
+    try std.testing.expectEqual(@as(u64, 0), profile.native_doc_value_miss_count);
+
+    const cursor = [_]std.json.Value{
+        .{ .float = 2.0 },
+        .{ .string = "doc:b" },
+    };
+    var cursor_result = try sortAndPageTextDocValueDocNumsAlloc(
+        alloc,
+        .{
+            .index_name = "ft",
+            .order_by = &order_by,
+            .search_after = &cursor,
+            .include_stored = false,
+            .profile = true,
+            .limit = 0,
+        },
+        text_entry.persistent.snapshot(),
+        &doc_nums,
+        executor,
+        plan,
+    );
+    defer cursor_result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), cursor_result.hits.len);
+    try std.testing.expectEqual(@as(u32, 1), cursor_result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, cursor_result.total_hits_relation);
+    const cursor_profile = cursor_result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", cursor_profile.plan);
+    try std.testing.expectEqual(@as(u64, 3), cursor_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 2), cursor_profile.cursor_rejected_count);
+    try std.testing.expectEqual(@as(u64, 3), cursor_profile.native_doc_value_hit_count);
+    try std.testing.expectEqual(@as(u64, 0), cursor_profile.native_doc_value_miss_count);
+
+    var before_result = try sortAndPageTextDocValueDocNumsAlloc(
+        alloc,
+        .{
+            .index_name = "ft",
+            .order_by = &order_by,
+            .search_before = &cursor,
+            .include_stored = false,
+            .profile = true,
+            .limit = 0,
+        },
+        text_entry.persistent.snapshot(),
+        &doc_nums,
+        executor,
+        plan,
+    );
+    defer before_result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), before_result.hits.len);
+    try std.testing.expectEqual(@as(u32, 1), before_result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, before_result.total_hits_relation);
+    const before_profile = before_result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", before_profile.plan);
+    try std.testing.expectEqual(@as(u64, 3), before_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 2), before_profile.cursor_rejected_count);
+    try std.testing.expectEqual(@as(u64, 3), before_profile.native_doc_value_hit_count);
+    try std.testing.expectEqual(@as(u64, 0), before_profile.native_doc_value_miss_count);
+}
+
+test "match_all native ordinal doc values zero limit avoids budget and decoration" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/match-all-ordinal-doc-values-zero-limit", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    const docs = [_]TestSortedPriceDoc{
+        .{ .id = "doc:a", .price = 1.0, .ordinal = 1001 },
+        .{ .id = "doc:b", .price = 2.0, .ordinal = 1002 },
+        .{ .id = "doc:c", .price = 3.0, .ordinal = 1003 },
+    };
+
+    var persistent = try persistent_mod.PersistentIndex.open(alloc, .{
+        .path = path_z.ptr,
+        .main_backend = .lsm_memory,
+    });
+    var persistent_owned = true;
+    errdefer if (persistent_owned) persistent.close();
+
+    const segment = try buildTestSortedPriceSegmentAlloc(alloc, &docs);
+    defer alloc.free(segment);
+    try persistent.writer.addSegment(segment);
+
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
+        .chunk_name = null,
+        .text_analysis = .{},
+        .runtime_schema = testSortedPriceSchema(),
+        .rebuild_root_path = "",
+        .persistent = persistent,
+    };
+    persistent_owned = false;
+    defer text_entry.persistent.close();
+
+    var ordinal_to_text_doc_id = std.AutoHashMapUnmanaged(doc_set.DocOrdinal, u32).empty;
+    defer ordinal_to_text_doc_id.deinit(alloc);
+    try std.testing.expect(try buildAllOrdinalTextDocIdMapAlloc(alloc, text_entry.persistent.snapshot(), &ordinal_to_text_doc_id));
+
+    const filter_doc_nums = [_]u32{ 1001, 1002, 1003 };
+    const constraints = NativeDocIdConstraints{
+        .positive_filter = true,
+        .filter_doc_nums = &filter_doc_nums,
+    };
+    const order_by = [_]types.SortField{.{ .field = "price" }};
+    const plan = SortExecutionPlan{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .runtime_schema = text_entry.runtime_schema,
+    };
+    const executor = MatchAllExecutor{
+        .ctx = null,
+        .collect_candidates = undefined,
+        .text_index_entry = undefined,
+        .load_projected_document = undefined,
+        .load_stored = testUnexpectedLoadStoredCallback,
+    };
+
+    const c = struct {
+        extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    const budget_env = "ANTFLY_TEXT_LATE_VISIBILITY_EXACT_CANDIDATE_BUDGET";
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(budget_env, "1", 1));
+    defer _ = c.unsetenv(budget_env);
+
+    var result = try sortAndPageMatchAllOrdinalDocValueCandidatesAlloc(
+        alloc,
+        .{
+            .index_name = "ft",
+            .order_by = &order_by,
+            .include_stored = false,
+            .profile = true,
+            .limit = 0,
+        },
+        executor,
+        text_entry.persistent.snapshot(),
+        &constraints,
+        plan,
+        &ordinal_to_text_doc_id,
+    );
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), result.hits.len);
+    try std.testing.expectEqual(@as(u32, 3), result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, result.total_hits_relation);
+    const profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", profile.plan);
+    try std.testing.expectEqual(@as(u64, 3), profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 0), profile.native_doc_value_hit_count);
+    try std.testing.expectEqual(@as(u64, 0), profile.native_doc_value_miss_count);
+
+    const cursor = [_]std.json.Value{
+        .{ .float = 2.0 },
+        .{ .string = "doc:b" },
+    };
+    var cursor_result = try sortAndPageMatchAllOrdinalDocValueCandidatesAlloc(
+        alloc,
+        .{
+            .index_name = "ft",
+            .order_by = &order_by,
+            .search_after = &cursor,
+            .include_stored = false,
+            .profile = true,
+            .limit = 0,
+        },
+        executor,
+        text_entry.persistent.snapshot(),
+        &constraints,
+        plan,
+        &ordinal_to_text_doc_id,
+    );
+    defer cursor_result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), cursor_result.hits.len);
+    try std.testing.expectEqual(@as(u32, 1), cursor_result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, cursor_result.total_hits_relation);
+    const cursor_profile = cursor_result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", cursor_profile.plan);
+    try std.testing.expectEqual(@as(u64, 3), cursor_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 2), cursor_profile.cursor_rejected_count);
+    try std.testing.expectEqual(@as(u64, 3), cursor_profile.native_doc_value_hit_count);
+    try std.testing.expectEqual(@as(u64, 0), cursor_profile.native_doc_value_miss_count);
+
+    var before_result = try sortAndPageMatchAllOrdinalDocValueCandidatesAlloc(
+        alloc,
+        .{
+            .index_name = "ft",
+            .order_by = &order_by,
+            .search_before = &cursor,
+            .include_stored = false,
+            .profile = true,
+            .limit = 0,
+        },
+        executor,
+        text_entry.persistent.snapshot(),
+        &constraints,
+        plan,
+        &ordinal_to_text_doc_id,
+    );
+    defer before_result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), before_result.hits.len);
+    try std.testing.expectEqual(@as(u32, 1), before_result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, before_result.total_hits_relation);
+    const before_profile = before_result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", before_profile.plan);
+    try std.testing.expectEqual(@as(u64, 3), before_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 2), before_profile.cursor_rejected_count);
+    try std.testing.expectEqual(@as(u64, 3), before_profile.native_doc_value_hit_count);
+    try std.testing.expectEqual(@as(u64, 0), before_profile.native_doc_value_miss_count);
+}
+
+test "native doc values sort plan requires runtime schema" {
+    const alloc = std.testing.allocator;
+
+    var hits = try alloc.alloc(types.SearchHit, 1);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .score = 1.0 };
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 1,
+        .graph_results = &.{},
+    };
+    defer result.deinit();
+
+    const Loader = struct {
+        fn load(_: ?*anyopaque, _: Allocator, _: types.SearchHit, field: []const u8) anyerror!?SortValue {
+            try std.testing.expectEqualStrings("rank", field);
+            return .{ .integer = 1 };
+        }
+    };
+
+    const order_by = [_]types.SortField{.{ .field = "rank", .desc = false }};
+    try std.testing.expectError(error.UnsupportedExactSort, sortAndPageSearchResultInPlace(&result, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 1,
+    }, null, testUnexpectedLoadStoredCallback, .{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+    }, .{
+        .require_native = true,
+        .load = Loader.load,
+    }));
+}
+
+test "native doc values sort plan requires a native loader" {
+    const alloc = std.testing.allocator;
+
+    var hits = try alloc.alloc(types.SearchHit, 1);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .score = 1.0 };
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 1,
+        .graph_results = &.{},
+    };
+    defer result.deinit();
+
+    const order_by = [_]types.SortField{.{ .field = "rank", .desc = false }};
+    try std.testing.expectError(error.UnsupportedQueryRequest, sortAndPageSearchResultInPlace(&result, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 1,
+    }, null, testUnexpectedLoadStoredCallback, .{ .kind = .native_doc_values_top_n, .require_native = true }, null));
+}
+
+test "text field sort source loading happens only for selected missing hits" {
+    const alloc = std.testing.allocator;
+
+    const Harness = struct {
+        load_count: usize = 0,
+        project_count: usize = 0,
+
+        fn loadStored(ctx: ?*anyopaque, load_alloc: Allocator, key: []const u8) anyerror!?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.load_count += 1;
+            return try std.fmt.allocPrint(load_alloc, "{{\"id\":\"{s}\"}}", .{key});
+        }
+
+        fn projectStored(
+            ctx: ?*anyopaque,
+            project_alloc: Allocator,
+            _: types.SearchRequest,
+            doc_key: []const u8,
+            raw: []const u8,
+        ) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.project_count += 1;
+            try std.testing.expect(std.mem.indexOf(u8, raw, doc_key) != null);
+            return try project_alloc.dupe(u8, raw);
+        }
+    };
+
+    var harness = Harness{};
+    var hits = try alloc.alloc(types.SearchHit, 2);
+    hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .stored_data = try alloc.dupe(u8, "{\"id\":\"doc:a\"}"),
+    };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:b") };
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 2,
+        .graph_results = &.{},
+    };
+    defer result.deinit();
+
+    const profile = try loadMissingProjectedTextHitDocuments(alloc, .{}, .{
+        .ctx = &harness,
+        .text_index_entry = undefined,
+        .text_index_is_chunk_backed = undefined,
+        .search_match_all = undefined,
+        .project_stored_search = Harness.projectStored,
+        .load_stored = Harness.loadStored,
+        .postprocess = undefined,
+    }, result.hits);
+
+    try std.testing.expectEqual(@as(usize, 1), harness.load_count);
+    try std.testing.expectEqual(@as(usize, 1), harness.project_count);
+    try std.testing.expectEqual(@as(usize, 1), profile.requested_count);
+    try std.testing.expectEqual(@as(usize, 1), profile.loaded_count);
+    try std.testing.expectEqual(@as(usize, 1), profile.batch_count);
+    try std.testing.expect(result.hits[0].stored_data != null);
+    try std.testing.expect(result.hits[1].stored_data != null);
+    try std.testing.expectEqualStrings("{\"id\":\"doc:b\"}", result.hits[1].stored_data.?);
+}
+
+test "text projected source load rejects expired deadline before stored load" {
+    const alloc = std.testing.allocator;
+
+    const Harness = struct {
+        load_count: usize = 0,
+        project_count: usize = 0,
+
+        fn loadStored(ctx: ?*anyopaque, load_alloc: Allocator, key: []const u8) anyerror!?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.load_count += 1;
+            return try std.fmt.allocPrint(load_alloc, "{{\"id\":\"{s}\"}}", .{key});
+        }
+
+        fn projectStored(
+            ctx: ?*anyopaque,
+            project_alloc: Allocator,
+            _: types.SearchRequest,
+            _: []const u8,
+            raw: []const u8,
+        ) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.project_count += 1;
+            return try project_alloc.dupe(u8, raw);
+        }
+    };
+
+    var harness = Harness{};
+    var hits = try alloc.alloc(types.SearchHit, 1);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a") };
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 1,
+        .graph_results = &.{},
+    };
+    defer result.deinit();
+
+    try std.testing.expectError(error.Timeout, loadMissingProjectedTextHitDocuments(alloc, .{
+        .execution_deadline_ns = 0,
+    }, .{
+        .ctx = &harness,
+        .text_index_entry = undefined,
+        .text_index_is_chunk_backed = undefined,
+        .search_match_all = undefined,
+        .project_stored_search = Harness.projectStored,
+        .load_stored = Harness.loadStored,
+        .postprocess = undefined,
+    }, result.hits));
+    try std.testing.expectEqual(@as(usize, 0), harness.load_count);
+    try std.testing.expectEqual(@as(usize, 0), harness.project_count);
 }
 
 fn testMatchAllExecutor(ctx: *const TestMatchAllCtx) MatchAllExecutor {
     return .{
         .ctx = @constCast(ctx),
         .collect_candidates = testCollectMatchAllCandidatesCallback,
+        .collect_candidates_stream = testStreamMatchAllCandidatesCallback,
         .text_index_entry = testTextIndexEntryCallback,
         .resolve_doc_set_doc_ids = testResolveDocSetDocIdsCallback,
         .resolve_doc_ids_to_doc_set = testResolveDocIdsToDocSetCallback,
         .live_filter_doc_set = testLiveFilterDocSetCallback,
         .load_projected_document = testMatchAllLoadProjectedCallback,
+        .load_projected_documents = testMatchAllLoadProjectedManyCallback,
         .load_stored = testMatchAllLoadStoredCallback,
     };
+}
+
+test "match_all projected source load rejects expired deadline before batch load" {
+    const alloc = std.testing.allocator;
+
+    var hits = try alloc.alloc(types.SearchHit, 2);
+    hits[0] = .{ .id = try alloc.dupe(u8, "doc:a") };
+    hits[1] = .{ .id = try alloc.dupe(u8, "doc:b") };
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 2,
+        .graph_results = &.{},
+    };
+    defer result.deinit();
+
+    var projected_batch_count: usize = 0;
+    var projected_batch_doc_count: usize = 0;
+    const ctx = TestMatchAllCtx{
+        .ids = &.{},
+        .projected_batch_count = &projected_batch_count,
+        .projected_batch_doc_count = &projected_batch_doc_count,
+    };
+
+    try std.testing.expectError(error.Timeout, loadMissingProjectedMatchAllHitDocuments(alloc, .{
+        .execution_deadline_ns = 0,
+    }, testMatchAllExecutor(&ctx), result.hits));
+    try std.testing.expectEqual(@as(usize, 0), projected_batch_count);
+    try std.testing.expectEqual(@as(usize, 0), projected_batch_doc_count);
+}
+
+test "match_all native candidate sort zero limit avoids decoration" {
+    const alloc = std.testing.allocator;
+
+    const Loader = struct {
+        load_count: usize = 0,
+
+        fn load(ctx: ?*anyopaque, _: Allocator, _: types.SearchHit, field: []const u8) anyerror!?SortValue {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.load_count += 1;
+            try std.testing.expectEqualStrings("rank", field);
+            return error.UnexpectedTestCall;
+        }
+    };
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "rank",
+        .path_match = "rank",
+        .mapping = .{
+            .field_type = .numeric,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+
+    var candidates = MatchAllCandidates{
+        .items = try alloc.alloc(MatchAllCandidate, 2),
+    };
+    candidates.items[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .ordinal = 1 };
+    candidates.items[1] = .{ .id = try alloc.dupe(u8, "doc:b"), .ordinal = 2 };
+    defer candidates.deinit(alloc);
+
+    var loader = Loader{};
+    const order_by = [_]types.SortField{.{ .field = "rank", .desc = false }};
+    var result = try sortAndPageMatchAllCandidatesAlloc(alloc, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 0,
+    }, &candidates, null, testUnexpectedLoadStoredCallback, .{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .runtime_schema = schema,
+    }, .{
+        .ctx = &loader,
+        .require_native = true,
+        .load = Loader.load,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), result.hits.len);
+    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, result.total_hits_relation);
+    try std.testing.expectEqual(@as(usize, 0), loader.load_count);
+    const profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", profile.plan);
+    try std.testing.expectEqual(@as(u64, 2), profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 0), profile.native_doc_value_hit_count);
+    try std.testing.expectEqual(@as(u64, 0), profile.native_doc_value_miss_count);
+}
+
+test "match_all native candidate sort applies cursor before admission" {
+    const alloc = std.testing.allocator;
+
+    const Loader = struct {
+        load_count: usize = 0,
+
+        fn load(ctx: ?*anyopaque, _: Allocator, hit: types.SearchHit, field: []const u8) anyerror!?SortValue {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.load_count += 1;
+            try std.testing.expectEqualStrings("rank", field);
+            if (std.mem.eql(u8, hit.id, "doc:a")) return .{ .integer = 1 };
+            if (std.mem.eql(u8, hit.id, "doc:b")) return .{ .integer = 2 };
+            if (std.mem.eql(u8, hit.id, "doc:c")) return .{ .integer = 3 };
+            return error.UnexpectedTestCall;
+        }
+    };
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "rank",
+        .path_match = "rank",
+        .mapping = .{
+            .field_type = .numeric,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+    const order_by = [_]types.SortField{.{ .field = "rank", .desc = false }};
+    const after_cursor = [_]std.json.Value{
+        .{ .integer = 1 },
+        .{ .string = "doc:a" },
+    };
+    const before_cursor = [_]std.json.Value{
+        .{ .integer = 3 },
+        .{ .string = "doc:c" },
+    };
+    const plan = SortExecutionPlan{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .runtime_schema = schema,
+    };
+
+    var after_candidates = MatchAllCandidates{
+        .items = try alloc.alloc(MatchAllCandidate, 3),
+    };
+    after_candidates.items[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .ordinal = 1 };
+    after_candidates.items[1] = .{ .id = try alloc.dupe(u8, "doc:b"), .ordinal = 2 };
+    after_candidates.items[2] = .{ .id = try alloc.dupe(u8, "doc:c"), .ordinal = 3 };
+    defer after_candidates.deinit(alloc);
+
+    var after_loader = Loader{};
+    var after_result = try sortAndPageMatchAllCandidatesAlloc(alloc, .{
+        .order_by = &order_by,
+        .search_after = &after_cursor,
+        .include_stored = false,
+        .profile = true,
+        .limit = 1,
+    }, &after_candidates, null, testUnexpectedLoadStoredCallback, plan, .{
+        .ctx = &after_loader,
+        .require_native = true,
+        .load = Loader.load,
+    });
+    defer after_result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), after_result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", after_result.hits[0].id);
+    try std.testing.expectEqual(@as(i64, 2), after_result.hits[0].sort_values[0].integer);
+    try std.testing.expectEqualStrings("doc:b", after_result.hits[0].sort_values[1].string);
+    try std.testing.expectEqual(@as(usize, 3), after_loader.load_count);
+    const after_profile = after_result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", after_profile.plan);
+    try std.testing.expectEqual(@as(u64, 3), after_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 1), after_profile.cursor_rejected_count);
+    try std.testing.expectEqual(@as(u64, 1), after_profile.selected_count);
+    try std.testing.expectEqual(@as(usize, 1), after_profile.window_capacity);
+    try std.testing.expectEqual(@as(usize, 1), after_profile.window_len);
+
+    var before_candidates = MatchAllCandidates{
+        .items = try alloc.alloc(MatchAllCandidate, 3),
+    };
+    before_candidates.items[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .ordinal = 1 };
+    before_candidates.items[1] = .{ .id = try alloc.dupe(u8, "doc:b"), .ordinal = 2 };
+    before_candidates.items[2] = .{ .id = try alloc.dupe(u8, "doc:c"), .ordinal = 3 };
+    defer before_candidates.deinit(alloc);
+
+    var before_loader = Loader{};
+    var before_result = try sortAndPageMatchAllCandidatesAlloc(alloc, .{
+        .order_by = &order_by,
+        .search_before = &before_cursor,
+        .include_stored = false,
+        .profile = true,
+        .limit = 1,
+    }, &before_candidates, null, testUnexpectedLoadStoredCallback, plan, .{
+        .ctx = &before_loader,
+        .require_native = true,
+        .load = Loader.load,
+    });
+    defer before_result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), before_result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", before_result.hits[0].id);
+    try std.testing.expectEqual(@as(i64, 2), before_result.hits[0].sort_values[0].integer);
+    try std.testing.expectEqualStrings("doc:b", before_result.hits[0].sort_values[1].string);
+    try std.testing.expectEqual(@as(usize, 3), before_loader.load_count);
+    const before_profile = before_result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", before_profile.plan);
+    try std.testing.expectEqual(@as(u64, 3), before_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 1), before_profile.cursor_rejected_count);
+    try std.testing.expectEqual(@as(u64, 1), before_profile.selected_count);
+    try std.testing.expectEqual(@as(usize, 1), before_profile.window_capacity);
+    try std.testing.expectEqual(@as(usize, 1), before_profile.window_len);
 }
 
 test "match_all applies explicit doc id constraints before paging" {
@@ -6345,6 +23606,349 @@ test "match_all candidate ordinal lookup uses identity read generation" {
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 9), candidates.items[0].ordinal);
 }
 
+test "match_all streaming collection stops after exact sort budget" {
+    const alloc = std.testing.allocator;
+    const encoded = [_][]u8{
+        try internal_keys.documentKeyAlloc(alloc, "doc:a"),
+        try internal_keys.documentKeyAlloc(alloc, "doc:b"),
+        try internal_keys.documentKeyAlloc(alloc, "doc:c"),
+    };
+    defer for (encoded) |key| alloc.free(key);
+
+    const Harness = struct {
+        keys: []const []const u8,
+        visited: usize = 0,
+        in_scan_callback: bool = false,
+        expired_checks: usize = 0,
+        ordinal_lookups: usize = 0,
+
+        fn scanStoreRange(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: []const u8,
+            _: []const u8,
+        ) anyerror![]docstore_mod.OwnedKVPair {
+            return error.UnexpectedTestCall;
+        }
+
+        fn scanStoreRangeWithContext(
+            ctx: ?*anyopaque,
+            _: []const u8,
+            _: []const u8,
+            _: docstore_mod.DocStore.ScanOptions,
+            scan_ctx: ?*anyopaque,
+            callback: docstore_mod.DocStore.ScanWithContextCallback,
+        ) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.in_scan_callback = true;
+            defer self.in_scan_callback = false;
+            for (self.keys) |key| {
+                self.visited += 1;
+                if (try callback(scan_ctx, key, "{}") == .stop) return;
+            }
+        }
+
+        fn isExpiredKey(ctx: ?*anyopaque, _: Allocator, _: []const u8) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            try std.testing.expect(!self.in_scan_callback);
+            self.expired_checks += 1;
+            return false;
+        }
+
+        fn lookupDocOrdinal(ctx: ?*anyopaque, _: Allocator, _: []const u8, _: ?u64) anyerror!?doc_set.DocOrdinal {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            try std.testing.expect(!self.in_scan_callback);
+            self.ordinal_lookups += 1;
+            return @intCast(self.ordinal_lookups);
+        }
+    };
+
+    var harness = Harness{ .keys = &encoded };
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, collectMatchAllCandidatesWithOptions(alloc, .{}, .{
+        .ctx = &harness,
+        .scan_store_range = Harness.scanStoreRange,
+        .scan_store_range_with_context = Harness.scanStoreRangeWithContext,
+        .is_expired_key = Harness.isExpiredKey,
+        .lookup_doc_ordinal = Harness.lookupDocOrdinal,
+    }, .{
+        .candidate_limit = 1,
+        .scan_batch_size = 2,
+    }));
+    try std.testing.expectEqual(@as(usize, 2), harness.visited);
+    try std.testing.expectEqual(@as(usize, 2), harness.expired_checks);
+    try std.testing.expectEqual(@as(usize, 2), harness.ordinal_lookups);
+}
+
+test "match_all id stream search_after skips cursor document child records" {
+    const alloc = std.testing.allocator;
+    const encoded = [_][]u8{
+        try internal_keys.documentKeyAlloc(alloc, "doc:a"),
+        try internal_keys.ttlKeyAlloc(alloc, "doc:a"),
+        try internal_keys.documentKeyAlloc(alloc, "doc:b"),
+    };
+    defer for (encoded) |key| alloc.free(key);
+
+    const Harness = struct {
+        keys: []const []const u8,
+        visited: usize = 0,
+
+        fn scanStoreRange(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: []const u8,
+            _: []const u8,
+        ) anyerror![]docstore_mod.OwnedKVPair {
+            return error.UnexpectedTestCall;
+        }
+
+        fn scanStoreRangeWithContext(
+            ctx: ?*anyopaque,
+            lower: []const u8,
+            upper: []const u8,
+            _: docstore_mod.DocStore.ScanOptions,
+            scan_ctx: ?*anyopaque,
+            callback: docstore_mod.DocStore.ScanWithContextCallback,
+        ) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            for (self.keys) |key| {
+                if (std.mem.order(u8, key, lower) == .lt) continue;
+                if (upper.len > 0 and std.mem.order(u8, key, upper) != .lt) continue;
+                self.visited += 1;
+                if (try callback(scan_ctx, key, "{}") == .stop) return;
+            }
+        }
+
+        fn isExpiredKey(_: ?*anyopaque, _: Allocator, _: []const u8) anyerror!bool {
+            return false;
+        }
+
+        fn lookupDocOrdinal(_: ?*anyopaque, _: Allocator, _: []const u8, _: ?u64) anyerror!?doc_set.DocOrdinal {
+            return null;
+        }
+    };
+
+    const ConsumerCtx = struct {
+        alloc: Allocator,
+        seen: usize = 0,
+    };
+    const Consumer = struct {
+        fn consume(ctx: ?*anyopaque, candidate: MatchAllCandidate) anyerror!void {
+            const consumer_ctx: *ConsumerCtx = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            var owned = candidate;
+            defer owned.deinit(consumer_ctx.alloc);
+            try std.testing.expectEqualStrings("doc:b", owned.id);
+            consumer_ctx.seen += 1;
+        }
+    };
+
+    var harness = Harness{ .keys = &encoded };
+    var consumer_ctx = ConsumerCtx{ .alloc = alloc };
+    const stats = try streamMatchAllCandidatesWithOptions(alloc, .{}, .{
+        .ctx = &harness,
+        .scan_store_range = Harness.scanStoreRange,
+        .scan_store_range_with_context = Harness.scanStoreRangeWithContext,
+        .is_expired_key = Harness.isExpiredKey,
+        .lookup_doc_ordinal = Harness.lookupDocOrdinal,
+    }, .{
+        .primary_key_start_after = "doc:a",
+        .stop_after_accepted = 1,
+        .scan_batch_size = 4,
+    }, &consumer_ctx, Consumer.consume);
+
+    try std.testing.expectEqual(@as(usize, 1), harness.visited);
+    try std.testing.expectEqual(@as(usize, 1), consumer_ctx.seen);
+    try std.testing.expectEqual(@as(usize, 1), stats.accepted_count);
+    try std.testing.expect(stats.stopped_early);
+}
+
+test "match_all id stream search_before excludes cursor document child records" {
+    const alloc = std.testing.allocator;
+    const encoded = [_][]u8{
+        try internal_keys.documentKeyAlloc(alloc, "doc:a"),
+        try internal_keys.documentKeyAlloc(alloc, "doc:b"),
+        try internal_keys.ttlKeyAlloc(alloc, "doc:b"),
+        try internal_keys.documentKeyAlloc(alloc, "doc:c"),
+    };
+    defer for (encoded) |key| alloc.free(key);
+
+    const Harness = struct {
+        keys: []const []const u8,
+        visited: usize = 0,
+
+        fn scanStoreRange(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: []const u8,
+            _: []const u8,
+        ) anyerror![]docstore_mod.OwnedKVPair {
+            return error.UnexpectedTestCall;
+        }
+
+        fn scanStoreRangeWithContext(
+            ctx: ?*anyopaque,
+            lower: []const u8,
+            upper: []const u8,
+            options: docstore_mod.DocStore.ScanOptions,
+            scan_ctx: ?*anyopaque,
+            callback: docstore_mod.DocStore.ScanWithContextCallback,
+        ) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            if (options.reverse) {
+                var i = self.keys.len;
+                while (i > 0) {
+                    i -= 1;
+                    const key = self.keys[i];
+                    if (std.mem.order(u8, key, lower) == .lt) continue;
+                    if (upper.len > 0 and std.mem.order(u8, key, upper) != .lt) continue;
+                    self.visited += 1;
+                    if (try callback(scan_ctx, key, "{}") == .stop) return;
+                }
+            } else {
+                for (self.keys) |key| {
+                    if (std.mem.order(u8, key, lower) == .lt) continue;
+                    if (upper.len > 0 and std.mem.order(u8, key, upper) != .lt) continue;
+                    self.visited += 1;
+                    if (try callback(scan_ctx, key, "{}") == .stop) return;
+                }
+            }
+        }
+
+        fn isExpiredKey(_: ?*anyopaque, _: Allocator, _: []const u8) anyerror!bool {
+            return false;
+        }
+
+        fn lookupDocOrdinal(_: ?*anyopaque, _: Allocator, _: []const u8, _: ?u64) anyerror!?doc_set.DocOrdinal {
+            return null;
+        }
+    };
+
+    const ConsumerCtx = struct {
+        alloc: Allocator,
+        seen: usize = 0,
+    };
+    const Consumer = struct {
+        fn consume(ctx: ?*anyopaque, candidate: MatchAllCandidate) anyerror!void {
+            const consumer_ctx: *ConsumerCtx = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            var owned = candidate;
+            defer owned.deinit(consumer_ctx.alloc);
+            try std.testing.expectEqualStrings("doc:a", owned.id);
+            consumer_ctx.seen += 1;
+        }
+    };
+
+    var harness = Harness{ .keys = &encoded };
+    var consumer_ctx = ConsumerCtx{ .alloc = alloc };
+    const stats = try streamMatchAllCandidatesWithOptions(alloc, .{}, .{
+        .ctx = &harness,
+        .scan_store_range = Harness.scanStoreRange,
+        .scan_store_range_with_context = Harness.scanStoreRangeWithContext,
+        .is_expired_key = Harness.isExpiredKey,
+        .lookup_doc_ordinal = Harness.lookupDocOrdinal,
+    }, .{
+        .primary_key_stop_before = "doc:b",
+        .primary_key_reverse = true,
+        .stop_after_accepted = 1,
+        .scan_batch_size = 4,
+    }, &consumer_ctx, Consumer.consume);
+
+    try std.testing.expectEqual(@as(usize, 1), harness.visited);
+    try std.testing.expectEqual(@as(usize, 1), consumer_ctx.seen);
+    try std.testing.expectEqual(@as(usize, 1), stats.accepted_count);
+    try std.testing.expect(stats.stopped_early);
+}
+
+test "match_all id reverse stream works without contextual scan support" {
+    const alloc = std.testing.allocator;
+    const encoded = [_][]u8{
+        try internal_keys.documentKeyAlloc(alloc, "doc:a"),
+        try internal_keys.documentKeyAlloc(alloc, "doc:b"),
+        try internal_keys.documentKeyAlloc(alloc, "doc:c"),
+        try internal_keys.documentKeyAlloc(alloc, "doc:d"),
+    };
+    defer for (encoded) |key| alloc.free(key);
+
+    const Harness = struct {
+        keys: []const []const u8,
+        scan_count: usize = 0,
+
+        fn scanStoreRange(
+            ctx: ?*anyopaque,
+            scan_alloc: Allocator,
+            lower: []const u8,
+            upper: []const u8,
+        ) anyerror![]docstore_mod.OwnedKVPair {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.scan_count += 1;
+            var out = std.ArrayListUnmanaged(docstore_mod.OwnedKVPair).empty;
+            errdefer {
+                for (out.items) |item| {
+                    scan_alloc.free(item.key);
+                    scan_alloc.free(item.value);
+                }
+                out.deinit(scan_alloc);
+            }
+            for (self.keys) |key| {
+                if (std.mem.order(u8, key, lower) == .lt) continue;
+                if (upper.len > 0 and std.mem.order(u8, key, upper) != .lt) continue;
+                var owned_key = try scan_alloc.dupe(u8, key);
+                errdefer scan_alloc.free(owned_key);
+                var owned_value = try scan_alloc.dupe(u8, "{}");
+                errdefer scan_alloc.free(owned_value);
+                try out.append(scan_alloc, .{
+                    .key = owned_key,
+                    .value = owned_value,
+                });
+                owned_key = @constCast(&[_]u8{});
+                owned_value = @constCast(&[_]u8{});
+            }
+            return try out.toOwnedSlice(scan_alloc);
+        }
+
+        fn isExpiredKey(_: ?*anyopaque, _: Allocator, _: []const u8) anyerror!bool {
+            return false;
+        }
+
+        fn lookupDocOrdinal(_: ?*anyopaque, _: Allocator, _: []const u8, _: ?u64) anyerror!?doc_set.DocOrdinal {
+            return null;
+        }
+    };
+
+    const ConsumerCtx = struct {
+        alloc: Allocator,
+        expected: []const []const u8,
+        seen: usize = 0,
+    };
+    const Consumer = struct {
+        fn consume(ctx: ?*anyopaque, candidate: MatchAllCandidate) anyerror!void {
+            const consumer_ctx: *ConsumerCtx = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            var owned = candidate;
+            defer owned.deinit(consumer_ctx.alloc);
+            try std.testing.expect(consumer_ctx.seen < consumer_ctx.expected.len);
+            try std.testing.expectEqualStrings(consumer_ctx.expected[consumer_ctx.seen], owned.id);
+            consumer_ctx.seen += 1;
+        }
+    };
+
+    const expected = [_][]const u8{ "doc:c", "doc:b" };
+    var harness = Harness{ .keys = &encoded };
+    var consumer_ctx = ConsumerCtx{ .alloc = alloc, .expected = &expected };
+    const stats = try streamMatchAllCandidatesWithOptions(alloc, .{}, .{
+        .ctx = &harness,
+        .scan_store_range = Harness.scanStoreRange,
+        .is_expired_key = Harness.isExpiredKey,
+        .lookup_doc_ordinal = Harness.lookupDocOrdinal,
+    }, .{
+        .primary_key_stop_before = "doc:d",
+        .primary_key_reverse = true,
+        .stop_after_accepted = expected.len,
+    }, &consumer_ctx, Consumer.consume);
+
+    try std.testing.expectEqual(@as(usize, 1), harness.scan_count);
+    try std.testing.expectEqual(expected.len, consumer_ctx.seen);
+    try std.testing.expectEqual(expected.len, stats.accepted_count);
+    try std.testing.expect(stats.stopped_early);
+}
+
 test "match_all consumes resolved ordinal filters without doc id projection" {
     const alloc = std.testing.allocator;
     const ctx = TestMatchAllCtx{
@@ -6371,6 +23975,20 @@ test "match_all consumes resolved ordinal filters without doc id projection" {
     try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
 }
 
+test "match_all rejects expired execution deadline" {
+    const alloc = std.testing.allocator;
+    const ctx = TestMatchAllCtx{
+        .ids = &.{ "doc:a", "doc:b", "doc:c" },
+        .ordinals = &.{ 1, 2, 3 },
+    };
+
+    try std.testing.expectError(error.Timeout, searchMatchAll(alloc, .{
+        .include_stored = false,
+        .limit = 10,
+        .execution_deadline_ns = platform_time.monotonicNs(),
+    }, testMatchAllExecutor(&ctx)));
+}
+
 test "match_all applies stored pattern filters before paging" {
     const alloc = std.testing.allocator;
     const ctx = TestMatchAllCtx{
@@ -6391,6 +24009,1274 @@ test "match_all applies stored pattern filters before paging" {
     try std.testing.expectEqual(@as(u32, 2), result.total_hits);
     try std.testing.expectEqual(@as(usize, 1), result.hits.len);
     try std.testing.expectEqualStrings("doc:c", result.hits[0].id);
+}
+
+test "match_all rejects sorted pages with unresolved stored pattern filters" {
+    const alloc = std.testing.allocator;
+    var collect_count: usize = 0;
+    var stream_collect_count: usize = 0;
+    const ctx = TestMatchAllCtx{
+        .ids = &.{ "doc:a", "doc:b", "doc:c" },
+        .ordinals = &.{ 1, 2, 3 },
+        .collect_count = &collect_count,
+        .stream_collect_count = &stream_collect_count,
+    };
+    const order_by = [_]types.SortField{.{ .field = "_id" }};
+
+    var executor = testMatchAllExecutor(&ctx);
+    executor.live_filter_doc_set = null;
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, searchMatchAll(alloc, .{
+        .filter_query_json = "{\"term\":{\"tier\":\"gold\"}}",
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 1,
+    }, executor));
+    const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("missing_native_filter_coverage", diagnostic.reason);
+    try std.testing.expectEqualStrings("filter_query_json_unresolved", diagnostic.detail);
+    try std.testing.expectEqual(@as(usize, 0), collect_count);
+    try std.testing.expectEqual(@as(usize, 0), stream_collect_count);
+}
+
+test "match_all rejects cursor pages with unresolved stored pattern filters" {
+    const alloc = std.testing.allocator;
+    var collect_count: usize = 0;
+    var stream_collect_count: usize = 0;
+    const ctx = TestMatchAllCtx{
+        .ids = &.{ "doc:a", "doc:b", "doc:c" },
+        .ordinals = &.{ 1, 2, 3 },
+        .collect_count = &collect_count,
+        .stream_collect_count = &stream_collect_count,
+    };
+    const order_by = [_]types.SortField{.{ .field = "_id" }};
+    const cursor = [_]std.json.Value{.{ .string = "doc:a" }};
+
+    var executor = testMatchAllExecutor(&ctx);
+    executor.live_filter_doc_set = null;
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, searchMatchAll(alloc, .{
+        .filter_query_json = "{\"term\":{\"tier\":\"gold\"}}",
+        .order_by = &order_by,
+        .search_after = &cursor,
+        .include_stored = false,
+        .limit = 1,
+    }, executor));
+    const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("missing_native_filter_coverage", diagnostic.reason);
+    try std.testing.expectEqualStrings("filter_query_json_unresolved", diagnostic.detail);
+    try std.testing.expectEqual(@as(usize, 0), collect_count);
+    try std.testing.expectEqual(@as(usize, 0), stream_collect_count);
+}
+
+test "match_all rejects field sort without native doc values" {
+    const alloc = std.testing.allocator;
+    var collect_count: usize = 0;
+    const ctx = TestMatchAllCtx{
+        .ids = &.{ "doc:a", "doc:b", "doc:c" },
+        .ordinals = &.{ 1, 2, 3 },
+        .collect_count = &collect_count,
+    };
+    const order_by = [_]types.SortField{
+        .{ .field = "rank" },
+        .{ .field = "_id" },
+    };
+
+    var executor = testMatchAllExecutor(&ctx);
+    executor.live_filter_doc_set = null;
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedExactSort, searchMatchAll(alloc, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 2,
+    }, executor));
+    const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("missing_doc_values_coverage", diagnostic.reason);
+    try std.testing.expectEqualStrings("text_index_entry_unavailable", diagnostic.detail);
+    try std.testing.expectEqual(@as(usize, 0), collect_count);
+}
+
+test "match_all rejects score sort without score-bearing source" {
+    const alloc = std.testing.allocator;
+    var collect_count: usize = 0;
+    var stream_collect_count: usize = 0;
+    const ctx = TestMatchAllCtx{
+        .ids = &.{ "doc:a", "doc:b", "doc:c" },
+        .ordinals = &.{ 1, 2, 3 },
+        .collect_count = &collect_count,
+        .stream_collect_count = &stream_collect_count,
+    };
+    const order_by = [_]types.SortField{.{ .field = "_score", .desc = true }};
+    const req = types.SearchRequest{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 2,
+    };
+
+    var executor = testMatchAllExecutor(&ctx);
+    executor.live_filter_doc_set = null;
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, planMatchAllSortBeforeCandidatesAlloc(alloc, req, executor));
+    var diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("_score", diagnostic.field);
+    try std.testing.expectEqualStrings("non_score_bearing_source", diagnostic.reason);
+    try std.testing.expectEqualStrings("non_score_bearing_source", diagnostic.detail);
+    try std.testing.expectError(error.UnsupportedQueryRequest, searchMatchAll(alloc, req, executor));
+    diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("_score", diagnostic.field);
+    try std.testing.expectEqualStrings("non_score_bearing_source", diagnostic.reason);
+    try std.testing.expectEqualStrings("non_score_bearing_source", diagnostic.detail);
+    try std.testing.expectEqual(@as(usize, 0), collect_count);
+    try std.testing.expectEqual(@as(usize, 0), stream_collect_count);
+}
+
+test "match_all candidate sort rejects direct score sort execution" {
+    const alloc = std.testing.allocator;
+    const items = try alloc.alloc(MatchAllCandidate, 1);
+    items[0] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .ordinal = 1,
+    };
+    var candidates = MatchAllCandidates{ .items = items };
+    defer candidates.deinit(alloc);
+    const order_by = [_]types.SortField{.{ .field = "_score", .desc = true }};
+
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, sortAndPageMatchAllCandidatesAlloc(
+        alloc,
+        .{
+            .order_by = &order_by,
+            .include_stored = false,
+            .limit = 1,
+        },
+        &candidates,
+        null,
+        testUnexpectedLoadStoredCallback,
+        .{ .kind = .score_top_k },
+        null,
+    ));
+    const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("_score", diagnostic.field);
+    try std.testing.expectEqualStrings("non_score_bearing_source", diagnostic.reason);
+    try std.testing.expectEqualStrings("non_score_bearing_source", diagnostic.detail);
+}
+
+test "match_all candidate sort enforces exact budget before stored json loads" {
+    const alloc = std.testing.allocator;
+
+    const Harness = struct {
+        load_count: usize = 0,
+
+        fn loadStored(ctx: ?*anyopaque, load_alloc: Allocator, key: []const u8) anyerror!?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.load_count += 1;
+            return try std.fmt.allocPrint(load_alloc, "{{\"rank\":1,\"id\":\"{s}\"}}", .{key});
+        }
+    };
+
+    const items = try alloc.alloc(MatchAllCandidate, 3);
+    items[0] = .{ .id = try alloc.dupe(u8, "doc:a"), .ordinal = 1 };
+    items[1] = .{ .id = try alloc.dupe(u8, "doc:b"), .ordinal = 2 };
+    items[2] = .{ .id = try alloc.dupe(u8, "doc:c"), .ordinal = 3 };
+    var candidates = MatchAllCandidates{ .items = items };
+    defer candidates.deinit(alloc);
+    var harness = Harness{};
+
+    const c = struct {
+        extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    const budget_env = "ANTFLY_TEXT_LATE_VISIBILITY_EXACT_CANDIDATE_BUDGET";
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(budget_env, "2", 1));
+    defer _ = c.unsetenv(budget_env);
+
+    const order_by = [_]types.SortField{.{ .field = "rank" }};
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, sortAndPageMatchAllCandidatesAlloc(
+        alloc,
+        .{
+            .index_name = "ft",
+            .order_by = &order_by,
+            .include_stored = false,
+            .limit = 2,
+        },
+        &candidates,
+        &harness,
+        Harness.loadStored,
+        .{ .kind = .stored_json_debug },
+        null,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), harness.load_count);
+    const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("ft", diagnostic.field);
+    try std.testing.expectEqualStrings("candidate_budget_exceeded", diagnostic.reason);
+    try std.testing.expectEqualStrings("match_all_exact_candidate_window", diagnostic.detail);
+}
+
+test "match_all stream sort enforces exact budget before decorating overflow candidate" {
+    const alloc = std.testing.allocator;
+
+    const Harness = struct {
+        ids: []const []const u8,
+        attempted_count: usize = 0,
+        accepted_count: usize = 0,
+        load_count: usize = 0,
+
+        fn collectCandidates(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: MatchAllCandidateCollectOptions,
+        ) anyerror!MatchAllCandidates {
+            return error.UnexpectedTestCall;
+        }
+
+        fn collectStream(
+            ctx: ?*anyopaque,
+            collect_alloc: Allocator,
+            req: types.SearchRequest,
+            options: MatchAllCandidateCollectOptions,
+            consumer_ctx: ?*anyopaque,
+            consumer: MatchAllCandidateConsumer,
+        ) anyerror!MatchAllCandidateStreamStats {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            _ = req;
+            _ = options;
+            for (self.ids, 0..) |id, i| {
+                self.attempted_count += 1;
+                var candidate = MatchAllCandidate{
+                    .id = try collect_alloc.dupe(u8, id),
+                    .ordinal = @intCast(i + 1),
+                };
+                errdefer candidate.deinit(collect_alloc);
+                try consumer(consumer_ctx, candidate);
+                candidate.id = @constCast(&[_]u8{});
+                self.accepted_count += 1;
+            }
+            return .{ .accepted_count = boundedU32(self.accepted_count), .stopped_early = false };
+        }
+
+        fn textIndexEntry(
+            _: ?*anyopaque,
+            _: ?[]const u8,
+        ) anyerror!?*index_manager_mod.IndexManager.TextIndex {
+            return error.UnexpectedTestCall;
+        }
+
+        fn loadProjectedDocument(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: []const u8,
+        ) anyerror![]u8 {
+            return error.UnexpectedTestCall;
+        }
+
+        fn loadStored(ctx: ?*anyopaque, load_alloc: Allocator, key: []const u8) anyerror!?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.load_count += 1;
+            return try std.fmt.allocPrint(load_alloc, "{{\"rank\":1,\"id\":\"{s}\"}}", .{key});
+        }
+    };
+
+    var harness = Harness{ .ids = &.{ "doc:a", "doc:b", "doc:c" } };
+    const c = struct {
+        extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    const budget_env = "ANTFLY_TEXT_LATE_VISIBILITY_EXACT_CANDIDATE_BUDGET";
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(budget_env, "2", 1));
+    defer _ = c.unsetenv(budget_env);
+
+    const order_by = [_]types.SortField{.{ .field = "rank" }};
+    const executor = MatchAllExecutor{
+        .ctx = &harness,
+        .collect_candidates = Harness.collectCandidates,
+        .collect_candidates_stream = Harness.collectStream,
+        .text_index_entry = Harness.textIndexEntry,
+        .load_projected_document = Harness.loadProjectedDocument,
+        .load_stored = Harness.loadStored,
+    };
+
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, sortAndPageMatchAllCandidateStreamAlloc(alloc, .{
+        .index_name = "ft",
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 2,
+    }, executor, .{}, .{ .kind = .stored_json_debug }, null));
+    try std.testing.expectEqual(@as(usize, 3), harness.attempted_count);
+    try std.testing.expectEqual(@as(usize, 2), harness.accepted_count);
+    try std.testing.expectEqual(@as(usize, 2), harness.load_count);
+    const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("ft", diagnostic.field);
+    try std.testing.expectEqualStrings("candidate_budget_exceeded", diagnostic.reason);
+    try std.testing.expectEqualStrings("match_all_exact_candidate_window", diagnostic.detail);
+}
+
+test "match_all native stream sort zero limit counts without decoration" {
+    const alloc = std.testing.allocator;
+
+    const Harness = struct {
+        ids: []const []const u8,
+        attempted_count: usize = 0,
+        accepted_count: usize = 0,
+
+        fn collectCandidates(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: MatchAllCandidateCollectOptions,
+        ) anyerror!MatchAllCandidates {
+            return error.UnexpectedTestCall;
+        }
+
+        fn collectStream(
+            ctx: ?*anyopaque,
+            collect_alloc: Allocator,
+            req: types.SearchRequest,
+            options: MatchAllCandidateCollectOptions,
+            consumer_ctx: ?*anyopaque,
+            consumer: MatchAllCandidateConsumer,
+        ) anyerror!MatchAllCandidateStreamStats {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            _ = req;
+            for (self.ids, 0..) |id, i| {
+                self.attempted_count += 1;
+                if (options.candidate_limit) |limit| {
+                    if (self.accepted_count >= limit) return error.QueryCandidateBudgetExceeded;
+                }
+                var candidate = MatchAllCandidate{
+                    .id = try collect_alloc.dupe(u8, id),
+                    .ordinal = @intCast(i + 1),
+                };
+                errdefer candidate.deinit(collect_alloc);
+                try consumer(consumer_ctx, candidate);
+                candidate.id = @constCast(&[_]u8{});
+                self.accepted_count += 1;
+            }
+            return .{ .accepted_count = self.accepted_count, .stopped_early = false };
+        }
+
+        fn textIndexEntry(
+            _: ?*anyopaque,
+            _: ?[]const u8,
+        ) anyerror!?*index_manager_mod.IndexManager.TextIndex {
+            return error.UnexpectedTestCall;
+        }
+
+        fn loadProjectedDocument(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: []const u8,
+        ) anyerror![]u8 {
+            return error.UnexpectedTestCall;
+        }
+    };
+
+    const Loader = struct {
+        load_count: usize = 0,
+
+        fn load(ctx: ?*anyopaque, _: Allocator, _: types.SearchHit, field: []const u8) anyerror!?SortValue {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            self.load_count += 1;
+            try std.testing.expectEqualStrings("rank", field);
+            return error.UnexpectedTestCall;
+        }
+    };
+
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "rank",
+        .path_match = "rank",
+        .mapping = .{
+            .field_type = .numeric,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+
+    var harness = Harness{ .ids = &.{ "doc:a", "doc:b", "doc:c" } };
+    var loader = Loader{};
+    const order_by = [_]types.SortField{.{ .field = "rank" }};
+    const executor = MatchAllExecutor{
+        .ctx = &harness,
+        .collect_candidates = Harness.collectCandidates,
+        .collect_candidates_stream = Harness.collectStream,
+        .text_index_entry = Harness.textIndexEntry,
+        .load_projected_document = Harness.loadProjectedDocument,
+        .load_stored = testUnexpectedLoadStoredCallback,
+    };
+
+    var result = try sortAndPageMatchAllCandidateStreamAlloc(alloc, .{
+        .index_name = "ft",
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+        .limit = 0,
+    }, executor, .{
+        .candidate_limit = 1,
+    }, .{
+        .kind = .native_doc_values_top_n,
+        .require_native = true,
+        .runtime_schema = schema,
+    }, .{
+        .ctx = &loader,
+        .require_native = true,
+        .load = Loader.load,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), harness.attempted_count);
+    try std.testing.expectEqual(@as(usize, 3), harness.accepted_count);
+    try std.testing.expectEqual(@as(usize, 0), loader.load_count);
+    try std.testing.expectEqual(@as(usize, 0), result.hits.len);
+    try std.testing.expectEqual(@as(u32, 3), result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, result.total_hits_relation);
+    const profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", profile.plan);
+    try std.testing.expectEqual(@as(u64, 3), profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 0), profile.native_doc_value_hit_count);
+    try std.testing.expectEqual(@as(u64, 0), profile.native_doc_value_miss_count);
+    try std.testing.expectEqual(@as(u64, 0), profile.stored_json_load_count);
+}
+
+test "match_all supports id-only sort without native doc values" {
+    const alloc = std.testing.allocator;
+    var collect_count: usize = 0;
+    var stream_collect_count: usize = 0;
+    var stream_accepted_count: usize = 0;
+    const ctx = TestMatchAllCtx{
+        .ids = &.{ "doc:a", "doc:b", "doc:c" },
+        .ordinals = &.{ 1, 2, 3 },
+        .collect_count = &collect_count,
+        .stream_collect_count = &stream_collect_count,
+        .stream_accepted_count = &stream_accepted_count,
+    };
+    const order_by = [_]types.SortField{.{ .field = "_id" }};
+
+    var executor = testMatchAllExecutor(&ctx);
+    executor.live_filter_doc_set = null;
+    const req = types.SearchRequest{
+        .order_by = &order_by,
+        .include_stored = false,
+        .offset = 1,
+        .limit = 1,
+        .profile = true,
+    };
+    const plan = try planMatchAllSortBeforeCandidatesAlloc(alloc, req, executor);
+    try std.testing.expectEqual(SortExecutionPlanKind.id_seek, plan.kind);
+    try std.testing.expectEqual(SortPlanExactness.exact, plan.exactness);
+    try std.testing.expectEqual(SortPlanSource.primary_key_scan, plan.source);
+    try std.testing.expectEqual(SortPlanCursorSupport.segment_seek, plan.cursor_support);
+    try std.testing.expectEqual(SortPlanSourceLoad.projected_source_after_page, plan.source_load);
+    try std.testing.expectEqual(SortPlanDistributedBehavior.shard_local_only, plan.distributed_behavior);
+    try std.testing.expectEqual(SortPlanSource.primary_key_scan, sortExecutionPlanSource(plan));
+    try std.testing.expectEqual(SortPlanCursorSupport.segment_seek, sortExecutionPlanCursorSupport(plan));
+
+    var result = try searchMatchAll(alloc, req, executor);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.gte, result.total_hits_relation);
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].sort_values[0].string);
+    try std.testing.expectEqual(@as(usize, 0), collect_count);
+    try std.testing.expectEqual(@as(usize, 1), stream_collect_count);
+    try std.testing.expectEqual(@as(usize, 2), stream_accepted_count);
+    const profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("id_seek", profile.plan);
+    try std.testing.expectEqualStrings("primary_key_scan", profile.source);
+    try std.testing.expectEqualStrings("segment_seek", profile.cursor_support);
+    try std.testing.expectEqualStrings("source_free", profile.source_load);
+    try std.testing.expectEqual(@as(u64, 2), profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 1), profile.selected_count);
+    try std.testing.expectEqual(@as(usize, 2), profile.window_capacity);
+    try std.testing.expectEqual(@as(usize, 1), profile.window_len);
+}
+
+test "match_all id seek zero limit exposes internal sort profile when sampled" {
+    const alloc = std.testing.allocator;
+    var stream_collect_count: usize = 0;
+    var stream_accepted_count: usize = 0;
+    const ctx = TestMatchAllCtx{
+        .ids = &.{ "doc:a", "doc:b" },
+        .ordinals = &.{ 1, 2 },
+        .stream_collect_count = &stream_collect_count,
+        .stream_accepted_count = &stream_accepted_count,
+    };
+    const order_by = [_]types.SortField{.{ .field = "_id" }};
+    var executor = testMatchAllExecutor(&ctx);
+    executor.live_filter_doc_set = null;
+
+    bench_query_profile_every_cache.store(2, .monotonic);
+    bench_query_profile_counter.store(1, .monotonic);
+    defer {
+        bench_query_profile_every_cache.store(bench_query_profile_unknown, .monotonic);
+        bench_query_profile_counter.store(0, .monotonic);
+    }
+
+    var result = try sortAndPageMatchAllIdSeekAlloc(
+        alloc,
+        .{
+            .order_by = &order_by,
+            .include_stored = false,
+            .limit = 0,
+            .profile = false,
+        },
+        executor,
+        &.{},
+        .{
+            .kind = .id_seek,
+            .source = .primary_key_scan,
+            .cursor_support = .segment_seek,
+        },
+    );
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), result.hits.len);
+    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, result.total_hits_relation);
+    try std.testing.expectEqual(@as(usize, 1), stream_collect_count);
+    try std.testing.expectEqual(@as(usize, 2), stream_accepted_count);
+    const profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("id_seek", profile.plan);
+    try std.testing.expectEqualStrings("primary_key_scan", profile.source);
+    try std.testing.expectEqualStrings("segment_seek", profile.cursor_support);
+    try std.testing.expectEqual(@as(u64, 2), profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 0), profile.selected_count);
+    try std.testing.expectEqual(@as(usize, 0), profile.window_capacity);
+    try std.testing.expectEqual(@as(usize, 0), profile.window_len);
+}
+
+test "match_all id seek zero limit respects cursor bounds exactly" {
+    const alloc = std.testing.allocator;
+    const order_by = [_]types.SortField{.{ .field = "_id" }};
+    const after_cursor = [_]std.json.Value{.{ .string = "doc:b" }};
+    const before_cursor = [_]std.json.Value{.{ .string = "doc:c" }};
+
+    var after_stream_collect_count: usize = 0;
+    var after_stream_accepted_count: usize = 0;
+    const after_ctx = TestMatchAllCtx{
+        .ids = &.{ "doc:a", "doc:b", "doc:c", "doc:d" },
+        .ordinals = &.{ 1, 2, 3, 4 },
+        .stream_collect_count = &after_stream_collect_count,
+        .stream_accepted_count = &after_stream_accepted_count,
+    };
+    var after_executor = testMatchAllExecutor(&after_ctx);
+    after_executor.live_filter_doc_set = null;
+
+    var after_result = try sortAndPageMatchAllIdSeekAlloc(
+        alloc,
+        .{
+            .order_by = &order_by,
+            .search_after = &after_cursor,
+            .include_stored = false,
+            .limit = 0,
+            .profile = true,
+        },
+        after_executor,
+        &.{},
+        .{
+            .kind = .id_seek,
+            .source = .primary_key_scan,
+            .cursor_support = .segment_seek,
+        },
+    );
+    defer after_result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), after_result.hits.len);
+    try std.testing.expectEqual(@as(u32, 2), after_result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, after_result.total_hits_relation);
+    try std.testing.expectEqual(@as(usize, 1), after_stream_collect_count);
+    try std.testing.expectEqual(@as(usize, 2), after_stream_accepted_count);
+    const after_profile = after_result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("id_seek", after_profile.plan);
+    try std.testing.expectEqualStrings("primary_key_scan", after_profile.source);
+    try std.testing.expectEqualStrings("segment_seek", after_profile.cursor_support);
+    try std.testing.expectEqual(@as(u64, 2), after_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 0), after_profile.selected_count);
+    try std.testing.expectEqual(@as(usize, 0), after_profile.window_capacity);
+    try std.testing.expectEqual(@as(usize, 0), after_profile.window_len);
+
+    var before_stream_collect_count: usize = 0;
+    var before_stream_accepted_count: usize = 0;
+    const before_ctx = TestMatchAllCtx{
+        .ids = &.{ "doc:a", "doc:b", "doc:c", "doc:d" },
+        .ordinals = &.{ 1, 2, 3, 4 },
+        .stream_collect_count = &before_stream_collect_count,
+        .stream_accepted_count = &before_stream_accepted_count,
+    };
+    var before_executor = testMatchAllExecutor(&before_ctx);
+    before_executor.live_filter_doc_set = null;
+
+    var before_result = try sortAndPageMatchAllIdSeekAlloc(
+        alloc,
+        .{
+            .order_by = &order_by,
+            .search_before = &before_cursor,
+            .include_stored = false,
+            .limit = 0,
+            .profile = true,
+        },
+        before_executor,
+        &.{},
+        .{
+            .kind = .id_seek,
+            .source = .primary_key_scan,
+            .cursor_support = .segment_seek,
+        },
+    );
+    defer before_result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), before_result.hits.len);
+    try std.testing.expectEqual(@as(u32, 2), before_result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, before_result.total_hits_relation);
+    try std.testing.expectEqual(@as(usize, 1), before_stream_collect_count);
+    try std.testing.expectEqual(@as(usize, 2), before_stream_accepted_count);
+    const before_profile = before_result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("id_seek", before_profile.plan);
+    try std.testing.expectEqualStrings("primary_key_scan", before_profile.source);
+    try std.testing.expectEqualStrings("segment_seek", before_profile.cursor_support);
+    try std.testing.expectEqual(@as(u64, 2), before_profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 0), before_profile.selected_count);
+    try std.testing.expectEqual(@as(usize, 0), before_profile.window_capacity);
+    try std.testing.expectEqual(@as(usize, 0), before_profile.window_len);
+}
+
+test "match_all id-only sort without stream reports bounded candidate collector" {
+    const alloc = std.testing.allocator;
+    var collect_count: usize = 0;
+    var stream_collect_count: usize = 0;
+    const ctx = TestMatchAllCtx{
+        .ids = &.{ "doc:c", "doc:a", "doc:b" },
+        .ordinals = &.{ 3, 1, 2 },
+        .collect_count = &collect_count,
+        .stream_collect_count = &stream_collect_count,
+    };
+    const order_by = [_]types.SortField{.{ .field = "_id" }};
+
+    var executor = testMatchAllExecutor(&ctx);
+    executor.live_filter_doc_set = null;
+    executor.collect_candidates_stream = null;
+    var result = try searchMatchAll(alloc, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .offset = 1,
+        .limit = 1,
+        .profile = true,
+    }, executor);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 3), result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, result.total_hits_relation);
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].sort_values[0].string);
+    try std.testing.expectEqual(@as(usize, 1), collect_count);
+    try std.testing.expectEqual(@as(usize, 0), stream_collect_count);
+
+    const profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("id_only", profile.plan);
+    try std.testing.expectEqualStrings("bounded_exact", profile.exactness);
+    try std.testing.expectEqualStrings("candidate_collector", profile.source);
+    try std.testing.expectEqualStrings("comparator", profile.cursor_support);
+    try std.testing.expectEqualStrings("source_free", profile.source_load);
+    try std.testing.expectEqual(@as(u64, 3), profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 1), profile.selected_count);
+}
+
+test "match_all native doc values without stream reports bounded exact collector" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/match-all-native-no-stream", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    const docs = [_]TestSortedPriceDoc{
+        .{ .id = "doc:a", .price = 3.0, .ordinal = 1003 },
+        .{ .id = "doc:b", .price = 1.0, .ordinal = 1001 },
+        .{ .id = "doc:c", .price = 2.0, .ordinal = 1002 },
+    };
+    var persistent = try persistent_mod.PersistentIndex.open(alloc, .{
+        .path = path_z.ptr,
+        .main_backend = .lsm_memory,
+    });
+    var persistent_owned = true;
+    errdefer if (persistent_owned) persistent.close();
+
+    const segment = try buildTestSortedPriceSegmentAlloc(alloc, &docs);
+    defer alloc.free(segment);
+    try persistent.writer.addSegment(segment);
+
+    const templates = [_]runtime_schema_mod.DynamicTemplate{.{
+        .name = "price",
+        .path_match = "price",
+        .mapping = .{
+            .field_type = .numeric,
+            .doc_values = true,
+            .sortable = true,
+            .analyzer = "keyword",
+        },
+    }};
+    const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
+    var apply_mutex = std.atomic.Mutex.unlocked;
+    var text_entry = index_manager_mod.IndexManager.TextIndex{
+        .apply_mutex = &apply_mutex,
+        .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
+        .chunk_name = null,
+        .text_analysis = .{},
+        .runtime_schema = schema,
+        .rebuild_root_path = "",
+        .persistent = persistent,
+    };
+    persistent_owned = false;
+    defer text_entry.persistent.close();
+
+    const Harness = struct {
+        match_ctx: TestMatchAllCtx,
+        text_entry: *index_manager_mod.IndexManager.TextIndex,
+
+        fn collectCandidates(
+            ctx: ?*anyopaque,
+            collect_alloc: Allocator,
+            req: types.SearchRequest,
+            options: MatchAllCandidateCollectOptions,
+        ) anyerror!MatchAllCandidates {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return testCollectMatchAllCandidatesCallback(&self.match_ctx, collect_alloc, req, options);
+        }
+
+        fn textIndexEntry(
+            ctx: ?*anyopaque,
+            _: ?[]const u8,
+        ) anyerror!?*index_manager_mod.IndexManager.TextIndex {
+            const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return self.text_entry;
+        }
+
+        fn loadProjectedDocument(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: []const u8,
+        ) anyerror![]u8 {
+            return error.UnexpectedTestCall;
+        }
+    };
+
+    var collect_count: usize = 0;
+    var stream_collect_count: usize = 0;
+    var harness = Harness{
+        .match_ctx = .{
+            .ids = &.{ "doc:a", "doc:b", "doc:c" },
+            .ordinals = &.{ 1003, 1001, 1002 },
+            .collect_count = &collect_count,
+            .stream_collect_count = &stream_collect_count,
+        },
+        .text_entry = &text_entry,
+    };
+    const order_by = [_]types.SortField{.{ .field = "price" }};
+    var result = try searchMatchAll(alloc, .{
+        .index_name = "ft",
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 2,
+        .profile = true,
+    }, .{
+        .ctx = &harness,
+        .collect_candidates = Harness.collectCandidates,
+        .collect_candidates_stream = null,
+        .text_index_entry = Harness.textIndexEntry,
+        .load_projected_document = Harness.loadProjectedDocument,
+        .load_stored = testUnexpectedLoadStoredCallback,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), collect_count);
+    try std.testing.expectEqual(@as(usize, 0), stream_collect_count);
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+    try std.testing.expectEqualStrings("doc:c", result.hits[1].id);
+
+    const profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", profile.plan);
+    try std.testing.expectEqualStrings("bounded_exact", profile.exactness);
+    try std.testing.expectEqualStrings("doc_values_collector", profile.source);
+    try std.testing.expectEqualStrings("match_all", profile.candidate_source);
+    try std.testing.expectEqual(@as(u64, 3), profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 2), profile.selected_count);
+    try std.testing.expectEqual(@as(u64, 3), profile.native_doc_value_hit_count);
+}
+
+test "match_all id seek rejects missing primary key stream with diagnostic" {
+    const alloc = std.testing.allocator;
+    const ctx = TestMatchAllCtx{
+        .ids = &.{ "doc:a", "doc:b" },
+        .ordinals = &.{ 1, 2 },
+    };
+    const order_by = [_]types.SortField{.{ .field = "_id" }};
+
+    var executor = testMatchAllExecutor(&ctx);
+    executor.collect_candidates_stream = null;
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.UnsupportedQueryRequest, sortAndPageMatchAllIdSeekAlloc(
+        alloc,
+        .{
+            .order_by = &order_by,
+            .include_stored = false,
+            .limit = 1,
+        },
+        executor,
+        &.{},
+        .{
+            .kind = .id_seek,
+            .source = .primary_key_scan,
+            .cursor_support = .segment_seek,
+        },
+    ));
+    const diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", diagnostic.reason);
+    try std.testing.expectEqualStrings("primary_key_stream_unavailable", diagnostic.detail);
+}
+
+test "match_all id-only sort seeks after cursor without scanning prior ids" {
+    const alloc = std.testing.allocator;
+    var collect_count: usize = 0;
+    var stream_collect_count: usize = 0;
+    var stream_accepted_count: usize = 0;
+    const ctx = TestMatchAllCtx{
+        .ids = &.{ "doc:a", "doc:b", "doc:c" },
+        .ordinals = &.{ 1, 2, 3 },
+        .collect_count = &collect_count,
+        .stream_collect_count = &stream_collect_count,
+        .stream_accepted_count = &stream_accepted_count,
+    };
+    const order_by = [_]types.SortField{.{ .field = "_id" }};
+    const cursor = [_]std.json.Value{.{ .string = "doc:a" }};
+
+    var executor = testMatchAllExecutor(&ctx);
+    executor.live_filter_doc_set = null;
+    const req = types.SearchRequest{
+        .order_by = &order_by,
+        .search_after = &cursor,
+        .include_stored = false,
+        .limit = 1,
+    };
+    const plan = try planMatchAllSortBeforeCandidatesAlloc(alloc, req, executor);
+    try std.testing.expectEqual(SortExecutionPlanKind.id_seek, plan.kind);
+    try std.testing.expectEqual(SortPlanSource.primary_key_scan, sortExecutionPlanSource(plan));
+    try std.testing.expectEqual(SortPlanCursorSupport.segment_seek, sortExecutionPlanCursorSupport(plan));
+
+    var result = try searchMatchAll(alloc, req, executor);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.gte, result.total_hits_relation);
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].sort_values[0].string);
+    try std.testing.expectEqual(@as(usize, 0), collect_count);
+    try std.testing.expectEqual(@as(usize, 1), stream_collect_count);
+    try std.testing.expectEqual(@as(usize, 1), stream_accepted_count);
+}
+
+test "match_all cursor-only request uses implicit id seek" {
+    const alloc = std.testing.allocator;
+    var collect_count: usize = 0;
+    var stream_collect_count: usize = 0;
+    var stream_accepted_count: usize = 0;
+    const ctx = TestMatchAllCtx{
+        .ids = &.{ "doc:a", "doc:b", "doc:c" },
+        .ordinals = &.{ 1, 2, 3 },
+        .collect_count = &collect_count,
+        .stream_collect_count = &stream_collect_count,
+        .stream_accepted_count = &stream_accepted_count,
+    };
+    const after_cursor = [_]std.json.Value{.{ .string = "doc:a" }};
+    const before_cursor = [_]std.json.Value{.{ .string = "doc:c" }};
+
+    var executor = testMatchAllExecutor(&ctx);
+    executor.live_filter_doc_set = null;
+    var after_result = try searchMatchAll(alloc, .{
+        .search_after = &after_cursor,
+        .include_stored = false,
+        .limit = 1,
+        .profile = true,
+    }, executor);
+    defer after_result.deinit();
+
+    try std.testing.expectEqual(types.TotalHitsRelation.gte, after_result.total_hits_relation);
+    try std.testing.expectEqual(@as(usize, 1), after_result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", after_result.hits[0].id);
+    try std.testing.expectEqualStrings("doc:b", after_result.hits[0].sort_values[0].string);
+    const after_profile = after_result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("id_seek", after_profile.plan);
+    try std.testing.expectEqualStrings("primary_key_scan", after_profile.source);
+    try std.testing.expectEqualStrings("segment_seek", after_profile.cursor_support);
+
+    var before_result = try searchMatchAll(alloc, .{
+        .search_before = &before_cursor,
+        .include_stored = false,
+        .limit = 1,
+        .profile = true,
+    }, executor);
+    defer before_result.deinit();
+
+    try std.testing.expectEqual(types.TotalHitsRelation.gte, before_result.total_hits_relation);
+    try std.testing.expectEqual(@as(usize, 1), before_result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", before_result.hits[0].id);
+    try std.testing.expectEqualStrings("doc:b", before_result.hits[0].sort_values[0].string);
+    const before_profile = before_result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("id_seek", before_profile.plan);
+    try std.testing.expectEqualStrings("primary_key_scan", before_profile.source);
+    try std.testing.expectEqualStrings("segment_seek", before_profile.cursor_support);
+
+    try std.testing.expectEqual(@as(usize, 0), collect_count);
+    try std.testing.expectEqual(@as(usize, 2), stream_collect_count);
+    try std.testing.expectEqual(@as(usize, 2), stream_accepted_count);
+}
+
+test "match_all id-only search_before bounds primary key stream at cursor" {
+    const alloc = std.testing.allocator;
+    var collect_count: usize = 0;
+    var stream_collect_count: usize = 0;
+    var stream_accepted_count: usize = 0;
+    const ctx = TestMatchAllCtx{
+        .ids = &.{ "doc:a", "doc:b", "doc:c" },
+        .ordinals = &.{ 1, 2, 3 },
+        .collect_count = &collect_count,
+        .stream_collect_count = &stream_collect_count,
+        .stream_accepted_count = &stream_accepted_count,
+    };
+    const order_by = [_]types.SortField{.{ .field = "_id" }};
+    const cursor = [_]std.json.Value{.{ .string = "doc:c" }};
+
+    var executor = testMatchAllExecutor(&ctx);
+    executor.live_filter_doc_set = null;
+    const req = types.SearchRequest{
+        .order_by = &order_by,
+        .search_before = &cursor,
+        .include_stored = false,
+        .limit = 1,
+        .profile = true,
+    };
+    const plan = try planMatchAllSortBeforeCandidatesAlloc(alloc, req, executor);
+    try std.testing.expectEqual(SortExecutionPlanKind.id_seek, plan.kind);
+    try std.testing.expectEqual(SortPlanExactness.exact, sortExecutionPlanExactness(plan));
+    try std.testing.expectEqual(SortPlanSource.primary_key_scan, sortExecutionPlanSource(plan));
+    try std.testing.expectEqual(SortPlanCursorSupport.segment_seek, sortExecutionPlanCursorSupport(plan));
+
+    var result = try searchMatchAll(alloc, req, executor);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.gte, result.total_hits_relation);
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].sort_values[0].string);
+    try std.testing.expectEqual(@as(usize, 0), collect_count);
+    try std.testing.expectEqual(@as(usize, 1), stream_collect_count);
+    try std.testing.expectEqual(@as(usize, 1), stream_accepted_count);
+    const profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("id_seek", profile.plan);
+    try std.testing.expectEqualStrings("exact", profile.exactness);
+    try std.testing.expectEqualStrings("primary_key_scan", profile.source);
+    try std.testing.expectEqualStrings("segment_seek", profile.cursor_support);
+    try std.testing.expectEqual(@as(u64, 1), profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 1), profile.selected_count);
+}
+
+test "match_all id-only search_before returns previous page in ascending id order" {
+    const alloc = std.testing.allocator;
+    var collect_count: usize = 0;
+    var stream_collect_count: usize = 0;
+    var stream_accepted_count: usize = 0;
+    const ctx = TestMatchAllCtx{
+        .ids = &.{ "doc:a", "doc:b", "doc:c", "doc:d" },
+        .ordinals = &.{ 1, 2, 3, 4 },
+        .collect_count = &collect_count,
+        .stream_collect_count = &stream_collect_count,
+        .stream_accepted_count = &stream_accepted_count,
+    };
+    const order_by = [_]types.SortField{.{ .field = "_id" }};
+    const cursor = [_]std.json.Value{.{ .string = "doc:d" }};
+
+    var executor = testMatchAllExecutor(&ctx);
+    executor.live_filter_doc_set = null;
+    var result = try searchMatchAll(alloc, .{
+        .order_by = &order_by,
+        .search_before = &cursor,
+        .include_stored = false,
+        .limit = 2,
+        .profile = true,
+    }, executor);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+    try std.testing.expectEqual(types.TotalHitsRelation.gte, result.total_hits_relation);
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+    try std.testing.expectEqualStrings("doc:c", result.hits[1].id);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].sort_values[0].string);
+    try std.testing.expectEqualStrings("doc:c", result.hits[1].sort_values[0].string);
+    try std.testing.expectEqual(@as(usize, 0), collect_count);
+    try std.testing.expectEqual(@as(usize, 1), stream_collect_count);
+    try std.testing.expectEqual(@as(usize, 2), stream_accepted_count);
+
+    const profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("id_seek", profile.plan);
+    try std.testing.expectEqualStrings("primary_key_scan", profile.source);
+    try std.testing.expectEqualStrings("segment_seek", profile.cursor_support);
+    try std.testing.expectEqual(@as(u64, 2), profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 2), profile.selected_count);
+    try std.testing.expectEqual(@as(usize, 2), profile.window_capacity);
+    try std.testing.expectEqual(@as(usize, 2), profile.window_len);
+}
+
+test "match_all id-only search_before reverse stream fails closed when candidate budget is exceeded" {
+    const alloc = std.testing.allocator;
+    var stream_collect_count: usize = 0;
+    var stream_accepted_count: usize = 0;
+    const ctx = TestMatchAllCtx{
+        .ids = &.{ "doc:a", "doc:b", "doc:c" },
+        .ordinals = &.{ 1, 2, 3 },
+        .stream_collect_count = &stream_collect_count,
+        .stream_accepted_count = &stream_accepted_count,
+    };
+    const order_by = [_]types.SortField{.{ .field = "_id" }};
+    const cursor = [_]std.json.Value{.{ .string = "doc:c" }};
+
+    var executor = testMatchAllExecutor(&ctx);
+    executor.live_filter_doc_set = null;
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, sortAndPageMatchAllCandidateStreamAlloc(alloc, .{
+        .order_by = &order_by,
+        .search_before = &cursor,
+        .include_stored = false,
+        .limit = 1,
+    }, executor, .{
+        .candidate_limit = 1,
+        .primary_key_stop_before = "doc:c",
+        .primary_key_reverse = true,
+    }, .{
+        .kind = .id_seek,
+        .source = .primary_key_scan,
+        .cursor_support = .segment_seek,
+    }, null));
+    try std.testing.expectEqual(@as(usize, 1), stream_collect_count);
+    try std.testing.expectEqual(@as(usize, 1), stream_accepted_count);
+}
+
+test "match_all ordered source loads only selected hits" {
+    const alloc = std.testing.allocator;
+    var collect_count: usize = 0;
+    var stream_collect_count: usize = 0;
+    var stream_accepted_count: usize = 0;
+    var projected_load_count: usize = 0;
+    var projected_batch_count: usize = 0;
+    var projected_batch_doc_count: usize = 0;
+    const ctx = TestMatchAllCtx{
+        .ids = &.{ "doc:a", "doc:b", "doc:c" },
+        .ordinals = &.{ 1, 2, 3 },
+        .collect_count = &collect_count,
+        .stream_collect_count = &stream_collect_count,
+        .stream_accepted_count = &stream_accepted_count,
+        .projected_load_count = &projected_load_count,
+        .projected_batch_count = &projected_batch_count,
+        .projected_batch_doc_count = &projected_batch_doc_count,
+    };
+    const order_by = [_]types.SortField{.{ .field = "_id" }};
+
+    var executor = testMatchAllExecutor(&ctx);
+    executor.live_filter_doc_set = null;
+    var result = try searchMatchAll(alloc, .{
+        .order_by = &order_by,
+        .include_stored = true,
+        .offset = 1,
+        .limit = 1,
+        .profile = true,
+    }, executor);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+    try std.testing.expect(result.hits[0].stored_data != null);
+    try std.testing.expectEqual(@as(usize, 0), projected_load_count);
+    try std.testing.expectEqual(@as(usize, 1), projected_batch_count);
+    try std.testing.expectEqual(@as(usize, 1), projected_batch_doc_count);
+    try std.testing.expectEqual(@as(usize, 0), collect_count);
+    try std.testing.expectEqual(@as(usize, 1), stream_collect_count);
+    try std.testing.expectEqual(@as(usize, 2), stream_accepted_count);
+    const profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("id_seek", profile.plan);
+    try std.testing.expectEqualStrings("projected_source_after_page", profile.source_load);
+    try std.testing.expectEqual(@as(u64, 0), profile.stored_json_load_count);
+    try std.testing.expectEqual(@as(u64, 1), profile.projected_source_load_count);
+}
+
+test "match_all unordered source loads selected hits through projected batch" {
+    const alloc = std.testing.allocator;
+    var collect_count: usize = 0;
+    var projected_load_count: usize = 0;
+    var projected_batch_count: usize = 0;
+    var projected_batch_doc_count: usize = 0;
+    const ctx = TestMatchAllCtx{
+        .ids = &.{ "doc:a", "doc:b", "doc:c" },
+        .ordinals = &.{ 1, 2, 3 },
+        .collect_count = &collect_count,
+        .projected_load_count = &projected_load_count,
+        .projected_batch_count = &projected_batch_count,
+        .projected_batch_doc_count = &projected_batch_doc_count,
+    };
+
+    var executor = testMatchAllExecutor(&ctx);
+    executor.live_filter_doc_set = null;
+    var result = try searchMatchAll(alloc, .{
+        .include_stored = true,
+        .offset = 1,
+        .limit = 1,
+    }, executor);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+    try std.testing.expect(result.hits[0].stored_data != null);
+    try std.testing.expectEqual(@as(u32, 3), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), collect_count);
+    try std.testing.expectEqual(@as(usize, 0), projected_load_count);
+    try std.testing.expectEqual(@as(usize, 1), projected_batch_count);
+    try std.testing.expectEqual(@as(usize, 1), projected_batch_doc_count);
+}
+
+test "match_all rejects invalid sort cursor contract" {
+    const alloc = std.testing.allocator;
+    const ctx = TestMatchAllCtx{
+        .ids = &.{ "doc:a", "doc:b", "doc:c" },
+        .ordinals = &.{ 1, 2, 3 },
+    };
+    const order_by = [_]types.SortField{
+        .{ .field = "rank" },
+        .{ .field = "_id" },
+    };
+    const short_cursor = [_]std.json.Value{.{ .integer = 1 }};
+    const full_cursor = [_]std.json.Value{
+        .{ .integer = 1 },
+        .{ .string = "doc:b" },
+    };
+    const bad_id_cursor = [_]std.json.Value{
+        .{ .integer = 1 },
+        .{ .integer = 9 },
+    };
+    const bad_null_cursor = [_]std.json.Value{
+        .null,
+        .{ .string = "doc:b" },
+    };
+    const bad_non_finite_cursor = [_]std.json.Value{
+        .{ .number_string = "nan" },
+        .{ .string = "doc:b" },
+    };
+    var bad_array_value = std.json.Array.init(alloc);
+    defer bad_array_value.deinit();
+    const bad_array_cursor = [_]std.json.Value{
+        .{ .array = bad_array_value },
+        .{ .string = "doc:b" },
+    };
+    var bad_object_value = std.json.ObjectMap.empty;
+    defer bad_object_value.deinit(alloc);
+    const bad_object_cursor = [_]std.json.Value{
+        .{ .object = bad_object_value },
+        .{ .string = "doc:b" },
+    };
+
+    var executor = testMatchAllExecutor(&ctx);
+    executor.live_filter_doc_set = null;
+    try std.testing.expectError(error.InvalidQueryRequest, searchMatchAll(alloc, .{
+        .order_by = &order_by,
+        .search_after = &short_cursor,
+        .include_stored = false,
+        .limit = 2,
+    }, executor));
+    try std.testing.expectError(error.InvalidQueryRequest, searchMatchAll(alloc, .{
+        .order_by = &order_by,
+        .search_after = &full_cursor,
+        .search_before = &full_cursor,
+        .include_stored = false,
+        .limit = 2,
+    }, executor));
+    try std.testing.expectError(error.InvalidQueryRequest, searchMatchAll(alloc, .{
+        .order_by = &order_by,
+        .search_after = &full_cursor,
+        .include_stored = false,
+        .offset = 1,
+        .limit = 2,
+    }, executor));
+    try std.testing.expectError(error.InvalidQueryRequest, searchMatchAll(alloc, .{
+        .order_by = &order_by,
+        .search_before = &full_cursor,
+        .include_stored = false,
+        .offset = 1,
+        .limit = 2,
+    }, executor));
+    try std.testing.expectError(error.InvalidQueryRequest, searchMatchAll(alloc, .{
+        .order_by = &order_by,
+        .search_after = &bad_id_cursor,
+        .include_stored = false,
+        .limit = 2,
+    }, executor));
+    try std.testing.expectError(error.InvalidQueryRequest, searchMatchAll(alloc, .{
+        .order_by = &order_by,
+        .search_after = &bad_null_cursor,
+        .include_stored = false,
+        .limit = 2,
+    }, executor));
+    try std.testing.expectError(error.InvalidQueryRequest, searchMatchAll(alloc, .{
+        .order_by = &order_by,
+        .search_after = &bad_non_finite_cursor,
+        .include_stored = false,
+        .limit = 2,
+    }, executor));
+    try std.testing.expectError(error.InvalidQueryRequest, searchMatchAll(alloc, .{
+        .order_by = &order_by,
+        .search_after = &bad_array_cursor,
+        .include_stored = false,
+        .limit = 2,
+    }, executor));
+    try std.testing.expectError(error.InvalidQueryRequest, searchMatchAll(alloc, .{
+        .order_by = &order_by,
+        .search_before = &bad_object_cursor,
+        .include_stored = false,
+        .limit = 2,
+    }, executor));
+}
+
+test "match_all rejects dotted field sort without native doc values" {
+    const alloc = std.testing.allocator;
+    const ctx = TestMatchAllCtx{
+        .ids = &.{ "doc:a", "doc:b", "doc:c" },
+        .ordinals = &.{ 1, 2, 3 },
+    };
+    const order_by = [_]types.SortField{
+        .{ .field = "nested.created_at", .desc = true },
+        .{ .field = "_id" },
+    };
+
+    var executor = testMatchAllExecutor(&ctx);
+    executor.live_filter_doc_set = null;
+    try std.testing.expectError(error.UnsupportedExactSort, searchMatchAll(alloc, .{
+        .order_by = &order_by,
+        .include_stored = false,
+        .limit = 2,
+    }, executor));
 }
 
 fn testResolveDocSetDocIdsCallback(
@@ -7500,10 +26386,13 @@ test "composed search skips resolved doc-set materialization without graph queri
         }
     };
 
+    logNativeSortPlanRejection("stale", "stale_reason", "stale_detail");
     const dense_vector = [_]f32{1.0};
     var result = try searchComposed(alloc, .{
         .dense = .{ .vector = &dense_vector, .k = 1 },
+        .merge_config = .{ .strategy = .rsf },
         .include_stored = false,
+        .profile = true,
     }, .{
         .ctx = null,
         .search_text_query = Harness.searchTextQuery,
@@ -7519,6 +26408,444 @@ test "composed search skips resolved doc-set materialization without graph queri
 
     try std.testing.expectEqual(@as(usize, 1), result.hits.len);
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+    const profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("score_top_k", profile.plan);
+    try std.testing.expectEqualStrings("approximate", profile.exactness);
+    try std.testing.expectEqualStrings("score_top_k", profile.source);
+    try std.testing.expectEqualStrings("source_free", profile.source_load);
+    try std.testing.expectEqual(@as(u64, 1), profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 1), profile.selected_count);
+    try std.testing.expectEqualStrings("", profile.sort_rejection_reason);
+    try std.testing.expectEqualStrings("", profile.sort_rejection_detail);
+    try std.testing.expectEqualStrings("", profile.sort_rejection_field.slice());
+}
+
+test "composed search rejects exact field sort across embedding sources" {
+    const alloc = std.testing.allocator;
+    const dense_vector = [_]f32{1.0};
+    const order_by = [_]types.SortField{
+        .{ .field = "created_at", .desc = true },
+        .{ .field = "_id" },
+    };
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, searchComposed(alloc, .{
+        .dense = .{ .vector = &dense_vector, .k = 1 },
+        .order_by = &order_by,
+        .include_stored = false,
+    }, undefined));
+}
+
+test "composed text exact sort preserves native component profile" {
+    const alloc = std.testing.allocator;
+
+    const Harness = struct {
+        fn searchTextQuery(
+            _: ?*anyopaque,
+            alloc_inner: Allocator,
+            req: types.SearchRequest,
+            _: types.TextQuery,
+        ) anyerror!types.SearchResult {
+            try std.testing.expect(req.profile);
+            const hits = try alloc_inner.alloc(types.SearchHit, 1);
+            hits[0] = .{
+                .id = try alloc_inner.dupe(u8, "doc:a"),
+                .sort_values = try types.cloneJsonValues(alloc_inner, &.{
+                    .{ .string = "2026-01-01T00:00:00Z" },
+                    .{ .string = "doc:a" },
+                }),
+            };
+            return .{
+                .alloc = alloc_inner,
+                .hits = hits,
+                .total_hits = 1,
+                .sort_profile = .{
+                    .plan = "native_doc_values_top_n",
+                    .exactness = "exact",
+                    .source = "doc_values_collector",
+                    .cursor_support = "comparator",
+                    .source_load = "source_free",
+                    .distributed_behavior = "shard_local_only",
+                    .selection_reason = "doc_values_collector",
+                    .require_native = true,
+                    .native_loader = true,
+                    .candidate_count = 1,
+                    .selected_count = 1,
+                    .window_capacity = 1,
+                    .window_len = 1,
+                },
+            };
+        }
+
+        fn searchText(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+        ) anyerror!types.SearchResult {
+            return error.TestUnexpectedResult;
+        }
+
+        fn searchDense(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: types.DenseKnnQuery,
+        ) anyerror!types.SearchResult {
+            return error.TestUnexpectedResult;
+        }
+
+        fn searchSparse(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: types.SparseKnnQuery,
+        ) anyerror!types.SearchResult {
+            return error.TestUnexpectedResult;
+        }
+
+        fn cloneNamedSet(
+            _: ?*anyopaque,
+            alloc_inner: Allocator,
+            set: graph_exec.NamedResultSet,
+            include_stored: bool,
+        ) anyerror!types.SearchResult {
+            return try graph_exec.cloneNamedSetAsResult(alloc_inner, set, include_stored);
+        }
+
+        fn fuseNamedSets(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: []const graph_exec.NamedResultSet,
+        ) anyerror!types.SearchResult {
+            return error.TestUnexpectedResult;
+        }
+
+        fn attachGraphResults(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: *types.SearchResult,
+            _: []const graph_exec.NamedResultSet,
+        ) anyerror!void {}
+    };
+
+    const order_by = [_]types.SortField{.{ .field = "created_at", .desc = true }};
+    var result = try searchComposed(alloc, .{
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+    }, .{
+        .ctx = null,
+        .search_text_query = Harness.searchTextQuery,
+        .search_text = Harness.searchText,
+        .search_dense = Harness.searchDense,
+        .search_sparse = Harness.searchSparse,
+        .clone_named_set = Harness.cloneNamedSet,
+        .fuse_named_sets = Harness.fuseNamedSets,
+        .attach_graph_results = Harness.attachGraphResults,
+    });
+    defer result.deinit();
+
+    const profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", profile.plan);
+    try std.testing.expectEqualStrings("exact", profile.exactness);
+    try std.testing.expectEqualStrings("doc_values_collector", profile.source);
+    try std.testing.expect(profile.require_native);
+    try std.testing.expectEqual(@as(u64, 1), profile.selected_count);
+}
+
+test "composed text exact sort propagates internal profile collection to component" {
+    const alloc = std.testing.allocator;
+
+    bench_query_profile_every_cache.store(2, .monotonic);
+    bench_query_profile_counter.store(1, .monotonic);
+    defer {
+        bench_query_profile_every_cache.store(bench_query_profile_unknown, .monotonic);
+        bench_query_profile_counter.store(0, .monotonic);
+    }
+
+    const Harness = struct {
+        fn searchTextQuery(
+            _: ?*anyopaque,
+            alloc_inner: Allocator,
+            req: types.SearchRequest,
+            _: types.TextQuery,
+        ) anyerror!types.SearchResult {
+            try std.testing.expect(req.profile);
+            const hits = try alloc_inner.alloc(types.SearchHit, 1);
+            hits[0] = .{
+                .id = try alloc_inner.dupe(u8, "doc:a"),
+                .sort_values = try types.cloneJsonValues(alloc_inner, &.{
+                    .{ .integer = 7 },
+                    .{ .string = "doc:a" },
+                }),
+            };
+            return .{
+                .alloc = alloc_inner,
+                .hits = hits,
+                .total_hits = 1,
+                .sort_profile = .{
+                    .plan = "native_doc_values_top_n",
+                    .exactness = "exact",
+                    .source = "doc_values_collector",
+                    .cursor_support = "comparator",
+                    .source_load = "source_free",
+                    .distributed_behavior = "shard_local_only",
+                    .selection_reason = "doc_values_collector",
+                    .require_native = true,
+                    .native_loader = true,
+                    .candidate_count = 1,
+                    .selected_count = 1,
+                    .window_capacity = 1,
+                    .window_len = 1,
+                },
+            };
+        }
+
+        fn searchText(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+        ) anyerror!types.SearchResult {
+            return error.TestUnexpectedResult;
+        }
+
+        fn searchDense(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: types.DenseKnnQuery,
+        ) anyerror!types.SearchResult {
+            return error.TestUnexpectedResult;
+        }
+
+        fn searchSparse(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: types.SparseKnnQuery,
+        ) anyerror!types.SearchResult {
+            return error.TestUnexpectedResult;
+        }
+
+        fn cloneNamedSet(
+            _: ?*anyopaque,
+            alloc_inner: Allocator,
+            set: graph_exec.NamedResultSet,
+            include_stored: bool,
+        ) anyerror!types.SearchResult {
+            return try graph_exec.cloneNamedSetAsResult(alloc_inner, set, include_stored);
+        }
+
+        fn fuseNamedSets(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: []const graph_exec.NamedResultSet,
+        ) anyerror!types.SearchResult {
+            return error.TestUnexpectedResult;
+        }
+
+        fn attachGraphResults(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: *types.SearchResult,
+            _: []const graph_exec.NamedResultSet,
+        ) anyerror!void {}
+    };
+
+    const order_by = [_]types.SortField{.{ .field = "rank" }};
+    var result = try searchComposed(alloc, .{
+        .full_text = .{ .term = .{ .field = "body", .term = "alpha" } },
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = false,
+    }, .{
+        .ctx = null,
+        .search_text_query = Harness.searchTextQuery,
+        .search_text = Harness.searchText,
+        .search_dense = Harness.searchDense,
+        .search_sparse = Harness.searchSparse,
+        .clone_named_set = Harness.cloneNamedSet,
+        .fuse_named_sets = Harness.fuseNamedSets,
+        .attach_graph_results = Harness.attachGraphResults,
+    });
+    defer result.deinit();
+
+    const profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("native_doc_values_top_n", profile.plan);
+    try std.testing.expectEqualStrings("exact", profile.exactness);
+    try std.testing.expectEqualStrings("doc_values_collector", profile.source);
+    try std.testing.expectEqualStrings("", profile.sort_rejection_reason);
+}
+
+test "composed exact sort validates component sort tuples" {
+    const alloc = std.testing.allocator;
+    const order_by = [_]types.SortField{.{ .field = "rank" }};
+
+    var incomplete_hits = try alloc.alloc(types.SearchHit, 1);
+    incomplete_hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .sort_values = try types.cloneJsonValues(alloc, &.{
+            .{ .integer = 1 },
+        }),
+    };
+    var incomplete_result = types.SearchResult{
+        .alloc = alloc,
+        .hits = incomplete_hits,
+        .total_hits = 1,
+    };
+    defer incomplete_result.deinit();
+
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.InvalidQueryRequest, validateComposedExactSortComponent(.{
+        .order_by = &order_by,
+    }, incomplete_result));
+    var diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_doc_value_type", diagnostic.reason);
+    try std.testing.expectEqualStrings("incomplete_sort_tuple", diagnostic.detail);
+
+    var unsorted_hits = try alloc.alloc(types.SearchHit, 2);
+    unsorted_hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:b"),
+        .sort_values = try types.cloneJsonValues(alloc, &.{
+            .{ .integer = 2 },
+            .{ .string = "doc:b" },
+        }),
+    };
+    unsorted_hits[1] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .sort_values = try types.cloneJsonValues(alloc, &.{
+            .{ .integer = 1 },
+            .{ .string = "doc:a" },
+        }),
+    };
+    var unsorted_result = types.SearchResult{
+        .alloc = alloc,
+        .hits = unsorted_hits,
+        .total_hits = 2,
+    };
+    defer unsorted_result.deinit();
+
+    resetLastSortRejectionDiagnostic();
+    try std.testing.expectError(error.InvalidQueryRequest, validateComposedExactSortComponent(.{
+        .order_by = &order_by,
+    }, unsorted_result));
+    diagnostic = takeLastSortRejectionDiagnostic() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("*", diagnostic.field);
+    try std.testing.expectEqualStrings("invalid_doc_value_type", diagnostic.reason);
+    try std.testing.expectEqualStrings("unsorted_component_window", diagnostic.detail);
+}
+
+test "composed text exact sort surfaces missing component profile" {
+    const alloc = std.testing.allocator;
+
+    const Harness = struct {
+        fn searchTextQuery(
+            _: ?*anyopaque,
+            alloc_inner: Allocator,
+            req: types.SearchRequest,
+            _: types.TextQuery,
+        ) anyerror!types.SearchResult {
+            try std.testing.expect(req.profile);
+            const hits = try alloc_inner.alloc(types.SearchHit, 1);
+            hits[0] = .{
+                .id = try alloc_inner.dupe(u8, "doc:a"),
+                .sort_values = try types.cloneJsonValues(alloc_inner, &.{
+                    .{ .string = "2026-01-01T00:00:00Z" },
+                    .{ .string = "doc:a" },
+                }),
+            };
+            return .{
+                .alloc = alloc_inner,
+                .hits = hits,
+                .total_hits = 1,
+            };
+        }
+
+        fn searchText(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+        ) anyerror!types.SearchResult {
+            return error.TestUnexpectedResult;
+        }
+
+        fn searchDense(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: types.DenseKnnQuery,
+        ) anyerror!types.SearchResult {
+            return error.TestUnexpectedResult;
+        }
+
+        fn searchSparse(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: types.SparseKnnQuery,
+        ) anyerror!types.SearchResult {
+            return error.TestUnexpectedResult;
+        }
+
+        fn cloneNamedSet(
+            _: ?*anyopaque,
+            alloc_inner: Allocator,
+            set: graph_exec.NamedResultSet,
+            include_stored: bool,
+        ) anyerror!types.SearchResult {
+            return try graph_exec.cloneNamedSetAsResult(alloc_inner, set, include_stored);
+        }
+
+        fn fuseNamedSets(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: []const graph_exec.NamedResultSet,
+        ) anyerror!types.SearchResult {
+            return error.TestUnexpectedResult;
+        }
+
+        fn attachGraphResults(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: *types.SearchResult,
+            _: []const graph_exec.NamedResultSet,
+        ) anyerror!void {}
+    };
+
+    const order_by = [_]types.SortField{.{ .field = "created_at", .desc = true }};
+    var result = try searchComposed(alloc, .{
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .order_by = &order_by,
+        .include_stored = false,
+        .profile = true,
+    }, .{
+        .ctx = null,
+        .search_text_query = Harness.searchTextQuery,
+        .search_text = Harness.searchText,
+        .search_dense = Harness.searchDense,
+        .search_sparse = Harness.searchSparse,
+        .clone_named_set = Harness.cloneNamedSet,
+        .fuse_named_sets = Harness.fuseNamedSets,
+        .attach_graph_results = Harness.attachGraphResults,
+    });
+    defer result.deinit();
+
+    const profile = result.sort_profile orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("unsupported_exact_sort", profile.plan);
+    try std.testing.expectEqualStrings("unsupported", profile.exactness);
+    try std.testing.expectEqualStrings("unsupported", profile.source);
+    try std.testing.expectEqualStrings("unsupported_exact_sort", profile.sort_rejection_reason);
+    try std.testing.expectEqualStrings("component_sort_profile_missing", profile.sort_rejection_detail);
+    try std.testing.expectEqual(@as(u64, 1), profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 1), profile.selected_count);
+    try std.testing.expect(takeLastSortRejectionDiagnostic() == null);
 }
 
 test "preflightSearchRequestAlloc summarizes search request result refs" {

@@ -344,7 +344,7 @@ describe("Listener", () => {
           {
             status: 200,
             took: 10,
-            hits: { hits: [], total: 0 },
+            hits: { hits: [], total: { value: 0, relation: "exact" } },
           },
         ],
       });
@@ -391,7 +391,7 @@ describe("Listener", () => {
           responses: requests.map(() => ({
             status: 200,
             took: 10,
-            hits: { hits: [], total: 0 },
+            hits: { hits: [], total: { value: 0, relation: "exact" } },
           })),
         }));
 
@@ -456,7 +456,7 @@ describe("Listener", () => {
           {
             status: 200,
             took: 10,
-            hits: { hits: [], total: 0 },
+            hits: { hits: [], total: { value: 0, relation: "exact" } },
           },
         ],
       });
@@ -536,12 +536,12 @@ describe("Listener", () => {
           {
             status: 200,
             took: 10,
-            hits: { hits: [], total: 0 },
+            hits: { hits: [], total: { value: 0, relation: "exact" } },
           },
           {
             status: 200,
             took: 10,
-            hits: { hits: [], total: 0 },
+            hits: { hits: [], total: { value: 0, relation: "exact" } },
           },
         ],
       });
@@ -763,7 +763,7 @@ describe("Listener", () => {
           {
             status: 200,
             took: 10,
-            hits: { hits: [], total: 0 },
+            hits: { hits: [], total: { value: 0, relation: "exact" } },
           },
         ],
       });
@@ -802,7 +802,7 @@ describe("Listener", () => {
           {
             status: 200,
             took: 10,
-            hits: { hits: [], total: 0 },
+            hits: { hits: [], total: { value: 0, relation: "exact" } },
           },
         ],
       });
@@ -839,7 +839,7 @@ describe("Listener", () => {
           {
             status: 200,
             took: 10,
-            hits: { hits: [], total: 0 },
+            hits: { hits: [], total: { value: 0, relation: "exact" } },
           },
         ],
       });
@@ -887,7 +887,7 @@ describe("Listener", () => {
           {
             status: 200,
             took: 10,
-            hits: { hits: [], total: 0 },
+            hits: { hits: [], total: { value: 0, relation: "exact" } },
           },
         ],
       });
@@ -945,7 +945,7 @@ describe("Listener", () => {
           {
             status: 200,
             took: 10,
-            hits: { hits: [], total: 0 },
+            hits: { hits: [], total: { value: 0, relation: "exact" } },
           },
         ],
       });
@@ -1024,7 +1024,7 @@ describe("Listener", () => {
           {
             status: 200,
             took: 10,
-            hits: { hits: [], total: 0 },
+            hits: { hits: [], total: { value: 0, relation: "exact" } },
           },
         ],
       });
