@@ -1734,7 +1734,8 @@ pub const Node = struct {
     }
 
     pub fn chunkText(self: *Node, ctx: *httpx.Context) !httpx.Response {
-        var parsed = (try ctx.parseJson(api.ChunkRequest)) orelse
+        var parsed = (ctx.parseJson(api.ChunkRequest) catch |err|
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = chunkRequestParseErrorMessage(err) })) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
         const body = parsed.value;
@@ -6174,6 +6175,15 @@ fn chunkInputParseErrorMessage(err: anyerror) []const u8 {
         error.ChunkMediaDataMimeTypeMismatch => "media data URI mime_type does not match content part mime_type",
         error.ChunkInputMustBeStringOrContentPartObject => "'input' must be a string or content part object",
         else => "invalid chunk input",
+    };
+}
+
+fn chunkRequestParseErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.MissingField => "missing required 'input' field",
+        error.SyntaxError => "request body must be valid JSON",
+        error.UnexpectedToken => "request body does not match chunk request schema",
+        else => "invalid chunk request",
     };
 }
 
