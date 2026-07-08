@@ -890,7 +890,7 @@ func TestReconcileHAAdminJobsRecoversStaleDirectAPIMissingTokenFailureWithEnvFro
 	g.Expect(container.Env[0].ValueFrom.SecretKeyRef.Key).To(Equal("token"))
 }
 
-func TestHAAdminBearerTokenUsesRuntimeSecretOnlyWhenAllowed(t *testing.T) {
+func TestHAAdminBearerTokenDoesNotReadRuntimeSecretRef(t *testing.T) {
 	g := NewWithT(t)
 	t.Setenv("MISSING_HA_ADMIN_TOKEN", "")
 
@@ -926,11 +926,7 @@ func TestHAAdminBearerTokenUsesRuntimeSecretOnlyWhenAllowed(t *testing.T) {
 		Scheme: s,
 	}
 
-	token, err := reconciler.haAdminBearerToken(context.Background(), cluster, true)
-	g.Expect(err).NotTo(HaveOccurred())
-	g.Expect(token).To(Equal("secret-token"))
-
-	_, err = reconciler.haAdminBearerToken(context.Background(), cluster, false)
+	_, err := reconciler.haAdminBearerToken(cluster)
 	g.Expect(err).To(HaveOccurred())
 	g.Expect(err.Error()).To(ContainSubstring("configured HA admin token env var MISSING_HA_ADMIN_TOKEN is empty or unset"))
 }
