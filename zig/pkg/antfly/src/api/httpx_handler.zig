@@ -642,7 +642,7 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid transaction begin request");
         };
-        const session = try self.api_server.txn_sessions.begin(alloc, begin_req, self.api_server.localSessionNodeId());
+        const session = try self.api_server.txn_sessions.begin(begin_req, self.api_server.localSessionNodeId());
         var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena_impl.deinit();
         const response = try transactions_api.buildBeginResponse(arena_impl.allocator(), session);
@@ -710,7 +710,7 @@ pub const AntflyApiHandler = struct {
             else => return err,
         };
         defer stage_req.deinit(alloc);
-        const session = (self.api_server.txn_sessions.stage(alloc, txn_id, &stage_req) catch |err| switch (err) {
+        const session = (self.api_server.txn_sessions.stage(txn_id, &stage_req) catch |err| switch (err) {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
@@ -794,7 +794,7 @@ pub const AntflyApiHandler = struct {
 
         var stage_req = try transactions_api.ownedRequestFromStageReadRequest(alloc, read_req);
         defer stage_req.deinit(alloc);
-        const session = (self.api_server.txn_sessions.stageRead(alloc, txn_id, &stage_req, owned_snapshot.stage()) catch |err| switch (err) {
+        const session = (self.api_server.txn_sessions.stageRead(txn_id, &stage_req, owned_snapshot.stage()) catch |err| switch (err) {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
@@ -850,7 +850,7 @@ pub const AntflyApiHandler = struct {
             },
         };
         defer stage_req.deinit(alloc);
-        const session = (self.api_server.txn_sessions.stage(alloc, txn_id, &stage_req) catch |err| switch (err) {
+        const session = (self.api_server.txn_sessions.stage(txn_id, &stage_req) catch |err| switch (err) {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
@@ -883,8 +883,7 @@ pub const AntflyApiHandler = struct {
             var resp = forwarded;
             return respond(ctx, &resp);
         }
-        const alloc = self.api_server.alloc;
-        const info = (self.api_server.txn_sessions.createSavepoint(alloc, txn_id) catch |err| switch (err) {
+        const info = (self.api_server.txn_sessions.createSavepoint(txn_id) catch |err| switch (err) {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
@@ -925,8 +924,7 @@ pub const AntflyApiHandler = struct {
             var resp = forwarded;
             return respond(ctx, &resp);
         }
-        const alloc = self.api_server.alloc;
-        const info = (self.api_server.txn_sessions.rollbackToSavepoint(alloc, txn_id, parsed_savepoint_id) catch |err| switch (err) {
+        const info = (self.api_server.txn_sessions.rollbackToSavepoint(txn_id, parsed_savepoint_id) catch |err| switch (err) {
             error.SessionLeaseLost => {
                 _ = ctx.status(409);
                 return ctx.text("session lease lost");
@@ -1010,7 +1008,7 @@ pub const AntflyApiHandler = struct {
             else => return err,
         };
         if (try self.api_server.validateCommitReadSet(commit_req)) |conflict| {
-            _ = self.api_server.txn_sessions.remove(alloc, txn_id);
+            _ = self.api_server.txn_sessions.remove(txn_id);
             var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
             defer arena_impl.deinit();
             const response = try transactions_api.buildSessionCommitResponse(
@@ -1097,14 +1095,14 @@ pub const AntflyApiHandler = struct {
 
         switch (outcome) {
             .committed => {
-                _ = self.api_server.txn_sessions.remove(alloc, txn_id);
+                _ = self.api_server.txn_sessions.remove(txn_id);
                 var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
                 defer arena_impl.deinit();
                 const response = try transactions_api.buildSessionCommitResponse(arena_impl.allocator(), txn_id, "committed", null, commit_req.tables);
                 return ctx.json(response);
             },
             .conflict => |conflict| {
-                _ = self.api_server.txn_sessions.remove(alloc, txn_id);
+                _ = self.api_server.txn_sessions.remove(txn_id);
                 const enriched_conflict = try self.api_server.enrichCommitConflict(commit_req, conflict);
                 var arena_impl = std.heap.ArenaAllocator.init(ctx.allocator);
                 defer arena_impl.deinit();
@@ -1138,8 +1136,7 @@ pub const AntflyApiHandler = struct {
             var resp = forwarded;
             return respond(ctx, &resp);
         }
-        const alloc = self.api_server.alloc;
-        if (!self.api_server.txn_sessions.remove(alloc, txn_id)) {
+        if (!self.api_server.txn_sessions.remove(txn_id)) {
             _ = ctx.status(404);
             return ctx.text("not found");
         }

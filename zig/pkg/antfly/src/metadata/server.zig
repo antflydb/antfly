@@ -339,10 +339,15 @@ const MetadataAdminMux = struct {
         const self: *MetadataAdminMux = @ptrCast(@alignCast(ptr));
         if (isPublicApiRequest(req.uri)) {
             var response = try self.public_api.handle(req);
+            if (sameAllocator(alloc, self.public_api.alloc)) return response;
             defer response.deinit(self.public_api.alloc);
             return try cloneHttpResponse(alloc, response);
         }
         return try self.admin.executor().execute(alloc, req);
+    }
+
+    fn sameAllocator(a: std.mem.Allocator, b: std.mem.Allocator) bool {
+        return a.ptr == b.ptr and a.vtable == b.vtable;
     }
 
     fn isPublicApiRequest(uri: []const u8) bool {

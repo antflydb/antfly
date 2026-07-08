@@ -1058,7 +1058,7 @@ pub const ApiHttpServer = struct {
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     foreign_registry: ?*const foreign_mod.Registry = null,
     owned_foreign_registry: ?*foreign_mod.Registry = null,
-    txn_sessions: transactions_api.SessionRegistry = .{},
+    txn_sessions: transactions_api.SessionRegistry,
     last_session_cleanup_ns: u64 = 0,
     last_session_lease_renew_ns: u64 = 0,
     created_at_ns: u64 = 0,
@@ -1107,6 +1107,7 @@ pub const ApiHttpServer = struct {
             .foreign_registry = cfg.foreign_registry,
             .created_at_ns = platform_time.monotonicNs(),
             .txn_sessions = transactions_api.SessionRegistry.initWithOptions(
+                owner_alloc,
                 cfg.session_store,
                 if (cfg.session_store != null and cfg.session_owner_lease_ttl_ns != null)
                     transactions_api.SessionLeaseStore.init(owner_alloc, cfg.session_store.?.store)
@@ -1171,6 +1172,7 @@ pub const ApiHttpServer = struct {
             effective_cfg.session_store = opened.durableStore();
             server.cfg = effective_cfg;
             server.txn_sessions = transactions_api.SessionRegistry.initWithOptions(
+                server.owner_alloc,
                 effective_cfg.session_store,
                 opened.leaseStore().*,
                 effective_cfg.session_owner_lease_ttl_ns,
@@ -1239,7 +1241,7 @@ pub const ApiHttpServer = struct {
         }
         self.mcp_sessions.deinit(self.owner_alloc);
         self.a2a_tasks.deinit(self.owner_alloc);
-        self.txn_sessions.deinit(self.owner_alloc);
+        self.txn_sessions.deinit();
         if (self.opened_session_store) |opened| {
             opened.deinit();
             self.owner_alloc.destroy(opened);
@@ -1874,7 +1876,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn cleanupExpiredSessions(self: *ApiHttpServer, cutoff_ns: u64) !usize {
-        return try self.txn_sessions.cleanupExpired(self.alloc, cutoff_ns);
+        return try self.txn_sessions.cleanupExpired(cutoff_ns);
     }
 
     fn requiresAuthentication(self: *const ApiHttpServer, path: []const u8) bool {
@@ -3183,7 +3185,7 @@ pub const ApiHttpServer = struct {
                 const begin_req = transactions_api.parseBeginRequest(self.alloc, req.body) catch {
                     return try textResponse(self.alloc, 400, "invalid transaction begin request");
                 };
-                const session = try self.txn_sessions.begin(self.alloc, begin_req, self.localSessionNodeId());
+                const session = try self.txn_sessions.begin(begin_req, self.localSessionNodeId());
                 var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
                 defer arena_impl.deinit();
                 const response = try transactions_api.buildBeginResponse(arena_impl.allocator(), session);
@@ -3343,7 +3345,7 @@ pub const ApiHttpServer = struct {
                 var stage_req = try transactions_api.ownedRequestFromStageReadRequest(self.alloc, read_req);
                 defer stage_req.deinit(self.alloc);
 
-                const session = (self.txn_sessions.stageRead(self.alloc, txn_id, &stage_req, owned_snapshot.stage()) catch |err| switch (err) {
+                const session = (self.txn_sessions.stageRead(txn_id, &stage_req, owned_snapshot.stage()) catch |err| switch (err) {
                     error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
                     else => return err,
                 }) orelse return try textResponse(self.alloc, 404, "not found");
@@ -3362,7 +3364,7 @@ pub const ApiHttpServer = struct {
                 };
                 defer stage_req.deinit(self.alloc);
 
-                const session = (self.txn_sessions.stage(self.alloc, txn_id, &stage_req) catch |err| switch (err) {
+                const session = (self.txn_sessions.stage(txn_id, &stage_req) catch |err| switch (err) {
                     error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
                     else => return err,
                 }) orelse return try textResponse(self.alloc, 404, "not found");
@@ -3381,7 +3383,7 @@ pub const ApiHttpServer = struct {
                 };
                 defer stage_req.deinit(self.alloc);
 
-                const session = (self.txn_sessions.stage(self.alloc, txn_id, &stage_req) catch |err| switch (err) {
+                const session = (self.txn_sessions.stage(txn_id, &stage_req) catch |err| switch (err) {
                     error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
                     else => return err,
                 }) orelse return try textResponse(self.alloc, 404, "not found");
@@ -3395,7 +3397,7 @@ pub const ApiHttpServer = struct {
             if (routes.Routes.matchTransactionSessionSavepoints(uri_parts.path)) |session_route| {
                 const txn_id = distributed_txn.parseTxnIdHex(session_route.txn_id) catch return try textResponse(self.alloc, 400, "invalid transaction id");
                 if (try self.forwardSessionRequest(txn_id, req)) |resp| return resp;
-                const info = (self.txn_sessions.createSavepoint(self.alloc, txn_id) catch |err| switch (err) {
+                const info = (self.txn_sessions.createSavepoint(txn_id) catch |err| switch (err) {
                     error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
                     error.SavepointLimitExceeded => return try textResponse(self.alloc, 409, "savepoint limit exceeded"),
                     else => return err,
@@ -3410,7 +3412,7 @@ pub const ApiHttpServer = struct {
             if (routes.Routes.matchTransactionSessionRollback(uri_parts.path)) |session_route| {
                 const txn_id = distributed_txn.parseTxnIdHex(session_route.txn_id) catch return try textResponse(self.alloc, 400, "invalid transaction id");
                 if (try self.forwardSessionRequest(txn_id, req)) |resp| return resp;
-                const info = (self.txn_sessions.rollbackToSavepoint(self.alloc, txn_id, session_route.savepoint_id) catch |err| switch (err) {
+                const info = (self.txn_sessions.rollbackToSavepoint(txn_id, session_route.savepoint_id) catch |err| switch (err) {
                     error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
                     else => return err,
                 }) orelse return try textResponse(self.alloc, 404, "not found");
@@ -3432,7 +3434,7 @@ pub const ApiHttpServer = struct {
                 };
                 defer stage_req.deinit(self.alloc);
 
-                const session = (self.txn_sessions.stage(self.alloc, txn_id, &stage_req) catch |err| switch (err) {
+                const session = (self.txn_sessions.stage(txn_id, &stage_req) catch |err| switch (err) {
                     error.SessionLeaseLost => return try textResponse(self.alloc, 409, "session lease lost"),
                     else => return err,
                 }) orelse return try textResponse(self.alloc, 404, "not found");
@@ -3485,7 +3487,7 @@ pub const ApiHttpServer = struct {
                     else => return err,
                 };
                 if (try self.validateCommitReadSet(commit_req)) |conflict| {
-                    _ = self.txn_sessions.remove(self.alloc, txn_id);
+                    _ = self.txn_sessions.remove(txn_id);
                     var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
                     defer arena_impl.deinit();
                     const response = try transactions_api.buildSessionCommitResponse(
@@ -3555,14 +3557,14 @@ pub const ApiHttpServer = struct {
 
                 switch (outcome) {
                     .committed => {
-                        _ = self.txn_sessions.remove(self.alloc, txn_id);
+                        _ = self.txn_sessions.remove(txn_id);
                         var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
                         defer arena_impl.deinit();
                         const response = try transactions_api.buildSessionCommitResponse(arena_impl.allocator(), txn_id, "committed", null, commit_req.tables);
                         return try jsonResponseOmitNullOptionals(self.alloc, response);
                     },
                     .conflict => |conflict| {
-                        _ = self.txn_sessions.remove(self.alloc, txn_id);
+                        _ = self.txn_sessions.remove(txn_id);
                         const enriched_conflict = try self.enrichCommitConflict(commit_req, conflict);
                         var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
                         defer arena_impl.deinit();
@@ -3582,7 +3584,7 @@ pub const ApiHttpServer = struct {
             if (routes.Routes.matchTransactionSessionAbort(uri_parts.path)) |session_route| {
                 const txn_id = distributed_txn.parseTxnIdHex(session_route.txn_id) catch return try textResponse(self.alloc, 400, "invalid transaction id");
                 if (try self.forwardSessionRequest(txn_id, req)) |resp| return resp;
-                if (!self.txn_sessions.remove(self.alloc, txn_id)) return try textResponse(self.alloc, 404, "not found");
+                if (!self.txn_sessions.remove(txn_id)) return try textResponse(self.alloc, 404, "not found");
                 var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
                 defer arena_impl.deinit();
                 const response = try transactions_api.buildAbortResponse(arena_impl.allocator(), txn_id);
@@ -4576,7 +4578,7 @@ pub const ApiHttpServer = struct {
         const interval_ns = self.cfg.session_cleanup_interval_ns orelse ttl_ns;
         if (self.last_session_cleanup_ns != 0 and now_ns -| self.last_session_cleanup_ns < interval_ns) return;
         self.last_session_cleanup_ns = now_ns;
-        _ = try self.txn_sessions.cleanupExpired(self.alloc, now_ns -| ttl_ns);
+        _ = try self.txn_sessions.cleanupExpired(now_ns -| ttl_ns);
     }
 
     fn routeInternalGroupQueryToReadSchema(ptr: *anyopaque, table_name: []const u8, req: *db_mod.types.SearchRequest) !void {
@@ -5706,7 +5708,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn forwardSessionRequest(self: *ApiHttpServer, txn_id: db_mod.types.TxnId, req: http_common.HttpRequest) !?http_common.HttpResponse {
-        const owner_node_id = (try self.txn_sessions.getOwnerNodeId(self.alloc, txn_id)) orelse transactions_api.sessionOwnerNodeId(txn_id);
+        const owner_node_id = (try self.txn_sessions.getOwnerNodeId(txn_id)) orelse transactions_api.sessionOwnerNodeId(txn_id);
         if (owner_node_id == 0) return null;
         const router = self.cfg.session_router orelse return null;
         const session_executor = self.cfg.session_executor orelse return null;
@@ -5762,7 +5764,7 @@ pub const ApiHttpServer = struct {
     fn tryAdoptSession(self: *ApiHttpServer, txn_id: db_mod.types.TxnId) !bool {
         const local_node_id = self.localSessionNodeId();
         if (local_node_id == 0) return false;
-        return try self.txn_sessions.adoptIfLeaseExpired(self.alloc, txn_id, local_node_id, null);
+        return try self.txn_sessions.adoptIfLeaseExpired(txn_id, local_node_id, null);
     }
 
     pub fn lookupStageReadSnapshot(
@@ -19041,9 +19043,9 @@ test "api http server enforces session adoption timeout when configured" {
     var durable = transactions_api.DurableSessionStore.init(alloc, &session_store);
     const lease_store = transactions_api.SessionLeaseStore.init(alloc, &session_store);
 
-    var registry = transactions_api.SessionRegistry.initWithLeaseTtl(&durable, lease_store, std.time.ns_per_s);
-    defer registry.deinit(alloc);
-    const session = try registry.begin(alloc, .{ .sync_level = .write }, 7);
+    var registry = transactions_api.SessionRegistry.initWithLeaseTtl(alloc, &durable, lease_store, std.time.ns_per_s);
+    defer registry.deinit();
+    const session = try registry.begin(.{ .sync_level = .write }, 7);
 
     const FakeSource = struct {
         fn iface(_: *@This()) StatusSource {

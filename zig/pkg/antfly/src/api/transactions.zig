@@ -631,6 +631,7 @@ pub const SessionLeaseStore = struct {
 };
 
 pub const SessionRegistry = struct {
+    alloc: std.mem.Allocator,
     mutex: AtomicMutex = .{},
     sessions: std.AutoHashMapUnmanaged(db_mod.types.TxnId, Session) = .empty,
     durable: ?*DurableSessionStore = null,
@@ -638,21 +639,23 @@ pub const SessionRegistry = struct {
     owner_lease_ttl_ns: ?u64 = null,
     max_savepoints: ?usize = null,
 
-    pub fn init(durable: ?*DurableSessionStore) SessionRegistry {
-        return initWithOptions(durable, null, null, null);
+    pub fn init(alloc: std.mem.Allocator, durable: ?*DurableSessionStore) SessionRegistry {
+        return initWithOptions(alloc, durable, null, null, null);
     }
 
-    pub fn initWithLeaseTtl(durable: ?*DurableSessionStore, lease_store: ?SessionLeaseStore, owner_lease_ttl_ns: ?u64) SessionRegistry {
-        return initWithOptions(durable, lease_store, owner_lease_ttl_ns, null);
+    pub fn initWithLeaseTtl(alloc: std.mem.Allocator, durable: ?*DurableSessionStore, lease_store: ?SessionLeaseStore, owner_lease_ttl_ns: ?u64) SessionRegistry {
+        return initWithOptions(alloc, durable, lease_store, owner_lease_ttl_ns, null);
     }
 
     pub fn initWithOptions(
+        alloc: std.mem.Allocator,
         durable: ?*DurableSessionStore,
         lease_store: ?SessionLeaseStore,
         owner_lease_ttl_ns: ?u64,
         max_savepoints: ?usize,
     ) SessionRegistry {
         return .{
+            .alloc = alloc,
             .durable = durable,
             .lease_store = lease_store,
             .owner_lease_ttl_ns = owner_lease_ttl_ns,
@@ -660,14 +663,15 @@ pub const SessionRegistry = struct {
         };
     }
 
-    pub fn deinit(self: *SessionRegistry, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *SessionRegistry) void {
+        const alloc = self.alloc;
         var it = self.sessions.iterator();
         while (it.next()) |entry| entry.value_ptr.deinit(alloc);
         self.sessions.deinit(alloc);
-        self.* = .{};
+        self.* = SessionRegistry.init(alloc, null);
     }
 
-    pub fn begin(self: *SessionRegistry, alloc: std.mem.Allocator, req: BeginRequest, owner_node_id: u64) !SessionInfo {
+    pub fn begin(self: *SessionRegistry, req: BeginRequest, owner_node_id: u64) !SessionInfo {
         const txn_id = newSessionTxnId(owner_node_id);
         const now = nextTxnTimestamp();
         const session: Session = .{
@@ -680,7 +684,7 @@ pub const SessionRegistry = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         try self.renewLeaseLocked(txn_id, owner_node_id);
-        try self.sessions.put(alloc, txn_id, session);
+        try self.sessions.put(self.alloc, txn_id, session);
         try self.persistLocked(session);
         return session.info();
     }
@@ -690,17 +694,18 @@ pub const SessionRegistry = struct {
         defer self.mutex.unlock();
         const session = if (self.sessions.getPtr(txn_id)) |existing| blk: {
             break :blk existing.*;
-        } else if (self.durable) |durable| blk: {
-            const loaded = (self.loadIntoCacheLocked(durable.alloc, txn_id) catch return null) orelse return null;
+        } else if (self.durable != null) blk: {
+            const loaded = (self.loadIntoCacheLocked(txn_id) catch return null) orelse return null;
             break :blk loaded.*;
         } else return null;
         return session.info();
     }
 
-    pub fn stage(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, req: *const OwnedTransactionCommitRequest) !?SessionInfo {
+    pub fn stage(self: *SessionRegistry, txn_id: db_mod.types.TxnId, req: *const OwnedTransactionCommitRequest) !?SessionInfo {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const session = (try self.loadIntoCacheLocked(alloc, txn_id)) orelse return null;
+        const alloc = self.alloc;
+        const session = (try self.loadIntoCacheLocked(txn_id)) orelse return null;
         if (session.staged == null) {
             session.staged = try req.clone(alloc);
         } else {
@@ -721,20 +726,20 @@ pub const SessionRegistry = struct {
     ) !?SessionReadSnapshot {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const session = (try self.loadIntoCacheLocked(alloc, txn_id)) orelse return null;
+        const session = (try self.loadIntoCacheLocked(txn_id)) orelse return null;
         return try cloneReadSnapshotForKey(alloc, &session.read_snapshots, table_name, key);
     }
 
     pub fn stageRead(
         self: *SessionRegistry,
-        alloc: std.mem.Allocator,
         txn_id: db_mod.types.TxnId,
         req: *const OwnedTransactionCommitRequest,
         snapshot: StageReadSnapshot,
     ) !?SessionInfo {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const session = (try self.loadIntoCacheLocked(alloc, txn_id)) orelse return null;
+        const alloc = self.alloc;
+        const session = (try self.loadIntoCacheLocked(txn_id)) orelse return null;
         try upsertReadSnapshot(alloc, &session.read_snapshots, snapshot);
         if (session.staged == null) {
             session.staged = try req.clone(alloc);
@@ -755,7 +760,7 @@ pub const SessionRegistry = struct {
     ) !?OwnedTransactionCommitRequest {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const session = (try self.loadIntoCacheLocked(alloc, txn_id)) orelse return null;
+        const session = (try self.loadIntoCacheLocked(txn_id)) orelse return null;
         var out: OwnedTransactionCommitRequest = if (session.staged) |staged|
             try staged.clone(alloc)
         else
@@ -774,10 +779,11 @@ pub const SessionRegistry = struct {
         return out;
     }
 
-    pub fn createSavepoint(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !?SavepointInfo {
+    pub fn createSavepoint(self: *SessionRegistry, txn_id: db_mod.types.TxnId) !?SavepointInfo {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const session = (try self.loadIntoCacheLocked(alloc, txn_id)) orelse return null;
+        const alloc = self.alloc;
+        const session = (try self.loadIntoCacheLocked(txn_id)) orelse return null;
         if (self.max_savepoints) |limit| {
             if (session.savepoints.count() >= limit) return error.SavepointLimitExceeded;
         }
@@ -798,10 +804,11 @@ pub const SessionRegistry = struct {
         return .{ .txn_id = txn_id, .savepoint_id = savepoint_id };
     }
 
-    pub fn rollbackToSavepoint(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, savepoint_id: u64) !?SavepointInfo {
+    pub fn rollbackToSavepoint(self: *SessionRegistry, txn_id: db_mod.types.TxnId, savepoint_id: u64) !?SavepointInfo {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const session = (try self.loadIntoCacheLocked(alloc, txn_id)) orelse return null;
+        const alloc = self.alloc;
+        const session = (try self.loadIntoCacheLocked(txn_id)) orelse return null;
         const savepoint = session.savepoints.getPtr(savepoint_id) orelse return null;
         if (session.staged) |*staged| staged.deinit(alloc);
         session.staged = try savepoint.snapshot.clone(alloc);
@@ -813,19 +820,19 @@ pub const SessionRegistry = struct {
         return .{ .txn_id = txn_id, .savepoint_id = savepoint_id };
     }
 
-    pub fn getStatus(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !?SessionStatus {
+    pub fn getStatus(self: *SessionRegistry, txn_id: db_mod.types.TxnId) !?SessionStatus {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const session = (try self.loadIntoCacheLocked(alloc, txn_id)) orelse return null;
-        return try sessionStatusFromSession(self, alloc, session);
+        const session = (try self.loadIntoCacheLocked(txn_id)) orelse return null;
+        return try sessionStatusFromSession(self, session);
     }
 
     pub fn getDetails(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !?SessionDetails {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const session = (try self.loadIntoCacheLocked(alloc, txn_id)) orelse return null;
+        const session = (try self.loadIntoCacheLocked(txn_id)) orelse return null;
         return .{
-            .status = try sessionStatusFromSession(self, alloc, session),
+            .status = try sessionStatusFromSession(self, session),
             .tables = try sessionTableDetails(alloc, session.staged),
             .read_snapshots = try sessionReadSnapshots(alloc, session),
             .savepoint_ids = try sessionSavepointIds(alloc, session),
@@ -847,7 +854,7 @@ pub const SessionRegistry = struct {
                 const txn_id = distributed_txn.parseTxnIdHex(row.key[session_prefix.len..]) catch continue;
                 var session = decodeSessionRecord(alloc, txn_id, row.value) catch continue;
                 defer session.deinit(alloc);
-                try statuses.append(alloc, try sessionStatusFromSession(self, alloc, &session));
+                try statuses.append(alloc, try sessionStatusFromSession(self, &session));
             }
             return try statuses.toOwnedSlice(alloc);
         }
@@ -855,23 +862,23 @@ pub const SessionRegistry = struct {
         var it = self.sessions.iterator();
         while (it.next()) |entry| {
             const session = entry.value_ptr.*;
-            try statuses.append(alloc, try sessionStatusFromSession(self, alloc, &session));
+            try statuses.append(alloc, try sessionStatusFromSession(self, &session));
         }
         return try statuses.toOwnedSlice(alloc);
     }
 
-    pub fn getOwnerNodeId(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !?u64 {
+    pub fn getOwnerNodeId(self: *SessionRegistry, txn_id: db_mod.types.TxnId) !?u64 {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const session = (try self.loadIntoCacheLocked(alloc, txn_id)) orelse return null;
+        const session = (try self.loadIntoCacheLocked(txn_id)) orelse return null;
         return session.owner_node_id;
     }
 
-    pub fn adopt(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, owner_node_id: u64) !bool {
+    pub fn adopt(self: *SessionRegistry, txn_id: db_mod.types.TxnId, owner_node_id: u64) !bool {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.durable == null) return false;
-        const session = (try self.loadIntoCacheLocked(alloc, txn_id)) orelse return false;
+        const session = (try self.loadIntoCacheLocked(txn_id)) orelse return false;
         if (session.owner_node_id == owner_node_id) return true;
         session.owner_node_id = owner_node_id;
         touchSession(session);
@@ -885,7 +892,6 @@ pub const SessionRegistry = struct {
 
     pub fn adoptIfLeaseExpired(
         self: *SessionRegistry,
-        alloc: std.mem.Allocator,
         txn_id: db_mod.types.TxnId,
         owner_node_id: u64,
         now_ns: ?u64,
@@ -894,10 +900,10 @@ pub const SessionRegistry = struct {
         defer self.mutex.unlock();
         if (self.durable == null) return false;
         if (self.lease_store == null or self.owner_lease_ttl_ns == null) return false;
-        const session = (try self.loadIntoCacheLocked(alloc, txn_id)) orelse return false;
+        const session = (try self.loadIntoCacheLocked(txn_id)) orelse return false;
         if (session.owner_node_id == owner_node_id) return true;
         const effective_now = now_ns orelse nextTxnTimestamp();
-        const lease_expires_at = try self.loadLeaseExpiryLocked(alloc, txn_id);
+        const lease_expires_at = try self.loadLeaseExpiryLocked(txn_id);
         if (lease_expires_at != 0 and effective_now < lease_expires_at) return false;
         self.renewLeaseLockedAt(txn_id, owner_node_id, effective_now) catch |err| switch (err) {
             error.SessionLeaseLost => return false,
@@ -928,10 +934,11 @@ pub const SessionRegistry = struct {
         }
     }
 
-    pub fn cleanupExpired(self: *SessionRegistry, alloc: std.mem.Allocator, cutoff_ns: u64) !usize {
+    pub fn cleanupExpired(self: *SessionRegistry, cutoff_ns: u64) !usize {
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        const alloc = self.alloc;
         var expired_ids = std.ArrayListUnmanaged(db_mod.types.TxnId).empty;
         defer expired_ids.deinit(alloc);
 
@@ -968,10 +975,11 @@ pub const SessionRegistry = struct {
         return expired_ids.items.len;
     }
 
-    pub fn remove(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) bool {
+    pub fn remove(self: *SessionRegistry, txn_id: db_mod.types.TxnId) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
-        _ = self.loadIntoCacheLocked(alloc, txn_id) catch return false;
+        const alloc = self.alloc;
+        _ = self.loadIntoCacheLocked(txn_id) catch return false;
         const removed = self.sessions.fetchRemove(txn_id) orelse return false;
         var session = removed.value;
         self.releaseLeaseLocked(txn_id, session.owner_node_id) catch return false;
@@ -988,11 +996,11 @@ pub const SessionRegistry = struct {
         if (self.durable) |durable| try durable.delete(txn_id);
     }
 
-    fn loadIntoCacheLocked(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !?*Session {
+    fn loadIntoCacheLocked(self: *SessionRegistry, txn_id: db_mod.types.TxnId) !?*Session {
         if (self.sessions.getPtr(txn_id)) |session| return session;
         const durable = self.durable orelse return null;
         const loaded = (try durable.load(txn_id)) orelse return null;
-        try self.sessions.put(alloc, txn_id, loaded);
+        try self.sessions.put(self.alloc, txn_id, loaded);
         return self.sessions.getPtr(txn_id).?;
     }
 
@@ -1028,8 +1036,9 @@ pub const SessionRegistry = struct {
         _ = try lease_store.release(txn_id, owner_node_id);
     }
 
-    fn loadLeaseExpiryLocked(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !u64 {
+    fn loadLeaseExpiryLocked(self: *SessionRegistry, txn_id: db_mod.types.TxnId) !u64 {
         const lease_store = self.lease_store orelse return 0;
+        const alloc = self.alloc;
         var record = (try lease_store.load(alloc, txn_id)) orelse return 0;
         defer lease_mod.deinitRecord(alloc, &record);
         return record.expires_at_ms * std.time.ns_per_ms;
@@ -2388,7 +2397,7 @@ fn sessionLeaseState(lease_expires_at: u64, now_ns: u64) SessionLeaseState {
     return .held;
 }
 
-fn sessionStatusFromSession(self: *SessionRegistry, alloc: std.mem.Allocator, session: *const Session) !SessionStatus {
+fn sessionStatusFromSession(self: *SessionRegistry, session: *const Session) !SessionStatus {
     const counts = stagedCounts(session.staged);
     const savepoint_count = session.savepoints.count();
     return .{
@@ -2396,7 +2405,7 @@ fn sessionStatusFromSession(self: *SessionRegistry, alloc: std.mem.Allocator, se
         .owner_node_id = session.owner_node_id,
         .begin_timestamp = session.begin_timestamp,
         .last_touched_timestamp = session.last_touched_timestamp,
-        .lease_expires_at = try self.loadLeaseExpiryLocked(alloc, session.txn_id),
+        .lease_expires_at = try self.loadLeaseExpiryLocked(session.txn_id),
         .sync_level = session.sync_level,
         .staged_table_count = counts.tables,
         .staged_read_count = counts.reads,
@@ -2707,13 +2716,13 @@ test "transaction commit parser keeps table transforms" {
 }
 
 test "transaction session registry begins and removes sessions" {
-    var registry = SessionRegistry.init(null);
-    defer registry.deinit(std.testing.allocator);
-    const session = try registry.begin(std.testing.allocator, .{ .sync_level = .full_index }, 7);
+    var registry = SessionRegistry.init(std.testing.allocator, null);
+    defer registry.deinit();
+    const session = try registry.begin(.{ .sync_level = .full_index }, 7);
     try std.testing.expect(registry.getInfo(session.txn_id) != null);
     try std.testing.expectEqual(db_mod.types.SyncLevel.full_index, registry.getInfo(session.txn_id).?.sync_level);
     try std.testing.expectEqual(@as(u64, 7), sessionOwnerNodeId(session.txn_id));
-    try std.testing.expect(registry.remove(std.testing.allocator, session.txn_id));
+    try std.testing.expect(registry.remove(session.txn_id));
     try std.testing.expect(registry.getInfo(session.txn_id) == null);
 }
 
@@ -2730,14 +2739,14 @@ test "transaction session registry adopts durable session ownership" {
     defer store.close();
     var durable = DurableSessionStore.init(std.testing.allocator, &store);
 
-    var writer = SessionRegistry.init(&durable);
-    defer writer.deinit(std.testing.allocator);
-    const session = try writer.begin(std.testing.allocator, .{ .sync_level = .write }, 9);
+    var writer = SessionRegistry.init(std.testing.allocator, &durable);
+    defer writer.deinit();
+    const session = try writer.begin(.{ .sync_level = .write }, 9);
 
-    var adopter = SessionRegistry.init(&durable);
-    defer adopter.deinit(std.testing.allocator);
-    try std.testing.expect(try adopter.adopt(std.testing.allocator, session.txn_id, 12));
-    const status = (try adopter.getStatus(std.testing.allocator, session.txn_id)).?;
+    var adopter = SessionRegistry.init(std.testing.allocator, &durable);
+    defer adopter.deinit();
+    try std.testing.expect(try adopter.adopt(session.txn_id, 12));
+    const status = (try adopter.getStatus(session.txn_id)).?;
     try std.testing.expectEqual(@as(u64, 12), status.owner_node_id);
 }
 
@@ -2755,20 +2764,20 @@ test "transaction session registry only adopts durable sessions after lease expi
     var durable = DurableSessionStore.init(std.testing.allocator, &store);
 
     const lease_store = SessionLeaseStore.init(std.testing.allocator, &store);
-    var writer = SessionRegistry.initWithLeaseTtl(&durable, lease_store, std.time.ns_per_s);
-    defer writer.deinit(std.testing.allocator);
-    const session = try writer.begin(std.testing.allocator, .{ .sync_level = .write }, 9);
+    var writer = SessionRegistry.initWithLeaseTtl(std.testing.allocator, &durable, lease_store, std.time.ns_per_s);
+    defer writer.deinit();
+    const session = try writer.begin(.{ .sync_level = .write }, 9);
 
-    var adopter = SessionRegistry.initWithLeaseTtl(&durable, lease_store, std.time.ns_per_s);
-    defer adopter.deinit(std.testing.allocator);
-    try std.testing.expect(!(try adopter.adoptIfLeaseExpired(std.testing.allocator, session.txn_id, 12, session.begin_timestamp)));
+    var adopter = SessionRegistry.initWithLeaseTtl(std.testing.allocator, &durable, lease_store, std.time.ns_per_s);
+    defer adopter.deinit();
+    try std.testing.expect(!(try adopter.adoptIfLeaseExpired(session.txn_id, 12, session.begin_timestamp)));
 
     var lease_record = (try lease_store.load(std.testing.allocator, session.txn_id)).?;
     defer lease_mod.deinitRecord(std.testing.allocator, &lease_record);
     const expired_now = lease_record.expires_at_ms * std.time.ns_per_ms + 1;
 
-    try std.testing.expect(try adopter.adoptIfLeaseExpired(std.testing.allocator, session.txn_id, 12, expired_now));
-    const status = (try adopter.getStatus(std.testing.allocator, session.txn_id)).?;
+    try std.testing.expect(try adopter.adoptIfLeaseExpired(session.txn_id, 12, expired_now));
+    const status = (try adopter.getStatus(session.txn_id)).?;
     try std.testing.expectEqual(@as(u64, 12), status.owner_node_id);
     try std.testing.expect(status.lease_expires_at > session.begin_timestamp);
 }
@@ -2787,20 +2796,20 @@ test "transaction session registry renews and releases separate lease records" {
     var durable = DurableSessionStore.init(std.testing.allocator, &store);
 
     const lease_store = SessionLeaseStore.init(std.testing.allocator, &store);
-    var registry = SessionRegistry.initWithLeaseTtl(&durable, lease_store, 10 * std.time.ns_per_ms);
-    defer registry.deinit(std.testing.allocator);
-    const session = try registry.begin(std.testing.allocator, .{ .sync_level = .write }, 15);
+    var registry = SessionRegistry.initWithLeaseTtl(std.testing.allocator, &durable, lease_store, 10 * std.time.ns_per_ms);
+    defer registry.deinit();
+    const session = try registry.begin(.{ .sync_level = .write }, 15);
 
-    const initial_status = (try registry.getStatus(std.testing.allocator, session.txn_id)) orelse return error.TestExpectedEqual;
+    const initial_status = (try registry.getStatus(session.txn_id)) orelse return error.TestExpectedEqual;
     try std.testing.expect(initial_status.lease_expires_at > 0);
 
     std.Thread.yield() catch {};
-    _ = (try registry.createSavepoint(std.testing.allocator, session.txn_id)) orelse return error.TestExpectedEqual;
+    _ = (try registry.createSavepoint(session.txn_id)) orelse return error.TestExpectedEqual;
 
-    const renewed_status = (try registry.getStatus(std.testing.allocator, session.txn_id)) orelse return error.TestExpectedEqual;
+    const renewed_status = (try registry.getStatus(session.txn_id)) orelse return error.TestExpectedEqual;
     try std.testing.expect(renewed_status.lease_expires_at > initial_status.lease_expires_at);
 
-    try std.testing.expect(registry.remove(std.testing.allocator, session.txn_id));
+    try std.testing.expect(registry.remove(session.txn_id));
     try std.testing.expect((try lease_store.load(std.testing.allocator, session.txn_id)) == null);
 }
 
@@ -2817,19 +2826,19 @@ test "transaction session registry reloads durable sessions from kv store" {
     defer store.close();
     var durable = DurableSessionStore.init(std.testing.allocator, &store);
 
-    var writer = SessionRegistry.init(&durable);
-    defer writer.deinit(std.testing.allocator);
-    const session = try writer.begin(std.testing.allocator, .{ .sync_level = .write }, 9);
+    var writer = SessionRegistry.init(std.testing.allocator, &durable);
+    defer writer.deinit();
+    const session = try writer.begin(.{ .sync_level = .write }, 9);
 
     var stage_req = try parseStageWriteRequest(std.testing.allocator, "{\"table\":\"docs\",\"key\":\"doc:a\",\"document\":{\"title\":\"persisted\"}}");
     defer stage_req.deinit(std.testing.allocator);
-    _ = try writer.stage(std.testing.allocator, session.txn_id, &stage_req);
+    _ = try writer.stage(session.txn_id, &stage_req);
 
-    var reader = SessionRegistry.init(&durable);
-    defer reader.deinit(std.testing.allocator);
+    var reader = SessionRegistry.init(std.testing.allocator, &durable);
+    defer reader.deinit();
     const loaded = reader.getInfo(session.txn_id) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u64, 9), sessionOwnerNodeId(loaded.txn_id));
-    const status = (try reader.getStatus(std.testing.allocator, session.txn_id)).?;
+    const status = (try reader.getStatus(session.txn_id)).?;
     try std.testing.expectEqual(@as(u64, 0), status.lease_expires_at);
 
     var merged = (try reader.cloneCommitRequest(std.testing.allocator, session.txn_id, null)) orelse return error.TestExpectedEqual;
@@ -2852,20 +2861,20 @@ test "transaction session registry reports status and cleans expired durable ses
     defer store.close();
     var durable = DurableSessionStore.init(std.testing.allocator, &store);
 
-    var registry = SessionRegistry.init(&durable);
-    defer registry.deinit(std.testing.allocator);
-    const session = try registry.begin(std.testing.allocator, .{ .sync_level = .write }, 11);
+    var registry = SessionRegistry.init(std.testing.allocator, &durable);
+    defer registry.deinit();
+    const session = try registry.begin(.{ .sync_level = .write }, 11);
 
     var read_req = try parseStageReadRequest(std.testing.allocator, "{\"table\":\"docs\",\"key\":\"doc:a\",\"version\":\"7\"}");
     defer read_req.deinit(std.testing.allocator);
-    _ = try registry.stage(std.testing.allocator, session.txn_id, &read_req);
+    _ = try registry.stage(session.txn_id, &read_req);
     var write_req = try parseStageWriteRequest(std.testing.allocator, "{\"table\":\"docs\",\"key\":\"doc:a\",\"document\":{\"title\":\"status\"}}");
     defer write_req.deinit(std.testing.allocator);
-    _ = try registry.stage(std.testing.allocator, session.txn_id, &write_req);
+    _ = try registry.stage(session.txn_id, &write_req);
 
-    _ = (try registry.createSavepoint(std.testing.allocator, session.txn_id)) orelse return error.TestExpectedEqual;
+    _ = (try registry.createSavepoint(session.txn_id)) orelse return error.TestExpectedEqual;
 
-    const status = (try registry.getStatus(std.testing.allocator, session.txn_id)) orelse return error.TestExpectedEqual;
+    const status = (try registry.getStatus(session.txn_id)) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u64, 11), status.owner_node_id);
     try std.testing.expectEqual(@as(u64, 0), status.lease_expires_at);
     try std.testing.expectEqual(@as(usize, 1), status.staged_table_count);
@@ -2879,21 +2888,21 @@ test "transaction session registry reports status and cleans expired durable ses
 
     registry.sessions.getPtr(session.txn_id).?.last_touched_timestamp = 1;
     try durable.save(registry.sessions.get(session.txn_id).?);
-    const removed = try registry.cleanupExpired(std.testing.allocator, 2);
+    const removed = try registry.cleanupExpired(2);
     try std.testing.expectEqual(@as(usize, 1), removed);
     try std.testing.expect(registry.getInfo(session.txn_id) == null);
     try std.testing.expect((try durable.load(session.txn_id)) == null);
 }
 
 test "transaction session registry enforces savepoint limits and reports remaining capacity" {
-    var registry = SessionRegistry.initWithOptions(null, null, null, 1);
-    defer registry.deinit(std.testing.allocator);
-    const session = try registry.begin(std.testing.allocator, .{ .sync_level = .write }, 21);
+    var registry = SessionRegistry.initWithOptions(std.testing.allocator, null, null, null, 1);
+    defer registry.deinit();
+    const session = try registry.begin(.{ .sync_level = .write }, 21);
 
-    _ = (try registry.createSavepoint(std.testing.allocator, session.txn_id)) orelse return error.TestExpectedEqual;
-    try std.testing.expectError(error.SavepointLimitExceeded, registry.createSavepoint(std.testing.allocator, session.txn_id));
+    _ = (try registry.createSavepoint(session.txn_id)) orelse return error.TestExpectedEqual;
+    try std.testing.expectError(error.SavepointLimitExceeded, registry.createSavepoint(session.txn_id));
 
-    const status = (try registry.getStatus(std.testing.allocator, session.txn_id)) orelse return error.TestExpectedEqual;
+    const status = (try registry.getStatus(session.txn_id)) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(usize, 1), status.savepoint_count);
     try std.testing.expectEqual(@as(usize, 1), status.savepoint_limit.?);
     try std.testing.expectEqual(@as(usize, 0), status.remaining_savepoints.?);
@@ -3000,14 +3009,14 @@ test "transaction session registry can renew owned leases opportunistically" {
     var durable = DurableSessionStore.init(std.testing.allocator, &store);
     const lease_store = SessionLeaseStore.init(std.testing.allocator, &store);
 
-    var registry = SessionRegistry.initWithLeaseTtl(&durable, lease_store, 10 * std.time.ns_per_ms);
-    defer registry.deinit(std.testing.allocator);
-    const session = try registry.begin(std.testing.allocator, .{ .sync_level = .write }, 21);
+    var registry = SessionRegistry.initWithLeaseTtl(std.testing.allocator, &durable, lease_store, 10 * std.time.ns_per_ms);
+    defer registry.deinit();
+    const session = try registry.begin(.{ .sync_level = .write }, 21);
 
-    const initial = (try registry.getStatus(std.testing.allocator, session.txn_id)) orelse return error.TestExpectedEqual;
+    const initial = (try registry.getStatus(session.txn_id)) orelse return error.TestExpectedEqual;
     const renewed_now = initial.lease_expires_at + 2 * std.time.ns_per_ms;
     try std.testing.expectEqual(@as(usize, 1), try registry.renewOwnedLeases(21, renewed_now));
-    const renewed = (try registry.getStatus(std.testing.allocator, session.txn_id)) orelse return error.TestExpectedEqual;
+    const renewed = (try registry.getStatus(session.txn_id)) orelse return error.TestExpectedEqual;
     try std.testing.expect(renewed.lease_expires_at > initial.lease_expires_at);
 }
 
