@@ -196,6 +196,7 @@ pub const ProvisionedTableReadCache = struct {
     // flight and nothing read the old epoch. Slots are never removed: one
     // u64 + the name per distinct table ever read through this cache.
     table_epochs: std.StringHashMapUnmanaged(u64) = .empty,
+    exclusive_table_access: std.StringHashMapUnmanaged(usize) = .empty,
     entries: std.ArrayListUnmanaged(*Entry) = .empty,
     retired_entries: std.ArrayListUnmanaged(*Entry) = .empty,
     pending_opens: std.ArrayListUnmanaged(PendingOpen) = .empty,
@@ -258,6 +259,18 @@ pub const ProvisionedTableReadCache = struct {
         }
     };
 
+    pub const ExclusiveTableAccess = struct {
+        cache: *ProvisionedTableReadCache,
+        table_name: []const u8,
+        active: bool = true,
+
+        pub fn deinit(self: *ExclusiveTableAccess) void {
+            if (!self.active) return;
+            self.cache.endExclusiveTableAccess(self.table_name);
+            self.active = false;
+        }
+    };
+
     const PendingOpen = struct {
         group_id: u64,
         identity_namespace: ?db_mod.DocIdentityNamespace = null,
@@ -294,6 +307,9 @@ pub const ProvisionedTableReadCache = struct {
         var epoch_keys = self.table_epochs.keyIterator();
         while (epoch_keys.next()) |key| self.alloc.free(key.*);
         self.table_epochs.deinit(self.alloc);
+        var exclusive_keys = self.exclusive_table_access.keyIterator();
+        while (exclusive_keys.next()) |key| self.alloc.free(key.*);
+        self.exclusive_table_access.deinit(self.alloc);
         self.mutex.unlock(io);
         self.threaded.deinit();
         self.* = undefined;
@@ -334,6 +350,9 @@ pub const ProvisionedTableReadCache = struct {
             // namespace would open (and cache) the wrong identity.
             const identity_namespace = try loadTableIdentityNamespaceForGroup(self.alloc, catalog, table_name, group_id);
             self.mutex.lockUncancelable(io);
+            while (self.hasExclusiveTableAccessLocked(table_name)) {
+                self.ready.waitUncancelable(io, &self.mutex);
+            }
             const open_epoch = self.epochForTableLocked(table_name) catch |err| {
                 self.mutex.unlock(io);
                 return err;
@@ -490,6 +509,38 @@ pub const ProvisionedTableReadCache = struct {
         return self.getOrOpen(path, catalog, group_id, lsm_root_generation, table_name);
     }
 
+    pub fn beginExclusiveTableAccess(self: *ProvisionedTableReadCache, table_name: []const u8) !ExclusiveTableAccess {
+        const io = self.threaded.io();
+        self.mutex.lockUncancelable(io);
+        errdefer self.mutex.unlock(io);
+
+        const gop = try self.exclusive_table_access.getOrPut(self.alloc, table_name);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = self.alloc.dupe(u8, table_name) catch |err| {
+                self.exclusive_table_access.removeByPtr(gop.key_ptr);
+                return err;
+            };
+            gop.value_ptr.* = 0;
+        }
+        gop.value_ptr.* += 1;
+
+        self.bumpEpochLocked(table_name);
+        self.removeEntriesForTableLocked(table_name);
+        self.ready.broadcast(io);
+        while (self.hasPendingOpenForTableLocked(table_name) or
+            self.hasTableLocked(table_name) or
+            self.hasRetiredEntryForTableLocked(table_name))
+        {
+            self.ready.waitUncancelable(io, &self.mutex);
+        }
+        self.mutex.unlock(io);
+
+        return .{
+            .cache = self,
+            .table_name = table_name,
+        };
+    }
+
     pub fn invalidateTable(self: *ProvisionedTableReadCache, table_name: []const u8) void {
         const io = self.threaded.io();
         self.mutex.lockUncancelable(io);
@@ -574,6 +625,23 @@ pub const ProvisionedTableReadCache = struct {
         return false;
     }
 
+    fn hasPendingOpenForTableLocked(
+        self: *ProvisionedTableReadCache,
+        table_name: []const u8,
+    ) bool {
+        for (self.pending_opens.items) |pending| {
+            if (std.mem.eql(u8, pending.table_name, table_name)) return true;
+        }
+        return false;
+    }
+
+    fn hasExclusiveTableAccessLocked(
+        self: *ProvisionedTableReadCache,
+        table_name: []const u8,
+    ) bool {
+        return self.exclusive_table_access.get(table_name) != null;
+    }
+
     fn removePendingOpenLocked(
         self: *ProvisionedTableReadCache,
         group_id: u64,
@@ -614,6 +682,13 @@ pub const ProvisionedTableReadCache = struct {
 
     fn hasTableLocked(self: *ProvisionedTableReadCache, table_name: []const u8) bool {
         for (self.entries.items) |entry| {
+            if (std.mem.eql(u8, entry.table_name, table_name)) return true;
+        }
+        return false;
+    }
+
+    fn hasRetiredEntryForTableLocked(self: *ProvisionedTableReadCache, table_name: []const u8) bool {
+        for (self.retired_entries.items) |entry| {
             if (std.mem.eql(u8, entry.table_name, table_name)) return true;
         }
         return false;
@@ -698,7 +773,23 @@ pub const ProvisionedTableReadCache = struct {
         entry.active_leases -= 1;
         if (entry.active_leases == 0 and entry.retired) {
             self.destroyRetiredEntryLocked(entry);
+            self.ready.broadcast(io);
         }
+    }
+
+    fn endExclusiveTableAccess(self: *ProvisionedTableReadCache, table_name: []const u8) void {
+        const io = self.threaded.io();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+
+        const count = self.exclusive_table_access.getPtr(table_name) orelse unreachable;
+        if (count.* > 1) {
+            count.* -= 1;
+        } else {
+            const removed = self.exclusive_table_access.fetchRemove(table_name) orelse unreachable;
+            self.alloc.free(removed.key);
+        }
+        self.ready.broadcast(io);
     }
 
     fn retireEntryLocked(self: *ProvisionedTableReadCache, entry: *Entry) void {
@@ -709,7 +800,10 @@ pub const ProvisionedTableReadCache = struct {
             self.alloc.destroy(entry);
             return;
         }
-        self.retired_entries.appendAssumeCapacity(entry);
+        self.retired_entries.append(self.alloc, entry) catch |err| {
+            std.log.err("failed to queue retired read-cache entry table={s} err={s}", .{ entry.table_name, @errorName(err) });
+            @panic("failed to queue retired read-cache entry");
+        };
     }
 
     fn destroyRetiredEntryLocked(self: *ProvisionedTableReadCache, entry: *Entry) void {
@@ -739,12 +833,34 @@ pub const ReadPreparation = struct {
         dense_query,
     };
 
+    pub const Activity = struct {
+        ptr: *anyopaque,
+        table_name: []const u8,
+        release_fn: *const fn (ptr: *anyopaque, table_name: []const u8) void,
+        active: bool = true,
+
+        pub fn deinit(self: *Activity) void {
+            if (!self.active) return;
+            self.release_fn(self.ptr, self.table_name);
+            self.active = false;
+        }
+    };
+
     pub const VTable = struct {
         prepare_for_read: *const fn (ptr: *anyopaque, table_name: []const u8, kind: Kind) void,
+        begin_read: ?*const fn (ptr: *anyopaque, table_name: []const u8, kind: Kind) Activity = null,
     };
 
     pub fn prepareForRead(self: ReadPreparation, table_name: []const u8, kind: Kind) void {
         self.vtable.prepare_for_read(self.ptr, table_name, kind);
+    }
+
+    pub fn beginRead(self: ReadPreparation, table_name: []const u8, kind: Kind) ?Activity {
+        const begin_read = self.vtable.begin_read orelse {
+            self.prepareForRead(table_name, kind);
+            return null;
+        };
+        return begin_read(self.ptr, table_name, kind);
     }
 };
 
@@ -2526,7 +2642,8 @@ pub const ProvisionedTableReadSource = struct {
     pub fn warmTableGroup(self: *ProvisionedTableReadSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8) !void {
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
-        if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
+        var read_activity = self.beginPreparedRead(table_name, .general);
+        defer if (read_activity) |*activity| activity.deinit();
 
         // Warmup must not pin a full managed query handle or run metadata-driven
         // query-open reconciliation for a just-created table. That work is
@@ -2558,6 +2675,15 @@ pub const ProvisionedTableReadSource = struct {
         };
     }
 
+    fn beginPreparedRead(
+        self: *ProvisionedTableReadSource,
+        table_name: []const u8,
+        kind: ReadPreparation.Kind,
+    ) ?ReadPreparation.Activity {
+        const prep = self.prepare_for_read orelse return null;
+        return prep.beginRead(table_name, kind);
+    }
+
     fn lookup(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -2568,7 +2694,8 @@ pub const ProvisionedTableReadSource = struct {
     ) !?LookupResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
-        if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
+        var read_activity = self.beginPreparedRead(table_name, .general);
+        defer if (read_activity) |*activity| activity.deinit();
         const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, key)) orelse return null;
         return try lookupProvisionedHostedLocal(self.primary_lookup_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, key, opts, consistency);
     }
@@ -2583,7 +2710,8 @@ pub const ProvisionedTableReadSource = struct {
     ) !?db_mod.types.DocumentArtifactManifest {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
-        if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
+        var read_activity = self.beginPreparedRead(table_name, .general);
+        defer if (read_activity) |*activity| activity.deinit();
         const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, doc_key)) orelse return null;
         return try documentArtifactManifestProvisionedHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, artifact_name, consistency);
     }
@@ -2597,7 +2725,8 @@ pub const ProvisionedTableReadSource = struct {
     ) !?db_mod.types.DocumentArtifactManifestList {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
-        if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
+        var read_activity = self.beginPreparedRead(table_name, .general);
+        defer if (read_activity) |*activity| activity.deinit();
         const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, doc_key)) orelse return null;
         return try documentArtifactManifestsProvisionedHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, consistency);
     }
@@ -2613,7 +2742,8 @@ pub const ProvisionedTableReadSource = struct {
     ) !?ScanResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
-        if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
+        var read_activity = self.beginPreparedRead(table_name, .general);
+        defer if (read_activity) |*activity| activity.deinit();
         const group_ids = try table_catalog.resolveGroupsForSpan(alloc, self.catalog, table_name, from_key, to_key);
         defer alloc.free(group_ids);
         if (group_ids.len == 0) return null;
@@ -2647,7 +2777,8 @@ pub const ProvisionedTableReadSource = struct {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
         try checkQueryDeadline(req);
-        if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, readPreparationKindForQuery(req));
+        var read_activity = self.beginPreparedRead(table_name, readPreparationKindForQuery(req));
+        defer if (read_activity) |*activity| activity.deinit();
         const group_ids = try table_catalog.resolveGroupsForSpan(alloc, self.catalog, table_name, "", "");
         defer alloc.free(group_ids);
         if (group_ids.len == 0) return null;
@@ -2721,7 +2852,8 @@ pub const ProvisionedTableReadSource = struct {
     ) !?db_mod.RuntimePreflightSummary {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
-        if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, readPreparationKindForQuery(req));
+        var read_activity = self.beginPreparedRead(table_name, readPreparationKindForQuery(req));
+        defer if (read_activity) |*activity| activity.deinit();
         const group_ids = try table_catalog.resolveGroupsForSpan(alloc, self.catalog, table_name, "", "");
         defer alloc.free(group_ids);
         if (group_ids.len == 0) return null;
@@ -2748,7 +2880,8 @@ pub const ProvisionedTableReadSource = struct {
     ) !?LookupResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
-        if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
+        var read_activity = self.beginPreparedRead(table_name, .general);
+        defer if (read_activity) |*activity| activity.deinit();
         return try lookupProvisionedHostedLocal(self.primary_lookup_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, key, opts, consistency);
     }
 
@@ -2763,7 +2896,8 @@ pub const ProvisionedTableReadSource = struct {
     ) !?db_mod.types.DocumentArtifactManifest {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
-        if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
+        var read_activity = self.beginPreparedRead(table_name, .general);
+        defer if (read_activity) |*activity| activity.deinit();
         return try documentArtifactManifestProvisionedHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, artifact_name, consistency);
     }
 
@@ -2777,7 +2911,8 @@ pub const ProvisionedTableReadSource = struct {
     ) !?db_mod.types.DocumentArtifactManifestList {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
-        if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
+        var read_activity = self.beginPreparedRead(table_name, .general);
+        defer if (read_activity) |*activity| activity.deinit();
         return try documentArtifactManifestsProvisionedHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, consistency);
     }
 
@@ -2820,7 +2955,8 @@ pub const ProvisionedTableReadSource = struct {
     ) !?ScanResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
-        if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
+        var read_activity = self.beginPreparedRead(table_name, .general);
+        defer if (read_activity) |*activity| activity.deinit();
         return try scanProvisionedHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, from_key, to_key, opts, consistency);
     }
 
@@ -2834,7 +2970,8 @@ pub const ProvisionedTableReadSource = struct {
     ) !?query_api.QueryResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
-        if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, readPreparationKindForQuery(req));
+        var read_activity = self.beginPreparedRead(table_name, readPreparationKindForQuery(req));
+        defer if (read_activity) |*activity| activity.deinit();
         const start_ns = platform_time.monotonicNs();
         const execution = try queryHostedLocalDetailed(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, req, consistency);
         var result = execution.result;
@@ -2861,7 +2998,8 @@ pub const ProvisionedTableReadSource = struct {
     ) !?db_mod.types.SearchResult {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
-        if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, readPreparationKindForQuery(req));
+        var read_activity = self.beginPreparedRead(table_name, readPreparationKindForQuery(req));
+        defer if (read_activity) |*activity| activity.deinit();
         return try queryHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, req, consistency);
     }
 
@@ -20361,6 +20499,102 @@ test "provisioned read cache retires invalidated entries until the last lease is
 
     reopened.release();
     try std.testing.expectEqual(@as(usize, 0), cache.retired_entries.items.len);
+}
+
+test "provisioned read cache exclusive access drains active read leases" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-provisioned-read-cache-exclusive-drain";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const FakeCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .description = "docs table",
+                    .schema_json = "",
+                    .read_schema_json = "",
+                    .indexes_json = @import("tables.zig").default_indexes_json,
+                    .replication_sources_json = "[]",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const ExclusiveThread = struct {
+        cache: *ProvisionedTableReadCache,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            var exclusive = self.cache.beginExclusiveTableAccess("docs") catch |err| {
+                self.err = err;
+                return;
+            };
+            exclusive.deinit();
+        }
+    };
+
+    var lsm_cache = lsm_backend.Cache.init(alloc, lsm_backend.DefaultCacheSizeBytes);
+    defer lsm_cache.deinit();
+    var cache = ProvisionedTableReadCache.init(alloc);
+    defer cache.deinit();
+    cache.lsm_cache = &lsm_cache;
+
+    var lease = try cache.getOrOpen(path, FakeCatalog.iface(), 7001, 1, "docs");
+    try std.testing.expectEqual(@as(usize, 1), cache.entries.items.len);
+
+    var ctx = ExclusiveThread{ .cache = &cache };
+    const thread = try std.Thread.spawn(.{}, ExclusiveThread.run, .{&ctx});
+
+    var observed_exclusive = false;
+    var observed_retired_count: usize = 0;
+    for (0..100) |_| {
+        const io = cache.threaded.io();
+        cache.mutex.lockUncancelable(io);
+        observed_exclusive = cache.hasExclusiveTableAccessLocked("docs");
+        observed_retired_count = cache.retired_entries.items.len;
+        cache.mutex.unlock(io);
+        if (observed_exclusive and observed_retired_count == 1) break;
+        io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+
+    lease.release();
+    thread.join();
+    if (ctx.err) |err| return err;
+    try std.testing.expect(observed_exclusive);
+    try std.testing.expectEqual(@as(usize, 1), observed_retired_count);
+    try std.testing.expectEqual(@as(usize, 0), cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), cache.retired_entries.items.len);
+    try std.testing.expect(!cache.hasExclusiveTableAccessLocked("docs"));
 }
 
 test "provisioned read cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails" {

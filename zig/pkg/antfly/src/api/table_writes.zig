@@ -2421,10 +2421,16 @@ pub const ProvisionedTableWriteCache = struct {
         if (entry.retired) return;
         entry.retired = true;
         if (entry.active_leases == 0) {
-            self.closing_entries.appendAssumeCapacity(entry);
+            self.closing_entries.append(self.alloc, entry) catch |err| {
+                std.log.err("failed to queue inactive writer-cache entry for close table={s} err={s}", .{ entry.table_name, @errorName(err) });
+                @panic("failed to queue inactive writer-cache entry for close");
+            };
             return;
         }
-        self.retired_entries.appendAssumeCapacity(entry);
+        self.retired_entries.append(self.alloc, entry) catch |err| {
+            std.log.err("failed to queue retired writer-cache entry table={s} err={s}", .{ entry.table_name, @errorName(err) });
+            @panic("failed to queue retired writer-cache entry");
+        };
     }
 
     fn retireInactiveEntryAtIndexForCloseLocked(self: *ProvisionedTableWriteCache, index: usize) !bool {
@@ -2435,7 +2441,10 @@ pub const ProvisionedTableWriteCache = struct {
         try self.closing_entries.ensureUnusedCapacity(self.alloc, 1);
         _ = self.entries.orderedRemove(index);
         entry.retired = true;
-        self.closing_entries.appendAssumeCapacity(entry);
+        self.closing_entries.append(self.alloc, entry) catch |err| {
+            std.log.err("failed to queue inactive writer-cache entry for close table={s} err={s}", .{ entry.table_name, @errorName(err) });
+            @panic("failed to queue inactive writer-cache entry for close");
+        };
         return true;
     }
 
@@ -2478,7 +2487,10 @@ pub const ProvisionedTableWriteCache = struct {
             _ = self.retired_entries.orderedRemove(i);
             break;
         }
-        self.closing_entries.appendAssumeCapacity(entry);
+        self.closing_entries.append(self.alloc, entry) catch |err| {
+            std.log.err("failed to queue retired writer-cache entry for close table={s} err={s}", .{ entry.table_name, @errorName(err) });
+            @panic("failed to queue retired writer-cache entry for close");
+        };
     }
 
     fn closeEntryNow(self: *ProvisionedTableWriteCache, entry: *Entry) void {
@@ -5320,6 +5332,14 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.read_cache) |cache| cache.invalidateTable(table_name);
     }
 
+    fn beginReadCacheExclusive(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+    ) !?table_reads.ProvisionedTableReadCache.ExclusiveTableAccess {
+        const cache = self.read_cache orelse return null;
+        return try cache.beginExclusiveTableAccess(table_name);
+    }
+
     fn invalidateWriteCacheForTable(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         lockAtomic(&self.local_db_mutex);
         if (self.write_cache) |cache| cache.invalidateTable(table_name);
@@ -6947,6 +6967,7 @@ pub const ProvisionedTableWriteSource = struct {
             .ptr = self,
             .vtable = &.{
                 .prepare_for_read = prepareForRead,
+                .begin_read = beginRead,
             },
         };
     }
@@ -6971,6 +6992,28 @@ pub const ProvisionedTableWriteSource = struct {
         self.invalidateReadCache(table_name);
         if (self.hasActiveBulkIngestSessionForTableBestEffort(table_name)) return;
         self.clearDirtyWriteTable(table_name);
+    }
+
+    fn beginRead(ptr: *anyopaque, table_name: []const u8, kind: table_reads.ReadPreparation.Kind) table_reads.ReadPreparation.Activity {
+        _ = kind;
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        self.beginTableRequest(table_name);
+        if (self.isWriteCacheDirtyForTable(table_name)) {
+            self.invalidateReadCache(table_name);
+            if (!self.hasActiveBulkIngestSessionForTableBestEffort(table_name)) {
+                self.clearDirtyWriteTable(table_name);
+            }
+        }
+        return .{
+            .ptr = self,
+            .table_name = table_name,
+            .release_fn = endRead,
+        };
+    }
+
+    fn endRead(ptr: *anyopaque, table_name: []const u8) void {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        self.endTableRequest(table_name);
     }
 
     fn leasePrimaryLookupDb(
@@ -7310,8 +7353,12 @@ pub const ProvisionedTableWriteSource = struct {
         fn repairOnce(self: *@This(), path: []const u8) !bool {
             if (!try db_mod.DB.restoreRuntimeRepairNeededForPath(self.alloc, path)) return false;
 
-            if (!self.source.tryBeginGroupOperation(self.table_name, self.group_id)) return true;
-            defer self.source.endGroupOperation(self.table_name, self.group_id);
+            if (!self.source.tryBeginStructuralTableActivity(self.table_name)) return true;
+            defer self.source.endStructuralTableActivity(self.table_name);
+            var read_cache_exclusive = try self.source.beginReadCacheExclusive(self.table_name);
+            defer {
+                if (read_cache_exclusive) |*exclusive| exclusive.deinit();
+            }
 
             if (!self.source.local_db_mutex.tryLock()) return true;
             if (self.source.hasDirtyWriteTableWithLocalDbLocked(self.table_name)) {
@@ -8613,6 +8660,10 @@ pub const ProvisionedTableWriteSource = struct {
                     }),
                 }
                 return err;
+            };
+            self.repairRestoredTableRuntimeStateBlocking(alloc, path, group_id, table_name) catch |err| switch (err) {
+                error.LsmRootWriterAlreadyOpen, error.WriterLocked => {},
+                else => return err,
             };
             self.requestRestoreRepairCatchUp(table_name, group_id);
         }

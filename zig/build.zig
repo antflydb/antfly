@@ -2870,6 +2870,7 @@ pub fn build(b: *std.Build) void {
         "api query contract preflight rejects search_before pagination over approximate vector source",
         "artifact enrichment request permits asset full text routing",
         "provisioned read cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails",
+        "provisioned read cache exclusive access drains active read leases",
         "provisioned group storage wires remote content to writer caches",
         "write cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails",
         "backend runtime durable lane runs inline jobs",
@@ -4229,6 +4230,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "aggregation completeness requires exact total relation",
             "provisioned read cache invalidates repeated ownership moves with pinned leases",
+            "provisioned read cache exclusive access drains active read leases",
             "parseRemoteSearchResult preserves fused index scores",
             "table read distributed sorted merge uses catalog runtime schema and rejects incomplete shard windows",
             "provisioned standby read gate permits stale reads and routes non-stale reads to primary",
