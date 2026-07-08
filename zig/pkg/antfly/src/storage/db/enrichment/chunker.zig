@@ -136,10 +136,10 @@ test "enrichment chunker preserves utf8 boundaries across default byte windows" 
 test "enrichment chunker makes progress when byte window is smaller than utf8 scalar" {
     const alloc = std.testing.allocator;
 
-    const chunks = try chunkText(alloc, "éx", 1, 0);
+    const chunks = try chunkText(alloc, "\xc3\xa9x", 1, 0);
     defer freeChunks(alloc, chunks);
 
     try std.testing.expectEqual(@as(usize, 2), chunks.len);
-    try std.testing.expectEqualStrings("é", chunks[0].text.?);
+    try std.testing.expectEqualStrings("\xc3\xa9", chunks[0].text.?);
     try std.testing.expect(std.unicode.utf8ValidateSlice(chunks[0].text.?));
 }

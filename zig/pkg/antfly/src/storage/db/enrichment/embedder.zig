@@ -455,9 +455,14 @@ const Utf8AssertingEmbedder = struct {
         for (texts, 0..) |text, i| {
             try std.testing.expect(std.unicode.utf8ValidateSlice(text));
             if (std.mem.indexOf(u8, text, &std.unicode.replacement_character_utf8) != null) self.saw_replacement = true;
+            const indices = try alloc.dupe(u32, &.{1});
+            const values = alloc.dupe(f32, &.{1.0}) catch |err| {
+                alloc.free(indices);
+                return err;
+            };
             out[i] = .{
-                .indices = try alloc.dupe(u32, &.{1}),
-                .values = try alloc.dupe(f32, &.{1.0}),
+                .indices = indices,
+                .values = values,
             };
             initialized += 1;
         }
