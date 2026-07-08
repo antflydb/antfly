@@ -374,8 +374,8 @@ fn computeAlgebraicAggregation(
         index.recordPlannerFallback("schema_lifecycle_not_ready", null, null);
         return null;
     }
-    if (!schema_mod.relationalAccessMethodQueryReady(ctx.runtime_schema, .algebraic_filter, entry.config.name)) {
-        index.recordPlannerFallback("relational_generation_not_ready", null, null);
+    if (schema_mod.relationalAccessMethodQueryBlockReason(ctx.runtime_schema, .algebraic_filter, entry.config.name)) |reason| {
+        index.recordPlannerFallback(reason, null, null);
         return null;
     }
     if (std.mem.eql(u8, request.type, "stats")) {
@@ -14793,7 +14793,7 @@ test "algebraic aggregations fail closed when relational generation record is st
 
     const status_value = manager.algebraic_indexes.items[0].index.status();
     try std.testing.expectEqual(@as(u64, 1), status_value.planner_fallback_count);
-    try std.testing.expectEqualStrings("relational_generation_not_ready", status_value.planner_last_fallback_reason.?);
+    try std.testing.expectEqualStrings("relational_generation_stale", status_value.planner_last_fallback_reason.?);
 }
 
 // Asserts a cardinality result was served approximately (from a sketch): it

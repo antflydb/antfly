@@ -1399,6 +1399,15 @@ pub const PersistentIndex = struct {
         return self.activeSegmentRangesRepairing(alloc, true, false);
     }
 
+    pub fn activeSegmentIdsAlloc(self: *PersistentIndex, alloc: Allocator) ![]u64 {
+        self.lockStorage();
+        defer self.unlockStorage();
+
+        var txn = try self.beginReadMainTxn();
+        defer txn.abort();
+        return try self.loadActiveSegmentIds(&txn, alloc);
+    }
+
     fn activeSegmentRangesRepairing(
         self: *PersistentIndex,
         alloc: Allocator,
@@ -2176,6 +2185,54 @@ pub const PersistentIndex = struct {
 
         try txn.commit();
         try self.writer.removeSegments(old_seg_ids);
+    }
+
+    pub fn putActiveSegmentArtifactForTest(
+        self: *PersistentIndex,
+        seg_id: u64,
+        segment_bytes: []const u8,
+        min_doc_key: []const u8,
+        max_doc_key: []const u8,
+    ) !void {
+        if (!builtin.is_test) return error.Unsupported;
+
+        self.lockStorage();
+        defer self.unlockStorage();
+
+        var txn = try self.beginWriteMainTxn();
+        errdefer txn.abort();
+
+        const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, seg_id));
+        try txn.put(.segments, &seg_key, segment_bytes);
+        try self.saveSegmentRange(&txn, seg_id, .{
+            .seg_id = seg_id,
+            .min_doc_key = min_doc_key,
+            .max_doc_key = max_doc_key,
+        });
+        try self.updateActiveSegments(&txn, seg_id, .add);
+        try txn.commit();
+    }
+
+    pub fn deleteSegmentArtifactDataForTest(self: *PersistentIndex, seg_id: u64) !void {
+        if (!builtin.is_test) return error.Unsupported;
+
+        self.lockStorage();
+        defer self.unlockStorage();
+
+        var txn = try self.beginWriteMainTxn();
+        errdefer txn.abort();
+
+        const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, seg_id));
+        txn.delete(.segments, &seg_key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+        txn.delete(.deletions, &seg_key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+        self.deleteSegmentFile(seg_id);
+        try txn.commit();
     }
 
     fn persistSegment(self: *PersistentIndex, seg_id: u64, segment_bytes: []const u8, lsn: u64) !void {

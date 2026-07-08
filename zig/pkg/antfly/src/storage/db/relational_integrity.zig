@@ -37,6 +37,7 @@ const foreign_key_integrity_progress_key_prefix = "\x00\x00__metadata__:foreign_
 const foreign_key_integrity_claim_key_prefix = "\x00\x00__metadata__:foreign_key_integrity_claim";
 const foreign_key_integrity_job_key_prefix = "\x00\x00__metadata__:foreign_key_integrity_job";
 const relational_index_repair_job_key_prefix = "\x00\x00__metadata__:relational_index_repair_job";
+const relational_index_drop_job_key_prefix = "\x00\x00__metadata__:relational_index_drop_job";
 const foreign_key_action_job_key_prefix = "\x00\x00__metadata__:foreign_key_action_job";
 const foreign_key_action_schedule_key_prefix = "\x00\x00__metadata__:foreign_key_action_schedule";
 const unique_constraint_integrity_progress_key_prefix = "\x00\x00__metadata__:unique_constraint_integrity_progress";
@@ -233,6 +234,9 @@ pub const RelationalIndexRepairJobRecord = struct {
     database_name: []const u8 = "default",
     namespace_name: []const u8 = "public",
     table_name: []const u8,
+    access_method: []const u8 = "ordered_tuple",
+    index_name: []const u8 = "",
+    generation: u64 = 0,
     worker_id: []const u8,
     lower_doc_key: []const u8 = "",
     upper_doc_key: []const u8 = "",
@@ -245,6 +249,18 @@ pub const RelationalIndexRepairJobRecord = struct {
     completed: bool = false,
     complete: ?bool = null,
     next_lower_doc_key: []const u8 = "",
+    cursor: []const u8 = "",
+    failure_reason: ?[]const u8 = null,
+    stale_generation: bool = false,
+    pass_count: u64 = 0,
+    last_units_queued: u64 = 0,
+    last_units_running: u64 = 0,
+    last_units_throttled: u64 = 0,
+    last_units_completed: u64 = 0,
+    total_units_queued: u64 = 0,
+    total_units_running: u64 = 0,
+    total_units_throttled: u64 = 0,
+    total_units_completed: u64 = 0,
     last_ranges_scanned: u64 = 0,
     last_ranges_repaired: u64 = 0,
     last_ranges_missing: u64 = 0,
@@ -254,6 +270,37 @@ pub const RelationalIndexRepairJobRecord = struct {
     last_report: relational_store_mod.ColumnBackedIndexRepairReport = .{},
     aggregate_report: relational_store_mod.ColumnBackedIndexRepairReport = .{},
     last_error: ?[]const u8 = null,
+};
+
+pub const RelationalIndexDropJobRecord = struct {
+    version: u32 = 1,
+    job_id: []const u8,
+    database_name: []const u8 = "default",
+    namespace_name: []const u8 = "public",
+    table_name: []const u8,
+    access_method: []const u8,
+    index_name: []const u8,
+    generation: u64,
+    worker_id: []const u8,
+    cursor: []const u8 = "",
+    lease_ms: u64,
+    max_work_units: usize,
+    status: []const u8,
+    created_at_ns: u64,
+    updated_at_ns: u64,
+    attempts: u32 = 0,
+    completed: bool = false,
+    failure_reason: ?[]const u8 = null,
+    stale_generation: bool = false,
+    pass_count: u64 = 0,
+    last_units_queued: u64 = 0,
+    last_units_running: u64 = 0,
+    last_units_throttled: u64 = 0,
+    last_units_completed: u64 = 0,
+    total_units_queued: u64 = 0,
+    total_units_running: u64 = 0,
+    total_units_throttled: u64 = 0,
+    total_units_completed: u64 = 0,
 };
 
 pub const ForeignKeyActionJobRecord = struct {
@@ -2010,16 +2057,38 @@ pub fn Impl(comptime DB: type) type {
             if (record.database_name.len > 0) self.alloc.free(record.database_name);
             if (record.namespace_name.len > 0) self.alloc.free(record.namespace_name);
             if (record.table_name.len > 0) self.alloc.free(record.table_name);
+            if (record.access_method.len > 0) self.alloc.free(record.access_method);
+            if (record.index_name.len > 0) self.alloc.free(record.index_name);
             if (record.worker_id.len > 0) self.alloc.free(record.worker_id);
             if (record.lower_doc_key.len > 0) self.alloc.free(record.lower_doc_key);
             if (record.upper_doc_key.len > 0) self.alloc.free(record.upper_doc_key);
             if (record.status.len > 0) self.alloc.free(record.status);
             if (record.next_lower_doc_key.len > 0) self.alloc.free(record.next_lower_doc_key);
+            if (record.cursor.len > 0) self.alloc.free(record.cursor);
+            if (record.failure_reason) |value| self.alloc.free(value);
             if (record.last_error) |value| self.alloc.free(value);
         }
 
         pub fn freeRelationalIndexRepairJobRecords(self: *DB, records: []RelationalIndexRepairJobRecord) void {
             for (records) |record| self.freeRelationalIndexRepairJobRecord(record);
+            if (records.len > 0) self.alloc.free(records);
+        }
+
+        pub fn freeRelationalIndexDropJobRecord(self: *DB, record: RelationalIndexDropJobRecord) void {
+            if (record.job_id.len > 0) self.alloc.free(record.job_id);
+            if (record.database_name.len > 0) self.alloc.free(record.database_name);
+            if (record.namespace_name.len > 0) self.alloc.free(record.namespace_name);
+            if (record.table_name.len > 0) self.alloc.free(record.table_name);
+            if (record.access_method.len > 0) self.alloc.free(record.access_method);
+            if (record.index_name.len > 0) self.alloc.free(record.index_name);
+            if (record.worker_id.len > 0) self.alloc.free(record.worker_id);
+            if (record.cursor.len > 0) self.alloc.free(record.cursor);
+            if (record.status.len > 0) self.alloc.free(record.status);
+            if (record.failure_reason) |value| self.alloc.free(value);
+        }
+
+        pub fn freeRelationalIndexDropJobRecords(self: *DB, records: []RelationalIndexDropJobRecord) void {
+            for (records) |record| self.freeRelationalIndexDropJobRecord(record);
             if (records.len > 0) self.alloc.free(records);
         }
 
@@ -2163,6 +2232,10 @@ pub fn Impl(comptime DB: type) type {
             self.core.lockApply();
             defer self.core.unlockApply();
 
+            return try listRelationalIndexRepairJobRecordsLocked(self);
+        }
+
+        fn listRelationalIndexRepairJobRecordsLocked(self: *DB) ![]RelationalIndexRepairJobRecord {
             const upper = try metadataPrefixUpperAlloc(self.alloc, relational_index_repair_job_key_prefix);
             defer if (upper) |buf| self.alloc.free(buf);
             const scanned = try self.core.store.scanRange(self.alloc, relational_index_repair_job_key_prefix, if (upper) |buf| buf else "");
@@ -2176,6 +2249,28 @@ pub fn Impl(comptime DB: type) type {
             for (scanned) |entry| {
                 const cloned = try cloneRelationalIndexRepairJobRecordFromJson(self, entry.value);
                 errdefer self.freeRelationalIndexRepairJobRecord(cloned);
+                try out.append(self.alloc, cloned);
+            }
+            return try out.toOwnedSlice(self.alloc);
+        }
+
+        pub fn listRelationalIndexDropJobRecords(self: *DB) ![]RelationalIndexDropJobRecord {
+            self.core.lockApply();
+            defer self.core.unlockApply();
+
+            const upper = try metadataPrefixUpperAlloc(self.alloc, relational_index_drop_job_key_prefix);
+            defer if (upper) |buf| self.alloc.free(buf);
+            const scanned = try self.core.store.scanRange(self.alloc, relational_index_drop_job_key_prefix, if (upper) |buf| buf else "");
+            defer docstore_mod.DocStore.freeResults(self.alloc, scanned);
+
+            var out = std.ArrayListUnmanaged(RelationalIndexDropJobRecord).empty;
+            errdefer {
+                for (out.items) |record| self.freeRelationalIndexDropJobRecord(record);
+                out.deinit(self.alloc);
+            }
+            for (scanned) |entry| {
+                const cloned = try cloneRelationalIndexDropJobRecordFromJson(self, entry.value);
+                errdefer self.freeRelationalIndexDropJobRecord(cloned);
                 try out.append(self.alloc, cloned);
             }
             return try out.toOwnedSlice(self.alloc);
@@ -2398,6 +2493,23 @@ pub fn Impl(comptime DB: type) type {
             };
             defer self.alloc.free(raw);
             return try cloneRelationalIndexRepairJobRecordFromJson(self, raw);
+        }
+
+        pub fn loadRelationalIndexDropJobRecord(
+            self: *DB,
+            job_id: []const u8,
+        ) !?RelationalIndexDropJobRecord {
+            self.core.lockApply();
+            defer self.core.unlockApply();
+
+            const key = try relationalIndexDropJobKeyAlloc(self.alloc, job_id);
+            defer self.alloc.free(key);
+            const raw = self.core.store.get(self.alloc, key) catch |err| switch (err) {
+                error.NotFound => return null,
+                else => return err,
+            };
+            defer self.alloc.free(raw);
+            return try cloneRelationalIndexDropJobRecordFromJson(self, raw);
         }
 
         pub fn loadUniqueConstraintIntegrityProgressRecord(
@@ -2752,6 +2864,18 @@ pub fn Impl(comptime DB: type) type {
             var next_lower_doc_key: []const u8 = "";
             var preserved_next_lower_doc_key: ?[]u8 = null;
             defer if (preserved_next_lower_doc_key) |value| self.alloc.free(value);
+            var cursor: []const u8 = "";
+            var preserved_cursor: ?[]u8 = null;
+            defer if (preserved_cursor) |value| self.alloc.free(value);
+            var failure_reason: ?[]const u8 = null;
+            var preserved_failure_reason: ?[]u8 = null;
+            defer if (preserved_failure_reason) |value| self.alloc.free(value);
+            var stale_generation = false;
+            var pass_count: u64 = 0;
+            var total_units_queued: u64 = 0;
+            var total_units_running: u64 = 0;
+            var total_units_throttled: u64 = 0;
+            var total_units_completed: u64 = 0;
             var last_ranges_scanned: u64 = 0;
             var last_ranges_repaired: u64 = 0;
             var last_ranges_missing: u64 = 0;
@@ -2771,6 +2895,18 @@ pub fn Impl(comptime DB: type) type {
                 attempts = existing.attempts +| 1;
                 preserved_next_lower_doc_key = try self.alloc.dupe(u8, existing.next_lower_doc_key);
                 next_lower_doc_key = preserved_next_lower_doc_key.?;
+                preserved_cursor = try self.alloc.dupe(u8, existing.cursor);
+                cursor = preserved_cursor.?;
+                if (existing.failure_reason) |value| {
+                    preserved_failure_reason = try self.alloc.dupe(u8, value);
+                    failure_reason = preserved_failure_reason.?;
+                }
+                stale_generation = existing.stale_generation;
+                pass_count = existing.pass_count;
+                total_units_queued = existing.total_units_queued;
+                total_units_running = existing.total_units_running;
+                total_units_throttled = existing.total_units_throttled;
+                total_units_completed = existing.total_units_completed;
                 last_ranges_scanned = existing.last_ranges_scanned;
                 last_ranges_repaired = existing.last_ranges_repaired;
                 last_ranges_missing = existing.last_ranges_missing;
@@ -2793,6 +2929,9 @@ pub fn Impl(comptime DB: type) type {
                 .database_name = database_name,
                 .namespace_name = namespace_name,
                 .table_name = table_name,
+                .access_method = "ordered_tuple",
+                .index_name = "",
+                .generation = 0,
                 .worker_id = worker_id,
                 .lower_doc_key = lower_doc_key,
                 .upper_doc_key = upper_doc_key,
@@ -2805,6 +2944,14 @@ pub fn Impl(comptime DB: type) type {
                 .completed = false,
                 .complete = null,
                 .next_lower_doc_key = next_lower_doc_key,
+                .cursor = cursor,
+                .failure_reason = failure_reason,
+                .stale_generation = stale_generation,
+                .pass_count = pass_count,
+                .total_units_queued = total_units_queued,
+                .total_units_running = total_units_running,
+                .total_units_throttled = total_units_throttled,
+                .total_units_completed = total_units_completed,
                 .last_ranges_scanned = last_ranges_scanned,
                 .last_ranges_repaired = last_ranges_repaired,
                 .last_ranges_missing = last_ranges_missing,
@@ -2879,6 +3026,9 @@ pub fn Impl(comptime DB: type) type {
                 .database_name = existing.database_name,
                 .namespace_name = existing.namespace_name,
                 .table_name = existing.table_name,
+                .access_method = existing.access_method,
+                .index_name = existing.index_name,
+                .generation = existing.generation,
                 .worker_id = existing.worker_id,
                 .lower_doc_key = existing.lower_doc_key,
                 .upper_doc_key = existing.upper_doc_key,
@@ -2891,6 +3041,15 @@ pub fn Impl(comptime DB: type) type {
                 .completed = complete,
                 .complete = complete,
                 .next_lower_doc_key = next_lower_doc_key,
+                .cursor = next_lower_doc_key,
+                .failure_reason = if (last_error) |value| value else existing.failure_reason,
+                .stale_generation = existing.stale_generation,
+                .pass_count = existing.pass_count +| 1,
+                .last_units_completed = ranges_scanned,
+                .total_units_queued = existing.total_units_queued,
+                .total_units_running = existing.total_units_running,
+                .total_units_throttled = existing.total_units_throttled,
+                .total_units_completed = existing.total_units_completed +| ranges_scanned,
                 .last_ranges_scanned = ranges_scanned,
                 .last_ranges_repaired = ranges_repaired,
                 .last_ranges_missing = ranges_missing,
@@ -2905,6 +3064,559 @@ pub fn Impl(comptime DB: type) type {
             defer self.alloc.free(payload);
             try self.core.store.put(key, payload);
             return try cloneRelationalIndexRepairJobRecordFromJson(self, payload);
+        }
+
+        pub fn upsertRelationalIndexRepairJobTargetAt(
+            self: *DB,
+            job_id: []const u8,
+            database_name: []const u8,
+            namespace_name: []const u8,
+            table_name: []const u8,
+            access_method: []const u8,
+            index_name: []const u8,
+            generation: u64,
+            worker_id: []const u8,
+            cursor: []const u8,
+            lease_ms: u64,
+            max_work_units: usize,
+            status: []const u8,
+            now_ns: u64,
+        ) !RelationalIndexRepairJobRecord {
+            if (job_id.len == 0 or database_name.len == 0 or namespace_name.len == 0 or table_name.len == 0 or access_method.len == 0 or index_name.len == 0 or generation == 0 or worker_id.len == 0 or lease_ms == 0 or max_work_units == 0 or status.len == 0) return error.InvalidRelationalIndexRepairJob;
+            self.core.lockApply();
+            defer self.core.unlockApply();
+
+            const key = try relationalIndexRepairJobKeyAlloc(self.alloc, job_id);
+            defer self.alloc.free(key);
+
+            var created_at_ns = now_ns;
+            var attempts: u32 = 1;
+            var preserved_cursor: ?[]u8 = null;
+            defer if (preserved_cursor) |value| self.alloc.free(value);
+            var previous_cursor: []const u8 = cursor;
+            var failure_reason: ?[]const u8 = null;
+            var preserved_failure_reason: ?[]u8 = null;
+            defer if (preserved_failure_reason) |value| self.alloc.free(value);
+            var stale_generation = false;
+            var pass_count: u64 = 0;
+            var total_units_queued: u64 = 0;
+            var total_units_running: u64 = 0;
+            var total_units_throttled: u64 = 0;
+            var total_units_completed: u64 = 0;
+            if (self.core.store.get(self.alloc, key)) |raw| {
+                defer self.alloc.free(raw);
+                const existing = try cloneRelationalIndexRepairJobRecordFromJson(self, raw);
+                defer self.freeRelationalIndexRepairJobRecord(existing);
+                if (existing.generation != 0 and existing.generation != generation) return error.StaleRelationalIndexRepairJobGeneration;
+                created_at_ns = existing.created_at_ns;
+                attempts = existing.attempts +| 1;
+                if (cursor.len == 0) {
+                    preserved_cursor = try self.alloc.dupe(u8, existing.cursor);
+                    previous_cursor = preserved_cursor.?;
+                }
+                if (existing.failure_reason) |value| {
+                    preserved_failure_reason = try self.alloc.dupe(u8, value);
+                    failure_reason = preserved_failure_reason.?;
+                }
+                stale_generation = existing.stale_generation;
+                pass_count = existing.pass_count;
+                total_units_queued = existing.total_units_queued;
+                total_units_running = existing.total_units_running;
+                total_units_throttled = existing.total_units_throttled;
+                total_units_completed = existing.total_units_completed;
+            } else |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            }
+
+            const record = RelationalIndexRepairJobRecord{
+                .job_id = job_id,
+                .database_name = database_name,
+                .namespace_name = namespace_name,
+                .table_name = table_name,
+                .access_method = access_method,
+                .index_name = index_name,
+                .generation = generation,
+                .worker_id = worker_id,
+                .lease_ms = lease_ms,
+                .max_work_units = max_work_units,
+                .status = status,
+                .created_at_ns = created_at_ns,
+                .updated_at_ns = now_ns,
+                .attempts = attempts,
+                .cursor = previous_cursor,
+                .failure_reason = failure_reason,
+                .stale_generation = stale_generation,
+                .pass_count = pass_count,
+                .total_units_queued = total_units_queued,
+                .total_units_running = total_units_running,
+                .total_units_throttled = total_units_throttled,
+                .total_units_completed = total_units_completed,
+            };
+            const payload = try std.json.Stringify.valueAlloc(self.alloc, record, .{ .emit_null_optional_fields = false });
+            defer self.alloc.free(payload);
+            try self.core.store.put(key, payload);
+            return try cloneRelationalIndexRepairJobRecordFromJson(self, payload);
+        }
+
+        pub fn recordRelationalIndexRepairJobTargetPassAt(
+            self: *DB,
+            job_id: []const u8,
+            status: []const u8,
+            complete: bool,
+            cursor: []const u8,
+            units_queued: u64,
+            units_running: u64,
+            units_throttled: u64,
+            units_completed: u64,
+            failure_reason: ?[]const u8,
+            stale_generation: bool,
+            now_ns: u64,
+        ) !RelationalIndexRepairJobRecord {
+            if (job_id.len == 0 or status.len == 0) return error.InvalidRelationalIndexRepairJob;
+            self.core.lockApply();
+            defer self.core.unlockApply();
+
+            const key = try relationalIndexRepairJobKeyAlloc(self.alloc, job_id);
+            defer self.alloc.free(key);
+            const raw = self.core.store.get(self.alloc, key) catch |err| switch (err) {
+                error.NotFound => return error.RelationalIndexRepairJobNotFound,
+                else => return err,
+            };
+            defer self.alloc.free(raw);
+            const existing = try cloneRelationalIndexRepairJobRecordFromJson(self, raw);
+            defer self.freeRelationalIndexRepairJobRecord(existing);
+
+            const record = RelationalIndexRepairJobRecord{
+                .job_id = existing.job_id,
+                .database_name = existing.database_name,
+                .namespace_name = existing.namespace_name,
+                .table_name = existing.table_name,
+                .access_method = existing.access_method,
+                .index_name = existing.index_name,
+                .generation = existing.generation,
+                .worker_id = existing.worker_id,
+                .lower_doc_key = existing.lower_doc_key,
+                .upper_doc_key = existing.upper_doc_key,
+                .lease_ms = existing.lease_ms,
+                .max_work_units = existing.max_work_units,
+                .status = status,
+                .created_at_ns = existing.created_at_ns,
+                .updated_at_ns = now_ns,
+                .attempts = existing.attempts,
+                .completed = complete,
+                .complete = complete,
+                .next_lower_doc_key = cursor,
+                .cursor = cursor,
+                .failure_reason = failure_reason,
+                .stale_generation = stale_generation,
+                .pass_count = existing.pass_count +| 1,
+                .last_units_queued = units_queued,
+                .last_units_running = units_running,
+                .last_units_throttled = units_throttled,
+                .last_units_completed = units_completed,
+                .total_units_queued = existing.total_units_queued +| units_queued,
+                .total_units_running = existing.total_units_running +| units_running,
+                .total_units_throttled = existing.total_units_throttled +| units_throttled,
+                .total_units_completed = existing.total_units_completed +| units_completed,
+                .last_ranges_scanned = existing.last_ranges_scanned,
+                .last_ranges_repaired = existing.last_ranges_repaired,
+                .last_ranges_missing = existing.last_ranges_missing,
+                .total_ranges_scanned = existing.total_ranges_scanned,
+                .total_ranges_repaired = existing.total_ranges_repaired,
+                .total_ranges_missing = existing.total_ranges_missing,
+                .last_report = existing.last_report,
+                .aggregate_report = existing.aggregate_report,
+                .last_error = failure_reason,
+            };
+            const payload = try std.json.Stringify.valueAlloc(self.alloc, record, .{ .emit_null_optional_fields = false });
+            defer self.alloc.free(payload);
+            try self.core.store.put(key, payload);
+            return try cloneRelationalIndexRepairJobRecordFromJson(self, payload);
+        }
+
+        pub fn runRelationalIndexRepairJobPageAt(
+            self: *DB,
+            job_id: []const u8,
+            database_name: []const u8,
+            namespace_name: []const u8,
+            table_name: []const u8,
+            access_method: []const u8,
+            index_name: []const u8,
+            generation: u64,
+            worker_id: []const u8,
+            lease_ms: u64,
+            max_work_units: usize,
+            now_ns: u64,
+        ) !RelationalIndexRepairJobRecord {
+            const started = try self.upsertRelationalIndexRepairJobTargetAt(job_id, database_name, namespace_name, table_name, access_method, index_name, generation, worker_id, "", lease_ms, max_work_units, "running", now_ns);
+            defer self.freeRelationalIndexRepairJobRecord(started);
+
+            const result = if (std.mem.eql(u8, access_method, "text_search"))
+                self.core.index_manager.repairRelationalTextSearchFromRows(self.core.store, index_name, max_work_units)
+            else if (std.mem.eql(u8, access_method, "algebraic_filter"))
+                self.core.index_manager.repairRelationalAlgebraicFromRows(self.core.store, index_name, max_work_units)
+            else
+                error.UnsupportedRelationalIndexRepairAccessMethod;
+
+            const page = result catch |err| {
+                return try self.recordRelationalIndexRepairJobTargetPassAt(
+                    job_id,
+                    "failed",
+                    false,
+                    started.cursor,
+                    1,
+                    0,
+                    0,
+                    0,
+                    @errorName(err),
+                    false,
+                    now_ns,
+                );
+            };
+
+            return try self.recordRelationalIndexRepairJobTargetPassAt(
+                job_id,
+                if (page.complete) "complete" else "running",
+                page.complete,
+                page.cursor,
+                page.units_queued,
+                page.units_running,
+                page.units_throttled,
+                page.units_completed,
+                page.failure_reason,
+                page.stale_generation,
+                now_ns,
+            );
+        }
+
+        pub fn scheduleRelationalIndexRepairJobPageAt(
+            self: *DB,
+            job_id: []const u8,
+            database_name: []const u8,
+            namespace_name: []const u8,
+            table_name: []const u8,
+            access_method: []const u8,
+            index_name: []const u8,
+            generation: u64,
+            worker_id: []const u8,
+            lease_ms: u64,
+            max_work_units: usize,
+            now_ns: u64,
+        ) !void {
+            if (job_id.len == 0 or database_name.len == 0 or namespace_name.len == 0 or table_name.len == 0 or access_method.len == 0 or index_name.len == 0 or generation == 0 or worker_id.len == 0 or lease_ms == 0 or max_work_units == 0) return error.InvalidRelationalIndexRepairJob;
+
+            const RepairPageJob = struct {
+                alloc: Allocator,
+                db: *DB,
+                job_id: []u8,
+                database_name: []u8,
+                namespace_name: []u8,
+                table_name: []u8,
+                access_method: []u8,
+                index_name: []u8,
+                generation: u64,
+                worker_id: []u8,
+                lease_ms: u64,
+                max_work_units: usize,
+                now_ns: u64,
+
+                fn init(
+                    alloc: Allocator,
+                    db: *DB,
+                    job_id_arg: []const u8,
+                    database_name_arg: []const u8,
+                    namespace_name_arg: []const u8,
+                    table_name_arg: []const u8,
+                    access_method_arg: []const u8,
+                    index_name_arg: []const u8,
+                    generation_arg: u64,
+                    worker_id_arg: []const u8,
+                    lease_ms_arg: u64,
+                    max_work_units_arg: usize,
+                    now_ns_arg: u64,
+                ) !*@This() {
+                    const job = try alloc.create(@This());
+                    errdefer alloc.destroy(job);
+                    job.* = .{
+                        .alloc = alloc,
+                        .db = db,
+                        .job_id = try alloc.dupe(u8, job_id_arg),
+                        .database_name = &.{},
+                        .namespace_name = &.{},
+                        .table_name = &.{},
+                        .access_method = &.{},
+                        .index_name = &.{},
+                        .generation = generation_arg,
+                        .worker_id = &.{},
+                        .lease_ms = lease_ms_arg,
+                        .max_work_units = max_work_units_arg,
+                        .now_ns = now_ns_arg,
+                    };
+                    errdefer alloc.free(job.job_id);
+                    job.database_name = try alloc.dupe(u8, database_name_arg);
+                    errdefer alloc.free(job.database_name);
+                    job.namespace_name = try alloc.dupe(u8, namespace_name_arg);
+                    errdefer alloc.free(job.namespace_name);
+                    job.table_name = try alloc.dupe(u8, table_name_arg);
+                    errdefer alloc.free(job.table_name);
+                    job.access_method = try alloc.dupe(u8, access_method_arg);
+                    errdefer alloc.free(job.access_method);
+                    job.index_name = try alloc.dupe(u8, index_name_arg);
+                    errdefer alloc.free(job.index_name);
+                    job.worker_id = try alloc.dupe(u8, worker_id_arg);
+                    return job;
+                }
+
+                fn run(ptr: *anyopaque) anyerror!void {
+                    const job: *@This() = @ptrCast(@alignCast(ptr));
+                    const record = try job.db.runRelationalIndexRepairJobPageAt(
+                        job.job_id,
+                        job.database_name,
+                        job.namespace_name,
+                        job.table_name,
+                        job.access_method,
+                        job.index_name,
+                        job.generation,
+                        job.worker_id,
+                        job.lease_ms,
+                        job.max_work_units,
+                        job.now_ns,
+                    );
+                    job.db.freeRelationalIndexRepairJobRecord(record);
+                }
+
+                fn deinit(ptr: *anyopaque) void {
+                    const job: *@This() = @ptrCast(@alignCast(ptr));
+                    job.alloc.free(job.job_id);
+                    job.alloc.free(job.database_name);
+                    job.alloc.free(job.namespace_name);
+                    job.alloc.free(job.table_name);
+                    job.alloc.free(job.access_method);
+                    job.alloc.free(job.index_name);
+                    job.alloc.free(job.worker_id);
+                    const alloc = job.alloc;
+                    alloc.destroy(job);
+                }
+            };
+
+            const job = try RepairPageJob.init(
+                self.runtime_alloc,
+                self,
+                job_id,
+                database_name,
+                namespace_name,
+                table_name,
+                access_method,
+                index_name,
+                generation,
+                worker_id,
+                lease_ms,
+                max_work_units,
+                now_ns,
+            );
+            errdefer RepairPageJob.deinit(job);
+
+            try self.backend_runtime.durable_jobs.submit(.{
+                .owner_id = self.relational_index_worker_owner_id,
+                .class = .maintenance,
+                .ptr = job,
+                .run = RepairPageJob.run,
+                .deinit = RepairPageJob.deinit,
+            });
+        }
+
+        pub fn snapshotRelationalIndexRepairStats(self: *DB) !types.RelationalIndexRepairStats {
+            const records = try self.listRelationalIndexRepairJobRecords();
+            defer self.freeRelationalIndexRepairJobRecords(records);
+
+            return aggregateRelationalIndexRepairStats(records);
+        }
+
+        pub fn snapshotRelationalIndexRepairStatsAssumeApplyLockHeld(self: *DB) !types.RelationalIndexRepairStats {
+            const records = try listRelationalIndexRepairJobRecordsLocked(self);
+            defer self.freeRelationalIndexRepairJobRecords(records);
+
+            return aggregateRelationalIndexRepairStats(records);
+        }
+
+        fn aggregateRelationalIndexRepairStats(records: []const RelationalIndexRepairJobRecord) types.RelationalIndexRepairStats {
+            var stats = types.RelationalIndexRepairStats{};
+            for (records) |record| {
+                stats.job_count += 1;
+                if (record.completed) {
+                    stats.completed_job_count += 1;
+                } else {
+                    stats.active_job_count += 1;
+                }
+                if (std.mem.eql(u8, record.status, "failed")) stats.failed_job_count += 1;
+                if (record.stale_generation) stats.stale_generation_job_count += 1;
+                stats.last_units_queued +|= record.last_units_queued;
+                stats.last_units_running +|= record.last_units_running;
+                stats.last_units_throttled +|= record.last_units_throttled;
+                stats.last_units_completed +|= record.last_units_completed;
+                stats.total_units_queued +|= record.total_units_queued;
+                stats.total_units_running +|= record.total_units_running;
+                stats.total_units_throttled +|= record.total_units_throttled;
+                stats.total_units_completed +|= record.total_units_completed;
+            }
+            return stats;
+        }
+
+        pub fn upsertRelationalIndexDropJobRecordAt(
+            self: *DB,
+            job_id: []const u8,
+            database_name: []const u8,
+            namespace_name: []const u8,
+            table_name: []const u8,
+            access_method: []const u8,
+            index_name: []const u8,
+            generation: u64,
+            worker_id: []const u8,
+            cursor: []const u8,
+            lease_ms: u64,
+            max_work_units: usize,
+            status: []const u8,
+            now_ns: u64,
+        ) !RelationalIndexDropJobRecord {
+            if (job_id.len == 0 or database_name.len == 0 or namespace_name.len == 0 or table_name.len == 0 or access_method.len == 0 or index_name.len == 0 or generation == 0 or worker_id.len == 0 or lease_ms == 0 or max_work_units == 0 or status.len == 0) return error.InvalidRelationalIndexDropJob;
+            self.core.lockApply();
+            defer self.core.unlockApply();
+
+            const key = try relationalIndexDropJobKeyAlloc(self.alloc, job_id);
+            defer self.alloc.free(key);
+
+            var created_at_ns = now_ns;
+            var attempts: u32 = 1;
+            var preserved_cursor: ?[]u8 = null;
+            defer if (preserved_cursor) |value| self.alloc.free(value);
+            var previous_cursor: []const u8 = cursor;
+            var failure_reason: ?[]const u8 = null;
+            var preserved_failure_reason: ?[]u8 = null;
+            defer if (preserved_failure_reason) |value| self.alloc.free(value);
+            var stale_generation = false;
+            var pass_count: u64 = 0;
+            var total_units_queued: u64 = 0;
+            var total_units_running: u64 = 0;
+            var total_units_throttled: u64 = 0;
+            var total_units_completed: u64 = 0;
+            if (self.core.store.get(self.alloc, key)) |raw| {
+                defer self.alloc.free(raw);
+                const existing = try cloneRelationalIndexDropJobRecordFromJson(self, raw);
+                defer self.freeRelationalIndexDropJobRecord(existing);
+                if (existing.generation != generation) return error.StaleRelationalIndexDropJobGeneration;
+                created_at_ns = existing.created_at_ns;
+                attempts = existing.attempts +| 1;
+                if (cursor.len == 0) {
+                    preserved_cursor = try self.alloc.dupe(u8, existing.cursor);
+                    previous_cursor = preserved_cursor.?;
+                }
+                if (existing.failure_reason) |value| {
+                    preserved_failure_reason = try self.alloc.dupe(u8, value);
+                    failure_reason = preserved_failure_reason.?;
+                }
+                stale_generation = existing.stale_generation;
+                pass_count = existing.pass_count;
+                total_units_queued = existing.total_units_queued;
+                total_units_running = existing.total_units_running;
+                total_units_throttled = existing.total_units_throttled;
+                total_units_completed = existing.total_units_completed;
+            } else |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            }
+
+            const record = RelationalIndexDropJobRecord{
+                .job_id = job_id,
+                .database_name = database_name,
+                .namespace_name = namespace_name,
+                .table_name = table_name,
+                .access_method = access_method,
+                .index_name = index_name,
+                .generation = generation,
+                .worker_id = worker_id,
+                .cursor = previous_cursor,
+                .lease_ms = lease_ms,
+                .max_work_units = max_work_units,
+                .status = status,
+                .created_at_ns = created_at_ns,
+                .updated_at_ns = now_ns,
+                .attempts = attempts,
+                .failure_reason = failure_reason,
+                .stale_generation = stale_generation,
+                .pass_count = pass_count,
+                .total_units_queued = total_units_queued,
+                .total_units_running = total_units_running,
+                .total_units_throttled = total_units_throttled,
+                .total_units_completed = total_units_completed,
+            };
+            const payload = try std.json.Stringify.valueAlloc(self.alloc, record, .{ .emit_null_optional_fields = false });
+            defer self.alloc.free(payload);
+            try self.core.store.put(key, payload);
+            return try cloneRelationalIndexDropJobRecordFromJson(self, payload);
+        }
+
+        pub fn recordRelationalIndexDropJobPassAt(
+            self: *DB,
+            job_id: []const u8,
+            status: []const u8,
+            complete: bool,
+            cursor: []const u8,
+            units_queued: u64,
+            units_running: u64,
+            units_throttled: u64,
+            units_completed: u64,
+            failure_reason: ?[]const u8,
+            stale_generation: bool,
+            now_ns: u64,
+        ) !RelationalIndexDropJobRecord {
+            if (job_id.len == 0 or status.len == 0) return error.InvalidRelationalIndexDropJob;
+            self.core.lockApply();
+            defer self.core.unlockApply();
+
+            const key = try relationalIndexDropJobKeyAlloc(self.alloc, job_id);
+            defer self.alloc.free(key);
+            const raw = self.core.store.get(self.alloc, key) catch |err| switch (err) {
+                error.NotFound => return error.RelationalIndexDropJobNotFound,
+                else => return err,
+            };
+            defer self.alloc.free(raw);
+            const existing = try cloneRelationalIndexDropJobRecordFromJson(self, raw);
+            defer self.freeRelationalIndexDropJobRecord(existing);
+
+            const record = RelationalIndexDropJobRecord{
+                .job_id = existing.job_id,
+                .database_name = existing.database_name,
+                .namespace_name = existing.namespace_name,
+                .table_name = existing.table_name,
+                .access_method = existing.access_method,
+                .index_name = existing.index_name,
+                .generation = existing.generation,
+                .worker_id = existing.worker_id,
+                .cursor = cursor,
+                .lease_ms = existing.lease_ms,
+                .max_work_units = existing.max_work_units,
+                .status = status,
+                .created_at_ns = existing.created_at_ns,
+                .updated_at_ns = now_ns,
+                .attempts = existing.attempts,
+                .completed = complete,
+                .failure_reason = failure_reason,
+                .stale_generation = stale_generation,
+                .pass_count = existing.pass_count +| 1,
+                .last_units_queued = units_queued,
+                .last_units_running = units_running,
+                .last_units_throttled = units_throttled,
+                .last_units_completed = units_completed,
+                .total_units_queued = existing.total_units_queued +| units_queued,
+                .total_units_running = existing.total_units_running +| units_running,
+                .total_units_throttled = existing.total_units_throttled +| units_throttled,
+                .total_units_completed = existing.total_units_completed +| units_completed,
+            };
+            const payload = try std.json.Stringify.valueAlloc(self.alloc, record, .{ .emit_null_optional_fields = false });
+            defer self.alloc.free(payload);
+            try self.core.store.put(key, payload);
+            return try cloneRelationalIndexDropJobRecordFromJson(self, payload);
         }
 
         pub fn completeForeignKeyIntegrityJobRecord(
@@ -4489,6 +5201,17 @@ pub fn Impl(comptime DB: type) type {
             });
         }
 
+        pub fn relationalIndexDropJobKeyAlloc(
+            alloc: Allocator,
+            job_id: []const u8,
+        ) ![]u8 {
+            return try std.fmt.allocPrint(alloc, "{s}:{d}:{s}", .{
+                relational_index_drop_job_key_prefix,
+                job_id.len,
+                job_id,
+            });
+        }
+
         pub fn foreignKeyActionJobKeyAlloc(
             alloc: Allocator,
             job_id: []const u8,
@@ -4619,6 +5342,9 @@ pub fn Impl(comptime DB: type) type {
                 .database_name = &.{},
                 .namespace_name = &.{},
                 .table_name = &.{},
+                .access_method = &.{},
+                .index_name = &.{},
+                .generation = parsed.value.generation,
                 .worker_id = &.{},
                 .lower_doc_key = &.{},
                 .upper_doc_key = &.{},
@@ -4631,6 +5357,18 @@ pub fn Impl(comptime DB: type) type {
                 .completed = parsed.value.completed,
                 .complete = parsed.value.complete,
                 .next_lower_doc_key = &.{},
+                .cursor = &.{},
+                .failure_reason = null,
+                .stale_generation = parsed.value.stale_generation,
+                .pass_count = parsed.value.pass_count,
+                .last_units_queued = parsed.value.last_units_queued,
+                .last_units_running = parsed.value.last_units_running,
+                .last_units_throttled = parsed.value.last_units_throttled,
+                .last_units_completed = parsed.value.last_units_completed,
+                .total_units_queued = parsed.value.total_units_queued,
+                .total_units_running = parsed.value.total_units_running,
+                .total_units_throttled = parsed.value.total_units_throttled,
+                .total_units_completed = parsed.value.total_units_completed,
                 .last_ranges_scanned = parsed.value.last_ranges_scanned,
                 .last_ranges_repaired = parsed.value.last_ranges_repaired,
                 .last_ranges_missing = parsed.value.last_ranges_missing,
@@ -4646,12 +5384,67 @@ pub fn Impl(comptime DB: type) type {
             cloned.database_name = try self.alloc.dupe(u8, parsed.value.database_name);
             cloned.namespace_name = try self.alloc.dupe(u8, parsed.value.namespace_name);
             cloned.table_name = try self.alloc.dupe(u8, parsed.value.table_name);
+            cloned.access_method = try self.alloc.dupe(u8, parsed.value.access_method);
+            cloned.index_name = try self.alloc.dupe(u8, parsed.value.index_name);
             cloned.worker_id = try self.alloc.dupe(u8, parsed.value.worker_id);
             cloned.lower_doc_key = try self.alloc.dupe(u8, parsed.value.lower_doc_key);
             cloned.upper_doc_key = try self.alloc.dupe(u8, parsed.value.upper_doc_key);
             cloned.status = try self.alloc.dupe(u8, parsed.value.status);
             cloned.next_lower_doc_key = try self.alloc.dupe(u8, parsed.value.next_lower_doc_key);
+            cloned.cursor = try self.alloc.dupe(u8, parsed.value.cursor);
+            if (parsed.value.failure_reason) |value| cloned.failure_reason = try self.alloc.dupe(u8, value);
             if (parsed.value.last_error) |value| cloned.last_error = try self.alloc.dupe(u8, value);
+            return cloned;
+        }
+
+        pub fn cloneRelationalIndexDropJobRecordFromJson(self: *DB, raw: []const u8) !RelationalIndexDropJobRecord {
+            var parsed = try std.json.parseFromSlice(RelationalIndexDropJobRecord, self.alloc, raw, .{
+                .allocate = .alloc_always,
+                .ignore_unknown_fields = true,
+            });
+            defer parsed.deinit();
+
+            var cloned = RelationalIndexDropJobRecord{
+                .version = parsed.value.version,
+                .job_id = &.{},
+                .database_name = &.{},
+                .namespace_name = &.{},
+                .table_name = &.{},
+                .access_method = &.{},
+                .index_name = &.{},
+                .generation = parsed.value.generation,
+                .worker_id = &.{},
+                .cursor = &.{},
+                .lease_ms = parsed.value.lease_ms,
+                .max_work_units = parsed.value.max_work_units,
+                .status = &.{},
+                .created_at_ns = parsed.value.created_at_ns,
+                .updated_at_ns = parsed.value.updated_at_ns,
+                .attempts = parsed.value.attempts,
+                .completed = parsed.value.completed,
+                .failure_reason = null,
+                .stale_generation = parsed.value.stale_generation,
+                .pass_count = parsed.value.pass_count,
+                .last_units_queued = parsed.value.last_units_queued,
+                .last_units_running = parsed.value.last_units_running,
+                .last_units_throttled = parsed.value.last_units_throttled,
+                .last_units_completed = parsed.value.last_units_completed,
+                .total_units_queued = parsed.value.total_units_queued,
+                .total_units_running = parsed.value.total_units_running,
+                .total_units_throttled = parsed.value.total_units_throttled,
+                .total_units_completed = parsed.value.total_units_completed,
+            };
+            errdefer self.freeRelationalIndexDropJobRecord(cloned);
+            cloned.job_id = try self.alloc.dupe(u8, parsed.value.job_id);
+            cloned.database_name = try self.alloc.dupe(u8, parsed.value.database_name);
+            cloned.namespace_name = try self.alloc.dupe(u8, parsed.value.namespace_name);
+            cloned.table_name = try self.alloc.dupe(u8, parsed.value.table_name);
+            cloned.access_method = try self.alloc.dupe(u8, parsed.value.access_method);
+            cloned.index_name = try self.alloc.dupe(u8, parsed.value.index_name);
+            cloned.worker_id = try self.alloc.dupe(u8, parsed.value.worker_id);
+            cloned.cursor = try self.alloc.dupe(u8, parsed.value.cursor);
+            cloned.status = try self.alloc.dupe(u8, parsed.value.status);
+            if (parsed.value.failure_reason) |value| cloned.failure_reason = try self.alloc.dupe(u8, value);
             return cloned;
         }
 
@@ -5600,6 +6393,341 @@ test "db relational index repair job records persist intent progress and resume 
     try std.testing.expectEqual(@as(u64, 2), persisted.total_ranges_repaired);
     try std.testing.expectEqual(@as(u64, 12), persisted.aggregate_report.scanned_rows);
     try std.testing.expectEqualStrings("last-pass-warning", persisted.last_error.?);
+}
+
+test "db relational index target repair job records persist generation counters and stale state" {
+    const DB = @import("mod.zig").DB;
+
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        const created = try db.upsertRelationalIndexRepairJobTargetAt(
+            "job:index-repair:docs:body_text:7",
+            "tenant_ops",
+            "analytics",
+            "docs",
+            "text_search",
+            "body_text",
+            7,
+            "worker:repair-a",
+            "",
+            60_000,
+            3,
+            "running",
+            10_000,
+        );
+        defer db.freeRelationalIndexRepairJobRecord(created);
+        try std.testing.expectEqualStrings("text_search", created.access_method);
+        try std.testing.expectEqualStrings("body_text", created.index_name);
+        try std.testing.expectEqual(@as(u64, 7), created.generation);
+        try std.testing.expectEqual(@as(u32, 1), created.attempts);
+        try std.testing.expectEqualStrings("", created.cursor);
+
+        const partial = try db.recordRelationalIndexRepairJobTargetPassAt(
+            "job:index-repair:docs:body_text:7",
+            "running",
+            false,
+            "row:m",
+            5,
+            1,
+            2,
+            3,
+            null,
+            false,
+            20_000,
+        );
+        defer db.freeRelationalIndexRepairJobRecord(partial);
+        try std.testing.expect(!partial.completed);
+        try std.testing.expectEqualStrings("row:m", partial.cursor);
+        try std.testing.expectEqual(@as(u64, 1), partial.pass_count);
+        try std.testing.expectEqual(@as(u64, 5), partial.total_units_queued);
+        try std.testing.expectEqual(@as(u64, 2), partial.total_units_throttled);
+        try std.testing.expectEqual(@as(u64, 3), partial.total_units_completed);
+
+        const resumed = try db.upsertRelationalIndexRepairJobTargetAt(
+            "job:index-repair:docs:body_text:7",
+            "tenant_ops",
+            "analytics",
+            "docs",
+            "text_search",
+            "body_text",
+            7,
+            "worker:repair-b",
+            "",
+            120_000,
+            4,
+            "running",
+            30_000,
+        );
+        defer db.freeRelationalIndexRepairJobRecord(resumed);
+        try std.testing.expectEqual(@as(u32, 2), resumed.attempts);
+        try std.testing.expectEqualStrings("row:m", resumed.cursor);
+        try std.testing.expectEqual(@as(u64, 3), resumed.total_units_completed);
+
+        try std.testing.expectError(
+            error.StaleRelationalIndexRepairJobGeneration,
+            db.upsertRelationalIndexRepairJobTargetAt(
+                "job:index-repair:docs:body_text:7",
+                "tenant_ops",
+                "analytics",
+                "docs",
+                "text_search",
+                "body_text",
+                8,
+                "worker:repair-c",
+                "",
+                120_000,
+                4,
+                "running",
+                35_000,
+            ),
+        );
+
+        const stale = try db.recordRelationalIndexRepairJobTargetPassAt(
+            "job:index-repair:docs:body_text:7",
+            "stale_generation",
+            true,
+            "row:z",
+            0,
+            0,
+            0,
+            0,
+            "target_generation_stale",
+            true,
+            40_000,
+        );
+        defer db.freeRelationalIndexRepairJobRecord(stale);
+        try std.testing.expect(stale.completed);
+        try std.testing.expect(stale.stale_generation);
+        try std.testing.expectEqualStrings("target_generation_stale", stale.failure_reason.?);
+
+        const success_created = try db.upsertRelationalIndexRepairJobTargetAt(
+            "job:index-repair:docs:body_text:9",
+            "tenant_ops",
+            "analytics",
+            "docs",
+            "text_search",
+            "body_text",
+            9,
+            "worker:repair-success",
+            "",
+            60_000,
+            3,
+            "running",
+            50_000,
+        );
+        defer db.freeRelationalIndexRepairJobRecord(success_created);
+        const success = try db.recordRelationalIndexRepairJobTargetPassAt(
+            "job:index-repair:docs:body_text:9",
+            "complete",
+            true,
+            "",
+            1,
+            1,
+            0,
+            1,
+            null,
+            false,
+            60_000,
+        );
+        defer db.freeRelationalIndexRepairJobRecord(success);
+        try std.testing.expect(success.completed);
+        try std.testing.expect(!success.stale_generation);
+        try std.testing.expectEqual(@as(u64, 1), success.total_units_completed);
+
+        const failed_created = try db.upsertRelationalIndexRepairJobTargetAt(
+            "job:index-repair:docs:body_text:10",
+            "tenant_ops",
+            "analytics",
+            "docs",
+            "text_search",
+            "body_text",
+            10,
+            "worker:repair-failed",
+            "",
+            60_000,
+            3,
+            "running",
+            70_000,
+        );
+        defer db.freeRelationalIndexRepairJobRecord(failed_created);
+        const failed = try db.recordRelationalIndexRepairJobTargetPassAt(
+            "job:index-repair:docs:body_text:10",
+            "failed",
+            false,
+            "row:f",
+            1,
+            0,
+            0,
+            0,
+            "injected_failure",
+            false,
+            80_000,
+        );
+        defer db.freeRelationalIndexRepairJobRecord(failed);
+        try std.testing.expect(!failed.completed);
+        try std.testing.expectEqualStrings("failed", failed.status);
+
+        const all = try db.listRelationalIndexRepairJobRecords();
+        defer db.freeRelationalIndexRepairJobRecords(all);
+        try std.testing.expectEqual(@as(usize, 3), all.len);
+
+        const stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(@as(u64, 3), stats.relational_index_repair.job_count);
+        try std.testing.expectEqual(@as(u64, 1), stats.relational_index_repair.active_job_count);
+        try std.testing.expectEqual(@as(u64, 2), stats.relational_index_repair.completed_job_count);
+        try std.testing.expectEqual(@as(u64, 1), stats.relational_index_repair.failed_job_count);
+        try std.testing.expectEqual(@as(u64, 1), stats.relational_index_repair.stale_generation_job_count);
+        try std.testing.expectEqual(@as(u64, 7), stats.relational_index_repair.total_units_queued);
+        try std.testing.expectEqual(@as(u64, 2), stats.relational_index_repair.total_units_running);
+        try std.testing.expectEqual(@as(u64, 2), stats.relational_index_repair.total_units_throttled);
+        try std.testing.expectEqual(@as(u64, 4), stats.relational_index_repair.total_units_completed);
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{});
+    defer reopened.close();
+    const persisted = (try reopened.loadRelationalIndexRepairJobRecord("job:index-repair:docs:body_text:7")) orelse return error.TestUnexpectedResult;
+    defer reopened.freeRelationalIndexRepairJobRecord(persisted);
+    try std.testing.expectEqualStrings("text_search", persisted.access_method);
+    try std.testing.expectEqualStrings("body_text", persisted.index_name);
+    try std.testing.expectEqual(@as(u64, 7), persisted.generation);
+    try std.testing.expectEqual(@as(u32, 2), persisted.attempts);
+    try std.testing.expectEqual(@as(u64, 2), persisted.pass_count);
+    try std.testing.expectEqual(@as(u64, 3), persisted.total_units_completed);
+    try std.testing.expect(persisted.stale_generation);
+    try std.testing.expectEqualStrings("target_generation_stale", persisted.failure_reason.?);
+}
+
+test "db relational index drop job records persist generation counters and stale state" {
+    const DB = @import("mod.zig").DB;
+
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        const created = try db.upsertRelationalIndexDropJobRecordAt(
+            "job:index-drop:docs:alg_docs:11",
+            "tenant_ops",
+            "analytics",
+            "docs",
+            "algebraic_filter",
+            "alg_docs",
+            11,
+            "worker:drop-a",
+            "",
+            60_000,
+            2,
+            "running",
+            10_000,
+        );
+        defer db.freeRelationalIndexDropJobRecord(created);
+        try std.testing.expectEqualStrings("algebraic_filter", created.access_method);
+        try std.testing.expectEqualStrings("alg_docs", created.index_name);
+        try std.testing.expectEqual(@as(u64, 11), created.generation);
+
+        const partial = try db.recordRelationalIndexDropJobPassAt(
+            "job:index-drop:docs:alg_docs:11",
+            "running",
+            false,
+            "artifact:postings:m",
+            4,
+            1,
+            1,
+            2,
+            null,
+            false,
+            20_000,
+        );
+        defer db.freeRelationalIndexDropJobRecord(partial);
+        try std.testing.expectEqualStrings("artifact:postings:m", partial.cursor);
+        try std.testing.expectEqual(@as(u64, 1), partial.pass_count);
+        try std.testing.expectEqual(@as(u64, 2), partial.total_units_completed);
+
+        const resumed = try db.upsertRelationalIndexDropJobRecordAt(
+            "job:index-drop:docs:alg_docs:11",
+            "tenant_ops",
+            "analytics",
+            "docs",
+            "algebraic_filter",
+            "alg_docs",
+            11,
+            "worker:drop-b",
+            "",
+            60_000,
+            2,
+            "running",
+            30_000,
+        );
+        defer db.freeRelationalIndexDropJobRecord(resumed);
+        try std.testing.expectEqual(@as(u32, 2), resumed.attempts);
+        try std.testing.expectEqualStrings("artifact:postings:m", resumed.cursor);
+
+        try std.testing.expectError(
+            error.StaleRelationalIndexDropJobGeneration,
+            db.upsertRelationalIndexDropJobRecordAt(
+                "job:index-drop:docs:alg_docs:11",
+                "tenant_ops",
+                "analytics",
+                "docs",
+                "algebraic_filter",
+                "alg_docs",
+                12,
+                "worker:drop-c",
+                "",
+                60_000,
+                2,
+                "running",
+                35_000,
+            ),
+        );
+
+        const complete = try db.recordRelationalIndexDropJobPassAt(
+            "job:index-drop:docs:alg_docs:11",
+            "complete",
+            true,
+            "",
+            0,
+            0,
+            0,
+            3,
+            null,
+            false,
+            40_000,
+        );
+        defer db.freeRelationalIndexDropJobRecord(complete);
+        try std.testing.expect(complete.completed);
+        try std.testing.expectEqual(@as(u64, 5), complete.total_units_completed);
+
+        const all = try db.listRelationalIndexDropJobRecords();
+        defer db.freeRelationalIndexDropJobRecords(all);
+        try std.testing.expectEqual(@as(usize, 1), all.len);
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{});
+    defer reopened.close();
+    const persisted = (try reopened.loadRelationalIndexDropJobRecord("job:index-drop:docs:alg_docs:11")) orelse return error.TestUnexpectedResult;
+    defer reopened.freeRelationalIndexDropJobRecord(persisted);
+    try std.testing.expectEqualStrings("algebraic_filter", persisted.access_method);
+    try std.testing.expectEqualStrings("alg_docs", persisted.index_name);
+    try std.testing.expectEqual(@as(u64, 11), persisted.generation);
+    try std.testing.expectEqual(@as(u32, 2), persisted.attempts);
+    try std.testing.expectEqual(@as(u64, 2), persisted.pass_count);
+    try std.testing.expectEqual(@as(u64, 5), persisted.total_units_completed);
+    try std.testing.expect(persisted.completed);
 }
 
 test "db foreign key action jobs canonicalize SQL action aliases" {

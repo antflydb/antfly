@@ -3598,6 +3598,32 @@ test "db write path transform relational batch transforms read and rewrite base 
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, primary_key));
 }
 
+test "db write path gates relational foreground batch writes on stale derived index" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"}],"lifecycle":"stale","generation":7,"schema_fingerprint":"secondary-index-v1:status_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"stale","lag":0,"ready_watermark":0}}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try std.testing.expectError(error.WriteUnavailable, db.batch(.{
+        .writes = &.{.{ .key = "row:blocked", .value = "{\"id\":\"blocked\",\"status\":\"ready\"}" }},
+    }));
+}
+
 test "db write path transform keeps delete when same-batch transform targets deleted key" {
     const DB = @import("mod.zig").DB;
     const alloc = std.testing.allocator;
@@ -7888,6 +7914,8 @@ pub fn Impl(comptime DB: type) type {
             };
             if (profile) |active_profile| DB.WritePathCallbacks.record_profile_ns(profile, &active_profile.merge_effective_req_ns, merge_effective_req_start_ns);
 
+            try enforceRelationalForegroundBatchWriteGate(self, effective_req);
+
             var effective_predicates = std.ArrayListUnmanaged(transactions_mod.VersionPredicate).empty;
             defer effective_predicates.deinit(self.alloc);
             var owned_row_claim_predicate_keys = std.ArrayListUnmanaged([]u8).empty;
@@ -8657,6 +8685,24 @@ pub fn Impl(comptime DB: type) type {
                 }
                 DB.WritePathCallbacks.notify_resolver_replay_runtimes(self, sequence);
             }
+        }
+
+        fn enforceRelationalForegroundBatchWriteGate(self: *DB, req: types.BatchRequest) !void {
+            if (!batchTouchesForegroundRows(req)) return;
+            if (schema_mod.relationalTableForegroundWriteBlockReason(self.core.schema, .batch) != null) return error.WriteUnavailable;
+        }
+
+        fn batchTouchesForegroundRows(req: types.BatchRequest) bool {
+            for (req.writes) |write| {
+                if (!DB.WritePathCallbacks.is_metadata_key(write.key)) return true;
+            }
+            for (req.deletes) |key| {
+                if (!DB.WritePathCallbacks.is_metadata_key(key)) return true;
+            }
+            for (req.relational_identity_rewrites) |rewrite| {
+                if (!DB.WritePathCallbacks.is_metadata_key(rewrite.old_key) or !DB.WritePathCallbacks.is_metadata_key(rewrite.new_key)) return true;
+            }
+            return false;
         }
 
         pub fn batchWithoutRangeValidationAfterGate(self: *DB, req: types.BatchRequest) anyerror!void {

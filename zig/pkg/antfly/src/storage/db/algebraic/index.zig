@@ -3142,6 +3142,29 @@ pub const Index = struct {
         return deleted;
     }
 
+    pub const ArtifactNamespaceForTest = enum {
+        raw,
+        canonical,
+    };
+
+    pub fn putArtifactRowForTest(
+        self: *Index,
+        store: *docstore_mod.DocStore,
+        namespace: ArtifactNamespaceForTest,
+        family: []const u8,
+        marker: []const u8,
+        value: []const u8,
+    ) !void {
+        if (!builtin.is_test) return error.Unsupported;
+
+        const key = switch (namespace) {
+            .raw => try self.keyAlloc(&.{ family, marker }),
+            .canonical => try token.canonicalTupleAlloc(self.alloc, &.{ "\x00\x00__algebraic__", self.name, family, marker }),
+        };
+        defer self.alloc.free(key);
+        try store.put(key, value);
+    }
+
     fn deleteRowsWithPrefix(self: *Index, store: *docstore_mod.DocStore, prefix: []const u8) !usize {
         const rows = try store.scanPrefix(self.alloc, prefix);
         defer docstore_mod.DocStore.freeResults(self.alloc, rows);

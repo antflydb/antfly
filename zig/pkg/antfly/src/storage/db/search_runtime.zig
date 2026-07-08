@@ -59,6 +59,7 @@ const platform_clock = @import("../../platform/clock.zig");
 const platform_time = @import("../../platform/time.zig");
 const vectorindex_mod = @import("antfly_vectorindex");
 const mapper = @import("document_mapper.zig");
+const backfill_state_mod = @import("backfill_state.zig");
 
 const Allocator = std.mem.Allocator;
 const NamedResultSet = db_query_graph.NamedResultSet;
@@ -561,6 +562,245 @@ test "relational table full-text backfill indexes committed base rows" {
     defer parsed.deinit();
     try std.testing.expectEqualStrings("packed row backfill", parsed.value.object.get("title").?.string);
     try std.testing.expectEqualStrings("ready", parsed.value.object.get("status").?.string);
+}
+
+test "relational table full-text repair job rebuilds from committed base rows" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const DB = @import("mod.zig").DB;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword"}},"required":["title"],"additionalProperties":false}}},"relational_indexes":[{"name":"ft_repair","owner_kind":"relational_column","owner_name":"title","access_method":"text_search","method_config":{"type":"full_text","field":"title"},"columns":["title"],"lifecycle":"building","generation":5,"schema_fingerprint":"secondary-index-v1:title","generation_record":{"generation":5,"owner_ranges":[],"lifecycle":"building","lag":1,"ready_watermark":0,"rebuild_cursor":""}}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "row:a",
+            .value = "{\"title\":\"alpha repair seed\",\"status\":\"ready\"}",
+        }},
+        .sync_level = .write,
+    });
+    try db.addIndex(.{
+        .name = "ft_repair",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "row:b",
+            .value = "{\"title\":\"beta repair foreground\",\"status\":\"ready\"}",
+        }},
+        .sync_level = .write,
+    });
+
+    const throttled = try db.runRelationalIndexRepairJobPageAt(
+        "job:index-repair:docs:ft_repair:5:throttled",
+        "default",
+        "public",
+        "docs",
+        "text_search",
+        "ft_repair",
+        5,
+        "worker:repair",
+        60_000,
+        0,
+        10_000,
+    );
+    defer db.freeRelationalIndexRepairJobRecord(throttled);
+    try std.testing.expect(!throttled.completed);
+    try std.testing.expectEqual(@as(u64, 1), throttled.total_units_throttled);
+    try std.testing.expectEqualStrings("repair_budget_exhausted", throttled.failure_reason.?);
+
+    try db.scheduleRelationalIndexRepairJobPageAt(
+        "job:index-repair:docs:ft_repair:5",
+        "default",
+        "public",
+        "docs",
+        "text_search",
+        "ft_repair",
+        5,
+        "worker:repair",
+        60_000,
+        1,
+        20_000,
+    );
+    db.backend_runtime.durable_jobs.drainOwner(db.relational_index_worker_owner_id);
+    const repaired = (try db.loadRelationalIndexRepairJobRecord("job:index-repair:docs:ft_repair:5")) orelse return error.TestUnexpectedResult;
+    defer db.freeRelationalIndexRepairJobRecord(repaired);
+    try std.testing.expect(repaired.completed);
+    try std.testing.expectEqualStrings("complete", repaired.status);
+    try std.testing.expect(repaired.total_units_completed > 0);
+
+    var result = try db.search(alloc, .{
+        .index_name = "ft_repair",
+        .query = .{ .match = .{ .field = "title", .text = "repair" } },
+        .limit = 10,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+}
+
+test "relational table full-text repair job rebuilds artifact matrix from committed base rows" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const DB = @import("mod.zig").DB;
+
+    const ArtifactCase = enum {
+        missing_segment_data,
+        corrupt_active_segment,
+        extra_stale_segment,
+        interrupted_rebuild_cursor,
+        foreground_write,
+    };
+    const cases = [_]ArtifactCase{
+        .missing_segment_data,
+        .corrupt_active_segment,
+        .extra_stale_segment,
+        .interrupted_rebuild_cursor,
+        .foreground_write,
+    };
+
+    for (cases) |scenario| {
+        var path_buf: [256]u8 = undefined;
+        const path = TestHelpers.tempPath(&path_buf);
+        defer TestHelpers.cleanupTempDir(path);
+
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        const schema_json =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword"}},"required":["title"],"additionalProperties":false}}},"relational_indexes":[{"name":"ft_repair","owner_kind":"relational_column","owner_name":"title","access_method":"text_search","method_config":{"type":"full_text","field":"title"},"columns":["title"],"lifecycle":"building","generation":5,"schema_fingerprint":"secondary-index-v1:title","generation_record":{"generation":5,"owner_ranges":[],"lifecycle":"building","lag":1,"ready_watermark":0,"rebuild_cursor":""}}]}
+        ;
+        var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+        defer parsed_schema.deinit(alloc);
+        const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+        defer schema_mod.freeSchema(alloc, runtime_schema);
+        try db.setSchema(runtime_schema);
+
+        try db.batch(.{
+            .writes = &.{.{
+                .key = "row:a",
+                .value = "{\"title\":\"alpha repair seed\",\"status\":\"ready\"}",
+            }},
+            .sync_level = .write,
+        });
+        try db.addIndex(.{
+            .name = "ft_repair",
+            .kind = .full_text,
+            .config_json = "{}",
+        });
+
+        // This row is committed after the original artifact exists. Repair must
+        // rebuild from authoritative rows and include it in every scenario.
+        try db.batch(.{
+            .writes = &.{.{
+                .key = "row:b",
+                .value = "{\"title\":\"beta repair foreground\",\"status\":\"ready\"}",
+            }},
+            .sync_level = .write,
+        });
+
+        {
+            const entry = db.core.index_manager.textIndexEntry("ft_repair") orelse return error.TestUnexpectedResult;
+            switch (scenario) {
+                .missing_segment_data => {
+                    const ids = try entry.persistent.activeSegmentIdsAlloc(alloc);
+                    defer alloc.free(ids);
+                    for (ids) |seg_id| try entry.persistent.deleteSegmentArtifactDataForTest(seg_id);
+                },
+                .corrupt_active_segment => {
+                    try entry.persistent.putActiveSegmentArtifactForTest(
+                        1_000_000,
+                        "not a valid antfly text segment",
+                        "row:corrupt",
+                        "row:corrupt",
+                    );
+                },
+                .extra_stale_segment => {
+                    var built = try mapper.buildTextSegmentsFromDocumentsWithMetadata(
+                        alloc,
+                        &.{.{
+                            .key = "row:stale",
+                            .value = "{\"title\":\"obsolete repair artifact\",\"status\":\"ready\"}",
+                        }},
+                        entry.text_analysis,
+                        entry.runtime_schema,
+                        .{ .target_segment_bytes = 1 },
+                    );
+                    defer built.deinit(alloc);
+                    for (built.segments) |*segment| {
+                        const owned = segment.*;
+                        segment.* = &.{};
+                        try entry.persistent.indexSegmentOwned(owned);
+                    }
+                },
+                .interrupted_rebuild_cursor => {
+                    const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
+                    try rebuild_state.update("row:a");
+                },
+                .foreground_write => {},
+            }
+        }
+
+        const job_id = try std.fmt.allocPrint(alloc, "job:index-repair:docs:ft_repair:5:{s}", .{@tagName(scenario)});
+        defer alloc.free(job_id);
+        const repaired = try db.runRelationalIndexRepairJobPageAt(
+            job_id,
+            "default",
+            "public",
+            "docs",
+            "text_search",
+            "ft_repair",
+            5,
+            "worker:repair",
+            60_000,
+            1,
+            20_000,
+        );
+        defer db.freeRelationalIndexRepairJobRecord(repaired);
+        try std.testing.expect(repaired.completed);
+        try std.testing.expectEqualStrings("complete", repaired.status);
+        try std.testing.expect(repaired.total_units_completed > 0);
+
+        var result = try db.search(alloc, .{
+            .index_name = "ft_repair",
+            .query = .{ .match = .{ .field = "title", .text = "repair" } },
+            .limit = 10,
+        });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+
+        var stale_result = try db.search(alloc, .{
+            .index_name = "ft_repair",
+            .query = .{ .match = .{ .field = "title", .text = "obsolete" } },
+            .limit = 10,
+        });
+        defer stale_result.deinit();
+        try std.testing.expectEqual(@as(u32, 0), stale_result.total_hits);
+
+        const active_ids = try (db.core.index_manager.textIndexEntry("ft_repair") orelse return error.TestUnexpectedResult).persistent.activeSegmentIdsAlloc(alloc);
+        defer alloc.free(active_ids);
+        try std.testing.expect(active_ids.len > 0);
+        for (active_ids) |seg_id| try std.testing.expect(seg_id != 1_000_000);
+
+        const rebuild_state = backfill_state_mod.RebuildState.init((db.core.index_manager.textIndexEntry("ft_repair") orelse return error.TestUnexpectedResult).rebuild_root_path);
+        const rebuild_cursor = try rebuild_state.check(alloc);
+        defer if (rebuild_cursor) |cursor| alloc.free(cursor);
+        try std.testing.expect(rebuild_cursor == null);
+    }
 }
 
 test "relational table full-text interrupted backfill persists generation progress" {
@@ -1910,8 +2150,8 @@ pub fn Impl(comptime DB: type) type {
                 return .{ .req = req };
             };
             entry.index.recordVectorFilterAttempt();
-            if (!schema_mod.relationalAccessMethodQueryReady(self.core.schema, .algebraic_filter, entry.config.name)) {
-                entry.index.recordPlannerFallback("relational_generation_not_ready", null, null);
+            if (schema_mod.relationalAccessMethodQueryBlockReason(self.core.schema, .algebraic_filter, entry.config.name)) |reason| {
+                entry.index.recordPlannerFallback(reason, null, null);
                 entry.index.recordVectorFilterUnsupported(req.require_algebraic_filter_resolution);
                 Self.recordUnsupportedDocSetFilterShape(self);
                 if (req.require_algebraic_filter_resolution) return error.UnsupportedQueryRequest;
@@ -8296,7 +8536,7 @@ test "db search runtime relational algebraic filters fail closed when generation
     try std.testing.expectEqual(@as(u64, 0), status_value.vector_filter_resolved_count);
     try std.testing.expectEqual(@as(u64, 1), status_value.vector_filter_unsupported_count);
     try std.testing.expectEqual(@as(u64, 1), status_value.vector_filter_fail_closed_count);
-    try std.testing.expectEqualStrings("relational_generation_not_ready", status_value.planner_last_fallback_reason.?);
+    try std.testing.expectEqualStrings("relational_generation_stale", status_value.planner_last_fallback_reason.?);
 }
 
 test "db search runtime identity algebraic doc facts feed native dense and sparse symbolic filters" {

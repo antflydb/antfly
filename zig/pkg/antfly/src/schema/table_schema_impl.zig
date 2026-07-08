@@ -425,15 +425,35 @@ fn freeParsedRelationalIndexGenerationRecord(
 ) void {
     freeRelationalIndexOwnerRanges(alloc, record.owner_ranges);
     if (record.failure_reason) |reason| alloc.free(reason);
+    if (record.rebuild_cursor) |cursor| alloc.free(cursor);
+    freeRelationalIndexGenerationComponentCursors(alloc, record.component_cursors);
+    freeRelationalIndexRebuildLeases(alloc, record.rebuild_leases);
+}
+
+fn freeRelationalIndexGenerationComponentCursors(
+    alloc: std.mem.Allocator,
+    cursors: storage_schema.RelationalIndexGenerationComponentCursors,
+) void {
+    if (cursors.dictionary) |cursor| alloc.free(cursor);
+    if (cursors.fact) |cursor| alloc.free(cursor);
+    if (cursors.path) |cursor| alloc.free(cursor);
+    if (cursors.postings) |cursor| alloc.free(cursor);
 }
 
 fn freeRelationalIndexOwnerRanges(alloc: std.mem.Allocator, ranges: []const storage_schema.RelationalIndexOwnerRange) void {
     for (ranges) |range| {
-        alloc.free(range.start);
-        alloc.free(range.end);
-        if (range.range_id) |range_id| alloc.free(range_id);
+        freeParsedRelationalIndexOwnerRange(alloc, range);
     }
     if (ranges.len > 0) alloc.free(ranges);
+}
+
+fn freeRelationalIndexRebuildLeases(alloc: std.mem.Allocator, leases: []const storage_schema.RelationalIndexRebuildLease) void {
+    for (leases) |lease| {
+        freeParsedRelationalIndexOwnerRange(alloc, lease.owner_range);
+        alloc.free(lease.holder);
+        alloc.free(lease.cursor);
+    }
+    if (leases.len > 0) alloc.free(leases);
 }
 
 fn freeStringSlice(alloc: std.mem.Allocator, values: []const []const u8) void {
@@ -1571,7 +1591,10 @@ fn validateRelationalIndexGenerationRecord(value: std.json.Value) !void {
             !std.mem.eql(u8, entry.key_ptr.*, "lag") and
             !std.mem.eql(u8, entry.key_ptr.*, "failure_reason") and
             !std.mem.eql(u8, entry.key_ptr.*, "ready_watermark") and
-            !std.mem.eql(u8, entry.key_ptr.*, "rebuild_cursor"))
+            !std.mem.eql(u8, entry.key_ptr.*, "rebuild_cursor") and
+            !std.mem.eql(u8, entry.key_ptr.*, "components") and
+            !std.mem.eql(u8, entry.key_ptr.*, "component_cursors") and
+            !std.mem.eql(u8, entry.key_ptr.*, "rebuild_leases"))
         {
             return error.InvalidSchemaUpdateRequest;
         }
@@ -1592,9 +1615,48 @@ fn validateRelationalIndexGenerationRecord(value: std.json.Value) !void {
     if (object.get("rebuild_cursor")) |cursor| {
         if (cursor != .string) return error.InvalidSchemaUpdateRequest;
     }
+    if (object.get("components")) |components| try validateRelationalIndexGenerationComponents(components);
+    if (object.get("component_cursors")) |cursors| try validateRelationalIndexGenerationComponentCursors(cursors);
+    if (object.get("rebuild_leases")) |leases| try validateRelationalIndexRebuildLeases(leases);
 }
 
-fn validateRelationalIndexOwnerRanges(value: std.json.Value) !void {
+fn validateRelationalIndexGenerationComponents(value: std.json.Value) !void {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    var field_it = object.iterator();
+    while (field_it.next()) |entry| {
+        if (!std.mem.eql(u8, entry.key_ptr.*, "dictionary") and
+            !std.mem.eql(u8, entry.key_ptr.*, "fact") and
+            !std.mem.eql(u8, entry.key_ptr.*, "path") and
+            !std.mem.eql(u8, entry.key_ptr.*, "postings"))
+        {
+            return error.InvalidSchemaUpdateRequest;
+        }
+        if (entry.value_ptr.* != .bool) return error.InvalidSchemaUpdateRequest;
+    }
+}
+
+fn validateRelationalIndexGenerationComponentCursors(value: std.json.Value) !void {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    var field_it = object.iterator();
+    while (field_it.next()) |entry| {
+        if (!std.mem.eql(u8, entry.key_ptr.*, "dictionary") and
+            !std.mem.eql(u8, entry.key_ptr.*, "fact") and
+            !std.mem.eql(u8, entry.key_ptr.*, "path") and
+            !std.mem.eql(u8, entry.key_ptr.*, "postings"))
+        {
+            return error.InvalidSchemaUpdateRequest;
+        }
+        if (entry.value_ptr.* != .string) return error.InvalidSchemaUpdateRequest;
+    }
+}
+
+fn validateRelationalIndexRebuildLeases(value: std.json.Value) !void {
     const array = switch (value) {
         .array => |array| array,
         else => return error.InvalidSchemaUpdateRequest,
@@ -1606,24 +1668,62 @@ fn validateRelationalIndexOwnerRanges(value: std.json.Value) !void {
         };
         var field_it = object.iterator();
         while (field_it.next()) |entry| {
-            if (!std.mem.eql(u8, entry.key_ptr.*, "start") and
-                !std.mem.eql(u8, entry.key_ptr.*, "end") and
-                !std.mem.eql(u8, entry.key_ptr.*, "range_id") and
-                !std.mem.eql(u8, entry.key_ptr.*, "placement_generation"))
+            if (!std.mem.eql(u8, entry.key_ptr.*, "owner_range") and
+                !std.mem.eql(u8, entry.key_ptr.*, "holder") and
+                !std.mem.eql(u8, entry.key_ptr.*, "cursor") and
+                !std.mem.eql(u8, entry.key_ptr.*, "expires_at_ms") and
+                !std.mem.eql(u8, entry.key_ptr.*, "generation"))
             {
                 return error.InvalidSchemaUpdateRequest;
             }
         }
-        const start = object.get("start") orelse return error.InvalidSchemaUpdateRequest;
-        if (start != .string) return error.InvalidSchemaUpdateRequest;
-        const end = object.get("end") orelse return error.InvalidSchemaUpdateRequest;
-        if (end != .string) return error.InvalidSchemaUpdateRequest;
-        if (object.get("range_id")) |range_id| {
-            if (range_id != .string or range_id.string.len == 0) return error.InvalidSchemaUpdateRequest;
+        const owner_range = object.get("owner_range") orelse return error.InvalidSchemaUpdateRequest;
+        try validateRelationalIndexOwnerRange(owner_range);
+        const holder = object.get("holder") orelse return error.InvalidSchemaUpdateRequest;
+        if (holder != .string or holder.string.len == 0) return error.InvalidSchemaUpdateRequest;
+        const cursor = object.get("cursor") orelse return error.InvalidSchemaUpdateRequest;
+        if (cursor != .string or cursor.string.len == 0) return error.InvalidSchemaUpdateRequest;
+        const expires_at_ms = object.get("expires_at_ms") orelse return error.InvalidSchemaUpdateRequest;
+        if (expires_at_ms != .integer or expires_at_ms.integer <= 0) return error.InvalidSchemaUpdateRequest;
+        const generation = object.get("generation") orelse return error.InvalidSchemaUpdateRequest;
+        if (generation != .integer or generation.integer <= 0) return error.InvalidSchemaUpdateRequest;
+    }
+}
+
+fn validateRelationalIndexOwnerRanges(value: std.json.Value) !void {
+    const array = switch (value) {
+        .array => |array| array,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    for (array.items) |item| {
+        try validateRelationalIndexOwnerRange(item);
+    }
+}
+
+fn validateRelationalIndexOwnerRange(value: std.json.Value) !void {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    var field_it = object.iterator();
+    while (field_it.next()) |entry| {
+        if (!std.mem.eql(u8, entry.key_ptr.*, "start") and
+            !std.mem.eql(u8, entry.key_ptr.*, "end") and
+            !std.mem.eql(u8, entry.key_ptr.*, "range_id") and
+            !std.mem.eql(u8, entry.key_ptr.*, "placement_generation"))
+        {
+            return error.InvalidSchemaUpdateRequest;
         }
-        if (object.get("placement_generation")) |generation| {
-            if (generation != .integer or generation.integer < 0) return error.InvalidSchemaUpdateRequest;
-        }
+    }
+    const start = object.get("start") orelse return error.InvalidSchemaUpdateRequest;
+    if (start != .string) return error.InvalidSchemaUpdateRequest;
+    const end = object.get("end") orelse return error.InvalidSchemaUpdateRequest;
+    if (end != .string) return error.InvalidSchemaUpdateRequest;
+    if (object.get("range_id")) |range_id| {
+        if (range_id != .string or range_id.string.len == 0) return error.InvalidSchemaUpdateRequest;
+    }
+    if (object.get("placement_generation")) |generation| {
+        if (generation != .integer or generation.integer < 0) return error.InvalidSchemaUpdateRequest;
     }
 }
 
@@ -6024,15 +6124,93 @@ fn parseRelationalIndexGenerationRecordAlloc(
     value: std.json.Value,
 ) !storage_schema.RelationalIndexGenerationRecord {
     const object = value.object;
+    const owner_ranges = try parseRelationalIndexOwnerRangesAlloc(alloc, object.get("owner_ranges").?);
+    errdefer freeRelationalIndexOwnerRanges(alloc, owner_ranges);
+    const failure_reason = if (object.get("failure_reason")) |reason| try alloc.dupe(u8, reason.string) else null;
+    errdefer if (failure_reason) |reason| alloc.free(reason);
+    const rebuild_cursor = if (object.get("rebuild_cursor")) |cursor| try alloc.dupe(u8, cursor.string) else null;
+    errdefer if (rebuild_cursor) |cursor| alloc.free(cursor);
+    const component_cursors = if (object.get("component_cursors")) |cursors| try parseRelationalIndexGenerationComponentCursorsAlloc(alloc, cursors.object) else storage_schema.RelationalIndexGenerationComponentCursors{};
+    errdefer freeRelationalIndexGenerationComponentCursors(alloc, component_cursors);
+    const rebuild_leases = if (object.get("rebuild_leases")) |leases| try parseRelationalIndexRebuildLeasesAlloc(alloc, leases) else &.{};
+    errdefer freeRelationalIndexRebuildLeases(alloc, rebuild_leases);
     return .{
         .generation = @intCast(object.get("generation").?.integer),
-        .owner_ranges = try parseRelationalIndexOwnerRangesAlloc(alloc, object.get("owner_ranges").?),
+        .owner_ranges = owner_ranges,
         .lifecycle = storageRelationalIndexLifecycleFromString(object.get("lifecycle").?.string).?,
         .lag = @intCast(object.get("lag").?.integer),
-        .failure_reason = if (object.get("failure_reason")) |reason| try alloc.dupe(u8, reason.string) else null,
+        .failure_reason = failure_reason,
         .ready_watermark = @intCast(object.get("ready_watermark").?.integer),
-        .rebuild_cursor = if (object.get("rebuild_cursor")) |cursor| try alloc.dupe(u8, cursor.string) else null,
+        .rebuild_cursor = rebuild_cursor,
+        .components = if (object.get("components")) |components| parseRelationalIndexGenerationComponents(components.object) else .{},
+        .component_cursors = component_cursors,
+        .rebuild_leases = rebuild_leases,
     };
+}
+
+fn parseRelationalIndexGenerationComponents(object: std.json.ObjectMap) storage_schema.RelationalIndexGenerationComponents {
+    return .{
+        .dictionary = if (object.get("dictionary")) |value| value.bool else true,
+        .fact = if (object.get("fact")) |value| value.bool else true,
+        .path = if (object.get("path")) |value| value.bool else true,
+        .postings = if (object.get("postings")) |value| value.bool else true,
+    };
+}
+
+fn parseRelationalIndexGenerationComponentCursorsAlloc(
+    alloc: std.mem.Allocator,
+    object: std.json.ObjectMap,
+) !storage_schema.RelationalIndexGenerationComponentCursors {
+    const dictionary = if (object.get("dictionary")) |value| try alloc.dupe(u8, value.string) else null;
+    errdefer if (dictionary) |cursor| alloc.free(cursor);
+    const fact = if (object.get("fact")) |value| try alloc.dupe(u8, value.string) else null;
+    errdefer if (fact) |cursor| alloc.free(cursor);
+    const path = if (object.get("path")) |value| try alloc.dupe(u8, value.string) else null;
+    errdefer if (path) |cursor| alloc.free(cursor);
+    const postings = if (object.get("postings")) |value| try alloc.dupe(u8, value.string) else null;
+    errdefer if (postings) |cursor| alloc.free(cursor);
+    return .{
+        .dictionary = dictionary,
+        .fact = fact,
+        .path = path,
+        .postings = postings,
+    };
+}
+
+fn parseRelationalIndexRebuildLeasesAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) ![]const storage_schema.RelationalIndexRebuildLease {
+    const array = value.array;
+    if (array.items.len == 0) return &.{};
+    const out = try alloc.alloc(storage_schema.RelationalIndexRebuildLease, array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |lease| {
+            freeParsedRelationalIndexOwnerRange(alloc, lease.owner_range);
+            alloc.free(lease.holder);
+            alloc.free(lease.cursor);
+        }
+        alloc.free(out);
+    }
+    for (array.items) |item| {
+        const object = item.object;
+        const owner_range = try parseRelationalIndexOwnerRangeAlloc(alloc, object.get("owner_range").?);
+        errdefer freeParsedRelationalIndexOwnerRange(alloc, owner_range);
+        const holder = try alloc.dupe(u8, object.get("holder").?.string);
+        errdefer alloc.free(holder);
+        const cursor = try alloc.dupe(u8, object.get("cursor").?.string);
+        errdefer alloc.free(cursor);
+        out[initialized] = .{
+            .owner_range = owner_range,
+            .holder = holder,
+            .cursor = cursor,
+            .expires_at_ms = @intCast(object.get("expires_at_ms").?.integer),
+            .generation = @intCast(object.get("generation").?.integer),
+        };
+        initialized += 1;
+    }
+    return out;
 }
 
 fn parseRelationalIndexOwnerRangesAlloc(
@@ -6052,25 +6230,41 @@ fn parseRelationalIndexOwnerRangesAlloc(
         alloc.free(out);
     }
     for (array.items) |item| {
-        const object = item.object;
-        const start = try alloc.dupe(u8, object.get("start").?.string);
-        errdefer alloc.free(start);
-        const end = try alloc.dupe(u8, object.get("end").?.string);
-        errdefer alloc.free(end);
-        const range_id = if (object.get("range_id")) |range_id_value|
-            try alloc.dupe(u8, range_id_value.string)
-        else
-            null;
-        errdefer if (range_id) |value_id| alloc.free(value_id);
-        out[initialized] = .{
-            .start = start,
-            .end = end,
-            .range_id = range_id,
-            .placement_generation = if (object.get("placement_generation")) |generation| @intCast(generation.integer) else 0,
-        };
+        out[initialized] = try parseRelationalIndexOwnerRangeAlloc(alloc, item);
         initialized += 1;
     }
     return out;
+}
+
+fn parseRelationalIndexOwnerRangeAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !storage_schema.RelationalIndexOwnerRange {
+    const object = value.object;
+    const start = try alloc.dupe(u8, object.get("start").?.string);
+    errdefer alloc.free(start);
+    const end = try alloc.dupe(u8, object.get("end").?.string);
+    errdefer alloc.free(end);
+    const range_id = if (object.get("range_id")) |range_id_value|
+        try alloc.dupe(u8, range_id_value.string)
+    else
+        null;
+    errdefer if (range_id) |value_id| alloc.free(value_id);
+    return .{
+        .start = start,
+        .end = end,
+        .range_id = range_id,
+        .placement_generation = if (object.get("placement_generation")) |generation| @intCast(generation.integer) else 0,
+    };
+}
+
+fn freeParsedRelationalIndexOwnerRange(
+    alloc: std.mem.Allocator,
+    range: storage_schema.RelationalIndexOwnerRange,
+) void {
+    alloc.free(range.start);
+    alloc.free(range.end);
+    if (range.range_id) |range_id| alloc.free(range_id);
 }
 
 fn parseRelationalIndexPlannerCapabilities(object: std.json.ObjectMap) storage_schema.RelationalIndexPlannerCapabilities {
@@ -8821,7 +9015,7 @@ test "parse relational table-owned algebraic index metadata" {
     const alloc = std.testing.allocator;
 
     var valid = try parseSchema(alloc,
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"row_algebraic_idx","owner_kind":"table","owner_name":"__antfly_table__","access_method":"algebraic_filter","method_config":{"type":"algebraic","derive_from_schema":true},"generation":1,"schema_fingerprint":"secondary-index-v1:row_algebraic","generation_record":{"generation":1,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"row_algebraic_idx","owner_kind":"table","owner_name":"__antfly_table__","access_method":"algebraic_filter","method_config":{"type":"algebraic","derive_from_schema":true},"generation":1,"schema_fingerprint":"secondary-index-v1:row_algebraic","generation_record":{"generation":1,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0,"components":{"dictionary":true,"fact":false,"path":true,"postings":false},"component_cursors":{"fact":"row:f","postings":"row:p"},"rebuild_leases":[{"owner_range":{"start":"","end":""},"holder":"worker-1","cursor":"row:c","expires_at_ms":1234,"generation":1}]}}]}
     );
     defer valid.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), valid.relational_indexes.len);
@@ -8830,6 +9024,20 @@ test "parse relational table-owned algebraic index metadata" {
     try std.testing.expectEqual(storage_schema.RelationalIndexAccessMethod.algebraic_filter, valid.relational_indexes[0].access_method);
     try std.testing.expectEqual(@as(usize, 0), valid.relational_indexes[0].columns.len);
     try std.testing.expectEqualStrings("{\"type\":\"algebraic\",\"derive_from_schema\":true}", valid.relational_indexes[0].method_config_json.?);
+    const algebraic_record = valid.relational_indexes[0].generation_record orelse return error.TestUnexpectedResult;
+    try std.testing.expect(algebraic_record.components.dictionary);
+    try std.testing.expect(!algebraic_record.components.fact);
+    try std.testing.expect(algebraic_record.components.path);
+    try std.testing.expect(!algebraic_record.components.postings);
+    try std.testing.expect(algebraic_record.component_cursors.dictionary == null);
+    try std.testing.expectEqualStrings("row:f", algebraic_record.component_cursors.fact.?);
+    try std.testing.expect(algebraic_record.component_cursors.path == null);
+    try std.testing.expectEqualStrings("row:p", algebraic_record.component_cursors.postings.?);
+    try std.testing.expectEqual(@as(usize, 1), algebraic_record.rebuild_leases.len);
+    try std.testing.expectEqualStrings("worker-1", algebraic_record.rebuild_leases[0].holder);
+    try std.testing.expectEqualStrings("row:c", algebraic_record.rebuild_leases[0].cursor);
+    try std.testing.expectEqual(@as(u64, 1234), algebraic_record.rebuild_leases[0].expires_at_ms);
+    try std.testing.expectEqual(@as(u64, 1), algebraic_record.rebuild_leases[0].generation);
 
     var valid_text_search = try parseSchema(alloc,
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"body":{"type":"text"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"body_text_idx","owner_kind":"relational_column","owner_name":"body","access_method":"text_search","method_config":{"type":"full_text","field":"body","analyzer":"standard","scoring":"bm25","highlight":true,"snippet":true},"columns":["body"],"generation":3,"schema_fingerprint":"secondary-index-v1:body","owner_ranges":[{"start":"row:a","end":"row:z","range_id":"range-a","placement_generation":1}],"generation_record":{"generation":3,"owner_ranges":[{"start":"row:a","end":"row:z","range_id":"range-a","placement_generation":1}],"lifecycle":"ready","lag":0,"ready_watermark":42}}]}
@@ -8857,6 +9065,48 @@ test "parse relational table-owned algebraic index metadata" {
             .name = "algebraic missing generation record",
             .schema_json =
             \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"row_algebraic_idx","owner_kind":"table","owner_name":"__antfly_table__","access_method":"algebraic_filter","method_config":{"type":"algebraic","derive_from_schema":true},"generation":1,"schema_fingerprint":"secondary-index-v1:row_algebraic"}]}
+            ,
+        },
+        .{
+            .name = "algebraic generation components wrong type",
+            .schema_json =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"row_algebraic_idx","owner_kind":"table","owner_name":"__antfly_table__","access_method":"algebraic_filter","method_config":{"type":"algebraic","derive_from_schema":true},"generation":1,"schema_fingerprint":"secondary-index-v1:row_algebraic","generation_record":{"generation":1,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0,"components":{"dictionary":"yes"}}}]}
+            ,
+        },
+        .{
+            .name = "algebraic generation components unknown field",
+            .schema_json =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"row_algebraic_idx","owner_kind":"table","owner_name":"__antfly_table__","access_method":"algebraic_filter","method_config":{"type":"algebraic","derive_from_schema":true},"generation":1,"schema_fingerprint":"secondary-index-v1:row_algebraic","generation_record":{"generation":1,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0,"components":{"dictionary":true,"unknown":false}}}]}
+            ,
+        },
+        .{
+            .name = "algebraic generation component cursor wrong type",
+            .schema_json =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"row_algebraic_idx","owner_kind":"table","owner_name":"__antfly_table__","access_method":"algebraic_filter","method_config":{"type":"algebraic","derive_from_schema":true},"generation":1,"schema_fingerprint":"secondary-index-v1:row_algebraic","generation_record":{"generation":1,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0,"component_cursors":{"fact":9}}}]}
+            ,
+        },
+        .{
+            .name = "algebraic generation component cursor unknown field",
+            .schema_json =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"row_algebraic_idx","owner_kind":"table","owner_name":"__antfly_table__","access_method":"algebraic_filter","method_config":{"type":"algebraic","derive_from_schema":true},"generation":1,"schema_fingerprint":"secondary-index-v1:row_algebraic","generation_record":{"generation":1,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0,"component_cursors":{"unknown":"row:x"}}}]}
+            ,
+        },
+        .{
+            .name = "algebraic rebuild lease missing holder",
+            .schema_json =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"row_algebraic_idx","owner_kind":"table","owner_name":"__antfly_table__","access_method":"algebraic_filter","method_config":{"type":"algebraic","derive_from_schema":true},"generation":1,"schema_fingerprint":"secondary-index-v1:row_algebraic","generation_record":{"generation":1,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0,"rebuild_leases":[{"owner_range":{"start":"","end":""},"cursor":"row:c","expires_at_ms":1234,"generation":1}]}}]}
+            ,
+        },
+        .{
+            .name = "algebraic rebuild lease missing cursor",
+            .schema_json =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"row_algebraic_idx","owner_kind":"table","owner_name":"__antfly_table__","access_method":"algebraic_filter","method_config":{"type":"algebraic","derive_from_schema":true},"generation":1,"schema_fingerprint":"secondary-index-v1:row_algebraic","generation_record":{"generation":1,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0,"rebuild_leases":[{"owner_range":{"start":"","end":""},"holder":"worker-1","expires_at_ms":1234,"generation":1}]}}]}
+            ,
+        },
+        .{
+            .name = "algebraic rebuild lease malformed record",
+            .schema_json =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"row_algebraic_idx","owner_kind":"table","owner_name":"__antfly_table__","access_method":"algebraic_filter","method_config":{"type":"algebraic","derive_from_schema":true},"generation":1,"schema_fingerprint":"secondary-index-v1:row_algebraic","generation_record":{"generation":1,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0,"rebuild_leases":[{"owner_range":{"start":"","end":""},"holder":"worker-1","cursor":"row:c","expires_at_ms":0,"generation":1}]}}]}
             ,
         },
         .{

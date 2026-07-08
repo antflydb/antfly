@@ -135,11 +135,22 @@ Benchmark sources are grouped by domain, while build step names stay stable:
 zig build search-bench-build
 zig build text-segment-write-bench
 zig build lsm-backend-bench
+zig build relational-read-bench
 zig build wal-bench
 zig build dense-stack-bench-build
 zig build hbc-read-bench
 zig build json-bench
 zig build regex-bench
+```
+
+`relational-read-bench` emits JSONL with a stable `schema_version`.
+`relational_read_bench_result` rows include `plan_class`, per-query latency,
+planner counters, retained candidate rows, and covering-payload counters so
+ordered-tuple stream, doc-set, and base-scan plans can be compared directly:
+
+```sh
+zig build relational-read-bench -- --samples 1 --rows 10000 --repeats 3 --batch-size 1000 --limit 100
+zig build relational-read-bench -- --mode ordered_tuple --rows 10000 --repeats 3 --batch-size 1000 --limit 100
 ```
 
 The `search-benchmark-game/engines/antfly-zig` directory is an adapter for the

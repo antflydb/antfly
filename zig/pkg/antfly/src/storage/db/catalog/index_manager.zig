@@ -807,6 +807,17 @@ pub const IndexManager = struct {
         index: algebraic_mod.index.Index,
     };
 
+    pub const RelationalIndexWorkerPageResult = struct {
+        units_queued: u64 = 0,
+        units_running: u64 = 0,
+        units_throttled: u64 = 0,
+        units_completed: u64 = 0,
+        cursor: []const u8 = "",
+        complete: bool = false,
+        failure_reason: ?[]const u8 = null,
+        stale_generation: bool = false,
+    };
+
     pub const TextMergeSourceSegment = struct {
         id: u64,
         deleted: ?roaring.RoaringBitmap = null,
@@ -1562,6 +1573,76 @@ pub const IndexManager = struct {
         entry.config.config_json = owned;
     }
 
+    pub fn repairRelationalTextSearchFromRows(
+        self: *IndexManager,
+        store: *docstore_mod.DocStore,
+        index_name: []const u8,
+        max_work_units: usize,
+    ) !RelationalIndexWorkerPageResult {
+        if (max_work_units == 0) return .{
+            .units_queued = 1,
+            .units_throttled = 1,
+            .failure_reason = "repair_budget_exhausted",
+        };
+        const entry = self.textIndexEntry(index_name) orelse return error.IndexNotFound;
+        lockIndexApplyMutex(entry.apply_mutex);
+        defer entry.apply_mutex.*.unlock();
+
+        const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
+        try rebuild_state.clear();
+
+        const removed_segments = try self.removeActiveTextSegments(entry);
+        try self.backfillTextIndex(store, entry, null);
+        try self.saveBackfilledAppliedSequence(store, entry.config);
+        return .{
+            .units_queued = 1,
+            .units_running = 1,
+            .units_completed = @max(@as(u64, 1), removed_segments),
+            .complete = true,
+        };
+    }
+
+    pub fn repairRelationalAlgebraicFromRows(
+        self: *IndexManager,
+        store: *docstore_mod.DocStore,
+        index_name: []const u8,
+        max_work_units: usize,
+    ) !RelationalIndexWorkerPageResult {
+        if (max_work_units == 0) return .{
+            .units_queued = 1,
+            .units_throttled = 1,
+            .failure_reason = "repair_budget_exhausted",
+        };
+        const entry = self.algebraicIndex(index_name) orelse return error.IndexNotFound;
+        lockIndexApplyMutex(entry.apply_mutex);
+        defer entry.apply_mutex.*.unlock();
+
+        const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
+        try rebuild_state.clear();
+
+        const rebuilt = try self.rebuildAlgebraicIndexFromBaseRows(store, entry);
+        try self.saveBackfilledAppliedSequence(store, entry.config);
+        return .{
+            .units_queued = 1,
+            .units_running = 1,
+            .units_completed = @max(@as(u64, 1), @as(u64, @intCast(rebuilt))),
+            .complete = true,
+        };
+    }
+
+    fn lockIndexApplyMutex(mutex: *std.atomic.Mutex) void {
+        while (!mutex.*.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn removeActiveTextSegments(self: *IndexManager, entry: *TextIndex) !u64 {
+        const ids = try entry.persistent.activeSegmentIdsAlloc(self.alloc);
+        defer self.alloc.free(ids);
+        if (ids.len == 0) return 0;
+
+        try entry.persistent.removeSegments(ids);
+        return @intCast(ids.len);
+    }
+
     fn rebuildAlgebraicIndexFromBaseRows(self: *IndexManager, store: *docstore_mod.DocStore, entry: *AlgebraicIndex) !usize {
         const lower = try internal_keys.documentRangeLowerAlloc(self.alloc, self.byte_range.start);
         defer self.alloc.free(lower);
@@ -1574,6 +1655,30 @@ pub const IndexManager = struct {
         if (resume_from == null) {
             _ = try entry.index.clearPersistedRows(store);
             try rebuild_state.update("");
+        }
+
+        const ready_watermark = try self.backfilledAppliedSequenceForConfig(store, entry.config);
+        const total_visible_docs = try self.countAlgebraicBackfillVisibleDocs(store, lower, upper, resume_from);
+        try self.updateAlgebraicGenerationRecord(store, entry, .{
+            .lifecycle = .building,
+            .lag = total_visible_docs,
+            .ready_watermark = ready_watermark,
+            .rebuild_cursor = resume_from,
+            .components = schema_mod.relational_index_generation_components_none,
+            .component_cursors = algebraicGenerationComponentCursors(resume_from),
+        });
+        var last_progress_cursor: ?[]const u8 = resume_from;
+        var last_progress_lag = total_visible_docs;
+        errdefer |err| {
+            self.updateAlgebraicGenerationRecord(store, entry, .{
+                .lifecycle = .failed,
+                .lag = last_progress_lag,
+                .ready_watermark = ready_watermark,
+                .rebuild_cursor = last_progress_cursor,
+                .failure_reason = @errorName(err),
+                .components = schema_mod.relational_index_generation_components_none,
+                .component_cursors = algebraicGenerationComponentCursors(last_progress_cursor),
+            }) catch {};
         }
 
         try entry.index.beginBulkIngestSession();
@@ -1672,6 +1777,16 @@ pub const IndexManager = struct {
                 try rebuild_state.update(key);
                 self.alloc.free(scan_after);
                 scan_after = try self.alloc.dupe(u8, key);
+                last_progress_cursor = scan_after;
+                last_progress_lag = total_visible_docs -| rebuilt;
+                try self.updateAlgebraicGenerationRecord(store, entry, .{
+                    .lifecycle = .building,
+                    .lag = last_progress_lag,
+                    .ready_watermark = ready_watermark,
+                    .rebuild_cursor = scan_after,
+                    .components = schema_mod.relational_index_generation_components_none,
+                    .component_cursors = algebraicGenerationComponentCursors(scan_after),
+                });
             }
             if (docs.items.len > 0 and @import("builtin").is_test) {
                 if (test_abort_algebraic_backfill_after_batches) |limit| {
@@ -1690,8 +1805,103 @@ pub const IndexManager = struct {
 
         try entry.index.finishBulkIngestSessionWithOptions(store, .{});
         bulk_session_open = false;
-        if (completed) try rebuild_state.clear();
+        if (completed) {
+            try rebuild_state.clear();
+            try self.promoteAlgebraicGenerationRecordReady(store, entry, ready_watermark);
+        }
         return rebuilt;
+    }
+
+    fn algebraicGenerationComponentCursors(cursor: ?[]const u8) schema_mod.RelationalIndexGenerationComponentCursors {
+        return .{
+            .dictionary = cursor,
+            .fact = cursor,
+            .path = cursor,
+            .postings = cursor,
+        };
+    }
+
+    fn countAlgebraicBackfillVisibleDocs(
+        self: *IndexManager,
+        store: *docstore_mod.DocStore,
+        lower: []const u8,
+        upper: ?[]const u8,
+        resume_from: ?[]const u8,
+    ) !u64 {
+        var visible_count: u64 = 0;
+        var txn = try store.beginReadTxn();
+        defer txn.abort();
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        cursor.setUpperBound(upper);
+
+        const start = if (resume_from) |resume_key| if (resume_key.len > 0) resume_key else lower else lower;
+        var row_opt = try cursor.seekAtOrAfter(start);
+        while (row_opt) |row| : (row_opt = try cursor.next()) {
+            if (upper) |buf| {
+                if (std.mem.order(u8, row.key, buf) != .lt) break;
+            }
+            if (resume_from) |resume_key| {
+                if (resume_key.len > 0 and std.mem.order(u8, row.key, resume_key) != .gt) continue;
+            }
+            if (isMetadataKey(row.key) or !self.visibleBaseDocumentRowKey(row.key)) continue;
+            const doc_id = (try internal_keys.decodeStoredDocumentRowKeyAlloc(self.alloc, row.key)) orelse continue;
+            if (!self.keyInRange(doc_id)) {
+                self.alloc.free(doc_id);
+                continue;
+            }
+            self.alloc.free(doc_id);
+            visible_count += 1;
+        }
+        return visible_count;
+    }
+
+    fn updateAlgebraicGenerationRecord(
+        self: *IndexManager,
+        store: *docstore_mod.DocStore,
+        entry: *const AlgebraicIndex,
+        progress: schema_mod.RelationalIndexGenerationProgress,
+    ) !void {
+        _ = try schema_mod.updateRelationalIndexGenerationRecord(
+            store,
+            self.alloc,
+            .algebraic_filter,
+            entry.config.name,
+            progress,
+        );
+    }
+
+    fn promoteAlgebraicGenerationRecordReady(
+        self: *IndexManager,
+        store: *docstore_mod.DocStore,
+        entry: *const AlgebraicIndex,
+        ready_watermark: u64,
+    ) !void {
+        const maybe_schema = try schema_mod.loadSchema(store, self.alloc);
+        const active_schema = maybe_schema orelse return;
+        defer schema_mod.freeSchema(self.alloc, active_schema);
+        if (active_schema.storage_mode != .relational) return;
+
+        for (active_schema.relational_indexes) |index| {
+            if (index.access_method != .algebraic_filter) continue;
+            if (!std.mem.eql(u8, index.name, entry.config.name)) continue;
+            const result = try schema_mod.promoteRelationalIndexComponentsReady(store, self.alloc, .{
+                .index_name = entry.config.name,
+                .expected_generation = index.generation,
+                .owner_ranges = index.owner_ranges,
+                .ready_watermark = ready_watermark,
+                .components = .{},
+            });
+            switch (result) {
+                .promoted, .already_ready => return,
+                .schema_missing, .non_relational_schema, .index_not_found, .wrong_access_method => return,
+                .generation_mismatch, .malformed_record, .stale_record, .owner_ranges_mismatch => {
+                    std.log.warn("algebraic relational generation promotion failed name={s} result={s}", .{ entry.config.name, @tagName(result) });
+                    return error.RelationalIndexGenerationPromotionFailed;
+                },
+            }
+        }
+        return;
     }
 
     fn markJsonSubdocumentDomainLifecycles(new_config: *algebraic_mod.index.Config, current: algebraic_mod.index.Config) void {
@@ -6922,12 +7132,7 @@ pub const IndexManager = struct {
         }
 
         if (!saw_visible_doc or flushed_batches > 0) try rebuild_state.clear();
-        try self.updateTextSearchGenerationRecord(store, entry, .{
-            .lifecycle = .ready,
-            .lag = 0,
-            .ready_watermark = ready_watermark,
-            .rebuild_cursor = null,
-        });
+        try self.promoteTextSearchGenerationRecordReady(store, entry, ready_watermark);
         if (flushed_batches > 0) try entry.persistent.checkpointLsmWalAfterDurableBoundary();
     }
 
@@ -6966,6 +7171,39 @@ pub const IndexManager = struct {
             entry.config.name,
             progress,
         );
+    }
+
+    fn promoteTextSearchGenerationRecordReady(
+        self: *IndexManager,
+        store: *docstore_mod.DocStore,
+        entry: *const TextIndex,
+        ready_watermark: u64,
+    ) !void {
+        const maybe_schema = try schema_mod.loadSchema(store, self.alloc);
+        const active_schema = maybe_schema orelse return;
+        defer schema_mod.freeSchema(self.alloc, active_schema);
+        if (active_schema.storage_mode != .relational) return;
+
+        for (active_schema.relational_indexes) |index| {
+            if (index.access_method != .text_search) continue;
+            if (!std.mem.eql(u8, index.name, entry.config.name)) continue;
+            const result = try schema_mod.promoteRelationalIndexRangesReady(store, self.alloc, .{
+                .access_method = .text_search,
+                .index_name = entry.config.name,
+                .expected_generation = index.generation,
+                .owner_ranges = index.owner_ranges,
+                .ready_watermark = ready_watermark,
+            });
+            switch (result) {
+                .promoted, .already_ready => return,
+                .schema_missing, .non_relational_schema, .index_not_found, .wrong_access_method => return,
+                .generation_mismatch, .malformed_record, .stale_record, .owner_ranges_mismatch => {
+                    std.log.warn("full_text relational generation promotion failed name={s} result={s}", .{ entry.config.name, @tagName(result) });
+                    return error.RelationalIndexGenerationPromotionFailed;
+                },
+            }
+        }
+        return;
     }
 
     fn indexPath(self: *const IndexManager, name: []const u8) ![]u8 {
@@ -14619,7 +14857,7 @@ test "index manager embedded json schema rebuild resumes after failure and reope
         \\{"version":11,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"attrs":{"type":"json","schema":{"type":"object","properties":{"old_field":{"type":"keyword"},"new_field":{"type":"keyword"}},"additionalProperties":true}}},"required":["id"],"additionalProperties":false}}}}
     ;
     const schema_v2 =
-        \\{"version":12,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"attrs":{"type":"json","schema":{"type":"object","properties":{"new_field":{"type":"keyword"}},"additionalProperties":true}}},"required":["id"],"additionalProperties":false}}}}
+        \\{"version":12,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"attrs":{"type":"json","schema":{"type":"object","properties":{"new_field":{"type":"keyword"}},"additionalProperties":true}}},"required":["id"],"additionalProperties":false}}},"relational_indexes":[{"name":"alg","owner_kind":"table","owner_name":"__antfly_table__","access_method":"algebraic_filter","method_config":{"type":"algebraic","derive_from_schema":true},"lifecycle":"catching_up","generation":7,"schema_fingerprint":"secondary-index-v1:alg","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"catching_up","lag":2,"ready_watermark":0,"rebuild_cursor":""}}]}
     ;
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -14662,17 +14900,38 @@ test "index manager embedded json schema rebuild resumes after failure and reope
             },
         }, .{ .mode = .bulk_ingest });
         try std.testing.expectEqual(@as(usize, 2), try countDocFactScalarKeysContaining(alloc, &store, "old_field"));
+        try std.testing.expectEqual(@as(usize, 2), try countAlgebraicKeysContaining(alloc, &store, "pathfact", "old_field"));
 
         try saveRuntimeSchemaJsonForIndexManagerTest(alloc, &store, schema_v2);
         test_algebraic_backfill_batch_size = 1;
         test_abort_algebraic_backfill_after_batches = 1;
         try std.testing.expectError(error.TestInjectedBackfillFailure, manager.reloadAlgebraicSchemaConfigs(&store, schema_v2));
 
+        const interrupted_schema = (try schema_mod.loadSchema(&store, alloc)) orelse return error.TestUnexpectedResult;
+        defer schema_mod.freeSchema(alloc, interrupted_schema);
+        const interrupted_record = interrupted_schema.relational_indexes[0].generation_record orelse return error.TestExpectedEqual;
+        try std.testing.expectEqual(schema_mod.RelationalIndexLifecycle.failed, interrupted_record.lifecycle);
+        try std.testing.expectEqual(@as(u64, 7), interrupted_record.generation);
+        try std.testing.expect(interrupted_record.lag > 0);
+        try std.testing.expect(interrupted_record.lag < 2);
+        try std.testing.expect(interrupted_record.rebuild_cursor != null);
+        try std.testing.expectEqualStrings("TestInjectedBackfillFailure", interrupted_record.failure_reason.?);
+        try std.testing.expect(!interrupted_record.components.dictionary);
+        try std.testing.expect(!interrupted_record.components.fact);
+        try std.testing.expect(!interrupted_record.components.path);
+        try std.testing.expect(!interrupted_record.components.postings);
+        const interrupted_cursor = interrupted_record.rebuild_cursor.?;
+        try std.testing.expectEqualStrings(interrupted_cursor, interrupted_record.component_cursors.dictionary.?);
+        try std.testing.expectEqualStrings(interrupted_cursor, interrupted_record.component_cursors.fact.?);
+        try std.testing.expectEqualStrings(interrupted_cursor, interrupted_record.component_cursors.path.?);
+        try std.testing.expectEqualStrings(interrupted_cursor, interrupted_record.component_cursors.postings.?);
+
         const rebuild_state = backfill_state_mod.RebuildState.init(manager.algebraic_indexes.items[0].rebuild_root_path);
         const resume_key = try rebuild_state.check(alloc);
         defer if (resume_key) |key| alloc.free(key);
         try std.testing.expect(resume_key != null);
         try std.testing.expectEqual(@as(usize, 1), try countDocFactScalarKeysContaining(alloc, &store, "new_field"));
+        try std.testing.expectEqual(@as(usize, 1), try countAlgebraicKeysContaining(alloc, &store, "pathfact", "new_field"));
     }
 
     test_abort_algebraic_backfill_after_batches = null;
@@ -14689,11 +14948,29 @@ test "index manager embedded json schema rebuild resumes after failure and reope
         try std.testing.expectEqualStrings("current", reloaded.json_subdocument_domains[0].lifecycle_status);
         try std.testing.expectEqual(@as(usize, 0), try countDocFactScalarKeysContaining(alloc, &store, "old_field"));
         try std.testing.expectEqual(@as(usize, 2), try countDocFactScalarKeysContaining(alloc, &store, "new_field"));
+        try std.testing.expectEqual(@as(usize, 2), try countAlgebraicKeysContaining(alloc, &store, "pathfact", "old_field"));
+        try std.testing.expectEqual(@as(usize, 2), try countAlgebraicKeysContaining(alloc, &store, "pathfact", "new_field"));
 
         const rebuild_state = backfill_state_mod.RebuildState.init(reopened.algebraic_indexes.items[0].rebuild_root_path);
         const cleared_resume_key = try rebuild_state.check(alloc);
         defer if (cleared_resume_key) |key| alloc.free(key);
         try std.testing.expect(cleared_resume_key == null);
+        const completed_schema = (try schema_mod.loadSchema(&store, alloc)) orelse return error.TestUnexpectedResult;
+        defer schema_mod.freeSchema(alloc, completed_schema);
+        const completed_record = completed_schema.relational_indexes[0].generation_record orelse return error.TestExpectedEqual;
+        try std.testing.expectEqual(schema_mod.RelationalIndexLifecycle.ready, completed_record.lifecycle);
+        try std.testing.expectEqual(@as(u64, 7), completed_record.generation);
+        try std.testing.expectEqual(@as(u64, 0), completed_record.lag);
+        try std.testing.expectEqual(@as(u64, 0), completed_record.ready_watermark);
+        try std.testing.expect(completed_record.rebuild_cursor == null);
+        try std.testing.expect(completed_record.components.dictionary);
+        try std.testing.expect(completed_record.components.fact);
+        try std.testing.expect(completed_record.components.path);
+        try std.testing.expect(completed_record.components.postings);
+        try std.testing.expect(completed_record.component_cursors.dictionary == null);
+        try std.testing.expect(completed_record.component_cursors.fact == null);
+        try std.testing.expect(completed_record.component_cursors.path == null);
+        try std.testing.expect(completed_record.component_cursors.postings == null);
         try std.testing.expect(std.mem.indexOf(u8, reopened.algebraic_indexes.items[0].config.config_json, "\"lifecycle_status\":\"rebuild_required\"") == null);
         try std.testing.expect(std.mem.indexOf(u8, reopened.algebraic_indexes.items[0].config.config_json, "\"capability_lifecycle_status\":\"rebuild_required\"") == null);
     }
@@ -14742,6 +15019,140 @@ test "index manager algebraic schema reload rebuilds stale persisted rows" {
     try std.testing.expect(!reloaded.dynamic_rules_backfill_pending);
     try std.testing.expect(!try storeHasDocFactScalarKeyContaining(alloc, &store, "old_field"));
     try std.testing.expect(try storeHasDocFactScalarKeyContaining(alloc, &store, "new_field"));
+}
+
+test "index manager algebraic repair rebuilds stale persisted rows from base rows" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path_z = indexManagerTmpPathWithSuffix(&path_buf, "algebraic-repair-from-rows");
+    defer cleanupIndexManagerDir(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, std.mem.span(path_z));
+    defer manager.deinit();
+
+    const schema_json =
+        \\{"version":1,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"old_field":{"type":"keyword"},"new_field":{"type":"keyword"}}}}}}
+    ;
+    const config_json = try algebraic_mod.schema_capability.configJsonFromSchemaJsonAlloc(alloc, "docs", schema_json);
+    defer alloc.free(config_json);
+
+    try manager.add(&store, .{
+        .name = "alg",
+        .kind = .algebraic,
+        .config_json = config_json,
+    });
+
+    const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:1");
+    defer alloc.free(stored_key);
+    const old_doc_json = "{\"old_field\":\"legacy\"}";
+    try store.put(stored_key, old_doc_json);
+    try manager.applyAlgebraicBatchByNameWithOptions(&store, "alg", .{
+        .documents = &.{.{ .key = "doc:1", .cleaned_value = old_doc_json }},
+    }, .{ .mode = .bulk_ingest });
+    try std.testing.expect(try storeHasDocFactScalarKeyContaining(alloc, &store, "old_field"));
+    try std.testing.expect(!try storeHasDocFactScalarKeyContaining(alloc, &store, "new_field"));
+
+    const new_doc_json = "{\"new_field\":\"fresh\"}";
+    try store.put(stored_key, new_doc_json);
+
+    const throttled = try manager.repairRelationalAlgebraicFromRows(&store, "alg", 0);
+    try std.testing.expectEqual(@as(u64, 1), throttled.units_throttled);
+    try std.testing.expectEqualStrings("repair_budget_exhausted", throttled.failure_reason.?);
+
+    const repaired = try manager.repairRelationalAlgebraicFromRows(&store, "alg", 1);
+    try std.testing.expect(repaired.complete);
+    try std.testing.expect(repaired.units_completed > 0);
+    try std.testing.expect(!try storeHasDocFactScalarKeyContaining(alloc, &store, "old_field"));
+    try std.testing.expect(try storeHasDocFactScalarKeyContaining(alloc, &store, "new_field"));
+}
+
+test "index manager algebraic repair clears artifact matrix before replaying base rows" {
+    const alloc = std.testing.allocator;
+
+    const ArtifactCase = struct {
+        name: []const u8,
+        namespace: algebraic_mod.index.Index.ArtifactNamespaceForTest,
+        family: []const u8,
+        interrupted: bool = false,
+        foreground_write: bool = false,
+    };
+    const cases = [_]ArtifactCase{
+        .{ .name = "dictionary", .namespace = .raw, .family = "lexicon" },
+        .{ .name = "fact", .namespace = .raw, .family = "docfact_scalar" },
+        .{ .name = "path", .namespace = .raw, .family = "pathfact" },
+        .{ .name = "postings", .namespace = .raw, .family = "postings" },
+        .{ .name = "canonical", .namespace = .canonical, .family = "tensor" },
+        .{ .name = "interrupted", .namespace = .raw, .family = "docfact", .interrupted = true },
+        .{ .name = "foreground", .namespace = .raw, .family = "path_lookup", .foreground_write = true },
+    };
+
+    for (cases) |case| {
+        var path_buf: [256]u8 = undefined;
+        const path_z = indexManagerTmpPathWithSuffix(&path_buf, case.name);
+        defer cleanupIndexManagerDir(path_z);
+
+        var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+        defer store.close();
+        var manager = try IndexManager.init(alloc, std.mem.span(path_z));
+        defer manager.deinit();
+
+        const schema_json =
+            \\{"version":1,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"new_field":{"type":"keyword"},"amount":{"type":"number"}}}}}}
+        ;
+        const config_json = try algebraic_mod.schema_capability.configJsonFromSchemaJsonAlloc(alloc, "docs", schema_json);
+        defer alloc.free(config_json);
+
+        try manager.add(&store, .{
+            .name = "alg",
+            .kind = .algebraic,
+            .config_json = config_json,
+        });
+
+        const row_a_key = try internal_keys.documentKeyAlloc(alloc, "doc:1");
+        defer alloc.free(row_a_key);
+        try store.put(row_a_key, "{\"new_field\":\"fresh\",\"amount\":10}");
+
+        if (case.foreground_write) {
+            const row_b_key = try internal_keys.documentKeyAlloc(alloc, "doc:2");
+            defer alloc.free(row_b_key);
+            try store.put(row_b_key, "{\"new_field\":\"foreground\",\"amount\":20}");
+        }
+
+        const marker = try std.fmt.allocPrint(alloc, "stale_artifact_{s}", .{case.name});
+        defer alloc.free(marker);
+        try manager.algebraic_indexes.items[0].index.putArtifactRowForTest(
+            &store,
+            case.namespace,
+            case.family,
+            marker,
+            "stale artifact row",
+        );
+        try std.testing.expectEqual(@as(usize, 1), try countAlgebraicKeysContaining(alloc, &store, case.family, marker));
+
+        if (case.interrupted) {
+            const rebuild_state = backfill_state_mod.RebuildState.init(manager.algebraic_indexes.items[0].rebuild_root_path);
+            try rebuild_state.update(row_a_key);
+            const cursor = try rebuild_state.check(alloc);
+            defer if (cursor) |value| alloc.free(value);
+            try std.testing.expect(cursor != null);
+        }
+
+        const repaired = try manager.repairRelationalAlgebraicFromRows(&store, "alg", 1);
+        try std.testing.expect(repaired.complete);
+        try std.testing.expect(repaired.units_completed > 0);
+        try std.testing.expectEqual(@as(usize, 0), try countAlgebraicKeysContaining(alloc, &store, case.family, marker));
+        try std.testing.expect(try storeHasDocFactScalarKeyContaining(alloc, &store, "fresh"));
+        if (case.foreground_write) {
+            try std.testing.expect(try storeHasDocFactScalarKeyContaining(alloc, &store, "foreground"));
+        }
+
+        const rebuild_state = backfill_state_mod.RebuildState.init(manager.algebraic_indexes.items[0].rebuild_root_path);
+        const cursor = try rebuild_state.check(alloc);
+        defer if (cursor) |value| alloc.free(value);
+        try std.testing.expect(cursor == null);
+    }
 }
 
 test "index manager algebraic schema reload resumes interrupted bounded rebuild" {
@@ -14888,12 +15299,17 @@ pub fn storeHasDocFactScalarKeyContaining(alloc: Allocator, store: *docstore_mod
 }
 
 fn countDocFactScalarKeysContaining(alloc: Allocator, store: *docstore_mod.DocStore, needle: []const u8) !usize {
+    return try countAlgebraicKeysContaining(alloc, store, "docfact_scalar", needle);
+}
+
+fn countAlgebraicKeysContaining(alloc: Allocator, store: *docstore_mod.DocStore, prefix_needle: []const u8, value_needle: []const u8) !usize {
     const rows = try store.scanRange(alloc, "", "");
     defer docstore_mod.DocStore.freeResults(alloc, rows);
     var count: usize = 0;
     for (rows) |row| {
-        if (std.mem.indexOf(u8, row.key, "docfact_scalar") != null and
-            std.mem.indexOf(u8, row.key, needle) != null) count += 1;
+        if (std.mem.indexOf(u8, row.key, prefix_needle) != null and
+            (std.mem.indexOf(u8, row.key, value_needle) != null or
+                std.mem.indexOf(u8, row.value, value_needle) != null)) count += 1;
     }
     return count;
 }

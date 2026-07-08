@@ -138,6 +138,7 @@ pub const DB = struct {
     async_context: *AsyncContext,
     backend_runtime: *background_runtime_mod.BackendRuntime,
     backend_owner_id: u64,
+    relational_index_worker_owner_id: u64,
     owned_backend_runtime: ?background_runtime_mod.BackendRuntimeHandle,
     executor: *derived_executor_mod.Executor,
     start_index_workers: bool,
@@ -2237,6 +2238,7 @@ pub const DB = struct {
     pub const ForeignKeyIntegrityClaimRecord = relational_integrity.ForeignKeyIntegrityClaimRecord;
     pub const ForeignKeyIntegrityJobRecord = relational_integrity.ForeignKeyIntegrityJobRecord;
     pub const RelationalIndexRepairJobRecord = relational_integrity.RelationalIndexRepairJobRecord;
+    pub const RelationalIndexDropJobRecord = relational_integrity.RelationalIndexDropJobRecord;
     pub const ForeignKeyActionJobRecord = relational_integrity.ForeignKeyActionJobRecord;
     pub const ForeignKeyActionScheduleRecord = relational_integrity.ForeignKeyActionScheduleRecord;
     pub const UniqueConstraintIntegrityProgressRecord = relational_integrity.UniqueConstraintIntegrityProgressRecord;
@@ -2271,6 +2273,14 @@ pub const DB = struct {
 
     pub fn freeRelationalIndexRepairJobRecords(self: *DB, records: []RelationalIndexRepairJobRecord) void {
         relational_integrity_impl.freeRelationalIndexRepairJobRecords(self, records);
+    }
+
+    pub fn freeRelationalIndexDropJobRecord(self: *DB, record: RelationalIndexDropJobRecord) void {
+        relational_integrity_impl.freeRelationalIndexDropJobRecord(self, record);
+    }
+
+    pub fn freeRelationalIndexDropJobRecords(self: *DB, records: []RelationalIndexDropJobRecord) void {
+        relational_integrity_impl.freeRelationalIndexDropJobRecords(self, records);
     }
 
     pub fn freeForeignKeyActionJobRecord(self: *DB, record: ForeignKeyActionJobRecord) void {
@@ -2311,6 +2321,10 @@ pub const DB = struct {
 
     pub fn listRelationalIndexRepairJobRecords(self: *DB) ![]RelationalIndexRepairJobRecord {
         return try relational_integrity_impl.listRelationalIndexRepairJobRecords(self);
+    }
+
+    pub fn listRelationalIndexDropJobRecords(self: *DB) ![]RelationalIndexDropJobRecord {
+        return try relational_integrity_impl.listRelationalIndexDropJobRecords(self);
     }
 
     pub fn loadForeignKeyActionJobRecord(self: *DB, job_id: []const u8) !?ForeignKeyActionJobRecord {
@@ -2373,6 +2387,13 @@ pub const DB = struct {
         job_id: []const u8,
     ) !?RelationalIndexRepairJobRecord {
         return try relational_integrity_impl.loadRelationalIndexRepairJobRecord(self, job_id);
+    }
+
+    pub fn loadRelationalIndexDropJobRecord(
+        self: *DB,
+        job_id: []const u8,
+    ) !?RelationalIndexDropJobRecord {
+        return try relational_integrity_impl.loadRelationalIndexDropJobRecord(self, job_id);
     }
 
     pub fn loadUniqueConstraintIntegrityProgressRecord(
@@ -2618,6 +2639,126 @@ pub const DB = struct {
     ) !RelationalIndexRepairJobRecord {
         try ha_replication_impl.enforceDurableMutationGate(self);
         return try relational_integrity_impl.recordRelationalIndexRepairJobPassAt(self, job_id, status, complete, ranges_scanned, ranges_repaired, ranges_missing, next_lower_doc_key, report, last_error, now_ns);
+    }
+
+    pub fn upsertRelationalIndexRepairJobTargetAt(
+        self: *DB,
+        job_id: []const u8,
+        database_name: []const u8,
+        namespace_name: []const u8,
+        table_name: []const u8,
+        access_method: []const u8,
+        index_name: []const u8,
+        generation: u64,
+        worker_id: []const u8,
+        cursor: []const u8,
+        lease_ms: u64,
+        max_work_units: usize,
+        status: []const u8,
+        now_ns: u64,
+    ) !RelationalIndexRepairJobRecord {
+        try ha_replication_impl.enforceDurableMutationGate(self);
+        return try relational_integrity_impl.upsertRelationalIndexRepairJobTargetAt(self, job_id, database_name, namespace_name, table_name, access_method, index_name, generation, worker_id, cursor, lease_ms, max_work_units, status, now_ns);
+    }
+
+    pub fn recordRelationalIndexRepairJobTargetPassAt(
+        self: *DB,
+        job_id: []const u8,
+        status: []const u8,
+        complete: bool,
+        cursor: []const u8,
+        units_queued: u64,
+        units_running: u64,
+        units_throttled: u64,
+        units_completed: u64,
+        failure_reason: ?[]const u8,
+        stale_generation: bool,
+        now_ns: u64,
+    ) !RelationalIndexRepairJobRecord {
+        try ha_replication_impl.enforceDurableMutationGate(self);
+        return try relational_integrity_impl.recordRelationalIndexRepairJobTargetPassAt(self, job_id, status, complete, cursor, units_queued, units_running, units_throttled, units_completed, failure_reason, stale_generation, now_ns);
+    }
+
+    pub fn runRelationalIndexRepairJobPageAt(
+        self: *DB,
+        job_id: []const u8,
+        database_name: []const u8,
+        namespace_name: []const u8,
+        table_name: []const u8,
+        access_method: []const u8,
+        index_name: []const u8,
+        generation: u64,
+        worker_id: []const u8,
+        lease_ms: u64,
+        max_work_units: usize,
+        now_ns: u64,
+    ) !RelationalIndexRepairJobRecord {
+        try ha_replication_impl.enforceDurableMutationGate(self);
+        return try relational_integrity_impl.runRelationalIndexRepairJobPageAt(self, job_id, database_name, namespace_name, table_name, access_method, index_name, generation, worker_id, lease_ms, max_work_units, now_ns);
+    }
+
+    pub fn snapshotRelationalIndexRepairStats(self: *DB) !types.RelationalIndexRepairStats {
+        return try relational_integrity_impl.snapshotRelationalIndexRepairStats(self);
+    }
+
+    pub fn snapshotRelationalIndexRepairStatsAssumeApplyLockHeld(self: *DB) !types.RelationalIndexRepairStats {
+        return try relational_integrity_impl.snapshotRelationalIndexRepairStatsAssumeApplyLockHeld(self);
+    }
+
+    pub fn scheduleRelationalIndexRepairJobPageAt(
+        self: *DB,
+        job_id: []const u8,
+        database_name: []const u8,
+        namespace_name: []const u8,
+        table_name: []const u8,
+        access_method: []const u8,
+        index_name: []const u8,
+        generation: u64,
+        worker_id: []const u8,
+        lease_ms: u64,
+        max_work_units: usize,
+        now_ns: u64,
+    ) !void {
+        try ha_replication_impl.enforceDurableMutationGate(self);
+        return try relational_integrity_impl.scheduleRelationalIndexRepairJobPageAt(self, job_id, database_name, namespace_name, table_name, access_method, index_name, generation, worker_id, lease_ms, max_work_units, now_ns);
+    }
+
+    pub fn upsertRelationalIndexDropJobRecordAt(
+        self: *DB,
+        job_id: []const u8,
+        database_name: []const u8,
+        namespace_name: []const u8,
+        table_name: []const u8,
+        access_method: []const u8,
+        index_name: []const u8,
+        generation: u64,
+        worker_id: []const u8,
+        cursor: []const u8,
+        lease_ms: u64,
+        max_work_units: usize,
+        status: []const u8,
+        now_ns: u64,
+    ) !RelationalIndexDropJobRecord {
+        try ha_replication_impl.enforceDurableMutationGate(self);
+        return try relational_integrity_impl.upsertRelationalIndexDropJobRecordAt(self, job_id, database_name, namespace_name, table_name, access_method, index_name, generation, worker_id, cursor, lease_ms, max_work_units, status, now_ns);
+    }
+
+    pub fn recordRelationalIndexDropJobPassAt(
+        self: *DB,
+        job_id: []const u8,
+        status: []const u8,
+        complete: bool,
+        cursor: []const u8,
+        units_queued: u64,
+        units_running: u64,
+        units_throttled: u64,
+        units_completed: u64,
+        failure_reason: ?[]const u8,
+        stale_generation: bool,
+        now_ns: u64,
+    ) !RelationalIndexDropJobRecord {
+        try ha_replication_impl.enforceDurableMutationGate(self);
+        return try relational_integrity_impl.recordRelationalIndexDropJobPassAt(self, job_id, status, complete, cursor, units_queued, units_running, units_throttled, units_completed, failure_reason, stale_generation, now_ns);
     }
 
     pub fn claimAndRunForeignKeyActionJobPage(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, page_limit: usize, lease_ms: u64) !ForeignKeyActionJobRecord {

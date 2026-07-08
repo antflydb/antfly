@@ -19144,6 +19144,16 @@ pub const ApiHttpServer = struct {
         var snapshot = (self.statusAdminSnapshot() catch return error.InternalFailure) orelse return error.NotFound;
         defer self.source.freeAdminSnapshot(&snapshot);
         const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.NotFound;
+        const existence_probe = (indexes_api.encodeSingleIndexForTableWithSnapshotAndRepairRecords(
+            alloc,
+            &snapshot,
+            table,
+            index_name,
+            null,
+            &.{},
+        ) catch return error.InternalFailure) orelse return error.NotFound;
+        alloc.free(existence_probe);
+
         var local_statuses = self.localTableRuntimeStatusesWithSnapshot(table_name, &snapshot) catch return error.InternalFailure;
         defer if (local_statuses) |*status| status.deinit(self.alloc);
         const target: catalog_resources.TableTarget = .{

@@ -626,6 +626,7 @@ pub const Reconciler = struct {
         for (desired_splits) |desired| {
             const existing = findSplitRecord(current.split_transitions, desired.transition_id);
             if (existing == null) {
+                if (!tableRangeMovementAllowedForGroup(self.alloc, desired_tables, desired_ranges, desired.source_group_id, .split, now_realtime_ms)) continue;
                 if (!splitTransitionDocIdentityCompatible(current, desired)) continue;
                 try split_upserts.append(self.alloc, try cloneSplitRecord(self.alloc, desired));
                 continue;
@@ -662,6 +663,7 @@ pub const Reconciler = struct {
         for (desired_merges) |desired| {
             const existing = findMergeRecord(current.merge_transitions, desired.transition_id);
             if (existing == null) {
+                if (!tableRangeMovementAllowedForGroup(self.alloc, desired_tables, desired_ranges, desired.donor_group_id, .merge, now_realtime_ms)) continue;
                 if (!mergeTransitionDocIdentityCompatible(current, desired, .disallow_active)) continue;
                 try merge_upserts.append(self.alloc, try cloneMergeRecord(self.alloc, desired));
                 continue;
@@ -2297,6 +2299,34 @@ fn secondaryIndexNeedsRebuild(index: anytype) bool {
     return index.generation != 0 and lifecycle == .building;
 }
 
+fn tableRangeMovementAllowed(
+    alloc: std.mem.Allocator,
+    tables: []const table_manager.TableRecord,
+    table_id: u64,
+    kind: storage_schema.RelationalRangeMovementKind,
+    now_ms: u64,
+) bool {
+    const table = findTableRecord(tables, table_id) orelse return false;
+    if (table.schema_json.len == 0) return true;
+    var parsed = schema_mod.parseValidatedTableSchema(alloc, table.schema_json) catch return false;
+    defer parsed.deinit(alloc);
+    const runtime = schema_mod.deriveRuntimeTableSchema(alloc, parsed) catch return false;
+    defer storage_schema.freeSchema(alloc, runtime);
+    return storage_schema.relationalTableRangeMovementBlockReason(runtime, kind, now_ms) == null;
+}
+
+fn tableRangeMovementAllowedForGroup(
+    alloc: std.mem.Allocator,
+    tables: []const table_manager.TableRecord,
+    ranges: []const table_manager.RangeRecord,
+    group_id: u64,
+    kind: storage_schema.RelationalRangeMovementKind,
+    now_ms: u64,
+) bool {
+    const range = findRangeRecord(ranges, group_id) orelse return false;
+    return tableRangeMovementAllowed(alloc, tables, range.table_id, kind, now_ms);
+}
+
 fn secondaryIndexRebuildRangeStillDeclared(
     alloc: std.mem.Allocator,
     tables: []const table_manager.TableRecord,
@@ -2690,6 +2720,50 @@ test "metadata reconciler plans transition upserts before runtime steps" {
     try std.testing.expectEqual(@as(usize, 1), plan.merge_upserts.len);
     try std.testing.expectEqual(@as(usize, 0), plan.split_steps.len);
     try std.testing.expectEqual(@as(usize, 0), plan.merge_steps.len);
+}
+
+test "metadata reconciler blocks split and merge while relational rebuild lease is held" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"body":{"type":"text"},"attrs":{"type":"json"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"body_text_idx","owner_kind":"relational_column","owner_name":"body","access_method":"text_search","method_config":{"type":"full_text","field":"body","analyzer":"standard"},"columns":["body"],"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:body","owner_ranges":[{"start":"row:a","end":"row:z","range_id":"range-a","placement_generation":3}],"generation_record":{"generation":7,"owner_ranges":[{"start":"row:a","end":"row:z","range_id":"range-a","placement_generation":3}],"lifecycle":"ready","lag":0,"ready_watermark":11,"rebuild_leases":[{"owner_range":{"start":"row:a","end":"row:z","range_id":"range-a","placement_generation":3},"holder":"worker-a","cursor":"row:m","expires_at_ms":9999999999999,"generation":7}]}},{"name":"attrs_alg_idx","owner_kind":"relational_column","owner_name":"attrs","access_method":"algebraic_filter","method_config":{"type":"algebraic","derive_from_schema":true},"columns":["attrs"],"lifecycle":"ready","generation":8,"schema_fingerprint":"secondary-index-v1:attrs","generation_record":{"generation":8,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":11}}]}
+    ;
+    try manager.upsertTable(.{ .table_id = 10, .name = "docs", .schema_json = schema_json });
+    try manager.upsertRange(.{
+        .group_id = 101,
+        .table_id = 10,
+        .start_key = "doc:a",
+        .end_key = "doc:m",
+    });
+    try manager.upsertRange(.{
+        .group_id = 102,
+        .table_id = 10,
+        .start_key = "doc:m",
+        .end_key = "doc:z",
+    });
+    try manager.requestSplit(.{
+        .transition_id = 7001,
+        .table_id = 10,
+        .source_group_id = 101,
+        .destination_group_id = 103,
+        .split_key = "doc:h",
+    });
+    try manager.requestMerge(.{
+        .transition_id = 7002,
+        .table_id = 10,
+        .donor_group_id = 102,
+        .receiver_group_id = 101,
+    });
+
+    var reconciler = Reconciler.init(std.testing.allocator);
+    var plan = try reconciler.computePlan(&manager, &.{}, &.{}, .{});
+    defer plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), plan.table_upserts.len);
+    try std.testing.expectEqual(@as(usize, 2), plan.range_upserts.len);
+    try std.testing.expectEqual(@as(usize, 0), plan.split_upserts.len);
+    try std.testing.expectEqual(@as(usize, 0), plan.merge_upserts.len);
 }
 
 test "metadata reconciler converges foreign key reference owner ranges" {

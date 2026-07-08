@@ -763,6 +763,8 @@ fn expectedTableGroupIds(
     snapshot: *const metadata_api.AdminSnapshot,
     table_id: u64,
 ) ![]u64 {
+    if (snapshot.placement_intents.len > 0) return &.{};
+
     var count: usize = 0;
     for (snapshot.ranges) |range| {
         if (range.table_id == table_id) count += 1;
@@ -1055,9 +1057,14 @@ fn appendRelationalIndexRepairStatus(
     var active_job_count: u64 = 0;
     var completed_job_count: u64 = 0;
     var failed_job_count: u64 = 0;
+    var stale_generation_job_count: u64 = 0;
     var total_ranges_scanned: u64 = 0;
     var total_ranges_repaired: u64 = 0;
     var total_ranges_missing: u64 = 0;
+    var total_units_queued: u64 = 0;
+    var total_units_running: u64 = 0;
+    var total_units_throttled: u64 = 0;
+    var total_units_completed: u64 = 0;
     var aggregate_report: db_mod.relational_store.ColumnBackedIndexRepairReport = .{};
     var latest: ?db_mod.DB.RelationalIndexRepairJobRecord = null;
 
@@ -1069,9 +1076,14 @@ fn appendRelationalIndexRepairStatus(
             active_job_count += 1;
         }
         if (std.mem.eql(u8, record.status, "failed")) failed_job_count += 1;
+        if (record.stale_generation) stale_generation_job_count += 1;
         total_ranges_scanned +|= record.total_ranges_scanned;
         total_ranges_repaired +|= record.total_ranges_repaired;
         total_ranges_missing +|= record.total_ranges_missing;
+        total_units_queued +|= record.total_units_queued;
+        total_units_running +|= record.total_units_running;
+        total_units_throttled +|= record.total_units_throttled;
+        total_units_completed +|= record.total_units_completed;
         aggregate_report.scanned_rows +|= record.aggregate_report.scanned_rows;
         aggregate_report.indexed_rows +|= record.aggregate_report.indexed_rows;
         aggregate_report.deleted_orphan_entries +|= record.aggregate_report.deleted_orphan_entries;
@@ -1087,12 +1099,22 @@ fn appendRelationalIndexRepairStatus(
     try appendIntValue(alloc, out, completed_job_count);
     try out.appendSlice(alloc, ",\"failed_job_count\":");
     try appendIntValue(alloc, out, failed_job_count);
+    try out.appendSlice(alloc, ",\"stale_generation_job_count\":");
+    try appendIntValue(alloc, out, stale_generation_job_count);
     try out.appendSlice(alloc, ",\"total_ranges_scanned\":");
     try appendIntValue(alloc, out, total_ranges_scanned);
     try out.appendSlice(alloc, ",\"total_ranges_repaired\":");
     try appendIntValue(alloc, out, total_ranges_repaired);
     try out.appendSlice(alloc, ",\"total_ranges_missing\":");
     try appendIntValue(alloc, out, total_ranges_missing);
+    try out.appendSlice(alloc, ",\"total_units_queued\":");
+    try appendIntValue(alloc, out, total_units_queued);
+    try out.appendSlice(alloc, ",\"total_units_running\":");
+    try appendIntValue(alloc, out, total_units_running);
+    try out.appendSlice(alloc, ",\"total_units_throttled\":");
+    try appendIntValue(alloc, out, total_units_throttled);
+    try out.appendSlice(alloc, ",\"total_units_completed\":");
+    try appendIntValue(alloc, out, total_units_completed);
     try out.appendSlice(alloc, ",\"aggregate_report\":");
     try appendRelationalRepairReport(alloc, out, aggregate_report);
     try out.appendSlice(alloc, ",\"latest\":");
@@ -1107,6 +1129,18 @@ fn appendRelationalIndexRepairStatus(
         try appendIntValue(alloc, out, record.updated_at_ns);
         try out.appendSlice(alloc, ",\"next_lower_doc_key\":");
         try appendJsonString(alloc, out, record.next_lower_doc_key);
+        try out.appendSlice(alloc, ",\"cursor\":");
+        try appendJsonString(alloc, out, record.cursor);
+        try out.appendSlice(alloc, ",\"last_units_queued\":");
+        try appendIntValue(alloc, out, record.last_units_queued);
+        try out.appendSlice(alloc, ",\"last_units_running\":");
+        try appendIntValue(alloc, out, record.last_units_running);
+        try out.appendSlice(alloc, ",\"last_units_throttled\":");
+        try appendIntValue(alloc, out, record.last_units_throttled);
+        try out.appendSlice(alloc, ",\"last_units_completed\":");
+        try appendIntValue(alloc, out, record.last_units_completed);
+        try out.appendSlice(alloc, ",\"stale_generation\":");
+        try out.appendSlice(alloc, if (record.stale_generation) "true" else "false");
         try out.appendSlice(alloc, ",\"last_error\":");
         if (record.last_error) |value| {
             try appendJsonString(alloc, out, value);
@@ -3573,11 +3607,21 @@ test "index encoders expose relational schema index status" {
             .worker_id = "worker:a",
             .lease_ms = 60_000,
             .max_work_units = 3,
-            .status = "running",
+            .status = "failed",
             .created_at_ns = 10,
             .updated_at_ns = 20,
             .attempts = 1,
             .next_lower_doc_key = "row:m",
+            .cursor = "row:m",
+            .stale_generation = true,
+            .last_units_queued = 5,
+            .last_units_running = 1,
+            .last_units_throttled = 2,
+            .last_units_completed = 3,
+            .total_units_queued = 5,
+            .total_units_running = 1,
+            .total_units_throttled = 2,
+            .total_units_completed = 3,
             .last_ranges_scanned = 2,
             .last_ranges_repaired = 1,
             .total_ranges_scanned = 2,
@@ -3609,6 +3653,12 @@ test "index encoders expose relational schema index status" {
             .attempts = 1,
             .completed = true,
             .complete = true,
+            .last_units_queued = 1,
+            .last_units_running = 1,
+            .last_units_completed = 1,
+            .total_units_queued = 1,
+            .total_units_running = 1,
+            .total_units_completed = 1,
             .last_ranges_scanned = 1,
             .last_ranges_repaired = 1,
             .total_ranges_scanned = 1,
@@ -3701,9 +3751,16 @@ test "index encoders expose relational schema index status" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"repair\":{\"job_count\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"active_job_count\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"completed_job_count\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"failed_job_count\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"stale_generation_job_count\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"total_ranges_repaired\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"total_units_queued\":6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"total_units_running\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"total_units_throttled\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"total_units_completed\":4") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"aggregate_report\":{\"scanned_rows\":8,\"indexed_rows\":7,\"deleted_orphan_entries\":1,\"written_entries\":3}") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"latest\":{\"job_id\":\"repair:orders:2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"last_units_completed\":1") != null);
 
     const detail = (try encodeSingleIndexForTableWithSnapshotAndRepairRecords(alloc, &snapshot, &snapshot.tables[0], "tenant_status_idx", null, repair_records[0..])).?;
     defer alloc.free(detail);

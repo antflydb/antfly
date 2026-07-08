@@ -4360,6 +4360,38 @@ pub const ForeignKeyStats = struct {
     }
 };
 
+pub const RelationalIndexRepairStats = struct {
+    job_count: u64 = 0,
+    active_job_count: u64 = 0,
+    completed_job_count: u64 = 0,
+    failed_job_count: u64 = 0,
+    stale_generation_job_count: u64 = 0,
+    last_units_queued: u64 = 0,
+    last_units_running: u64 = 0,
+    last_units_throttled: u64 = 0,
+    last_units_completed: u64 = 0,
+    total_units_queued: u64 = 0,
+    total_units_running: u64 = 0,
+    total_units_throttled: u64 = 0,
+    total_units_completed: u64 = 0,
+
+    pub fn hasRuntimeFacts(self: @This()) bool {
+        return self.job_count != 0 or
+            self.active_job_count != 0 or
+            self.completed_job_count != 0 or
+            self.failed_job_count != 0 or
+            self.stale_generation_job_count != 0 or
+            self.last_units_queued != 0 or
+            self.last_units_running != 0 or
+            self.last_units_throttled != 0 or
+            self.last_units_completed != 0 or
+            self.total_units_queued != 0 or
+            self.total_units_running != 0 or
+            self.total_units_throttled != 0 or
+            self.total_units_completed != 0;
+    }
+};
+
 pub const DBStats = struct {
     doc_count: u64 = 0,
     index_count: u32 = 0,
@@ -4367,6 +4399,7 @@ pub const DBStats = struct {
     doc_identity: DocIdentityStats = .{},
     doc_set_planning: DocSetPlanningStats = .{},
     foreign_keys: ForeignKeyStats = .{},
+    relational_index_repair: RelationalIndexRepairStats = .{},
     enrichment: EnrichmentStats = .{},
     resolution: ReplayStageStats = .{},
     promotion: ReplayStageStats = .{},

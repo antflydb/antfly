@@ -5588,10 +5588,54 @@ const OrderedTuplePredicateSetProbe = union(enum) {
     exceeded_gate: usize,
 };
 
-const ordered_tuple_exact_unordered_unpaged_candidate_gate: usize = 32;
-const ordered_tuple_exact_unordered_candidate_page_multiplier: usize = 4;
-const ordered_tuple_bounded_unordered_candidate_gate: usize = 4096;
-const ordered_tuple_candidate_selectivity_threshold_ppm: u64 = 250_000;
+const default_ordered_tuple_candidate_policy = OrderedTupleCandidatePolicy{};
+
+const OrderedTupleCandidatePolicy = struct {
+    exact_unordered_unpaged_floor: usize = 32,
+    page_width_multiplier: usize = 4,
+    materialization_cap: usize = 4096,
+    selectivity_threshold_ppm: u64 = 250_000,
+
+    fn pageFloor(self: @This(), req: types.RelationalRowsQueryRequest) usize {
+        if (orderedTupleRequestedPageWidth(req)) |page_width| {
+            return @max(@as(usize, 1), page_width *| self.page_width_multiplier);
+        }
+        return self.exact_unordered_unpaged_floor;
+    }
+
+    fn selectivityBudget(self: @This(), base_rows: u64) usize {
+        const budget = std.math.divCeil(u64, base_rows *| self.selectivity_threshold_ppm, 1_000_000) catch std.math.maxInt(u64);
+        return relationalRowsSaturatingUsize(budget);
+    }
+
+    fn probeGate(self: @This(), req: types.RelationalRowsQueryRequest, base_rows: ?u64) ?OrderedTupleCandidateGate {
+        if (req.order_by.len != 0 or queryHasDistinctOn(req) or req.row_claim != null) return null;
+        const page_floor = self.pageFloor(req);
+        const selectivity_limit = if (base_rows) |row_count| blk: {
+            if (row_count == 0) break :blk @as(usize, 0);
+            break :blk @max(page_floor, self.selectivityBudget(row_count));
+        } else self.materialization_cap;
+
+        if (selectivity_limit < self.materialization_cap) {
+            return .{ .limit = selectivity_limit, .kind = .selectivity_budget };
+        }
+        return .{ .limit = self.materialization_cap, .kind = .materialization_cap };
+    }
+
+    fn candidateSetUsable(self: @This(), req: types.RelationalRowsQueryRequest, set: *const doc_set.ResolvedDocSet, base_rows: ?u64) bool {
+        if (req.order_by.len != 0 or queryHasDistinctOn(req) or req.row_claim != null) return true;
+        const cardinality = set.estimatedCardinality() orelse return false;
+        const gate = self.probeGate(req, base_rows) orelse return true;
+        if (cardinality > gate.limit) return false;
+        if (base_rows) |row_count| {
+            if (row_count == 0) return cardinality == 0;
+            const selectivity_ppm = relationalRowsSelectivityPpm(@intCast(cardinality), row_count);
+            return selectivity_ppm <= self.selectivity_threshold_ppm or cardinality <= gate.limit;
+        }
+        return true;
+    }
+};
+
 const OrderedTupleCandidateGateKind = enum {
     materialization_cap,
     selectivity_budget,
@@ -6183,26 +6227,11 @@ fn orderedTupleRequestedPageWidth(req: types.RelationalRowsQueryRequest) ?usize 
 }
 
 fn orderedTupleCandidateSelectivityBudget(base_rows: u64) usize {
-    const budget = std.math.divCeil(u64, base_rows *| ordered_tuple_candidate_selectivity_threshold_ppm, 1_000_000) catch std.math.maxInt(u64);
-    return relationalRowsSaturatingUsize(budget);
+    return default_ordered_tuple_candidate_policy.selectivityBudget(base_rows);
 }
 
 fn orderedTupleCandidateSetProbeGate(req: types.RelationalRowsQueryRequest, base_rows: ?u64) ?OrderedTupleCandidateGate {
-    if (req.order_by.len != 0 or queryHasDistinctOn(req) or req.row_claim != null) return null;
-    const materialization_cap = ordered_tuple_bounded_unordered_candidate_gate;
-    const page_floor = if (orderedTupleRequestedPageWidth(req)) |page_width|
-        @max(@as(usize, 1), page_width *| ordered_tuple_exact_unordered_candidate_page_multiplier)
-    else
-        ordered_tuple_exact_unordered_unpaged_candidate_gate;
-    const selectivity_limit = if (base_rows) |row_count| blk: {
-        if (row_count == 0) break :blk @as(usize, 0);
-        break :blk @max(page_floor, orderedTupleCandidateSelectivityBudget(row_count));
-    } else materialization_cap;
-
-    if (selectivity_limit < materialization_cap) {
-        return .{ .limit = selectivity_limit, .kind = .selectivity_budget };
-    }
-    return .{ .limit = materialization_cap, .kind = .materialization_cap };
+    return default_ordered_tuple_candidate_policy.probeGate(req, base_rows);
 }
 
 fn orderedTupleCandidateSetGate(req: types.RelationalRowsQueryRequest, base_rows: ?u64) usize {
@@ -6211,16 +6240,7 @@ fn orderedTupleCandidateSetGate(req: types.RelationalRowsQueryRequest, base_rows
 }
 
 fn orderedTupleCandidateSetUsableForQuery(req: types.RelationalRowsQueryRequest, set: *const doc_set.ResolvedDocSet, base_rows: ?u64) bool {
-    if (req.order_by.len != 0 or queryHasDistinctOn(req) or req.row_claim != null) return true;
-    const cardinality = set.estimatedCardinality() orelse return false;
-    if (cardinality > orderedTupleCandidateSetGate(req, base_rows)) return false;
-    if (base_rows) |row_count| {
-        if (row_count == 0) return cardinality == 0;
-        const selectivity_ppm = relationalRowsSelectivityPpm(@intCast(cardinality), row_count);
-        return selectivity_ppm <= ordered_tuple_candidate_selectivity_threshold_ppm or
-            cardinality <= orderedTupleCandidateSetGate(req, base_rows);
-    }
-    return true;
+    return default_ordered_tuple_candidate_policy.candidateSetUsable(req, set, base_rows);
 }
 
 fn orderedTupleCandidateSetProbeLimit(req: types.RelationalRowsQueryRequest, base_rows: ?u64) ?usize {
@@ -15173,6 +15193,7 @@ pub fn Impl(comptime DB: type) type {
             candidates: []const RelationalRowsMutationSourceCandidate,
         ) !types.RelationalRowsMutationSourceResult {
             try rejectSystemVersionedRelationalMutation(runtime_schema);
+            try enforceRelationalRowsForegroundWriteGate(runtime_schema, .routed_prepare);
             const claim = try validateRelationalRowsMutationSourceRequest(alloc, runtime_schema, req);
             const txn_id = claim.txn_id orelse return error.InvalidQueryRequest;
             try validatePlannedRelationalRowsMutationSourceCandidatesAlloc(alloc, runtime_schema, req, candidates);
@@ -15778,6 +15799,7 @@ pub fn Impl(comptime DB: type) type {
             candidates: []const RelationalRowsJoinedMutationSourceCandidate,
         ) !types.RelationalRowsMutationSourceResult {
             try rejectSystemVersionedRelationalMutation(target_schema);
+            try enforceRelationalRowsForegroundWriteGate(target_schema, .routed_prepare);
             const claim = try validateJoinedMutationSourceRequestWithSchemas(alloc, target_schema, source_schema, req);
             const txn_id = claim.txn_id orelse return error.InvalidQueryRequest;
             try validatePlannedRelationalRowsJoinedMutationSourceCandidatesAlloc(alloc, target_schema, source_schema, req, candidates);
@@ -15938,6 +15960,13 @@ pub fn Impl(comptime DB: type) type {
                 .participant_deletes = participant_deletes,
                 .participant_transforms = participant_transforms,
             };
+        }
+
+        fn enforceRelationalRowsForegroundWriteGate(
+            runtime_schema: schema_mod.TableSchema,
+            operation: schema_mod.RelationalForegroundWriteOperation,
+        ) !void {
+            if (schema_mod.relationalTableForegroundWriteBlockReason(runtime_schema, operation) != null) return error.WriteUnavailable;
         }
 
         fn stageRelationalRowsTemporalPortionMutationAlloc(
@@ -23959,6 +23988,46 @@ test "relational rows mutation source rejects invalid planned versions before cl
     try expectNoPendingTxnIntentForKey(alloc, &db, joined_source_mismatch_txn, "row:a");
 }
 
+test "relational rows mutation source gates planned stage on stale derived index" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const DB = @import("mod.zig").DB;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"status_idx","owner_kind":"relational_column","owner_name":"status","access_method":"ordered_tuple","columns":["status"],"keys":[{"column":"status"}],"lifecycle":"stale","generation":7,"schema_fingerprint":"secondary-index-v1:status_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"stale","lag":0,"ready_watermark":0}}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+
+    const txn_id = try db.beginTransaction(1_000);
+    defer db.abortTransaction(txn_id, 1_001) catch {};
+    const operations = [_]types.TransformOp{.{
+        .op = .set,
+        .path = "status",
+        .value_json = "\"claimed\"",
+    }};
+    const req: types.RelationalRowsMutationSourceRequest = .{
+        .kind = .update,
+        .source = .{ .row_claim = .{
+            .mode = .for_update,
+            .owner_id = "session:stale-derived-index",
+            .txn_id = txn_id,
+        } },
+        .operations = operations[0..],
+    };
+
+    try std.testing.expectError(error.WriteUnavailable, db.stagePlannedRelationalRowsMutationSourceAlloc(alloc, runtime_schema, req, 0, &.{}));
+}
+
 test "relational rows mutation source validates restart identity only for table-emptying deletes" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
@@ -29295,12 +29364,23 @@ test "relational ordered tuple fallback profile names capability rejections" {
 }
 
 test "relational ordered tuple candidate gate uses measured selectivity budget" {
-    const exact_page_gate = orderedTupleCandidateSetGate(.{ .limit = 1, .total_mode = .exact }, null);
-    try std.testing.expectEqual(@as(usize, ordered_tuple_bounded_unordered_candidate_gate), exact_page_gate);
-    try std.testing.expectEqual(@as(usize, ordered_tuple_bounded_unordered_candidate_gate), orderedTupleCandidateSetGate(.{ .total_mode = .exact }, null));
-    try std.testing.expectEqual(@as(usize, 25), orderedTupleCandidateSetGate(.{ .limit = 1, .total_mode = .exact }, 100));
-    try std.testing.expectEqual(@as(usize, 400), orderedTupleCandidateSetGate(.{ .limit = 100, .total_mode = .exact }, 1000));
-    try std.testing.expectEqual(@as(usize, ordered_tuple_bounded_unordered_candidate_gate), orderedTupleCandidateSetGate(.{ .limit = 1, .total_mode = .exact }, 1_000_000));
+    const policy = default_ordered_tuple_candidate_policy;
+    const GateCase = struct {
+        name: []const u8,
+        req: types.RelationalRowsQueryRequest,
+        base_rows: ?u64,
+        expected_limit: usize,
+    };
+    const gate_cases = [_]GateCase{
+        .{ .name = "exact page without base estimate uses materialization cap", .req = .{ .limit = 1, .total_mode = .exact }, .base_rows = null, .expected_limit = policy.materialization_cap },
+        .{ .name = "unpaged exact without base estimate uses materialization cap", .req = .{ .total_mode = .exact }, .base_rows = null, .expected_limit = policy.materialization_cap },
+        .{ .name = "small base estimate uses selectivity budget", .req = .{ .limit = 1, .total_mode = .exact }, .base_rows = 100, .expected_limit = 25 },
+        .{ .name = "wide page floors selectivity budget", .req = .{ .limit = 100, .total_mode = .exact }, .base_rows = 1000, .expected_limit = 400 },
+        .{ .name = "large base estimate caps materialization", .req = .{ .limit = 1, .total_mode = .exact }, .base_rows = 1_000_000, .expected_limit = policy.materialization_cap },
+    };
+    for (gate_cases) |case| {
+        try std.testing.expectEqual(case.expected_limit, orderedTupleCandidateSetGate(case.req, case.base_rows));
+    }
 
     var small_ordinals: [4]doc_set.DocOrdinal = undefined;
     for (&small_ordinals, 0..) |*ordinal, i| ordinal.* = @intCast(i);
@@ -29314,57 +29394,60 @@ test "relational ordered tuple candidate gate uses measured selectivity budget" 
     for (&bounded_ordinals, 0..) |*ordinal, i| ordinal.* = @intCast(i);
     const bounded_set = doc_set.ResolvedDocSet{ .ordinals = bounded_ordinals[0..] };
 
-    try std.testing.expect(orderedTupleCandidateSetUsableForQuery(.{ .limit = 1, .total_mode = .exact }, &small_set, null));
-    try std.testing.expect(orderedTupleCandidateSetUsableForQuery(.{ .limit = 1, .total_mode = .exact }, &too_many_exact, null));
-    try std.testing.expect(orderedTupleCandidateSetUsableForQuery(.{ .limit = 100, .total_mode = .exact }, &too_many_exact, null));
-    try std.testing.expectEqual(@as(usize, ordered_tuple_bounded_unordered_candidate_gate), orderedTupleCandidateSetGate(.{ .limit = 100, .total_mode = .exact }, null));
-    try std.testing.expect(orderedTupleCandidateSetUsableForQuery(.{ .limit = 100, .total_mode = .none }, &bounded_set, null));
-    try std.testing.expect(orderedTupleCandidateSetUsableForQuery(.{ .limit = 1, .total_mode = .exact }, &small_set, 100));
-    try std.testing.expect(orderedTupleCandidateSetUsableForQuery(.{ .limit = 1, .total_mode = .exact }, &too_many_exact, 20));
-    try std.testing.expect(!orderedTupleCandidateSetUsableForQuery(.{ .limit = 1, .total_mode = .exact }, &bounded_set, 100));
-
-    const over_cap_ordinals = try std.testing.allocator.alloc(doc_set.DocOrdinal, ordered_tuple_bounded_unordered_candidate_gate + 1);
+    const over_cap_ordinals = try std.testing.allocator.alloc(doc_set.DocOrdinal, policy.materialization_cap + 1);
     defer std.testing.allocator.free(over_cap_ordinals);
     for (over_cap_ordinals, 0..) |*ordinal, i| ordinal.* = @intCast(i);
     const over_cap_set = doc_set.ResolvedDocSet{ .ordinals = over_cap_ordinals };
-    try std.testing.expect(!orderedTupleCandidateSetUsableForQuery(.{ .limit = 1, .total_mode = .exact }, &over_cap_set, null));
-    try std.testing.expect(!orderedTupleCandidateSetUsableForQuery(.{ .limit = 1, .total_mode = .exact }, &over_cap_set, 1_000_000));
 
-    var finite_profile = types.RelationalRowsQueryResult.Profile{};
-    setRelationalRowsProfileOrderedTupleProbeGate(&finite_profile, .{ .limit = 1, .total_mode = .exact }, 100, 5, false);
-    try std.testing.expectEqual(@as(u64, 25), finite_profile.candidate_gate_limit);
-    try std.testing.expectEqual(@as(u64, 5), finite_profile.candidate_gate_observed);
-    try std.testing.expect(!finite_profile.candidate_gate_exceeded);
-    try std.testing.expectEqual(@as(u64, 5), finite_profile.estimated_candidate_rows);
-
-    var wider_profile = types.RelationalRowsQueryResult.Profile{};
-    setRelationalRowsProfileOrderedTupleProbeGate(&wider_profile, .{ .limit = 100, .total_mode = .exact }, 1000, 33, false);
-    try std.testing.expectEqual(@as(u64, 400), wider_profile.candidate_gate_limit);
-    try std.testing.expectEqual(@as(u64, 33), wider_profile.candidate_gate_observed);
-    try std.testing.expect(!wider_profile.candidate_gate_exceeded);
-    try std.testing.expectEqual(@as(u64, 33), wider_profile.estimated_candidate_rows);
-
-    var unpaged_profile = types.RelationalRowsQueryResult.Profile{};
-    setRelationalRowsProfileOrderedTupleProbeGate(&unpaged_profile, .{ .total_mode = .exact }, null, 33, false);
-    try std.testing.expectEqual(@as(u64, ordered_tuple_bounded_unordered_candidate_gate), unpaged_profile.candidate_gate_limit);
-    try std.testing.expectEqual(@as(u64, 33), unpaged_profile.candidate_gate_observed);
-    try std.testing.expect(!unpaged_profile.candidate_gate_exceeded);
-    try std.testing.expectEqual(@as(u64, 33), unpaged_profile.estimated_candidate_rows);
+    const UsableCase = struct {
+        name: []const u8,
+        req: types.RelationalRowsQueryRequest,
+        set: *const doc_set.ResolvedDocSet,
+        base_rows: ?u64,
+        expected_usable: bool,
+    };
+    const usable_cases = [_]UsableCase{
+        .{ .name = "small exact set without base estimate", .req = .{ .limit = 1, .total_mode = .exact }, .set = &small_set, .base_rows = null, .expected_usable = true },
+        .{ .name = "small over-page exact set without base estimate", .req = .{ .limit = 1, .total_mode = .exact }, .set = &too_many_exact, .base_rows = null, .expected_usable = true },
+        .{ .name = "wide exact page without base estimate", .req = .{ .limit = 100, .total_mode = .exact }, .set = &too_many_exact, .base_rows = null, .expected_usable = true },
+        .{ .name = "bounded no-total set without base estimate", .req = .{ .limit = 100, .total_mode = .none }, .set = &bounded_set, .base_rows = null, .expected_usable = true },
+        .{ .name = "small set inside selectivity budget", .req = .{ .limit = 1, .total_mode = .exact }, .set = &small_set, .base_rows = 100, .expected_usable = true },
+        .{ .name = "high percentage set inside page floor", .req = .{ .limit = 1, .total_mode = .exact }, .set = &too_many_exact, .base_rows = 20, .expected_usable = true },
+        .{ .name = "set over selectivity budget", .req = .{ .limit = 1, .total_mode = .exact }, .set = &bounded_set, .base_rows = 100, .expected_usable = false },
+        .{ .name = "set over materialization cap without base estimate", .req = .{ .limit = 1, .total_mode = .exact }, .set = &over_cap_set, .base_rows = null, .expected_usable = false },
+        .{ .name = "set over materialization cap with base estimate", .req = .{ .limit = 1, .total_mode = .exact }, .set = &over_cap_set, .base_rows = 1_000_000, .expected_usable = false },
+    };
+    for (usable_cases) |case| {
+        try std.testing.expectEqual(case.expected_usable, orderedTupleCandidateSetUsableForQuery(case.req, case.set, case.base_rows));
+    }
 
     const order_by = [_]types.RelationalRowsQueryOrder{.{ .field = "rank", .direction = .asc }};
-    var ungated_profile = types.RelationalRowsQueryResult.Profile{};
-    setRelationalRowsProfileOrderedTupleProbeGate(&ungated_profile, .{ .order_by = order_by[0..], .limit = 100, .total_mode = .exact }, 1000, 33, true);
-    try std.testing.expectEqual(@as(u64, 0), ungated_profile.candidate_gate_limit);
-    try std.testing.expectEqual(@as(u64, 0), ungated_profile.candidate_gate_observed);
-    try std.testing.expect(!ungated_profile.candidate_gate_exceeded);
-    try std.testing.expectEqual(@as(u64, 0), ungated_profile.estimated_candidate_rows);
-
-    var exceeded_profile = types.RelationalRowsQueryResult.Profile{};
-    setRelationalRowsProfileOrderedTupleProbeGate(&exceeded_profile, .{ .limit = 1, .total_mode = .exact }, 100, 26, true);
-    try std.testing.expectEqual(@as(u64, 25), exceeded_profile.candidate_gate_limit);
-    try std.testing.expectEqual(@as(u64, 26), exceeded_profile.candidate_gate_observed);
-    try std.testing.expect(exceeded_profile.candidate_gate_exceeded);
-    try std.testing.expectEqual(@as(u64, 26), exceeded_profile.estimated_candidate_rows);
+    const ProfileCase = struct {
+        name: []const u8,
+        req: types.RelationalRowsQueryRequest,
+        base_rows: ?u64,
+        observed: usize,
+        exceeded: bool,
+        expected_limit: u64,
+        expected_observed: u64,
+        expected_exceeded: bool,
+        expected_estimated: u64,
+    };
+    const profile_cases = [_]ProfileCase{
+        .{ .name = "finite selectivity probe", .req = .{ .limit = 1, .total_mode = .exact }, .base_rows = 100, .observed = 5, .exceeded = false, .expected_limit = 25, .expected_observed = 5, .expected_exceeded = false, .expected_estimated = 5 },
+        .{ .name = "wide page probe", .req = .{ .limit = 100, .total_mode = .exact }, .base_rows = 1000, .observed = 33, .exceeded = false, .expected_limit = 400, .expected_observed = 33, .expected_exceeded = false, .expected_estimated = 33 },
+        .{ .name = "unpaged probe", .req = .{ .total_mode = .exact }, .base_rows = null, .observed = 33, .exceeded = false, .expected_limit = @intCast(policy.materialization_cap), .expected_observed = 33, .expected_exceeded = false, .expected_estimated = 33 },
+        .{ .name = "ordered query bypasses unordered gate", .req = .{ .order_by = order_by[0..], .limit = 100, .total_mode = .exact }, .base_rows = 1000, .observed = 33, .exceeded = true, .expected_limit = 0, .expected_observed = 0, .expected_exceeded = false, .expected_estimated = 0 },
+        .{ .name = "exceeded selectivity probe", .req = .{ .limit = 1, .total_mode = .exact }, .base_rows = 100, .observed = 26, .exceeded = true, .expected_limit = 25, .expected_observed = 26, .expected_exceeded = true, .expected_estimated = 26 },
+    };
+    for (profile_cases) |case| {
+        var profile = types.RelationalRowsQueryResult.Profile{};
+        setRelationalRowsProfileOrderedTupleProbeGate(&profile, case.req, case.base_rows, case.observed, case.exceeded);
+        try std.testing.expectEqual(case.expected_limit, profile.candidate_gate_limit);
+        try std.testing.expectEqual(case.expected_observed, profile.candidate_gate_observed);
+        try std.testing.expectEqual(case.expected_exceeded, profile.candidate_gate_exceeded);
+        try std.testing.expectEqual(case.expected_estimated, profile.estimated_candidate_rows);
+    }
 }
 
 test "relational ordered tuple candidate probe uses measured candidates past old page gate" {
@@ -29561,6 +29644,7 @@ test "relational ordered tuple candidate probe reports selectivity budget fallba
     const table_schema_api = @import("../../schema/mod.zig");
 
     const alloc = std.testing.allocator;
+    const policy = default_ordered_tuple_candidate_policy;
     var path_buf: [256]u8 = undefined;
     const path = TestHelpers.tempPath(&path_buf);
     defer TestHelpers.cleanupTempDir(path);
@@ -29577,7 +29661,7 @@ test "relational ordered tuple candidate probe reports selectivity budget fallba
     defer schema_mod.freeSchema(alloc, runtime_schema);
     try db.setSchema(runtime_schema);
 
-    const row_count = ordered_tuple_bounded_unordered_candidate_gate + 1;
+    const row_count = policy.materialization_cap + 1;
     const writes = try alloc.alloc(types.BatchWrite, row_count);
     defer {
         for (writes) |write| {
@@ -29634,7 +29718,7 @@ test "relational ordered tuple candidate probe reports selectivity budget fallba
     try std.testing.expect(result.profile.candidate_gate_exceeded);
     try std.testing.expectEqual(@as(u64, @intCast(selectivity_budget + 1)), result.profile.estimated_candidate_rows);
     try std.testing.expectEqual(@as(u64, @intCast(row_count)), result.profile.base_scan_rows);
-    try std.testing.expect(result.profile.ordered_tuple_probe_selectivity_ppm > ordered_tuple_candidate_selectivity_threshold_ppm);
+    try std.testing.expect(result.profile.ordered_tuple_probe_selectivity_ppm > policy.selectivity_threshold_ppm);
     try std.testing.expect(result.profile.index_entries_scanned >= result.profile.candidate_gate_observed);
     try std.testing.expectEqual(@as(u32, @intCast(row_count)), result.total);
     try std.testing.expectEqual(@as(usize, 1), result.rows.len);
@@ -29666,171 +29750,112 @@ test "relational ordered tuple candidate planner uses measured selectivity thres
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","tenant","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"relational_indexes":[{"name":"tenant_rank_selectivity_idx","owner_kind":"relational_column","owner_name":"tenant","access_method":"ordered_tuple","columns":["tenant"],"keys":[{"column":"tenant"},{"column":"rank"}],"where":{"all":[{"field":"tenant","op":"is_not_null"}]},"lifecycle":"ready","generation":7,"schema_fingerprint":"secondary-index-v1:tenant_rank_selectivity_idx","generation_record":{"generation":7,"owner_ranges":[],"lifecycle":"ready","lag":0,"ready_watermark":0}}]}
     ;
 
-    {
-        var path_buf: [256]u8 = undefined;
-        const path = TestHelpers.tempPath(&path_buf);
-        defer TestHelpers.cleanupTempDir(path);
+    const policy = default_ordered_tuple_candidate_policy;
+    const row_count: usize = 100;
+    const SelectivityCase = struct {
+        name: []const u8,
+        matching_rows: usize,
+        expected_access_method: types.RelationalRowsQueryResult.AccessMethod,
+        expected_fallback_reason: types.RelationalRowsQueryResult.FallbackReason,
+        expected_gate_limit: u64,
+        expected_gate_observed: u64,
+        expected_probe_selectivity_ppm: u64,
+        expected_selected_selectivity_ppm: ?u64 = null,
+        expected_total: u32,
+    };
+    const cases = [_]SelectivityCase{
+        .{
+            .name = "low selectivity admits ordered tuple doc set",
+            .matching_rows = 10,
+            .expected_access_method = .ordered_tuple_doc_set,
+            .expected_fallback_reason = .none,
+            .expected_gate_limit = @as(u64, @intCast(policy.selectivityBudget(row_count))),
+            .expected_gate_observed = 10,
+            .expected_probe_selectivity_ppm = 100_000,
+            .expected_selected_selectivity_ppm = 100_000,
+            .expected_total = 10,
+        },
+        .{
+            .name = "threshold selectivity admits ordered tuple doc set",
+            .matching_rows = 25,
+            .expected_access_method = .ordered_tuple_doc_set,
+            .expected_fallback_reason = .none,
+            .expected_gate_limit = @as(u64, @intCast(policy.selectivityBudget(row_count))),
+            .expected_gate_observed = 25,
+            .expected_probe_selectivity_ppm = policy.selectivity_threshold_ppm,
+            .expected_selected_selectivity_ppm = policy.selectivity_threshold_ppm,
+            .expected_total = 25,
+        },
+        .{
+            .name = "high selectivity falls back to base scan",
+            .matching_rows = 90,
+            .expected_access_method = .base_scan,
+            .expected_fallback_reason = .ordered_tuple_candidate_gate,
+            .expected_gate_limit = @as(u64, @intCast(policy.selectivityBudget(row_count))),
+            .expected_gate_observed = @as(u64, @intCast(policy.selectivityBudget(row_count) + 1)),
+            .expected_probe_selectivity_ppm = 260_000,
+            .expected_total = 90,
+        },
+    };
 
-        var db = try DB.open(alloc, std.mem.span(path), .{});
-        defer db.close();
-        var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
-        defer parsed_schema.deinit(alloc);
-        const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
-        defer schema_mod.freeSchema(alloc, runtime_schema);
-        try db.setSchema(runtime_schema);
+    for (cases) |case| {
+        {
+            var path_buf: [256]u8 = undefined;
+            const path = TestHelpers.tempPath(&path_buf);
+            defer TestHelpers.cleanupTempDir(path);
 
-        const row_count: usize = 100;
-        const writes = try alloc.alloc(types.BatchWrite, row_count);
-        defer {
-            for (writes) |write| {
-                alloc.free(write.key);
-                alloc.free(write.value);
+            var db = try DB.open(alloc, std.mem.span(path), .{});
+            defer db.close();
+            var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+            defer parsed_schema.deinit(alloc);
+            const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+            defer schema_mod.freeSchema(alloc, runtime_schema);
+            try db.setSchema(runtime_schema);
+
+            const writes = try alloc.alloc(types.BatchWrite, row_count);
+            defer {
+                for (writes) |write| {
+                    alloc.free(write.key);
+                    alloc.free(write.value);
+                }
+                alloc.free(writes);
             }
-            alloc.free(writes);
-        }
-        for (writes, 0..) |*write, i| {
-            const tenant = if (i < 10) "t1" else "t2";
-            write.* = .{
-                .key = try std.fmt.allocPrint(alloc, "row:{d:0>3}", .{i}),
-                .value = try std.fmt.allocPrint(alloc, "{{\"id\":\"{d:0>3}\",\"tenant\":\"{s}\",\"rank\":{d}}}", .{ i, tenant, i }),
-            };
-        }
-        try db.batch(.{ .writes = writes, .sync_level = .write });
-
-        const predicates = [_]schema_mod.RelationalCheck{
-            .{ .name = "", .field = "tenant", .op = .eq, .value_json = "\"t1\"" },
-            .{ .name = "", .field = "rank", .op = .gt, .value_json = "-1" },
-        };
-        var result = try db.queryRelationalRows(alloc, runtime_schema, .{
-            .predicates = predicates[0..],
-            .select = select_id[0..],
-            .select_all = false,
-            .scalar_subqueries = scalar_subqueries[0..],
-            .limit = 5,
-            .total_mode = .exact,
-        });
-        defer result.deinit(alloc);
-
-        try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.ordered_tuple_doc_set, result.profile.access_method);
-        try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.none, result.profile.fallback_reason);
-        try std.testing.expect(result.profile.ordered_tuple_plan_selected);
-        try std.testing.expectEqual(@as(u64, row_count), result.profile.base_scan_rows);
-        try std.testing.expectEqual(@as(u64, 10), result.profile.candidate_gate_observed);
-        try std.testing.expectEqual(@as(u64, 100_000), result.profile.ordered_tuple_probe_selectivity_ppm);
-        try std.testing.expectEqual(@as(u64, 100_000), result.profile.selected_candidate_selectivity_ppm);
-        try std.testing.expectEqual(@as(u32, 10), result.total);
-        try std.testing.expectEqual(@as(usize, 5), result.rows.len);
-    }
-
-    {
-        var path_buf: [256]u8 = undefined;
-        const path = TestHelpers.tempPath(&path_buf);
-        defer TestHelpers.cleanupTempDir(path);
-
-        var db = try DB.open(alloc, std.mem.span(path), .{});
-        defer db.close();
-        var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
-        defer parsed_schema.deinit(alloc);
-        const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
-        defer schema_mod.freeSchema(alloc, runtime_schema);
-        try db.setSchema(runtime_schema);
-
-        const row_count: usize = 100;
-        const writes = try alloc.alloc(types.BatchWrite, row_count);
-        defer {
-            for (writes) |write| {
-                alloc.free(write.key);
-                alloc.free(write.value);
+            for (writes, 0..) |*write, i| {
+                const tenant = if (i < case.matching_rows) "t1" else "t2";
+                write.* = .{
+                    .key = try std.fmt.allocPrint(alloc, "row:{d:0>3}", .{i}),
+                    .value = try std.fmt.allocPrint(alloc, "{{\"id\":\"{d:0>3}\",\"tenant\":\"{s}\",\"rank\":{d}}}", .{ i, tenant, i }),
+                };
             }
-            alloc.free(writes);
-        }
-        for (writes, 0..) |*write, i| {
-            const tenant = if (i < 25) "t1" else "t2";
-            write.* = .{
-                .key = try std.fmt.allocPrint(alloc, "row:{d:0>3}", .{i}),
-                .value = try std.fmt.allocPrint(alloc, "{{\"id\":\"{d:0>3}\",\"tenant\":\"{s}\",\"rank\":{d}}}", .{ i, tenant, i }),
+            try db.batch(.{ .writes = writes, .sync_level = .write });
+
+            const predicates = [_]schema_mod.RelationalCheck{
+                .{ .name = "", .field = "tenant", .op = .eq, .value_json = "\"t1\"" },
+                .{ .name = "", .field = "rank", .op = .gt, .value_json = "-1" },
             };
-        }
-        try db.batch(.{ .writes = writes, .sync_level = .write });
+            var result = try db.queryRelationalRows(alloc, runtime_schema, .{
+                .predicates = predicates[0..],
+                .select = select_id[0..],
+                .select_all = false,
+                .scalar_subqueries = scalar_subqueries[0..],
+                .limit = 5,
+                .total_mode = .exact,
+            });
+            defer result.deinit(alloc);
 
-        const predicates = [_]schema_mod.RelationalCheck{
-            .{ .name = "", .field = "tenant", .op = .eq, .value_json = "\"t1\"" },
-            .{ .name = "", .field = "rank", .op = .gt, .value_json = "-1" },
-        };
-        var result = try db.queryRelationalRows(alloc, runtime_schema, .{
-            .predicates = predicates[0..],
-            .select = select_id[0..],
-            .select_all = false,
-            .scalar_subqueries = scalar_subqueries[0..],
-            .limit = 5,
-            .total_mode = .exact,
-        });
-        defer result.deinit(alloc);
-
-        try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.ordered_tuple_doc_set, result.profile.access_method);
-        try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.none, result.profile.fallback_reason);
-        try std.testing.expectEqual(@as(u64, row_count), result.profile.base_scan_rows);
-        try std.testing.expectEqual(@as(u64, 25), result.profile.candidate_gate_limit);
-        try std.testing.expectEqual(@as(u64, 25), result.profile.candidate_gate_observed);
-        try std.testing.expectEqual(@as(u64, ordered_tuple_candidate_selectivity_threshold_ppm), result.profile.ordered_tuple_probe_selectivity_ppm);
-        try std.testing.expectEqual(@as(u64, ordered_tuple_candidate_selectivity_threshold_ppm), result.profile.selected_candidate_selectivity_ppm);
-        try std.testing.expectEqual(@as(u32, 25), result.total);
-        try std.testing.expectEqual(@as(usize, 5), result.rows.len);
-    }
-
-    {
-        var path_buf: [256]u8 = undefined;
-        const path = TestHelpers.tempPath(&path_buf);
-        defer TestHelpers.cleanupTempDir(path);
-
-        var db = try DB.open(alloc, std.mem.span(path), .{});
-        defer db.close();
-        var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
-        defer parsed_schema.deinit(alloc);
-        const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
-        defer schema_mod.freeSchema(alloc, runtime_schema);
-        try db.setSchema(runtime_schema);
-
-        const row_count: usize = 100;
-        const writes = try alloc.alloc(types.BatchWrite, row_count);
-        defer {
-            for (writes) |write| {
-                alloc.free(write.key);
-                alloc.free(write.value);
+            try std.testing.expectEqual(case.expected_access_method, result.profile.access_method);
+            try std.testing.expectEqual(case.expected_fallback_reason, result.profile.fallback_reason);
+            try std.testing.expect(result.profile.ordered_tuple_plan_selected);
+            try std.testing.expectEqual(@as(u64, row_count), result.profile.base_scan_rows);
+            try std.testing.expectEqual(case.expected_gate_limit, result.profile.candidate_gate_limit);
+            try std.testing.expectEqual(case.expected_gate_observed, result.profile.candidate_gate_observed);
+            try std.testing.expectEqual(case.expected_probe_selectivity_ppm, result.profile.ordered_tuple_probe_selectivity_ppm);
+            if (case.expected_selected_selectivity_ppm) |expected| {
+                try std.testing.expectEqual(expected, result.profile.selected_candidate_selectivity_ppm);
             }
-            alloc.free(writes);
+            try std.testing.expectEqual(case.expected_total, result.total);
+            try std.testing.expectEqual(@as(usize, 5), result.rows.len);
         }
-        for (writes, 0..) |*write, i| {
-            const tenant = if (i < 90) "t1" else "t2";
-            write.* = .{
-                .key = try std.fmt.allocPrint(alloc, "row:{d:0>3}", .{i}),
-                .value = try std.fmt.allocPrint(alloc, "{{\"id\":\"{d:0>3}\",\"tenant\":\"{s}\",\"rank\":{d}}}", .{ i, tenant, i }),
-            };
-        }
-        try db.batch(.{ .writes = writes, .sync_level = .write });
-
-        const predicates = [_]schema_mod.RelationalCheck{
-            .{ .name = "", .field = "tenant", .op = .eq, .value_json = "\"t1\"" },
-            .{ .name = "", .field = "rank", .op = .gt, .value_json = "-1" },
-        };
-        var result = try db.queryRelationalRows(alloc, runtime_schema, .{
-            .predicates = predicates[0..],
-            .select = select_id[0..],
-            .select_all = false,
-            .scalar_subqueries = scalar_subqueries[0..],
-            .limit = 5,
-            .total_mode = .exact,
-        });
-        defer result.deinit(alloc);
-
-        try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.base_scan, result.profile.access_method);
-        try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.ordered_tuple_candidate_gate, result.profile.fallback_reason);
-        try std.testing.expectEqual(@as(u64, row_count), result.profile.base_scan_rows);
-        try std.testing.expectEqual(@as(u64, 25), result.profile.candidate_gate_limit);
-        try std.testing.expectEqual(@as(u64, 26), result.profile.candidate_gate_observed);
-        try std.testing.expectEqual(@as(u64, 260_000), result.profile.ordered_tuple_probe_selectivity_ppm);
-        try std.testing.expectEqual(@as(u32, 90), result.total);
-        try std.testing.expectEqual(@as(usize, 5), result.rows.len);
     }
 }
 
@@ -30090,111 +30115,164 @@ test "relational rows direct ordered tuple scan honors total modes" {
         .{ .name = "", .field = "rank", .op = .gt, .value_json = "0" },
     };
     const select = [_][]const u8{"id"};
-    var bounded = try db.queryRelationalRows(alloc, runtime_schema, .{
-        .predicates = predicates[0..],
-        .select = select[0..],
-        .select_all = false,
-        .limit = 2,
-        .total_mode = .none,
-        .profile = true,
-    });
-    defer bounded.deinit(alloc);
-    try std.testing.expect(bounded.include_profile);
-    try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.ordered_tuple_stream, bounded.profile.access_method);
-    try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.none, bounded.profile.fallback_reason);
-    try std.testing.expect(bounded.profile.ordered_tuple_plan_selected);
-    try std.testing.expectEqual(@as(u32, 2), bounded.profile.ordered_tuple_key_count);
-    try std.testing.expectEqual(@as(u32, 1), bounded.profile.ordered_tuple_equality_prefix_len);
-    try std.testing.expectEqual(@as(u32, 1), bounded.profile.ordered_tuple_range_key_index);
-    try std.testing.expectEqual(@as(u32, 2), bounded.profile.ordered_tuple_filter_predicates);
-    try std.testing.expectEqual(@as(u32, 2), bounded.profile.ordered_tuple_proven_predicates);
-    try std.testing.expectEqual(@as(u32, 0), bounded.profile.ordered_tuple_residual_predicates);
-    try std.testing.expect(!bounded.profile.ordered_tuple_residual_recheck_required);
-    try std.testing.expect(!bounded.profile.ordered_tuple_prefix_scan);
-    try std.testing.expect(bounded.profile.ordered_tuple_lower_tuple_bytes > 0);
-    try std.testing.expect(bounded.profile.ordered_tuple_upper_tuple_bytes > 0);
-    try std.testing.expectEqual(@as(usize, 2), bounded.rows.len);
-    try std.testing.expect(!bounded.total_exact);
-    try std.testing.expectEqual(@as(u32, 2), bounded.total);
-    try std.testing.expectEqual(@as(u64, 2), bounded.profile.estimated_candidate_rows);
-    try std.testing.expectEqual(@as(u64, 2), bounded.profile.index_entries_scanned);
-    try std.testing.expectEqual(@as(u64, 2), bounded.profile.candidate_stream_emitted);
-    try std.testing.expectEqual(@as(u64, 0), bounded.profile.retained_candidate_rows);
-    try std.testing.expectEqual(types.RelationalRowsQueryResult.CandidateStreamStopReason.page_full, bounded.profile.candidate_stream_stop_reason);
-    try std.testing.expectEqual(@as(u64, 0), bounded.profile.hydrated_rows);
-    try std.testing.expectEqual(@as(u64, 0), bounded.profile.residual_rechecks);
-    try std.testing.expectEqual(@as(u64, 2), bounded.profile.covering_payload_rows);
-    try std.testing.expectEqual(@as(u64, 2), bounded.profile.covering_payload_rechecked_rows);
-    try std.testing.expectEqual(@as(u64, 2), bounded.profile.covering_payload_hydration_avoided_rows);
-    try std.testing.expectEqual(@as(u64, 0), bounded.profile.covering_payload_fallback_metadata_missing_rows);
-    try std.testing.expectEqual(@as(u64, 0), bounded.profile.covering_payload_fallback_row_generation_mismatch_rows);
-    try std.testing.expectEqual(@as(u64, 0), bounded.profile.covering_payload_fallback_residual_predicate_rows);
-    try std.testing.expectEqual(@as(u64, 0), bounded.profile.covering_payload_fallback_projection_shape_rows);
-    try std.testing.expectEqual(@as(u64, 2), bounded.profile.projected_rows);
-
-    var exact = try db.queryRelationalRows(alloc, runtime_schema, .{
-        .predicates = predicates[0..],
-        .select = select[0..],
-        .select_all = false,
-        .limit = 2,
-        .total_mode = .exact,
-    });
-    defer exact.deinit(alloc);
-    try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.ordered_tuple_stream, exact.profile.access_method);
-    try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.none, exact.profile.fallback_reason);
-    try std.testing.expect(exact.profile.ordered_tuple_plan_selected);
-    try std.testing.expectEqual(@as(u32, 2), exact.profile.ordered_tuple_key_count);
-    try std.testing.expectEqual(@as(u32, 1), exact.profile.ordered_tuple_equality_prefix_len);
-    try std.testing.expectEqual(@as(u32, 1), exact.profile.ordered_tuple_range_key_index);
-    try std.testing.expectEqual(@as(u32, 2), exact.profile.ordered_tuple_filter_predicates);
-    try std.testing.expectEqual(@as(u32, 2), exact.profile.ordered_tuple_proven_predicates);
-    try std.testing.expectEqual(@as(u32, 0), exact.profile.ordered_tuple_residual_predicates);
-    try std.testing.expect(!exact.profile.ordered_tuple_residual_recheck_required);
-    try std.testing.expect(!exact.profile.ordered_tuple_prefix_scan);
-    try std.testing.expectEqual(@as(usize, 2), exact.rows.len);
-    try std.testing.expect(exact.total_exact);
-    try std.testing.expectEqual(@as(u32, 4), exact.total);
-    try std.testing.expectEqual(@as(u64, 4), exact.profile.index_entries_scanned);
-    try std.testing.expectEqual(@as(u64, 0), exact.profile.hydrated_rows);
-    try std.testing.expectEqual(@as(u64, 0), exact.profile.residual_rechecks);
-    try std.testing.expectEqual(@as(u64, 2), exact.profile.covering_payload_rows);
-    try std.testing.expectEqual(@as(u64, 4), exact.profile.covering_payload_rechecked_rows);
-    try std.testing.expectEqual(@as(u64, 4), exact.profile.covering_payload_hydration_avoided_rows);
-    try std.testing.expectEqual(@as(u64, 2), exact.profile.projected_rows);
-
     const residual_predicates = [_]schema_mod.RelationalCheck{
         .{ .name = "", .field = "tenant", .op = .eq, .value_json = "\"t1\"" },
         .{ .name = "", .field = "rank", .op = .gt, .value_json = "0" },
         .{ .name = "", .field = "status", .op = .eq, .value_json = "\"active\"" },
     };
-    var residual = try db.queryRelationalRows(alloc, runtime_schema, .{
-        .predicates = residual_predicates[0..],
-        .select = select[0..],
-        .select_all = false,
-        .limit = 1,
-        .total_mode = .none,
-        .profile = true,
-    });
-    defer residual.deinit(alloc);
-    try std.testing.expect(residual.include_profile);
-    try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.ordered_tuple_stream, residual.profile.access_method);
-    try std.testing.expect(residual.profile.ordered_tuple_plan_selected);
-    try std.testing.expectEqual(@as(u32, 3), residual.profile.ordered_tuple_filter_predicates);
-    try std.testing.expectEqual(@as(u32, 2), residual.profile.ordered_tuple_proven_predicates);
-    try std.testing.expectEqual(@as(u32, 1), residual.profile.ordered_tuple_residual_predicates);
-    try std.testing.expect(residual.profile.ordered_tuple_residual_recheck_required);
-    try std.testing.expectEqual(@as(usize, 1), residual.rows.len);
-    try std.testing.expectEqualStrings("{\"id\":\"b\"}", residual.rows[0]);
-    try std.testing.expect(!residual.total_exact);
-    try std.testing.expectEqual(@as(u32, 1), residual.total);
-    try std.testing.expectEqual(@as(u64, 2), residual.profile.estimated_candidate_rows);
-    try std.testing.expectEqual(@as(u64, 2), residual.profile.index_entries_scanned);
-    try std.testing.expectEqual(@as(u64, 2), residual.profile.hydrated_rows);
-    try std.testing.expectEqual(@as(u64, 2), residual.profile.residual_rechecks);
-    try std.testing.expectEqual(@as(u64, 0), residual.profile.covering_payload_rows);
-    try std.testing.expectEqual(@as(u64, 0), residual.profile.covering_payload_hydration_avoided_rows);
-    try std.testing.expectEqual(@as(u64, 2), residual.profile.covering_payload_fallback_residual_predicate_rows);
-    try std.testing.expectEqual(@as(u64, 1), residual.profile.projected_rows);
+
+    const DirectOrderedTupleTotalModeCase = struct {
+        name: []const u8,
+        predicates: []const schema_mod.RelationalCheck,
+        limit: ?u32,
+        total_mode: types.RelationalRowsQueryRequest.TotalMode,
+        profile: bool = false,
+        expected_include_profile: bool = false,
+        expected_rows: usize,
+        expected_first_row: ?[]const u8 = null,
+        expected_total: u32,
+        expected_total_exact: bool,
+        expected_filter_predicates: u32,
+        expected_proven_predicates: u32,
+        expected_residual_predicates: u32,
+        expected_residual_recheck_required: bool,
+        expected_estimated_candidate_rows: u64,
+        expected_index_entries_scanned: u64,
+        expected_candidate_stream_emitted: ?u64 = null,
+        expected_stop_reason: ?types.RelationalRowsQueryResult.CandidateStreamStopReason = null,
+        expected_hydrated_rows: u64,
+        expected_residual_rechecks: u64,
+        expected_covering_payload_rows: u64,
+        expected_covering_payload_rechecked_rows: u64,
+        expected_covering_payload_hydration_avoided_rows: u64,
+        expected_covering_payload_fallback_residual_rows: u64 = 0,
+        expected_projected_rows: u64,
+    };
+    const cases = [_]DirectOrderedTupleTotalModeCase{
+        .{
+            .name = "bounded/no-total",
+            .predicates = predicates[0..],
+            .limit = 2,
+            .total_mode = .none,
+            .profile = true,
+            .expected_include_profile = true,
+            .expected_rows = 2,
+            .expected_total = 2,
+            .expected_total_exact = false,
+            .expected_filter_predicates = 2,
+            .expected_proven_predicates = 2,
+            .expected_residual_predicates = 0,
+            .expected_residual_recheck_required = false,
+            .expected_estimated_candidate_rows = 2,
+            .expected_index_entries_scanned = 2,
+            .expected_candidate_stream_emitted = 2,
+            .expected_stop_reason = .page_full,
+            .expected_hydrated_rows = 0,
+            .expected_residual_rechecks = 0,
+            .expected_covering_payload_rows = 2,
+            .expected_covering_payload_rechecked_rows = 2,
+            .expected_covering_payload_hydration_avoided_rows = 2,
+            .expected_projected_rows = 2,
+        },
+        .{
+            .name = "exact-total",
+            .predicates = predicates[0..],
+            .limit = 2,
+            .total_mode = .exact,
+            .expected_rows = 2,
+            .expected_total = 4,
+            .expected_total_exact = true,
+            .expected_filter_predicates = 2,
+            .expected_proven_predicates = 2,
+            .expected_residual_predicates = 0,
+            .expected_residual_recheck_required = false,
+            .expected_estimated_candidate_rows = 4,
+            .expected_index_entries_scanned = 4,
+            .expected_hydrated_rows = 0,
+            .expected_residual_rechecks = 0,
+            .expected_covering_payload_rows = 2,
+            .expected_covering_payload_rechecked_rows = 4,
+            .expected_covering_payload_hydration_avoided_rows = 4,
+            .expected_projected_rows = 2,
+        },
+        .{
+            .name = "residual-recheck",
+            .predicates = residual_predicates[0..],
+            .limit = 1,
+            .total_mode = .none,
+            .profile = true,
+            .expected_include_profile = true,
+            .expected_rows = 1,
+            .expected_first_row = "{\"id\":\"b\"}",
+            .expected_total = 1,
+            .expected_total_exact = false,
+            .expected_filter_predicates = 3,
+            .expected_proven_predicates = 2,
+            .expected_residual_predicates = 1,
+            .expected_residual_recheck_required = true,
+            .expected_estimated_candidate_rows = 2,
+            .expected_index_entries_scanned = 2,
+            .expected_hydrated_rows = 2,
+            .expected_residual_rechecks = 2,
+            .expected_covering_payload_rows = 0,
+            .expected_covering_payload_rechecked_rows = 0,
+            .expected_covering_payload_hydration_avoided_rows = 0,
+            .expected_covering_payload_fallback_residual_rows = 2,
+            .expected_projected_rows = 1,
+        },
+    };
+
+    for (cases) |case| {
+        var result = try db.queryRelationalRows(alloc, runtime_schema, .{
+            .predicates = case.predicates,
+            .select = select[0..],
+            .select_all = false,
+            .limit = case.limit,
+            .total_mode = case.total_mode,
+            .profile = case.profile,
+        });
+        defer result.deinit(alloc);
+
+        try std.testing.expectEqual(case.expected_include_profile, result.include_profile);
+        try std.testing.expectEqual(types.RelationalRowsQueryResult.AccessMethod.ordered_tuple_stream, result.profile.access_method);
+        try std.testing.expectEqual(types.RelationalRowsQueryResult.FallbackReason.none, result.profile.fallback_reason);
+        try std.testing.expect(result.profile.ordered_tuple_plan_selected);
+        try std.testing.expectEqual(@as(u32, 2), result.profile.ordered_tuple_key_count);
+        try std.testing.expectEqual(@as(u32, 1), result.profile.ordered_tuple_equality_prefix_len);
+        try std.testing.expectEqual(@as(u32, 1), result.profile.ordered_tuple_range_key_index);
+        try std.testing.expectEqual(case.expected_filter_predicates, result.profile.ordered_tuple_filter_predicates);
+        try std.testing.expectEqual(case.expected_proven_predicates, result.profile.ordered_tuple_proven_predicates);
+        try std.testing.expectEqual(case.expected_residual_predicates, result.profile.ordered_tuple_residual_predicates);
+        try std.testing.expectEqual(case.expected_residual_recheck_required, result.profile.ordered_tuple_residual_recheck_required);
+        try std.testing.expect(!result.profile.ordered_tuple_prefix_scan);
+        try std.testing.expect(result.profile.ordered_tuple_lower_tuple_bytes > 0);
+        try std.testing.expect(result.profile.ordered_tuple_upper_tuple_bytes > 0);
+        try std.testing.expectEqual(case.expected_rows, result.rows.len);
+        if (case.expected_first_row) |row| {
+            try std.testing.expectEqualStrings(row, result.rows[0]);
+        }
+        try std.testing.expectEqual(case.expected_total_exact, result.total_exact);
+        try std.testing.expectEqual(case.expected_total, result.total);
+        try std.testing.expectEqual(case.expected_estimated_candidate_rows, result.profile.estimated_candidate_rows);
+        try std.testing.expectEqual(case.expected_index_entries_scanned, result.profile.index_entries_scanned);
+        if (case.expected_candidate_stream_emitted) |expected| {
+            try std.testing.expectEqual(expected, result.profile.candidate_stream_emitted);
+        }
+        try std.testing.expectEqual(@as(u64, 0), result.profile.retained_candidate_rows);
+        if (case.expected_stop_reason) |reason| {
+            try std.testing.expectEqual(reason, result.profile.candidate_stream_stop_reason);
+        }
+        try std.testing.expectEqual(case.expected_hydrated_rows, result.profile.hydrated_rows);
+        try std.testing.expectEqual(case.expected_residual_rechecks, result.profile.residual_rechecks);
+        try std.testing.expectEqual(case.expected_covering_payload_rows, result.profile.covering_payload_rows);
+        try std.testing.expectEqual(case.expected_covering_payload_rechecked_rows, result.profile.covering_payload_rechecked_rows);
+        try std.testing.expectEqual(case.expected_covering_payload_hydration_avoided_rows, result.profile.covering_payload_hydration_avoided_rows);
+        try std.testing.expectEqual(@as(u64, 0), result.profile.covering_payload_fallback_metadata_missing_rows);
+        try std.testing.expectEqual(@as(u64, 0), result.profile.covering_payload_fallback_row_generation_mismatch_rows);
+        try std.testing.expectEqual(case.expected_covering_payload_fallback_residual_rows, result.profile.covering_payload_fallback_residual_predicate_rows);
+        try std.testing.expectEqual(@as(u64, 0), result.profile.covering_payload_fallback_projection_shape_rows);
+        try std.testing.expectEqual(case.expected_projected_rows, result.profile.projected_rows);
+    }
 }
 
 test "relational rows ordered tuple scan streams order-satisfying pagination" {

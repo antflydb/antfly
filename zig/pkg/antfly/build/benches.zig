@@ -372,6 +372,32 @@ pub fn addBenchSteps(ctx: anytype) BenchSteps {
     const lsm_backend_bench_step = b.step("lsm-backend-bench", "Benchmark LSM read and scan paths with optional cache and storage instrumentation");
     lsm_backend_bench_step.dependOn(&run_lsm_backend_bench.step);
 
+    const relational_read_bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/storage/relational_read_bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    relational_read_bench_mod.addImport("antfly_zig", lib_mod);
+    const relational_read_bench = b.addExecutable(.{
+        .name = "relational_read_bench",
+        .root_module = relational_read_bench_mod,
+    });
+
+    const run_relational_read_bench = b.addRunArtifact(relational_read_bench);
+    if (b.args) |args| {
+        run_relational_read_bench.addArgs(args);
+    } else {
+        run_relational_read_bench.addArgs(&.{
+            "--samples",    "1",
+            "--rows",       "10000",
+            "--repeats",    "3",
+            "--batch-size", "1000",
+            "--limit",      "100",
+        });
+    }
+    const relational_read_bench_step = b.step("relational-read-bench", "Benchmark relational read selectivity, total-mode, and index-policy matrix");
+    relational_read_bench_step.dependOn(&run_relational_read_bench.step);
+
     const hbc_storage_read_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/vectors/hbc_storage_read_bench.zig"),
         .target = target,

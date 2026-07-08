@@ -556,6 +556,7 @@ pub fn Impl(comptime DB: type) type {
                     .lmdb, .mem => {},
                 }
                 installIndexLsmReadRuntime(&effective_index_backends, backend_runtime);
+                const relational_index_worker_owner_id = backend_runtime.allocOwnerId();
 
                 const core_opts: db_config.CoreOpenOptions = .{
                     .map_size = opts.map_size,
@@ -631,6 +632,7 @@ pub fn Impl(comptime DB: type) type {
                     .async_context = async_context,
                     .backend_runtime = backend_runtime,
                     .backend_owner_id = backend_owner_id,
+                    .relational_index_worker_owner_id = relational_index_worker_owner_id,
                     .owned_backend_runtime = owned_backend_runtime,
                     .executor = executor,
                     .start_index_workers = start_index_workers,
@@ -1630,6 +1632,7 @@ pub fn Impl(comptime DB: type) type {
                 runtime.deinit();
                 self.runtime_alloc.destroy(runtime);
             }
+            self.backend_runtime.durable_jobs.closeOwner(self.relational_index_worker_owner_id);
             self.core.deinit();
             if (self.owned_backend_runtime) |*runtime| runtime.deinit();
             self.async_context.deinit(self.runtime_alloc);
@@ -1968,6 +1971,14 @@ pub fn Impl(comptime DB: type) type {
             return self.foreign_key_stats.snapshot();
         }
 
+        pub fn snapshotRelationalIndexRepairStatsBestEffort(self: *DB) types.RelationalIndexRepairStats {
+            return self.snapshotRelationalIndexRepairStats() catch .{};
+        }
+
+        pub fn snapshotRelationalIndexRepairStatsLockedBestEffort(self: *DB) types.RelationalIndexRepairStats {
+            return self.snapshotRelationalIndexRepairStatsAssumeApplyLockHeld() catch .{};
+        }
+
         pub fn reassignIdentityNamespaceForInternalTransition(self: *DB, namespace: doc_identity.Namespace) !void {
             if (self.open_mode == .status_only) return error.UnsupportedOperation;
             self.core.lockApply();
@@ -2147,6 +2158,7 @@ pub fn Impl(comptime DB: type) type {
                     .async_indexing = Self.snapshotAsyncIndexingStats(self),
                     .doc_set_planning = Self.snapshotDocSetPlanningStats(self),
                     .foreign_keys = Self.snapshotForeignKeyStats(self),
+                    .relational_index_repair = .{},
                     .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else .{},
                     .resolution = Self.resolutionStageStats(self),
                     .promotion = Self.promotionStageStats(self),
@@ -2610,6 +2622,7 @@ pub fn Impl(comptime DB: type) type {
                 .doc_identity = identity_stats,
                 .doc_set_planning = Self.snapshotDocSetPlanningStats(self),
                 .foreign_keys = Self.snapshotForeignKeyStats(self),
+                .relational_index_repair = Self.snapshotRelationalIndexRepairStatsLockedBestEffort(self),
                 .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else .{},
                 .resolution = Self.resolutionStageStats(self),
                 .promotion = Self.promotionStageStats(self),
@@ -2782,6 +2795,7 @@ pub fn Impl(comptime DB: type) type {
                 .doc_identity = identity_stats,
                 .doc_set_planning = Self.snapshotDocSetPlanningStats(self),
                 .foreign_keys = Self.snapshotForeignKeyStats(self),
+                .relational_index_repair = Self.snapshotRelationalIndexRepairStatsLockedBestEffort(self),
                 .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else try Self.persistedEnrichmentStats(self),
                 .resolution = Self.resolutionStageStats(self),
                 .promotion = Self.promotionStageStats(self),
@@ -2880,6 +2894,7 @@ pub fn Impl(comptime DB: type) type {
                 .doc_identity = identity_stats,
                 .doc_set_planning = Self.snapshotDocSetPlanningStats(self),
                 .foreign_keys = Self.snapshotForeignKeyStats(self),
+                .relational_index_repair = Self.snapshotRelationalIndexRepairStatsLockedBestEffort(self),
                 .resolution = Self.resolutionStageStats(self),
                 .promotion = Self.promotionStageStats(self),
                 .graph_metric_runtime = Self.graphMetricRuntimeStats(self),
@@ -3013,6 +3028,7 @@ pub fn Impl(comptime DB: type) type {
         fn overlayRuntimeStatusRuntimeOnly(self: *DB, runtime_stats: *types.DBStats) void {
             runtime_stats.async_indexing = Self.snapshotAsyncIndexingStats(self);
             runtime_stats.foreign_keys = Self.snapshotForeignKeyStats(self);
+            runtime_stats.relational_index_repair = Self.snapshotRelationalIndexRepairStatsBestEffort(self);
             runtime_stats.enrichment = if (self.enrichment_runtime) |runtime|
                 runtime.stats()
             else
@@ -3758,10 +3774,11 @@ test "db lifecycle open borrows shared backend runtime" {
     try std.testing.expect(first.backend_owner_id != 0);
     try std.testing.expect(second.backend_owner_id != 0);
     try std.testing.expect(first.backend_owner_id != second.backend_owner_id);
-    // Each open allocates two owner ids from the shared runtime: one for the
-    // backend (backend_owner_id) and one dedicated to algebraic HLL cardinality
-    // maintenance. Two opens therefore consume ids 1..4, leaving 5 next.
-    try std.testing.expectEqual(@as(u64, 5), runtime.ptr().allocOwnerId());
+    // Each open allocates three owner ids from the shared runtime: one for the
+    // backend (backend_owner_id), one for relational index workers, and one for
+    // algebraic HLL cardinality maintenance. Two opens therefore consume ids
+    // 1..6, leaving 7 next.
+    try std.testing.expectEqual(@as(u64, 7), runtime.ptr().allocOwnerId());
 }
 
 test "db lifecycle open downgrades borrowed manual backend runtime to manual executor" {
@@ -4425,6 +4442,12 @@ test "db lifecycle open query_readonly lsm primary opens physical backend read-o
     try std.testing.expectError(error.ReadOnly, readonly.upsertRelationalIndexRepairJobRecordAt("repair-at", "default", "public", "docs", "worker-a", "doc:a", "doc:z", 1000, 10, "running", 1));
     try std.testing.expectError(error.ReadOnly, readonly.recordRelationalIndexRepairJobPass("repair-a", "running", false, 1, 1, 0, "doc:m", .{}, null));
     try std.testing.expectError(error.ReadOnly, readonly.recordRelationalIndexRepairJobPassAt("repair-at", "complete", true, 1, 1, 0, "", .{}, null, 1));
+    try std.testing.expectError(error.ReadOnly, readonly.upsertRelationalIndexRepairJobTargetAt("repair-target", "default", "public", "docs", "text_search", "idx", 1, "worker-a", "", 1000, 10, "running", 1));
+    try std.testing.expectError(error.ReadOnly, readonly.recordRelationalIndexRepairJobTargetPassAt("repair-target", "complete", true, "", 1, 1, 0, 1, null, false, 1));
+    try std.testing.expectError(error.ReadOnly, readonly.runRelationalIndexRepairJobPageAt("repair-target", "default", "public", "docs", "text_search", "idx", 1, "worker-a", 1000, 10, 1));
+    try std.testing.expectError(error.ReadOnly, readonly.scheduleRelationalIndexRepairJobPageAt("repair-target", "default", "public", "docs", "text_search", "idx", 1, "worker-a", 1000, 10, 1));
+    try std.testing.expectError(error.ReadOnly, readonly.upsertRelationalIndexDropJobRecordAt("drop-target", "default", "public", "docs", "text_search", "idx", 1, "worker-a", "", 1000, 10, "running", 1));
+    try std.testing.expectError(error.ReadOnly, readonly.recordRelationalIndexDropJobPassAt("drop-target", "complete", true, "", 1, 1, 0, 1, null, false, 1));
     try std.testing.expectError(error.ReadOnly, readonly.completeForeignKeyIntegrityJobRecord("job-a", "complete", true, .{}));
     try std.testing.expectError(error.ReadOnly, readonly.completeForeignKeyIntegrityJobRecordWithDiagnostics("job-a", "complete", true, .{}, "[]", 0, false));
     try std.testing.expectError(error.ReadOnly, readonly.completeForeignKeyIntegrityJobRecordAt("job-at", "complete", true, .{}, 1));

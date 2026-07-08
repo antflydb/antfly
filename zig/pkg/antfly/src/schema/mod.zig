@@ -420,14 +420,47 @@ fn cloneRelationalIndexGenerationRecord(
     alloc: std.mem.Allocator,
     record: storage_schema.RelationalIndexGenerationRecord,
 ) !storage_schema.RelationalIndexGenerationRecord {
+    const owner_ranges = try cloneRelationalIndexOwnerRanges(alloc, record.owner_ranges);
+    errdefer freeRelationalIndexOwnerRanges(alloc, owner_ranges);
+    const failure_reason = if (record.failure_reason) |reason| try alloc.dupe(u8, reason) else null;
+    errdefer if (failure_reason) |reason| alloc.free(reason);
+    const rebuild_cursor = if (record.rebuild_cursor) |cursor| try alloc.dupe(u8, cursor) else null;
+    errdefer if (rebuild_cursor) |cursor| alloc.free(cursor);
+    const component_cursors = try cloneRelationalIndexGenerationComponentCursors(alloc, record.component_cursors);
+    errdefer freeRelationalIndexGenerationComponentCursors(alloc, component_cursors);
+    const rebuild_leases = try cloneRelationalIndexRebuildLeases(alloc, record.rebuild_leases);
+    errdefer freeRelationalIndexRebuildLeases(alloc, rebuild_leases);
     return .{
         .generation = record.generation,
-        .owner_ranges = try cloneRelationalIndexOwnerRanges(alloc, record.owner_ranges),
+        .owner_ranges = owner_ranges,
         .lifecycle = record.lifecycle,
         .lag = record.lag,
-        .failure_reason = if (record.failure_reason) |reason| try alloc.dupe(u8, reason) else null,
+        .failure_reason = failure_reason,
         .ready_watermark = record.ready_watermark,
-        .rebuild_cursor = if (record.rebuild_cursor) |cursor| try alloc.dupe(u8, cursor) else null,
+        .rebuild_cursor = rebuild_cursor,
+        .components = record.components,
+        .component_cursors = component_cursors,
+        .rebuild_leases = rebuild_leases,
+    };
+}
+
+fn cloneRelationalIndexGenerationComponentCursors(
+    alloc: std.mem.Allocator,
+    cursors: storage_schema.RelationalIndexGenerationComponentCursors,
+) !storage_schema.RelationalIndexGenerationComponentCursors {
+    const dictionary = if (cursors.dictionary) |cursor| try alloc.dupe(u8, cursor) else null;
+    errdefer if (dictionary) |cursor| alloc.free(cursor);
+    const fact = if (cursors.fact) |cursor| try alloc.dupe(u8, cursor) else null;
+    errdefer if (fact) |cursor| alloc.free(cursor);
+    const path = if (cursors.path) |cursor| try alloc.dupe(u8, cursor) else null;
+    errdefer if (path) |cursor| alloc.free(cursor);
+    const postings = if (cursors.postings) |cursor| try alloc.dupe(u8, cursor) else null;
+    errdefer if (postings) |cursor| alloc.free(cursor);
+    return .{
+        .dictionary = dictionary,
+        .fact = fact,
+        .path = path,
+        .postings = postings,
     };
 }
 
@@ -438,6 +471,18 @@ fn freeRelationalIndexGenerationRecord(
     freeRelationalIndexOwnerRanges(alloc, record.owner_ranges);
     if (record.failure_reason) |reason| alloc.free(reason);
     if (record.rebuild_cursor) |cursor| alloc.free(cursor);
+    freeRelationalIndexGenerationComponentCursors(alloc, record.component_cursors);
+    freeRelationalIndexRebuildLeases(alloc, record.rebuild_leases);
+}
+
+fn freeRelationalIndexGenerationComponentCursors(
+    alloc: std.mem.Allocator,
+    cursors: storage_schema.RelationalIndexGenerationComponentCursors,
+) void {
+    if (cursors.dictionary) |cursor| alloc.free(cursor);
+    if (cursors.fact) |cursor| alloc.free(cursor);
+    if (cursors.path) |cursor| alloc.free(cursor);
+    if (cursors.postings) |cursor| alloc.free(cursor);
 }
 
 fn cloneRelationalIndexOwnerRanges(
@@ -452,15 +497,82 @@ fn cloneRelationalIndexOwnerRanges(
         alloc.free(out);
     }
     for (ranges) |range| {
-        out[initialized] = .{
-            .start = try alloc.dupe(u8, range.start),
-            .end = try alloc.dupe(u8, range.end),
-            .range_id = if (range.range_id) |range_id| try alloc.dupe(u8, range_id) else null,
-            .placement_generation = range.placement_generation,
-        };
+        out[initialized] = try cloneRelationalIndexOwnerRange(alloc, range);
         initialized += 1;
     }
     return out;
+}
+
+fn cloneRelationalIndexRebuildLeases(
+    alloc: std.mem.Allocator,
+    leases: []const storage_schema.RelationalIndexRebuildLease,
+) ![]const storage_schema.RelationalIndexRebuildLease {
+    if (leases.len == 0) return &.{};
+    const out = try alloc.alloc(storage_schema.RelationalIndexRebuildLease, leases.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |lease| freeRelationalIndexRebuildLease(alloc, lease);
+        alloc.free(out);
+    }
+    for (leases) |lease| {
+        out[initialized] = try cloneRelationalIndexRebuildLease(alloc, lease);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn cloneRelationalIndexRebuildLease(
+    alloc: std.mem.Allocator,
+    lease: storage_schema.RelationalIndexRebuildLease,
+) !storage_schema.RelationalIndexRebuildLease {
+    const owner_range = try cloneRelationalIndexOwnerRange(alloc, lease.owner_range);
+    errdefer freeRelationalIndexOwnerRange(alloc, owner_range);
+    const holder = try alloc.dupe(u8, lease.holder);
+    errdefer alloc.free(holder);
+    const cursor = try alloc.dupe(u8, lease.cursor);
+    errdefer alloc.free(cursor);
+    return .{
+        .owner_range = owner_range,
+        .holder = holder,
+        .cursor = cursor,
+        .expires_at_ms = lease.expires_at_ms,
+        .generation = lease.generation,
+    };
+}
+
+fn cloneRelationalIndexOwnerRange(
+    alloc: std.mem.Allocator,
+    range: storage_schema.RelationalIndexOwnerRange,
+) !storage_schema.RelationalIndexOwnerRange {
+    const start = try alloc.dupe(u8, range.start);
+    errdefer alloc.free(start);
+    const end = try alloc.dupe(u8, range.end);
+    errdefer alloc.free(end);
+    const range_id = if (range.range_id) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (range_id) |value| alloc.free(value);
+    return .{
+        .start = start,
+        .end = end,
+        .range_id = range_id,
+        .placement_generation = range.placement_generation,
+    };
+}
+
+fn freeRelationalIndexRebuildLeases(
+    alloc: std.mem.Allocator,
+    leases: []const storage_schema.RelationalIndexRebuildLease,
+) void {
+    for (leases) |lease| freeRelationalIndexRebuildLease(alloc, lease);
+    if (leases.len > 0) alloc.free(leases);
+}
+
+fn freeRelationalIndexRebuildLease(
+    alloc: std.mem.Allocator,
+    lease: storage_schema.RelationalIndexRebuildLease,
+) void {
+    freeRelationalIndexOwnerRange(alloc, lease.owner_range);
+    alloc.free(lease.holder);
+    alloc.free(lease.cursor);
 }
 
 fn freeRelationalIndexOwnerRanges(

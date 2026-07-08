@@ -1645,6 +1645,12 @@ test "storage.ha db write gate rejects client writes on standby but allows repli
     try std.testing.expectError(error.HAReadOnlyStandby, db.upsertRelationalIndexRepairJobRecordAt("repair-at", "default", "public", "docs", "worker-a", "doc:a", "doc:z", 1000, 10, "running", 1));
     try std.testing.expectError(error.HAReadOnlyStandby, db.recordRelationalIndexRepairJobPass("repair-a", "running", false, 1, 1, 0, "doc:m", .{}, null));
     try std.testing.expectError(error.HAReadOnlyStandby, db.recordRelationalIndexRepairJobPassAt("repair-at", "complete", true, 1, 1, 0, "", .{}, null, 1));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.upsertRelationalIndexRepairJobTargetAt("repair-target", "default", "public", "docs", "text_search", "idx", 1, "worker-a", "", 1000, 10, "running", 1));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.recordRelationalIndexRepairJobTargetPassAt("repair-target", "complete", true, "", 1, 1, 0, 1, null, false, 1));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.runRelationalIndexRepairJobPageAt("repair-target", "default", "public", "docs", "text_search", "idx", 1, "worker-a", 1000, 10, 1));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.scheduleRelationalIndexRepairJobPageAt("repair-target", "default", "public", "docs", "text_search", "idx", 1, "worker-a", 1000, 10, 1));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.upsertRelationalIndexDropJobRecordAt("drop-target", "default", "public", "docs", "text_search", "idx", 1, "worker-a", "", 1000, 10, "running", 1));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.recordRelationalIndexDropJobPassAt("drop-target", "complete", true, "", 1, 1, 0, 1, null, false, 1));
     try std.testing.expectError(error.HAReadOnlyStandby, db.completeForeignKeyIntegrityJobRecord("job-a", "complete", true, .{}));
     try std.testing.expectError(error.HAReadOnlyStandby, db.completeForeignKeyIntegrityJobRecordWithDiagnostics("job-a", "complete", true, .{}, "[]", 0, false));
     try std.testing.expectError(error.HAReadOnlyStandby, db.completeForeignKeyIntegrityJobRecordAt("job-at", "complete", true, .{}, 1));
