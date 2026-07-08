@@ -52,7 +52,7 @@ jobs:
       - name: Install ARM64 cross-compiler
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu xz-utils
 
       - name: Install Zig
         uses: mlugg/setup-zig@v2
