@@ -7737,10 +7737,6 @@ func haAdminJobLabels(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlanned
 	return labels
 }
 
-func haAdminJobComplete(job *batchv1.Job) bool {
-	return haAdminJobPhase(job) == haAdminJobPhaseSucceeded
-}
-
 func haAdminJobPhase(job *batchv1.Job) string {
 	for _, condition := range job.Status.Conditions {
 		if condition.Type == batchv1.JobFailed && condition.Status == corev1.ConditionTrue {
