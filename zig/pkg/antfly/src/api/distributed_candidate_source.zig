@@ -379,7 +379,7 @@ test "DistributedCandidateSource nearest parses query hits into candidates" {
     var fake = FakeTableReadSource{ .alloc = alloc, .table = "entities" };
     defer fake.docs.deinit(alloc);
     fake.query_body =
-        \\{"responses":[{"hits":{"total":1,"hits":[
+        \\{"responses":[{"hits":{"total":{"value":1,"relation":"exact"},"hits":[
         \\  {"_id":"person/ada_lovelace","_score":0.98,"_source":{"canonical_name":"Ada Lovelace","label":"person"}}
         \\]}}]}
     ;

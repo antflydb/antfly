@@ -215,7 +215,7 @@ func TestE2E_ForeignTable_BasicQuery(t *testing.T) {
 
 	result := resp.Responses[0]
 	require.Equal(t, int32(200), result.Status, "expected HTTP 200, got %d: %s", result.Status, result.Error)
-	require.Equal(t, uint64(5), result.Hits.Total, "expected 5 rows from PG")
+	require.Equal(t, uint64(5), antfly.QueryHitsTotalValue(result.Hits.Total), "expected 5 rows from PG")
 	require.Len(t, result.Hits.Hits, 5)
 
 	// Verify fields came through
@@ -259,7 +259,7 @@ func TestE2E_ForeignTable_FilteredQuery(t *testing.T) {
 	require.Equal(t, int32(200), result.Status, "expected 200, got %d: %s", result.Status, result.Error)
 
 	// Should get Alice and Charlie (both gold)
-	require.Equal(t, uint64(2), result.Hits.Total, "expected 2 gold-tier customers")
+	require.Equal(t, uint64(2), antfly.QueryHitsTotalValue(result.Hits.Total), "expected 2 gold-tier customers")
 	names := map[string]bool{}
 	for _, hit := range result.Hits.Hits {
 		name, _ := hit.Source["name"].(string)

@@ -608,10 +608,11 @@ func (g *GraphIndexV0) Stats() IndexStats {
 	g.edgeTypeCountsMu.RUnlock()
 
 	is := GraphIndexStats{
-		TotalEdges:             totalEdges,
-		Rebuilding:             g.backfilling.Load(),
-		BackfillItemsProcessed: g.backfillItemsProcessed.Load(),
-		BackfillProgress:       g.loadBackfillProgress(),
+		TotalEdges:       totalEdges,
+		EdgeCount:        totalEdges,
+		Rebuilding:       g.backfilling.Load(),
+		BackfillActive:   g.backfilling.Load(),
+		BackfillProgress: g.loadBackfillProgress(),
 	}
 	if etCopy != nil {
 		is.EdgeTypes = &etCopy

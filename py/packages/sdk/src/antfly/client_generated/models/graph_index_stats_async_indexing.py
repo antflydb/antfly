@@ -11,7 +11,7 @@ T = TypeVar("T", bound="GraphIndexStatsAsyncIndexing")
 
 @_attrs_define
 class GraphIndexStatsAsyncIndexing:
-    """Derived-index background indexing diagnostics."""
+    """ """
 
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 

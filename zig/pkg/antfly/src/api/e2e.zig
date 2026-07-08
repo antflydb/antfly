@@ -663,7 +663,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     try std.testing.expectEqual(@as(usize, 1), query_responses.value.responses.?.len);
     const query_result = query_responses.value.responses.?[0];
     try std.testing.expectEqualStrings("docs", query_result.table.?);
-    try std.testing.expectEqual(@as(i64, 1), query_result.hits.?.total.?);
+    try std.testing.expectEqual(@as(i64, 1), query_result.hits.?.total.?.value);
     try std.testing.expectEqualStrings("doc:a", query_result.hits.?.hits.?[0]._id);
 
     const aggregation_query_body = try std.testing.allocator.dupe(u8,
@@ -880,7 +880,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     var filtered_query_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, filtered_query.body, .{});
     defer filtered_query_responses.deinit();
     const filtered_query_result = filtered_query_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 1), filtered_query_result.hits.?.total.?);
+    try std.testing.expectEqual(@as(i64, 1), filtered_query_result.hits.?.total.?.value);
     try std.testing.expectEqualStrings("doc:a", filtered_query_result.hits.?.hits.?[0]._id);
 
     const phrase_query_body = try test_contract_helpers.encodeQueryRequest(std.testing.allocator, query_openapi.MatchPhraseQuery{
@@ -893,7 +893,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     var phrase_query_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, phrase_query.body, .{});
     defer phrase_query_responses.deinit();
     const phrase_query_result = phrase_query_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 1), phrase_query_result.hits.?.total.?);
+    try std.testing.expectEqual(@as(i64, 1), phrase_query_result.hits.?.total.?.value);
     try std.testing.expectEqualStrings("doc:a", phrase_query_result.hits.?.hits.?[0]._id);
 
     const fuzzy_query_body = try test_contract_helpers.encodeQueryRequest(std.testing.allocator, query_openapi.FuzzyQuery{
@@ -907,7 +907,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     var fuzzy_query_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, fuzzy_query.body, .{});
     defer fuzzy_query_responses.deinit();
     const fuzzy_query_result = fuzzy_query_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 2), fuzzy_query_result.hits.?.total.?);
+    try std.testing.expectEqual(@as(i64, 2), fuzzy_query_result.hits.?.total.?.value);
     const fuzzy_hits = fuzzy_query_result.hits.?.hits.?;
     var saw_doc_a = false;
     var saw_doc_c = false;
@@ -930,7 +930,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     var numeric_range_query_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, numeric_range_query.body, .{});
     defer numeric_range_query_responses.deinit();
     const numeric_range_query_result = numeric_range_query_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 1), numeric_range_query_result.hits.?.total.?);
+    try std.testing.expectEqual(@as(i64, 1), numeric_range_query_result.hits.?.total.?.value);
     try std.testing.expectEqualStrings("doc:a", numeric_range_query_result.hits.?.hits.?[0]._id);
 
     const prefix_query_body = try test_contract_helpers.encodeQueryRequest(std.testing.allocator, query_openapi.PrefixQuery{
@@ -943,7 +943,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     var prefix_query_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, prefix_query.body, .{});
     defer prefix_query_responses.deinit();
     const prefix_query_result = prefix_query_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 1), prefix_query_result.hits.?.total.?);
+    try std.testing.expectEqual(@as(i64, 1), prefix_query_result.hits.?.total.?.value);
     try std.testing.expectEqualStrings("doc:a", prefix_query_result.hits.?.hits.?[0]._id);
 
     const wildcard_query_body = try test_contract_helpers.encodeQueryRequest(std.testing.allocator, query_openapi.WildcardQuery{
@@ -956,7 +956,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     var wildcard_query_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, wildcard_query.body, .{});
     defer wildcard_query_responses.deinit();
     const wildcard_query_result = wildcard_query_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 1), wildcard_query_result.hits.?.total.?);
+    try std.testing.expectEqual(@as(i64, 1), wildcard_query_result.hits.?.total.?.value);
     try std.testing.expectEqualStrings("doc:b", wildcard_query_result.hits.?.hits.?[0]._id);
 
     const regexp_query_body = try test_contract_helpers.encodeQueryRequest(std.testing.allocator, query_openapi.RegexpQuery{
@@ -969,7 +969,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     var regexp_query_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, regexp_query.body, .{});
     defer regexp_query_responses.deinit();
     const regexp_query_result = regexp_query_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 1), regexp_query_result.hits.?.total.?);
+    try std.testing.expectEqual(@as(i64, 1), regexp_query_result.hits.?.total.?.value);
     try std.testing.expectEqualStrings("doc:c", regexp_query_result.hits.?.hits.?[0]._id);
 
     const term_range_query_body = try test_contract_helpers.encodeQueryRequest(std.testing.allocator, query_openapi.TermRangeQuery{
@@ -984,7 +984,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     var term_range_query_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, term_range_query.body, .{});
     defer term_range_query_responses.deinit();
     const term_range_query_result = term_range_query_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 1), term_range_query_result.hits.?.total.?);
+    try std.testing.expectEqual(@as(i64, 1), term_range_query_result.hits.?.total.?.value);
     try std.testing.expectEqualStrings("doc:a", term_range_query_result.hits.?.hits.?[0]._id);
 
     const date_range_query_body = try test_contract_helpers.encodeQueryRequest(std.testing.allocator, query_openapi.DateRangeStringQuery{
@@ -999,7 +999,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     var date_range_query_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, date_range_query.body, .{});
     defer date_range_query_responses.deinit();
     const date_range_query_result = date_range_query_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 1), date_range_query_result.hits.?.total.?);
+    try std.testing.expectEqual(@as(i64, 1), date_range_query_result.hits.?.total.?.value);
     try std.testing.expectEqualStrings("doc:c", date_range_query_result.hits.?.hits.?[0]._id);
 
     const count_profile_query_body = try test_contract_helpers.encodeMatchQueryRequestWithFlags(
@@ -1017,7 +1017,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     var count_profile_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, count_profile_query.body, .{});
     defer count_profile_responses.deinit();
     const count_profile_result = count_profile_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 2), count_profile_result.hits.?.total.?);
+    try std.testing.expectEqual(@as(i64, 2), count_profile_result.hits.?.total.?.value);
     try std.testing.expectEqual(@as(usize, 0), count_profile_result.hits.?.hits.?.len);
     try std.testing.expect(count_profile_result.profile != null);
     try std.testing.expect(count_profile_result.took >= 0);
@@ -1041,7 +1041,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     var deleted_query_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, deleted_query.body, .{});
     defer deleted_query_responses.deinit();
     const deleted_query_result = deleted_query_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 0), deleted_query_result.hits.?.total.?);
+    try std.testing.expectEqual(@as(i64, 0), deleted_query_result.hits.?.total.?.value);
 
     var deleted_index = try client.deleteTableIndex(base_uri, "docs", "embed_idx");
     defer deleted_index.deinit(std.testing.allocator);
@@ -5835,7 +5835,7 @@ test "public api e2e supports graph queries" {
 
     var parsed_graph = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, graph_query.body, .{});
     defer parsed_graph.deinit();
-    try std.testing.expectEqual(@as(i64, 0), parsed_graph.value.responses.?[0].hits.?.total);
+    try std.testing.expectEqual(@as(i64, 0), parsed_graph.value.responses.?[0].hits.?.total.?.value);
     const neighbors = try expectSingleGraphResult.get(parsed_graph.value, "neighbors");
     try std.testing.expectEqual(indexes_openapi.GraphQueryType.neighbors, neighbors.type);
     try std.testing.expectEqual(@as(i64, 2), neighbors.total);
@@ -6398,7 +6398,7 @@ test "public api smoke e2e queries across split ranges" {
     try std.testing.expectEqual(@as(usize, 1), query_responses.value.responses.?.len);
     const query_result = query_responses.value.responses.?[0];
     try std.testing.expectEqualStrings("docs", query_result.table.?);
-    try std.testing.expectEqual(@as(i64, 2), query_result.hits.?.total.?);
+    try std.testing.expectEqual(@as(i64, 2), query_result.hits.?.total.?.value);
     try std.testing.expectEqualStrings("doc:a", query_result.hits.?.hits.?[0]._id);
     try std.testing.expectEqualStrings("doc:z", query_result.hits.?.hits.?[1]._id);
 
@@ -6425,7 +6425,7 @@ test "public api smoke e2e queries across split ranges" {
     var deleted_query_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, deleted_query.body, .{});
     defer deleted_query_responses.deinit();
     const deleted_query_result = deleted_query_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 0), deleted_query_result.hits.?.total.?);
+    try std.testing.expectEqual(@as(i64, 0), deleted_query_result.hits.?.total.?.value);
 }
 
 test "public api split e2e uses distributed global text stats for bm25 and significant_terms" {
@@ -6571,7 +6571,7 @@ test "public api split e2e uses distributed global text stats for bm25 and signi
 
     try std.testing.expectEqual(@as(usize, 1), bm25_query_responses.value.responses.?.len);
     const bm25_result = bm25_query_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 6), bm25_result.hits.?.total.?);
+    try std.testing.expectEqual(@as(i64, 6), bm25_result.hits.?.total.?.value);
     try std.testing.expectEqualStrings("doc:a", bm25_result.hits.?.hits.?[0]._id);
 
     const significant_terms_body = try std.testing.allocator.dupe(u8,
@@ -7871,7 +7871,7 @@ test "public api smoke e2e queries after merge finalization" {
     defer query_responses.deinit();
     try std.testing.expectEqual(@as(usize, 1), query_responses.value.responses.?.len);
     const query_result = query_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 1), query_result.hits.?.total.?);
+    try std.testing.expectEqual(@as(i64, 1), query_result.hits.?.total.?.value);
     try std.testing.expectEqualStrings("doc:z", query_result.hits.?.hits.?[0]._id);
 
     const delete_body = try test_contract_helpers.normalizeBatchRequest(std.testing.allocator, "{\"deletes\":[\"doc:z\"]}");
@@ -7891,5 +7891,5 @@ test "public api smoke e2e queries after merge finalization" {
     var deleted_query_responses = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, deleted_query.body, .{});
     defer deleted_query_responses.deinit();
     const deleted_query_result = deleted_query_responses.value.responses.?[0];
-    try std.testing.expectEqual(@as(i64, 0), deleted_query_result.hits.?.total.?);
+    try std.testing.expectEqual(@as(i64, 0), deleted_query_result.hits.?.total.?.value);
 }

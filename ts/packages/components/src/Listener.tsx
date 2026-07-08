@@ -1,4 +1,9 @@
-import type { AggregationBucket, QueryHit, QueryResult } from "@antfly/sdk";
+import {
+  type AggregationBucket,
+  type QueryHit,
+  type QueryResult,
+  queryResultTotalHits,
+} from "@antfly/sdk";
 import { type ReactNode, useEffect, useRef } from "react";
 import { useSharedContext, type Widget } from "./SharedContext";
 import { conjunctsFrom, defer, type MultiqueryRequest, multiquery, resolveTable } from "./utils";
@@ -46,7 +51,7 @@ interface QueryResponse {
   error?: string;
   hits?: {
     hits: QueryHit[];
-    total: number;
+    total?: NonNullable<QueryResult["hits"]>["total"];
   };
   aggregations?: Record<string, { buckets?: AggregationBucket[] }>;
 }
@@ -293,7 +298,7 @@ export default function Listener({ children, onChange }: ListenerProps) {
                     }
                     return [];
                   },
-                  total: (result: QueryResult) => result.hits?.total || 0,
+                  total: (result: QueryResult) => queryResultTotalHits(result) ?? 0,
                   id,
                 });
               });
@@ -419,7 +424,7 @@ export default function Listener({ children, onChange }: ListenerProps) {
                       )
                       .slice(0, size);
                   },
-                  total: (result: QueryResult) => result.hits?.total || 0,
+                  total: (result: QueryResult) => queryResultTotalHits(result) ?? 0,
                   id: id,
                 });
               });

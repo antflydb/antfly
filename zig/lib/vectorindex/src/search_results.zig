@@ -79,18 +79,37 @@ pub const SearchResults = struct {
     }
 
     pub fn addResult(self: *SearchResults, vector_id: u64, dist: f32, error_bound: f32) void {
+        self.addResultWithOwnedMetadata(vector_id, dist, error_bound, null);
+    }
+
+    pub fn addResultWithOwnedMetadata(self: *SearchResults, vector_id: u64, dist: f32, error_bound: f32, metadata: ?[]u8) void {
+        if (self.k == 0) {
+            if (metadata) |owned| self.alloc.free(owned);
+            return;
+        }
         const candidate = SearchResult{
             .vector_id = vector_id,
             .distance = dist,
             .error_bound = error_bound,
+            .metadata = metadata,
         };
         if (self.items.items.len < self.k) {
-            self.items.push(self.alloc, candidate) catch return;
+            self.items.push(self.alloc, candidate) catch {
+                if (metadata) |owned| self.alloc.free(owned);
+                return;
+            };
         } else {
             const worst = self.items.peek() orelse return;
             if (candidate.distance < worst.distance) {
-                _ = self.items.pop();
-                self.items.push(self.alloc, candidate) catch return;
+                if (self.items.pop()) |removed| {
+                    if (removed.metadata) |owned| self.alloc.free(owned);
+                }
+                self.items.push(self.alloc, candidate) catch {
+                    if (metadata) |owned| self.alloc.free(owned);
+                    return;
+                };
+            } else if (metadata) |owned| {
+                self.alloc.free(owned);
             }
         }
     }
@@ -310,4 +329,18 @@ test "fromSortedApproxSlice preserves sorted order without heap pushes" {
     try std.testing.expectEqual(@as(u64, 20), hits[1].vector_id);
     try std.testing.expectEqual(@as(f32, 1.0), hits[0].distance);
     try std.testing.expectEqual(@as(f32, 2.0), hits[1].distance);
+}
+
+test "owned metadata is released when result is not retained" {
+    var zero = SearchResults.init(std.testing.allocator, 0);
+    zero.addResultWithOwnedMetadata(1, 1.0, 0, try std.testing.allocator.dupe(u8, "doc:a"));
+    try std.testing.expectEqual(@as(usize, 0), zero.getHits().len);
+    zero.deinit();
+
+    var top_one = SearchResults.init(std.testing.allocator, 1);
+    defer top_one.deinit();
+    top_one.addResultWithOwnedMetadata(1, 1.0, 0, try std.testing.allocator.dupe(u8, "doc:a"));
+    top_one.addResultWithOwnedMetadata(2, 2.0, 0, try std.testing.allocator.dupe(u8, "doc:b"));
+    try std.testing.expectEqual(@as(usize, 1), top_one.getHits().len);
+    try std.testing.expectEqual(@as(u64, 1), top_one.getHits()[0].vector_id);
 }

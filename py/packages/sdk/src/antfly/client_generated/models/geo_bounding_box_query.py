@@ -13,27 +13,39 @@ T = TypeVar("T", bound="GeoBoundingBoxQuery")
 
 @_attrs_define
 class GeoBoundingBoxQuery:
-    """
-    Attributes:
-        top_left (list[float]): [lon, lat]
-        bottom_right (list[float]): [lon, lat]
-        field (str | Unset):
-        boost (float | None | Unset): A floating-point number used to decrease or increase the relevance scores of a
-            query.
+    """Geographic bounding box filter. The public query shape uses scalar latitude and longitude bounds to match structured
+    filter_query.geo_bbox. Longitude ranges may cross the antimeridian by specifying a western/min longitude that is
+    greater than the eastern/max longitude; for example, min_lon 179.5 and max_lon -179.5 matches points near +/-180
+    degrees longitude. Latitude bounds must be ordered with min_lat <= max_lat.
+
+        Attributes:
+            field (str): Field or path containing geo_point values.
+            min_lat (float): Southern latitude bound.
+            min_lon (float): Western longitude bound. If greater than max_lon, the box crosses the antimeridian.
+            max_lat (float): Northern latitude bound. Must be greater than or equal to min_lat.
+            max_lon (float): Eastern longitude bound. May be less than min_lon for antimeridian-wrapped boxes.
+            boost (float | None | Unset): A floating-point number used to decrease or increase the relevance scores of a
+                query.
     """
 
-    top_left: list[float]
-    bottom_right: list[float]
-    field: str | Unset = UNSET
+    field: str
+    min_lat: float
+    min_lon: float
+    max_lat: float
+    max_lon: float
     boost: float | None | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        top_left = self.top_left
-
-        bottom_right = self.bottom_right
-
         field = self.field
+
+        min_lat = self.min_lat
+
+        min_lon = self.min_lon
+
+        max_lat = self.max_lat
+
+        max_lon = self.max_lon
 
         boost: float | None | Unset
         if isinstance(self.boost, Unset):
@@ -45,12 +57,13 @@ class GeoBoundingBoxQuery:
         field_dict.update(self.additional_properties)
         field_dict.update(
             {
-                "top_left": top_left,
-                "bottom_right": bottom_right,
+                "field": field,
+                "min_lat": min_lat,
+                "min_lon": min_lon,
+                "max_lat": max_lat,
+                "max_lon": max_lon,
             }
         )
-        if field is not UNSET:
-            field_dict["field"] = field
         if boost is not UNSET:
             field_dict["boost"] = boost
 
@@ -59,11 +72,15 @@ class GeoBoundingBoxQuery:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        top_left = cast(list[float], d.pop("top_left"))
+        field = d.pop("field")
 
-        bottom_right = cast(list[float], d.pop("bottom_right"))
+        min_lat = d.pop("min_lat")
 
-        field = d.pop("field", UNSET)
+        min_lon = d.pop("min_lon")
+
+        max_lat = d.pop("max_lat")
+
+        max_lon = d.pop("max_lon")
 
         def _parse_boost(data: object) -> float | None | Unset:
             if data is None:
@@ -75,9 +92,11 @@ class GeoBoundingBoxQuery:
         boost = _parse_boost(d.pop("boost", UNSET))
 
         geo_bounding_box_query = cls(
-            top_left=top_left,
-            bottom_right=bottom_right,
             field=field,
+            min_lat=min_lat,
+            min_lon=min_lon,
+            max_lat=max_lat,
+            max_lon=max_lon,
             boost=boost,
         )
 

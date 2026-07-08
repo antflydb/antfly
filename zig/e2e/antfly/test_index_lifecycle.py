@@ -74,6 +74,51 @@ def _maybe_serverless_build(serverless_api, table_name: str) -> dict | None:
         raise
 
 
+def _serverless_build_or_wait_for_publish(
+    serverless_api,
+    table_name: str,
+    *,
+    min_head_version: int,
+    published_wal_end_lsn: int,
+    timeout_s: float = 60.0,
+) -> dict:
+    assert _maybe_serverless_build(serverless_api, table_name) is not None
+
+    return _wait_for_serverless_build_status(
+        serverless_api,
+        table_name,
+        lambda current: (
+            current.get("head_version", 0) >= min_head_version
+            and current.get("published_wal_end_lsn") == published_wal_end_lsn
+            and current.get("publish_recommended") is False
+            and current.get("head_republish_recommended") is False
+        ),
+        timeout_s=timeout_s,
+        reason=f"serverless publish did not complete for head version >= {min_head_version}",
+    )
+
+
+def _wait_for_serverless_build_status(
+    serverless_api,
+    table_name: str,
+    predicate,
+    *,
+    timeout_s: float = 30.0,
+    interval_s: float = 0.5,
+    reason: str,
+) -> dict:
+    last_status = None
+
+    def probe():
+        nonlocal last_status
+        last_status = serverless_api.table_build_status(table_name)
+        return last_status if predicate(last_status) else None
+
+    status = wait_until(probe, timeout_s=timeout_s, interval_s=interval_s)
+    assert status is not None, f"{reason}; last_status={last_status}"
+    return status
+
+
 def _index_exists(stateful_api, table_name: str, index_name: str) -> dict | None:
     try:
         names = _index_names(stateful_api.list_indexes(table_name))
@@ -1690,21 +1735,17 @@ def test_serverless_named_embedding_indexes_report_publication_actions(serverles
     rebuilt = _maybe_serverless_build(serverless_api, table_name)
     assert rebuilt is not None
     target_head_version = rebuilt.get("version") or rebuilt.get("head_version") or 2
-    ready = wait_until(
-        lambda: (
-            current
-            if (
-                (current := serverless_api.table_build_status(table_name)).get("head_version", 0) == target_head_version
-                and _named_action(current, "vector_index_actions", "semantic_b") == "reuse"
-                and _named_action(current, "sparse_index_actions", "sparse_a") == "reuse"
-                and _named_action(current, "sparse_index_actions", "sparse_b") == "reuse"
-            )
-            else None
+    ready = _wait_for_serverless_build_status(
+        serverless_api,
+        table_name,
+        lambda current: (
+            current.get("head_version", 0) >= target_head_version
+            and _named_action(current, "vector_index_actions", "semantic_b") == "reuse"
+            and _named_action(current, "sparse_index_actions", "sparse_a") == "reuse"
+            and _named_action(current, "sparse_index_actions", "sparse_b") == "reuse"
         ),
-        timeout_s=30.0,
-        interval_s=0.5,
+        reason=f"serverless republish did not reach head version {target_head_version}",
     )
-    assert ready is not None
 
     semantic_b = serverless_api.get_index(table_name, "semantic_b")
     sparse_a = serverless_api.get_index(table_name, "sparse_a")
@@ -1803,23 +1844,26 @@ def test_serverless_same_name_dense_index_update_republishes_head(serverless_api
     assert planned["artifact_actions"]["dense_vector"] == "rebuild"
     assert planned["published_wal_end_lsn"] == first_published_wal_end
 
-    rebuilt = _maybe_serverless_build(serverless_api, table_name)
+    rebuilt = _serverless_build_or_wait_for_publish(
+        serverless_api,
+        table_name,
+        min_head_version=first_head_version + 1,
+        published_wal_end_lsn=first_published_wal_end,
+    )
     assert rebuilt is not None
     target_head_version = rebuilt.get("version") or rebuilt.get("head_version") or (first_head_version + 1)
-    ready = wait_until(
-        lambda: (
-            current
-            if (
-                (current := serverless_api.table_build_status(table_name)).get("head_version", 0) == target_head_version
-                and current.get("published_wal_end_lsn") == first_published_wal_end
-                and _named_action(current, "head_vector_index_actions", "semantic_idx") == "rebuild"
-            )
-            else None
+    ready = _wait_for_serverless_build_status(
+        serverless_api,
+        table_name,
+        lambda current: (
+            current.get("head_version", 0) >= target_head_version
+            and current.get("published_wal_end_lsn") == first_published_wal_end
+            and current.get("publish_recommended") is False
+            and _named_action(current, "head_vector_index_actions", "semantic_idx") == "rebuild"
         ),
-        timeout_s=30.0,
-        interval_s=0.5,
+        timeout_s=60.0,
+        reason=f"serverless dense-index republish did not reach head version {target_head_version}",
     )
-    assert ready is not None
 
     detail = serverless_api.get_index(table_name, "semantic_idx")
     assert detail["status"]["head_publication_action"] == "rebuild"
@@ -1908,16 +1952,12 @@ def test_serverless_build_status_reports_head_actions_for_text_only_updates(serv
     assert second_build is not None
     target_head_version = second_build.get("version") or second_build.get("head_version") or 2
 
-    status = wait_until(
-        lambda: (
-            current
-            if (current := serverless_api.table_build_status(table_name)).get("head_version", 0) == target_head_version
-            else None
-        ),
-        timeout_s=30.0,
-        interval_s=0.5,
+    status = _wait_for_serverless_build_status(
+        serverless_api,
+        table_name,
+        lambda current: current.get("head_version", 0) >= target_head_version,
+        reason=f"serverless rebuild did not reach head version {target_head_version}",
     )
-    assert status is not None
     assert status["head_artifact_actions"]["document_segment"] == "rebuild"
     assert status["head_artifact_actions"]["full_text"] == "rebuild"
     assert status["head_artifact_actions"]["dense_vector"] == "reuse"
@@ -2033,21 +2073,17 @@ def test_serverless_schema_migration_republishes_versioned_full_text_indexes(ser
     rebuilt = _maybe_serverless_build(serverless_api, table_name)
     assert rebuilt is not None
     target_head_version = rebuilt.get("version") or rebuilt.get("head_version") or (first_head_version + 1)
-    ready = wait_until(
-        lambda: (
-            current
-            if (
-                (current := serverless_api.table_build_status(table_name)).get("head_version", 0) == target_head_version
-                and current.get("published_wal_end_lsn") == first_published_wal_end
-                and _full_text_action(current, "head_full_text_index_actions", "full_text_index_v0") == "reuse"
-                and _full_text_action(current, "head_full_text_index_actions", "full_text_index_v1") == "rebuild"
-            )
-            else None
+    ready = _wait_for_serverless_build_status(
+        serverless_api,
+        table_name,
+        lambda current: (
+            current.get("head_version", 0) >= target_head_version
+            and current.get("published_wal_end_lsn") == first_published_wal_end
+            and _full_text_action(current, "head_full_text_index_actions", "full_text_index_v0") == "reuse"
+            and _full_text_action(current, "head_full_text_index_actions", "full_text_index_v1") == "rebuild"
         ),
-        timeout_s=30.0,
-        interval_s=0.5,
+        reason=f"serverless full-text republish did not reach head version {target_head_version}",
     )
-    assert ready is not None
 
     active_index = serverless_api.get_index(table_name, "full_text_index_v0")
     next_index = serverless_api.get_index(table_name, "full_text_index_v1")

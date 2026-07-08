@@ -16,7 +16,12 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@antfly/design-system";
-import type { Table as AntflyTable, QueryRequest, TableStatus } from "@antfly/sdk";
+import {
+  type Table as AntflyTable,
+  type QueryRequest,
+  queryResultTotalHits,
+  type TableStatus,
+} from "@antfly/sdk";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import { Trash2 } from "lucide-react";
 import type React from "react";
@@ -81,7 +86,7 @@ const TablesListPage: React.FC = () => {
             limit: 0,
           };
           const result = await api.tables.query(table.name, query);
-          return [table.name, result?.responses?.[0]?.hits?.total ?? null] as const;
+          return [table.name, queryResultTotalHits(result?.responses?.[0]) ?? null] as const;
         })
       );
       setDocumentCounts(

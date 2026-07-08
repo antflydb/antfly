@@ -846,6 +846,14 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
                 alloc.free(candidate.decision);
             }
             if (item.algebraic_candidates.len > 0) alloc.free(item.algebraic_candidates);
+            for (item.algebraic_candidate_decision_history) |entry| {
+                alloc.free(entry.recommendation);
+                alloc.free(entry.materialization_id);
+                alloc.free(entry.lifecycle);
+                alloc.free(entry.previous_decision);
+                alloc.free(entry.decision);
+            }
+            if (item.algebraic_candidate_decision_history.len > 0) alloc.free(item.algebraic_candidate_decision_history);
             for (item.algebraic_progress) |progress| {
                 alloc.free(progress.recommendation);
                 alloc.free(progress.materialization_id);
@@ -957,14 +965,23 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
             .edge_count = item.edge_count,
             .node_count = item.node_count,
             .root_node = item.root_node,
+            .coverage_skipped_count = item.coverage_skipped_count,
+            .coverage_terminal_failed_count = item.coverage_terminal_failed_count,
             .backfill_active = item.backfill_active,
             .backfill_progress = item.backfill_progress,
+            .enrichment_failed = item.enrichment_failed,
             .repair_degraded = item.repair_degraded,
             .repair_issue_count = item.repair_issue_count,
             .repair_summary_ready = item.repair_summary_ready,
             .repair_issue_count_estimated = item.repair_issue_count_estimated,
+            .repair_scan_issue_count = item.repair_scan_issue_count,
+            .projection_checkpoint_status = item.projection_checkpoint_status,
+            .projection_checkpoint_applied_sequence = item.projection_checkpoint_applied_sequence,
+            .projection_checkpoint_generation = item.projection_checkpoint_generation,
+            .projection_checkpoint_config_hash = item.projection_checkpoint_config_hash,
             .replay_applied_sequence = item.replay_applied_sequence,
             .replay_target_sequence = item.replay_target_sequence,
+            .checkpoint_replay_tail_sequence_count = item.checkpoint_replay_tail_sequence_count,
             .replay_catch_up_required = item.replay_catch_up_required,
             .catch_up_active = item.catch_up_active,
             .catch_up_phase = item.catch_up_phase,
@@ -1098,6 +1115,17 @@ test "table runtime snapshot cache clones stored status" {
         .kind = .dense_vector,
         .doc_count = 11,
         .node_count = 5,
+        .coverage_skipped_count = 6,
+        .coverage_terminal_failed_count = 7,
+        .backfill_active = true,
+        .backfill_progress = 0.5,
+        .enrichment_failed = true,
+        .repair_scan_issue_count = 8,
+        .projection_checkpoint_status = "rebuilding",
+        .projection_checkpoint_applied_sequence = 9,
+        .projection_checkpoint_generation = 10,
+        .projection_checkpoint_config_hash = 11,
+        .checkpoint_replay_tail_sequence_count = 12,
     };
     items[0].stats.indexes[1] = .{
         .name = try std.testing.allocator.dupe(u8, "alg"),
@@ -1210,6 +1238,17 @@ test "table runtime snapshot cache clones stored status" {
     try std.testing.expectEqual(@as(u64, 8), cloned.items[0].stats.doc_set_planning.ordinal_list_count);
     try std.testing.expectEqual(@as(u64, 5), cloned.items[0].stats.doc_set_planning.stale_identity_generation_rejection_count);
     try std.testing.expectEqualStrings("vec", cloned.items[0].stats.indexes[0].name);
+    try std.testing.expectEqual(@as(u64, 6), cloned.items[0].stats.indexes[0].coverage_skipped_count);
+    try std.testing.expectEqual(@as(u64, 7), cloned.items[0].stats.indexes[0].coverage_terminal_failed_count);
+    try std.testing.expect(cloned.items[0].stats.indexes[0].backfill_active);
+    try std.testing.expectEqual(@as(f64, 0.5), cloned.items[0].stats.indexes[0].backfill_progress);
+    try std.testing.expect(cloned.items[0].stats.indexes[0].enrichment_failed);
+    try std.testing.expectEqual(@as(u64, 8), cloned.items[0].stats.indexes[0].repair_scan_issue_count);
+    try std.testing.expectEqualStrings("rebuilding", cloned.items[0].stats.indexes[0].projection_checkpoint_status);
+    try std.testing.expectEqual(@as(u64, 9), cloned.items[0].stats.indexes[0].projection_checkpoint_applied_sequence);
+    try std.testing.expectEqual(@as(u64, 10), cloned.items[0].stats.indexes[0].projection_checkpoint_generation);
+    try std.testing.expectEqual(@as(u64, 11), cloned.items[0].stats.indexes[0].projection_checkpoint_config_hash);
+    try std.testing.expectEqual(@as(u64, 12), cloned.items[0].stats.indexes[0].checkpoint_replay_tail_sequence_count);
     try std.testing.expectEqualStrings("alg", cloned.items[0].stats.indexes[1].name);
     try std.testing.expectEqual(@as(u64, 1), cloned.items[0].stats.indexes[1].algebraic_parse_error_count);
     try std.testing.expectEqual(@as(u32, 42), cloned.items[0].stats.indexes[1].algebraic_schema_version);

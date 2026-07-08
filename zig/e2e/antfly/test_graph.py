@@ -19,7 +19,7 @@ from __future__ import annotations
 import time
 import requests
 
-from helpers import json_doc, upsert, wait_until
+from helpers import json_doc, query_hits_total_value, upsert, wait_until
 
 
 def _create_index(api, table_name: str, index_name: str, payload: dict) -> dict:
@@ -344,7 +344,7 @@ def test_graph_neighbors_traverse_and_shortest_path(serverless_api):
     )
     from_search_result = _graph_result(from_search, "neighbors_from_search")
     assert from_search_result is not None
-    assert from_search["responses"][0]["hits"]["total"] >= 1
+    assert query_hits_total_value(from_search["responses"][0]["hits"]) >= 1
     assert [node["key"] for node in from_search_result["nodes"]] == ["bob", "carol"]
 
     from_fused = wait_until(

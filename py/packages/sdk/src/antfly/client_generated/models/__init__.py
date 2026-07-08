@@ -179,6 +179,7 @@ from .evaluator_score import EvaluatorScore
 from .evaluator_score_metadata import EvaluatorScoreMetadata
 from .exa_search_config import ExaSearchConfig
 from .exa_search_config_search_type import ExaSearchConfigSearchType
+from .exact_sort_error import ExactSortError
 from .extension_error import ExtensionError
 from .extension_member import ExtensionMember
 from .extension_object_decl import ExtensionObjectDecl
@@ -212,6 +213,10 @@ from .extraction_token import ExtractionToken
 from .failed_operation import FailedOperation
 from .failed_operation_operation import FailedOperationOperation
 from .fetch_config import FetchConfig
+from .field_capability import FieldCapability
+from .field_capability_index_sort_order import FieldCapabilityIndexSortOrder
+from .field_capability_query_modes_item import FieldCapabilityQueryModesItem
+from .field_capability_sort_lifecycle_state import FieldCapabilitySortLifecycleState
 from .field_statistics import FieldStatistics
 from .filter_spec import FilterSpec
 from .filter_spec_operator import FilterSpecOperator
@@ -250,6 +255,8 @@ from .graph_index_stats_edge_types import GraphIndexStatsEdgeTypes
 from .graph_index_stats_index_type import GraphIndexStatsIndexType
 from .graph_index_stats_promotion import GraphIndexStatsPromotion
 from .graph_index_stats_resolution import GraphIndexStatsResolution
+from .graph_index_stats_resolver_replay import GraphIndexStatsResolverReplay
+from .graph_index_stats_source_artifact import GraphIndexStatsSourceArtifact
 from .graph_node_selector import GraphNodeSelector
 from .graph_query import GraphQuery
 from .graph_query_params import GraphQueryParams
@@ -372,7 +379,6 @@ from .inference_rewrite_response_object import InferenceRewriteResponseObject
 from .inference_role import InferenceRole
 from .inference_sparse_vector import InferenceSparseVector
 from .inference_style import InferenceStyle
-from .inference_text_chunk_options import InferenceTextChunkOptions
 from .inference_text_content import InferenceTextContent
 from .inference_text_content_part import InferenceTextContentPart
 from .inference_text_content_part_type import InferenceTextContentPartType
@@ -390,7 +396,6 @@ from .inference_transcribe_object_object import InferenceTranscribeObjectObject
 from .inference_transcribe_request import InferenceTranscribeRequest
 from .inference_transcribe_response import InferenceTranscribeResponse
 from .inference_transcribe_response_object import InferenceTranscribeResponseObject
-from .inference_vad_options import InferenceVADOptions
 from .inferenceschemas_config import InferenceschemasConfig
 from .install_extension_request import InstallExtensionRequest
 from .install_manifest import InstallManifest
@@ -482,6 +487,8 @@ from .query_hit_hierarchy_level import QueryHitHierarchyLevel
 from .query_hit_index_scores import QueryHitIndexScores
 from .query_hit_source import QueryHitSource
 from .query_hits import QueryHits
+from .query_hits_total import QueryHitsTotal
+from .query_hits_total_relation import QueryHitsTotalRelation
 from .query_profile import QueryProfile
 from .query_responses import QueryResponses
 from .query_result import QueryResult
@@ -529,6 +536,9 @@ from .shard_config import ShardConfig
 from .shards_profile import ShardsProfile
 from .significance_algorithm import SignificanceAlgorithm
 from .sort_field import SortField
+from .sort_profile import SortProfile
+from .sort_profile_candidate_source import SortProfileCandidateSource
+from .sort_profile_sort_lifecycle_state import SortProfileSortLifecycleState
 from .sse_error import SSEError
 from .sse_event import SSEEvent
 from .sse_step_completed import SSEStepCompleted
@@ -562,6 +572,7 @@ from .table_statistics_field_stats import TableStatisticsFieldStats
 from .tavily_search_config import TavilySearchConfig
 from .tavily_search_config_search_depth import TavilySearchConfigSearchDepth
 from .template_field_mapping import TemplateFieldMapping
+from .template_field_mapping_missing_null_policy import TemplateFieldMappingMissingNullPolicy
 from .term_query import TermQuery
 from .term_range_query import TermRangeQuery
 from .text_chunk_options import TextChunkOptions
@@ -607,6 +618,7 @@ from .update_manifest_ref import UpdateManifestRef
 from .update_password_request import UpdatePasswordRequest
 from .user import User
 from .user_metadata_type_0 import UserMetadataType0
+from .vad_options import VADOptions
 from .vertex_embedder_config import VertexEmbedderConfig
 from .vertex_generator_config import VertexGeneratorConfig
 from .vertex_reranker_config import VertexRerankerConfig
@@ -794,6 +806,7 @@ __all__ = (
     "EvaluatorName",
     "EvaluatorScore",
     "EvaluatorScoreMetadata",
+    "ExactSortError",
     "ExaSearchConfig",
     "ExaSearchConfigSearchType",
     "ExtensionError",
@@ -829,6 +842,10 @@ __all__ = (
     "FailedOperation",
     "FailedOperationOperation",
     "FetchConfig",
+    "FieldCapability",
+    "FieldCapabilityIndexSortOrder",
+    "FieldCapabilityQueryModesItem",
+    "FieldCapabilitySortLifecycleState",
     "FieldStatistics",
     "FilterSpec",
     "FilterSpecOperator",
@@ -867,6 +884,8 @@ __all__ = (
     "GraphIndexStatsIndexType",
     "GraphIndexStatsPromotion",
     "GraphIndexStatsResolution",
+    "GraphIndexStatsResolverReplay",
+    "GraphIndexStatsSourceArtifact",
     "GraphNodeSelector",
     "GraphQuery",
     "GraphQueryParams",
@@ -990,7 +1009,6 @@ __all__ = (
     "InferenceschemasConfig",
     "InferenceSparseVector",
     "InferenceStyle",
-    "InferenceTextChunkOptions",
     "InferenceTextContent",
     "InferenceTextContentPart",
     "InferenceTextContentPartType",
@@ -1008,7 +1026,6 @@ __all__ = (
     "InferenceTranscribeRequest",
     "InferenceTranscribeResponse",
     "InferenceTranscribeResponseObject",
-    "InferenceVADOptions",
     "InstalledExtension",
     "InstalledExtensionStatus",
     "InstallExtensionRequest",
@@ -1099,6 +1116,8 @@ __all__ = (
     "QueryHitIndexScores",
     "QueryHits",
     "QueryHitSource",
+    "QueryHitsTotal",
+    "QueryHitsTotalRelation",
     "QueryProfile",
     "QueryResponses",
     "QueryResult",
@@ -1146,6 +1165,9 @@ __all__ = (
     "ShardsProfile",
     "SignificanceAlgorithm",
     "SortField",
+    "SortProfile",
+    "SortProfileCandidateSource",
+    "SortProfileSortLifecycleState",
     "SSEError",
     "SSEEvent",
     "SSEStepCompleted",
@@ -1179,6 +1201,7 @@ __all__ = (
     "TavilySearchConfig",
     "TavilySearchConfigSearchDepth",
     "TemplateFieldMapping",
+    "TemplateFieldMappingMissingNullPolicy",
     "TermQuery",
     "TermRangeQuery",
     "TextChunkOptions",
@@ -1224,6 +1247,7 @@ __all__ = (
     "UpdatePasswordRequest",
     "User",
     "UserMetadataType0",
+    "VADOptions",
     "VertexEmbedderConfig",
     "VertexGeneratorConfig",
     "VertexRerankerConfig",

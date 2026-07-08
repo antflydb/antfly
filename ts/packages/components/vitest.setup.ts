@@ -47,6 +47,8 @@ afterEach(() => {
 // Mock the @antfly/sdk module
 vi.mock("@antfly/sdk", () => {
   return {
+    queryHitsTotalValue: vi.fn((total) => total?.value),
+    queryResultTotalHits: vi.fn((result) => result?.hits?.total?.value),
     AntflyClient: vi.fn(function () {
       this.multiquery = vi.fn(async (queries) => {
         // Return mock successful responses for each query
@@ -71,7 +73,7 @@ vi.mock("@antfly/sdk", () => {
                   },
                 },
               ],
-              total: 2,
+              total: { value: 2, relation: "exact" },
             },
             facets: {},
           })),

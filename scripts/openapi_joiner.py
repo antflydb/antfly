@@ -35,9 +35,11 @@ GO_INDEX_REF_PATHS = {
 }
 PATH_REWRITES = {
     "../auth/api.yaml": "specs/openapi/auth/api.yaml",
+    "../shared/chunking.yaml": "specs/openapi/shared/chunking.yaml",
     "../shared/generating.yaml": "specs/openapi/shared/generating.yaml",
     "schema.yaml": "specs/openapi/antfly/schema.yaml",
     "indexes.yaml": "specs/openapi/antfly/indexes.yaml",
+    "sort.yaml": "specs/openapi/antfly/sort.yaml",
     "generating.yaml": "specs/openapi/antfly/generating.yaml",
     "eval.yaml": "specs/openapi/antfly/eval.yaml",
     "reranking.yaml": "specs/openapi/antfly/reranking.yaml",

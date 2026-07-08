@@ -5,7 +5,12 @@
 // When running from source, import from src
 // In production, use: import { AntflyClient } from "@antfly/sdk";
 import { AntflyClient } from "../src/client.js";
-import type { BatchRequest, CreateTableRequest, QueryRequest } from "../src/types.js";
+import {
+  type BatchRequest,
+  type CreateTableRequest,
+  type QueryRequest,
+  queryResultTotalHits,
+} from "../src/types.js";
 
 async function main() {
   // Initialize the client with environment variables
@@ -133,7 +138,7 @@ async function main() {
 
     if (ragResult && typeof ragResult === "object" && "summary_result" in ragResult) {
       console.log("RAG Summary:", ragResult.summary_result?.summary);
-      console.log("Query hits:", ragResult.query_result?.hits?.total);
+      console.log("Query hits:", queryResultTotalHits(ragResult.query_result));
     }
 
     // Example: Table-specific RAG query with streaming

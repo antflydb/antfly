@@ -1563,6 +1563,10 @@ pub const MetadataHttpServer = struct {
             defer self.source.freeAdminSnapshot(&snapshot);
             if (finalizeWouldDeleteActiveNodeOrStore(&snapshot, node_id)) return error.ActiveNodeFinalizeRejected;
             try self.source.finalizeNodeShutdown(node_id);
+            self.source.triggerReallocate() catch |err| switch (err) {
+                error.UnsupportedOperation => {},
+                else => return err,
+            };
             return;
         }
         return error.UnsupportedOperation;
@@ -3283,6 +3287,7 @@ test "metadata http server appends explicit shutdown commands even when snapshot
 test "metadata http server finalizes node shutdown through explicit command" {
     const FakeSource = struct {
         finalize_count: usize = 0,
+        reallocate_count: usize = 0,
         nodes: [1]metadata_table_manager.NodeRecord = .{
             .{ .node_id = 9, .role = "data", .lifecycle = metadata_table_manager.node_lifecycle_active },
         },
@@ -3295,6 +3300,7 @@ test "metadata http server finalizes node shutdown through explicit command" {
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
                     .finalize_node_shutdown = finalizeNodeShutdown,
+                    .trigger_reallocate = triggerReallocate,
                 },
             };
         }
@@ -3326,6 +3332,11 @@ test "metadata http server finalizes node shutdown through explicit command" {
             try std.testing.expectEqual(@as(u64, 9), node_id);
             self.finalize_count += 1;
         }
+
+        fn triggerReallocate(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.reallocate_count += 1;
+        }
     };
 
     var source = FakeSource{};
@@ -3335,12 +3346,14 @@ test "metadata http server finalizes node shutdown through explicit command" {
     defer active_finalize_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 409), active_finalize_resp.status);
     try std.testing.expectEqual(@as(usize, 0), source.finalize_count);
+    try std.testing.expectEqual(@as(usize, 0), source.reallocate_count);
 
     source.nodes[0].lifecycle = metadata_table_manager.node_lifecycle_draining;
     var finalize_resp = try server.handle(.{ .method = .DELETE, .uri = "/internal/v1/nodes/9" });
     defer finalize_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 202), finalize_resp.status);
     try std.testing.expectEqual(@as(usize, 1), source.finalize_count);
+    try std.testing.expectEqual(@as(usize, 1), source.reallocate_count);
 }
 
 test "metadata http server rejects finalizing active store-only node" {

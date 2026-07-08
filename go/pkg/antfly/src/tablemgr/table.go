@@ -401,8 +401,7 @@ func (tm *TableManager) needsUpdates(
 					if !bs.Equal(os) {
 						indexStatsChanged = true
 						if bs.Rebuilding != os.Rebuilding || bs.Error != os.Error ||
-							diffExceedsPercent(bs.TotalIndexed, os.TotalIndexed, 10) ||
-							diffExceedsPercent(bs.DiskUsage, os.DiskUsage, 10) {
+							diffExceedsPercent(bs.TotalIndexed, os.TotalIndexed, 10) {
 							needsPersist = true
 							break
 						}

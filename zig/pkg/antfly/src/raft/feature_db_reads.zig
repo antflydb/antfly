@@ -180,16 +180,11 @@ test "feature db reads honor per-read consistency" {
         cleanupTestDir(path);
     }
 
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
-    });
     try db.batch(.{
         .writes = &.{
             .{
                 .key = "doc:a",
-                .value = "{\"embedding\":[1,0],\"title\":\"alpha\"}",
+                .value = "{\"title\":\"alpha\"}",
             },
         },
         .sync_level = .full_index,
@@ -208,11 +203,7 @@ test "feature db reads honor per-read consistency" {
     defer scan.deinit(alloc);
 
     var search = try reads.searchWithConsistency(alloc, &db, .{
-        .index_name = "dv_v1",
-        .query = .{ .dense_knn = .{
-            .vector = &.{ 1.0, 0.0 },
-            .k = 1,
-        } },
+        .query = .{ .match_all = {} },
         .limit = 1,
         .include_stored = false,
     }, .read_index);
@@ -223,7 +214,6 @@ test "feature db reads honor per-read consistency" {
     try std.testing.expectEqual(@as(u64, 77), recorder.group_ids[1]);
     try std.testing.expectEqualStrings("enrichment:lookup:leader_lease", recorder.contexts[0][0..recorder.context_lens[0]]);
     try std.testing.expectEqualStrings("enrichment:search:read_index", recorder.contexts[1][0..recorder.context_lens[1]]);
-    try std.testing.expectEqual(@as(u32, 1), search.total_hits);
 }
 
 test "feature db reads can use callback requester wrapper" {

@@ -25,6 +25,7 @@ const Resolver = @import("resolver.zig").Resolver;
 const TypeGenerator = @import("codegen_types.zig").TypeGenerator;
 const ClientGenerator = @import("codegen_client.zig").ClientGenerator;
 const ServerGenerator = @import("codegen_server.zig").ServerGenerator;
+const shared = @import("codegen_shared.zig");
 
 pub const GenerateOptions = struct {
     package_name: []const u8 = "api",
@@ -115,7 +116,8 @@ pub fn generate(arena: Allocator, doc: *const types.OpenApiDoc, opts: GenerateOp
         // Re-export all types at top level for convenience
         if (opts.generate_types) {
             if (doc.components) |components| {
-                for (components.schemas.keys()) |schema_name| {
+                const schema_names = try shared.sortedStringKeys(arena, components.schemas.keys());
+                for (schema_names) |schema_name| {
                     const type_name = try naming.toTypeName(arena, schema_name);
                     try w.line("pub const {s} = types.{s};", .{ type_name, type_name });
                 }
@@ -125,7 +127,7 @@ pub fn generate(arena: Allocator, doc: *const types.OpenApiDoc, opts: GenerateOp
             }
         }
 
-        result.root = try w.toOwnedSlice();
+        result.root = try finishGeneratedModule(arena, w.toSlice());
     }
 
     return result;
@@ -147,7 +149,8 @@ fn buildModule(
     for (fixed_imports) |imp| {
         try hdr.line("const {s} = @import(\"{s}\");", .{ imp[0], imp[1] });
     }
-    for (used_imports.keys()) |module_name| {
+    const import_names = try shared.sortedStringKeys(arena, used_imports.keys());
+    for (import_names) |module_name| {
         try hdr.line("const {s} = @import(\"{s}\");", .{ module_name, module_name });
     }
     try hdr.blank();
@@ -156,7 +159,25 @@ fn buildModule(
     const combined = try arena.alloc(u8, header.len + body.len);
     @memcpy(combined[0..header.len], header);
     @memcpy(combined[header.len..], body);
-    return combined;
+    return finishGeneratedModule(arena, combined);
+}
+
+fn finishGeneratedModule(arena: Allocator, source: []const u8) ![]const u8 {
+    var end = source.len;
+    while (end > 0 and source[end - 1] == '\n') : (end -= 1) {}
+
+    const normalized = try arena.alloc(u8, end + 1);
+    @memcpy(normalized[0..end], source[0..end]);
+    normalized[end] = '\n';
+    return normalized;
+}
+
+test "finish generated module keeps exactly one trailing newline" {
+    const alloc = std.testing.allocator;
+    const normalized = try finishGeneratedModule(alloc, "const x = 1;\n\n");
+    defer alloc.free(normalized);
+
+    try std.testing.expectEqualStrings("const x = 1;\n", normalized);
 }
 
 test "generate minimal" {

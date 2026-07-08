@@ -20,14 +20,6 @@ pub const ContentSecurityConfig = struct {
     user_agent: ?[]const u8 = null,
 };
 
-/// S3 credential with optional bucket patterns and security overrides.
-pub const S3CredentialConfig = struct {
-    /// Glob patterns for bucket names this credential handles. When a URL matches a pattern, this credential is auto-selected.
-    buckets: ?[]const []const u8 = null,
-    /// Security overrides for this credential.
-    security: ?ContentSecurityConfig = null,
-};
-
 /// HTTP credential for authenticated endpoints.
 pub const HTTPCredentialConfig = struct {
     /// Base URL prefix this credential applies to.
@@ -48,4 +40,12 @@ pub const RemoteContentConfig = struct {
     s3: ?std.json.ArrayHashMap(S3CredentialConfig) = null,
     /// Named HTTP credentials for authenticated endpoints.
     http: ?std.json.ArrayHashMap(HTTPCredentialConfig) = null,
+};
+
+/// S3 credential with optional bucket patterns and security overrides.
+pub const S3CredentialConfig = struct {
+    /// Glob patterns for bucket names this credential handles. When a URL matches a pattern, this credential is auto-selected.
+    buckets: ?[]const []const u8 = null,
+    /// Security overrides for this credential.
+    security: ?ContentSecurityConfig = null,
 };

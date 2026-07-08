@@ -151,6 +151,7 @@ pub const SegmentInfo = struct {
 
 pub const MergeOutputOptions = struct {
     target_segment_bytes: usize = 256 * 1024 * 1024,
+    index_sort: []const segment_mod.SegmentIndexSortField = &.{},
 };
 
 /// Merge multiple segments from the snapshot into one.
@@ -172,7 +173,11 @@ pub fn mergeSegments(
             .deleted = seg.shared.deleted,
         };
     }
-    return try segment_mod.mergeSegmentInputs(alloc, inputs);
+    const index_sort = try segment_mod.commonIndexSortForMergeInputsAlloc(alloc, inputs);
+    defer segment_mod.freeIndexSortFields(alloc, index_sort);
+    return try segment_mod.mergeSegmentInputsWithOptions(alloc, inputs, .{
+        .index_sort = index_sort,
+    });
 }
 
 /// Merge multiple segments from a snapshot into bounded output segments.
@@ -197,6 +202,12 @@ pub fn mergeSegmentsBounded(
             .deleted = seg.shared.deleted,
         };
     }
+    const common_index_sort = if (options.index_sort.len == 0)
+        try segment_mod.commonIndexSortForMergeInputsAlloc(alloc, inputs)
+    else
+        &.{};
+    defer if (options.index_sort.len == 0) segment_mod.freeIndexSortFields(alloc, common_index_sort);
+    const effective_index_sort = if (options.index_sort.len > 0) options.index_sort else common_index_sort;
 
     const live_docs = countLiveDocs(inputs);
     if (live_docs == 0) return try alloc.alloc([]u8, 0);
@@ -205,7 +216,9 @@ pub fn mergeSegmentsBounded(
     if (live_docs <= 1) {
         const segments = try alloc.alloc([]u8, 1);
         errdefer alloc.free(segments);
-        segments[0] = try segment_mod.mergeSegmentInputs(alloc, inputs);
+        segments[0] = try segment_mod.mergeSegmentInputsWithOptions(alloc, inputs, .{
+            .index_sort = effective_index_sort,
+        });
         return segments;
     }
 
@@ -226,7 +239,7 @@ pub fn mergeSegmentsBounded(
         var window_len = @min(docs_per_segment, live_docs - window_start);
         const segment = while (true) {
             const window_end = window_start + window_len;
-            const candidate = try mergeLiveDocWindow(alloc, inputs, window_start, window_end);
+            const candidate = try mergeLiveDocWindow(alloc, inputs, window_start, window_end, effective_index_sort);
             if (candidate.len <= target_bytes or window_len == 1) break candidate;
             alloc.free(candidate);
             window_len = @max(@as(u32, 1), window_len / 2);
@@ -326,6 +339,7 @@ fn mergeLiveDocWindow(
     inputs: []const segment_mod.MergeInput,
     window_start: u32,
     window_end: u32,
+    index_sort: []const segment_mod.SegmentIndexSortField,
 ) ![]u8 {
     const window_inputs = try alloc.alloc(segment_mod.MergeInput, inputs.len);
     defer alloc.free(window_inputs);
@@ -359,7 +373,9 @@ fn mergeLiveDocWindow(
         };
     }
 
-    return try segment_mod.mergeSegmentInputs(alloc, window_inputs);
+    return try segment_mod.mergeSegmentInputsWithOptions(alloc, window_inputs, .{
+        .index_sort = index_sort,
+    });
 }
 
 fn isDeleted(input: segment_mod.MergeInput, doc_id: u32) bool {
@@ -409,6 +425,77 @@ test "merge two segments" {
     try std.testing.expectEqual(@as(u32, 2), hello.docFreq());
     const world = inv.lookup("world") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u32, 1), world.docFreq());
+}
+
+test "merge preserves common sorted segment index_sort metadata" {
+    const alloc = std.testing.allocator;
+
+    var price1_writer = typed_dv.TypedDocValuesWriter.init(alloc, .u64_val, 1024);
+    defer price1_writer.deinit();
+    try price1_writer.add(0, .{ .u64_val = 3 });
+    const price1_data = try price1_writer.build();
+    defer alloc.free(price1_data);
+
+    var sw1 = segment_mod.SegmentWriter.init(alloc);
+    defer sw1.deinit();
+    const price1 = try sw1.addField("price");
+    try sw1.addSection(price1, .typed_doc_values, price1_data);
+    try sw1.addStoredDoc("doc:c", "{\"price\":3}");
+    try sw1.addIndexSortMetadata(&.{
+        .{ .field = "price", .desc = false },
+        .{ .field = "_id", .desc = false },
+    });
+    const seg1 = try sw1.build();
+    defer alloc.free(seg1);
+
+    var price2_writer = typed_dv.TypedDocValuesWriter.init(alloc, .u64_val, 1024);
+    defer price2_writer.deinit();
+    try price2_writer.add(0, .{ .u64_val = 1 });
+    const price2_data = try price2_writer.build();
+    defer alloc.free(price2_data);
+
+    var sw2 = segment_mod.SegmentWriter.init(alloc);
+    defer sw2.deinit();
+    const price2 = try sw2.addField("price");
+    try sw2.addSection(price2, .typed_doc_values, price2_data);
+    try sw2.addStoredDoc("doc:a", "{\"price\":1}");
+    try sw2.addIndexSortMetadata(&.{
+        .{ .field = "price", .desc = false },
+        .{ .field = "_id", .desc = false },
+    });
+    const seg2 = try sw2.build();
+    defer alloc.free(seg2);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg1);
+    try writer.addSegment(seg2);
+
+    const merged = try mergeSegments(alloc, writer.snapshot(), &.{ 0, 1 });
+    defer alloc.free(merged);
+
+    var reader = try segment_mod.SegmentReader.init(alloc, merged);
+    defer reader.deinit();
+    try std.testing.expectEqualStrings("doc:a", reader.storedDoc(0).?.id);
+    try std.testing.expectEqualStrings("doc:c", reader.storedDoc(1).?.id);
+
+    const fields = (try reader.indexSortFieldsAlloc(alloc)) orelse return error.TestExpectedEqual;
+    defer segment_mod.freeIndexSortFields(alloc, fields);
+    try std.testing.expectEqual(@as(usize, 2), fields.len);
+    try std.testing.expectEqualStrings("price", fields[0].field);
+    try std.testing.expectEqualStrings("_id", fields[1].field);
+
+    var bounds = (try reader.indexSortBoundsAlloc(alloc)) orelse return error.TestExpectedEqual;
+    defer bounds.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), bounds.first.len);
+    try std.testing.expect(bounds.first[0] == .u64_val);
+    try std.testing.expectEqual(@as(u64, 1), bounds.first[0].u64_val);
+    try std.testing.expect(bounds.first[1] == .id);
+    try std.testing.expectEqualStrings("doc:a", bounds.first[1].id);
+    try std.testing.expect(bounds.last[0] == .u64_val);
+    try std.testing.expectEqual(@as(u64, 3), bounds.last[0].u64_val);
+    try std.testing.expect(bounds.last[1] == .id);
+    try std.testing.expectEqualStrings("doc:c", bounds.last[1].id);
 }
 
 test "bounded merge splits output and preserves live documents" {

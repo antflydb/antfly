@@ -65,7 +65,21 @@ Current non-core format boundaries:
   canvas
 - GIF hardening also covers ignored Comment Extensions and an out-of-bounds
   image-descriptor failure path
-- BMP remains deliberately out of scope unless reintroduced explicitly
+- BMP decode is owned by the shared image layer for user-supplied media paths,
+  including inference preprocessing and DB `remoteMedia` embeddings. The first
+  shared implementation covers uncompressed indexed/truecolor BMPs and rejects
+  bitfields/RLE as typed unsupported inputs.
+- WebP has a pure-Zig parser/probe boundary in the shared layer, VP8L
+  still-image decode paths, and a constrained VP8 lossy still-image decoder
+  for intra keyframes with VP8 loop filtering and optional `ALPH` composition.
+  `Format.webp`, inference routing, fixture-backed corpus checks, and
+  `image/webp` capability advertising are wired. Animated WebP is explicitly
+  rejected until frame extraction semantics are implemented. The WebP corpus now
+  includes generated VP8/VP8L/ALPH fixtures, an upstream libwebp VP8 still image
+  fixture, and Go x/image reference fixtures covering VP8L, VP8 loop filter
+  variants, odd dimensions, photo-like lossy input, and extended ALPH
+  composition. Imported WebP fixture provenance and license text are recorded in
+  `testdata/image/THIRD_PARTY_FIXTURES.md`.
 
 Current JPEG boundary:
 
@@ -169,16 +183,15 @@ repos.
   - `antfly-inference-zig` currently documents and implements `JPEG/PNG/BMP/GIF`
     acceptance in its native image decode path
 
-### Not required for the current migration
+### Not required for the original stb_image migration
 
 - APNG decode
-- WebP decode
 - TIFF decode
 - PDF `JPXDecode`
 - PDF `JBIG2Decode`
 
-Those may be future work, but they should not block removing `stb_image` if the
-rest of the project does not currently depend on them.
+Those items did not block the original `stb_image` removal. WebP is now tracked
+as follow-up format support owned by the shared pure-Zig image layer.
 
 ## JPEG Scope
 
@@ -246,23 +259,95 @@ it, so the doc and APIs should keep room for later expansion.
 
 ## BMP Scope
 
-BMP should be treated as a parity decision, not as an automatic requirement.
+Decision: BMP is part of the shared image layer because `remoteMedia` and
+native image preprocessing can receive user-supplied BMPs through the same
+media path as JPEG, PNG, and GIF. BMP support must live in `lib/image`, not in
+antfly inference, so all callers get the same format detection, decode errors,
+and corpus coverage.
 
-Decision: BMP is currently dropped from the shared image layer. The shared
-runtime target is JPEG, PNG, and GIF. `antfly-inference-zig` should be treated as having
-that narrowed native decode contract unless we later decide to reintroduce BMP
-for a concrete product reason.
-
-If we want the shared layer to preserve termite's current input contract, BMP
-decode should cover:
+Initial BMP decode covers:
 
 - uncompressed indexed and truecolor BMPs
 - top-down and bottom-up orientation
-- bitfields
-- RLE only if we actually want strong BMP compatibility
+- 1/4/8-bit indexed BMPs with BGRA palettes
+- 24-bit BGR
+- 32-bit BGRX/BGRA, treating all-zero alpha planes as opaque BGRX
 
-If we do not want to support BMP, then termite's public/native decode contract
-needs to be narrowed deliberately and documented.
+Out of scope for the first BMP implementation:
+
+- bitfields
+- RLE compression
+- OS/2 CORE headers
+- color management metadata
+
+Those inputs should fail as unsupported BMP, not fall through to a generic
+image decode failure.
+
+BMP conformance coverage lives in `testdata/image/bmp/` and
+`testdata/image/manifest.zon`. The checked-in core corpus includes orientation,
+indexed 1/4/8-bit, known-unsupported bitfields/RLE, and truncated invalid
+fixtures. Broader BMP Suite imports should be curated incrementally instead of
+bulk-imported.
+
+## WebP Scope
+
+Decision: WebP is owned by the shared pure-Zig image layer. WebP is not a thin
+container-only feature: production support needs at least RIFF/WebP parsing
+plus VP8 lossy and VP8L lossless image decode. Alpha (`ALPH`) is also required
+for common real-world files. Animated WebP remains an explicit unsupported case
+until frame extraction semantics are implemented.
+
+The pure-Zig WebP implementation should be structured as:
+
+- `webp.zig`
+  - RIFF/WebP signature and chunk parsing (`probe` is present and shared
+    `detectFormat()` recognizes WebP)
+  - `VP8 ` lossy still-image decode (keyframe frame-tag/dimension and token
+    partition metadata parsing, bool-coded first-partition header parsing,
+    macroblock grid sizing, YUV-to-RGBA output, scalar inverse transform, and
+    luma/chroma intra-prediction primitives are present; padded YUV frame-plane
+    allocation and cropped RGBA conversion are present as frame assembly
+    targets; coefficient token/residual block decode and segment-aware
+    quant/dequant matrix derivation are present as internal primitives;
+    macroblock segment/skip/luma/chroma mode parsing is
+    present for 16x16 and 4x4 luma mode paths, and coefficient probability
+    update parsing is wired to the reference default and update-probability
+    tables; the keyframe control parser now preserves the macroblock-mode
+    reader state after entropy/skip parsing and token partitions are selected
+    by macroblock row; 16x16 intra macroblock prediction writes into Y/U/V
+    planes with boundary-aware DC and left/top sample handling; 16x16
+    macroblock coefficient payload reading now follows the Y2/Y1/UV block
+    ordering with token-context updates, and residual application now
+    reconstructs Y/U/V blocks including Y2-to-Y1 DC propagation; constrained
+    raster-order frame assembly exists for intra 16x16 keyframes, including
+    row-based token partition selection, prediction, residual application, and
+    cropped RGBA conversion; 4x4 luma macroblock reconstruction now uses VP8
+    edge defaults, already-reconstructed neighbor samples, type-3 luma
+    coefficients, and is exercised by the frame assembly path; the keyframe
+    4x4 luma mode parser is wired to the reference default probability table;
+    `decodeRgba` routes supported `VP8 ` chunks through this constrained
+    pure-Zig path; normal and simple VP8 loop filtering are implemented using
+    per-macroblock segment/mode/residue metadata; fixture-backed VP8 parity now
+    includes generated still-image fixtures plus upstream libwebp and Go
+    x/image reference samples)
+  - `VP8L` lossless still-image decode (`decodeRgba` has the core lossless
+    paths: prefix codes, LZ77, color cache, all inverse transforms, and
+    meta-prefix Huffman groups; fixture/corpus parity exists for checked-in
+    generated fixtures and Go x/image reference fixtures)
+  - `VP8X` feature validation (`probe` validates flags and canvas size)
+  - `ALPH` composition when present (`probe` recognizes ALPH; raw/filter and
+    VP8L-compressed alpha-plane decoding helpers are present, and supported
+    lossy `VP8 ` decode composes the alpha plane into RGBA)
+  - clear rejection for animation until frame extraction is implemented
+- inference calls the shared image layer for WebP and should not contain
+  independent WebP parsing
+- local embedder capabilities advertise exact supported image MIME types,
+  including `image/webp`, rather than broad `image/*`
+- WebP corpus coverage lives in `testdata/image/webp/` and
+  `testdata/image/manifest.zon`, with success, animated-known-unsupported, and
+  invalid fixtures checked by `verify-webp`
+- imported upstream WebP fixtures must have provenance and license terms recorded
+  in `testdata/image/THIRD_PARTY_FIXTURES.md`
 
 ## Migration Order
 
@@ -565,9 +650,9 @@ What to use it for:
 
 Recommendation:
 
-- do not start BMP work unless we explicitly reverse the current drop decision
-- if BMP is kept, BMP Suite should be the initial corpus rather than hand-made
-  samples only
+- keep small hand-made BMP fixtures for exact parser behavior
+- add BMP Suite fixtures for broader indexed, truecolor, orientation, bitfield,
+  and invalid coverage
 
 ## Corpus Layout
 
@@ -641,4 +726,8 @@ We should not delete `stb_image` until all of these are true:
 3. Start with pure Zig JPEG decode plus a strong differential harness.
 4. Add PNG decode and migrate antfly inference static image preprocessing.
 5. Add GIF decode and migrate antfly inference chunking.
-6. Keep BMP out of scope unless the product surface deliberately adds it back.
+6. Add BMP decode in the shared image layer and route inference through shared
+   format detection.
+7. Keep WebP as a pure-Zig shared codec; do not use `libwebp`. Continue
+   broadening VP8 and VP8L conformance with additional external/reference
+   fixtures as the corpus grows.

@@ -3,14 +3,12 @@
 
 const std = @import("std");
 
-/// Text content with character offsets.
-pub const TextContent = struct {
-    /// The chunk text content
-    text: []const u8,
-    /// Character position in original text where chunk starts
-    start_char: i64,
-    /// Character position in original text where chunk ends (exclusive)
-    end_char: i64,
+/// Options specific to audio chunking.
+pub const AudioChunkOptions = struct {
+    /// Window duration in milliseconds for fixed-window audio chunking (default: 30000).
+    window_duration_ms: ?i64 = null,
+    /// Overlap duration in milliseconds between audio chunks (default: 0).
+    overlap_duration_ms: ?i64 = null,
 };
 
 /// Binary media content with format-specific metadata.
@@ -25,24 +23,6 @@ pub const BinaryContent = struct {
     frame_index: ?i64 = null,
     /// Animation: display delay in milliseconds
     frame_delay_ms: ?i64 = null,
-};
-
-/// Options specific to text chunking.
-pub const TextChunkOptions = struct {
-    /// Target number of tokens per chunk.
-    target_tokens: ?i64 = null,
-    /// Number of tokens to overlap between consecutive chunks. Helps maintain context across chunk boundaries. Only used by fixed-size chunkers.
-    overlap_tokens: ?i64 = null,
-    /// Separator string for splitting (e.g., '\n\n' for paragraphs). Only used by fixed-size chunkers.
-    separator: ?[]const u8 = null,
-};
-
-/// Options specific to audio chunking.
-pub const AudioChunkOptions = struct {
-    /// Window duration in milliseconds for fixed-window audio chunking (default: 30000).
-    window_duration_ms: ?i64 = null,
-    /// Overlap duration in milliseconds between audio chunks (default: 0).
-    overlap_duration_ms: ?i64 = null,
 };
 
 /// A chunk of content. Text chunks have mime_type text/plain.
@@ -77,4 +57,66 @@ pub const ChunkOptions = struct {
     threshold: ?f32 = null,
     text: ?TextChunkOptions = null,
     audio: ?AudioChunkOptions = null,
+};
+
+/// Audio chunking configuration for inference, including VAD options.
+pub const InferenceAudioChunkConfig = struct {
+    /// Window duration in milliseconds for fixed-window audio chunking (default: 30000).
+    window_duration_ms: ?i64 = null,
+    /// Overlap duration in milliseconds between audio chunks (default: 0).
+    overlap_duration_ms: ?i64 = null,
+    vad: ?VADOptions = null,
+};
+
+/// Configuration for chunking requests to Antfly inference. Combines shared text options with inference-specific audio/VAD options.
+pub const InferenceChunkConfig = struct {
+    /// The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name from models/chunkers/{name}/.
+    model: ?[]const u8 = null,
+    /// Maximum number of chunks to generate per document.
+    max_chunks: ?i64 = null,
+    /// Confidence threshold for model-based chunking (0.0-1.0). Used by ONNX text models and VAD audio models.
+    threshold: ?f32 = null,
+    text: ?TextChunkOptions = null,
+    audio: ?InferenceAudioChunkConfig = null,
+};
+
+/// Content part supported by chunking requests.
+pub const InferenceChunkContentPart = std.json.Value;
+
+pub const InferenceChunkRequest = struct {
+    /// Input content to chunk. Supports two formats: - Text string: `"This is a long document..."` - ContentPart: `{"type": "media", "data": "<base64>", "mime_type": "audio/wav"}` - ContentPart: `{"type": "text", "text": "..."}`
+    input: std.json.Value,
+    config: ?InferenceChunkConfig = null,
+};
+
+/// Options specific to text chunking.
+pub const TextChunkOptions = struct {
+    /// Target number of tokens per chunk.
+    target_tokens: ?i64 = null,
+    /// Number of tokens to overlap between consecutive chunks. Helps maintain context across chunk boundaries. Only used by fixed-size chunkers.
+    overlap_tokens: ?i64 = null,
+    /// Separator string for splitting (e.g., '\n\n' for paragraphs). Only used by fixed-size chunkers.
+    separator: ?[]const u8 = null,
+};
+
+/// Text content with character offsets.
+pub const TextContent = struct {
+    /// The chunk text content
+    text: []const u8,
+    /// Character position in original text where chunk starts
+    start_char: i64,
+    /// Character position in original text where chunk ends (exclusive)
+    end_char: i64,
+};
+
+/// Options for Voice Activity Detection (VAD) based audio segmentation.
+pub const VADOptions = struct {
+    /// Minimum silence duration (ms) to split speech segments. Gaps shorter than this are merged. Higher values produce longer, fewer segments. Default: 300.
+    min_silence_duration_ms: ?i64 = null,
+    /// Minimum speech duration (ms) for a segment to be kept. Shorter segments are discarded. Default: 250.
+    min_speech_duration_ms: ?i64 = null,
+    /// Padding (ms) added before and after detected speech. Default: 30.
+    speech_pad_ms: ?i64 = null,
+    /// Maximum segment duration (ms). Segments longer than this are split. Useful for Whisper-compatible chunking. Default: 30000.
+    max_segment_duration_ms: ?i64 = null,
 };

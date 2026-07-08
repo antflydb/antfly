@@ -23,6 +23,7 @@ pub fn configureModule(
     public_openapi_mod: *std.Build.Module,
     query_openapi_mod: *std.Build.Module,
     indexes_openapi_mod: *std.Build.Module,
+    sort_openapi_mod: *std.Build.Module,
     metadata_openapi_mod: *std.Build.Module,
     reranking_mod: *std.Build.Module,
     objectstore_mod: *std.Build.Module,
@@ -45,6 +46,7 @@ pub fn configureModule(
     mod.addImport("antfly_public_openapi", public_openapi_mod);
     mod.addImport("antfly_query_openapi", query_openapi_mod);
     mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
+    mod.addImport("antfly_sort_openapi", sort_openapi_mod);
     mod.addImport("antfly_metadata_openapi", metadata_openapi_mod);
     mod.addImport("antfly_reranking", reranking_mod);
     mod.addImport("objectstore", objectstore_mod);

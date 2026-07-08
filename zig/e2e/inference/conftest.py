@@ -184,7 +184,10 @@ def api(base_url):
             err = body.get("error", "")
             if "INVALID_MODEL" in err or "MODEL_NOT_FOUND" in err:
                 pytest.skip(f"Model unavailable: {body.get('message', err)}")
-        r.raise_for_status()
+        try:
+            r.raise_for_status()
+        except requests.HTTPError as exc:
+            raise AssertionError(f"{exc}\nresponse body: {r.text[:2000]}") from exc
 
     class Api:
         def __init__(self, session, base_url):
@@ -222,7 +225,7 @@ def api(base_url):
             if model:
                 config["model"] = model
             config.update(kwargs)
-            body: dict = {"text": text}
+            body: dict = {"input": text}
             if config:
                 body["config"] = config
             r = self.post("/chunk", json=body)

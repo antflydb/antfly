@@ -408,14 +408,16 @@ func NewGeoDistance(lon float64, lat float64, distance string, field string) Que
 // Example:
 //
 //	q := query.NewGeoBoundingBox(
-//	    -122.5, 37.9,  // top left lon, lat
-//	    -122.3, 37.7,  // bottom right lon, lat
+//	    37.7, -122.5,  // min lat, min lon
+//	    37.9, -122.3,  // max lat, max lon
 //	    "location",
 //	)
-func NewGeoBoundingBox(topLeftLon float64, topLeftLat float64, bottomRightLon float64, bottomRightLat float64, field string) Query {
+func NewGeoBoundingBox(minLat float64, minLon float64, maxLat float64, maxLon float64, field string) Query {
 	return GeoBoundingBoxQuery{
-		TopLeft:     []float64{topLeftLon, topLeftLat},
-		BottomRight: []float64{bottomRightLon, bottomRightLat},
-		Field:       field,
+		Field:  field,
+		MinLat: minLat,
+		MinLon: minLon,
+		MaxLat: maxLat,
+		MaxLon: maxLon,
 	}.ToQuery()
 }

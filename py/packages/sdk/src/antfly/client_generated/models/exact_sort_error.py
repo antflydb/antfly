@@ -1,0 +1,123 @@
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import Any, TypeVar
+
+from attrs import define as _attrs_define
+
+from ..types import UNSET, Unset
+
+T = TypeVar("T", bound="ExactSortError")
+
+
+@_attrs_define
+class ExactSortError:
+    """
+    Attributes:
+        error (str): Stable error class. Example: unsupported_exact_sort.
+        message (str): Human-readable error summary. Example: exact sort is unsupported for this query.
+        reason (str): Stable machine-readable rejection reason. Known exact-sort
+            reasons include `unmapped_field`, `non_sortable_field`,
+            `unsupported_sort_field`, `mixed_field_type`,
+            `field_not_sort_ready`, `filter_not_queryable`,
+            `invalid_cursor_arity`, `invalid_cursor_type`,
+            `invalid_sort_tuple`, `approximate_candidate_source`,
+            `candidate_budget_exceeded`, `missing_null_policy`,
+            `non_score_bearing_source`, `invalid_score_value`,
+            `count_only_ordered_page`, `stored_json_sort_disabled`,
+            `unsupported_exact_sort`, and `distributed_merge_unsupported`.
+             Example: field_not_sort_ready.
+        sort_rejection_reason (str): Stable exact-sort rejection reason; uses the same stable reason taxonomy as
+            `reason`. Example: field_not_sort_ready.
+        sort_rejection_detail (str): Stable user-facing exact-sort rejection detail. Internal storage
+            and planner details are reserved for logs, traces, and explicit
+            debug surfaces.
+             Example: field_not_sort_ready.
+        sort_rejection_field (str): Sort field associated with the rejection when safe to expose. Example: created_at.
+        status (int):  Example: 422.
+        budget_rejection_reason (str | Unset): Stable budget rejection reason when the rejection was
+            budget-driven. Known values include
+            `text_exact_late_visibility_totals`,
+            `text_field_sort_candidate_window`,
+            `match_all_candidate_collect_limit`,
+            `match_all_exact_candidate_window`,
+            `sorted_segment_scan_window`, and
+            `distributed_merge_shard_window`.
+             Example: text_field_sort_candidate_window.
+    """
+
+    error: str
+    message: str
+    reason: str
+    sort_rejection_reason: str
+    sort_rejection_detail: str
+    sort_rejection_field: str
+    status: int
+    budget_rejection_reason: str | Unset = UNSET
+
+    def to_dict(self) -> dict[str, Any]:
+        error = self.error
+
+        message = self.message
+
+        reason = self.reason
+
+        sort_rejection_reason = self.sort_rejection_reason
+
+        sort_rejection_detail = self.sort_rejection_detail
+
+        sort_rejection_field = self.sort_rejection_field
+
+        status = self.status
+
+        budget_rejection_reason = self.budget_rejection_reason
+
+        field_dict: dict[str, Any] = {}
+
+        field_dict.update(
+            {
+                "error": error,
+                "message": message,
+                "reason": reason,
+                "sort_rejection_reason": sort_rejection_reason,
+                "sort_rejection_detail": sort_rejection_detail,
+                "sort_rejection_field": sort_rejection_field,
+                "status": status,
+            }
+        )
+        if budget_rejection_reason is not UNSET:
+            field_dict["budget_rejection_reason"] = budget_rejection_reason
+
+        return field_dict
+
+    @classmethod
+    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        d = dict(src_dict)
+        error = d.pop("error")
+
+        message = d.pop("message")
+
+        reason = d.pop("reason")
+
+        sort_rejection_reason = d.pop("sort_rejection_reason")
+
+        sort_rejection_detail = d.pop("sort_rejection_detail")
+
+        sort_rejection_field = d.pop("sort_rejection_field")
+
+        status = d.pop("status")
+
+        budget_rejection_reason = d.pop("budget_rejection_reason", UNSET)
+
+        exact_sort_error = cls(
+            error=error,
+            message=message,
+            reason=reason,
+            sort_rejection_reason=sort_rejection_reason,
+            sort_rejection_detail=sort_rejection_detail,
+            sort_rejection_field=sort_rejection_field,
+            status=status,
+            budget_rejection_reason=budget_rejection_reason,
+        )
+
+        return exact_sort_error

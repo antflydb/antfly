@@ -83,7 +83,8 @@ type QueryRequest struct {
 	// Analyses specifies analysis operations to perform
 	Analyses *oapi.Analyses `json:"analyses,omitempty"`
 
-	// Count whether to return only the count of matching documents
+	// Count whether to return only the count of matching documents.
+	// Count-only requests do not support OrderBy, SearchAfter, or SearchBefore.
 	Count bool `json:"count,omitempty"`
 
 	// DistanceOver minimum distance for semantic similarity search
@@ -123,17 +124,21 @@ type QueryRequest struct {
 	// MergeConfig for combining results from semantic_search and full_text_search
 	MergeConfig MergeConfig `json:"merge_config"`
 
-	// Offset number of results to skip for pagination (only available for full_text_search queries)
+	// Offset number of results to skip for pagination.
+	// Supported for text-backed, match_all, and filter-only requests; not semantic search.
 	Offset int `json:"offset,omitempty"`
 
-	// OrderBy specifies fields to order by with direction
+	// OrderBy specifies exact stored-field sort order.
+	// Supported for text-backed, match_all, and filter-only requests; not semantic search or count-only requests.
 	OrderBy []oapi.SortField `json:"order_by,omitempty"`
 
-	// SearchAfter cursor for forward pagination (pass _sort values from last hit)
-	SearchAfter []string `json:"search_after,omitempty"`
+	// SearchAfter cursor for forward pagination. Pass typed _sort values from the last hit.
+	// Requires OrderBy and is not supported for semantic search or count-only requests.
+	SearchAfter []any `json:"search_after,omitempty"`
 
-	// SearchBefore cursor for backward pagination (pass _sort values from first hit)
-	SearchBefore []string `json:"search_before,omitempty"`
+	// SearchBefore cursor for backward pagination. Pass typed _sort values from the first hit.
+	// Requires OrderBy and is not supported for semantic search or count-only requests.
+	SearchBefore []any `json:"search_before,omitempty"`
 
 	// Reranker configuration for reranking results
 	Reranker *RerankerConfig `json:"reranker,omitempty"`
