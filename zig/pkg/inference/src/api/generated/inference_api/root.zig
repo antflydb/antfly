@@ -73,6 +73,7 @@ pub const PredictResponse = types.PredictResponse;
 pub const PredictorInfo = types.PredictorInfo;
 pub const PredictorTask = types.PredictorTask;
 pub const PredictorsResponse = types.PredictorsResponse;
+pub const PromptCacheConfig = types.PromptCacheConfig;
 pub const ReadObject = types.ReadObject;
 pub const ReadRequest = types.ReadRequest;
 pub const ReadResponse = types.ReadResponse;

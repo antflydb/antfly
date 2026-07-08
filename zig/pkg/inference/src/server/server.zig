@@ -104,6 +104,7 @@ pub const BudgetOverrides = struct {
 
 pub const PromptCacheConfig = struct {
     enabled: bool = false,
+    mode: runtime.kv.prompt_cache.Mode = .simple,
     max_bytes_mb: usize = 512,
     min_tokens: usize = 64,
     ttl_ms: u64 = 300_000,
@@ -111,6 +112,7 @@ pub const PromptCacheConfig = struct {
     pub fn runtimeConfig(self: @This()) runtime.kv.prompt_cache.Config {
         return .{
             .enabled = self.enabled,
+            .mode = self.mode,
             .max_bytes = self.max_bytes_mb * 1024 * 1024,
             .min_tokens = self.min_tokens,
             .ttl_ms = self.ttl_ms,
@@ -5567,6 +5569,11 @@ fn appendPromptCacheMetrics(writer: *std.Io.Writer, models: anytype) !void {
     var cached_tokens: u64 = 0;
     var live_entries: u64 = 0;
     var live_bytes: u64 = 0;
+    var block_hash_hits: u64 = 0;
+    var block_hash_misses: u64 = 0;
+    var block_hash_evictions: u64 = 0;
+    var block_hash_cached_blocks: u64 = 0;
+    var block_hash_collision_guards: u64 = 0;
     var it = models.iterator();
     while (it.next()) |entry| {
         const stats = entry.value_ptr.*.prompt_prefix_cache.stats();
@@ -5576,6 +5583,11 @@ fn appendPromptCacheMetrics(writer: *std.Io.Writer, models: anytype) !void {
         cached_tokens += stats.cached_tokens;
         live_entries += @intCast(stats.live_entries);
         live_bytes += @intCast(stats.live_bytes);
+        block_hash_hits += stats.block_hash_hits;
+        block_hash_misses += stats.block_hash_misses;
+        block_hash_evictions += stats.block_hash_evictions;
+        block_hash_cached_blocks += @intCast(stats.block_hash_cached_blocks);
+        block_hash_collision_guards += stats.block_hash_collision_guards;
     }
     try appendPromMetric(writer, "antfly_inference_prompt_cache_hits_total", "counter", "Total prompt prefix cache hits", hits);
     try appendPromMetric(writer, "antfly_inference_prompt_cache_misses_total", "counter", "Total prompt prefix cache misses", misses);
@@ -5583,6 +5595,11 @@ fn appendPromptCacheMetrics(writer: *std.Io.Writer, models: anytype) !void {
     try appendPromMetric(writer, "antfly_inference_prompt_cache_cached_tokens", "gauge", "Prompt prefix cache retained prompt tokens", cached_tokens);
     try appendPromMetric(writer, "antfly_inference_prompt_cache_live_entries", "gauge", "Prompt prefix cache live entries", live_entries);
     try appendPromMetric(writer, "antfly_inference_prompt_cache_live_bytes", "gauge", "Prompt prefix cache estimated retained bytes", live_bytes);
+    try appendPromMetric(writer, "antfly_inference_prompt_cache_block_hash_hits_total", "counter", "Total block-hash prompt cache hits", block_hash_hits);
+    try appendPromMetric(writer, "antfly_inference_prompt_cache_block_hash_misses_total", "counter", "Total block-hash prompt cache misses", block_hash_misses);
+    try appendPromMetric(writer, "antfly_inference_prompt_cache_block_hash_evictions_total", "counter", "Total block-hash prompt cache evictions", block_hash_evictions);
+    try appendPromMetric(writer, "antfly_inference_prompt_cache_block_hash_cached_blocks", "gauge", "Block-hash prompt cache retained KV blocks", block_hash_cached_blocks);
+    try appendPromMetric(writer, "antfly_inference_prompt_cache_block_hash_collision_guards_total", "counter", "Total block-hash prompt cache collisions detected", block_hash_collision_guards);
 }
 
 fn aggregateResidentProjectionStats(models: anytype) embedding_mod.ResidentProjectionStats {

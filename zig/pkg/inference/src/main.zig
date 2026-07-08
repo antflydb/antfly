@@ -49,6 +49,7 @@ const RunConfig = struct {
 
     const PromptCacheConfig = struct {
         enabled: bool = false,
+        mode: inference.runtime.kv.prompt_cache.Mode = .simple,
         max_bytes_mb: usize = 512,
         min_tokens: usize = 64,
         ttl_ms: u64 = 300_000,
@@ -320,6 +321,7 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
         if (cfg.pool_size) |value| node_cfg.pool_size = value;
         if (cfg.prompt_cache) |value| node_cfg.prompt_cache = .{
             .enabled = value.enabled,
+            .mode = value.mode,
             .max_bytes_mb = value.max_bytes_mb,
             .min_tokens = value.min_tokens,
             .ttl_ms = value.ttl_ms,
@@ -502,7 +504,7 @@ test "run config parses shared scraping fields and ignores api_url" {
         \\  ],
         \\  "max_loaded_models": 8,
         \\  "pool_size": 4,
-        \\  "prompt_cache": { "enabled": true, "max_bytes_mb": 64, "min_tokens": 32, "ttl_ms": 1000 }
+        \\  "prompt_cache": { "enabled": true, "mode": "block_hash", "max_bytes_mb": 64, "min_tokens": 32, "ttl_ms": 1000 }
         \\}
     ;
     const parsed = try std.json.parseFromSlice(RunConfig, std.testing.allocator, raw, .{
@@ -524,6 +526,7 @@ test "run config parses shared scraping fields and ignores api_url" {
     try std.testing.expectEqual(@as(?usize, 8), parsed.value.max_loaded_models);
     try std.testing.expectEqual(@as(?usize, 4), parsed.value.pool_size);
     try std.testing.expectEqual(true, parsed.value.prompt_cache.?.enabled);
+    try std.testing.expectEqual(inference.runtime.kv.prompt_cache.Mode.block_hash, parsed.value.prompt_cache.?.mode);
     try std.testing.expectEqual(@as(usize, 64), parsed.value.prompt_cache.?.max_bytes_mb);
     try std.testing.expectEqual(@as(usize, 32), parsed.value.prompt_cache.?.min_tokens);
     try std.testing.expectEqual(@as(u64, 1000), parsed.value.prompt_cache.?.ttl_ms);

@@ -20350,6 +20350,36 @@ components:
           $ref: '#/components/schemas/InferenceModelFormat'
         quantization:
           $ref: '#/components/schemas/InferenceModelQuantization'
+    InferencePromptCacheConfig:
+      type: object
+      description: Native generator prompt KV cache configuration.
+      properties:
+        enabled:
+          type: boolean
+          description: Enable inference-native prompt KV cache reuse for generator requests.
+          default: false
+        mode:
+          type: string
+          description: >
+            Prompt KV cache implementation. `simple` keeps the retained-prefix cache.
+
+            `block_hash` uses hash-addressed full KV blocks under prompt_cache_key.
+          enum:
+            - simple
+            - block_hash
+          default: simple
+        max_bytes_mb:
+          type: integer
+          description: Maximum retained KV cache memory per loaded generator model.
+          default: 512
+        min_tokens:
+          type: integer
+          description: Minimum prompt length eligible for prompt KV caching.
+          default: 64
+        ttl_ms:
+          type: integer
+          description: Time-to-live for idle prompt KV cache entries.
+          default: 300000
     InferenceConfig:
       type: object
       required:
@@ -20435,6 +20465,9 @@ components:
             independently of max_loaded_models.
           default: 1
           example: 1
+        prompt_cache:
+          $ref: '#/components/schemas/InferencePromptCacheConfig'
+          description: Native generator prompt KV cache settings.
         backend_priority:
           type: array
           items:
