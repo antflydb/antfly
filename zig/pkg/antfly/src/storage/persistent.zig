@@ -943,7 +943,7 @@ pub const PersistentIndex = struct {
                     error.NotFound => null,
                     else => return err,
                 };
-                var segment_data = if (seg_bytes) |bytes| blk: {
+                var segment_data: ?index_mod.SegmentData = if (seg_bytes) |bytes| blk: {
                     break :blk if (segment_files) |*store|
                         try store.publish(seg_id, bytes)
                     else
@@ -972,16 +972,18 @@ pub const PersistentIndex = struct {
                     try stale_active_ids.append(alloc, seg_id);
                     continue;
                 };
-                segment_data.madviseAccessPattern();
-                errdefer segment_data.deinit(alloc);
-                writer.addSegmentWithIdData(seg_id, segment_data) catch |err| {
+                segment_data.?.madviseAccessPattern();
+                errdefer if (segment_data) |*data| data.deinit(alloc);
+                writer.addSegmentWithIdData(seg_id, segment_data.?) catch |err| {
                     if (isStaleActiveSegmentDataError(err)) {
-                        segment_data.deinit(alloc);
+                        segment_data.?.deinit(alloc);
+                        segment_data = null;
                         try stale_active_ids.append(alloc, seg_id);
                         continue;
                     }
                     return err;
                 };
+                segment_data = null;
 
                 const deletion_bytes = read_txn.get(.deletions, &seg_key) catch |err| switch (err) {
                     error.NotFound => null,
@@ -2843,6 +2845,30 @@ test "persistent index open prunes stale active segment references" {
         defer alloc.free(active_ids);
         try std.testing.expectEqual(@as(usize, 0), active_ids.len);
     }
+}
+
+test "persistent index open keeps recovered segment ownership on later catalog error" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+
+    {
+        var pi = try PersistentIndex.open(alloc, .{ .path = path });
+        defer pi.close();
+
+        const seg = try buildSimpleSegment(alloc, "doc:a", "alpha");
+        defer alloc.free(seg);
+        try pi.indexSegment(seg);
+
+        var txn = try pi.beginWriteMainTxn();
+        errdefer txn.abort();
+        const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, @as(u64, 1)));
+        try txn.put(.deletions, &seg_key, "\x01\x00");
+        try txn.commit();
+    }
+
+    try std.testing.expectError(error.InvalidRoaringBitmap, PersistentIndex.open(alloc, .{ .path = path }));
 }
 
 test "persistent index classifies active segments for split" {

@@ -6212,6 +6212,9 @@ pub const ProvisionedTableWriteSource = struct {
         alloc: std.mem.Allocator,
         table_name: []const u8,
     ) void {
+        self.beginTableRequest(table_name);
+        defer self.endTableRequest(table_name);
+
         var leases = std.ArrayListUnmanaged(ProvisionedTableWriteCache.CachedDb).empty;
         defer {
             for (leases.items) |*lease| {
