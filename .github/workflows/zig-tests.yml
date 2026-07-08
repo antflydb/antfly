@@ -454,7 +454,7 @@ jobs:
   e2e-base:
     name: e2e-base
     needs: changes
-    if: github.event_name != 'schedule' && needs.changes.outputs.e2e == 'true'
+    if: github.event_name == 'pull_request' && needs.changes.outputs.e2e == 'true'
     runs-on: arc-antfly-heavy
     timeout-minutes: 45
     env:
@@ -503,7 +503,7 @@ jobs:
   e2e-full:
     name: e2e-full
     needs: changes
-    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 8 * * *'
+    if: github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch' || github.event.schedule == '0 8 * * *'
     runs-on: arc-antfly-heavy
     timeout-minutes: 90
     env:
