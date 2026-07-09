@@ -73,6 +73,41 @@ func NewTermiteAPI(logger *zap.Logger, node *TermiteNode) http.Handler {
 	})
 }
 
+type captureResponseWriter struct {
+	header http.Header
+	status int
+	body   bytes.Buffer
+}
+
+func newCaptureResponseWriter() *captureResponseWriter {
+	return &captureResponseWriter{header: make(http.Header)}
+}
+
+func (w *captureResponseWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *captureResponseWriter) WriteHeader(statusCode int) {
+	if w.status != 0 {
+		return
+	}
+	w.status = statusCode
+}
+
+func (w *captureResponseWriter) Write(p []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.body.Write(p)
+}
+
+func (w *captureResponseWriter) Status() int {
+	if w.status == 0 {
+		return http.StatusOK
+	}
+	return w.status
+}
+
 // GenerateEmbeddings implements ServerInterface
 func (t *TermiteAPI) GenerateEmbeddings(w http.ResponseWriter, r *http.Request) {
 	t.node.handleApiEmbed(w, r)
@@ -101,6 +136,11 @@ func (t *TermiteAPI) RecognizeEntities(w http.ResponseWriter, r *http.Request) {
 // GenerateContent implements ServerInterface
 func (t *TermiteAPI) GenerateContent(w http.ResponseWriter, r *http.Request) {
 	t.node.handleApiGenerate(w, r)
+}
+
+// GenerateBatchContent implements ServerInterface
+func (t *TermiteAPI) GenerateBatchContent(w http.ResponseWriter, r *http.Request) {
+	t.node.handleApiGenerateBatch(w, r)
 }
 
 // RewriteText implements ServerInterface
@@ -1407,6 +1447,132 @@ func mediaPartImageURL(part MediaContentPart) string {
 		return ""
 	}
 	return "data:" + part.MimeType + ";base64," + base64.StdEncoding.EncodeToString(part.Data)
+}
+
+func generateBatchErrorFromHTTPStatus(status int, message string) GenerateBatchError {
+	code := "generation_failed"
+	retryable := status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status >= 500
+	switch status {
+	case http.StatusBadRequest:
+		code = "invalid_request"
+	case http.StatusNotFound:
+		code = "model_not_found"
+	case http.StatusRequestTimeout:
+		code = "request_timeout"
+	case http.StatusTooManyRequests:
+		code = "queue_full"
+	case http.StatusServiceUnavailable:
+		code = "service_unavailable"
+	}
+	return GenerateBatchError{
+		Code:      code,
+		Message:   strings.TrimSpace(message),
+		Retryable: retryable,
+	}
+}
+
+// handleApiGenerateBatch handles synchronous batch generation requests.
+//
+// The Go Termite runtime delegates each item through the existing single-request
+// generator path. The Zig inference server implements the native batched KV
+// scheduler for compatible GGUF-backed generation requests.
+func (ln *TermiteNode) handleApiGenerateBatch(w http.ResponseWriter, r *http.Request) {
+	defer func() { _ = r.Body.Close() }()
+
+	var req GenerateBatchRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("decoding request: %v", err), http.StatusBadRequest)
+		return
+	}
+	if req.Mode != "" && req.Mode != GenerateBatchModeSync {
+		http.Error(w, fmt.Sprintf("unsupported batch mode: %s", req.Mode), http.StatusBadRequest)
+		return
+	}
+	if len(req.Requests) == 0 {
+		http.Error(w, "requests are required", http.StatusBadRequest)
+		return
+	}
+
+	resp := GenerateBatchResponse{
+		Object: GenerateBatchResponseObjectGenerateBatch,
+		Data:   make([]GenerateBatchResultItem, len(req.Requests)),
+		Summary: GenerateBatchSummary{
+			Total: len(req.Requests),
+		},
+	}
+
+	for i, item := range req.Requests {
+		result := GenerateBatchResultItem{
+			CustomId: item.CustomId,
+			Index:    i,
+		}
+
+		if item.Body.Stream {
+			result.Error = GenerateBatchError{
+				Code:    "unsupported_stream",
+				Message: "streaming is not supported for synchronous generate batches",
+			}
+			resp.Summary.Failed++
+			resp.Data[i] = result
+			continue
+		}
+
+		body, err := json.Marshal(item.Body)
+		if err != nil {
+			result.Error = GenerateBatchError{
+				Code:    "invalid_request",
+				Message: fmt.Sprintf("encoding request item: %v", err),
+			}
+			resp.Summary.Failed++
+			resp.Data[i] = result
+			continue
+		}
+
+		itemReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, "/ai/v1/generate", bytes.NewReader(body))
+		if err != nil {
+			result.Error = GenerateBatchError{
+				Code:      "internal_error",
+				Message:   fmt.Sprintf("creating request item: %v", err),
+				Retryable: true,
+			}
+			resp.Summary.Failed++
+			resp.Data[i] = result
+			continue
+		}
+		itemReq.Header = r.Header.Clone()
+		itemReq.Header.Set("Content-Type", "application/json")
+
+		itemWriter := newCaptureResponseWriter()
+		ln.handleApiGenerate(itemWriter, itemReq)
+		status := itemWriter.Status()
+		if status < http.StatusOK || status >= http.StatusMultipleChoices {
+			result.Error = generateBatchErrorFromHTTPStatus(status, itemWriter.body.String())
+			resp.Summary.Failed++
+			resp.Data[i] = result
+			continue
+		}
+
+		if err := json.Unmarshal(itemWriter.body.Bytes(), &result.Response); err != nil {
+			result.Error = GenerateBatchError{
+				Code:      "invalid_response",
+				Message:   fmt.Sprintf("decoding generation response: %v", err),
+				Retryable: true,
+			}
+			resp.Summary.Failed++
+			resp.Data[i] = result
+			continue
+		}
+
+		resp.Summary.Succeeded++
+		resp.Data[i] = result
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		ln.logger.Error("encoding response", zap.Error(err))
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 }
 
 // handleApiGenerate handles text generation requests using LLM models (OpenAI-compatible)

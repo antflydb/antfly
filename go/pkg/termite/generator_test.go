@@ -99,6 +99,86 @@ func TestTermiteNode_HandleApiGenerate_InvalidRequest(t *testing.T) {
 	}
 }
 
+func TestTermiteNode_HandleApiGenerateBatch_InvalidEnvelope(t *testing.T) {
+	node := &TermiteNode{
+		logger:            zap.NewNop(),
+		generatorRegistry: nil,
+		requestQueue:      NewRequestQueue(RequestQueueConfig{}, zap.NewNop()),
+	}
+
+	tests := []struct {
+		name     string
+		body     string
+		wantCode int
+		wantErr  string
+	}{
+		{
+			name:     "invalid JSON",
+			body:     `{invalid}`,
+			wantCode: http.StatusBadRequest,
+			wantErr:  "decoding request",
+		},
+		{
+			name:     "empty requests",
+			body:     `{"requests":[]}`,
+			wantCode: http.StatusBadRequest,
+			wantErr:  "requests are required",
+		},
+		{
+			name:     "unsupported mode",
+			body:     `{"mode":"async","requests":[{"custom_id":"a","body":{"model":"test","messages":[{"role":"user","content":"hi"}]}}]}`,
+			wantCode: http.StatusBadRequest,
+			wantErr:  "unsupported batch mode",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest("POST", "/ai/v1/generate/batch", bytes.NewBufferString(tt.body))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			node.handleApiGenerateBatch(w, req)
+			assert.Equal(t, tt.wantCode, w.Code)
+			assert.Contains(t, w.Body.String(), tt.wantErr)
+		})
+	}
+}
+
+func TestTermiteNode_HandleApiGenerateBatch_ItemErrors(t *testing.T) {
+	node := &TermiteNode{
+		logger:            zap.NewNop(),
+		generatorRegistry: nil,
+		requestQueue:      NewRequestQueue(RequestQueueConfig{}, zap.NewNop()),
+	}
+
+	req := httptest.NewRequest("POST", "/ai/v1/generate/batch", bytes.NewBufferString(`{
+		"requests": [
+			{"custom_id":"streaming","body":{"model":"test","stream":true,"messages":[{"role":"user","content":"hi"}]}},
+			{"custom_id":"no-models","body":{"model":"test","messages":[{"role":"user","content":"hi"}]}}
+		]
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	node.handleApiGenerateBatch(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var resp GenerateBatchResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Equal(t, GenerateBatchResponseObjectGenerateBatch, resp.Object)
+	require.Equal(t, 2, resp.Summary.Total)
+	require.Equal(t, 0, resp.Summary.Succeeded)
+	require.Equal(t, 2, resp.Summary.Failed)
+	require.Len(t, resp.Data, 2)
+	assert.Equal(t, "streaming", resp.Data[0].CustomId)
+	assert.Equal(t, 0, resp.Data[0].Index)
+	assert.Equal(t, "unsupported_stream", resp.Data[0].Error.Code)
+	assert.Equal(t, "no-models", resp.Data[1].CustomId)
+	assert.Equal(t, 1, resp.Data[1].Index)
+	assert.Equal(t, "service_unavailable", resp.Data[1].Error.Code)
+	assert.True(t, resp.Data[1].Error.Retryable)
+}
+
 // Note: TestTermiteNode_HandleApiGenerate_ModelNotFound and TestTermiteNode_HandleApiGenerate_Success
 // require a real registry with models or a mockable interface. The GeneratorRegistry type now uses
 // internal ttlcache and doesn't expose the models map directly. These tests would need to either:
