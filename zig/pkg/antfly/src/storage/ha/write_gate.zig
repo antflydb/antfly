@@ -104,13 +104,12 @@ pub fn primaryFencedByReceipt(identity: standby_mod.Identity, node_id: []const u
 }
 
 pub fn evaluateStandby(standby: *standby_mod.Standby, request: Request) !Decision {
-    if (request.expected_identity) |expected| try validateIdentity(standby.identity, expected);
-
     const handoff = standby.promotedPrimaryHandoff() catch |err| switch (err) {
         error.StandbyNotPromoted => null,
         else => return err,
     };
     if (handoff) |promotion_handoff| {
+        if (request.expected_identity) |expected| try validateIdentity(promotion_handoff.identity, expected);
         return .{
             .role = .promoted_standby,
             .action = .open_promoted_primary,
@@ -120,6 +119,8 @@ pub fn evaluateStandby(standby: *standby_mod.Standby, request: Request) !Decisio
             .promotion_handoff = promotion_handoff,
         };
     }
+
+    if (request.expected_identity) |expected| try validateIdentity(standby.identity, expected);
 
     const progress = standby.currentProgress();
     return .{
@@ -312,6 +313,18 @@ test "storage.ha write gate rejects standby until promotion handoff is opened" {
         try std.testing.expectEqual(Action.open_promoted_primary, decision.action);
         break :blk decision.promotion_handoff orelse return error.TestExpectedEqual;
     };
+
+    {
+        var recovered = try standby_mod.Standby.open(alloc, paths.log.ptr, paths.progress.ptr, identity, .{});
+        defer recovered.close();
+
+        const decision = try evaluateStandby(&recovered, .{ .expected_identity = promoted_identity });
+        try std.testing.expect(!decision.canWrite());
+        try std.testing.expectEqual(Role.promoted_standby, decision.role);
+        try std.testing.expectEqual(Action.open_promoted_primary, decision.action);
+        try std.testing.expect(decision.promotion_handoff != null);
+        try std.testing.expectError(error.WrongTimeline, evaluateStandby(&recovered, .{ .expected_identity = identity }));
+    }
 
     var primary = try primary_mod.Primary.openPromotedFromStandby(alloc, paths.log.ptr, paths.slots.ptr, handoff, .{});
     defer primary.close();

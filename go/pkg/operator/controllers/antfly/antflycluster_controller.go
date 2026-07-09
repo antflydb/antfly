@@ -5144,7 +5144,11 @@ func (r *AntflyClusterReconciler) applyHADirectRejoinJobResult(cluster *antflyv1
 	if cluster == nil || cluster.Status.HAStatus == nil || action == nil {
 		return false
 	}
-	if !haDirectRejoinResultMatchesAction(result, cluster.Status.HAStatus, *action) {
+	matchAction := *action
+	if haActionKind(matchAction.Kind) != haActionDemoteFormerPrimary && result.FormerLastLSN > 0 {
+		matchAction.ObservedLSN = result.FormerLastLSN
+	}
+	if !haDirectRejoinResultMatchesAction(result, cluster.Status.HAStatus, matchAction) {
 		return false
 	}
 	action.AdminResult = haRejoinAdminActionResult(result)
@@ -5249,6 +5253,13 @@ func haDirectRejoinResultMatchesAction(result haRejoinJobResult, status *antflyv
 		return false
 	}
 	if haActionKind(action.Kind) == haActionDemoteFormerPrimary {
+		if action.ObservedLSN > 0 && result.FormerLastLSN != action.ObservedLSN {
+			return false
+		}
+	} else {
+		if action.TargetLSN > 0 && result.ForkLSN != action.TargetLSN {
+			return false
+		}
 		if action.ObservedLSN > 0 && result.FormerLastLSN != action.ObservedLSN {
 			return false
 		}
@@ -7415,7 +7426,10 @@ func haRejoinResultMatchesPromotion(status *antflyv1.HAStatus, action antflyv1.H
 	if result.TargetTimelineID != promotion.NewTimelineID || result.TargetEpoch != promotion.NewEpoch {
 		return false
 	}
-	if expectedForkLSN := haPromotionObservedLSN(promotion); expectedForkLSN != 0 && result.ForkLSN != expectedForkLSN {
+	if promotion.SwitchLSN != 0 && result.ForkLSN != promotion.SwitchLSN {
+		return false
+	}
+	if promotion.RequiredLSN != 0 && result.ForkLSN != promotion.RequiredLSN {
 		return false
 	}
 	if haActionKind(action.Kind) == haActionRewindFormerPrimary &&

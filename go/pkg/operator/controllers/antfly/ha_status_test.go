@@ -99,7 +99,7 @@ func TestPlanHAPlansSlotAndBaseBackupForMissingStandby(t *testing.T) {
 	if plan.Actions[0].Kind != haActionCreateSlot || plan.Actions[0].TargetLSN != initial {
 		t.Fatalf("unexpected first action: %#v", plan.Actions[0])
 	}
-	if plan.Actions[1].Kind != haActionSeedStandby || plan.Actions[1].DependsOn != haActionCreateSlot || plan.Actions[1].TargetLSN != initial {
+	if plan.Actions[1].Kind != haActionSeedStandby || plan.Actions[1].DependsOn != haActionCreateSlot || plan.Actions[1].TargetLSN != 10 {
 		t.Fatalf("unexpected second action: %#v", plan.Actions[1])
 	}
 
@@ -116,7 +116,7 @@ func TestPlanHAPlansSlotAndBaseBackupForMissingStandby(t *testing.T) {
 	if !reflect.DeepEqual(cluster.Status.HAStatus.PlannedActions[0].AdminCommand, []string{"slot", "create", "--slot", "standby-a", "--initial-lsn", "5"}) {
 		t.Fatalf("unexpected create-slot admin command: %#v", cluster.Status.HAStatus.PlannedActions[0].AdminCommand)
 	}
-	if !reflect.DeepEqual(cluster.Status.HAStatus.PlannedActions[1].AdminCommand, []string{"seed", "begin", "--slot", "standby-a", "--manifest-id", "base-standby-a-5"}) {
+	if !reflect.DeepEqual(cluster.Status.HAStatus.PlannedActions[1].AdminCommand, []string{"seed", "begin", "--slot", "standby-a", "--manifest-id", "base-standby-a-10"}) {
 		t.Fatalf("unexpected seed admin command: %#v", cluster.Status.HAStatus.PlannedActions[1].AdminCommand)
 	}
 	if cluster.Status.HAStatus.PlannedActions[1].DependsOn != string(haActionCreateSlot) {

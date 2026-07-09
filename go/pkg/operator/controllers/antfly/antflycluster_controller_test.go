@@ -431,11 +431,11 @@ func TestReconcileHAAdminJobsExecutesPlannedActionsInOrder(t *testing.T) {
 				var payload map[string]any
 				g.Expect(json.NewDecoder(req.Body).Decode(&payload)).To(Succeed())
 				g.Expect(payload["slot_name"]).To(Equal("standby-a"))
-				g.Expect(payload["manifest_id"]).To(Equal("base-standby-a-5"))
+				g.Expect(payload["manifest_id"]).To(Equal("base-standby-a-10"))
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"base_backup_begin:base-standby-a-5","action_kind":"base_backup_begin","target":"base-standby-a-5","state":"applied","node_id":"primary-a"},"slot_name":"standby-a","manifest_id":"base-standby-a-5","backup_lsn":5,"start_record_lsn":5}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"base_backup_begin:base-standby-a-10","action_kind":"base_backup_begin","target":"base-standby-a-10","state":"applied","node_id":"primary-a"},"slot_name":"standby-a","manifest_id":"base-standby-a-10","backup_lsn":10,"start_record_lsn":10}`)),
 				}, nil
 			default:
 				t.Fatalf("unexpected HA admin API request: %s %s", req.Method, req.URL.Path)
@@ -3032,8 +3032,8 @@ func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
 					Name:             "standby-a",
 					InitialLSN:       &initial,
 					AdminURL:         "http://standby-a-ha.default.svc:8081",
-					SeedManifestPath: "/backup/base-standby-a-5.afha",
-					SeedContentRoot:  "/backup/base-standby-a-5",
+					SeedManifestPath: "/backup/base-standby-a-10.afha",
+					SeedContentRoot:  "/backup/base-standby-a-10",
 				}},
 			},
 		},
@@ -3059,26 +3059,26 @@ func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"base_backup_begin:base-standby-a-5","action_kind":"base_backup_begin","target":"base-standby-a-5","state":"applied","node_id":"primary-a"},"slot_name":"standby-a","manifest_id":"base-standby-a-5","backup_lsn":5,"start_record_lsn":5}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"base_backup_begin:base-standby-a-10","action_kind":"base_backup_begin","target":"base-standby-a-10","state":"applied","node_id":"primary-a"},"slot_name":"standby-a","manifest_id":"base-standby-a-10","backup_lsn":10,"start_record_lsn":10}`)),
 				}, nil
 			case "/admin/v1/ha/base-backups/finish":
 				var body map[string]any
 				g.Expect(json.NewDecoder(req.Body).Decode(&body)).To(Succeed())
-				g.Expect(body).To(HaveKeyWithValue("manifest_path", "/backup/base-standby-a-5.afha"))
+				g.Expect(body).To(HaveKeyWithValue("manifest_path", "/backup/base-standby-a-10.afha"))
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"base_backup_finish:base-standby-a-5","action_kind":"base_backup_finish","target":"base-standby-a-5","state":"applied","node_id":"primary-a"},"manifest_id":"base-standby-a-5","backup_lsn":5,"end_record_lsn":5}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"base_backup_finish:base-standby-a-10","action_kind":"base_backup_finish","target":"base-standby-a-10","state":"applied","node_id":"primary-a"},"manifest_id":"base-standby-a-10","backup_lsn":10,"end_record_lsn":10}`)),
 				}, nil
 			case "/admin/v1/ha/standby/bootstrap":
 				var body map[string]any
 				g.Expect(json.NewDecoder(req.Body).Decode(&body)).To(Succeed())
-				g.Expect(body).To(HaveKeyWithValue("manifest_path", "/backup/base-standby-a-5.afha"))
-				g.Expect(body).To(HaveKeyWithValue("content_root", "/backup/base-standby-a-5"))
+				g.Expect(body).To(HaveKeyWithValue("manifest_path", "/backup/base-standby-a-10.afha"))
+				g.Expect(body).To(HaveKeyWithValue("content_root", "/backup/base-standby-a-10"))
 				return &http.Response{
 					StatusCode: http.StatusOK,
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"standby_bootstrap:base-standby-a-5","action_kind":"standby_bootstrap","target":"base-standby-a-5","state":"applied","node_id":"standby-a"},"manifest_id":"base-standby-a-5","backup_lsn":5,"checkpoint_lsn":5}`)),
+					Body:       io.NopCloser(strings.NewReader(`{"schema_version":1,"action":{"action_id":"standby_bootstrap:base-standby-a-10","action_kind":"standby_bootstrap","target":"base-standby-a-10","state":"applied","node_id":"standby-a"},"manifest_id":"base-standby-a-10","backup_lsn":10,"checkpoint_lsn":10}`)),
 				}, nil
 			default:
 				t.Fatalf("unexpected direct HA admin request: %s", req.URL.Path)
@@ -3100,25 +3100,25 @@ func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.SlotAction).To(Equal("create"))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[0].AdminResult.SlotName).To(Equal("standby-a"))
 	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult).NotTo(BeNil())
-	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.ActionID).To(Equal("base_backup_begin:base-standby-a-5"))
-	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.ManifestID).To(Equal("base-standby-a-5"))
-	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.BackupLSN).To(Equal(uint64(5)))
-	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.StartRecordLSN).To(Equal(uint64(5)))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.ActionID).To(Equal("base_backup_begin:base-standby-a-10"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.ManifestID).To(Equal("base-standby-a-10"))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.BackupLSN).To(Equal(uint64(10)))
+	g.Expect(cluster.Status.HAStatus.PlannedActions[1].AdminResult.StartRecordLSN).To(Equal(uint64(10)))
 	finish := cluster.Status.HAStatus.PlannedActions[2]
 	g.Expect(finish.Kind).To(Equal(string(haActionFinishStandbySeed)))
 	g.Expect(finish.AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
 	g.Expect(finish.AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(finish.AdminResult).NotTo(BeNil())
-	g.Expect(finish.AdminResult.ActionID).To(Equal("base_backup_finish:base-standby-a-5"))
-	g.Expect(finish.AdminResult.EndRecordLSN).To(Equal(uint64(5)))
+	g.Expect(finish.AdminResult.ActionID).To(Equal("base_backup_finish:base-standby-a-10"))
+	g.Expect(finish.AdminResult.EndRecordLSN).To(Equal(uint64(10)))
 
 	bootstrap := cluster.Status.HAStatus.PlannedActions[3]
 	g.Expect(bootstrap.Kind).To(Equal(string(haActionBootstrapStandbySeed)))
 	g.Expect(bootstrap.AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
 	g.Expect(bootstrap.AdminJobName).To(Equal(haAdminDirectAPIName))
 	g.Expect(bootstrap.AdminResult).NotTo(BeNil())
-	g.Expect(bootstrap.AdminResult.ActionID).To(Equal("standby_bootstrap:base-standby-a-5"))
-	g.Expect(bootstrap.AdminResult.CheckpointLSN).To(Equal(uint64(5)))
+	g.Expect(bootstrap.AdminResult.ActionID).To(Equal("standby_bootstrap:base-standby-a-10"))
+	g.Expect(bootstrap.AdminResult.CheckpointLSN).To(Equal(uint64(10)))
 	g.Expect(observed).To(Equal([]string{
 		"POST /admin/v1/ha/replication-slots",
 		"POST /admin/v1/ha/base-backups",

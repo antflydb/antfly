@@ -825,7 +825,7 @@ pub const Server = struct {
             }
         }
 
-        if (expected_action != null and expected_action.? == .rewind) {
+        if (expected_action != null and expected_action.? == .rewind and self.ctx.former_primary_log == null) {
             const log = self.rejoinRewindLog() orelse
                 return try textResponse(self.alloc, 409, "FormerPrimaryLogUnavailable");
             last_lsn = log.lastLsn();
@@ -911,8 +911,9 @@ pub const Server = struct {
     }
 
     fn rejoinRewindLog(self: *Server) ?*replication_log.ReplicationLog {
+        if (self.ctx.former_primary_log) |log| return log;
         if (self.ctx.primary) |primary| return &primary.log;
-        return self.ctx.former_primary_log;
+        return null;
     }
 
     fn parseAcquireFenceRequest(self: *Server, req: http_common.HttpRequest) !fencing.FenceRequest {
@@ -1867,6 +1868,7 @@ fn commandErrorStatus(err: anyerror) u16 {
         error.SlotRequiresReseed,
         error.WalNoLongerRetained,
         error.RejoinAssessmentStale,
+        error.RejoinForkIdentityMismatch,
         error.RejoinRewindNotAllowed,
         error.RejoinReseedNotAllowed,
         error.FormerPrimaryBeforeFork,
@@ -1874,6 +1876,7 @@ fn commandErrorStatus(err: anyerror) u16 {
         error.RecordAlreadyReceived,
         error.StandbyAlreadyBootstrapped,
         error.SyncPolicyUnsatisfied,
+        error.NonMonotonicFenceGeneration,
         => 409,
         error.SlotNotFound,
         error.BackupStartNotFound,
@@ -2526,6 +2529,14 @@ test "storage.ha http admin serves health and command endpoint" {
     try expectContains(typed_fence.body, "\"receipt\"");
     try expectContains(typed_fence.body, "\"promoted_node_id\":\"standby-a\"");
 
+    var typed_fence_doc = try std.json.parseFromSlice(admin_api.HAFenceResponse, alloc, typed_fence.body, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    defer typed_fence_doc.deinit();
+    const typed_fence_receipt_json = try std.json.Stringify.valueAlloc(alloc, typed_fence_doc.value.receipt, .{});
+    defer alloc.free(typed_fence_receipt_json);
+
     var typed_current_fence = try server.handle(.{
         .method = .GET,
         .uri = admin_api.routes.ha_fence_current,
@@ -2553,11 +2564,18 @@ test "storage.ha http admin serves health and command endpoint" {
     try expectContains(typed_rejoin_unfenced.body, "\"action\":\"reject_unfenced\"");
     try expectContains(typed_rejoin_unfenced.body, "\"reason\":\"no_fence\"");
 
+    const typed_rejoin_fenced_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"node_id\":\"primary-a\",\"identity\":{{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1}},\"last_lsn\":2,\"retained_from_lsn\":0,\"allow_rewind_after_forced_promotion\":false,\"receipt\":{s}}}",
+        .{typed_fence_receipt_json},
+    );
+    defer alloc.free(typed_rejoin_fenced_body);
+
     var typed_rejoin_fenced = try server.handle(.{
         .method = .POST,
         .uri = admin_api.routes.ha_rejoin_assess,
         .content_type = "application/json",
-        .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":2,\"retained_from_lsn\":0,\"allow_rewind_after_forced_promotion\":false,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":1,\"observed_lsn\":1,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}",
+        .body = typed_rejoin_fenced_body,
     });
     defer typed_rejoin_fenced.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), typed_rejoin_fenced.status);
@@ -2570,17 +2588,18 @@ test "storage.ha http admin serves health and command endpoint" {
         .method = .POST,
         .uri = admin_api.routes.ha_rejoin_rewind,
         .content_type = "application/json",
-        .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":2,\"retained_from_lsn\":0,\"allow_rewind_after_forced_promotion\":false,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":1,\"observed_lsn\":1,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}",
+        .body = typed_rejoin_fenced_body,
     });
     defer typed_rejoin_rewind.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 409), typed_rejoin_rewind.status);
-    try expectContains(typed_rejoin_rewind.body, "FormerPrimaryLogUnavailable");
+    try std.testing.expectEqual(@as(u16, 200), typed_rejoin_rewind.status);
+    try expectContains(typed_rejoin_rewind.body, "\"action_kind\":\"rejoin_rewind\"");
+    try expectContains(typed_rejoin_rewind.body, "\"state\":\"applied\"");
 
     var typed_rejoin_reseed_mismatch = try server.handle(.{
         .method = .POST,
         .uri = admin_api.routes.ha_rejoin_reseed,
         .content_type = "application/json",
-        .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":2,\"retained_from_lsn\":0,\"allow_rewind_after_forced_promotion\":false,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":1,\"observed_lsn\":1,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}",
+        .body = typed_rejoin_fenced_body,
     });
     defer typed_rejoin_reseed_mismatch.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 409), typed_rejoin_reseed_mismatch.status);

@@ -46475,6 +46475,7 @@ test "storage.ha db mirrors appended derived replay records into HA stream" {
     defer alloc.free(artifact_key);
     {
         var db = try DB.open(alloc, std.mem.span(db_path), .{
+            .identity_namespace = .{ .shard_id = 3, .table_id = 9 },
             .ha_async_effect_mirror = .{
                 .primary = &primary,
                 .last_lsn = &last_lsn,
@@ -46551,6 +46552,7 @@ test "storage.ha db mirrors committed batch mutations into HA stream for standby
     var failures = std.atomic.Value(u64).init(0);
     {
         var db = try DB.open(alloc, std.mem.span(primary_db_path), .{
+            .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
             .ha_async_batch_mirror = .{
                 .primary = &primary,
                 .last_lsn = &last_lsn,
@@ -46589,6 +46591,7 @@ test "storage.ha db mirrors committed batch mutations into HA stream for standby
     try std.testing.expectEqual(@as(u64, 123), decoded.value.request.timestamp_ns);
 
     var standby_db = try DB.open(alloc, std.mem.span(standby_db_path), .{
+        .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
         .ha_write_gate = .{ .standby = &standby },
         .ha_async_batch_mirror = .{
             .primary = &primary,
@@ -46774,6 +46777,7 @@ test "storage.ha db session sync wait satisfies remote apply through standby DB 
     defer standby.close();
 
     var standby_db = try DB.open(alloc, std.mem.span(standby_db_path), .{
+        .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
         .ha_write_gate = .{ .standby = &standby },
         .start_index_workers = false,
     });
@@ -46792,6 +46796,7 @@ test "storage.ha db session sync wait satisfies remote apply through standby DB 
     var waits = std.atomic.Value(u64).init(0);
     const standby_names = [_][]const u8{"standby-a"};
     var primary_db = try DB.open(alloc, std.mem.span(primary_db_path), .{
+        .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
         .ha_async_batch_mirror = .{
             .primary = &primary,
             .last_lsn = &last_lsn,
@@ -46887,6 +46892,7 @@ test "storage.ha db session sync wait remote write acknowledges durable receive 
     var waits = std.atomic.Value(u64).init(0);
     const standby_names = [_][]const u8{"standby-a"};
     var primary_db = try DB.open(alloc, std.mem.span(primary_db_path), .{
+        .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
         .ha_async_batch_mirror = .{
             .primary = &primary,
             .last_lsn = &last_lsn,
@@ -47310,6 +47316,7 @@ test "storage.ha db mirrors and applies schema metadata mutation records" {
     var failures = std.atomic.Value(u64).init(0);
     {
         var db = try DB.open(alloc, std.mem.span(primary_db_path), .{
+            .identity_namespace = .{ .shard_id = 5, .table_id = 11 },
             .ha_async_metadata_mirror = .{
                 .primary = &primary,
                 .last_lsn = &last_lsn,
@@ -47339,6 +47346,7 @@ test "storage.ha db mirrors and applies schema metadata mutation records" {
     try std.testing.expectEqual(@as(u64, 11), entry.record.table_id);
 
     var standby_db = try DB.open(alloc, std.mem.span(standby_db_path), .{
+        .identity_namespace = .{ .shard_id = 5, .table_id = 11 },
         .ha_write_gate = .{ .standby = &standby },
         .start_index_workers = false,
     });

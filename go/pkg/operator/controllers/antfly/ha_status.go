@@ -2286,6 +2286,18 @@ func haEvaluateFormerPrimary(status *antflyv1.HAStatus) haFormerPrimaryEvaluatio
 	if !evaluation.Fenced {
 		return evaluation
 	}
+	if standby, ok := haStandbyStatusByName(status)[promotion.OldPrimaryID]; ok &&
+		standby.Active &&
+		!standby.ReseedRequired &&
+		standby.Status != "reseed_required" &&
+		standby.TimelineID == promotion.NewTimelineID {
+		evaluation.ObservedTimelineID = standby.TimelineID
+		evaluation.ObservedLSN = maxHAObservedLSN(standby)
+		evaluation.RejoinRequired = false
+		evaluation.Action = "None"
+		evaluation.Reason = "FormerPrimaryOnPromotionTimeline"
+		return evaluation
+	}
 	if haApplyFormerPrimaryAssessment(&evaluation, status.FormerPrimary, promotion) {
 		return evaluation
 	}
@@ -2396,21 +2408,20 @@ func haFormerPrimaryFenced(status *antflyv1.HAStatus, promotion *antflyv1.HAProm
 	if promotion.FenceGeneration == 0 {
 		return false
 	}
-	former := status.FormerPrimary
-	if former == nil || !former.Fenced {
+	if haPromotionReceipt(status) == promotion {
+		return true
+	}
+	if promotion.FenceAuthority != "" && status.Fencing.Authority != promotion.FenceAuthority {
 		return false
 	}
-	if strings.TrimSpace(former.NodeID) != strings.TrimSpace(promotion.OldPrimaryID) {
+	if status.Fencing.Generation < promotion.FenceGeneration {
 		return false
 	}
-	if former.FenceAuthority != "" && promotion.FenceAuthority != "" && former.FenceAuthority != promotion.FenceAuthority {
+	if promotion.PromotedStandbyID != "" &&
+		status.Fencing.Holder != promotion.PromotedStandbyID {
 		return false
 	}
-	if strings.TrimSpace(former.FenceHolder) != "" &&
-		strings.TrimSpace(former.FenceHolder) != strings.TrimSpace(promotion.PromotedStandbyID) {
-		return false
-	}
-	return former.FenceGeneration == promotion.FenceGeneration
+	return status.Fencing.Ready
 }
 
 func maxHAObservedLSN(standby antflyv1.HAStandbyStatus) uint64 {
