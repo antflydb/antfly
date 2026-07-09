@@ -1982,6 +1982,32 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/ai/v1/generate/batch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Generate text for a synchronous batch of requests
+         * @description Runs multiple non-streaming generation requests as one synchronous batch.
+         *     Compatible native requests for the same model are executed through the
+         *     native batched KV decoder; unsupported per-item options are returned as
+         *     per-item errors without failing sibling requests.
+         *
+         *     This endpoint implements the synchronous form only. Future async durable
+         *     batching will use the same request item shape with `mode: async`.
+         */
+        post: operations["generateBatchContent"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/ai/v1/chat/completions": {
         parameters: {
             query?: never;
@@ -11279,6 +11305,44 @@ export interface components {
             choices: components["schemas"]["InferenceGenerateChoice"][];
             usage: components["schemas"]["InferenceGenerateUsage"];
         };
+        /**
+         * @description Batch execution mode. Only synchronous batches are implemented.
+         * @enum {string}
+         */
+        InferenceGenerateBatchMode: "sync";
+        InferenceGenerateBatchRequest: {
+            mode?: components["schemas"]["InferenceGenerateBatchMode"];
+            requests: components["schemas"]["InferenceGenerateBatchRequestItem"][];
+        };
+        InferenceGenerateBatchRequestItem: {
+            /** @description Caller-supplied identifier echoed in the result item. */
+            custom_id: string;
+            body: components["schemas"]["InferenceGenerateRequest"];
+        };
+        InferenceGenerateBatchError: {
+            code: string;
+            message: string;
+            /** @default false */
+            retryable?: boolean;
+        };
+        InferenceGenerateBatchResultItem: {
+            custom_id: string;
+            /** @description Zero-based request index from the submitted batch. */
+            index: number;
+            response?: components["schemas"]["InferenceGenerateResponse"];
+            error?: components["schemas"]["InferenceGenerateBatchError"];
+        };
+        InferenceGenerateBatchSummary: {
+            total: number;
+            succeeded: number;
+            failed: number;
+        };
+        InferenceGenerateBatchResponse: {
+            /** @enum {string} */
+            object: "generate.batch";
+            data: components["schemas"]["InferenceGenerateBatchResultItem"][];
+            summary: components["schemas"]["InferenceGenerateBatchSummary"];
+        };
         InferenceGenerateChoice: {
             /** @description Index of this choice in the list */
             index: number;
@@ -15521,6 +15585,57 @@ export interface operations {
                 };
             };
             /** @description Generation service unavailable (no models configured) */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+        };
+    };
+    generateBatchContent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InferenceGenerateBatchRequest"];
+            };
+        };
+        responses: {
+            /** @description Batch generation results in request order */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceGenerateBatchResponse"];
+                };
+            };
+            /** @description Invalid batch envelope */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Internal server error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Generation service unavailable */
             503: {
                 headers: {
                     [name: string]: unknown;

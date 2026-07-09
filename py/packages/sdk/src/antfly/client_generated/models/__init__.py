@@ -313,6 +313,14 @@ from .inference_error import InferenceError
 from .inference_finish_reason import InferenceFinishReason
 from .inference_function_definition import InferenceFunctionDefinition
 from .inference_function_definition_parameters import InferenceFunctionDefinitionParameters
+from .inference_generate_batch_error import InferenceGenerateBatchError
+from .inference_generate_batch_mode import InferenceGenerateBatchMode
+from .inference_generate_batch_request import InferenceGenerateBatchRequest
+from .inference_generate_batch_request_item import InferenceGenerateBatchRequestItem
+from .inference_generate_batch_response import InferenceGenerateBatchResponse
+from .inference_generate_batch_response_object import InferenceGenerateBatchResponseObject
+from .inference_generate_batch_result_item import InferenceGenerateBatchResultItem
+from .inference_generate_batch_summary import InferenceGenerateBatchSummary
 from .inference_generate_choice import InferenceGenerateChoice
 from .inference_generate_choice_logprobs_type_0 import InferenceGenerateChoiceLogprobsType0
 from .inference_generate_chunk import InferenceGenerateChunk
@@ -949,6 +957,14 @@ __all__ = (
     "InferenceFinishReason",
     "InferenceFunctionDefinition",
     "InferenceFunctionDefinitionParameters",
+    "InferenceGenerateBatchError",
+    "InferenceGenerateBatchMode",
+    "InferenceGenerateBatchRequest",
+    "InferenceGenerateBatchRequestItem",
+    "InferenceGenerateBatchResponse",
+    "InferenceGenerateBatchResponseObject",
+    "InferenceGenerateBatchResultItem",
+    "InferenceGenerateBatchSummary",
     "InferenceGenerateChoice",
     "InferenceGenerateChoiceLogprobsType0",
     "InferenceGenerateChunk",

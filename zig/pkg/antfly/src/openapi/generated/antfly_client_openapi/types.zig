@@ -4395,6 +4395,66 @@ pub const InferenceFunctionDefinition = struct {
     strict: ?bool = null,
 };
 
+pub const InferenceGenerateBatchError = struct {
+    code: []const u8,
+    message: []const u8,
+    retryable: ?bool = null,
+};
+
+/// Batch execution mode. Only synchronous batches are implemented.
+pub const InferenceGenerateBatchMode = enum {
+    sync,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .sync => "sync",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "sync", .sync },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const InferenceGenerateBatchRequest = struct {
+    mode: ?InferenceGenerateBatchMode = null,
+    requests: []const InferenceGenerateBatchRequestItem,
+};
+
+pub const InferenceGenerateBatchRequestItem = struct {
+    /// Caller-supplied identifier echoed in the result item.
+    custom_id: []const u8,
+    body: InferenceGenerateRequest,
+};
+
+pub const InferenceGenerateBatchResponse = struct {
+    object: []const u8,
+    data: []const InferenceGenerateBatchResultItem,
+    summary: InferenceGenerateBatchSummary,
+};
+
+pub const InferenceGenerateBatchResultItem = struct {
+    custom_id: []const u8,
+    /// Zero-based request index from the submitted batch.
+    index: i64,
+    response: ?InferenceGenerateResponse = null,
+    @"error": ?InferenceGenerateBatchError = null,
+};
+
+pub const InferenceGenerateBatchSummary = struct {
+    total: i64,
+    succeeded: i64,
+    failed: i64,
+};
+
 pub const InferenceGenerateChoice = struct {
     /// Index of this choice in the list
     index: i64,

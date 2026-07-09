@@ -314,6 +314,49 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+  /generate/batch:
+    post:
+      summary: Generate text for a synchronous batch of requests
+      description: |
+        Runs multiple non-streaming generation requests as one synchronous batch.
+        Compatible native requests for the same model are executed through the
+        native batched KV decoder; unsupported per-item options are returned as
+        per-item errors without failing sibling requests.
+
+        This endpoint implements the synchronous form only. Future async durable
+        batching will use the same request item shape with `mode: async`.
+      operationId: generateBatchContent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GenerateBatchRequest'
+      responses:
+        '200':
+          description: Batch generation results in request order
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenerateBatchResponse'
+        '400':
+          description: Invalid batch envelope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Generation service unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
   /chat/completions:
     post:
       summary: OpenAI Chat Completions endpoint
@@ -2631,6 +2674,92 @@ components:
           description: List of completion choices (currently always 1)
         usage:
           $ref: '#/components/schemas/GenerateUsage'
+    GenerateBatchMode:
+      type: string
+      enum:
+        - sync
+      description: Batch execution mode. Only synchronous batches are implemented.
+    GenerateBatchRequest:
+      type: object
+      required:
+        - requests
+      properties:
+        mode:
+          $ref: '#/components/schemas/GenerateBatchMode'
+        requests:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/GenerateBatchRequestItem'
+    GenerateBatchRequestItem:
+      type: object
+      required:
+        - custom_id
+        - body
+      properties:
+        custom_id:
+          type: string
+          description: Caller-supplied identifier echoed in the result item.
+        body:
+          $ref: '#/components/schemas/GenerateRequest'
+    GenerateBatchError:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        retryable:
+          type: boolean
+          default: false
+    GenerateBatchResultItem:
+      type: object
+      required:
+        - custom_id
+        - index
+      properties:
+        custom_id:
+          type: string
+        index:
+          type: integer
+          description: Zero-based request index from the submitted batch.
+        response:
+          $ref: '#/components/schemas/GenerateResponse'
+        error:
+          $ref: '#/components/schemas/GenerateBatchError'
+    GenerateBatchSummary:
+      type: object
+      required:
+        - total
+        - succeeded
+        - failed
+      properties:
+        total:
+          type: integer
+        succeeded:
+          type: integer
+        failed:
+          type: integer
+    GenerateBatchResponse:
+      type: object
+      required:
+        - object
+        - data
+        - summary
+      properties:
+        object:
+          type: string
+          enum:
+            - generate.batch
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/GenerateBatchResultItem'
+        summary:
+          $ref: '#/components/schemas/GenerateBatchSummary'
     GenerateChoice:
       type: object
       required:
