@@ -2947,15 +2947,21 @@ pub const Node = struct {
         };
     }
 
+    const BatchGenerateTaskResult = struct {
+        text: ?[]const u8 = null,
+        finish_reason: []const u8 = "length",
+        prompt_tokens: usize = 0,
+        completion_tokens: usize = 0,
+        @"error": ?api.GenerateBatchError = null,
+    };
+
     const BatchGenerateTask = struct {
         allocator: std.mem.Allocator,
-        response_allocator: std.mem.Allocator,
         pipeline: generation.NativeGenerationPipeline,
         messages: []const generation.Message,
         config: generation.GenerationConfig,
         response_format: ?api.GenerateResponseFormat,
-        model_name: []const u8,
-        out: *api.GenerateBatchResultItem,
+        out: *BatchGenerateTaskResult,
 
         fn run(self: *@This()) std.Io.Cancelable!void {
             self.runInner() catch |err| {
@@ -2971,14 +2977,10 @@ pub const Node = struct {
             defer if (formatted_response_text) |text| self.allocator.free(text);
             formatted_response_text = try coerceGenerateResponseFormat(self.allocator, self.response_format, response_text);
             if (formatted_response_text) |text| response_text = text;
-            self.out.response = try buildGenerateResponseValue(
-                self.response_allocator,
-                self.model_name,
-                response_text,
-                result.finish_reason,
-                result.prompt_tokens,
-                result.tokens_used,
-            );
+            self.out.text = try self.allocator.dupe(u8, response_text);
+            self.out.finish_reason = result.finish_reason;
+            self.out.prompt_tokens = result.prompt_tokens;
+            self.out.completion_tokens = result.tokens_used;
         }
     };
 
@@ -3237,6 +3239,12 @@ pub const Node = struct {
                     continue;
                 };
 
+                var task_arenas = try ctx.allocator.alloc(std.heap.ArenaAllocator, group_indices.items.len);
+                for (task_arenas) |*arena| arena.* = std.heap.ArenaAllocator.init(ctx.allocator);
+                defer {
+                    for (task_arenas) |*arena| arena.deinit();
+                    ctx.allocator.free(task_arenas);
+                }
                 const decode_states = try ctx.allocator.alloc(generation.NativeDecodeState, group_indices.items.len);
                 for (decode_states) |*state| state.* = generation.NativeDecodeState.initContiguous(ctx.allocator);
                 defer {
@@ -3256,6 +3264,12 @@ pub const Node = struct {
                     }
                     ctx.allocator.free(leases);
                 }
+                var task_results = try ctx.allocator.alloc(BatchGenerateTaskResult, group_indices.items.len);
+                for (task_results) |*task_result| task_result.* = .{};
+                defer ctx.allocator.free(task_results);
+                var task_ran = try ctx.allocator.alloc(bool, group_indices.items.len);
+                @memset(task_ran, false);
+                defer ctx.allocator.free(task_ran);
                 var tasks = try ctx.allocator.alloc(BatchGenerateTask, group_indices.items.len);
                 defer ctx.allocator.free(tasks);
 
@@ -3263,8 +3277,9 @@ pub const Node = struct {
                 var group = std.Io.Group.init;
                 for (group_indices.items, 0..) |idx, pos| {
                     if (!pending[idx]) continue;
+                    const task_alloc = task_arenas[pos].allocator();
                     const queue_item_units = self.estimateGenerateQueueUnits(owned_messages[idx].messages, configs[pos].max_tokens);
-                    decode_states[pos] = generation.NativeDecodeState.initPaged(ctx.allocator, &kv_manager, pool_id, model.shared_moe_cache);
+                    decode_states[pos] = generation.NativeDecodeState.initPaged(task_alloc, &kv_manager, pool_id, model.shared_moe_cache);
                     decode_states[pos].kv_storage = &kv_storage;
                     leases[pos] = if (model.native_generate_coordinator) |coordinator| blk: {
                         const lease = coordinator.acquire(.{
@@ -3280,10 +3295,9 @@ pub const Node = struct {
                         break :blk lease;
                     } else .{ .request_id = 0, .reserved_units = 0, .prompt_bytes = 0, .max_tokens = 0, .prefill_chunk_size = 256, .active_requests_snapshot = 0 };
                     tasks[pos] = .{
-                        .allocator = ctx.allocator,
-                        .response_allocator = response_alloc,
+                        .allocator = task_alloc,
                         .pipeline = .{
-                            .allocator = ctx.allocator,
+                            .allocator = task_alloc,
                             .io = ctx.io,
                             .cb = cb,
                             .session = model.session,
@@ -3304,9 +3318,9 @@ pub const Node = struct {
                         .messages = owned_messages[idx].messages,
                         .config = configs[pos],
                         .response_format = body.requests[idx].body.response_format,
-                        .model_name = body.requests[idx].body.model,
-                        .out = &results[idx],
+                        .out = &task_results[pos],
                     };
+                    task_ran[pos] = true;
                     group.concurrent(ctx.io, BatchGenerateTask.run, .{&tasks[pos]}) catch {
                         tasks[pos].run() catch {};
                         continue;
@@ -3314,7 +3328,28 @@ pub const Node = struct {
                     spawned_any = true;
                 }
                 if (spawned_any) group.await(ctx.io) catch {};
-                for (group_indices.items) |idx| pending[idx] = false;
+                for (group_indices.items, 0..) |idx, pos| {
+                    if (!pending[idx]) continue;
+                    if (!task_ran[pos]) {
+                        pending[idx] = false;
+                        continue;
+                    }
+                    if (task_results[pos].@"error") |batch_err| {
+                        results[idx].@"error" = batch_err;
+                    } else if (task_results[pos].text) |text| {
+                        results[idx].response = try buildGenerateResponseValue(
+                            response_alloc,
+                            body.requests[idx].body.model,
+                            text,
+                            task_results[pos].finish_reason,
+                            task_results[pos].prompt_tokens,
+                            task_results[pos].completion_tokens,
+                        );
+                    } else {
+                        results[idx].@"error" = .{ .code = "GENERATION_FAILED", .message = "missing batch generation result", .retryable = true };
+                    }
+                    pending[idx] = false;
+                }
             }
         }
 
@@ -4715,7 +4750,6 @@ pub const Node = struct {
                     .@"error" = "BATCH_TOO_LARGE",
                     .message = try std.fmt.allocPrint(ctx.allocator, "total downloaded image bytes must be at most {d}", .{batch_byte_cap}),
                 }),
-                else => return err,
             };
             downloaded[i] = item;
             downloaded_count += 1;

@@ -13,6 +13,11 @@
 // limitations under the License.
 
 const std = @import("std");
+const platform = @import("antfly_platform");
+
+fn spinLock(mutex: *std.atomic.Mutex) void {
+    platform.sync.lockYielding(mutex);
+}
 
 pub const RequestId = u64;
 
@@ -137,6 +142,7 @@ pub const Snapshot = struct {
 
 pub const NativeGenerateCoordinator = struct {
     allocator: std.mem.Allocator,
+    mutex: std.atomic.Mutex = .unlocked,
     policy: Policy = .{},
     stats: Stats = .{},
     entries: std.ArrayListUnmanaged(Entry) = .empty,
@@ -159,12 +165,17 @@ pub const NativeGenerateCoordinator = struct {
     }
 
     pub fn deinit(self: *NativeGenerateCoordinator) void {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
         self.entries.deinit(self.allocator);
         self.pending_prefill.deinit(self.allocator);
         self.pending_decode.deinit(self.allocator);
     }
 
     pub fn acquire(self: *NativeGenerateCoordinator, admission: Admission) !Lease {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+
         const request_id = self.next_request_id;
         self.next_request_id += 1;
         const reserved_units = @max(admission.requested_units, 1);
@@ -182,12 +193,15 @@ pub const NativeGenerateCoordinator = struct {
             .reserved_units = reserved_units,
             .prompt_bytes = admission.prompt_bytes,
             .max_tokens = admission.max_tokens,
-            .prefill_chunk_size = self.recommendPrefillChunkFor(request_id),
+            .prefill_chunk_size = self.recommendPrefillChunkForUnlocked(request_id),
             .active_requests_snapshot = self.entries.items.len,
         };
     }
 
     pub fn release(self: *NativeGenerateCoordinator, lease: Lease) void {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+
         const idx = self.indexOf(lease.request_id) orelse return;
         const entry = self.entries.items[idx];
         self.removePendingPrefillByRequest(lease.request_id);
@@ -213,6 +227,9 @@ pub const NativeGenerateCoordinator = struct {
         kv_sequence_len: usize,
         kv_position_offset: usize,
     ) !void {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+
         if (self.findPendingPrefill(work_ptr) != null) return;
         try self.pending_prefill.append(self.allocator, .{
             .request_id = lease.request_id,
@@ -225,6 +242,8 @@ pub const NativeGenerateCoordinator = struct {
     }
 
     pub fn cancelPrefillWork(self: *NativeGenerateCoordinator, work_ptr: *anyopaque) void {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
         self.removePendingPrefill(work_ptr);
     }
 
@@ -236,6 +255,9 @@ pub const NativeGenerateCoordinator = struct {
         kv_sequence_len: usize,
         kv_position_offset: usize,
     ) !void {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+
         if (self.findPendingDecode(work_ptr) != null) return;
         try self.pending_decode.append(self.allocator, .{
             .request_id = lease.request_id,
@@ -247,6 +269,8 @@ pub const NativeGenerateCoordinator = struct {
     }
 
     pub fn cancelDecodeWork(self: *NativeGenerateCoordinator, work_ptr: *anyopaque) void {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
         self.removePendingDecode(work_ptr);
     }
 
@@ -264,6 +288,9 @@ pub const NativeGenerateCoordinator = struct {
         phase: Phase,
         blocks: usize,
     ) void {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+
         switch (phase) {
             .decode => {
                 if (self.findPendingDecode(work_ptr)) |idx| {
@@ -284,10 +311,13 @@ pub const NativeGenerateCoordinator = struct {
     /// tests and observability — production admission consults the field
     /// internally during `claimStep`.
     pub fn pendingKvBlocksEstimate(
-        self: *const NativeGenerateCoordinator,
+        self: *NativeGenerateCoordinator,
         work_ptr: *anyopaque,
         phase: Phase,
     ) ?usize {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+
         switch (phase) {
             .decode => {
                 const idx = self.findPendingDecode(work_ptr) orelse return null;
@@ -310,6 +340,9 @@ pub const NativeGenerateCoordinator = struct {
         phase: Phase,
         exclusive: bool,
     ) void {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+
         switch (phase) {
             .decode => {
                 if (self.findPendingDecode(work_ptr)) |idx| {
@@ -326,10 +359,13 @@ pub const NativeGenerateCoordinator = struct {
     }
 
     pub fn pendingRequiresExclusiveStep(
-        self: *const NativeGenerateCoordinator,
+        self: *NativeGenerateCoordinator,
         work_ptr: *anyopaque,
         phase: Phase,
     ) ?bool {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+
         switch (phase) {
             .decode => {
                 const idx = self.findPendingDecode(work_ptr) orelse return null;
@@ -360,6 +396,9 @@ pub const NativeGenerateCoordinator = struct {
         budget: StepBudget,
         out: *std.ArrayListUnmanaged(StepItem),
     ) !bool {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+
         if (self.in_turn) |owner| {
             if (owner != lease.request_id) return false;
         } else {
@@ -488,6 +527,9 @@ pub const NativeGenerateCoordinator = struct {
         lease: *Lease,
         items: []const StepItem,
     ) void {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+
         var prefill_count: u64 = 0;
         var decode_count: u64 = 0;
         var query_tokens: u64 = 0;
@@ -514,7 +556,7 @@ pub const NativeGenerateCoordinator = struct {
             self.stats.step_singleton_batches_total += 1;
         }
         const phase: Phase = if (decode_count > 0) .decode else .prefill;
-        self.finishTurn(lease, phase);
+        self.finishTurnUnlocked(lease, phase);
     }
 
     pub fn awaitTurn(self: *NativeGenerateCoordinator, lease: *Lease, phase: Phase, io: std.Io) void {
@@ -525,6 +567,12 @@ pub const NativeGenerateCoordinator = struct {
     }
 
     pub fn tryAcquireTurn(self: *NativeGenerateCoordinator, lease: *Lease, phase: Phase) bool {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        return self.tryAcquireTurnUnlocked(lease, phase);
+    }
+
+    fn tryAcquireTurnUnlocked(self: *NativeGenerateCoordinator, lease: *Lease, phase: Phase) bool {
         if (self.in_turn) |owner| {
             return owner == lease.request_id and self.in_turn_phase == phase;
         }
@@ -534,11 +582,17 @@ pub const NativeGenerateCoordinator = struct {
 
         self.in_turn = lease.request_id;
         self.in_turn_phase = phase;
-        lease.prefill_chunk_size = self.recommendPrefillChunkFor(lease.request_id);
+        lease.prefill_chunk_size = self.recommendPrefillChunkForUnlocked(lease.request_id);
         return true;
     }
 
     pub fn finishTurn(self: *NativeGenerateCoordinator, lease: *Lease, phase: Phase) void {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        self.finishTurnUnlocked(lease, phase);
+    }
+
+    fn finishTurnUnlocked(self: *NativeGenerateCoordinator, lease: *Lease, phase: Phase) void {
         if (self.in_turn != lease.request_id) return;
         self.in_turn = null;
         self.in_turn_phase = null;
@@ -556,31 +610,46 @@ pub const NativeGenerateCoordinator = struct {
     }
 
     pub fn notePrefillProgress(self: *NativeGenerateCoordinator, lease: *Lease, processed_tokens: usize, total_prompt_tokens: usize) void {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+
         const idx = self.indexOf(lease.request_id) orelse return;
         var entry = &self.entries.items[idx];
         entry.phase = .prefill;
         entry.prompt_tokens_processed = processed_tokens;
         entry.total_prompt_tokens = total_prompt_tokens;
-        lease.prefill_chunk_size = self.recommendPrefillChunkFor(lease.request_id);
+        lease.prefill_chunk_size = self.recommendPrefillChunkForUnlocked(lease.request_id);
     }
 
     pub fn beginDecode(self: *NativeGenerateCoordinator, lease: *Lease, total_prompt_tokens: usize) void {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+
         const idx = self.indexOf(lease.request_id) orelse return;
         var entry = &self.entries.items[idx];
         entry.phase = .decode;
         entry.prompt_tokens_processed = total_prompt_tokens;
         entry.total_prompt_tokens = total_prompt_tokens;
-        lease.prefill_chunk_size = self.recommendPrefillChunkFor(lease.request_id);
+        lease.prefill_chunk_size = self.recommendPrefillChunkForUnlocked(lease.request_id);
     }
 
     pub fn noteDecodeProgress(self: *NativeGenerateCoordinator, lease: *Lease, generated_tokens: usize) void {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+
         const idx = self.indexOf(lease.request_id) orelse return;
         var entry = &self.entries.items[idx];
         entry.phase = .decode;
         entry.generated_tokens = generated_tokens;
     }
 
-    pub fn snapshot(self: *const NativeGenerateCoordinator) Snapshot {
+    pub fn snapshot(self: *NativeGenerateCoordinator) Snapshot {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        return self.snapshotUnlocked();
+    }
+
+    fn snapshotUnlocked(self: *const NativeGenerateCoordinator) Snapshot {
         var waiting_requests: usize = 0;
         var prefill_requests: usize = 0;
         var decode_requests: usize = 0;
@@ -599,14 +668,22 @@ pub const NativeGenerateCoordinator = struct {
         };
     }
 
-    pub fn schedulerStats(self: *const NativeGenerateCoordinator) Stats {
+    pub fn schedulerStats(self: *NativeGenerateCoordinator) Stats {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
         return self.stats;
     }
 
-    fn recommendPrefillChunkFor(self: *const NativeGenerateCoordinator, request_id: RequestId) usize {
+    pub fn recommendPrefillChunkFor(self: *NativeGenerateCoordinator, request_id: RequestId) usize {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        return self.recommendPrefillChunkForUnlocked(request_id);
+    }
+
+    fn recommendPrefillChunkForUnlocked(self: *const NativeGenerateCoordinator, request_id: RequestId) usize {
         const idx = self.indexOf(request_id) orelse return self.base_prefill_chunk_size;
         const entry = self.entries.items[idx];
-        const state = self.snapshot();
+        const state = self.snapshotUnlocked();
 
         const prompt_bytes = @max(entry.prompt_bytes, 1);
         const prompt_token_estimate = @max(prompt_bytes / 4, 1);
