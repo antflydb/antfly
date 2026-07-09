@@ -8682,11 +8682,12 @@ test "native decode state deinit releases paged sequence" {
     });
     var state = NativeDecodeState.initPaged(allocator, &manager, pool_id, null);
     try state.notePrefill(5);
-    try std.testing.expect(manager.tokenCount(state.sequence_id.?).? > 0);
+    const sequence_id = state.sequence_id.?;
+    try std.testing.expect(manager.tokenCount(sequence_id).? > 0);
 
     state.deinit();
     try std.testing.expectEqual(@as(?runtime.kv.manager.SequenceId, null), state.sequence_id);
-    try std.testing.expectEqual(@as(usize, 0), manager.tokenCount(1).?);
+    try std.testing.expectEqual(@as(?usize, null), manager.tokenCount(sequence_id));
 }
 
 test "native decode state reports retained kv window offsets after trim" {
