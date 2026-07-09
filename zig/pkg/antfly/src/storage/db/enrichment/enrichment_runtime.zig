@@ -2026,19 +2026,34 @@ fn flushAssetProducerBatch(
     for (items.items, 0..) |*item, idx| requests[idx] = item.asRequest();
 
     var produced = producer.produceBatch(runtime.alloc, requests) catch |err| {
-        if (items.items.len == 1 or isRetryableEnrichmentError(err)) return err;
+        if (err == error.OutOfMemory) return err;
+        if (isRetryableEnrichmentError(err)) return err;
         return try flushAssetProducerBatchSequential(runtime, producer, items.items, window);
     };
+    if (produced.len != items.items.len) {
+        for (produced) |output| {
+            if (output.len > 0) runtime.alloc.free(output);
+        }
+        runtime.alloc.free(produced);
+        return try flushAssetProducerBatchSequential(runtime, producer, items.items, window);
+    }
+
     defer runtime.alloc.free(produced);
     errdefer {
         for (produced) |output| {
             if (output.len > 0) runtime.alloc.free(output);
         }
     }
-    if (produced.len != items.items.len) return error.InvalidAssetProducerResponse;
 
     for (items.items, produced, 0..) |*item, output, idx| {
-        try applyAssetProducerBatchOutput(runtime, item.*, output, window);
+        applyAssetProducerBatchOutput(runtime, item.*, output, window) catch |err| {
+            runtime.alloc.free(output);
+            produced[idx] = "";
+            if (err == error.OutOfMemory) return err;
+            if (isRetryableEnrichmentError(err)) return err;
+            recordIsolatedRequestError(runtime, item.request, err);
+            continue;
+        };
         runtime.alloc.free(output);
         produced[idx] = "";
     }
@@ -2053,12 +2068,17 @@ fn flushAssetProducerBatchSequential(
     for (items) |item| {
         const request = item.asRequest();
         const produced = producer.produce(runtime.alloc, request) catch |err| {
+            if (err == error.OutOfMemory) return err;
             if (isRetryableEnrichmentError(err)) return err;
             recordIsolatedRequestError(runtime, item.request, err);
             continue;
         };
         defer runtime.alloc.free(produced);
-        try applyAssetProducerBatchOutput(runtime, item, produced, window);
+        applyAssetProducerBatchOutput(runtime, item, produced, window) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            if (isRetryableEnrichmentError(err)) return err;
+            recordIsolatedRequestError(runtime, item.request, err);
+        };
     }
 }
 
@@ -8481,6 +8501,118 @@ test "document extraction generated OCR batches honor execution item cap" {
     try std.testing.expectEqualStrings("ocr text 0", units[0].text);
     try std.testing.expectEqualStrings("ocr text 1", units[1].text);
     try std.testing.expectEqualStrings("ocr text 0", units[2].text);
+}
+
+test "generic generated asset batch fallback isolates malformed batch envelope" {
+    const alloc = std.testing.allocator;
+
+    const FallbackProducer = struct {
+        batch_count: usize = 0,
+        single_count: usize = 0,
+
+        fn producer(self: *@This()) asset_producer_mod.Producer {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .produce = produce,
+                    .produce_batch = produceBatch,
+                },
+            };
+        }
+
+        fn produce(ptr: *anyopaque, a: Allocator, request: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.single_count += 1;
+            return try std.fmt.allocPrint(a, "ok:{s}", .{request.source_text});
+        }
+
+        fn produceBatch(ptr: *anyopaque, a: Allocator, _: []const asset_producer_mod.Request) ![][]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.batch_count += 1;
+            const malformed = try a.alloc([]u8, 1);
+            errdefer a.free(malformed);
+            malformed[0] = try a.dupe(u8, "orphaned-output");
+            return malformed;
+        }
+    };
+
+    const TestItem = struct {
+        fn make(a: Allocator, doc_key: []const u8, source: []const u8, artifact_key: []const u8, state_key: []const u8) !AssetProducerBatchItem {
+            return .{
+                .request = .{
+                    .kind = .asset,
+                    .index_name = "asset_idx",
+                    .artifact_name = "asset",
+                    .doc_key = doc_key,
+                    .source_field = "body",
+                    .content_type = "text/plain",
+                },
+                .producer_type = .generator,
+                .config_json = try a.dupe(u8, "{\"provider\":\"test\"}"),
+                .raw_doc = try a.dupe(u8, "{}"),
+                .source_text = try a.dupe(u8, source),
+                .artifact_key = try a.dupe(u8, artifact_key),
+                .state_key = try a.dupe(u8, state_key),
+                .state_value = try a.dupe(u8, "{\"state\":\"done\"}"),
+            };
+        }
+    };
+
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+    var erased_store = try backend_erased.storeFrom(alloc, store);
+    defer erased_store.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/indexes", .{tmp.sub_path});
+    var index_manager = try index_manager_mod.IndexManager.init(alloc, index_path);
+    defer index_manager.deinit();
+
+    var fake = FallbackProducer{};
+    const producer = fake.producer();
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = erased_store,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = &index_manager,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .asset_producer = producer },
+        .ownership = undefined,
+    };
+
+    var items = std.ArrayListUnmanaged(AssetProducerBatchItem).empty;
+    defer {
+        clearAssetProducerBatchItems(alloc, &items);
+        items.deinit(alloc);
+    }
+    try items.append(alloc, try TestItem.make(alloc, "doc:1", "one", "artifact:one", "state:one"));
+    try items.append(alloc, try TestItem.make(alloc, "doc:2", "two", "artifact:two", "state:two"));
+
+    var window = GeneratedReplayWindow{ .alloc = alloc };
+    defer window.deinit();
+
+    try flushAssetProducerBatch(&runtime, &items, &window);
+
+    try std.testing.expectEqual(@as(usize, 1), fake.batch_count);
+    try std.testing.expectEqual(@as(usize, 2), fake.single_count);
+    try std.testing.expectEqual(@as(usize, 2), window.changed_artifact_keys.items.len);
+
+    const first = try storeGetAlloc(&runtime, "artifact:one");
+    defer alloc.free(first);
+    try std.testing.expectEqualStrings("ok:one", first);
+    const second = try storeGetAlloc(&runtime, "artifact:two");
+    defer alloc.free(second);
+    try std.testing.expectEqualStrings("ok:two", second);
 }
 
 test "document extraction generated OCR batch fallback isolates permanent unit failure" {

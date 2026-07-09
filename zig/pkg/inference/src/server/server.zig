@@ -1430,6 +1430,22 @@ pub const Node = struct {
         return 1 + prompt_units + decode_units + image_units;
     }
 
+    fn estimateGenerateBatchQueueUnits(
+        self: *Node,
+        requests: []const api.GenerateBatchRequestItem,
+        owned_messages: []const OwnedGenerateMessages,
+        pending: []const bool,
+    ) usize {
+        var total: usize = 1;
+        for (requests, pending, 0..) |item, is_pending, idx| {
+            if (!is_pending) continue;
+            const max_tokens: i32 = if (item.body.max_tokens) |mt| @intCast(mt) else 256;
+            const item_units = self.estimateGenerateQueueUnits(owned_messages[idx].messages, max_tokens);
+            total = std.math.add(usize, total, item_units) catch std.math.maxInt(usize);
+        }
+        return total;
+    }
+
     fn estimateGeneratePromptBytes(self: *Node, messages: []const generation.Message) usize {
         _ = self;
         var text_bytes: usize = 0;
@@ -3002,12 +3018,6 @@ pub const Node = struct {
             });
         }
 
-        const queue_units = self.estimateHttpRequestQueueUnits(ctx);
-        if (try self.acquireSlotUnits(ctx, queue_units)) |resp| return resp;
-        defer self.releaseSlotUnits(queue_units);
-        self.metrics.incRequest("generate_batch");
-        defer self.metrics.decActive();
-
         var response_arena = std.heap.ArenaAllocator.init(ctx.allocator);
         defer response_arena.deinit();
         const response_alloc = response_arena.allocator();
@@ -3044,6 +3054,12 @@ pub const Node = struct {
             }
             pending[idx] = results[idx].@"error" == null;
         }
+
+        const queue_units = self.estimateGenerateBatchQueueUnits(body.requests, owned_messages, pending);
+        if (try self.acquireSlotUnits(ctx, queue_units)) |resp| return resp;
+        defer self.releaseSlotUnits(queue_units);
+        self.metrics.incRequest("generate_batch");
+        defer self.metrics.decActive();
 
         while (true) {
             const first_idx = blk: {
@@ -6361,6 +6377,38 @@ test "generate batch preflight rejects image content without parsing media" {
 
     const reason = Node.generateBatchUnsupportedReasonPreflight(parsed.value) orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("UNSUPPORTED_MULTIMODAL", reason.code);
+}
+
+test "generate batch queue units sum pending generation work" {
+    const alloc = std.testing.allocator;
+    var node = try Node.init(alloc, .{});
+    defer node.deinit();
+
+    const request_json =
+        \\{"mode":"sync","requests":[
+        \\{"custom_id":"a","body":{"model":"m","max_tokens":512,"messages":[{"role":"user","content":"short"}]}},
+        \\{"custom_id":"b","body":{"model":"m","max_tokens":256,"messages":[{"role":"user","content":"this prompt is deliberately longer than one prompt queue block so the estimate is weighted"}]}},
+        \\{"custom_id":"c","body":{"model":"m","max_tokens":256,"messages":[{"role":"user","content":"already rejected"}]}}
+        \\]}
+    ;
+    var parsed = try std.json.parseFromSlice(api.GenerateBatchRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+
+    var owned_messages = try alloc.alloc(Node.OwnedGenerateMessages, parsed.value.requests.len);
+    defer {
+        for (owned_messages) |*owned| owned.deinit();
+        alloc.free(owned_messages);
+    }
+    for (parsed.value.requests, 0..) |item, idx| {
+        owned_messages[idx] = try node.parseGenerateMessages(alloc, item.body);
+    }
+    const pending = [_]bool{ true, true, false };
+
+    const expected =
+        @as(usize, 1) +
+        node.estimateGenerateQueueUnits(owned_messages[0].messages, 512) +
+        node.estimateGenerateQueueUnits(owned_messages[1].messages, 256);
+    try std.testing.expectEqual(expected, node.estimateGenerateBatchQueueUnits(parsed.value.requests, owned_messages, pending[0..]));
 }
 
 test "read batch downloaded byte accounting enforces aggregate cap" {
