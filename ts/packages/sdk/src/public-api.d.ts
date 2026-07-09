@@ -7220,6 +7220,16 @@ export interface components {
          * @enum {string}
          */
         EnrichmentKind: "chunk" | "asset" | "embedding";
+        /** @description Non-semantic execution policy for one producer or index maintenance operation. These fields tune how work is batched and do not change generated artifact identity. */
+        ExecutionPolicy: {
+            /** @description Maximum items to process in one batch for this operation. */
+            batch_items?: number;
+            /**
+             * Format: uint64
+             * @description Approximate maximum source bytes to process in one batch for this operation.
+             */
+            batch_bytes?: number;
+        };
         /** @description Inline managed enrichment definition. Enrichments materialize generated artifacts before indexing and may target source rows or previously generated artifact streams. */
         EnrichmentConfig: {
             /** @description Stable generated artifact name. */
@@ -7248,6 +7258,8 @@ export interface components {
             content_type?: string;
             /** @description Serialized asset producer configuration. */
             producer_json?: string;
+            /** @description Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity. */
+            execution?: components["schemas"]["ExecutionPolicy"];
         };
         FullTextIndexConfig: {
             /** @description Whether to use memory-only storage */
@@ -8151,6 +8163,23 @@ export interface components {
                 [key: string]: unknown;
             };
         };
+        /** @description Namespaced execution policy for index shorthand. Index configs can drive multiple operations, so each operation receives its own policy. */
+        IndexExecutionConfig: {
+            /** @description Index maintenance, backfill, replay, or materialization batching. */
+            indexing?: components["schemas"]["ExecutionPolicy"];
+            /** @description Chunk producer batching for shorthand-created chunk enrichments. */
+            chunking?: components["schemas"]["ExecutionPolicy"];
+            /** @description Embedding producer batching for shorthand-created embedding enrichments. */
+            embedding?: components["schemas"]["ExecutionPolicy"];
+            /** @description Extraction producer batching for shorthand-created asset enrichments. */
+            extracting?: components["schemas"]["ExecutionPolicy"];
+            /** @description Reader producer batching for shorthand-created asset enrichments. */
+            reading?: components["schemas"]["ExecutionPolicy"];
+            /** @description Generator producer batching for shorthand-created asset enrichments. */
+            generating?: components["schemas"]["ExecutionPolicy"];
+            /** @description Transcriber producer batching for shorthand-created asset enrichments. */
+            transcribing?: components["schemas"]["ExecutionPolicy"];
+        };
         /** @description Unified configuration for embeddings indexes. When sparse is true, creates a sparse vector index (SPLADE inverted index). When sparse is false (default), creates a dense vector index (HNSW). For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected. */
         EmbeddingsIndexConfig: {
             /**
@@ -8201,6 +8230,8 @@ export interface components {
              * @default 1024
              */
             chunk_size?: number;
+            /** @description Non-semantic execution policy for index maintenance and any shorthand-created chunking or embedding producers. */
+            execution?: components["schemas"]["IndexExecutionConfig"];
         };
         /** @description Configuration for a specific edge type */
         EdgeTypeConfig: {
@@ -8240,6 +8271,11 @@ export interface components {
             /** @description Required metadata fields for this edge type */
             required_metadata?: string[];
         };
+        /** @description Execution policy for graph index work. Artifact producer batching belongs on graph artifact.execution. */
+        GraphIndexExecutionConfig: {
+            /** @description Graph edge materialization, backfill, replay, or maintenance batching. */
+            indexing?: components["schemas"]["ExecutionPolicy"];
+        };
         /** @description Configuration for graph index type */
         GraphIndexConfig: {
             /** @description Configuration for generating node summaries (enables tree navigation in Retrieval Agent) */
@@ -8256,6 +8292,8 @@ export interface components {
             edge_types?: components["schemas"]["EdgeTypeConfig"][];
             /** @description Maximum number of edges per document (0 = unlimited) */
             max_edges_per_document?: number;
+            /** @description Non-semantic execution policy for graph edge materialization. Shorthand artifact producer batching belongs on artifact.execution. */
+            execution?: components["schemas"]["GraphIndexExecutionConfig"];
         };
         /** @description Schema-derived algebraic sidecar configuration. Public requests may opt into schema derivation, while materializations remain engine-owned. */
         AlgebraicIndexConfig: {

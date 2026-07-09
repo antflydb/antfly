@@ -100,6 +100,25 @@ components:
         embedding:
           $ref: "#/components/schemas/ExecutionPolicy"
           description: "Embedding producer batching for shorthand-created embedding enrichments."
+        extracting:
+          $ref: "#/components/schemas/ExecutionPolicy"
+          description: "Extraction producer batching for shorthand-created asset enrichments."
+        reading:
+          $ref: "#/components/schemas/ExecutionPolicy"
+          description: "Reader producer batching for shorthand-created asset enrichments."
+        generating:
+          $ref: "#/components/schemas/ExecutionPolicy"
+          description: "Generator producer batching for shorthand-created asset enrichments."
+        transcribing:
+          $ref: "#/components/schemas/ExecutionPolicy"
+          description: "Transcriber producer batching for shorthand-created asset enrichments."
+    GraphIndexExecutionConfig:
+      type: object
+      description: "Execution policy for graph index work. Artifact producer batching belongs on graph artifact.execution."
+      properties:
+        indexing:
+          $ref: "#/components/schemas/ExecutionPolicy"
+          description: "Graph edge materialization, backfill, replay, or maintenance batching."
     EnrichmentConfig:
       type: object
       description: "Inline managed enrichment definition. Enrichments materialize generated artifacts before indexing and may target source rows or previously generated artifact streams."
@@ -1125,8 +1144,8 @@ components:
           type: integer
           description: "Maximum number of edges per document (0 = unlimited)"
         execution:
-          $ref: "#/components/schemas/IndexExecutionConfig"
-          description: "Non-semantic execution policy for graph edge materialization and shorthand-created relation producers."
+          $ref: "#/components/schemas/GraphIndexExecutionConfig"
+          description: "Non-semantic execution policy for graph edge materialization. Shorthand artifact producer batching belongs on artifact.execution."
     EdgeTypeConfig:
       type: object
       description: "Configuration for a specific edge type"

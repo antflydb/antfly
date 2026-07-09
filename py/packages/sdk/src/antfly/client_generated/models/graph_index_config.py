@@ -11,6 +11,7 @@ from ..types import UNSET, Unset
 if TYPE_CHECKING:
     from ..models.edge_type_config import EdgeTypeConfig
     from ..models.generator_config import GeneratorConfig
+    from ..models.graph_index_execution_config import GraphIndexExecutionConfig
 
 
 T = TypeVar("T", bound="GraphIndexConfig")
@@ -30,12 +31,15 @@ class GraphIndexConfig:
             {{content}}.
         edge_types (list[EdgeTypeConfig] | Unset): List of edge types with their configurations
         max_edges_per_document (int | Unset): Maximum number of edges per document (0 = unlimited)
+        execution (GraphIndexExecutionConfig | Unset): Execution policy for graph index work. Artifact producer batching
+            belongs on graph artifact.execution.
     """
 
     summarizer: GeneratorConfig | Unset = UNSET
     template: str | Unset = UNSET
     edge_types: list[EdgeTypeConfig] | Unset = UNSET
     max_edges_per_document: int | Unset = UNSET
+    execution: GraphIndexExecutionConfig | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -54,6 +58,10 @@ class GraphIndexConfig:
 
         max_edges_per_document = self.max_edges_per_document
 
+        execution: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.execution, Unset):
+            execution = self.execution.to_dict()
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
@@ -65,6 +73,8 @@ class GraphIndexConfig:
             field_dict["edge_types"] = edge_types
         if max_edges_per_document is not UNSET:
             field_dict["max_edges_per_document"] = max_edges_per_document
+        if execution is not UNSET:
+            field_dict["execution"] = execution
 
         return field_dict
 
@@ -72,6 +82,7 @@ class GraphIndexConfig:
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.edge_type_config import EdgeTypeConfig
         from ..models.generator_config import GeneratorConfig
+        from ..models.graph_index_execution_config import GraphIndexExecutionConfig
 
         d = dict(src_dict)
         _summarizer = d.pop("summarizer", UNSET)
@@ -94,11 +105,19 @@ class GraphIndexConfig:
 
         max_edges_per_document = d.pop("max_edges_per_document", UNSET)
 
+        _execution = d.pop("execution", UNSET)
+        execution: GraphIndexExecutionConfig | Unset
+        if isinstance(_execution, Unset):
+            execution = UNSET
+        else:
+            execution = GraphIndexExecutionConfig.from_dict(_execution)
+
         graph_index_config = cls(
             summarizer=summarizer,
             template=template,
             edge_types=edge_types,
             max_edges_per_document=max_edges_per_document,
+            execution=execution,
         )
 
         graph_index_config.additional_properties = d

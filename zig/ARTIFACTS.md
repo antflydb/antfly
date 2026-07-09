@@ -324,8 +324,13 @@ Execution policy is scoped to the catalog resource that owns the work. Explicit
 enrichments already name one producer operation, so their `execution` block uses
 the policy fields directly. Index shorthand can expand into multiple work
 owners, so its `execution` block uses operation namespaces such as `indexing`,
-`chunking`, and `embedding`; the translator copies each nested policy to the
-generated resource where it becomes that resource's flat `execution` policy.
+`chunking`, `embedding`, `reading`, `generating`, `extracting`, and
+`transcribing`; the translator copies each nested policy to the generated
+resource where it becomes that resource's flat `execution` policy.
+Graph indexes are the exception because their shorthand already has an
+`artifact` object: graph root `execution` is only for graph/indexing work, and
+producer batching for the generated relation asset belongs in
+`artifact.execution`.
 
 Embedding enrichments should use the same execution-policy model. Existing dense
 and chunked embedding workers already resolve process-level batch item and byte
@@ -510,10 +515,11 @@ asset/extractor execution policy controls model calls that produce relations.
 }
 ```
 
-If the graph index uses shorthand to create the relation-producing asset, that
-shorthand should carry a separate producer execution policy. The index
-translator should copy it onto the generated asset enrichment and keep graph
-indexing batching on the graph index:
+If the graph index uses shorthand to create the relation-producing asset,
+producer batching belongs on that artifact object. The index translator should
+copy `artifact.execution` onto the generated asset enrichment and keep graph
+indexing batching on the graph index. Do not also put artifact producer policy
+under graph root `execution`:
 
 ```json
 {

@@ -18,6 +18,7 @@ pub const ExecutionPolicy = types.ExecutionPolicy;
 pub const FullTextIndexConfig = types.FullTextIndexConfig;
 pub const FullTextIndexStats = types.FullTextIndexStats;
 pub const GraphIndexConfig = types.GraphIndexConfig;
+pub const GraphIndexExecutionConfig = types.GraphIndexExecutionConfig;
 pub const GraphIndexStats = types.GraphIndexStats;
 pub const GraphNodeSelector = types.GraphNodeSelector;
 pub const GraphQuery = types.GraphQuery;

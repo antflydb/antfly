@@ -15322,6 +15322,18 @@ components:
         embedding:
           $ref: '#/components/schemas/ExecutionPolicy'
           description: Embedding producer batching for shorthand-created embedding enrichments.
+        extracting:
+          $ref: '#/components/schemas/ExecutionPolicy'
+          description: Extraction producer batching for shorthand-created asset enrichments.
+        reading:
+          $ref: '#/components/schemas/ExecutionPolicy'
+          description: Reader producer batching for shorthand-created asset enrichments.
+        generating:
+          $ref: '#/components/schemas/ExecutionPolicy'
+          description: Generator producer batching for shorthand-created asset enrichments.
+        transcribing:
+          $ref: '#/components/schemas/ExecutionPolicy'
+          description: Transcriber producer batching for shorthand-created asset enrichments.
     EmbeddingsIndexConfig:
       type: object
       description: Unified configuration for embeddings indexes. When sparse is true, creates a sparse
@@ -15462,6 +15474,14 @@ components:
             type: string
       required:
         - name
+    GraphIndexExecutionConfig:
+      type: object
+      description: Execution policy for graph index work. Artifact producer batching belongs on graph
+        artifact.execution.
+      properties:
+        indexing:
+          $ref: '#/components/schemas/ExecutionPolicy'
+          description: Graph edge materialization, backfill, replay, or maintenance batching.
     GraphIndexConfig:
       type: object
       description: Configuration for graph index type
@@ -15493,9 +15513,9 @@ components:
           type: integer
           description: Maximum number of edges per document (0 = unlimited)
         execution:
-          $ref: '#/components/schemas/IndexExecutionConfig'
-          description: Non-semantic execution policy for graph edge materialization and shorthand-created
-            relation producers.
+          $ref: '#/components/schemas/GraphIndexExecutionConfig'
+          description: Non-semantic execution policy for graph edge materialization. Shorthand artifact
+            producer batching belongs on artifact.execution.
     AlgebraicIndexConfig:
       type: object
       description: Schema-derived algebraic sidecar configuration. Public requests may opt into schema

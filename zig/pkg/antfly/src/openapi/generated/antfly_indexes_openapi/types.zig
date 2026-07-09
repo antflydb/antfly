@@ -598,8 +598,14 @@ pub const GraphIndexConfig = struct {
     edge_types: ?[]const EdgeTypeConfig = null,
     /// Maximum number of edges per document (0 = unlimited)
     max_edges_per_document: ?i64 = null,
-    /// Non-semantic execution policy for graph edge materialization and shorthand-created relation producers.
-    execution: ?IndexExecutionConfig = null,
+    /// Non-semantic execution policy for graph edge materialization. Shorthand artifact producer batching belongs on artifact.execution.
+    execution: ?GraphIndexExecutionConfig = null,
+};
+
+/// Execution policy for graph index work. Artifact producer batching belongs on graph artifact.execution.
+pub const GraphIndexExecutionConfig = struct {
+    /// Graph edge materialization, backfill, replay, or maintenance batching.
+    indexing: ?ExecutionPolicy = null,
 };
 
 /// Discriminator for the index stats variant.
@@ -988,6 +994,14 @@ pub const IndexExecutionConfig = struct {
     chunking: ?ExecutionPolicy = null,
     /// Embedding producer batching for shorthand-created embedding enrichments.
     embedding: ?ExecutionPolicy = null,
+    /// Extraction producer batching for shorthand-created asset enrichments.
+    extracting: ?ExecutionPolicy = null,
+    /// Reader producer batching for shorthand-created asset enrichments.
+    reading: ?ExecutionPolicy = null,
+    /// Generator producer batching for shorthand-created asset enrichments.
+    generating: ?ExecutionPolicy = null,
+    /// Transcriber producer batching for shorthand-created asset enrichments.
+    transcribing: ?ExecutionPolicy = null,
 };
 
 /// Statistics for an index

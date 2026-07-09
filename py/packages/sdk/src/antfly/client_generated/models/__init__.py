@@ -180,6 +180,7 @@ from .evaluator_score_metadata import EvaluatorScoreMetadata
 from .exa_search_config import ExaSearchConfig
 from .exa_search_config_search_type import ExaSearchConfigSearchType
 from .exact_sort_error import ExactSortError
+from .execution_policy import ExecutionPolicy
 from .extension_error import ExtensionError
 from .extension_member import ExtensionMember
 from .extension_object_decl import ExtensionObjectDecl
@@ -247,6 +248,7 @@ from .get_document_artifact_manifest_detail import GetDocumentArtifactManifestDe
 from .google_embedder_config import GoogleEmbedderConfig
 from .google_generator_config import GoogleGeneratorConfig
 from .graph_index_config import GraphIndexConfig
+from .graph_index_execution_config import GraphIndexExecutionConfig
 from .graph_index_stats import GraphIndexStats
 from .graph_index_stats_algebraic_graph import GraphIndexStatsAlgebraicGraph
 from .graph_index_stats_algebraic_graph_traversal import GraphIndexStatsAlgebraicGraphTraversal
@@ -272,6 +274,7 @@ from .image_url_content_part import ImageURLContentPart
 from .image_url_content_part_type import ImageURLContentPartType
 from .incomplete_details import IncompleteDetails
 from .incomplete_details_reason import IncompleteDetailsReason
+from .index_execution_config import IndexExecutionConfig
 from .index_status import IndexStatus
 from .index_status_shard_status import IndexStatusShardStatus
 from .index_type import IndexType
@@ -813,6 +816,7 @@ __all__ = (
     "ExactSortError",
     "ExaSearchConfig",
     "ExaSearchConfigSearchType",
+    "ExecutionPolicy",
     "ExtensionError",
     "ExtensionMember",
     "ExtensionObjectDecl",
@@ -880,6 +884,7 @@ __all__ = (
     "GoogleEmbedderConfig",
     "GoogleGeneratorConfig",
     "GraphIndexConfig",
+    "GraphIndexExecutionConfig",
     "GraphIndexStats",
     "GraphIndexStatsAlgebraicGraph",
     "GraphIndexStatsAlgebraicGraphTraversal",
@@ -905,6 +910,7 @@ __all__ = (
     "ImageURLContentPartType",
     "IncompleteDetails",
     "IncompleteDetailsReason",
+    "IndexExecutionConfig",
     "IndexStatus",
     "IndexStatusShardStatus",
     "IndexType",

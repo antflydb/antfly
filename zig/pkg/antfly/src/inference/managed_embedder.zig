@@ -2218,7 +2218,7 @@ fn appendExecutionObjectIfPresent(
 
 fn validateIndexExecutionObjectForCreateTable(execution: std.json.Value) !void {
     if (execution != .object) return error.InvalidCreateTableRequest;
-    for ([_][]const u8{ "indexing", "chunking", "embedding" }) |field_name| {
+    for ([_][]const u8{ "indexing", "chunking", "embedding", "extracting", "reading", "generating", "transcribing" }) |field_name| {
         const policy = execution.object.get(field_name) orelse continue;
         _ = enrichment_types.parseExecutionPolicyValue(policy) catch return error.InvalidCreateTableRequest;
     }

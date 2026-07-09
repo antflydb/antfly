@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from ..models.chunker_config import ChunkerConfig
     from ..models.embedder_config import EmbedderConfig
     from ..models.generator_config import GeneratorConfig
+    from ..models.index_execution_config import IndexExecutionConfig
 
 
 T = TypeVar("T", bound="EmbeddingsIndexConfig")
@@ -224,6 +225,8 @@ class EmbeddingsIndexConfig:
             top_k (int | Unset): Default number of results to return from search (sparse only) Default: 10.
             min_weight (float | Unset): Minimum weight threshold for sparse vector entries (sparse only) Default: 0.0.
             chunk_size (int | Unset): Number of documents per posting list chunk (sparse only) Default: 1024.
+            execution (IndexExecutionConfig | Unset): Namespaced execution policy for index shorthand. Index configs can
+                drive multiple operations, so each operation receives its own policy.
     """
 
     external: bool | Unset = False
@@ -241,6 +244,7 @@ class EmbeddingsIndexConfig:
     top_k: int | Unset = 10
     min_weight: float | Unset = 0.0
     chunk_size: int | Unset = 1024
+    execution: IndexExecutionConfig | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -282,6 +286,10 @@ class EmbeddingsIndexConfig:
 
         chunk_size = self.chunk_size
 
+        execution: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.execution, Unset):
+            execution = self.execution.to_dict()
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
@@ -315,6 +323,8 @@ class EmbeddingsIndexConfig:
             field_dict["min_weight"] = min_weight
         if chunk_size is not UNSET:
             field_dict["chunk_size"] = chunk_size
+        if execution is not UNSET:
+            field_dict["execution"] = execution
 
         return field_dict
 
@@ -323,6 +333,7 @@ class EmbeddingsIndexConfig:
         from ..models.chunker_config import ChunkerConfig
         from ..models.embedder_config import EmbedderConfig
         from ..models.generator_config import GeneratorConfig
+        from ..models.index_execution_config import IndexExecutionConfig
 
         d = dict(src_dict)
         external = d.pop("external", UNSET)
@@ -375,6 +386,13 @@ class EmbeddingsIndexConfig:
 
         chunk_size = d.pop("chunk_size", UNSET)
 
+        _execution = d.pop("execution", UNSET)
+        execution: IndexExecutionConfig | Unset
+        if isinstance(_execution, Unset):
+            execution = UNSET
+        else:
+            execution = IndexExecutionConfig.from_dict(_execution)
+
         embeddings_index_config = cls(
             external=external,
             sparse=sparse,
@@ -391,6 +409,7 @@ class EmbeddingsIndexConfig:
             top_k=top_k,
             min_weight=min_weight,
             chunk_size=chunk_size,
+            execution=execution,
         )
 
         embeddings_index_config.additional_properties = d
