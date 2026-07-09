@@ -335,6 +335,64 @@ fields are the same shape as readers:
 }
 ```
 
+For embeddings indexes that use the inline managed-embedder shorthand, execution
+policy should live beside `embedder`, not inside it:
+
+```json
+{
+  "type": "embeddings",
+  "field": "body",
+  "dimension": 384,
+  "embedder": {
+    "provider": "antfly",
+    "model": "bge-base-en-v1.5"
+  },
+  "execution": {
+    "batch_items": 16,
+    "batch_bytes": 262144
+  }
+}
+```
+
+The index translator should copy that policy onto the generated embedding
+enrichment. The vector index itself consumes the produced embedding artifact;
+the batching policy applies to the embedding producer that creates that artifact.
+For artifact-backed indexes that point at an existing embedding artifact, the
+policy belongs on the matching embedding enrichment:
+
+```json
+{
+  "type": "embeddings",
+  "field": "embedding",
+  "embedding_name": "document_chunk_dense_v1",
+  "source_artifact_name": "document_chunks_v1",
+  "dimension": 384
+}
+```
+
+```json
+{
+  "name": "document_chunk_dense_v1",
+  "kind": "embedding",
+  "field": "text",
+  "source_artifact_name": "document_chunks_v1",
+  "expected_dims": 384,
+  "embedder": {
+    "provider": "antfly",
+    "model": "bge-base-en-v1.5"
+  },
+  "execution": {
+    "batch_items": 32,
+    "batch_bytes": 524288
+  }
+}
+```
+
+Existing `embedder.batch_size` should be treated as a compatibility alias for
+`execution.batch_items` when possible, then normalized out of semantic embedder
+configuration before deriving artifact identity. New configs should prefer the
+top-level `execution` block.
+
 Extraction inference also has a batched request shape: multiple text inputs or
 image inputs can be submitted together and results are returned by input index.
 Recognizer-backed extraction should batch text inputs directly; for GLiNER2 this
