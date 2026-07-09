@@ -129,26 +129,27 @@ The JSON response returns one item per request. Results are matched by
 
 ```json
 {
-  "object": "generate_batch_result",
+  "object": "generate.batch",
   "data": [
-    {"custom_id": "doc-a", "index": 0, "response": {"text": "..."}, "error": null},
+    {"custom_id": "doc-a", "index": 0, "response": {"object": "chat.completion", "choices": [{"message": {"content": "..."}}]}, "error": null},
     {"custom_id": "doc-b", "index": 1, "response": null, "error": {"code": "INFERENCE_FAILED", "message": "...", "retryable": true}}
   ],
   "summary": {"total": 2, "succeeded": 1, "failed": 1}
 }
 ```
 
-`application/x-ndjson` implies synchronous streaming batch mode. The request
-body is one JSON object per line, each equivalent to one entry in the JSON
-`requests` array:
+The initial implementation exposes the JSON envelope only. A future
+`application/x-ndjson` transport should imply synchronous streaming batch mode.
+The request body would be one JSON object per line, each equivalent to one
+entry in the JSON `requests` array:
 
 ```jsonl
 {"custom_id":"doc-a","body":{"model":"qwen","messages":[{"role":"user","content":"Summarize A"}]}}
 {"custom_id":"doc-b","body":{"model":"qwen","messages":[{"role":"user","content":"Summarize B"}]}}
 ```
 
-The response content type is also `application/x-ndjson`, and each output line
-is a completed item:
+The response content type would also be `application/x-ndjson`, with each
+output line as a completed item:
 
 ```jsonl
 {"custom_id":"doc-a","index":0,"response":{"text":"..."},"error":null}
