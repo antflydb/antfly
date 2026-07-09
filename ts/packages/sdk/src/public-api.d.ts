@@ -10587,6 +10587,16 @@ export interface components {
              * @enum {string}
              */
             input_type?: "search_query" | "search_document" | "query" | "document" | "classification" | "clustering";
+            /**
+             * @description Controls how dense embedding requests report per-input failures.
+             *     `fail_fast` preserves OpenAI-compatible all-or-error behavior.
+             *     `per_item` returns successful embeddings in `data` and indexed
+             *     permanent/transient failures in `errors` without failing the
+             *     entire HTTP request.
+             * @default fail_fast
+             * @enum {string}
+             */
+            error_policy?: "fail_fast" | "per_item";
         };
         /** @description OpenAI-compatible embedding response with a polymorphic `embedding` field for dense or sparse vectors */
         InferenceEmbedResponse: {
@@ -10600,6 +10610,33 @@ export interface components {
             /** @description Model used for embedding generation */
             model: string;
             usage: components["schemas"]["InferenceEmbeddingUsage"];
+            /** @description Indexed per-input failures. Only populated when request error_policy is per_item. */
+            errors?: components["schemas"]["InferenceEmbeddingItemError"][];
+            summary?: components["schemas"]["InferenceEmbeddingBatchSummary"];
+        };
+        /** @description Per-input embedding failure for error_policy=per_item responses */
+        InferenceEmbeddingItemError: {
+            /** @description Original input index that failed */
+            index: number;
+            /** @description Stable machine-readable failure code */
+            code: string;
+            /** @description Human-readable failure message */
+            message: string;
+            /**
+             * @description Pipeline stage that classified the failure
+             * @enum {string}
+             */
+            stage: "parse" | "fetch" | "image_decode" | "audio_decode" | "text_inference" | "image_inference" | "audio_inference" | "inference";
+            /** @description Whether retrying the same item may succeed */
+            retryable: boolean;
+            /** @description HTTP-style status classification for this item */
+            status: number;
+        };
+        /** @description Counts for per-item embedding responses */
+        InferenceEmbeddingBatchSummary: {
+            total: number;
+            succeeded: number;
+            failed: number;
         };
         /** @description A sparse vector with parallel index/value arrays, sorted by index ascending */
         InferenceSparseVector: {
