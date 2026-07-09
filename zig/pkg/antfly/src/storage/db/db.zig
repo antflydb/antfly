@@ -3068,7 +3068,7 @@ pub const DB = struct {
             db.recordStartupOpenStats(profile);
             if (opts.open_mode.allowsReplay()) {
                 const replay_started_ns = monotonicTimeNs();
-                replayPendingDerivedBatches(&db, null, null) catch |err| switch (err) {
+                replayPendingDerivedBatches(&db, null, null, .{}) catch |err| switch (err) {
                     error.ArtifactRepairRequired => {},
                     else => return err,
                 };
@@ -8071,6 +8071,7 @@ pub const DB = struct {
         defer self.core.unlockApply();
 
         try self.core.syncStore(true);
+        try self.core.index_manager.syncAll(true);
 
         const snapshot_root = try std.fmt.allocPrint(self.alloc, "{s}.snapshots/{s}", .{ self.core.path, id });
         defer self.alloc.free(snapshot_root);
@@ -8133,10 +8134,10 @@ pub const DB = struct {
         // restore them after the logical store and derived log are rehydrated.
         var restored = try DB.open(alloc, path, opts);
         defer restored.close();
-        _ = try restored.core.index_manager.rebuildGraphSplitDestination(
-            restored.getRange().start,
-            restored.getRange().end,
-        );
+        _ = try restored.rebuildDenseIndexesForTargetCoverage(alloc);
+        _ = try restored.rebuildSparseIndexesForTargetCoverage(alloc);
+        try restored.rebuildGraphIndexesForTargetCoverage(alloc);
+        try restored.core.index_manager.syncAll(true);
     }
 
     pub fn restoreSnapshotToDeferredRuntimeRepair(
@@ -8325,7 +8326,7 @@ pub const DB = struct {
 
         if (std.mem.eql(u8, phase, "runtime_repair") or std.mem.eql(u8, phase, "reset_watermarks")) {
             std.log.info("restore runtime repair reset managed index watermarks path={s}", .{self.core.path});
-            try self.resetManagedIndexAppliedSequences();
+            try self.resetManagedIndexAppliedSequencesForRestoreRepair(alloc);
             try self.refreshManagedIndexWorkersLocked();
             try self.updateRestoreRuntimeRepairPhase(alloc, "rebuild_graph", false);
             return true;
@@ -8354,12 +8355,21 @@ pub const DB = struct {
         if (std.mem.eql(u8, phase, "drain_async")) {
             std.log.info("restore runtime repair drain async work path={s}", .{self.core.path});
             try self.runRestoreRepairDrainAsync();
+            try self.updateRestoreRuntimeRepairPhase(alloc, "rebuild_replayed_artifacts", false);
+            return true;
+        }
+        if (std.mem.eql(u8, phase, "rebuild_replayed_artifacts")) {
+            std.log.info("restore runtime repair rebuild replayed embedding artifacts path={s}", .{self.core.path});
+            _ = try self.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc);
+            _ = try self.rebuildSparseIndexesForTargetCoverage(alloc);
             try self.updateRestoreRuntimeRepairPhase(alloc, "sync_indexes", false);
             return true;
         }
         if (std.mem.eql(u8, phase, "sync_indexes")) {
             std.log.info("restore runtime repair complete runtime indexes path={s}", .{self.core.path});
+            try self.saveAllLiveIndexStatusSnapshots(alloc);
             try self.core.index_manager.syncAll(true);
+            try self.core.syncStore(true);
             try markRestoreRuntimeRepairComplete(alloc, self.core.path);
             std.log.info("restore runtime repair marked complete path={s}", .{self.core.path});
             return true;
@@ -9956,6 +9966,27 @@ pub const DB = struct {
         }
     }
 
+    fn resetManagedIndexAppliedSequencesForRestoreRepair(self: *DB, alloc: Allocator) !void {
+        const managed_indexes = try self.core.managedIndexes(alloc);
+        defer {
+            for (managed_indexes) |index_ref| alloc.free(@constCast(index_ref.name));
+            alloc.free(managed_indexes);
+        }
+
+        for (managed_indexes) |index_ref| {
+            const sequence: u64 = switch (index_ref.kind) {
+                .full_text => try self.probeDerivedReplayTargetSequence(
+                    alloc,
+                    self.core.replaySource(),
+                    index_ref,
+                    0,
+                ),
+                else => 0,
+            };
+            try self.core.saveAppliedSequence(index_ref.name, sequence);
+        }
+    }
+
     fn rebaseManagedIndexAppliedSequencesIfNeeded(self: *DB) !void {
         const managed_indexes = try self.core.managedIndexes(self.alloc);
         defer {
@@ -10092,14 +10123,22 @@ pub const DB = struct {
         };
     }
 
-    pub fn runDerivedUntil(self: *DB, sequence: u64) !void {
+    const ReplayDrainOptions = struct {
+        truncate_replay: bool = true,
+    };
+
+    fn runDerivedUntilWithOptions(self: *DB, sequence: u64, options: ReplayDrainOptions) !void {
         if (sequence == 0) return;
         if (!self.executor.hasWorkers()) {
-            try replayPendingDerivedBatches(self, null, null);
+            try replayPendingDerivedBatches(self, null, null, options);
             return;
         }
         self.executor.notifySequence(sequence);
         try self.executor.waitForAll(sequence);
+    }
+
+    pub fn runDerivedUntil(self: *DB, sequence: u64) !void {
+        try self.runDerivedUntilWithOptions(sequence, .{});
     }
 
     pub fn runDerivedUntilTargets(self: *DB, sequence: u64, index_names: []const []const u8) !void {
@@ -10147,10 +10186,10 @@ pub const DB = struct {
         }
     }
 
-    pub fn runMaintenanceUntil(self: *DB, sequence: u64, sync_targets: ManagedSyncTargets) !void {
+    fn runMaintenanceUntilWithOptions(self: *DB, sequence: u64, sync_targets: ManagedSyncTargets, options: ReplayDrainOptions) !void {
         var stable_target = sequence;
         while (true) {
-            try self.runDerivedUntil(stable_target);
+            try self.runDerivedUntilWithOptions(stable_target, options);
             try self.runEnrichmentUntil(stable_target);
 
             const next_target = self.core.nextDerivedSequence();
@@ -10161,6 +10200,10 @@ pub const DB = struct {
             }
             stable_target = next_target;
         }
+    }
+
+    pub fn runMaintenanceUntil(self: *DB, sequence: u64, sync_targets: ManagedSyncTargets) !void {
+        try self.runMaintenanceUntilWithOptions(sequence, sync_targets, .{});
     }
 
     pub fn runMaintenanceUntilTargets(self: *DB, sequence: u64, index_names: []const []const u8) !void {
@@ -10235,7 +10278,7 @@ pub const DB = struct {
     }
 
     pub fn catchUpPendingDerivedReplay(self: *DB) !void {
-        try replayPendingDerivedBatches(self, null, null);
+        try replayPendingDerivedBatches(self, null, null, .{});
     }
 
     pub fn catchUpPendingDerivedReplayWithProgress(
@@ -10243,7 +10286,7 @@ pub const DB = struct {
         progress_ctx: *anyopaque,
         progress_hook: ReplayProgressHook,
     ) !void {
-        try replayPendingDerivedBatches(self, progress_ctx, progress_hook);
+        try replayPendingDerivedBatches(self, progress_ctx, progress_hook, .{});
     }
 
     const run_until_idle_max_replay_rounds: usize = 16;
@@ -10263,13 +10306,13 @@ pub const DB = struct {
         return promotion_stats.blocked;
     }
 
-    fn drainReplayStagesUntilStable(self: *DB) !void {
+    fn drainReplayStagesUntilStableWithOptions(self: *DB, options: ReplayDrainOptions) !void {
         var rounds: usize = 0;
         while (rounds < run_until_idle_max_replay_rounds) : (rounds += 1) {
             const starting_sequence = self.core.nextDerivedSequence();
             const starting_resolution_applied = if (self.resolution_runtime) |runtime| runtime.stats().applied_sequence else 0;
             const starting_promotion_applied = if (self.promotion_runtime) |runtime| runtime.stats().applied_sequence else 0;
-            try self.runMaintenanceUntil(self.currentMaintenanceTargetSequence(), .{});
+            try self.runMaintenanceUntilWithOptions(self.currentMaintenanceTargetSequence(), .{}, options);
             const drained_sequence = self.core.nextDerivedSequence();
 
             const drain_resolver_replay = self.resolverReplayNeedsDrain();
@@ -10287,7 +10330,7 @@ pub const DB = struct {
 
                 if (self.resolverReplayBlockedAfterRunnableDrain()) return;
 
-                try self.runMaintenanceUntil(self.currentMaintenanceTargetSequence(), .{});
+                try self.runMaintenanceUntilWithOptions(self.currentMaintenanceTargetSequence(), .{}, options);
                 if (self.resolverReplayBlockedAfterRunnableDrain()) return;
             }
 
@@ -10358,6 +10401,10 @@ pub const DB = struct {
         }
     }
 
+    fn drainReplayStagesUntilStable(self: *DB) !void {
+        try self.drainReplayStagesUntilStableWithOptions(.{});
+    }
+
     fn sleepArtifactRepairMetadataWorker(self: *DB, target_ns: u64) bool {
         var slept: u64 = 0;
         while (slept < target_ns) : (slept += artifact_repair_metadata_sleep_slice_ns) {
@@ -10425,7 +10472,7 @@ pub const DB = struct {
         // derived/replay stages: large portable restores can still leave
         // substantial posting or LSM maintenance debt, and queries remain
         // correct while that background-maintenance debt is paid down.
-        try self.drainReplayStagesUntilStable();
+        try self.drainReplayStagesUntilStableWithOptions(.{ .truncate_replay = false });
         try self.flushAppliedSequencesForIdle();
     }
 
@@ -12034,6 +12081,22 @@ pub const DB = struct {
         errdefer status_batch.abort();
         for (pending.items) |item| try status_batch.put(item.key, &item.value);
         try status_batch.commit();
+    }
+
+    fn saveAllLiveIndexStatusSnapshots(self: *DB, alloc: Allocator) !void {
+        const configs = try self.core.listIndexes(alloc);
+        defer types.freeIndexConfigs(alloc, configs);
+        if (configs.len == 0) return;
+
+        var updates = std.ArrayListUnmanaged(apply_state.AppliedSequenceUpdate).empty;
+        defer updates.deinit(alloc);
+        for (configs) |cfg| {
+            try updates.append(alloc, .{
+                .index_name = cfg.name,
+                .sequence = try self.core.loadAppliedSequence(alloc, cfg.name),
+            });
+        }
+        try saveIndexStatusSnapshots(alloc, self.core.store, self.core.index_manager, updates.items);
     }
 
     fn loadIndexStatusSnapshot(self: *DB, alloc: Allocator, index_name: []const u8) !?IndexStatusSnapshot {
@@ -23554,7 +23617,12 @@ fn checkpointManagedProjectionEffectsForAppliedSequenceUpdates(
     }
 }
 
-fn replayPendingDerivedBatches(self: *DB, progress_ctx: ?*anyopaque, progress_hook: ?ReplayProgressHook) !void {
+fn replayPendingDerivedBatches(
+    self: *DB,
+    progress_ctx: ?*anyopaque,
+    progress_hook: ?ReplayProgressHook,
+    options: DB.ReplayDrainOptions,
+) !void {
     if (!self.core.hasManagedIndexes()) return;
 
     const dense_catch_up_watchdog_interval_ns = 5 * std.time.ns_per_s;
@@ -23790,7 +23858,7 @@ fn replayPendingDerivedBatches(self: *DB, progress_ctx: ?*anyopaque, progress_ho
             try self.core.saveAppliedSequence(index_ref.name, target_sequence);
         }
     }
-    try truncateReplayJournalIfSafe(self);
+    if (options.truncate_replay) try truncateReplayJournalIfSafe(self);
 }
 
 fn applyDerivedBatchToIndex(self: *DB, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef) !void {
@@ -62135,6 +62203,42 @@ test "db explicit restore runtime repair repairs managed chunked dense embedding
         const query_vec = try deterministic.interface().embedDense(alloc, "", "abcdefgh", 3);
         defer alloc.free(query_vec);
         var after = try waitForSearchResult(alloc, &restored, .{
+            .index_name = "dv_v1",
+            .dense = .{ .vector = query_vec, .k = 3 },
+            .return_mode = .parent,
+        }, 1);
+        defer after.deinit();
+        try std.testing.expectEqualStrings("doc:a", after.hits[0].id);
+    }
+
+    {
+        var status_db = try DB.open(alloc, std.mem.span(restore_path), .{
+            .primary_backend = primary_backend,
+            .open_mode = .status_only,
+        });
+        defer status_db.close();
+
+        const stats = try status_db.stats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(@as(usize, 1), stats.indexes.len);
+        try std.testing.expectEqualStrings("dv_v1", stats.indexes[0].name);
+        try std.testing.expectEqual(types.IndexKind.dense_vector, stats.indexes[0].kind);
+        try std.testing.expect(stats.indexes[0].doc_count > 0);
+        try std.testing.expectEqual(stats.indexes[0].replay_target_sequence, stats.indexes[0].replay_applied_sequence);
+        try std.testing.expect(!stats.indexes[0].replay_catch_up_required);
+    }
+
+    {
+        var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+        var reopened = try DB.open(alloc, std.mem.span(restore_path), .{
+            .primary_backend = primary_backend,
+            .open_mode = .query_readonly,
+        });
+        defer reopened.close();
+
+        const query_vec = try deterministic.interface().embedDense(alloc, "", "abcdefgh", 3);
+        defer alloc.free(query_vec);
+        var after = try waitForSearchResult(alloc, &reopened, .{
             .index_name = "dv_v1",
             .dense = .{ .vector = query_vec, .k = 3 },
             .return_mode = .parent,

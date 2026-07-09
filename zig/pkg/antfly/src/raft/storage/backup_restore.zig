@@ -166,7 +166,15 @@ fn applyRestoreSnapshot(
     var manifest = try backups_api.readManifestFromLocation(alloc, &location, restore.backup_id);
     defer manifest.deinit(alloc);
     if (options.expected_table_name) |table_name| {
-        if (!std.mem.eql(u8, manifest.table_name, table_name)) return error.InvalidBackupRequest;
+        if (!std.mem.eql(u8, manifest.table_name, table_name)) {
+            std.log.err("restore manifest table mismatch expected={s} actual={s} backup_id={s} snapshot_path={s}", .{
+                table_name,
+                manifest.table_name,
+                restore.backup_id,
+                restore.snapshot_path,
+            });
+            return error.InvalidBackupRequest;
+        }
     }
     if (manifest.read_schema_json.len > 0) return error.UnsupportedBackupMigrationState;
     const snapshot_path = if (restore.snapshot_path.len > 0)

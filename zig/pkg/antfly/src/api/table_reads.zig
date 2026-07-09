@@ -5576,20 +5576,17 @@ fn lookupProvisionedLocal(
     const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
     defer alloc.free(path);
     if (cache) |cached| {
-        const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, catalog, table_name, group_id);
-        if (cached.getIfPresent(group_id, lsm_root_generation, identity_namespace, table_name)) |db_lease_value| {
-            var db_lease = db_lease_value;
-            defer db_lease.release();
-            const db = db_lease.db;
+        var db_lease = try cached.getOrOpen(path, catalog, group_id, lsm_root_generation, table_name);
+        defer db_lease.release();
+        const db = db_lease.db;
 
-            var reads = raft_mod.FeatureDBReads.init(group_id, requester);
-            var result = (try reads.lookupWithConsistency(alloc, db, key, opts, consistency)) orelse return null;
-            defer result.deinit(alloc);
-            return .{
-                .json = try alloc.dupe(u8, result.json),
-                .version = try db.getTimestamp(alloc, key),
-            };
-        }
+        var reads = raft_mod.FeatureDBReads.init(group_id, requester);
+        var result = (try reads.lookupWithConsistency(alloc, db, key, opts, consistency)) orelse return null;
+        defer result.deinit(alloc);
+        return .{
+            .json = try alloc.dupe(u8, result.json),
+            .version = try db.getTimestamp(alloc, key),
+        };
     }
 
     var db = try openProvisionedLookupDbForTable(

@@ -1421,11 +1421,10 @@ pub const ApiHttpServer = struct {
         if (snapshot) |admin_snapshot| {
             try self.appendRemoteRuntimeStatusesFromSnapshot(&items, table_name, admin_snapshot);
         }
-        const snapshot_has_groups = self.snapshotHasProjectedTableGroups(table_name, snapshot);
         const should_query_writes = if (snapshot == null)
             self.table_reads == null or !read_statuses_present or read_needs_refresh
         else
-            !snapshot_has_groups and (items.items.len == 0 or !read_statuses_present or read_needs_refresh);
+            items.items.len == 0 or !read_statuses_present or read_needs_refresh;
         if (should_query_writes and self.table_writes != null) {
             if (try self.table_writes.?.localRuntimeStatuses(self.alloc, table_name)) |statuses| {
                 var owned = statuses;
@@ -1599,17 +1598,6 @@ pub const ApiHttpServer = struct {
         }
         if (local_node_id == 0 and local_store_id == 0) return !saw_group_placement or snapshot.stores.len <= 1;
         return !saw_group_placement;
-    }
-
-    fn snapshotHasProjectedTableGroups(
-        self: *ApiHttpServer,
-        table_name: []const u8,
-        maybe_snapshot: ?*const metadata_api.AdminSnapshot,
-    ) bool {
-        _ = self;
-        const snapshot = maybe_snapshot orelse return false;
-        const table = tables_api.findTableByName(snapshot, table_name) orelse return false;
-        return tableHasAnyGroup(snapshot, table.table_id);
     }
 
     fn localRuntimeStatusFromRemoteReport(
@@ -5456,6 +5444,16 @@ pub const ApiHttpServer = struct {
     }
 
     fn restoreOwnedTable(self: *ApiHttpServer, table_name: []const u8, backup_location: *backups_api.BackupLocation, backup_id: []const u8) !void {
+        return try self.restoreOwnedTableWithLifecycle(table_name, backup_location, backup_id, false);
+    }
+
+    fn restoreOwnedTableWithLifecycle(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        backup_location: *backups_api.BackupLocation,
+        backup_id: []const u8,
+        restore_lifecycle_already_active: bool,
+    ) !void {
         var manifest = backups_api.readManifestFromLocation(self.alloc, backup_location, backup_id) catch return error.InvalidBackupRequest;
         defer manifest.deinit(self.alloc);
 
@@ -5464,7 +5462,7 @@ pub const ApiHttpServer = struct {
         if (try self.tableExists(table_name)) return error.TableAlreadyExists;
 
         const table_writes_source = self.table_writes orelse return error.UnsupportedOperation;
-        const restore_lifecycle_active = try table_writes_source.beginRestoreLifecycle(table_name);
+        const restore_lifecycle_active = if (restore_lifecycle_already_active) false else try table_writes_source.beginRestoreLifecycle(table_name);
         defer if (restore_lifecycle_active) table_writes_source.finishRestoreLifecycle(table_name);
 
         var create_req = backups_api.createTableRequestFromManifest(self.alloc, &manifest) catch {
@@ -5615,9 +5613,19 @@ pub const ApiHttpServer = struct {
         backup_location: *backups_api.BackupLocation,
         backup_id: []const u8,
     ) !void {
+        return try self.restoreOwnedTableWithRetryAndLifecycle(table_name, backup_location, backup_id, false);
+    }
+
+    fn restoreOwnedTableWithRetryAndLifecycle(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        backup_location: *backups_api.BackupLocation,
+        backup_id: []const u8,
+        restore_lifecycle_already_active: bool,
+    ) !void {
         var attempt: usize = 0;
         while (attempt < 3) : (attempt += 1) {
-            self.restoreOwnedTable(table_name, backup_location, backup_id) catch |err| switch (err) {
+            self.restoreOwnedTableWithLifecycle(table_name, backup_location, backup_id, restore_lifecycle_already_active) catch |err| switch (err) {
                 error.TableVisibilityTimeout => {
                     if (attempt + 1 >= 3) return err;
                     if ((self.tableExists(table_name) catch false)) {
@@ -7097,6 +7105,16 @@ pub const ApiHttpServer = struct {
             op_alloc.free(status_names);
             op_alloc.free(statuses);
         }
+        const restore_lifecycle_active = op_alloc.alloc(bool, table_names.len) catch return error.InternalFailure;
+        @memset(restore_lifecycle_active, false);
+        defer {
+            if (self.table_writes) |write_source| {
+                for (table_names, restore_lifecycle_active) |table_name, active| {
+                    if (active) write_source.finishRestoreLifecycle(table_name);
+                }
+            }
+            op_alloc.free(restore_lifecycle_active);
+        }
 
         for (table_names, 0..) |table_name, i| {
             const status_name = op_alloc.dupe(u8, table_name) catch return error.InternalFailure;
@@ -7113,6 +7131,20 @@ pub const ApiHttpServer = struct {
             if (std.mem.eql(u8, restore_mode, "skip_if_exists") and exists) {
                 statuses[i].status = "skipped";
                 continue;
+            }
+        }
+
+        if (self.table_writes) |write_source| {
+            for (table_names, 0..) |table_name, i| {
+                if (statuses[i].@"error" != null or std.mem.eql(u8, statuses[i].status, "skipped")) continue;
+                const active = write_source.beginRestoreLifecycle(table_name) catch |err| {
+                    statuses[i].@"error" = switch (err) {
+                        error.UnsupportedOperation => "method not allowed",
+                        else => "restore failed",
+                    };
+                    continue;
+                };
+                restore_lifecycle_active[i] = active;
             }
         }
 
@@ -7192,7 +7224,7 @@ pub const ApiHttpServer = struct {
                 }
             }
 
-            self.restoreOwnedTableWithRetry(table_name, location, table_backup_id) catch |err| {
+            self.restoreOwnedTableWithRetryAndLifecycle(table_name, location, table_backup_id, restore_lifecycle_active[i]) catch |err| {
                 if (isRetryableMetadataLeadershipError(err)) return error.NotLeader;
                 std.log.err("cluster restore failed table={s} backup_id={s} err={}", .{
                     table_name,
