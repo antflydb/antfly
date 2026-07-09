@@ -3239,6 +3239,7 @@ pub const Node = struct {
                     continue;
                 };
 
+                var kv_mutex: std.atomic.Mutex = .unlocked;
                 var task_arenas = try ctx.allocator.alloc(std.heap.ArenaAllocator, group_indices.items.len);
                 for (task_arenas) |*arena| arena.* = std.heap.ArenaAllocator.init(ctx.allocator);
                 defer {
@@ -3280,6 +3281,7 @@ pub const Node = struct {
                     const task_alloc = task_arenas[pos].allocator();
                     const queue_item_units = self.estimateGenerateQueueUnits(owned_messages[idx].messages, configs[pos].max_tokens);
                     decode_states[pos] = generation.NativeDecodeState.initPaged(task_alloc, &kv_manager, pool_id, model.shared_moe_cache);
+                    decode_states[pos].kv_lock = &kv_mutex;
                     decode_states[pos].kv_storage = &kv_storage;
                     leases[pos] = if (model.native_generate_coordinator) |coordinator| blk: {
                         const lease = coordinator.acquire(.{

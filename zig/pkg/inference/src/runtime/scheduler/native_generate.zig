@@ -561,9 +561,15 @@ pub const NativeGenerateCoordinator = struct {
 
     pub fn awaitTurn(self: *NativeGenerateCoordinator, lease: *Lease, phase: Phase, io: std.Io) void {
         while (!self.tryAcquireTurn(lease, phase)) {
-            self.stats.turn_yields_total += 1;
+            self.noteTurnYield();
             io.sleep(std.Io.Duration.fromMilliseconds(0), .awake) catch return;
         }
+    }
+
+    fn noteTurnYield(self: *NativeGenerateCoordinator) void {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        self.stats.turn_yields_total += 1;
     }
 
     pub fn tryAcquireTurn(self: *NativeGenerateCoordinator, lease: *Lease, phase: Phase) bool {

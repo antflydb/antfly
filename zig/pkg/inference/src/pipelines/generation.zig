@@ -1198,6 +1198,11 @@ pub const NativeDecodeState = struct {
     allocator: std.mem.Allocator,
     kv_manager: ?*runtime.kv.manager.KvManager = null,
     kv_storage: ?*runtime.kv.storage_runtime.KvStorageRuntime = null,
+    /// Optional external lock for shared paged KV metadata/storage. Batch
+    /// generation wires every decode state in a group to the same manager and
+    /// storage runtime, so admission reads and KV mutations must share this
+    /// lock even though forward execution is serialized by the scheduler turn.
+    kv_lock: ?*std.atomic.Mutex = null,
     sequence_id: ?runtime.kv.manager.SequenceId = null,
     pool_id: ?runtime.kv.block.KvPoolId = null,
     total_tokens: usize = 0,
@@ -1231,6 +1236,12 @@ pub const NativeDecodeState = struct {
             .moe_runtime = runtime.moe.runtime.MoeRuntime.init(allocator, shared_moe_cache),
             .shared_moe_cache = shared_moe_cache,
         };
+    }
+
+    fn lockPagedKv(self: *const NativeDecodeState) ?*std.atomic.Mutex {
+        const mutex = self.kv_lock orelse return null;
+        platform.sync.lockYielding(mutex);
+        return mutex;
     }
 
     pub fn isPaged(self: *const NativeDecodeState) bool {
@@ -1283,7 +1294,7 @@ pub const NativeDecodeState = struct {
         self.deepseek_v4_compressed_cache = null;
     }
 
-    pub fn ensureAttached(self: *NativeDecodeState) !void {
+    fn ensureAttachedUnlocked(self: *NativeDecodeState) !void {
         if (!self.isPaged()) return;
         if (self.sequence_id != null) return;
         self.sequence_id = try self.kv_manager.?.attachSequence(self.pool_id orelse return error.InvalidPoolId);
@@ -1291,6 +1302,12 @@ pub const NativeDecodeState = struct {
             const storage_sequence_id = try storage.attachSequence(storage.poolId());
             if (storage_sequence_id != self.sequence_id.?) return error.InvalidPagedKvState;
         }
+    }
+
+    pub fn ensureAttached(self: *NativeDecodeState) !void {
+        const lock = self.lockPagedKv();
+        defer if (lock) |mutex| mutex.unlock();
+        return self.ensureAttachedUnlocked();
     }
 
     fn kvPageSizeTokens(self: *const NativeDecodeState) ?usize {
@@ -1426,6 +1443,8 @@ pub const NativeDecodeState = struct {
     }
 
     pub fn deinit(self: *NativeDecodeState) void {
+        const lock = self.lockPagedKv();
+        defer if (lock) |mutex| mutex.unlock();
         if (self.kv_manager) |manager| {
             if (self.sequence_id) |sequence_id| {
                 manager.releaseSequence(sequence_id) catch {};
@@ -1458,7 +1477,9 @@ pub const NativeDecodeState = struct {
     pub fn notePrefill(self: *NativeDecodeState, token_count: usize) !void {
         self.total_tokens = token_count;
         if (self.isPaged()) {
-            try self.ensureAttached();
+            const lock = self.lockPagedKv();
+            defer if (lock) |mutex| mutex.unlock();
+            try self.ensureAttachedUnlocked();
             try self.kv_manager.?.appendTokens(self.sequence_id.?, @intCast(token_count));
             if (self.kv_storage) |storage| try storage.appendTokens(self.sequence_id.?, @intCast(token_count));
             try self.reservePagedKvReplayCapacity();
@@ -1477,7 +1498,9 @@ pub const NativeDecodeState = struct {
     pub fn appendPrefillChunk(self: *NativeDecodeState, token_count: usize) !void {
         self.total_tokens += token_count;
         if (self.isPaged()) {
-            try self.ensureAttached();
+            const lock = self.lockPagedKv();
+            defer if (lock) |mutex| mutex.unlock();
+            try self.ensureAttachedUnlocked();
             try self.kv_manager.?.appendTokens(self.sequence_id.?, @intCast(token_count));
             if (self.kv_storage) |storage| try storage.appendTokens(self.sequence_id.?, @intCast(token_count));
             try self.reservePagedKvReplayCapacity();
@@ -1496,7 +1519,9 @@ pub const NativeDecodeState = struct {
     pub fn appendGeneratedToken(self: *NativeDecodeState) !void {
         self.total_tokens += 1;
         if (self.isPaged()) {
-            try self.ensureAttached();
+            const lock = self.lockPagedKv();
+            defer if (lock) |mutex| mutex.unlock();
+            try self.ensureAttachedUnlocked();
             try self.kv_manager.?.appendTokens(self.sequence_id.?, 1);
             _ = try self.kv_manager.?.trimSequenceToSlidingWindow(self.sequence_id.?);
             if (self.kv_storage) |storage| {
@@ -1520,7 +1545,9 @@ pub const NativeDecodeState = struct {
     pub fn appendGeneratedTokens(self: *NativeDecodeState, count: usize) !void {
         self.total_tokens += count;
         if (self.isPaged()) {
-            try self.ensureAttached();
+            const lock = self.lockPagedKv();
+            defer if (lock) |mutex| mutex.unlock();
+            try self.ensureAttachedUnlocked();
             try self.kv_manager.?.appendTokens(self.sequence_id.?, @intCast(count));
             _ = try self.kv_manager.?.trimSequenceToSlidingWindow(self.sequence_id.?);
             if (self.kv_storage) |storage| {
@@ -1549,6 +1576,8 @@ pub const NativeDecodeState = struct {
         const was_paged = self.isPaged();
         self.total_tokens -= count;
         if (was_paged) {
+            const lock = self.lockPagedKv();
+            defer if (lock) |mutex| mutex.unlock();
             const manager = self.kv_manager.?;
             if (self.sequence_id) |seq_id| {
                 const removed = try manager.truncateSequence(seq_id, count);
@@ -1577,6 +1606,8 @@ pub const NativeDecodeState = struct {
     /// attention output. Call after prefill, before the decode loop.
     pub fn compactKvCache(self: *NativeDecodeState, config: runtime.kv.compaction.CompactionConfig) !usize {
         if (self.deepseek_v4_compressed_cache != null) return error.DeepSeekV4CompressedKvCompactionNotSupported;
+        const lock = self.lockPagedKv();
+        defer if (lock) |mutex| mutex.unlock();
         const manager = self.kv_manager orelse return 0;
         const seq_id = self.sequence_id orelse return 0;
         const pool_id = self.pool_id orelse return error.InvalidPoolId;
@@ -7484,6 +7515,8 @@ fn stepBudgetFromState(
     decode_state: *NativeDecodeState,
 ) runtime.scheduler.native_generate.StepBudget {
     var budget = scheduler.defaultStepBudget();
+    const lock = decode_state.lockPagedKv();
+    defer if (lock) |mutex| mutex.unlock();
     const km = decode_state.kv_manager orelse return budget;
     const pool_id = decode_state.pool_id orelse return budget;
     const avail = km.poolAvailableBlocks(pool_id) orelse return budget;
@@ -7502,6 +7535,8 @@ fn notePendingKvBlocksFromState(
     phase: runtime.scheduler.native_generate.Phase,
     additional_tokens: usize,
 ) void {
+    const lock = decode_state.lockPagedKv();
+    defer if (lock) |mutex| mutex.unlock();
     const km = decode_state.kv_manager orelse return;
     const seq_id = decode_state.sequence_id orelse return;
     const est = km.estimateBlocksFor(seq_id, additional_tokens) orelse return;
