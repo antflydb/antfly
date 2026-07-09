@@ -14044,6 +14044,7 @@ components:
       description: Managed generated artifact kind.
     ExecutionPolicy:
       type: object
+      additionalProperties: false
       description: Non-semantic execution policy for one producer or index maintenance operation. These
         fields tune how work is batched and do not change generated artifact identity.
       properties:
@@ -15310,6 +15311,7 @@ components:
           overlap_tokens: 50
     IndexExecutionConfig:
       type: object
+      additionalProperties: false
       description: Namespaced execution policy for index shorthand. Index configs can drive multiple operations,
         so each operation receives its own policy.
       properties:
@@ -15476,6 +15478,7 @@ components:
         - name
     GraphIndexExecutionConfig:
       type: object
+      additionalProperties: false
       description: Execution policy for graph index work. Artifact producer batching belongs on graph
         artifact.execution.
       properties:

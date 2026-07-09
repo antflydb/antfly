@@ -338,12 +338,20 @@ const AntflyReaderState = struct {
         if (parsed.value.data.len != req.images.len) return error.InvalidReadResultCount;
 
         const out = try alloc.alloc(Result, req.images.len);
-        var initialized: usize = 0;
+        const assigned = try alloc.alloc(bool, req.images.len);
+        defer alloc.free(assigned);
+        @memset(assigned, false);
         errdefer {
-            for (out[0..initialized]) |*item| deinitResult(alloc, item);
+            for (out, assigned) |*item, was_assigned| {
+                if (was_assigned) deinitResult(alloc, item);
+            }
             alloc.free(out);
         }
-        for (parsed.value.data, 0..) |item, i| {
+        var initialized: usize = 0;
+        for (parsed.value.data) |item| {
+            if (item.index < 0) return error.InvalidReadResultCount;
+            const result_index = std.math.cast(usize, item.index) orelse return error.InvalidReadResultCount;
+            if (result_index >= req.images.len or assigned[result_index]) return error.InvalidReadResultCount;
             var result = Result{
                 .text = try alloc.dupe(u8, item.text),
                 .fields_json = null,
@@ -352,9 +360,11 @@ const AntflyReaderState = struct {
             errdefer deinitResult(alloc, &result);
             if (item.fields) |fields| result.fields_json = try std.json.Stringify.valueAlloc(alloc, fields, .{});
             if (item.regions) |regions| result.regions_json = try std.json.Stringify.valueAlloc(alloc, regions, .{});
-            out[i] = result;
+            out[result_index] = result;
+            assigned[result_index] = true;
             initialized += 1;
         }
+        if (initialized != req.images.len) return error.InvalidReadResultCount;
         return out;
     }
 };
@@ -750,7 +760,7 @@ test "antfly reader sends batched images and request max tokens" {
 
     var server = try httpx.TestServer.start(alloc, io, &.{
         .{ .method = .POST, .path = "/read", .assert_request = expectAntflyReaderBatchRequest, .respond = .{
-            .body = "{\"object\":\"list\",\"data\":[{\"object\":\"read_result\",\"index\":0,\"text\":\"first\"},{\"object\":\"read_result\",\"index\":1,\"text\":\"second\"}],\"model\":\"reader\",\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":2,\"total_tokens\":4}}",
+            .body = "{\"object\":\"list\",\"data\":[{\"object\":\"read_result\",\"index\":1,\"text\":\"second\"},{\"object\":\"read_result\",\"index\":0,\"text\":\"first\"}],\"model\":\"reader\",\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":2,\"total_tokens\":4}}",
         } },
     });
     defer server.deinit();

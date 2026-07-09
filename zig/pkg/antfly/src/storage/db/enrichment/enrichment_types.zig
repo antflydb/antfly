@@ -39,11 +39,15 @@ pub fn parseExecutionPolicyJson(alloc: Allocator, execution_json: []const u8) !E
 pub fn parseExecutionPolicyValue(value: std.json.Value) !ExecutionPolicy {
     if (value != .object) return error.InvalidEnrichmentExecutionConfig;
     var out = ExecutionPolicy{};
-    if (value.object.get("batch_items")) |field| {
-        out.batch_items = try parsePositiveExecutionInteger(field);
-    }
-    if (value.object.get("batch_bytes")) |field| {
-        out.batch_bytes = try parsePositiveExecutionInteger(field);
+    var iter = value.object.iterator();
+    while (iter.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, "batch_items")) {
+            out.batch_items = try parsePositiveExecutionInteger(entry.value_ptr.*);
+        } else if (std.mem.eql(u8, entry.key_ptr.*, "batch_bytes")) {
+            out.batch_bytes = try parsePositiveExecutionInteger(entry.value_ptr.*);
+        } else {
+            return error.InvalidEnrichmentExecutionConfig;
+        }
     }
     return out;
 }

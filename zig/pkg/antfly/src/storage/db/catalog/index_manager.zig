@@ -13510,9 +13510,10 @@ fn executionNamespaceJsonAlloc(alloc: Allocator, root: std.json.Value, namespace
 
 fn validateIndexExecutionConfigValue(execution: std.json.Value) !void {
     if (execution != .object) return error.InvalidIndexConfig;
-    for ([_][]const u8{ "indexing", "chunking", "embedding", "extracting", "reading", "generating", "transcribing" }) |field_name| {
-        const policy = execution.object.get(field_name) orelse continue;
-        _ = enrichment_types.parseExecutionPolicyValue(policy) catch return error.InvalidIndexConfig;
+    var iter = execution.object.iterator();
+    while (iter.next()) |entry| {
+        if (!isIndexExecutionNamespace(entry.key_ptr.*)) return error.InvalidIndexConfig;
+        _ = enrichment_types.parseExecutionPolicyValue(entry.value_ptr.*) catch return error.InvalidIndexConfig;
     }
 }
 
@@ -13523,6 +13524,16 @@ fn validateGraphIndexExecutionConfigValue(execution: std.json.Value) !void {
         if (!std.mem.eql(u8, entry.key_ptr.*, "indexing")) return error.InvalidIndexConfig;
         _ = enrichment_types.parseExecutionPolicyValue(entry.value_ptr.*) catch return error.InvalidIndexConfig;
     }
+}
+
+fn isIndexExecutionNamespace(name: []const u8) bool {
+    return std.mem.eql(u8, name, "indexing") or
+        std.mem.eql(u8, name, "chunking") or
+        std.mem.eql(u8, name, "embedding") or
+        std.mem.eql(u8, name, "extracting") or
+        std.mem.eql(u8, name, "reading") or
+        std.mem.eql(u8, name, "generating") or
+        std.mem.eql(u8, name, "transcribing");
 }
 
 fn parseDenseConfig(alloc: Allocator, raw: []const u8) !DenseConfig {
@@ -16545,12 +16556,22 @@ test "parseDenseGeneratorConfig preserves execution namespaces" {
     try std.testing.expect(std.mem.indexOf(u8, generator.embedding_execution_json, "indexing") == null);
 }
 
-test "parseDenseGeneratorConfig rejects invalid execution namespace" {
+test "parseDenseGeneratorConfig rejects invalid execution policy" {
     const alloc = std.testing.allocator;
-    const json =
+    const invalid_value =
         \\{"field":"embedding","dims":384,"execution":{"indexing":{"batch_items":0}},"generator":{"kind":"dense_embedding","source_field":"body","artifact_name":"body_chunks","chunk_size":256}}
     ;
-    try std.testing.expectError(error.InvalidIndexConfig, parseDenseGeneratorConfig(alloc, json));
+    try std.testing.expectError(error.InvalidIndexConfig, parseDenseGeneratorConfig(alloc, invalid_value));
+
+    const unknown_namespace =
+        \\{"field":"embedding","dims":384,"execution":{"embeddings":{"batch_items":8}},"generator":{"kind":"dense_embedding","source_field":"body","artifact_name":"body_chunks","chunk_size":256}}
+    ;
+    try std.testing.expectError(error.InvalidIndexConfig, parseDenseGeneratorConfig(alloc, unknown_namespace));
+
+    const unknown_policy_field =
+        \\{"field":"embedding","dims":384,"execution":{"embedding":{"batch_item":8}},"generator":{"kind":"dense_embedding","source_field":"body","artifact_name":"body_chunks","chunk_size":256}}
+    ;
+    try std.testing.expectError(error.InvalidIndexConfig, parseDenseGeneratorConfig(alloc, unknown_policy_field));
 }
 
 test "parseSparseGeneratorConfig parses source_template" {
