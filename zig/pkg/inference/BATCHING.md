@@ -171,7 +171,7 @@ creating the durable job.
 
 ## Reader/OCR batching
 
-The `/read` endpoint accepts multiple images and routes them through a reader-level batch API instead of invoking the model once per image. The public HTTP request is capped at 64 images so callers cannot monopolize memory before model-level budgeting runs. The reader abstraction has two layers:
+The `/read` endpoint accepts multiple images and routes them through a reader-level batch API instead of invoking the model once per image. The public HTTP request is capped at 64 images and an aggregate downloaded-input byte cap (`ANTFLY_INFERENCE_READ_BATCH_BYTES`, default 256 MiB) so callers cannot monopolize memory before model-level budgeting runs. The reader abstraction has two layers:
 
 - `LoadedReader.readBatch`: the stable reader contract used by the server and local direct calls.
 - Model-family implementations: native Florence can use a real batch fast path; VLM, GenAI, Pix2Struct, and multistage OCR may keep the serial fallback until their runtimes expose safe batch execution.

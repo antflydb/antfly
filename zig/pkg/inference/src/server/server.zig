@@ -140,6 +140,7 @@ pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
 const max_generate_batch_items: usize = 128;
 const max_read_batch_images: usize = 64;
+const default_max_read_batch_bytes: usize = 256 * 1024 * 1024;
 
 const GenerateBackendSelection = struct {
     native_choice: native_backend_choice.Choice = .auto,
@@ -1048,8 +1049,13 @@ pub const Node = struct {
         const image_datas = try allocator.alloc([]const u8, request.images.len);
         defer allocator.free(image_datas);
 
+        const batch_byte_cap = readBatchMaxBytes();
+        var batch_bytes: usize = 0;
         for (request.images, 0..) |image_url, i| {
-            downloaded[i] = try downloadRemoteContent(self, allocator, image_url);
+            var item = try downloadRemoteContent(self, allocator, image_url);
+            errdefer item.deinit(allocator);
+            batch_bytes = try addReadBatchDownloadedBytes(batch_bytes, item, batch_byte_cap);
+            downloaded[i] = item;
             downloaded_count += 1;
             image_datas[i] = downloaded[i].data;
         }
@@ -2831,7 +2837,7 @@ pub const Node = struct {
         };
     }
 
-    fn generateBatchUnsupportedReason(body: api.GenerateRequest, messages: []const generation.Message) ?api.GenerateBatchError {
+    fn generateBatchUnsupportedReasonPreflight(body: api.GenerateRequest) ?api.GenerateBatchError {
         if (body.stream orelse false) return .{ .code = "UNSUPPORTED_STREAM", .message = "batch generation does not support stream=true", .retryable = false };
         if (body.tools != null or body.tool_choice != null) return .{ .code = "UNSUPPORTED_TOOLS", .message = "batch generation does not support tools yet", .retryable = false };
         if (body.draft_model != null) return .{ .code = "UNSUPPORTED_DRAFT_MODEL", .message = "batch generation does not support draft_model yet", .retryable = false };
@@ -2843,6 +2849,33 @@ pub const Node = struct {
             .auto, .native, .metal, .cuda => {},
             .onnx, .xla, .webgpu, .wasm => return .{ .code = "UNSUPPORTED_BACKEND", .message = "batch generation requires a native backend", .retryable = false },
         };
+        if (generateRequestHasNonTextContentParts(body)) {
+            return .{ .code = "UNSUPPORTED_MULTIMODAL", .message = "batch generation currently supports text-only native requests", .retryable = false };
+        }
+        return null;
+    }
+
+    fn generateRequestHasNonTextContentParts(body: api.GenerateRequest) bool {
+        for (body.messages) |msg| {
+            const content = msg.content orelse continue;
+            switch (content) {
+                .array => |parts| {
+                    for (parts.items) |part| {
+                        if (part != .object) continue;
+                        const type_value = part.object.get("type") orelse continue;
+                        if (type_value != .string) continue;
+                        if (!std.mem.eql(u8, type_value.string, "text")) return true;
+                    }
+                },
+                .object => return true,
+                else => {},
+            }
+        }
+        return false;
+    }
+
+    fn generateBatchUnsupportedReason(body: api.GenerateRequest, messages: []const generation.Message) ?api.GenerateBatchError {
+        if (generateBatchUnsupportedReasonPreflight(body)) |reason| return reason;
         if (generation.messagesHaveImages(messages) or generation.messagesHaveAudio(messages)) {
             return .{ .code = "UNSUPPORTED_MULTIMODAL", .message = "batch generation currently supports text-only native requests", .retryable = false };
         }
@@ -2991,6 +3024,12 @@ pub const Node = struct {
                 .custom_id = item.custom_id,
                 .index = @intCast(idx),
             };
+            if (generateBatchUnsupportedReasonPreflight(item.body)) |batch_err| {
+                results[idx].@"error" = batch_err;
+                owned_messages[idx] = .{ .allocator = ctx.allocator };
+                pending[idx] = false;
+                continue;
+            }
             owned_messages[idx] = parseGenerateMessages(self, ctx.allocator, item.body) catch |err| blk: {
                 results[idx].@"error" = .{ .code = "INVALID_REQUEST", .message = @errorName(err), .retryable = false };
                 break :blk .{ .allocator = ctx.allocator };
@@ -4662,12 +4701,23 @@ pub const Node = struct {
         const image_datas = try ctx.allocator.alloc([]const u8, body.images.len);
         defer ctx.allocator.free(image_datas);
 
+        const batch_byte_cap = readBatchMaxBytes();
+        var batch_bytes: usize = 0;
         for (body.images, 0..) |img_url, i| {
-            downloaded[i] = downloadRemoteContent(self, ctx.allocator, img_url.url) catch
+            var item = downloadRemoteContent(self, ctx.allocator, img_url.url) catch
                 return ctx.status(400).json(.{
                     .@"error" = "INVALID_REQUEST",
                     .message = "failed to download image content",
                 });
+            errdefer item.deinit(ctx.allocator);
+            batch_bytes = addReadBatchDownloadedBytes(batch_bytes, item, batch_byte_cap) catch |err| switch (err) {
+                error.ReadBatchTooLarge => return ctx.status(413).json(.{
+                    .@"error" = "BATCH_TOO_LARGE",
+                    .message = try std.fmt.allocPrint(ctx.allocator, "total downloaded image bytes must be at most {d}", .{batch_byte_cap}),
+                }),
+                else => return err,
+            };
+            downloaded[i] = item;
             downloaded_count += 1;
             image_datas[i] = downloaded[i].data;
         }
@@ -6264,6 +6314,26 @@ test "node config accepts shared scraping config" {
     };
     try std.testing.expectEqual(@as(?bool, true), cfg.content_security.?.block_private_ips);
     try std.testing.expectEqualStrings("s3.amazonaws.com", cfg.s3_credentials.?.endpoint.?);
+}
+
+test "generate batch preflight rejects image content without parsing media" {
+    const request_json =
+        \\{"model":"m","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.invalid/image.png"}}]}]}
+    ;
+    var parsed = try std.json.parseFromSlice(api.GenerateRequest, std.testing.allocator, request_json, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+
+    const reason = Node.generateBatchUnsupportedReasonPreflight(parsed.value) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("UNSUPPORTED_MULTIMODAL", reason.code);
+}
+
+test "read batch downloaded byte accounting enforces aggregate cap" {
+    const item = scraping.DownloadedContent{
+        .content_type = @constCast("image/png"),
+        .data = @constCast("12345"),
+    };
+    try std.testing.expectEqual(@as(usize, 14), try addReadBatchDownloadedBytes(0, item, 14));
+    try std.testing.expectError(error.ReadBatchTooLarge, addReadBatchDownloadedBytes(10, item, 14));
 }
 
 test "registerRoutesOn prefixes embed aliases and metrics route" {
@@ -8221,6 +8291,17 @@ fn downloadRemoteContent(self: *const Node, alloc: std.mem.Allocator, url: []con
     const security = if (self.config.content_security) |*cfg| cfg else null;
     const s3_credentials = if (self.config.s3_credentials) |*cfg| cfg else null;
     return try scraping.downloadContentAlloc(alloc, url, security, s3_credentials);
+}
+
+fn readBatchMaxBytes() usize {
+    return @max(@as(usize, 1), platform.env.getenvUsize("ANTFLY_INFERENCE_READ_BATCH_BYTES") orelse default_max_read_batch_bytes);
+}
+
+fn addReadBatchDownloadedBytes(current: usize, item: scraping.DownloadedContent, max_bytes: usize) !usize {
+    const with_data = std.math.add(usize, current, item.data.len) catch return error.ReadBatchTooLarge;
+    const total = std.math.add(usize, with_data, item.content_type.len) catch return error.ReadBatchTooLarge;
+    if (total > max_bytes) return error.ReadBatchTooLarge;
+    return total;
 }
 
 const DecodedDataUri = struct {

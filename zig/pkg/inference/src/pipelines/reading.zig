@@ -208,6 +208,11 @@ pub const ReadingPipeline = struct {
             const chunk_len = @min(max_batch, image_datas.len - offset);
             const chunk = image_datas[offset .. offset + chunk_len];
             const chunk_results = try self.readBatchNativeFlorence(chunk);
+            if (chunk_results.len != chunk_len) {
+                for (chunk_results) |*result| result.deinit();
+                allocator.free(chunk_results);
+                return error.InvalidReadResultCount;
+            }
             {
                 defer allocator.free(chunk_results);
                 for (chunk_results, 0..) |result, i| {
