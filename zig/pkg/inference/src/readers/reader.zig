@@ -73,6 +73,34 @@ const VisionLoadedReader = struct {
 
         return parseOutput(self.allocator, self.parser_kind, raw.text, normalized_prompt);
     }
+
+    pub fn readBatch(self: *VisionLoadedReader, image_datas: []const []const u8, options: ReadOptions) ![]Result {
+        const normalized_prompt = normalizePromptForFamily(self.parser_kind, options.prompt);
+        const raw_results = try self.core.readRawBatch(image_datas, .{
+            .prompt = normalized_prompt,
+            .max_tokens = options.max_tokens,
+        });
+        defer {
+            for (raw_results) |raw| {
+                var tmp = raw;
+                tmp.deinit();
+            }
+            self.allocator.free(raw_results);
+        }
+
+        const out = try self.allocator.alloc(Result, raw_results.len);
+        var filled: usize = 0;
+        errdefer {
+            for (out[0..filled]) |*result| result.deinit();
+            self.allocator.free(out);
+        }
+
+        for (raw_results, 0..) |raw, i| {
+            out[i] = try parseOutput(self.allocator, self.parser_kind, raw.text, normalized_prompt);
+            filled += 1;
+        }
+        return out;
+    }
 };
 
 const VlmLoadedReader = struct {
@@ -113,6 +141,10 @@ const VlmLoadedReader = struct {
         defer raw.deinit();
 
         return parseOutput(self.allocator, self.parser_kind, raw.text, options.prompt);
+    }
+
+    pub fn readBatch(self: *VlmLoadedReader, image_datas: []const []const u8, options: ReadOptions) ![]Result {
+        return readBatchSerial(VlmLoadedReader, self, image_datas, options);
     }
 };
 
@@ -176,6 +208,10 @@ const GenAiLoadedReader = struct {
 
         return parseOutput(self.allocator, self.parser_kind, raw.text, options.prompt);
     }
+
+    pub fn readBatch(self: *GenAiLoadedReader, image_datas: []const []const u8, options: ReadOptions) ![]Result {
+        return readBatchSerial(GenAiLoadedReader, self, image_datas, options);
+    }
 };
 
 pub const LoadedReader = union(enum) {
@@ -231,7 +267,32 @@ pub const LoadedReader = union(enum) {
             .multistage => |*reader| reader.read(image_data, options),
         };
     }
+
+    pub fn readBatch(self: *LoadedReader, image_datas: []const []const u8, options: ReadOptions) ![]Result {
+        return switch (self.*) {
+            .vision => |*reader| reader.readBatch(image_datas, options),
+            .genai => |*reader| reader.readBatch(image_datas, options),
+            .vlm => |*reader| reader.readBatch(image_datas, options),
+            .multistage => |*reader| readBatchSerial(@TypeOf(reader.*), reader, image_datas, options),
+        };
+    }
 };
+
+fn readBatchSerial(comptime ReaderType: type, reader: *ReaderType, image_datas: []const []const u8, options: ReadOptions) ![]Result {
+    const allocator = reader.allocator;
+    const out = try allocator.alloc(Result, image_datas.len);
+    var filled: usize = 0;
+    errdefer {
+        for (out[0..filled]) |*result| result.deinit();
+        allocator.free(out);
+    }
+
+    for (image_datas, 0..) |image_data, i| {
+        out[i] = try reader.read(image_data, options);
+        filled += 1;
+    }
+    return out;
+}
 
 pub fn isSupportedModelDir(allocator: std.mem.Allocator, model_path: []const u8) bool {
     if (multistage_metadata.isMultiStageModelDir(allocator, model_path)) return true;

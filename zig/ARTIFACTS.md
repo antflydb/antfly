@@ -259,6 +259,90 @@ enrichment fields. If `producer` is omitted, the enrichment defaults to `copy`
 behavior: the source field or rendered source template value is stored directly
 as the asset value.
 
+Execution policy belongs with the enrichment producer but is separate from the
+semantic provider config. The provider `config` describes what output should be
+produced: model, prompt, auth target, schema, and other behavior that can change
+artifact bytes. The optional `execution` block describes how the worker should
+run the producer: batch sizes, byte caps, concurrency hints, and retry/pacing
+knobs.
+
+Example reader/OCR producer with per-enrichment batching:
+
+```json
+{
+  "type": "reader",
+  "config": {
+    "provider": "antfly",
+    "model": "florence2-ocr",
+    "prompt": "Read the document text."
+  },
+  "execution": {
+    "batch_items": 4,
+    "batch_bytes": 67108864
+  }
+}
+```
+
+`execution` is still catalog configuration, so users can tune different
+enrichments and models independently. It is not part of artifact identity. A
+change from `batch_items: 4` to `batch_items: 8` should not by itself make an
+artifact stale or force a rebuild when the semantic `config`, source document,
+rendered template/media parts, and output content type are unchanged.
+
+Effective batching should be resolved as a layered execution policy:
+
+```text
+enrichment producer.execution override
+  -> model or reader manifest default
+  -> process/operator default
+  -> built-in fallback
+  -> clamped by process/operator maximums and backend limits
+```
+
+For reader/OCR assets, the initial policy should support item and byte caps:
+
+- default OCR batch items: 4
+- conservative hard cap: 8 unless the operator raises it
+- byte or pixel cap in addition to item count, because one full-page scan can
+  cost much more than one cropped receipt
+- final inference-side chunking remains a backend safety valve
+
+Suggested operator controls:
+
+```text
+ANTFLY_ENRICHMENT_OCR_BATCH_ITEMS=4
+ANTFLY_ENRICHMENT_OCR_BATCH_MAX_ITEMS=8
+ANTFLY_ENRICHMENT_OCR_BATCH_BYTES=67108864
+```
+
+Readers must stay model-neutral at this layer. Artifact workers batch
+`readers.Request.images`; inference decides whether a concrete reader can
+execute the batch natively, chunk it, or fall back. The artifact pipeline should
+not encode Florence-specific assumptions.
+
+Embedding enrichments should use the same execution-policy model. Existing dense
+and chunked embedding workers already resolve process-level batch item and byte
+limits; per-enrichment `producer.execution` overrides can feed that same
+resolution without becoming part of embedding artifact identity. Suggested
+fields are the same shape as readers:
+
+```json
+{
+  "execution": {
+    "batch_items": 8,
+    "batch_bytes": 262144
+  }
+}
+```
+
+Extraction inference also has a batched request shape: multiple text inputs or
+image inputs can be submitted together and results are returned by input index.
+Recognizer-backed extraction should batch text inputs directly; for GLiNER2 this
+means one recognizer batch per schema label set, not one model run per text.
+Reader-backed image extraction should batch the reader/OCR step before schema
+extraction. As with readers and embedders, extraction batch policy belongs in
+`execution` and must be clamped by model and operator limits.
+
 The public asset enrichment shape uses `field` and `template`. The older
 `source_field`/`source_template` names are internal catalog/replay names and are
 not part of the public enrichment config. `template` follows the existing
@@ -273,8 +357,9 @@ Model-backed assets run in both paths:
   on transient failures.
 
 For model-backed assets, Antfly stores a separate internal skip-state row keyed
-by the source value, rendered multimodal parts, and `producer_json`. Asset rows
-remain value-only.
+by the source value, rendered multimodal parts, and the semantic producer
+configuration. Non-semantic `producer.execution` fields are excluded from this
+identity. Asset rows remain value-only.
 
 The model-facing producer types are separate from artifact kinds:
 

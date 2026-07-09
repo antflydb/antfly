@@ -1037,19 +1037,42 @@ pub const Node = struct {
             allocator.free(out);
         }
 
+        const downloaded = try allocator.alloc(scraping.DownloadedContent, request.images.len);
+        var downloaded_count: usize = 0;
+        defer {
+            for (downloaded[0..downloaded_count]) |*item| item.deinit(allocator);
+            allocator.free(downloaded);
+        }
+        const image_datas = try allocator.alloc([]const u8, request.images.len);
+        defer allocator.free(image_datas);
+
         for (request.images, 0..) |image_url, i| {
-            var downloaded = try downloadRemoteContent(self, allocator, image_url);
-            defer downloaded.deinit(allocator);
-            var result = try reader.read(downloaded.data, .{
-                .prompt = request.prompt,
-                .max_tokens = if (request.max_tokens) |mt| @intCast(mt) else null,
-            });
-            defer result.deinit();
-            out[i] = .{
+            downloaded[i] = try downloadRemoteContent(self, allocator, image_url);
+            downloaded_count += 1;
+            image_datas[i] = downloaded[i].data;
+        }
+
+        const results = try reader.readBatch(image_datas, .{
+            .prompt = request.prompt,
+            .max_tokens = if (request.max_tokens) |mt| @intCast(mt) else null,
+        });
+        defer {
+            for (results) |result| {
+                var tmp = result;
+                tmp.deinit();
+            }
+            allocator.free(results);
+        }
+        if (results.len != request.images.len) return error.InvalidReadResultCount;
+
+        for (results, 0..) |result, i| {
+            var item: readers_api.Result = .{
                 .text = try allocator.dupe(u8, result.text),
-                .fields_json = try readerFieldsJsonAlloc(allocator, result.fields),
-                .regions_json = try readerRegionsJsonAlloc(allocator, result.regions),
             };
+            errdefer readers_api.deinitResult(allocator, &item);
+            item.fields_json = try readerFieldsJsonAlloc(allocator, result.fields);
+            item.regions_json = try readerRegionsJsonAlloc(allocator, result.regions);
+            out[i] = item;
             initialized += 1;
         }
         return out;
@@ -4036,22 +4059,42 @@ pub const Node = struct {
             }
         }
 
-        var completion_tokens: usize = 0;
+        const downloaded = try ctx.allocator.alloc(scraping.DownloadedContent, body.images.len);
+        var downloaded_count: usize = 0;
+        defer {
+            for (downloaded[0..downloaded_count]) |*item| item.deinit(ctx.allocator);
+            ctx.allocator.free(downloaded);
+        }
+        const image_datas = try ctx.allocator.alloc([]const u8, body.images.len);
+        defer ctx.allocator.free(image_datas);
+
         for (body.images, 0..) |img_url, i| {
-            var downloaded = downloadRemoteContent(self, ctx.allocator, img_url.url) catch
+            downloaded[i] = downloadRemoteContent(self, ctx.allocator, img_url.url) catch
                 return ctx.status(400).json(.{
                     .@"error" = "INVALID_REQUEST",
                     .message = "failed to download image content",
                 });
-            defer downloaded.deinit(ctx.allocator);
+            downloaded_count += 1;
+            image_datas[i] = downloaded[i].data;
+        }
 
-            var result = reader.read(downloaded.data, .{
-                .prompt = body.prompt,
-                .max_tokens = if (body.max_tokens) |mt| @intCast(mt) else null,
-            }) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
-            defer result.deinit();
+        const results = reader.readBatch(image_datas, .{
+            .prompt = body.prompt,
+            .max_tokens = if (body.max_tokens) |mt| @intCast(mt) else null,
+        }) catch |err|
+            return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = @errorName(err) });
+        defer {
+            for (results) |result| {
+                var tmp = result;
+                tmp.deinit();
+            }
+            ctx.allocator.free(results);
+        }
+        if (results.len != body.images.len)
+            return ctx.status(500).json(.{ .@"error" = "INFERENCE_FAILED", .message = "InvalidReadResultCount" });
 
+        var completion_tokens: usize = 0;
+        for (results, 0..) |result, i| {
             completion_tokens += estimateTextTokens(result.text);
             results_out[i] = try toApiReadObject(alloc, result, i);
             filled = i + 1;

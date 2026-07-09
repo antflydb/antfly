@@ -166,6 +166,7 @@ pub const Runtime = struct {
         const results = try provider.read(alloc, .{
             .images = source.images,
             .prompt = source.prompt,
+            .max_tokens = cfg_parsed.value.max_tokens,
         });
         defer {
             for (results) |*result| readers.deinitResult(alloc, result);
