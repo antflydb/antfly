@@ -14042,6 +14042,22 @@ components:
         - asset
         - embedding
       description: Managed generated artifact kind.
+    ExecutionPolicy:
+      type: object
+      description: Non-semantic execution policy for one producer or index maintenance operation. These
+        fields tune how work is batched and do not change generated artifact identity.
+      properties:
+        batch_items:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 1
+          description: Maximum items to process in one batch for this operation.
+        batch_bytes:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 1
+          format: uint64
+          description: Approximate maximum source bytes to process in one batch for this operation.
     EnrichmentConfig:
       type: object
       description: Inline managed enrichment definition. Enrichments materialize generated artifacts before
@@ -14101,6 +14117,10 @@ components:
           x-go-type-skip-optional-pointer: true
           type: string
           description: Serialized asset producer configuration.
+        execution:
+          $ref: '#/components/schemas/ExecutionPolicy'
+          description: Non-semantic execution policy for this enrichment producer. This does not participate
+            in generated artifact identity.
     FullTextIndexConfig:
       type: object
       properties:
@@ -15288,6 +15308,20 @@ components:
         text:
           target_tokens: 500
           overlap_tokens: 50
+    IndexExecutionConfig:
+      type: object
+      description: Namespaced execution policy for index shorthand. Index configs can drive multiple operations,
+        so each operation receives its own policy.
+      properties:
+        indexing:
+          $ref: '#/components/schemas/ExecutionPolicy'
+          description: Index maintenance, backfill, replay, or materialization batching.
+        chunking:
+          $ref: '#/components/schemas/ExecutionPolicy'
+          description: Chunk producer batching for shorthand-created chunk enrichments.
+        embedding:
+          $ref: '#/components/schemas/ExecutionPolicy'
+          description: Embedding producer batching for shorthand-created embedding enrichments.
     EmbeddingsIndexConfig:
       type: object
       description: Unified configuration for embeddings indexes. When sparse is true, creates a sparse
@@ -15371,6 +15405,10 @@ components:
           minimum: 64
           default: 1024
           description: Number of documents per posting list chunk (sparse only)
+        execution:
+          $ref: '#/components/schemas/IndexExecutionConfig'
+          description: Non-semantic execution policy for index maintenance and any shorthand-created chunking
+            or embedding producers.
     EdgeTypeConfig:
       type: object
       description: Configuration for a specific edge type
@@ -15454,6 +15492,10 @@ components:
           x-go-type-skip-optional-pointer: true
           type: integer
           description: Maximum number of edges per document (0 = unlimited)
+        execution:
+          $ref: '#/components/schemas/IndexExecutionConfig'
+          description: Non-semantic execution policy for graph edge materialization and shorthand-created
+            relation producers.
     AlgebraicIndexConfig:
       type: object
       description: Schema-derived algebraic sidecar configuration. Public requests may opt into schema

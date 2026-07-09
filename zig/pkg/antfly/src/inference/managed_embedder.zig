@@ -867,7 +867,13 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
 
     if (sparse) {
         if (external) {
-            return try std.fmt.allocPrint(alloc, "{{\"field\":\"{s}\"}}", .{source_field});
+            var out = std.ArrayListUnmanaged(u8).empty;
+            defer out.deinit(alloc);
+            try out.appendSlice(alloc, "{\"field\":");
+            try appendJsonString(alloc, &out, source_field);
+            try appendExecutionObjectIfPresent(alloc, &out, root);
+            try out.append(alloc, '}');
+            return try out.toOwnedSlice(alloc);
         }
 
         const embedder = root.get("embedder") orelse return error.InvalidCreateTableRequest;
@@ -919,6 +925,7 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
         }
         try out.appendSlice(alloc, "},\"embedder\":");
         try out.appendSlice(alloc, embedder_json);
+        try appendExecutionObjectIfPresent(alloc, &out, root);
         try out.append(alloc, '}');
         return try out.toOwnedSlice(alloc);
     }
@@ -986,6 +993,7 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
         try out.appendSlice(alloc, embedder);
     }
 
+    try appendExecutionObjectIfPresent(alloc, &out, root);
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
 }
@@ -2191,6 +2199,21 @@ fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), 
     try out.appendSlice(alloc, encoded);
 }
 
+fn appendExecutionObjectIfPresent(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    root: std.json.ObjectMap,
+) !void {
+    const execution = root.get("execution") orelse return;
+    if (execution != .object) return error.InvalidCreateTableRequest;
+    var parsed = try std.json.parseFromValue(indexes_openapi.IndexExecutionConfig, alloc, execution, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    const encoded = try std.json.Stringify.valueAlloc(alloc, execution, .{});
+    defer alloc.free(encoded);
+    try out.appendSlice(alloc, ",\"execution\":");
+    try out.appendSlice(alloc, encoded);
+}
+
 fn stringifyManagedEmbedderConfigAlloc(
     alloc: std.mem.Allocator,
     cfg: embeddings_types.Config,
@@ -2333,7 +2356,7 @@ test "managed embedder uses embedder dimensions metadata at runtime" {
 test "managed embedder translates managed embeddings config into db generator config" {
     var local = TestLocalDenseProvider{ .dimensions = 384 };
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
-        \\{"type":"embeddings","field":"body","dimension":384,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}}
+        \\{"type":"embeddings","field":"body","dimension":384,"embedder":{"provider":"antfly","model":"antflydb/clipclap"},"execution":{"indexing":{"batch_items":1024},"embedding":{"batch_items":16,"batch_bytes":262144}}}
     , .{});
     defer parsed.deinit();
 
@@ -2344,6 +2367,8 @@ test "managed embedder translates managed embeddings config into db generator co
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"dims\":384") != null);
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"embedding_name\":\"semantic_idx\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"generator\":{\"kind\":\"dense_embedding\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"execution\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"embedding\":{\"batch_items\":16,\"batch_bytes\":262144}") != null);
 }
 
 pub fn testArtifactBackedEmbeddingTranslation() !void {

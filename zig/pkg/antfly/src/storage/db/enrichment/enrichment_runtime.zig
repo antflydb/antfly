@@ -207,6 +207,14 @@ fn generatedEmbedBatchBytes() usize {
     return @max(@as(usize, 1), parsed);
 }
 
+fn requestEmbedBatchItems(alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest) usize {
+    return enrichment_types.executionBatchItemsOrDefault(alloc, request.execution_json, generatedEmbedBatchItems());
+}
+
+fn requestEmbedBatchBytes(alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest) usize {
+    return enrichment_types.executionBatchBytesOrDefault(alloc, request.execution_json, generatedEmbedBatchBytes());
+}
+
 fn backoffWriterLockRetry() void {
     if (comptime builtin.os.tag == .freestanding) return;
     std.Thread.yield() catch {};
@@ -802,7 +810,8 @@ fn samePlainDenseBatchKey(
     rhs: enrichment_types.GeneratedEnrichmentRequest,
 ) bool {
     return lhs.expected_dims == rhs.expected_dims and
-        std.mem.eql(u8, requestEmbeddingName(lhs), requestEmbeddingName(rhs));
+        std.mem.eql(u8, requestEmbeddingName(lhs), requestEmbeddingName(rhs)) and
+        std.mem.eql(u8, lhs.execution_json, rhs.execution_json);
 }
 
 fn workerChunkCacheKey(
@@ -3767,7 +3776,8 @@ fn sameChunkedDenseBatchKey(
     rhs: enrichment_types.GeneratedEnrichmentRequest,
 ) bool {
     return lhs.expected_dims == rhs.expected_dims and
-        std.mem.eql(u8, requestEmbeddingName(lhs), requestEmbeddingName(rhs));
+        std.mem.eql(u8, requestEmbeddingName(lhs), requestEmbeddingName(rhs)) and
+        std.mem.eql(u8, lhs.execution_json, rhs.execution_json);
 }
 
 fn appendCachedChunkDenseEmbeddingToWindow(
@@ -3963,8 +3973,8 @@ fn processMaterializedChunkDenseRequest(
     window: *GeneratedReplayWindow,
 ) !void {
     const max_window_items = generatedReplayWindowItems();
-    const max_batch_items = generatedEmbedBatchItems();
-    const max_batch_bytes = generatedEmbedBatchBytes();
+    const max_batch_items = requestEmbedBatchItems(runtime.alloc, request);
+    const max_batch_bytes = requestEmbedBatchBytes(runtime.alloc, request);
 
     var chunk_texts = std.ArrayListUnmanaged([]const u8).empty;
     defer {
@@ -4186,8 +4196,8 @@ fn processMaterializedChunkSparseRequest(
     window: *GeneratedReplayWindow,
 ) !void {
     const max_window_items = generatedReplayWindowItems();
-    const max_batch_items = generatedEmbedBatchItems();
-    const max_batch_bytes = generatedEmbedBatchBytes();
+    const max_batch_items = requestEmbedBatchItems(runtime.alloc, request);
+    const max_batch_bytes = requestEmbedBatchBytes(runtime.alloc, request);
 
     var sources = std.ArrayListUnmanaged(ChunkEmbeddingSource).empty;
     defer {
@@ -4439,8 +4449,6 @@ fn processPlainDenseWindow(
 ) !void {
     if (requests.len == 0) return;
     const dense_embedder = runtime.config.dense_embedder orelse return;
-    const max_batch_items = generatedEmbedBatchItems();
-    const max_batch_bytes = generatedEmbedBatchBytes();
 
     const processed = try runtime.alloc.alloc(bool, requests.len);
     defer runtime.alloc.free(processed);
@@ -4452,6 +4460,8 @@ fn processPlainDenseWindow(
         processed[i] = true;
 
         const seed = requests[i];
+        const max_batch_items = requestEmbedBatchItems(runtime.alloc, seed);
+        const max_batch_bytes = requestEmbedBatchBytes(runtime.alloc, seed);
         const embedding_artifact_name = requestEmbeddingName(seed);
         const consumer_indexes = try runtime.index_manager.denseIndexesForEmbedding(runtime.alloc, embedding_artifact_name, seed.expected_dims);
         defer {
@@ -4530,8 +4540,8 @@ fn processChunkedDenseWindow(
             freeChunkedDenseWindowItems(runtime.alloc, chunk_items.items);
             chunk_items.deinit(runtime.alloc);
         }
-        const max_batch_items = generatedEmbedBatchItems();
-        const max_batch_bytes = generatedEmbedBatchBytes();
+        const max_batch_items = requestEmbedBatchItems(runtime.alloc, seed);
+        const max_batch_bytes = requestEmbedBatchBytes(runtime.alloc, seed);
         var batch_source_bytes: usize = 0;
 
         var j: usize = i;
@@ -5240,8 +5250,8 @@ fn buildChunkDenseEmbeddingsFromSources(
 
     if (chunk_texts.items.len == 0) return try embeddings.toOwnedSlice(runtime.alloc);
 
-    const max_batch_items = generatedEmbedBatchItems();
-    const max_batch_bytes = generatedEmbedBatchBytes();
+    const max_batch_items = requestEmbedBatchItems(runtime.alloc, request);
+    const max_batch_bytes = requestEmbedBatchBytes(runtime.alloc, request);
     var start: usize = 0;
     while (start < chunk_texts.items.len) {
         const end = boundedTextBatchEnd(chunk_texts.items, start, max_batch_items, max_batch_bytes);
@@ -5364,8 +5374,8 @@ fn buildChunkSparseEmbeddingsFromSources(
 
     if (chunk_texts.items.len == 0) return try embeddings.toOwnedSlice(runtime.alloc);
 
-    const max_batch_items = generatedEmbedBatchItems();
-    const max_batch_bytes = generatedEmbedBatchBytes();
+    const max_batch_items = requestEmbedBatchItems(runtime.alloc, request);
+    const max_batch_bytes = requestEmbedBatchBytes(runtime.alloc, request);
     var start: usize = 0;
     while (start < chunk_texts.items.len) {
         const end = boundedTextBatchEnd(chunk_texts.items, start, max_batch_items, max_batch_bytes);

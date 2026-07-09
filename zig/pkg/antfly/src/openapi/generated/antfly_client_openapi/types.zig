@@ -2379,6 +2379,8 @@ pub const EmbeddingsIndexConfig = struct {
     min_weight: ?f32 = null,
     /// Number of documents per posting list chunk (sparse only)
     chunk_size: ?i64 = null,
+    /// Non-semantic execution policy for index maintenance and any shorthand-created chunking or embedding producers.
+    execution: ?IndexExecutionConfig = null,
 };
 
 /// Discriminator for the index stats variant.
@@ -2514,6 +2516,8 @@ pub const EnrichmentConfig = struct {
     content_type: ?[]const u8 = null,
     /// Serialized asset producer configuration.
     producer_json: ?[]const u8 = null,
+    /// Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity.
+    execution: ?ExecutionPolicy = null,
 };
 
 /// Managed generated artifact kind.
@@ -2753,6 +2757,14 @@ pub const ExactSortError = struct {
     /// Sort field associated with the rejection when safe to expose.
     sort_rejection_field: []const u8,
     status: i32,
+};
+
+/// Non-semantic execution policy for one producer or index maintenance operation. These fields tune how work is batched and do not change generated artifact identity.
+pub const ExecutionPolicy = struct {
+    /// Maximum items to process in one batch for this operation.
+    batch_items: ?i64 = null,
+    /// Approximate maximum source bytes to process in one batch for this operation.
+    batch_bytes: ?i64 = null,
 };
 
 pub const ExtensionError = struct {
@@ -3470,6 +3482,8 @@ pub const GraphIndexConfig = struct {
     edge_types: ?[]const EdgeTypeConfig = null,
     /// Maximum number of edges per document (0 = unlimited)
     max_edges_per_document: ?i64 = null,
+    /// Non-semantic execution policy for graph edge materialization and shorthand-created relation producers.
+    execution: ?IndexExecutionConfig = null,
 };
 
 /// Discriminator for the index stats variant.
@@ -3775,6 +3789,8 @@ pub const IndexConfig = struct {
     min_weight: ?f32 = null,
     /// Number of documents per posting list chunk (sparse only)
     chunk_size: ?i64 = null,
+    /// Non-semantic execution policy for index maintenance and any shorthand-created chunking or embedding producers.
+    execution: ?IndexExecutionConfig = null,
     /// List of edge types with their configurations
     edge_types: ?[]const EdgeTypeConfig = null,
     /// Maximum number of edges per document (0 = unlimited)
@@ -3860,6 +3876,10 @@ pub const IndexConfig = struct {
             try jw.objectField("chunk_size");
             try jw.write(value);
         }
+        if (self.execution) |value| {
+            try jw.objectField("execution");
+            try jw.write(value);
+        }
         if (self.edge_types) |value| {
             try jw.objectField("edge_types");
             try jw.write(value);
@@ -3874,6 +3894,16 @@ pub const IndexConfig = struct {
         }
         try jw.endObject();
     }
+};
+
+/// Namespaced execution policy for index shorthand. Index configs can drive multiple operations, so each operation receives its own policy.
+pub const IndexExecutionConfig = struct {
+    /// Index maintenance, backfill, replay, or materialization batching.
+    indexing: ?ExecutionPolicy = null,
+    /// Chunk producer batching for shorthand-created chunk enrichments.
+    chunking: ?ExecutionPolicy = null,
+    /// Embedding producer batching for shorthand-created embedding enrichments.
+    embedding: ?ExecutionPolicy = null,
 };
 
 /// Statistics for an index

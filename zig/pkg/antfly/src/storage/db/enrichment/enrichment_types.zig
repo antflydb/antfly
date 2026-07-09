@@ -24,6 +24,49 @@ const Allocator = std.mem.Allocator;
 /// on HTTP wiring.
 pub var interactive_embed_inflight: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
 
+pub const ExecutionPolicy = struct {
+    batch_items: ?usize = null,
+    batch_bytes: ?usize = null,
+};
+
+pub fn parseExecutionPolicyJson(alloc: Allocator, execution_json: []const u8) !ExecutionPolicy {
+    if (execution_json.len == 0) return .{};
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, execution_json, .{});
+    defer parsed.deinit();
+    return try parseExecutionPolicyValue(parsed.value);
+}
+
+pub fn parseExecutionPolicyValue(value: std.json.Value) !ExecutionPolicy {
+    if (value != .object) return error.InvalidEnrichmentExecutionConfig;
+    var out = ExecutionPolicy{};
+    if (value.object.get("batch_items")) |field| {
+        out.batch_items = try parsePositiveExecutionInteger(field);
+    }
+    if (value.object.get("batch_bytes")) |field| {
+        out.batch_bytes = try parsePositiveExecutionInteger(field);
+    }
+    return out;
+}
+
+fn parsePositiveExecutionInteger(value: std.json.Value) !usize {
+    const raw = switch (value) {
+        .integer => |n| n,
+        else => return error.InvalidEnrichmentExecutionConfig,
+    };
+    if (raw <= 0) return error.InvalidEnrichmentExecutionConfig;
+    return std.math.cast(usize, raw) orelse error.InvalidEnrichmentExecutionConfig;
+}
+
+pub fn executionBatchItemsOrDefault(alloc: Allocator, execution_json: []const u8, default_value: usize) usize {
+    const policy = parseExecutionPolicyJson(alloc, execution_json) catch return default_value;
+    return policy.batch_items orelse default_value;
+}
+
+pub fn executionBatchBytesOrDefault(alloc: Allocator, execution_json: []const u8, default_value: usize) usize {
+    const policy = parseExecutionPolicyJson(alloc, execution_json) catch return default_value;
+    return policy.batch_bytes orelse default_value;
+}
+
 pub const GeneratedEnrichmentKind = enum {
     dense_embedding,
     sparse_embedding,
@@ -49,6 +92,7 @@ pub const GeneratedEnrichmentRequest = struct {
     full_text_index: bool = false,
     content_type: []const u8 = "",
     producer_json: []const u8 = "",
+    execution_json: []const u8 = "",
 };
 
 pub const GeneratedEnrichmentRef = struct {
@@ -76,6 +120,7 @@ pub fn freeGeneratedRequest(alloc: Allocator, request: GeneratedEnrichmentReques
     if (request.chunker_json.len > 0) alloc.free(request.chunker_json);
     if (request.content_type.len > 0) alloc.free(request.content_type);
     if (request.producer_json.len > 0) alloc.free(request.producer_json);
+    if (request.execution_json.len > 0) alloc.free(request.execution_json);
 }
 
 pub fn cloneGeneratedRequest(alloc: Allocator, request: GeneratedEnrichmentRequest) !GeneratedEnrichmentRequest {
@@ -94,6 +139,7 @@ pub fn cloneGeneratedRequest(alloc: Allocator, request: GeneratedEnrichmentReque
         .full_text_index = request.full_text_index,
         .content_type = if (request.content_type.len > 0) try alloc.dupe(u8, request.content_type) else "",
         .producer_json = if (request.producer_json.len > 0) try alloc.dupe(u8, request.producer_json) else "",
+        .execution_json = if (request.execution_json.len > 0) try alloc.dupe(u8, request.execution_json) else "",
     };
 }
 
