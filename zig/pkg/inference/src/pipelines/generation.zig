@@ -7102,10 +7102,9 @@ pub const NativeGenerationPipeline = struct {
             .token_id = token_id,
             .seq_len = seq_len,
         };
-        try scheduler.enqueueDecodeWork(lease.*, @ptrCast(&work), seq_len, decode_ctx.kv_sequence_len, decode_ctx.kv_position_offset);
+        const pending_options = pendingWorkOptionsFromState(decode_state, 1);
+        try scheduler.enqueueDecodeWork(lease.*, @ptrCast(&work), seq_len, decode_ctx.kv_sequence_len, decode_ctx.kv_position_offset, pending_options);
         defer if (!work.ready) scheduler.cancelDecodeWork(@ptrCast(&work));
-        notePendingKvBlocksFromState(scheduler, decode_state, @ptrCast(&work), .decode, 1);
-        notePendingExclusiveStepFromState(scheduler, decode_state, @ptrCast(&work), .decode);
 
         var driver = DecodeStepDriver{
             .pipeline = self,
@@ -7142,10 +7141,9 @@ pub const NativeGenerationPipeline = struct {
             .query_seq_len = query_seq_len,
             .wants_last_logits = wants_last_logits,
         };
-        try scheduler.enqueuePrefillWork(lease.*, @ptrCast(&work), seq_len, query_seq_len, decode_ctx.kv_sequence_len, decode_ctx.kv_position_offset);
+        const pending_options = pendingWorkOptionsFromState(decode_state, query_seq_len);
+        try scheduler.enqueuePrefillWork(lease.*, @ptrCast(&work), seq_len, query_seq_len, decode_ctx.kv_sequence_len, decode_ctx.kv_position_offset, pending_options);
         defer if (!work.ready) scheduler.cancelPrefillWork(@ptrCast(&work));
-        notePendingKvBlocksFromState(scheduler, decode_state, @ptrCast(&work), .prefill, query_seq_len);
-        notePendingExclusiveStepFromState(scheduler, decode_state, @ptrCast(&work), .prefill);
 
         var driver = PrefillStepDriver{
             .pipeline = self,
@@ -7543,6 +7541,21 @@ fn notePendingKvBlocksFromState(
     scheduler.notePendingKvBlocks(work_ptr, phase, est);
 }
 
+fn pendingWorkOptionsFromState(
+    decode_state: *NativeDecodeState,
+    additional_tokens: usize,
+) runtime.scheduler.native_generate.PendingWorkOptions {
+    var options = runtime.scheduler.native_generate.PendingWorkOptions{
+        .exclusive_step = decode_state.deepseek_v4_compressed_cache != null,
+    };
+    const lock = decode_state.lockPagedKv();
+    defer if (lock) |mutex| mutex.unlock();
+    const km = decode_state.kv_manager orelse return options;
+    const seq_id = decode_state.sequence_id orelse return options;
+    options.kv_blocks_estimate = km.estimateBlocksFor(seq_id, additional_tokens) orelse 0;
+    return options;
+}
+
 fn notePendingExclusiveStepFromState(
     scheduler: *runtime.scheduler.native_generate.NativeGenerateCoordinator,
     decode_state: *const NativeDecodeState,
@@ -7936,7 +7949,7 @@ test "runStepLoop drives stub driver to completion and reports per-iteration bud
 
     var work_byte: u8 = 1;
     coordinator.beginDecode(&lease, 4);
-    try coordinator.enqueueDecodeWork(lease, @ptrCast(&work_byte), 5, 5, 0);
+    try coordinator.enqueueDecodeWork(lease, @ptrCast(&work_byte), 5, 5, 0, .{});
 
     const StubDriver = struct {
         coordinator: *runtime.scheduler.native_generate.NativeGenerateCoordinator,
@@ -8061,8 +8074,8 @@ test "runStepLoop drains a multi-item step from a stub driver" {
 
     coordinator.beginDecode(&lease_a, 4);
     coordinator.beginDecode(&lease_b, 4);
-    try coordinator.enqueueDecodeWork(lease_a, @ptrCast(&work_a), 5, 5, 0);
-    try coordinator.enqueueDecodeWork(lease_b, @ptrCast(&work_b), 5, 5, 0);
+    try coordinator.enqueueDecodeWork(lease_a, @ptrCast(&work_a), 5, 5, 0, .{});
+    try coordinator.enqueueDecodeWork(lease_b, @ptrCast(&work_b), 5, 5, 0, .{});
 
     const StubDriver = struct {
         coordinator: *runtime.scheduler.native_generate.NativeGenerateCoordinator,
@@ -8184,7 +8197,7 @@ test "notePendingKvBlocksFromState plumbs estimate to scheduler" {
     defer coordinator.release(lease);
 
     var work_a: u8 = 0;
-    try coordinator.enqueueDecodeWork(lease, @ptrCast(&work_a), 7, 7, 0);
+    try coordinator.enqueueDecodeWork(lease, @ptrCast(&work_a), 7, 7, 0, .{});
 
     notePendingKvBlocksFromState(&coordinator, &decode_state, @ptrCast(&work_a), .decode, 1);
 
@@ -8193,7 +8206,7 @@ test "notePendingKvBlocksFromState plumbs estimate to scheduler" {
 
     // A larger overflow: 5 tokens vs 2-token slack → 1 new block.
     var work_b: u8 = 1;
-    try coordinator.enqueueDecodeWork(lease, @ptrCast(&work_b), 11, 11, 0);
+    try coordinator.enqueueDecodeWork(lease, @ptrCast(&work_b), 11, 11, 0, .{});
     notePendingKvBlocksFromState(&coordinator, &decode_state, @ptrCast(&work_b), .decode, 5);
     try std.testing.expectEqual(@as(?usize, 1), coordinator.pendingKvBlocksEstimate(@ptrCast(&work_b), .decode));
 }
@@ -8214,14 +8227,14 @@ test "notePendingExclusiveStepFromState marks DeepSeek V4 compressed cache work"
     defer coordinator.release(lease);
 
     var normal_work: u8 = 0;
-    try coordinator.enqueueDecodeWork(lease, @ptrCast(&normal_work), 7, 7, 0);
+    try coordinator.enqueueDecodeWork(lease, @ptrCast(&normal_work), 7, 7, 0, .{});
     notePendingExclusiveStepFromState(&coordinator, &decode_state, @ptrCast(&normal_work), .decode);
     try std.testing.expectEqual(@as(?bool, false), coordinator.pendingRequiresExclusiveStep(@ptrCast(&normal_work), .decode));
 
     decode_state.deepseek_v4_compressed_cache = try gpt_arch.DeepSeekV4CompressedCache.init(allocator, 1);
 
     var compressed_work: u8 = 1;
-    try coordinator.enqueueDecodeWork(lease, @ptrCast(&compressed_work), 8, 8, 0);
+    try coordinator.enqueueDecodeWork(lease, @ptrCast(&compressed_work), 8, 8, 0, .{});
     notePendingExclusiveStepFromState(&coordinator, &decode_state, @ptrCast(&compressed_work), .decode);
     try std.testing.expectEqual(@as(?bool, true), coordinator.pendingRequiresExclusiveStep(@ptrCast(&compressed_work), .decode));
 }

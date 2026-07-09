@@ -111,11 +111,43 @@ pub const Runtime = struct {
     fn produceBatch(ptr: *anyopaque, alloc: Allocator, requests: []const asset_producer.Request) ![][]u8 {
         const self: *Runtime = @ptrCast(@alignCast(ptr));
         if (requests.len == 0) return try alloc.alloc([]u8, 0);
-        if (self.tryReadBatch(alloc, requests)) |items| return items else |err| switch (err) {
+
+        const first_type = requests[0].producer_type;
+        for (requests) |request| {
+            if (request.producer_type != first_type) return try self.produceBatchSequential(alloc, requests);
+        }
+
+        const batch_result = switch (first_type) {
+            .copy => self.produceCopyBatch(alloc, requests),
+            .reader => self.tryReadBatch(alloc, requests),
+            .generator => self.tryGenerateBatch(alloc, requests),
+            .extractor => self.tryExtractBatch(alloc, requests),
+            .transcriber => self.tryTranscribeBatch(alloc, requests),
+            .document_extraction => error.BatchIncompatible,
+        };
+        if (batch_result) |items| {
+            return items;
+        } else |err| switch (err) {
             error.BatchIncompatible => {},
             else => return err,
         }
         return try self.produceBatchSequential(alloc, requests);
+    }
+
+    fn produceCopyBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) ![][]u8 {
+        _ = self;
+        const out = try alloc.alloc([]u8, requests.len);
+        errdefer {
+            for (out) |item| {
+                if (item.len > 0) alloc.free(item);
+            }
+            alloc.free(out);
+        }
+        for (out) |*item| item.* = "";
+        for (requests, 0..) |request, i| {
+            out[i] = try alloc.dupe(u8, request.source_text);
+        }
+        return out;
     }
 
     fn produceBatchSequential(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) ![][]u8 {
@@ -129,6 +161,124 @@ pub const Runtime = struct {
         for (out) |*item| item.* = "";
         for (requests, 0..) |request, i| {
             out[i] = try self.produceOne(alloc, request);
+        }
+        return out;
+    }
+
+    fn tryExtractBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) ![][]u8 {
+        for (requests) |request| {
+            if (request.producer_type != .extractor) return error.BatchIncompatible;
+            if (!std.mem.eql(u8, request.config_json, requests[0].config_json)) return error.BatchIncompatible;
+        }
+
+        var cfg = try extracting.parseConfigFromSlice(alloc, requests[0].config_json);
+        defer cfg.deinit(alloc);
+
+        const inputs = try alloc.alloc(extracting.Input, requests.len);
+        var inputs_filled: usize = 0;
+        defer {
+            for (inputs[0..inputs_filled]) |input| alloc.free(input.content_json);
+            alloc.free(inputs);
+        }
+
+        for (requests, 0..) |request, i| {
+            inputs[i] = .{
+                .content_json = try extractionContentJsonAlloc(alloc, request.source_text, request.source_parts_json),
+            };
+            inputs_filled += 1;
+        }
+
+        const extract_request = extracting.Request{
+            .inputs = inputs,
+            .schema_json = cfg.schema_json,
+            .options_json = cfg.options_json,
+        };
+        var response = if (isLocalExtractionProvider(cfg.provider, cfg.resolvedUrl())) blk: {
+            const local = self.antfly_provider orelse return error.BatchIncompatible;
+            const extract_fn = local.extract orelse return error.BatchIncompatible;
+            break :blk try extract_fn(local.ptr, alloc, cfg.model, extract_request);
+        } else try extracting.extractWithConfig(alloc, self.http, cfg, extract_request);
+        defer response.deinit();
+
+        const out = try alloc.alloc([]u8, requests.len);
+        errdefer {
+            for (out) |item| {
+                if (item.len > 0) alloc.free(item);
+            }
+            alloc.free(out);
+        }
+        for (out) |*item| item.* = "";
+        for (requests, 0..) |request, i| {
+            out[i] = if (isJsonContentType(request.content_type) or request.content_type.len == 0)
+                try extractionResultJsonAtAlloc(alloc, response.json, i)
+            else
+                try alloc.dupe(u8, response.json);
+        }
+        return out;
+    }
+
+    fn tryGenerateBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) ![][]u8 {
+        for (requests) |request| {
+            if (request.producer_type != .generator) return error.BatchIncompatible;
+            if (!std.mem.eql(u8, request.config_json, requests[0].config_json)) return error.BatchIncompatible;
+            if (request.source_parts_json) |raw_parts| {
+                if (raw_parts.len > 0) return error.BatchIncompatible;
+            }
+        }
+
+        var parsed_cfg = try parseGeneratorProducerConfig(alloc, requests[0].config_json);
+        defer parsed_cfg.deinit(alloc);
+        const cfg = parsed_cfg.generator;
+        if (cfg.provider != .antfly or cfg.url.len == 0) return error.BatchIncompatible;
+        if (cfg.api_key != null or cfg.project_id != null or cfg.location != null or cfg.credentials_path != null) return error.BatchIncompatible;
+        if (cfg.tools_json != null or cfg.tool_choice_json != null or parsed_cfg.tool_output != .content) return error.BatchIncompatible;
+
+        const batch_url = try antflyGenerateBatchUrlAlloc(alloc, cfg.url);
+        defer alloc.free(batch_url);
+        const body = try antflyGenerateBatchRequestJsonAlloc(alloc, cfg, requests);
+        defer alloc.free(body);
+
+        var resp = try self.http.post(batch_url, .{ .json = body, .timeout_ms = 300_000 });
+        defer resp.deinit();
+        if (!resp.ok()) return error.GenerateBatchRequestFailed;
+        const payload = resp.body orelse return error.EmptyGenerateBatchResponse;
+        return try parseAntflyGenerateBatchResponseAlloc(alloc, payload, requests.len);
+    }
+
+    fn tryTranscribeBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) ![][]u8 {
+        for (requests) |request| {
+            if (request.producer_type != .transcriber) return error.BatchIncompatible;
+            if (!std.mem.eql(u8, request.config_json, requests[0].config_json)) return error.BatchIncompatible;
+        }
+
+        var cfg_parsed = try std.json.parseFromSlice(transcribing.Config, alloc, requests[0].config_json, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        });
+        defer cfg_parsed.deinit();
+        if (!isLocalTranscriberProvider(cfg_parsed.value.provider, cfg_parsed.value.resolvedUrl())) return error.BatchIncompatible;
+        const local = self.antfly_provider orelse return error.BatchIncompatible;
+        const transcribe_audio = local.transcribe_audio orelse return error.BatchIncompatible;
+
+        const out = try alloc.alloc([]u8, requests.len);
+        errdefer {
+            for (out) |item| {
+                if (item.len > 0) alloc.free(item);
+            }
+            alloc.free(out);
+        }
+        for (out) |*item| item.* = "";
+        for (requests, 0..) |request, i| {
+            var result = try transcribe_audio(local.ptr, alloc, cfg_parsed.value.model orelse "", .{
+                .url = request.source_text,
+                .language = cfg_parsed.value.language_code,
+            });
+            defer transcribing.deinitResponse(alloc, &result);
+
+            out[i] = if (isJsonContentType(request.content_type))
+                try std.json.Stringify.valueAlloc(alloc, result, .{})
+            else
+                try alloc.dupe(u8, result.text orelse "");
         }
         return out;
     }
@@ -593,6 +743,123 @@ fn extractionContentJsonAlloc(alloc: Allocator, source_text: []const u8, source_
     return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(source_text, .{})});
 }
 
+fn extractionResultJsonAtAlloc(alloc: Allocator, response_json: []const u8, index: usize) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response_json, .{});
+    defer parsed.deinit();
+    if (parsed.value == .object) {
+        if (parsed.value.object.get("data")) |data| {
+            if (data == .array) {
+                if (index >= data.array.items.len) return error.InvalidExtractorResponse;
+                return try std.json.Stringify.valueAlloc(alloc, data.array.items[index], .{});
+            }
+        }
+    }
+    if (index == 0) return try alloc.dupe(u8, response_json);
+    return error.InvalidExtractorResponse;
+}
+
+fn antflyGenerateBatchUrlAlloc(alloc: Allocator, base_url: []const u8) ![]u8 {
+    const trimmed = trimRightSlash(base_url);
+    if (trimmed.len == 0) return error.InvalidGeneratorConfig;
+    return try std.fmt.allocPrint(alloc, "{s}/generate/batch", .{trimmed});
+}
+
+fn trimRightSlash(value: []const u8) []const u8 {
+    var end = value.len;
+    while (end > 0 and value[end - 1] == '/') : (end -= 1) {}
+    return value[0..end];
+}
+
+fn antflyGenerateBatchRequestJsonAlloc(
+    alloc: Allocator,
+    cfg: generating_runtime.GeneratorConfig,
+    requests: []const asset_producer.Request,
+) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+
+    try out.appendSlice(alloc, "{\"mode\":\"sync\",\"requests\":[");
+    for (requests, 0..) |request, i| {
+        if (i > 0) try out.append(alloc, ',');
+        const item = try std.fmt.allocPrint(
+            alloc,
+            "{{\"custom_id\":\"{d}\",\"body\":{{\"model\":{f},\"messages\":[{{\"role\":\"user\",\"content\":{f}}}],\"mode\":\"eager\"",
+            .{
+                i,
+                std.json.fmt(cfg.model, .{}),
+                std.json.fmt(request.source_text, .{}),
+            },
+        );
+        defer alloc.free(item);
+        try out.appendSlice(alloc, item);
+        if (cfg.max_tokens > 0) {
+            const max_tokens = try std.fmt.allocPrint(alloc, ",\"max_tokens\":{d}", .{cfg.max_tokens});
+            defer alloc.free(max_tokens);
+            try out.appendSlice(alloc, max_tokens);
+        }
+        try out.appendSlice(alloc, "}}}");
+    }
+    try out.appendSlice(alloc, "]}");
+    return try out.toOwnedSlice(alloc);
+}
+
+fn parseAntflyGenerateBatchResponseAlloc(alloc: Allocator, payload: []const u8, count: usize) ![][]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidGenerateBatchResponse;
+    const data = parsed.value.object.get("data") orelse return error.InvalidGenerateBatchResponse;
+    if (data != .array) return error.InvalidGenerateBatchResponse;
+
+    const out = try alloc.alloc([]u8, count);
+    errdefer {
+        for (out) |item| {
+            if (item.len > 0) alloc.free(item);
+        }
+        alloc.free(out);
+    }
+    for (out) |*item| item.* = "";
+    var seen = try alloc.alloc(bool, count);
+    defer alloc.free(seen);
+    @memset(seen, false);
+
+    for (data.array.items) |item| {
+        if (item != .object) return error.InvalidGenerateBatchResponse;
+        const raw_index = item.object.get("index") orelse return error.InvalidGenerateBatchResponse;
+        if (raw_index != .integer or raw_index.integer < 0) return error.InvalidGenerateBatchResponse;
+        const index: usize = @intCast(raw_index.integer);
+        if (index >= count or seen[index]) return error.InvalidGenerateBatchResponse;
+        seen[index] = true;
+
+        if (item.object.get("error")) |err_value| {
+            if (err_value != .null) return error.GenerateBatchItemFailed;
+        }
+        const response = item.object.get("response") orelse return error.InvalidGenerateBatchResponse;
+        if (response == .null) return error.InvalidGenerateBatchResponse;
+        out[index] = try generateResponseContentAlloc(alloc, response);
+    }
+
+    for (seen) |was_seen| {
+        if (!was_seen) return error.InvalidGenerateBatchResponse;
+    }
+    return out;
+}
+
+fn generateResponseContentAlloc(alloc: Allocator, response: std.json.Value) ![]u8 {
+    if (response != .object) return error.InvalidGenerateBatchResponse;
+    const choices = response.object.get("choices") orelse return error.InvalidGenerateBatchResponse;
+    if (choices != .array or choices.array.items.len == 0) return error.InvalidGenerateBatchResponse;
+    const choice = choices.array.items[0];
+    if (choice != .object) return error.InvalidGenerateBatchResponse;
+    const message = choice.object.get("message") orelse return error.InvalidGenerateBatchResponse;
+    if (message != .object) return error.InvalidGenerateBatchResponse;
+    const content = message.object.get("content") orelse return try alloc.dupe(u8, "");
+    return switch (content) {
+        .string => |text| try alloc.dupe(u8, text),
+        .null => try alloc.dupe(u8, ""),
+        else => error.InvalidGenerateBatchResponse,
+    };
+}
+
 fn parseGeneratorContentParts(alloc: Allocator, source_text: []const u8, raw_parts: []const u8) ![]generating_runtime.ContentPart {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw_parts, .{});
     defer parsed.deinit();
@@ -872,6 +1139,87 @@ test "asset producer runtime stores forced tool arguments from plain json conten
     try std.testing.expectEqualStrings("{\"relations\":[{\"type\":\"mentioned in\",\"target\":{\"id\":\"Ada\"}}]}", result.?);
 }
 
+fn expectAntflyGenerateBatchRequest(req: httpx.testing_mod.RequestInfo) !void {
+    try std.testing.expectEqual(.POST, req.method);
+    try std.testing.expect(std.mem.indexOf(u8, req.body, "\"mode\":\"sync\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req.body, "\"custom_id\":\"0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req.body, "\"custom_id\":\"1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req.body, "\"model\":\"local-generator\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req.body, "\"content\":\"first prompt\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req.body, "\"content\":\"second prompt\"") != null);
+}
+
+test "asset producer runtime batches compatible antfly generator requests" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    var server = try httpx.TestServer.start(alloc, io, &.{
+        .{ .method = .POST, .path = "/generate/batch", .assert_request = expectAntflyGenerateBatchRequest, .respond = .{
+            .body =
+            \\{"object":"generate.batch","data":[
+            \\{"custom_id":"0","index":0,"response":{"id":"gen-0","object":"chat.completion","created":1,"model":"local-generator","choices":[{"index":0,"message":{"role":"assistant","content":"first answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}},
+            \\{"custom_id":"1","index":1,"response":{"id":"gen-1","object":"chat.completion","created":1,"model":"local-generator","choices":[{"index":0,"message":{"role":"assistant","content":"second answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}}
+            \\],"summary":{"total":2,"succeeded":2,"failed":0}}
+            ,
+        } },
+    });
+    defer server.deinit();
+
+    var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+    defer client.deinit();
+    var runtime = Runtime.init(alloc, &client);
+    const producer = runtime.producer();
+
+    const cfg_json = try std.fmt.allocPrint(alloc, "{{\"provider\":\"antfly\",\"model\":\"local-generator\",\"url\":\"{s}\",\"max_tokens\":24}}", .{server.baseUrl()});
+    defer alloc.free(cfg_json);
+
+    var results: ?[][]u8 = null;
+    var run_err: ?anyerror = null;
+    var group = std.Io.Group.init;
+
+    const Fiber = struct {
+        fn run(
+            a: Allocator,
+            p: asset_producer.Producer,
+            cfg: []const u8,
+            out: *?[][]u8,
+            err_out: *?anyerror,
+        ) std.Io.Cancelable!void {
+            out.* = p.produceBatch(a, &.{
+                .{
+                    .producer_type = .generator,
+                    .config_json = cfg,
+                    .source_text = "first prompt",
+                    .content_type = "text/plain",
+                },
+                .{
+                    .producer_type = .generator,
+                    .config_json = cfg,
+                    .source_text = "second prompt",
+                    .content_type = "text/plain",
+                },
+            }) catch |err| {
+                err_out.* = err;
+                return;
+            };
+        }
+    };
+
+    try group.concurrent(io, Fiber.run, .{ alloc, producer, cfg_json, &results, &run_err });
+    try server.handleOne();
+    try group.await(io);
+    if (run_err) |err| return err;
+    defer {
+        for (results.?) |result| alloc.free(result);
+        alloc.free(results.?);
+    }
+    try std.testing.expectEqual(@as(usize, 2), results.?.len);
+    try std.testing.expectEqualStrings("first answer", results.?[0]);
+    try std.testing.expectEqualStrings("second answer", results.?[1]);
+}
+
 test "asset producer runtime routes antfly reader without url to local provider" {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -1004,6 +1352,76 @@ test "asset producer runtime batches compatible antfly reader requests" {
     try std.testing.expectEqual(@as(usize, 1), local.read_calls);
 }
 
+test "asset producer runtime batches compatible antfly transcriber requests" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const Local = struct {
+        transcribe_calls: usize = 0,
+
+        fn provider(self: *@This()) managed_embedder.AntflyProvider {
+            return .{
+                .ptr = self,
+                .embed_dense_texts = embedDense,
+                .embed_sparse_texts = embedSparse,
+                .transcribe_audio = transcribeAudio,
+            };
+        }
+
+        fn embedDense(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+
+        fn embedSparse(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![]@import("storage/db/enrichment/embedder.zig").SparseEmbedding {
+            return error.TestUnexpectedResult;
+        }
+
+        fn transcribeAudio(ptr: *anyopaque, a: Allocator, model: []const u8, request: transcribing.Request) !transcribing.Response {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.transcribe_calls += 1;
+            try std.testing.expectEqualStrings("local-transcriber", model);
+            try std.testing.expectEqualStrings("en-US", request.language.?);
+            const text = if (std.mem.endsWith(u8, request.url, "a.wav")) "first transcript" else "second transcript";
+            return .{
+                .text = try a.dupe(u8, text),
+                .language = try a.dupe(u8, "en-US"),
+            };
+        }
+    };
+
+    var local = Local{};
+    var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+    defer client.deinit();
+    var runtime = Runtime.initWithOptions(alloc, &client, .{ .antfly_provider = local.provider() });
+    const producer = runtime.producer();
+
+    const results = try producer.produceBatch(alloc, &.{
+        .{
+            .producer_type = .transcriber,
+            .config_json = "{\"provider\":\"antfly\",\"model\":\"local-transcriber\",\"language_code\":\"en-US\"}",
+            .source_text = "file:///tmp/a.wav",
+            .content_type = "text/plain",
+        },
+        .{
+            .producer_type = .transcriber,
+            .config_json = "{\"provider\":\"antfly\",\"model\":\"local-transcriber\",\"language_code\":\"en-US\"}",
+            .source_text = "file:///tmp/b.wav",
+            .content_type = "text/plain",
+        },
+    });
+    defer {
+        for (results) |result| alloc.free(result);
+        alloc.free(results);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expectEqualStrings("first transcript", results[0]);
+    try std.testing.expectEqualStrings("second transcript", results[1]);
+    try std.testing.expectEqual(@as(usize, 2), local.transcribe_calls);
+}
+
 test "asset producer runtime routes antfly transcriber without url to local provider" {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -1117,5 +1535,76 @@ test "asset producer runtime routes antfly extractor without url to local provid
 
     try std.testing.expect(std.mem.indexOf(u8, result, "\"entities\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"Ada\"") != null);
+    try std.testing.expectEqual(@as(usize, 1), local.extract_calls);
+}
+
+test "asset producer runtime batches compatible antfly extractor requests" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const Local = struct {
+        extract_calls: usize = 0,
+
+        fn provider(self: *@This()) managed_embedder.AntflyProvider {
+            return .{
+                .ptr = self,
+                .embed_dense_texts = embedDense,
+                .embed_sparse_texts = embedSparse,
+                .extract = extract,
+            };
+        }
+
+        fn embedDense(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+
+        fn embedSparse(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![]@import("storage/db/enrichment/embedder.zig").SparseEmbedding {
+            return error.TestUnexpectedResult;
+        }
+
+        fn extract(ptr: *anyopaque, a: Allocator, model: []const u8, request: extracting.Request) !extracting.Response {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.extract_calls += 1;
+            try std.testing.expectEqualStrings("local-extractor", model);
+            try std.testing.expectEqual(@as(usize, 2), request.inputs.len);
+            try std.testing.expect(std.mem.indexOf(u8, request.inputs[0].content_json, "Ada") != null);
+            try std.testing.expect(std.mem.indexOf(u8, request.inputs[1].content_json, "Grace") != null);
+            return .{
+                .allocator = a,
+                .json = try a.dupe(u8, "{\"object\":\"extraction\",\"model\":\"local-extractor\",\"data\":[{\"entities\":[{\"label\":\"person\",\"text\":\"Ada\"}],\"relations\":[]},{\"entities\":[{\"label\":\"person\",\"text\":\"Grace\"}],\"relations\":[]}]}"),
+            };
+        }
+    };
+
+    var local = Local{};
+    var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+    defer client.deinit();
+    var runtime = Runtime.initWithOptions(alloc, &client, .{ .antfly_provider = local.provider() });
+    const producer = runtime.producer();
+
+    const results = try producer.produceBatch(alloc, &.{
+        .{
+            .producer_type = .extractor,
+            .config_json = "{\"provider\":\"antfly\",\"model\":\"local-extractor\",\"schema\":{\"entities\":[\"person\"]}}",
+            .source_text = "Ada works at Antfly.",
+            .content_type = "application/json",
+        },
+        .{
+            .producer_type = .extractor,
+            .config_json = "{\"provider\":\"antfly\",\"model\":\"local-extractor\",\"schema\":{\"entities\":[\"person\"]}}",
+            .source_text = "Grace works at Antfly.",
+            .content_type = "application/json",
+        },
+    });
+    defer {
+        for (results) |result| alloc.free(result);
+        alloc.free(results);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), results.len);
+    try std.testing.expect(std.mem.indexOf(u8, results[0], "\"Ada\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, results[1], "\"Grace\"") != null);
     try std.testing.expectEqual(@as(usize, 1), local.extract_calls);
 }
