@@ -335,8 +335,16 @@ fields are the same shape as readers:
 }
 ```
 
-For embeddings indexes that use the inline managed-embedder shorthand, execution
-policy should live beside `embedder`, not inside it:
+Index execution and embedder execution are separate knobs. Index execution
+controls catalog/index maintenance windows: how many documents, artifacts, or
+posting-list writes the indexer processes per pass. Embedder execution controls
+inference calls: how many texts/chunks are sent to the embedder in one request
+and how large that request may be. They should not share one ambiguous
+`batch_items` field.
+
+For embeddings indexes that use the inline managed-embedder shorthand, the
+execution policy should live beside `embedder`, not inside it, with separate
+namespaces for indexing and embedding:
 
 ```json
 {
@@ -348,17 +356,25 @@ policy should live beside `embedder`, not inside it:
     "model": "bge-base-en-v1.5"
   },
   "execution": {
-    "batch_items": 16,
-    "batch_bytes": 262144
+    "index": {
+      "batch_items": 1024
+    },
+    "embedding": {
+      "batch_items": 16,
+      "batch_bytes": 262144
+    }
   }
 }
 ```
 
-The index translator should copy that policy onto the generated embedding
-enrichment. The vector index itself consumes the produced embedding artifact;
-the batching policy applies to the embedding producer that creates that artifact.
-For artifact-backed indexes that point at an existing embedding artifact, the
-policy belongs on the matching embedding enrichment:
+The index translator should keep `execution.index` on the vector index and copy
+`execution.embedding` onto the generated embedding enrichment. The vector index
+itself consumes the produced embedding artifact; the embedding batching policy
+applies to the producer that creates that artifact.
+
+For artifact-backed indexes that point at an existing embedding artifact, index
+batching belongs on the index and embedder batching belongs on the matching
+embedding enrichment:
 
 ```json
 {
@@ -366,7 +382,12 @@ policy belongs on the matching embedding enrichment:
   "field": "embedding",
   "embedding_name": "document_chunk_dense_v1",
   "source_artifact_name": "document_chunks_v1",
-  "dimension": 384
+  "dimension": 384,
+  "execution": {
+    "index": {
+      "batch_items": 1024
+    }
+  }
 }
 ```
 
@@ -389,9 +410,10 @@ policy belongs on the matching embedding enrichment:
 ```
 
 Existing `embedder.batch_size` should be treated as a compatibility alias for
-`execution.batch_items` when possible, then normalized out of semantic embedder
-configuration before deriving artifact identity. New configs should prefer the
-top-level `execution` block.
+the embedder-side batch size: `execution.embedding.batch_items` in inline index
+configs, or `execution.batch_items` on explicit embedding enrichments. It should
+then be normalized out of semantic embedder configuration before deriving
+artifact identity. New configs should prefer the `execution` block.
 
 Extraction inference also has a batched request shape: multiple text inputs or
 image inputs can be submitted together and results are returned by input index.
