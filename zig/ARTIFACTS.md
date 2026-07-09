@@ -415,6 +415,140 @@ configs, or `execution.batch_items` on explicit embedding enrichments. It should
 then be normalized out of semantic embedder configuration before deriving
 artifact identity. New configs should prefer the `execution` block.
 
+Chunking follows the same split. Chunk shape is semantic: target size, overlap,
+tokenizer/model, store-chunks behavior, and full-text side effects can change
+the chunk artifacts. Chunker execution is non-semantic: how many source texts or
+asset values are sent through the chunker per pass or per remote chunker request.
+For an inline embedding index with managed chunking there can be three separate
+execution namespaces:
+
+```json
+{
+  "type": "embeddings",
+  "field": "body",
+  "dimension": 384,
+  "chunker": {
+    "provider": "antfly",
+    "text": {
+      "target_tokens": 512,
+      "overlap_tokens": 64
+    }
+  },
+  "embedder": {
+    "provider": "antfly",
+    "model": "bge-base-en-v1.5"
+  },
+  "execution": {
+    "index": {
+      "batch_items": 1024
+    },
+    "chunking": {
+      "batch_items": 128,
+      "batch_bytes": 1048576
+    },
+    "embedding": {
+      "batch_items": 16,
+      "batch_bytes": 262144
+    }
+  }
+}
+```
+
+The translator should keep `execution.index` on the vector index, copy
+`execution.chunking` onto the generated chunk enrichment, and copy
+`execution.embedding` onto the generated embedding enrichment. For explicit
+chunk enrichments, the same chunker-side policy lives directly on the
+enrichment:
+
+```json
+{
+  "name": "body_chunks_v1",
+  "kind": "chunk",
+  "field": "body",
+  "chunker": {
+    "provider": "antfly",
+    "text": {
+      "target_tokens": 512,
+      "overlap_tokens": 64
+    }
+  },
+  "execution": {
+    "batch_items": 128,
+    "batch_bytes": 1048576
+  }
+}
+```
+
+Graph indexes use the same ownership boundary, but the useful execution knobs
+are different. A graph index consumes edge-like input from document `_edges`, a
+user-defined enrichment, or a shorthand-created asset enrichment. The graph
+index execution policy controls edge materialization and replay batching; the
+asset/extractor execution policy controls model calls that produce relations.
+
+```json
+{
+  "type": "graph",
+  "source": {
+    "kind": "artifact",
+    "artifact": "relations_v1",
+    "path": "$.relations[*]",
+    "format": "extraction_relation"
+  },
+  "execution": {
+    "index": {
+      "batch_items": 4096,
+      "batch_bytes": 4194304
+    }
+  }
+}
+```
+
+If the graph index uses shorthand to create the relation-producing asset, that
+shorthand should carry a separate producer execution policy. The index
+translator should copy it onto the generated asset enrichment and keep graph
+index batching on the graph index:
+
+```json
+{
+  "type": "graph",
+  "artifact": {
+    "name": "relations_v1",
+    "kind": "asset",
+    "field": "body",
+    "content_type": "application/json",
+    "producer_json": {
+      "type": "extractor",
+      "config": {
+        "provider": "antfly",
+        "model": "gliner2-relations",
+        "schema": "relations_v1"
+      }
+    },
+    "execution": {
+      "batch_items": 8,
+      "batch_bytes": 262144
+    }
+  },
+  "source": {
+    "kind": "artifact",
+    "artifact": "relations_v1",
+    "path": "$.relations[*]",
+    "format": "extraction_relation"
+  },
+  "execution": {
+    "index": {
+      "batch_items": 4096,
+      "batch_bytes": 4194304
+    }
+  }
+}
+```
+
+Graph traversal limits are not enrichment batching. Defaults such as max depth,
+frontier caps, or result caps may be index or query execution policy, but they
+should be named as traversal/query defaults rather than sharing producer
+`batch_items`.
+
 Extraction inference also has a batched request shape: multiple text inputs or
 image inputs can be submitted together and results are returned by input index.
 Recognizer-backed extraction should batch text inputs directly; for GLiNER2 this
