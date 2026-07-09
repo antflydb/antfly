@@ -2480,7 +2480,7 @@ components:
           type: string
           maxLength: 256
           description: |
-            inference-native prompt prefix cache namespace/routing key. Requests with the same key can
+            inference-native prompt prefix cache namespace key. Requests with the same key can
             reuse matching prompt-prefix KV on the same node.
         prompt_cache:
           type: boolean
