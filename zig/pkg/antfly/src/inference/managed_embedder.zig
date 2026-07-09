@@ -43,6 +43,7 @@ else
 const db_embedder = @import("../storage/db/enrichment/embedder.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const std_http_listener = @import("../raft/transport/std_http_listener.zig");
+const enrichment_types = @import("../storage/db/enrichment/enrichment_types.zig");
 
 fn getenv(name: [*:0]const u8) ?[*:0]u8 {
     if (!builtin.link_libc) return null;
@@ -2208,10 +2209,19 @@ fn appendExecutionObjectIfPresent(
     if (execution != .object) return error.InvalidCreateTableRequest;
     var parsed = try std.json.parseFromValue(indexes_openapi.IndexExecutionConfig, alloc, execution, .{ .allocate = .alloc_always });
     defer parsed.deinit();
+    try validateIndexExecutionObjectForCreateTable(execution);
     const encoded = try std.json.Stringify.valueAlloc(alloc, execution, .{});
     defer alloc.free(encoded);
     try out.appendSlice(alloc, ",\"execution\":");
     try out.appendSlice(alloc, encoded);
+}
+
+fn validateIndexExecutionObjectForCreateTable(execution: std.json.Value) !void {
+    if (execution != .object) return error.InvalidCreateTableRequest;
+    for ([_][]const u8{ "indexing", "chunking", "embedding" }) |field_name| {
+        const policy = execution.object.get(field_name) orelse continue;
+        _ = enrichment_types.parseExecutionPolicyValue(policy) catch return error.InvalidCreateTableRequest;
+    }
 }
 
 fn stringifyManagedEmbedderConfigAlloc(
@@ -2369,6 +2379,16 @@ test "managed embedder translates managed embeddings config into db generator co
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"generator\":{\"kind\":\"dense_embedding\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"execution\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"embedding\":{\"batch_items\":16,\"batch_bytes\":262144}") != null);
+}
+
+test "managed embedder rejects invalid execution batch policy" {
+    var local = TestLocalDenseProvider{ .dimensions = 384 };
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"type":"embeddings","field":"body","dimension":384,"embedder":{"provider":"antfly","model":"antflydb/clipclap"},"execution":{"indexing":{"batch_items":0}}}
+    , .{});
+    defer parsed.deinit();
+
+    try std.testing.expectError(error.InvalidCreateTableRequest, translateEmbeddingsIndexConfigJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{ .antfly_provider = local.provider() }));
 }
 
 pub fn testArtifactBackedEmbeddingTranslation() !void {

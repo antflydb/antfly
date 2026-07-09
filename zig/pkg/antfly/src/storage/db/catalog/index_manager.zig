@@ -13504,7 +13504,16 @@ fn executionNamespaceJsonAlloc(alloc: Allocator, root: std.json.Value, namespace
     if (root != .object) return error.InvalidIndexConfig;
     const execution = root.object.get("execution") orelse return "";
     if (execution != .object) return error.InvalidIndexConfig;
+    try validateIndexExecutionConfigValue(execution);
     return try executionObjectFieldJsonAlloc(alloc, execution.object, namespace);
+}
+
+fn validateIndexExecutionConfigValue(execution: std.json.Value) !void {
+    if (execution != .object) return error.InvalidIndexConfig;
+    for ([_][]const u8{ "indexing", "chunking", "embedding" }) |field_name| {
+        const policy = execution.object.get(field_name) orelse continue;
+        _ = enrichment_types.parseExecutionPolicyValue(policy) catch return error.InvalidIndexConfig;
+    }
 }
 
 fn parseDenseConfig(alloc: Allocator, raw: []const u8) !DenseConfig {
@@ -16495,6 +16504,14 @@ test "parseDenseGeneratorConfig preserves execution namespaces" {
     try std.testing.expect(std.mem.indexOf(u8, generator.embedding_execution_json, "\"batch_items\":8") != null);
     try std.testing.expect(std.mem.indexOf(u8, generator.embedding_execution_json, "\"batch_bytes\":65536") != null);
     try std.testing.expect(std.mem.indexOf(u8, generator.embedding_execution_json, "indexing") == null);
+}
+
+test "parseDenseGeneratorConfig rejects invalid execution namespace" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"field":"embedding","dims":384,"execution":{"indexing":{"batch_items":0}},"generator":{"kind":"dense_embedding","source_field":"body","artifact_name":"body_chunks","chunk_size":256}}
+    ;
+    try std.testing.expectError(error.InvalidIndexConfig, parseDenseGeneratorConfig(alloc, json));
 }
 
 test "parseSparseGeneratorConfig parses source_template" {
