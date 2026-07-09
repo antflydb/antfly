@@ -316,12 +316,14 @@ ANTFLY_ENRICHMENT_OCR_BATCH_BYTES=67108864
 ```
 
 Readers must stay model-neutral at this layer. The artifact producer exposes a
-batch request hook, and the local Antfly reader producer coalesces compatible
-reader requests into one `readers.Request.images` call when producer type,
-semantic config, prompt, and model options match. Inference decides whether a
-concrete reader can execute the batch natively, chunk it, or fall back. The
-artifact pipeline must not encode Florence-specific assumptions. Remote
-providers, mixed configs, mixed prompts, generators, extractors, and
+batch request hook, and document-extraction OCR/transcription workers flush
+pending generated-text units according to the resolved `execution.batch_items`
+and `execution.batch_bytes` policy. The local Antfly reader producer coalesces
+compatible reader requests into one `readers.Request.images` call when producer
+type, semantic config, prompt, and model options match. Inference decides
+whether a concrete reader can execute the batch natively, chunk it, or fall
+back. The artifact pipeline must not encode Florence-specific assumptions.
+Remote providers, mixed configs, mixed prompts, generators, extractors, and
 transcribers can use the same producer batch hook, but they currently fall back
 to sequential execution unless their provider implementation exposes a native
 batch operation.
@@ -574,8 +576,10 @@ Recognizer-backed extraction should batch text inputs directly; for GLiNER2 this
 means one recognizer batch per schema label set, not one model run per text.
 Reader-backed image extraction batches the reader/OCR step before schema
 extraction when pending units share a compatible local Antfly reader
-configuration. As with readers and embedders, extraction batch policy belongs in
-`execution` and must be clamped by model and operator limits.
+configuration. The worker preserves document unit order by flushing pending
+generated-text units before non-generated units and at stream end. As with
+readers and embedders, extraction batch policy belongs in `execution` and is
+clamped by model and operator limits.
 
 The public asset enrichment shape uses `field` and `template`. The older
 `source_field`/`source_template` names are internal catalog/replay names and are
