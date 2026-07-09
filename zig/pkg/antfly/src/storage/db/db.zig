@@ -37858,6 +37858,176 @@ test "db asset producer enrichments execute fake providers and skip unchanged st
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, state_key));
 }
 
+test "db asset producer enrichments batch compatible generated assets" {
+    const alloc = std.testing.allocator;
+
+    const BatchProducer = struct {
+        batch_calls: usize = 0,
+        batch_lengths: [4]usize = .{ 0, 0, 0, 0 },
+        single_calls: usize = 0,
+
+        fn producer(self: *@This()) asset_producer_mod.Producer {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .produce = produce,
+                    .produce_batch = produceBatch,
+                },
+            };
+        }
+
+        fn produce(ptr: *anyopaque, alloc_inner: Allocator, request: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.single_calls += 1;
+            return try std.fmt.allocPrint(alloc_inner, "single:{s}", .{request.source_text});
+        }
+
+        fn produceBatch(ptr: *anyopaque, alloc_inner: Allocator, requests: []const asset_producer_mod.Request) ![][]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.batch_lengths[self.batch_calls] = requests.len;
+            self.batch_calls += 1;
+            const out = try alloc_inner.alloc([]u8, requests.len);
+            errdefer {
+                for (out) |item| {
+                    if (item.len > 0) alloc_inner.free(item);
+                }
+                alloc_inner.free(out);
+            }
+            for (out, requests) |*item, request| {
+                item.* = try std.fmt.allocPrint(alloc_inner, "batch:{s}", .{request.source_text});
+            }
+            return out;
+        }
+    };
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var fake = BatchProducer{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .asset_producer = fake.producer(),
+        },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "summary_v1",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+        .execution = .{ .batch_items = 2, .batch_bytes = 1024 },
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"beta\"}" },
+        },
+        .sync_level = .enrichments,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), fake.batch_calls);
+    try std.testing.expectEqual(@as(usize, 2), fake.batch_lengths[0]);
+    try std.testing.expectEqual(@as(usize, 0), fake.single_calls);
+
+    var first = (try db.lookup(alloc, "doc:a", .{
+        .fields = &.{"_artifacts"},
+        .include_all_fields = false,
+    })).?;
+    defer first.deinit(alloc);
+    var parsed_first = try std.json.parseFromSlice(std.json.Value, alloc, first.json, .{});
+    defer parsed_first.deinit();
+    try std.testing.expectEqualStrings("batch:alpha", parsed_first.value.object.get("_artifacts").?.object.get("summary_v1").?.object.get("value").?.string);
+
+    var second = (try db.lookup(alloc, "doc:b", .{
+        .fields = &.{"_artifacts"},
+        .include_all_fields = false,
+    })).?;
+    defer second.deinit(alloc);
+    var parsed_second = try std.json.parseFromSlice(std.json.Value, alloc, second.json, .{});
+    defer parsed_second.deinit();
+    try std.testing.expectEqualStrings("batch:beta", parsed_second.value.object.get("_artifacts").?.object.get("summary_v1").?.object.get("value").?.string);
+}
+
+test "db asset producer batch fallback isolates permanent item failure" {
+    const alloc = std.testing.allocator;
+
+    const FallbackProducer = struct {
+        batch_calls: usize = 0,
+        single_calls: usize = 0,
+
+        fn producer(self: *@This()) asset_producer_mod.Producer {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .produce = produce,
+                    .produce_batch = produceBatch,
+                },
+            };
+        }
+
+        fn produce(ptr: *anyopaque, alloc_inner: Allocator, request: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.single_calls += 1;
+            if (std.mem.eql(u8, request.source_text, "bad")) return error.BadAssetInput;
+            return try std.fmt.allocPrint(alloc_inner, "ok:{s}", .{request.source_text});
+        }
+
+        fn produceBatch(ptr: *anyopaque, _: Allocator, _: []const asset_producer_mod.Request) ![][]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.batch_calls += 1;
+            return error.BatchItemFailed;
+        }
+    };
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var fake = FallbackProducer{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .asset_producer = fake.producer(),
+        },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "summary_v1",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+        .execution = .{ .batch_items = 2, .batch_bytes = 1024 },
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:good", .value = "{\"body\":\"good\"}" },
+            .{ .key = "doc:bad", .value = "{\"body\":\"bad\"}" },
+        },
+        .sync_level = .enrichments,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), fake.batch_calls);
+    try std.testing.expectEqual(@as(usize, 2), fake.single_calls);
+
+    const good_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:good", "asset", "summary_v1");
+    defer alloc.free(good_key);
+    const good_value = try db.core.store.get(alloc, good_key);
+    defer alloc.free(good_value);
+    try std.testing.expectEqualStrings("ok:good", good_value);
+
+    const bad_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:bad", "asset", "summary_v1");
+    defer alloc.free(bad_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, bad_key));
+}
+
 test "db document unit payload preserves pdf page provenance" {
     const alloc = std.testing.allocator;
     var text_regions = [_]document_extraction_mod.TextRegion{.{

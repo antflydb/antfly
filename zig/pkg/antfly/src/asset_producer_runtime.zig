@@ -240,9 +240,16 @@ pub const Runtime = struct {
 
         var resp = try self.http.post(batch_url, .{ .json = body, .timeout_ms = 300_000 });
         defer resp.deinit();
-        if (!resp.ok()) return error.GenerateBatchRequestFailed;
+        if (!resp.ok()) return mapAntflyGenerateBatchStatus(resp.status.code);
         const payload = resp.body orelse return error.EmptyGenerateBatchResponse;
         return try parseAntflyGenerateBatchResponseAlloc(alloc, payload, requests.len);
+    }
+
+    fn mapAntflyGenerateBatchStatus(status: u16) anyerror {
+        return switch (status) {
+            408, 409, 425, 429 => error.GenerateBatchTransientFailure,
+            else => if (status >= 500 and status <= 599) error.GenerateBatchTransientFailure else error.GenerateBatchRequestFailed,
+        };
     }
 
     fn tryTranscribeBatch(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) ![][]u8 {

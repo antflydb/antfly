@@ -452,6 +452,7 @@ fn isRetryableEnrichmentError(err: anyerror) bool {
         error.SendFailed,
         error.RecvFailed,
         error.ResourceBudgetExceeded,
+        error.GenerateBatchTransientFailure,
         => true,
         else => false,
     };
@@ -813,11 +814,51 @@ const PlainDenseBatchItem = struct {
     artifact_key: []u8,
 };
 
+const AssetProducerBatchItem = struct {
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    producer_type: asset_producer_mod.ProducerType,
+    config_json: []u8,
+    raw_doc: []u8,
+    source_text: []const u8,
+    source_parts_json: ?[]u8 = null,
+    artifact_key: []u8,
+    state_key: []u8,
+    state_value: []u8,
+
+    fn asRequest(self: *const @This()) asset_producer_mod.Request {
+        return .{
+            .producer_type = self.producer_type,
+            .config_json = self.config_json,
+            .source_text = self.source_text,
+            .source_parts_json = self.source_parts_json,
+            .content_type = self.request.content_type,
+        };
+    }
+};
+
 fn freePlainDenseBatchItems(alloc: Allocator, items: []PlainDenseBatchItem) void {
     for (items) |item| {
         alloc.free(@constCast(item.source_text));
         alloc.free(item.artifact_key);
     }
+}
+
+fn freeAssetProducerBatchItem(alloc: Allocator, item: AssetProducerBatchItem) void {
+    if (item.config_json.len > 0) alloc.free(item.config_json);
+    alloc.free(item.raw_doc);
+    alloc.free(@constCast(item.source_text));
+    if (item.source_parts_json) |parts| alloc.free(parts);
+    alloc.free(item.artifact_key);
+    alloc.free(item.state_key);
+    alloc.free(item.state_value);
+}
+
+fn clearAssetProducerBatchItems(
+    alloc: Allocator,
+    items: *std.ArrayListUnmanaged(AssetProducerBatchItem),
+) void {
+    for (items.items) |item| freeAssetProducerBatchItem(alloc, item);
+    items.clearRetainingCapacity();
 }
 
 fn freeWorkerChunkCache(alloc: Allocator, cache: *std.ArrayListUnmanaged(WorkerChunkCacheEntry)) void {
@@ -853,6 +894,26 @@ fn samePlainDenseBatchKey(
     return lhs.expected_dims == rhs.expected_dims and
         std.mem.eql(u8, requestEmbeddingName(lhs), requestEmbeddingName(rhs)) and
         std.mem.eql(u8, lhs.execution_json, rhs.execution_json);
+}
+
+fn sameAssetProducerBatchKey(lhs: AssetProducerBatchItem, rhs: AssetProducerBatchItem) bool {
+    return lhs.producer_type == rhs.producer_type and
+        std.mem.eql(u8, lhs.config_json, rhs.config_json) and
+        std.mem.eql(u8, lhs.request.content_type, rhs.request.content_type) and
+        std.mem.eql(u8, lhs.request.execution_json, rhs.request.execution_json);
+}
+
+fn assetProducerBatchItemBytes(item: AssetProducerBatchItem) usize {
+    return addUsizeSaturating(
+        addUsizeSaturating(item.config_json.len, item.source_text.len),
+        if (item.source_parts_json) |parts| parts.len else 0,
+    );
+}
+
+fn assetProducerBatchBytes(items: []const AssetProducerBatchItem) usize {
+    var total: usize = 0;
+    for (items) |item| total = addUsizeSaturating(total, assetProducerBatchItemBytes(item));
+    return total;
 }
 
 fn workerChunkCacheKey(
@@ -1115,6 +1176,11 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         defer deferred_plain_dense.deinit(self.alloc);
         var deferred_chunked_dense = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest).empty;
         defer deferred_chunked_dense.deinit(self.alloc);
+        var deferred_assets = std.ArrayListUnmanaged(AssetProducerBatchItem).empty;
+        defer {
+            clearAssetProducerBatchItems(self.alloc, &deferred_assets);
+            deferred_assets.deinit(self.alloc);
+        }
         var window = GeneratedReplayWindow{ .alloc = self.alloc };
         defer window.deinit();
         const max_window_items = generatedReplayWindowItems();
@@ -1123,9 +1189,10 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         var max_seen = self.applied_sequence;
         for (pending) |group| {
             max_seen = @max(max_seen, group.sequence);
-            try processPendingDocumentGroup(self, group, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &window, &processed_request_count);
+            try processPendingDocumentGroup(self, group, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window, &processed_request_count);
             if (window.itemCount() >= max_window_items) try flushGeneratedReplayWindow(self, &window);
         }
+        try flushAssetProducerBatch(self, &deferred_assets, &window);
         try processPlainDenseWindow(self, deferred_plain_dense.items, &window);
         try processChunkedDenseWindow(self, deferred_chunked_dense.items, &chunk_cache, &window);
         try flushGeneratedReplayWindow(self, &window);
@@ -1652,6 +1719,11 @@ fn workerMain(runtime: *EnrichmentRuntime) void {
             defer deferred_plain_dense.deinit(runtime.alloc);
             var deferred_chunked_dense = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest).empty;
             defer deferred_chunked_dense.deinit(runtime.alloc);
+            var deferred_assets = std.ArrayListUnmanaged(AssetProducerBatchItem).empty;
+            defer {
+                clearAssetProducerBatchItems(runtime.alloc, &deferred_assets);
+                deferred_assets.deinit(runtime.alloc);
+            }
             var window = GeneratedReplayWindow{ .alloc = runtime.alloc };
             defer window.deinit();
             const max_window_items = generatedReplayWindowItems();
@@ -1661,7 +1733,7 @@ fn workerMain(runtime: *EnrichmentRuntime) void {
 
             for (pending) |group| {
                 max_seen = @max(max_seen, group.sequence);
-                processPendingDocumentGroup(runtime, group, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &window, &processed_request_count) catch |err| {
+                processPendingDocumentGroup(runtime, group, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window, &processed_request_count) catch |err| {
                     handleWorkerLoopError(runtime, io, err);
                     if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return;
                     if (isRetryableEnrichmentError(err)) continue :retry_pending;
@@ -1674,6 +1746,12 @@ fn workerMain(runtime: *EnrichmentRuntime) void {
                     continue :worker_loop;
                 };
             }
+            flushAssetProducerBatch(runtime, &deferred_assets, &window) catch |err| {
+                handleWorkerLoopError(runtime, io, err);
+                if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return;
+                if (isRetryableEnrichmentError(err)) continue :retry_pending;
+                continue :worker_loop;
+            };
             processPlainDenseWindow(runtime, deferred_plain_dense.items, &window) catch |err| {
                 handleWorkerLoopError(runtime, io, err);
                 if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return;
@@ -1742,6 +1820,7 @@ fn processPendingDocumentGroup(
     request_plan_cache: *std.ArrayListUnmanaged(RequestPlanCacheEntry),
     deferred_plain_dense: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest),
     deferred_chunked_dense: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest),
+    deferred_assets: *std.ArrayListUnmanaged(AssetProducerBatchItem),
     window: *GeneratedReplayWindow,
     processed_request_count: *u64,
 ) !void {
@@ -1759,7 +1838,7 @@ fn processPendingDocumentGroup(
             continue;
         }
         switch (request.kind) {
-            .asset => processAsset(runtime, request, window) catch |err| {
+            .asset => processAsset(runtime, request, deferred_assets, window) catch |err| {
                 if (isRetryableEnrichmentError(err)) return err;
                 recordIsolatedRequestError(runtime, request, err);
                 continue;
@@ -1786,6 +1865,7 @@ fn processPendingDocumentGroup(
 fn processAsset(
     runtime: *EnrichmentRuntime,
     request: enrichment_types.GeneratedEnrichmentRequest,
+    deferred_assets: *std.ArrayListUnmanaged(AssetProducerBatchItem),
     window: *GeneratedReplayWindow,
 ) !void {
     const doc_store_key = try internal_keys.documentKeyAlloc(runtime.alloc, request.doc_key);
@@ -1794,14 +1874,16 @@ fn processAsset(
         std.mem.Allocator.Error.OutOfMemory => return err,
         else => return,
     };
-    defer runtime.alloc.free(raw);
+    var raw_owned = true;
+    defer if (raw_owned) runtime.alloc.free(raw);
 
     var producer_cfg = try asset_producer_mod.parseProducerConfig(runtime.alloc, request.producer_json);
     defer producer_cfg.deinit(runtime.alloc);
 
     const artifact_name = requestArtifactName(request);
     const key = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, request.doc_key, "asset", artifact_name);
-    defer runtime.alloc.free(key);
+    var key_owned = true;
+    defer if (key_owned) runtime.alloc.free(key);
 
     const text_indexes = try runtime.index_manager.textIndexesForChunk(runtime.alloc, artifact_name, request.full_text_index);
     defer {
@@ -1822,7 +1904,8 @@ fn processAsset(
         try materializeGraphAssetDeleteForRuntime(runtime, request, window);
         return;
     };
-    defer runtime.alloc.free(@constCast(source_text));
+    var source_text_owned = true;
+    defer if (source_text_owned) runtime.alloc.free(@constCast(source_text));
     if (source_text.len == 0) {
         const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
         defer runtime.alloc.free(state_key);
@@ -1846,7 +1929,10 @@ fn processAsset(
         try renderSourcePartsJson(runtime.alloc, runtime.config, raw, request)
     else
         null;
-    defer if (source_parts_json) |value| runtime.alloc.free(value);
+    var source_parts_json_owned = true;
+    defer if (source_parts_json_owned) {
+        if (source_parts_json) |value| runtime.alloc.free(value);
+    };
 
     if (producer_cfg.type == .copy) {
         if (try shouldSkipAssetArtifact(runtime, key, source_text)) {
@@ -1863,9 +1949,11 @@ fn processAsset(
     }
 
     const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
-    defer runtime.alloc.free(state_key);
+    var state_key_owned = true;
+    defer if (state_key_owned) runtime.alloc.free(state_key);
     const state_value = try assetStateValueAlloc(runtime.alloc, source_text, source_parts_json, request.producer_json);
-    defer runtime.alloc.free(state_value);
+    var state_value_owned = true;
+    defer if (state_value_owned) runtime.alloc.free(state_value);
     if (try shouldSkipAssetProducer(runtime, state_key, state_value)) {
         const existing = storeGetAlloc(runtime, key) catch |err| switch (err) {
             std.mem.Allocator.Error.OutOfMemory => return err,
@@ -1879,24 +1967,122 @@ fn processAsset(
         }
     }
 
-    const producer = runtime.config.asset_producer orelse return error.MissingAssetProducer;
-    const produced = try producer.produce(runtime.alloc, .{
+    const config_json = producer_cfg.config_json;
+    producer_cfg.config_json = "";
+    var config_json_owned = true;
+    errdefer if (config_json_owned and config_json.len > 0) runtime.alloc.free(config_json);
+
+    try appendAssetProducerBatchItem(runtime, deferred_assets, window, .{
+        .request = request,
         .producer_type = producer_cfg.type,
-        .config_json = producer_cfg.config_json,
+        .config_json = @constCast(config_json),
+        .raw_doc = raw,
         .source_text = source_text,
         .source_parts_json = source_parts_json,
-        .content_type = request.content_type,
+        .artifact_key = key,
+        .state_key = state_key,
+        .state_value = state_value,
     });
-    defer runtime.alloc.free(produced);
+    config_json_owned = false;
+    raw_owned = false;
+    source_text_owned = false;
+    source_parts_json_owned = false;
+    key_owned = false;
+    state_key_owned = false;
+    state_value_owned = false;
+}
 
+fn appendAssetProducerBatchItem(
+    runtime: *EnrichmentRuntime,
+    items: *std.ArrayListUnmanaged(AssetProducerBatchItem),
+    window: *GeneratedReplayWindow,
+    item: AssetProducerBatchItem,
+) !void {
+    const policy = requestGeneratedTextBatchPolicy(runtime.alloc, item.request);
+    if (items.items.len > 0) {
+        const current_bytes = assetProducerBatchBytes(items.items);
+        const item_bytes = assetProducerBatchItemBytes(item);
+        if (!sameAssetProducerBatchKey(items.items[0], item) or
+            items.items.len >= policy.max_items or
+            addUsizeSaturating(current_bytes, item_bytes) > policy.max_bytes)
+        {
+            try flushAssetProducerBatch(runtime, items, window);
+        }
+    }
+    try items.append(runtime.alloc, item);
+}
+
+fn flushAssetProducerBatch(
+    runtime: *EnrichmentRuntime,
+    items: *std.ArrayListUnmanaged(AssetProducerBatchItem),
+    window: *GeneratedReplayWindow,
+) !void {
+    if (items.items.len == 0) return;
+    defer clearAssetProducerBatchItems(runtime.alloc, items);
+
+    const producer = runtime.config.asset_producer orelse return error.MissingAssetProducer;
+    const requests = try runtime.alloc.alloc(asset_producer_mod.Request, items.items.len);
+    defer runtime.alloc.free(requests);
+    for (items.items, 0..) |*item, idx| requests[idx] = item.asRequest();
+
+    var produced = producer.produceBatch(runtime.alloc, requests) catch |err| {
+        if (items.items.len == 1 or isRetryableEnrichmentError(err)) return err;
+        return try flushAssetProducerBatchSequential(runtime, producer, items.items, window);
+    };
+    defer runtime.alloc.free(produced);
+    errdefer {
+        for (produced) |output| {
+            if (output.len > 0) runtime.alloc.free(output);
+        }
+    }
+    if (produced.len != items.items.len) return error.InvalidAssetProducerResponse;
+
+    for (items.items, produced, 0..) |*item, output, idx| {
+        try applyAssetProducerBatchOutput(runtime, item.*, output, window);
+        runtime.alloc.free(output);
+        produced[idx] = "";
+    }
+}
+
+fn flushAssetProducerBatchSequential(
+    runtime: *EnrichmentRuntime,
+    producer: asset_producer_mod.Producer,
+    items: []const AssetProducerBatchItem,
+    window: *GeneratedReplayWindow,
+) !void {
+    for (items) |item| {
+        const request = item.asRequest();
+        const produced = producer.produce(runtime.alloc, request) catch |err| {
+            if (isRetryableEnrichmentError(err)) return err;
+            recordIsolatedRequestError(runtime, item.request, err);
+            continue;
+        };
+        defer runtime.alloc.free(produced);
+        try applyAssetProducerBatchOutput(runtime, item, produced, window);
+    }
+}
+
+fn applyAssetProducerBatchOutput(
+    runtime: *EnrichmentRuntime,
+    item: AssetProducerBatchItem,
+    produced: []const u8,
+    window: *GeneratedReplayWindow,
+) !void {
     const writes = [_]KVPair{
-        .{ .key = key, .value = produced },
-        .{ .key = state_key, .value = state_value },
+        .{ .key = item.artifact_key, .value = produced },
+        .{ .key = item.state_key, .value = item.state_value },
     };
     try storePutBatch(runtime, &writes, &.{});
-    try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);
-    try appendInlineFullTextDocumentToWindow(runtime, window, key, produced, text_indexes);
-    try materializeGraphAssetForRuntime(runtime, request, produced, raw, window);
+    try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, item.artifact_key);
+
+    const artifact_name = requestArtifactName(item.request);
+    const text_indexes = try runtime.index_manager.textIndexesForChunk(runtime.alloc, artifact_name, item.request.full_text_index);
+    defer {
+        for (text_indexes) |name| runtime.alloc.free(name);
+        runtime.alloc.free(text_indexes);
+    }
+    try appendInlineFullTextDocumentToWindow(runtime, window, item.artifact_key, produced, text_indexes);
+    try materializeGraphAssetForRuntime(runtime, item.request, produced, item.raw_doc, window);
     recordArtifactBytes(runtime, .asset, produced.len);
 }
 
