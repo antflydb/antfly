@@ -92,21 +92,79 @@ When `error_policy` is `per_item`, malformed content parts, failed media fetches
 
 This keeps the fast path fast while giving ingestion callers a way to isolate poisoned media without forcing DB batch rollback.
 
-## Future batch wrapper
+## Synchronous generation batch endpoint
 
-OCR/read, transcription, extraction, and generative LLM calls should use the same envelope-vs-item distinction, but they should not overload every native response shape independently. A future generic synchronous batch wrapper can route multiple independent endpoint requests:
+Generative LLM batching should start with a synchronous `/generate/batch`
+endpoint for artifact workers and enrichment pipelines. This endpoint batches
+independent generation requests for throughput, but it is still an online call:
+the client keeps the connection open and receives per-item results for that
+submitted batch.
+
+The single-request `/generate` endpoint should stay a normal one-request API.
+Batch transport belongs on `/generate/batch` so clients can rely on a stable
+response shape and so streaming, retries, and per-item failures are explicit.
+
+For JSON requests, the body is an envelope with an optional `mode`. The initial
+implementation only supports `sync`; `async` is reserved for future durable
+batch jobs:
 
 ```json
 {
-  "endpoint": "/read",
+  "mode": "sync",
   "requests": [
-    {"custom_id": "doc-a", "body": {"model": "reader", "input": "..."}},
-    {"custom_id": "doc-b", "body": {"model": "reader", "input": "..."}}
+    {
+      "custom_id": "doc-a",
+      "body": {"model": "qwen", "messages": [{"role": "user", "content": "Summarize A"}]}
+    },
+    {
+      "custom_id": "doc-b",
+      "body": {"model": "qwen", "messages": [{"role": "user", "content": "Summarize B"}]}
+    }
   ]
 }
 ```
 
-Each item would return `custom_id`, `status`, and either `response` or `error`. That mirrors OpenAI/Gemini-style batch semantics and can later be backed by an async JSONL job API without changing the per-item result model.
+The JSON response returns one item per request. Results are matched by
+`custom_id` and `index`, not response order:
+
+```json
+{
+  "object": "generate_batch_result",
+  "data": [
+    {"custom_id": "doc-a", "index": 0, "response": {"text": "..."}, "error": null},
+    {"custom_id": "doc-b", "index": 1, "response": null, "error": {"code": "INFERENCE_FAILED", "message": "...", "retryable": true}}
+  ],
+  "summary": {"total": 2, "succeeded": 1, "failed": 1}
+}
+```
+
+`application/x-ndjson` implies synchronous streaming batch mode. The request
+body is one JSON object per line, each equivalent to one entry in the JSON
+`requests` array:
+
+```jsonl
+{"custom_id":"doc-a","body":{"model":"qwen","messages":[{"role":"user","content":"Summarize A"}]}}
+{"custom_id":"doc-b","body":{"model":"qwen","messages":[{"role":"user","content":"Summarize B"}]}}
+```
+
+The response content type is also `application/x-ndjson`, and each output line
+is a completed item:
+
+```jsonl
+{"custom_id":"doc-a","index":0,"response":{"text":"..."},"error":null}
+{"custom_id":"doc-b","index":1,"response":null,"error":{"code":"INFERENCE_FAILED","message":"...","retryable":true}}
+```
+
+Envelope failures remain HTTP failures: malformed JSON/NDJSON, unknown model,
+unsupported `mode`, oversized envelope, or invalid request options that prevent
+the batch from starting. Per-item failures are encoded in item results.
+
+Future durable async batching should reuse the same per-item result model but
+use a separate job lifecycle: `mode: "async"` on a JSON `/generate/batch`
+request, an `input_file_id` or object-store reference, a returned batch/job ID,
+status polling, and output/error files. NDJSON uploads should not imply async;
+large streamed uploads belong in a file API or object-store upload path before
+creating the durable job.
 
 ## Reader/OCR batching
 
