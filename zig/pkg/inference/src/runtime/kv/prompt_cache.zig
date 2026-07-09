@@ -31,6 +31,12 @@ pub const Config = struct {
     max_bytes: usize = 512 * 1024 * 1024,
     min_tokens: usize = 64,
     ttl_ms: u64 = 300_000,
+    resource_usage_observer: ?ResourceUsageObserver = null,
+};
+
+pub const ResourceUsageObserver = struct {
+    context: *anyopaque,
+    update: *const fn (context: *anyopaque, current: *u64, next: u64) void,
 };
 
 pub const Stats = struct {
@@ -98,6 +104,7 @@ pub const PromptPrefixCache = struct {
     block_hash_misses: u64 = 0,
     block_hash_evictions: u64 = 0,
     block_hash_collision_guards: u64 = 0,
+    resource_accounted_bytes: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) PromptPrefixCache {
         return .{
@@ -116,8 +123,16 @@ pub const PromptPrefixCache = struct {
     }
 
     pub fn configure(self: *PromptPrefixCache, config: Config) void {
+        if (self.config.resource_usage_observer) |old_observer| {
+            const same_observer = if (config.resource_usage_observer) |new_observer|
+                old_observer.context == new_observer.context and old_observer.update == new_observer.update
+            else
+                false;
+            if (!same_observer) old_observer.update(old_observer.context, &self.resource_accounted_bytes, 0);
+        }
         self.config = config;
         self.evictToBudget();
+        self.updateResourceUsage();
     }
 
     pub fn ensurePool(self: *PromptPrefixCache, config: pool_mod.KvPoolConfig) !?block.KvPoolId {
@@ -276,6 +291,7 @@ pub const PromptPrefixCache = struct {
             .last_used = self.tick,
         });
         self.estimated_bytes += bytes;
+        self.updateResourceUsage();
         self.evictToBudget();
     }
 
@@ -447,6 +463,7 @@ pub const PromptPrefixCache = struct {
             .last_used = self.tick,
         });
         self.estimated_bytes += bytes;
+        self.updateResourceUsage();
     }
 
     fn releaseRetainedBlockHashBlock(
@@ -540,6 +557,11 @@ pub const PromptPrefixCache = struct {
         }
     }
 
+    fn updateResourceUsage(self: *PromptPrefixCache) void {
+        const observer = self.config.resource_usage_observer orelse return;
+        observer.update(observer.context, &self.resource_accounted_bytes, @intCast(self.estimated_bytes));
+    }
+
     fn clearEntries(self: *PromptPrefixCache) void {
         var idx: usize = self.entries.items.len;
         while (idx > 0) {
@@ -562,6 +584,7 @@ pub const PromptPrefixCache = struct {
         self.allocator.free(entry.blocks);
         if (entry.storage_blocks.len > 0) self.allocator.free(entry.storage_blocks);
         self.estimated_bytes -|= entry.estimated_bytes;
+        self.updateResourceUsage();
         _ = self.entries.swapRemove(idx);
         self.evictions += 1;
     }
@@ -574,6 +597,7 @@ pub const PromptPrefixCache = struct {
         }
         self.allocator.free(entry.tokens);
         self.estimated_bytes -|= entry.estimated_bytes;
+        self.updateResourceUsage();
         _ = self.block_hash_index.remove(entry.hash);
         const last_idx = self.block_hash_entries.items.len - 1;
         _ = self.block_hash_entries.swapRemove(idx);
@@ -688,6 +712,52 @@ test "prompt cache evicts retained blocks by budget" {
     try cache.storeFromSequence("", &.{ 1, 2 }, source_id);
 
     try std.testing.expectEqual(@as(usize, 0), cache.stats().live_entries);
+}
+
+test "prompt cache reports retained bytes to resource observer" {
+    const UsageProbe = struct {
+        updates: usize = 0,
+        last: u64 = 0,
+        peak: u64 = 0,
+
+        fn update(context: *anyopaque, current: *u64, next: u64) void {
+            const probe: *@This() = @ptrCast(@alignCast(context));
+            current.* = next;
+            probe.last = next;
+            probe.peak = @max(probe.peak, next);
+            probe.updates += 1;
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var probe = UsageProbe{};
+    var cache = PromptPrefixCache.init(allocator);
+    defer cache.deinit();
+    cache.configure(.{
+        .enabled = true,
+        .min_tokens = 2,
+        .max_bytes = 1,
+        .resource_usage_observer = .{
+            .context = &probe,
+            .update = UsageProbe.update,
+        },
+    });
+
+    const pool_id = (try cache.ensurePool(.{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 2,
+        .num_layers_packed = 1,
+        .num_kv_heads = 1,
+        .head_dim = 2,
+    })).?;
+    const source_id = try cache.manager.attachSequence(pool_id);
+    try cache.manager.appendTokens(source_id, 2);
+    try cache.storeFromSequence("", &.{ 1, 2 }, source_id);
+
+    try std.testing.expect(probe.peak > 0);
+    try std.testing.expectEqual(@as(u64, 0), probe.last);
+    try std.testing.expect(probe.updates >= 2);
 }
 
 test "prompt cache budgets metadata bytes" {

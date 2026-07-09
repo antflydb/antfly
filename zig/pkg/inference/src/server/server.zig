@@ -109,13 +109,17 @@ pub const PromptCacheConfig = struct {
     min_tokens: usize = 64,
     ttl_ms: u64 = 300_000,
 
-    pub fn runtimeConfig(self: @This()) runtime.kv.prompt_cache.Config {
+    pub fn runtimeConfig(
+        self: @This(),
+        resource_usage_observer: ?runtime.kv.prompt_cache.ResourceUsageObserver,
+    ) runtime.kv.prompt_cache.Config {
         return .{
             .enabled = self.enabled,
             .mode = self.mode,
             .max_bytes = self.max_bytes_mb * 1024 * 1024,
             .min_tokens = self.min_tokens,
             .ttl_ms = self.ttl_ms,
+            .resource_usage_observer = resource_usage_observer,
         };
     }
 };
@@ -132,6 +136,7 @@ pub const NodeConfig = struct {
     pool_size: usize = 2,
     generation_budget_overrides: BudgetOverrides = .{},
     prompt_cache: PromptCacheConfig = .{},
+    prompt_cache_resource_usage_observer: ?runtime.kv.prompt_cache.ResourceUsageObserver = null,
 };
 
 pub const WarmModelKind = enum {
@@ -2686,7 +2691,7 @@ pub const Node = struct {
             effective_draft_model_name == null and
             config.cache_compaction_ratio == null)
         {
-            model.prompt_prefix_cache.configure(self.config.prompt_cache.runtimeConfig());
+            model.prompt_prefix_cache.configure(self.config.prompt_cache.runtimeConfig(self.config.prompt_cache_resource_usage_observer));
             const cache_ready = if (backend_kind == .metal or backend_kind == .cuda) blk: {
                 const ensured = model.prompt_prefix_cache.ensureStorage(pool_config) catch |err|
                     return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
