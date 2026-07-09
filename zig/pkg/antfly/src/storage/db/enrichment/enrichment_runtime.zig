@@ -1052,8 +1052,13 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     pub fn waitForApplied(self: *@This(), sequence: u64) !void {
+        try self.catchUpUntil(sequence);
+    }
+
+    pub fn catchUpUntil(self: *@This(), sequence: u64) !void {
         if (self.config.dense_embedder == null and self.config.sparse_embedder == null and self.config.asset_producer == null and !self.config.enable_without_producers) return;
 
+        self.notifySequence(sequence);
         const pending = try enrichment_worker.collectPendingDocumentGroups(self.alloc, self.replay_source, self.applied_sequence);
         defer enrichment_worker.freePendingDocumentGroups(self.alloc, pending);
 
@@ -1367,6 +1372,26 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         if (self.applied_sequence < sequence and self.retrying) return RuntimeError.EnrichmentRetryInProgress;
     }
 
+    pub fn catchUpUntil(self: *EnrichmentRuntime, sequence: u64) !void {
+        if (sequence == 0) return;
+        const io_impl = self.io_impl orelse return error.MissingBackendRuntimeIo;
+        const io = io_impl.io();
+
+        self.notifySequence(sequence);
+        while (true) {
+            self.mutex.lockUncancelable(io);
+            const applied = self.applied_sequence;
+            const failed = self.last_error_name != null;
+            const retrying = self.retrying;
+            self.mutex.unlock(io);
+
+            if (failed) return RuntimeError.EnrichmentWorkerFailed;
+            if (applied >= sequence) return;
+            if (retrying) return RuntimeError.EnrichmentRetryInProgress;
+            try runForegroundCatchUpPass(self, io, sequence);
+        }
+    }
+
     pub fn markAppliedThrough(self: *EnrichmentRuntime, sequence: u64) !void {
         const io_impl = self.io_impl orelse return error.MissingBackendRuntimeIo;
         const io = io_impl.io();
@@ -1570,118 +1595,107 @@ fn workerMain(runtime: *EnrichmentRuntime) void {
         const target_sequence = runtime.target_sequence;
         runtime.mutex.unlock(io);
 
-        const now_ms = runtime.config.clock.nowRealtimeMs();
-        runtime.mutex.lockUncancelable(io);
-        const acquired = runtime.ownership.ensureLease(now_ms) catch |err| {
-            runtime.ownership.noteAcquireFailure();
-            runtime.mutex.unlock(io);
-            runtime.recordError(io, err);
-            continue :worker_loop;
-        };
-        runtime.mutex.unlock(io);
-        if (!acquired) {
-            io.sleep(Io.Duration.zero, .awake) catch {};
-            continue;
-        }
-
-        const pending = enrichment_worker.collectPendingDocumentGroups(runtime.alloc, runtime.replay_source, runtime.applied_sequence) catch |err| {
+        runForegroundCatchUpPass(runtime, io, target_sequence) catch |err| {
             handleWorkerLoopError(runtime, io, err);
             continue :worker_loop;
         };
-        defer enrichment_worker.freePendingDocumentGroups(runtime.alloc, pending);
+    }
+}
 
-        var processed_request_count: u64 = 0;
-        var max_seen = runtime.applied_sequence;
+fn runForegroundCatchUpPass(runtime: *EnrichmentRuntime, io: Io, target_sequence: u64) !void {
+    const now_ms = runtime.config.clock.nowRealtimeMs();
+    runtime.mutex.lockUncancelable(io);
+    const acquired = runtime.ownership.ensureLease(now_ms) catch |err| {
+        runtime.ownership.noteAcquireFailure();
+        runtime.mutex.unlock(io);
+        return err;
+    };
+    runtime.mutex.unlock(io);
+    if (!acquired) {
+        io.sleep(Io.Duration.zero, .awake) catch {};
+        return;
+    }
 
-        retry_pending: while (true) {
-            var chunk_cache = std.ArrayListUnmanaged(WorkerChunkCacheEntry).empty;
-            defer freeWorkerChunkCache(runtime.alloc, &chunk_cache);
-            var request_plan_cache = std.ArrayListUnmanaged(RequestPlanCacheEntry).empty;
-            defer freeRequestPlanCache(runtime.alloc, &request_plan_cache);
-            var deferred_plain_dense = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest).empty;
-            defer deferred_plain_dense.deinit(runtime.alloc);
-            var deferred_chunked_dense = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest).empty;
-            defer deferred_chunked_dense.deinit(runtime.alloc);
-            var window = GeneratedReplayWindow{ .alloc = runtime.alloc };
-            defer window.deinit();
-            const max_window_items = generatedReplayWindowItems();
+    const pending = try enrichment_worker.collectPendingDocumentGroups(runtime.alloc, runtime.replay_source, runtime.applied_sequence);
+    defer enrichment_worker.freePendingDocumentGroups(runtime.alloc, pending);
 
-            processed_request_count = 0;
-            max_seen = runtime.applied_sequence;
+    var processed_request_count: u64 = 0;
+    var max_seen = runtime.applied_sequence;
 
-            for (pending) |group| {
-                max_seen = @max(max_seen, group.sequence);
-                processPendingDocumentGroup(runtime, group, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &window, &processed_request_count) catch |err| {
-                    handleWorkerLoopError(runtime, io, err);
-                    if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return;
-                    if (isRetryableEnrichmentError(err)) continue :retry_pending;
-                    continue :worker_loop;
-                };
-                flushGeneratedReplayWindowIfNeeded(runtime, &window, max_window_items) catch |err| {
-                    handleWorkerLoopError(runtime, io, err);
-                    if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return;
-                    if (isRetryableEnrichmentError(err)) continue :retry_pending;
-                    continue :worker_loop;
-                };
-            }
-            processPlainDenseWindow(runtime, deferred_plain_dense.items, &window) catch |err| {
-                handleWorkerLoopError(runtime, io, err);
-                if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return;
+    retry_pending: while (true) {
+        var chunk_cache = std.ArrayListUnmanaged(WorkerChunkCacheEntry).empty;
+        defer freeWorkerChunkCache(runtime.alloc, &chunk_cache);
+        var request_plan_cache = std.ArrayListUnmanaged(RequestPlanCacheEntry).empty;
+        defer freeRequestPlanCache(runtime.alloc, &request_plan_cache);
+        var deferred_plain_dense = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest).empty;
+        defer deferred_plain_dense.deinit(runtime.alloc);
+        var deferred_chunked_dense = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest).empty;
+        defer deferred_chunked_dense.deinit(runtime.alloc);
+        var window = GeneratedReplayWindow{ .alloc = runtime.alloc };
+        defer window.deinit();
+        const max_window_items = generatedReplayWindowItems();
+
+        processed_request_count = 0;
+        max_seen = runtime.applied_sequence;
+
+        for (pending) |group| {
+            max_seen = @max(max_seen, group.sequence);
+            processPendingDocumentGroup(runtime, group, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &window, &processed_request_count) catch |err| {
+                if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
                 if (isRetryableEnrichmentError(err)) continue :retry_pending;
-                continue :worker_loop;
+                return err;
             };
-            processChunkedDenseWindow(runtime, deferred_chunked_dense.items, &chunk_cache, &window) catch |err| {
-                handleWorkerLoopError(runtime, io, err);
-                if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return;
+            flushGeneratedReplayWindowIfNeeded(runtime, &window, max_window_items) catch |err| {
+                if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
                 if (isRetryableEnrichmentError(err)) continue :retry_pending;
-                continue :worker_loop;
+                return err;
             };
-            flushGeneratedReplayWindow(runtime, &window) catch |err| {
-                handleWorkerLoopError(runtime, io, err);
-                if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return;
-                if (isRetryableEnrichmentError(err)) continue :retry_pending;
-                continue :worker_loop;
-            };
-            break :retry_pending;
         }
-        if (pending.len == 0) {
-            max_seen = target_sequence;
-        }
+        processPlainDenseWindow(runtime, deferred_plain_dense.items, &window) catch |err| {
+            if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
+            if (isRetryableEnrichmentError(err)) continue :retry_pending;
+            return err;
+        };
+        processChunkedDenseWindow(runtime, deferred_chunked_dense.items, &chunk_cache, &window) catch |err| {
+            if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
+            if (isRetryableEnrichmentError(err)) continue :retry_pending;
+            return err;
+        };
+        flushGeneratedReplayWindow(runtime, &window) catch |err| {
+            if (err == error.EnrichmentRetryAborted and runtimeShuttingDown(runtime)) return err;
+            if (isRetryableEnrichmentError(err)) continue :retry_pending;
+            return err;
+        };
+        break :retry_pending;
+    }
+    if (pending.len == 0) {
+        max_seen = target_sequence;
+    }
 
-        if (max_seen > runtime.applied_sequence) {
-            saveAppliedSequenceWithRetry(runtime, scope_name, max_seen) catch |err| {
-                handleWorkerLoopError(runtime, io, err);
-                continue :worker_loop;
-            };
-            var status: enrichment_state.RuntimeStatus = .{};
-            runtime.mutex.lockUncancelable(io);
-            runtime.applied_sequence = max_seen;
-            runtime.processed_requests += processed_request_count;
-            runtime.retrying = false;
-            runtime.worker_failed = false;
-            clearPublishedGeneratedArtifacts(runtime);
-            status = runtimeStatusSnapshot(runtime);
-            runtime.cond.broadcast(io);
-            runtime.mutex.unlock(io);
-            saveRuntimeStatusWithRetry(runtime, scope_name, status) catch |err| {
-                handleWorkerLoopError(runtime, io, err);
-                continue :worker_loop;
-            };
-            runtime.notifyStatusHook();
-        } else if (pending.len == 0) {
-            var status: enrichment_state.RuntimeStatus = .{};
-            runtime.mutex.lockUncancelable(io);
-            runtime.retrying = false;
-            runtime.worker_failed = false;
-            status = runtimeStatusSnapshot(runtime);
-            runtime.cond.broadcast(io);
-            runtime.mutex.unlock(io);
-            saveRuntimeStatusWithRetry(runtime, scope_name, status) catch |err| {
-                handleWorkerLoopError(runtime, io, err);
-                continue :worker_loop;
-            };
-            runtime.notifyStatusHook();
-        }
+    if (max_seen > runtime.applied_sequence) {
+        try saveAppliedSequenceWithRetry(runtime, scope_name, max_seen);
+        var status: enrichment_state.RuntimeStatus = .{};
+        runtime.mutex.lockUncancelable(io);
+        runtime.applied_sequence = max_seen;
+        runtime.processed_requests += processed_request_count;
+        runtime.retrying = false;
+        runtime.worker_failed = false;
+        clearPublishedGeneratedArtifacts(runtime);
+        status = runtimeStatusSnapshot(runtime);
+        runtime.cond.broadcast(io);
+        runtime.mutex.unlock(io);
+        try saveRuntimeStatusWithRetry(runtime, scope_name, status);
+        runtime.notifyStatusHook();
+    } else if (pending.len == 0) {
+        var status: enrichment_state.RuntimeStatus = .{};
+        runtime.mutex.lockUncancelable(io);
+        runtime.retrying = false;
+        runtime.worker_failed = false;
+        status = runtimeStatusSnapshot(runtime);
+        runtime.cond.broadcast(io);
+        runtime.mutex.unlock(io);
+        try saveRuntimeStatusWithRetry(runtime, scope_name, status);
+        runtime.notifyStatusHook();
     }
 }
 

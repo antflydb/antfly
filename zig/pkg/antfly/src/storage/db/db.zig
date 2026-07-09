@@ -275,6 +275,7 @@ pub const OpenOptions = struct {
     remote_content: ?*const scraping.RemoteContentConfig = null,
     start_index_workers: bool = true,
     start_optional_runtimes: bool = true,
+    start_optional_runtime_workers: bool = true,
     external_derived_checkpoints: bool = true,
     enrichment: ?enrichment_runtime_mod.Config = null,
     ttl_cleanup: ttl_runtime_mod.Config = .{},
@@ -2724,6 +2725,7 @@ pub const DB = struct {
     owned_backend_runtime: ?background_runtime_mod.BackendRuntimeHandle,
     executor: *derived_executor_mod.Executor,
     start_index_workers: bool,
+    optional_runtime_workers_enabled: bool,
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
     enrichment_append_context: ?*EnrichmentAppendContext,
@@ -3002,6 +3004,7 @@ pub const DB = struct {
                 .owned_backend_runtime = owned_backend_runtime,
                 .executor = executor,
                 .start_index_workers = start_index_workers,
+                .optional_runtime_workers_enabled = false,
                 .secret_store = opts.secret_store,
                 .remote_content = opts.remote_content,
                 .enrichment_append_context = null,
@@ -3033,8 +3036,10 @@ pub const DB = struct {
             try db.initAsyncInfrastructure(effective_executor, opts.resource_manager);
             profile.init_async_infrastructure_ns = elapsedSince(init_async_started_ns);
             executor_ready = true;
-            const optional_runtimes_enabled = opts.open_mode.allowsOptionalRuntimes() and opts.start_optional_runtimes and !ha_standby_role;
-            if (optional_runtimes_enabled) {
+            const optional_runtimes_initialized = opts.open_mode.allowsOptionalRuntimes() and opts.start_optional_runtimes and !ha_standby_role;
+            const optional_runtime_workers_enabled = optional_runtimes_initialized and opts.start_optional_runtime_workers;
+            db.optional_runtime_workers_enabled = optional_runtime_workers_enabled;
+            if (optional_runtimes_initialized) {
                 const init_optional_started_ns = monotonicTimeNs();
                 try db.initOptionalRuntimes(opts);
                 profile.init_optional_runtimes_ns = elapsedSince(init_optional_started_ns);
@@ -3074,7 +3079,7 @@ pub const DB = struct {
                 };
                 profile.replay_pending_derived_ns = elapsedSince(replay_started_ns);
             }
-            if (optional_runtimes_enabled) {
+            if (optional_runtime_workers_enabled) {
                 try db.resumeGeneratedReplayFromJournalIfNeeded();
             }
             if (db.start_index_workers) {
@@ -3085,12 +3090,12 @@ pub const DB = struct {
                 }
                 profile.start_index_workers_ns = elapsedSince(start_workers_started_ns);
             }
-            if (optional_runtimes_enabled) {
+            if (optional_runtime_workers_enabled) {
                 const start_optional_started_ns = monotonicTimeNs();
                 try db.startOptionalRuntimes();
                 profile.start_optional_runtimes_ns = elapsedSince(start_optional_started_ns);
             }
-            if (optional_runtimes_enabled and opts.open_mode == .writer) {
+            if (optional_runtime_workers_enabled and opts.open_mode == .writer) {
                 db.startQuarantineRetryWorkerIfNeeded();
             }
             profile.total_ns = monotonicTimeNs() - open_started_ns;
@@ -10151,6 +10156,10 @@ pub const DB = struct {
     pub fn runEnrichmentUntil(self: *DB, sequence: u64) !void {
         if (sequence == 0) return;
         if (self.enrichment_runtime) |runtime| {
+            if (!self.optional_runtime_workers_enabled) {
+                try runtime.catchUpUntil(sequence);
+                return;
+            }
             runtime.notifySequence(sequence);
             try runtime.waitForApplied(sequence);
         }

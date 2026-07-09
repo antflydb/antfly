@@ -6,6 +6,57 @@ boundaries, and local-shard execution roadmap work.
 For the canonical enrichment architecture and artifact identity contract, see
 [ENRICHMENTS.md](ENRICHMENTS.md).
 
+## DB Handle And Runtime Ownership Contract
+
+`DB.open()` must not make the caller's role ambiguous. A DB handle can be a
+storage/query handle, a foreground maintenance handle, or the authoritative
+runtime owner for a shard, but those roles have different side-effect budgets.
+
+The serving layer may open multiple handles for the same table-group root:
+
+- one live writer/runtime-owner handle
+- read-only query handles
+- status-only handles
+- short-lived foreground maintenance handles such as restore repair or startup
+  catch-up
+
+Multiple handles are acceptable only when background runtime ownership remains
+singular and explicit. The live writer/runtime owner is the only role that
+should start long-lived optional workers such as generated enrichment replay,
+TTL cleanup, transaction recovery, text merge, sparse compaction, and
+quarantine retry. Query and status handles must be side-effect-free. Restore
+repair and startup catch-up may mutate derived/index state, but only as
+exclusive foreground maintenance operations under table/group lifecycle gates.
+
+The DB layer therefore separates three concepts:
+
+- storage capability: whether the handle can write the primary/index stores
+- runtime initialization: whether helper runtimes are constructed so foreground
+  code can use their replay/apply logic
+- runtime worker ownership: whether background workers are started and allowed
+  to keep running after open
+
+Restore repair is the important example. A restored shard with generated
+chunking or generated embeddings needs the enrichment runtime's replay logic to
+materialize chunk and embedding artifacts. It must not start every optional
+runtime worker just to get that capability. Instead, restore repair initializes
+only the required runtime services, drives generated enrichment replay in the
+foreground, drains derived/index replay, syncs state, and then closes the
+maintenance handle.
+
+The invariant is:
+
+```text
+one background runtime owner per shard root
+many short-lived foreground handles allowed
+foreground handles do not wait on background workers they did not start
+```
+
+If a maintenance phase needs runtime behavior, the runtime must expose a
+foreground catch-up API. Waiting for a background worker from a handle opened
+with workers disabled is a bug; starting broad optional workers to avoid that
+wait is also a bug.
+
 ## Write Contract
 
 `DB.batch()` is document-first.

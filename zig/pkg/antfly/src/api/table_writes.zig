@@ -13591,7 +13591,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                         .ha_write_gate = open_options.ha_write_gate,
                         .open_mode = .writer_no_replay,
                         .start_index_workers = false,
-                        .start_optional_runtimes = false,
+                        .start_optional_runtime_workers = false,
                         .ttl_cleanup = .{ .enabled = false },
                         .transaction_recovery = .{ .enabled = false },
                         .text_merge = .{ .enabled = false },
