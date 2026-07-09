@@ -1135,6 +1135,10 @@ pub const ApiHttpServer = struct {
         };
     }
 
+    pub fn setHAInternalExecutor(self: *ApiHttpServer, executor_value: ?http_common.RequestExecutor) void {
+        self.cfg.ha_internal_executor = executor_value;
+    }
+
     pub fn configuredInferenceAPIURL(self: *const ApiHttpServer) ?[]const u8 {
         const node_config = self.cfg.node_config orelse return null;
         return node_config.inference.api_url;

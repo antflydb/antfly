@@ -103,6 +103,11 @@ pub const Receipt = struct {
     }
 };
 
+pub const ReceiptBinding = struct {
+    old_primary_id: []const u8,
+    parent_identity: standby_mod.Identity,
+};
+
 const OwnedReceipt = struct {
     receipt: Receipt,
 
@@ -155,7 +160,12 @@ pub const Store = struct {
         return current_receipt.receipt;
     }
 
-    pub fn recordReceipt(self: *Store, receipt: Receipt) !void {
+    pub fn recordVerifiedReceipt(self: *Store, receipt: Receipt, binding: ReceiptBinding) !void {
+        try validateReceiptBinding(receipt, binding);
+        try self.recordReceipt(receipt);
+    }
+
+    fn recordReceipt(self: *Store, receipt: Receipt) !void {
         try validateReceipt(receipt);
         if (self.current_receipt) |held| {
             if (sameReceipt(held.receipt, receipt)) return;
@@ -294,6 +304,16 @@ pub fn validateReceipt(receipt: Receipt) !void {
     {
         return error.FenceFieldTooLong;
     }
+}
+
+pub fn validateReceiptBinding(receipt: Receipt, binding: ReceiptBinding) !void {
+    try validateReceipt(receipt);
+    if (!std.mem.eql(u8, receipt.old_primary_id, binding.old_primary_id)) return error.RejoinReceiptBindingMismatch;
+    if (receipt.identity.cluster_id != binding.parent_identity.cluster_id) return error.WrongCluster;
+    if (receipt.identity.shard_id != binding.parent_identity.shard_id) return error.WrongShard;
+    if (receipt.identity.table_id != binding.parent_identity.table_id) return error.WrongTable;
+    if (receipt.parent_timeline_id != binding.parent_identity.timeline_id) return error.WrongTimeline;
+    if (receipt.parent_epoch != binding.parent_identity.epoch) return error.WrongEpoch;
 }
 
 fn sameFence(receipt: Receipt, request: FenceRequest) bool {

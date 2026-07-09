@@ -1052,6 +1052,7 @@ pub fn runFromIterator(
                 .fence_store = if (ha_fence_store) |*store| store else null,
                 .former_primary_log = if (ha_former_primary_log) |*log| log else null,
             },
+            .standby_owner = if (ha_standby != null) &ha_standby else null,
             .admin_bearer_token = ha_admin_bearer_token,
             .internal_primary = if (ha_primary) |*primary| primary else null,
             .primary_retention_policy = ha_retention_policy,

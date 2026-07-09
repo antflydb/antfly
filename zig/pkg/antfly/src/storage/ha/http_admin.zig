@@ -817,18 +817,19 @@ pub const Server = struct {
             }
         else
             null;
-        if (receipt) |fence| {
-            if (self.ctx.fence_store) |fence_store| {
-                fence_store.recordReceipt(fence) catch |err| {
-                    return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
-                };
-            }
-        }
 
         if (expected_action != null and expected_action.? == .rewind and self.ctx.former_primary_log == null) {
             const log = self.rejoinRewindLog() orelse
                 return try textResponse(self.alloc, 409, "FormerPrimaryLogUnavailable");
             last_lsn = log.lastLsn();
+        }
+
+        if (expected_action != null) {
+            if (receipt) |fence| {
+                self.validateRejoinReceiptBinding(parsed.value.node_id, identity, fence) catch {
+                    return try textResponse(self.alloc, 400, "invalid HA rejoin receipt binding");
+                };
+            }
         }
 
         const assessment = ha_admin.assessFormerPrimaryRejoin(.{
@@ -848,6 +849,12 @@ pub const Server = struct {
                     else => "HA rejoin assessment does not allow requested action",
                 };
                 return try textResponse(self.alloc, 409, message);
+            }
+
+            if (receipt) |fence| {
+                self.recordVerifiedLocalRejoinReceipt(parsed.value.node_id, identity, fence) catch |err| {
+                    return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
+                };
             }
 
             if (expected == .rewind) {
@@ -907,6 +914,24 @@ pub const Server = struct {
                 .node_id = assessment.former_node_id,
             },
             .assessment = try adminRejoinAssessment(assessment),
+        });
+    }
+
+    fn validateRejoinReceiptBinding(self: *Server, node_id: []const u8, identity: standby_mod.Identity, receipt: fencing.Receipt) !void {
+        _ = self;
+        try fencing.validateReceiptBinding(receipt, .{
+            .old_primary_id = node_id,
+            .parent_identity = identity,
+        });
+    }
+
+    fn recordVerifiedLocalRejoinReceipt(self: *Server, node_id: []const u8, identity: standby_mod.Identity, receipt: fencing.Receipt) !void {
+        const local_node_id = self.ctx.primary_node_id orelse return;
+        if (!std.mem.eql(u8, local_node_id, node_id)) return;
+        const fence_store = self.ctx.fence_store orelse return;
+        try fence_store.recordVerifiedReceipt(receipt, .{
+            .old_primary_id = node_id,
+            .parent_identity = identity,
         });
     }
 
@@ -1925,6 +1950,7 @@ fn commandErrorStatus(err: anyerror) u16 {
         error.WrongTable,
         error.WrongTimeline,
         error.WrongEpoch,
+        error.RejoinReceiptBindingMismatch,
         => 400,
         else => 500,
     };
@@ -2065,7 +2091,14 @@ test "storage.ha http admin executes typed former primary log rewind when config
     _ = try former_log.append(alloc, baseRecord(identity, 2, "two"));
     _ = try former_log.append(alloc, baseRecord(identity, 3, "diverged"));
 
-    var server = Server.init(alloc, .{ .former_primary_log = &former_log });
+    var fence_store = try fencing.Store.open(alloc, paths.fence_wal.ptr, .{});
+    defer fence_store.close();
+
+    var server = Server.init(alloc, .{
+        .primary_node_id = "primary-a",
+        .fence_store = &fence_store,
+        .former_primary_log = &former_log,
+    });
     defer server.deinit();
 
     const body =
@@ -2087,6 +2120,10 @@ test "storage.ha http admin executes typed former primary log rewind when config
     try expectContains(rewind.body, "\"node_id\":\"primary-a\"");
     try expectContains(rewind.body, "\"discarded_lsn_count\":1");
     try std.testing.expectEqual(@as(u64, 2), former_log.lastLsn());
+    const current_receipt = (try fence_store.current(alloc)) orelse return error.TestExpectedEqual;
+    defer fencing.freeReceipt(alloc, current_receipt);
+    try std.testing.expectEqualStrings("primary-a", current_receipt.old_primary_id);
+    try std.testing.expectEqualStrings("standby-a", current_receipt.promoted_node_id);
 
     var stale = try server.handle(.{
         .method = .POST,
@@ -2113,6 +2150,60 @@ test "storage.ha http admin rejects typed former primary rewind on node without 
     defer response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 409), response.status);
     try expectContains(response.body, "FormerPrimaryLogUnavailable");
+}
+
+test "storage.ha http admin does not persist rejoin assess receipts" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "rejoin-assess-readonly");
+    defer paths.deinit(alloc);
+
+    var fence_store = try fencing.Store.open(alloc, paths.fence_wal.ptr, .{});
+    defer fence_store.close();
+    var server = Server.init(alloc, .{
+        .primary_node_id = "primary-a",
+        .fence_store = &fence_store,
+    });
+    defer server.deinit();
+
+    var response = try server.handle(.{
+        .method = .POST,
+        .uri = admin_api.routes.ha_rejoin_assess,
+        .content_type = "application/json",
+        .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":3,\"retained_from_lsn\":1,\"allow_rewind_after_forced_promotion\":false,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-a\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":2,\"observed_lsn\":2,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}",
+    });
+    defer response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), response.status);
+    try expectContains(response.body, "\"action_kind\":\"rejoin_assess\"");
+    try expectContains(response.body, "\"action\":\"rewind\"");
+    try std.testing.expect((try fence_store.current(alloc)) == null);
+}
+
+test "storage.ha http admin rejects unbound rejoin receipts before persisting" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "rejoin-receipt-binding");
+    defer paths.deinit(alloc);
+
+    var former_log = try replication_log.ReplicationLog.open(paths.primary_log.ptr, .{});
+    defer former_log.close();
+    var fence_store = try fencing.Store.open(alloc, paths.fence_wal.ptr, .{});
+    defer fence_store.close();
+    var server = Server.init(alloc, .{
+        .primary_node_id = "primary-a",
+        .fence_store = &fence_store,
+        .former_primary_log = &former_log,
+    });
+    defer server.deinit();
+
+    var response = try server.handle(.{
+        .method = .POST,
+        .uri = admin_api.routes.ha_rejoin_rewind,
+        .content_type = "application/json",
+        .body = "{\"node_id\":\"primary-a\",\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":1,\"epoch\":1},\"last_lsn\":3,\"retained_from_lsn\":1,\"allow_rewind_after_forced_promotion\":false,\"receipt\":{\"identity\":{\"cluster_id\":100,\"shard_id\":10,\"table_id\":20,\"timeline_id\":2,\"epoch\":2},\"old_primary_id\":\"primary-b\",\"promoted_node_id\":\"standby-a\",\"parent_timeline_id\":1,\"parent_epoch\":1,\"new_timeline_id\":2,\"new_epoch\":2,\"required_lsn\":2,\"observed_lsn\":2,\"generation\":1,\"forced\":false,\"token\":\"token\",\"reason\":\"http-admin-test\"}}",
+    });
+    defer response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), response.status);
+    try expectContains(response.body, "invalid HA rejoin receipt binding");
+    try std.testing.expect((try fence_store.current(alloc)) == null);
 }
 
 test "storage.ha http admin marks former primary slot for typed reseed" {
