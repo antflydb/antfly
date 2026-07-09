@@ -946,8 +946,9 @@ pub const DBCore = struct {
 
     pub fn setSchema(self: *DBCore, table_schema: schema_mod.TableSchema) !void {
         try schema_mod.saveSchema(self.store, self.alloc, table_schema);
+        const next_schema = try schema_mod.loadSchema(self.store, self.alloc);
         if (self.schema) |existing| schema_mod.freeSchema(self.alloc, existing);
-        self.schema = try schema_mod.loadSchema(self.store, self.alloc);
+        self.schema = next_schema;
     }
 
     pub fn saveSchemaCloneTo(self: *DBCore, dest_store: *docstore_mod.DocStore) !void {
@@ -1613,15 +1614,23 @@ pub fn importStoreSnapshot(alloc: Allocator, store: *docstore_mod.DocStore, snap
     var decoded = try lsm_table_file.decodeAlloc(alloc, raw);
     defer decoded.deinit(alloc);
 
-    var writes = try alloc.alloc(docstore_mod.KVPair, decoded.entries.len);
-    defer alloc.free(writes);
-    for (decoded.entries, 0..) |entry, i| {
-        writes[i] = .{
-            .key = entry.key,
-            .value = entry.value,
-        };
+    const batch_size = 8192;
+    var offset: usize = 0;
+    while (offset < decoded.entries.len) {
+        const end = @min(offset + batch_size, decoded.entries.len);
+        const writes = try alloc.alloc(docstore_mod.KVPair, end - offset);
+        defer alloc.free(writes);
+        for (decoded.entries[offset..end], 0..) |entry, i| {
+            writes[i] = .{
+                .key = entry.key,
+                .value = entry.value,
+            };
+        }
+        try store.putBatch(writes, &.{});
+        offset = end;
     }
-    try store.putBatch(writes, &.{});
+
+    try store.sync(true);
 }
 
 pub fn importChangeJournalSnapshot(alloc: Allocator, store: *docstore_mod.DocStore, snapshot_root: []const u8) !void {
@@ -1664,25 +1673,43 @@ fn writeStoreSnapshot(alloc: Allocator, store: *docstore_mod.DocStore, snapshot_
     const snapshot_path = try std.fmt.allocPrint(alloc, "{s}/store.bin", .{snapshot_root});
     defer alloc.free(snapshot_path);
 
-    const docs = try store.scanRange(alloc, "", "");
-    defer docstore_mod.DocStore.freeResults(alloc, docs);
+    var builder = StoreSnapshotEntryBuilder{ .alloc = alloc };
+    defer builder.deinit();
+    try store.scanWithContext("", "", .{}, &builder, StoreSnapshotEntryBuilder.scanEntry);
 
-    var entries = try alloc.alloc(lsm_table_file.Entry, docs.len);
-    defer alloc.free(entries);
-    for (docs, 0..) |doc, i| {
-        entries[i] = .{
-            .namespace_name = null,
-            .key = doc.key,
-            .value = doc.value,
-            .tombstone = false,
-        };
-    }
-
-    const encoded = try lsm_table_file.encodeAlloc(alloc, entries);
+    const encoded = try lsm_table_file.encodeAlloc(alloc, builder.entries.items);
     defer alloc.free(encoded);
     try writeFileAbsolute(snapshot_path, encoded);
     return encoded.len;
 }
+
+const StoreSnapshotEntryBuilder = struct {
+    alloc: Allocator,
+    entries: std.ArrayListUnmanaged(lsm_table_file.Entry) = .empty,
+
+    fn deinit(self: *@This()) void {
+        for (self.entries.items) |entry| {
+            self.alloc.free(@constCast(entry.key));
+            self.alloc.free(@constCast(entry.value));
+        }
+        self.entries.deinit(self.alloc);
+    }
+
+    fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+        const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        const owned_key = try self.alloc.dupe(u8, key);
+        errdefer self.alloc.free(owned_key);
+        const owned_value = try self.alloc.dupe(u8, value);
+        errdefer self.alloc.free(owned_value);
+        try self.entries.append(self.alloc, .{
+            .namespace_name = null,
+            .key = owned_key,
+            .value = owned_value,
+            .tombstone = false,
+        });
+        return .@"continue";
+    }
+};
 
 fn threadedIo() if (builtin.os.tag == .freestanding) void else std.Io.Threaded {
     if (builtin.os.tag == .freestanding) return;

@@ -8065,6 +8065,8 @@ pub const DB = struct {
     }
 
     pub fn snapshot(self: *DB, id: []const u8) !u64 {
+        try self.runMaintenanceUntil(self.currentMaintenanceTargetSequence(), .{});
+
         lockApply(self);
         defer self.core.unlockApply();
 
@@ -8357,6 +8359,7 @@ pub const DB = struct {
         }
         if (std.mem.eql(u8, phase, "sync_indexes")) {
             std.log.info("restore runtime repair complete runtime indexes path={s}", .{self.core.path});
+            try self.core.index_manager.syncAll(true);
             try markRestoreRuntimeRepairComplete(alloc, self.core.path);
             std.log.info("restore runtime repair marked complete path={s}", .{self.core.path});
             return true;
@@ -10417,11 +10420,12 @@ pub const DB = struct {
 
     fn runRestoreRepairDrainAsync(self: *DB) !void {
         // Earlier repair phases synchronously rebuild restored runtime state.
-        // At this point only persisted applied-sequence watermarks need to be
-        // flushed before the final index sync/complete marker. Do not call
-        // runUntilIdle here: large portable restores can leave substantial
-        // replay, posting-maintenance, or LSM maintenance debt, and queries
-        // remain correct while that background-maintenance debt is paid down.
+        // At this point replay-driven runtimes must publish a fresh query view
+        // before the final index sync/complete marker. Keep the drain scoped to
+        // derived/replay stages: large portable restores can still leave
+        // substantial posting or LSM maintenance debt, and queries remain
+        // correct while that background-maintenance debt is paid down.
+        try self.drainReplayStagesUntilStable();
         try self.flushAppliedSequencesForIdle();
     }
 

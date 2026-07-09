@@ -5463,6 +5463,10 @@ pub const ApiHttpServer = struct {
         if (manifest.read_schema_json.len > 0) return error.UnsupportedBackupMigrationState;
         if (try self.tableExists(table_name)) return error.TableAlreadyExists;
 
+        const table_writes_source = self.table_writes orelse return error.UnsupportedOperation;
+        const restore_lifecycle_active = try table_writes_source.beginRestoreLifecycle(table_name);
+        defer if (restore_lifecycle_active) table_writes_source.finishRestoreLifecycle(table_name);
+
         var create_req = backups_api.createTableRequestFromManifest(self.alloc, &manifest) catch {
             return error.UnsupportedBackupFormat;
         };
@@ -5480,7 +5484,6 @@ pub const ApiHttpServer = struct {
         if (try self.tableExists(table_name)) created_metadata = true;
         errdefer if (created_metadata) self.source.dropTable(self.alloc, table_name) catch {};
 
-        const table_writes_source = self.table_writes orelse return error.UnsupportedOperation;
         const local_backup_root = switch (backup_location.*) {
             .file => |value| value,
             .remote => try createBackupStagingRoot(self.alloc, backup_id),
@@ -5505,13 +5508,6 @@ pub const ApiHttpServer = struct {
 
         const timeout_ns = 30 * std.time.ns_per_s;
         const poll_interval_ns = 50 * std.time.ns_per_ms;
-        var portable_restore = false;
-        for (manifest.shards) |shard| {
-            if (std.mem.endsWith(u8, shard.snapshot_path, ".afb")) {
-                portable_restore = true;
-                break;
-            }
-        }
         var restore_attempt: usize = 0;
         while (restore_attempt < 3) : (restore_attempt += 1) {
             const start_ns = platform_time.monotonicNs();
@@ -5532,30 +5528,7 @@ pub const ApiHttpServer = struct {
                 sleepNs(poll_interval_ns);
             }
 
-            if (portable_restore) return;
-
-            // Wait until the read path can see the restored data. A null probe
-            // means the catalog hasn't propagated the table yet; keep polling
-            // rather than optimistically assuming success.
-            const verify_deadline_ns = platform_time.monotonicNs() + 10 * std.time.ns_per_s;
-            while (true) {
-                const storage_status = self.probeTableStorageStatus(table_name) catch null;
-                if (storage_status) |status| {
-                    if (!status.empty) break;
-                }
-                if (platform_time.monotonicNs() >= verify_deadline_ns) break;
-                sleepNs(poll_interval_ns);
-            }
-
-            const storage_status = self.probeTableStorageStatus(table_name) catch null;
-            if (storage_status != null and !storage_status.?.empty) return;
-            std.log.info("restoreOwnedTable data not visible via read path table={s} backup_id={s} attempt={d}", .{
-                table_name,
-                backup_id,
-                restore_attempt + 1,
-            });
-            if (restore_attempt + 1 >= 3) return error.TableVisibilityTimeout;
-            sleepNs(500 * std.time.ns_per_ms);
+            return;
         }
     }
 
@@ -6991,6 +6964,7 @@ pub const ApiHttpServer = struct {
         location: *backups_api.BackupLocation,
     ) cluster_api_http.ClusterApi.ExecuteBackupError![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        const op_alloc = self.alloc;
 
         self.source.ensureLinearizableRead() catch |err| {
             if (isRetryableMetadataLeadershipError(err)) return error.NotLeader;
@@ -6998,44 +6972,49 @@ pub const ApiHttpServer = struct {
             return error.InternalFailure;
         };
 
-        var all_tables_snapshot: ?metadata_api.AdminSnapshot = null;
-        defer if (all_tables_snapshot) |*snapshot| self.source.freeAdminSnapshot(snapshot);
-        var borrowed_table_names: ?[][]const u8 = null;
-        defer if (borrowed_table_names) |names| alloc.free(names);
-        const table_names: []const []const u8 = if (req.table_names) |values| values else blk: {
-            all_tables_snapshot = (self.source.adminSnapshot() catch |err| return metadataAccessFailure(err)) orelse {
-                borrowed_table_names = alloc.alloc([]const u8, 0) catch return error.InternalFailure;
-                break :blk borrowed_table_names.?;
-            };
-            borrowed_table_names = borrowedTableNamesFromAdminSnapshot(alloc, &all_tables_snapshot.?) catch return error.InternalFailure;
-            break :blk borrowed_table_names.?;
+        const table_names: [][]u8 = if (req.table_names) |values|
+            cloneTableNamesAlloc(op_alloc, values) catch return error.InternalFailure
+        else blk: {
+            var snapshot = (self.source.adminSnapshot() catch |err| return metadataAccessFailure(err)) orelse
+                break :blk op_alloc.alloc([]u8, 0) catch return error.InternalFailure;
+            defer self.source.freeAdminSnapshot(&snapshot);
+            break :blk tableNamesFromAdminSnapshotAlloc(op_alloc, &snapshot) catch return error.InternalFailure;
         };
+        defer freeOwnedTableNames(op_alloc, table_names);
 
-        const statuses = alloc.alloc(backups_api.ClusterTableBackupStatus, table_names.len) catch return error.InternalFailure;
-        defer alloc.free(statuses);
+        const statuses = op_alloc.alloc(backups_api.ClusterTableBackupStatus, table_names.len) catch return error.InternalFailure;
+        const status_names = op_alloc.alloc([]u8, table_names.len) catch {
+            op_alloc.free(statuses);
+            return error.InternalFailure;
+        };
+        var status_name_count: usize = 0;
+        defer {
+            for (status_names[0..status_name_count]) |name| op_alloc.free(name);
+            op_alloc.free(status_names);
+            op_alloc.free(statuses);
+        }
         var cluster_tables = std.ArrayListUnmanaged(backups_api.ClusterTableBackupEntry).empty;
         defer {
-            for (cluster_tables.items) |*entry| entry.deinit(alloc);
-            cluster_tables.deinit(alloc);
+            for (cluster_tables.items) |*entry| entry.deinit(op_alloc);
+            cluster_tables.deinit(op_alloc);
         }
-        var extension_snapshot_opt: ?metadata_api.AdminSnapshot = null;
-        defer if (extension_snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
-        const extension_snapshot: ?*const metadata_api.AdminSnapshot = if (all_tables_snapshot) |*snapshot|
-            snapshot
-        else blk: {
-            extension_snapshot_opt = self.source.adminSnapshot() catch |err| switch (err) {
-                error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
-                else => null,
-            };
-            break :blk if (extension_snapshot_opt) |*snapshot| snapshot else null;
+        var extension_snapshot_opt = self.source.adminSnapshot() catch |err| switch (err) {
+            error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
+            else => null,
         };
+        defer if (extension_snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
+        const extension_snapshot: ?*const metadata_api.AdminSnapshot = if (extension_snapshot_opt) |*snapshot| snapshot else null;
 
         for (table_names, 0..) |table_name, i| {
-            statuses[i] = .{ .name = table_name, .status = "failed", .@"error" = null };
-            const table_backup_id = backups_api.clusterTableBackupId(alloc, req.backup_id, table_name) catch return error.InternalFailure;
+            const status_name = op_alloc.dupe(u8, table_name) catch return error.InternalFailure;
+            status_names[status_name_count] = status_name;
+            status_name_count += 1;
+            statuses[i] = .{ .name = status_name, .status = "failed", .@"error" = null };
+
+            const table_backup_id = backups_api.clusterTableBackupId(op_alloc, req.backup_id, table_name) catch return error.InternalFailure;
             self.backupOwnedTable(table_name, location, req.location, table_backup_id, .native) catch |err| {
                 if (isRetryableMetadataLeadershipError(err)) {
-                    alloc.free(table_backup_id);
+                    op_alloc.free(table_backup_id);
                     return error.NotLeader;
                 }
                 statuses[i].@"error" = switch (err) {
@@ -7045,27 +7024,31 @@ pub const ApiHttpServer = struct {
                     error.UnsupportedBackupMigrationState => "backup does not support active schema migration",
                     else => "backup failed",
                 };
-                alloc.free(table_backup_id);
+                op_alloc.free(table_backup_id);
                 continue;
             };
             statuses[i].status = "completed";
-            const entry_name = alloc.dupe(u8, table_name) catch {
-                alloc.free(table_backup_id);
+            var entry_name_owned: ?[]u8 = op_alloc.dupe(u8, table_name) catch {
+                op_alloc.free(table_backup_id);
                 return error.InternalFailure;
             };
-            errdefer alloc.free(entry_name);
-            cluster_tables.append(alloc, .{
-                .name = entry_name,
-                .table_backup_id = table_backup_id,
+            var table_backup_id_owned: ?[]u8 = table_backup_id;
+            errdefer if (entry_name_owned) |entry_name| op_alloc.free(entry_name);
+            errdefer if (table_backup_id_owned) |owned_backup_id| op_alloc.free(owned_backup_id);
+            cluster_tables.append(op_alloc, .{
+                .name = entry_name_owned.?,
+                .table_backup_id = table_backup_id_owned.?,
             }) catch return error.InternalFailure;
+            entry_name_owned = null;
+            table_backup_id_owned = null;
         }
 
         const installed_extensions = if (extension_snapshot) |snapshot| snapshot.installed_extensions else &.{};
         const extension_members = if (extension_snapshot) |snapshot| snapshot.extension_members else &.{};
         const extension_dependencies = if (extension_snapshot) |snapshot| snapshot.extension_dependencies else &.{};
-        var manifest = backups_api.createClusterManifestWithExtensions(alloc, req.backup_id, req.location, cluster_tables.items, installed_extensions, extension_members, extension_dependencies) catch return error.InternalFailure;
-        defer manifest.deinit(alloc);
-        backups_api.writeClusterManifestToLocation(alloc, location, &manifest) catch return error.InternalFailure;
+        var manifest = backups_api.createClusterManifestWithExtensions(op_alloc, req.backup_id, req.location, cluster_tables.items, installed_extensions, extension_members, extension_dependencies) catch return error.InternalFailure;
+        defer manifest.deinit(op_alloc);
+        backups_api.writeClusterManifestToLocation(op_alloc, location, &manifest) catch return error.InternalFailure;
 
         return backups_api.encodeClusterBackupResponse(alloc, req.backup_id, statuses) catch return error.InternalFailure;
     }
@@ -7078,21 +7061,22 @@ pub const ApiHttpServer = struct {
         restore_mode: []const u8,
     ) cluster_api_http.ClusterApi.ExecuteRestoreError![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        const op_alloc = self.alloc;
 
-        var manifest = backups_api.readClusterManifestFromLocation(alloc, location, req.backup_id) catch return error.InvalidRequest;
-        defer manifest.deinit(alloc);
+        var manifest = backups_api.readClusterManifestFromLocation(op_alloc, location, req.backup_id) catch return error.InvalidRequest;
+        defer manifest.deinit(op_alloc);
 
         preflightClusterRestoreExtensions(self, &manifest) catch |err| switch (err) {
             error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
             else => return error.InvalidRequest,
         };
 
-        var borrowed_table_names: ?[][]const u8 = null;
-        defer if (borrowed_table_names) |names| alloc.free(names);
-        const table_names: []const []const u8 = if (req.table_names) |values| values else blk: {
-            borrowed_table_names = borrowedTableNamesFromClusterManifest(alloc, &manifest) catch return error.InternalFailure;
-            break :blk borrowed_table_names.?;
+        const table_names: [][]u8 = if (req.table_names) |values|
+            cloneTableNamesAlloc(op_alloc, values) catch return error.InternalFailure
+        else blk: {
+            break :blk tableNamesFromClusterManifestAlloc(op_alloc, &manifest) catch return error.InternalFailure;
         };
+        defer freeOwnedTableNames(op_alloc, table_names);
 
         if (std.mem.eql(u8, restore_mode, "fail_if_exists")) {
             for (table_names) |table_name| {
@@ -7102,11 +7086,23 @@ pub const ApiHttpServer = struct {
             }
         }
 
-        const statuses = alloc.alloc(backups_api.ClusterTableRestoreStatus, table_names.len) catch return error.InternalFailure;
-        defer alloc.free(statuses);
+        const statuses = op_alloc.alloc(backups_api.ClusterTableRestoreStatus, table_names.len) catch return error.InternalFailure;
+        const status_names = op_alloc.alloc([]u8, table_names.len) catch {
+            op_alloc.free(statuses);
+            return error.InternalFailure;
+        };
+        var status_name_count: usize = 0;
+        defer {
+            for (status_names[0..status_name_count]) |name| op_alloc.free(name);
+            op_alloc.free(status_names);
+            op_alloc.free(statuses);
+        }
 
         for (table_names, 0..) |table_name, i| {
-            statuses[i] = .{ .name = table_name, .status = "failed", .@"error" = null };
+            const status_name = op_alloc.dupe(u8, table_name) catch return error.InternalFailure;
+            status_names[status_name_count] = status_name;
+            status_name_count += 1;
+            statuses[i] = .{ .name = status_name, .status = "failed", .@"error" = null };
 
             if (backups_api.findClusterTable(&manifest, table_name) == null) {
                 statuses[i].@"error" = "backup does not include table";
@@ -8129,12 +8125,7 @@ pub const ApiHttpServer = struct {
         var resp = try cluster_api_http.handleClusterBackupList(self.alloc, location_uri, self.clusterApi());
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
-            200 => blk: {
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const parsed = try parseJsonResponseBody(metadata_openapi.BackupListResponse, arena_impl.allocator(), resp.body);
-                break :blk try jsonResponse(self.alloc, parsed);
-            },
+            200 => try jsonBodyResponseWithStatus(self.alloc, 200, resp.body),
             else => try textResponse(self.alloc, resp.status, resp.body),
         };
     }
@@ -8143,12 +8134,7 @@ pub const ApiHttpServer = struct {
         var resp = try cluster_api_http.handleClusterBackup(self.alloc, body, self.clusterApi(), self.cfg.secret_store);
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
-            200 => blk: {
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const parsed = try parseJsonResponseBody(metadata_openapi.ClusterBackupResponse, arena_impl.allocator(), resp.body);
-                break :blk try jsonResponse(self.alloc, parsed);
-            },
+            200 => try jsonBodyResponseWithStatus(self.alloc, 200, resp.body),
             else => try textResponse(self.alloc, resp.status, resp.body),
         };
     }
@@ -8157,12 +8143,7 @@ pub const ApiHttpServer = struct {
         var resp = try cluster_api_http.handleClusterRestore(self.alloc, body, self.clusterApi(), self.cfg.secret_store);
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
-            202 => blk: {
-                var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
-                defer arena_impl.deinit();
-                const parsed = try parseJsonResponseBody(metadata_openapi.ClusterRestoreResponse, arena_impl.allocator(), resp.body);
-                break :blk try jsonResponseWithStatus(self.alloc, 202, parsed);
-            },
+            202 => try jsonBodyResponseWithStatus(self.alloc, 202, resp.body),
             else => try textResponse(self.alloc, resp.status, resp.body),
         };
     }
@@ -8813,24 +8794,58 @@ fn queryBuilderJsonInt(value: ?std.json.Value) ?i64 {
     };
 }
 
-fn borrowedTableNamesFromAdminSnapshot(
+fn cloneTableNamesAlloc(
+    alloc: std.mem.Allocator,
+    names: []const []const u8,
+) ![][]u8 {
+    const owned = try alloc.alloc([]u8, names.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (owned[0..initialized]) |name| alloc.free(name);
+        alloc.free(owned);
+    }
+    for (names, 0..) |name, i| {
+        owned[i] = try alloc.dupe(u8, name);
+        initialized += 1;
+    }
+    return owned;
+}
+
+fn freeOwnedTableNames(alloc: std.mem.Allocator, names: [][]u8) void {
+    for (names) |name| alloc.free(name);
+    alloc.free(names);
+}
+
+fn tableNamesFromAdminSnapshotAlloc(
     alloc: std.mem.Allocator,
     snapshot: *const metadata_api.AdminSnapshot,
-) ![][]const u8 {
-    const names = try alloc.alloc([]const u8, snapshot.tables.len);
+) ![][]u8 {
+    const names = try alloc.alloc([]u8, snapshot.tables.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (names[0..initialized]) |name| alloc.free(name);
+        alloc.free(names);
+    }
     for (snapshot.tables, 0..) |table, i| {
-        names[i] = table.name;
+        names[i] = try alloc.dupe(u8, table.name);
+        initialized += 1;
     }
     return names;
 }
 
-fn borrowedTableNamesFromClusterManifest(
+fn tableNamesFromClusterManifestAlloc(
     alloc: std.mem.Allocator,
     manifest: *const backups_api.ClusterBackupManifest,
-) ![][]const u8 {
-    const names = try alloc.alloc([]const u8, manifest.tables.len);
+) ![][]u8 {
+    const names = try alloc.alloc([]u8, manifest.tables.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (names[0..initialized]) |name| alloc.free(name);
+        alloc.free(names);
+    }
     for (manifest.tables, 0..) |table, i| {
-        names[i] = table.name;
+        names[i] = try alloc.dupe(u8, table.name);
+        initialized += 1;
     }
     return names;
 }
