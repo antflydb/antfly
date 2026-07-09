@@ -1847,8 +1847,10 @@ pub fn buildOwnedBatchDecodeContext(
                 .tail_tokens = ctx.kv_cache.?.tail_tokens,
                 .position_offset = ctx.kv_cache.?.position_offset,
                 .logical_blocks = ctx.kv_cache.?.logical_blocks,
+                .kv_storage = ctx.kv_cache.?.kv_storage,
             },
             .kv_manager = ctx.kv_manager.?,
+            .kv_storage = ctx.kv_storage,
         };
     }
 
@@ -1861,6 +1863,7 @@ pub fn buildOwnedBatchDecodeContext(
             .query_sequence_len = first_ctx.query_sequence_len,
             .kv_sequence_len = first_ctx.kv_sequence_len,
             .kv_position_offset = first_ctx.kv_position_offset,
+            .kv_storage = first_ctx.kv_storage,
             .kv_batch = batch,
             .moe_runtime = first_ctx.moe_runtime,
         },
@@ -1928,8 +1931,10 @@ pub fn buildOwnedMixedBatchDecodeContext(
                 .tail_tokens = ctx.kv_cache.?.tail_tokens,
                 .position_offset = ctx.kv_cache.?.position_offset,
                 .logical_blocks = ctx.kv_cache.?.logical_blocks,
+                .kv_storage = ctx.kv_cache.?.kv_storage,
             },
             .kv_manager = ctx.kv_manager.?,
+            .kv_storage = ctx.kv_storage,
             .per_item_query_len = item.query_sequence_len,
             .per_item_total_len = item.total_sequence_len,
             .per_item_kv_len = item.kv_sequence_len,
@@ -1951,6 +1956,7 @@ pub fn buildOwnedMixedBatchDecodeContext(
             .query_sequence_len = max_query_seq_len,
             .kv_sequence_len = max_kv_seq_len,
             .kv_position_offset = 0,
+            .kv_storage = items[0].state.kv_storage,
             .kv_batch = batch,
             .moe_runtime = &items[0].state.moe_runtime,
         },
@@ -8724,10 +8730,21 @@ test "owned batch decode context captures per-item kv bindings" {
         .num_kv_heads = 8,
         .head_dim = 64,
     });
+    var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, .{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 4,
+        .num_layers_packed = 2,
+        .num_kv_heads = 8,
+        .head_dim = 64,
+    });
+    defer storage.deinit();
 
     var first = NativeDecodeState.initPaged(allocator, &manager, pool_id, null);
+    first.kv_storage = &storage;
     defer first.deinit();
     var second = NativeDecodeState.initPaged(allocator, &manager, pool_id, null);
+    second.kv_storage = &storage;
     defer second.deinit();
 
     try first.notePrefill(6);
@@ -8741,6 +8758,9 @@ test "owned batch decode context captures per-item kv bindings" {
     try std.testing.expect(owned.context.kv_batch != null);
     try std.testing.expectEqual(first.sequence_id.?, owned.kv_batch.?[0].kv_cache.sequence_id);
     try std.testing.expectEqual(second.sequence_id.?, owned.kv_batch.?[1].kv_cache.sequence_id);
+    try std.testing.expectEqual(@as(?*runtime.kv.storage_runtime.KvStorageRuntime, &storage), owned.context.kv_storage);
+    try std.testing.expectEqual(@as(?*runtime.kv.storage_runtime.KvStorageRuntime, &storage), owned.kv_batch.?[0].kv_storage);
+    try std.testing.expectEqual(@as(?*runtime.kv.storage_runtime.KvStorageRuntime, &storage), owned.kv_batch.?[0].kv_cache.kv_storage);
 }
 
 test "mixed batch decode context captures per-item overrides" {
@@ -8756,10 +8776,21 @@ test "mixed batch decode context captures per-item overrides" {
         .num_kv_heads = 8,
         .head_dim = 64,
     });
+    var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, .{
+        .backend = .native,
+        .dtype = .f32,
+        .page_size_tokens = 4,
+        .num_layers_packed = 2,
+        .num_kv_heads = 8,
+        .head_dim = 64,
+    });
+    defer storage.deinit();
 
     var prefill = NativeDecodeState.initPaged(allocator, &manager, pool_id, null);
+    prefill.kv_storage = &storage;
     defer prefill.deinit();
     var decode = NativeDecodeState.initPaged(allocator, &manager, pool_id, null);
+    decode.kv_storage = &storage;
     defer decode.deinit();
 
     try prefill.notePrefill(8);
@@ -8791,6 +8822,9 @@ test "mixed batch decode context captures per-item overrides" {
     try std.testing.expectEqual(gpt_arch.DecodeContext.AttentionMode.paged_prefill, owned.context.attention_mode);
     try std.testing.expectEqual(@as(?contracts.AttentionMode, .paged_decode), owned.kv_batch.?[0].per_item_mode);
     try std.testing.expectEqual(@as(?contracts.AttentionMode, .paged_prefill), owned.kv_batch.?[1].per_item_mode);
+    try std.testing.expectEqual(@as(?*runtime.kv.storage_runtime.KvStorageRuntime, &storage), owned.context.kv_storage);
+    try std.testing.expectEqual(@as(?*runtime.kv.storage_runtime.KvStorageRuntime, &storage), owned.kv_batch.?[0].kv_storage);
+    try std.testing.expectEqual(@as(?*runtime.kv.storage_runtime.KvStorageRuntime, &storage), owned.kv_batch.?[1].kv_cache.kv_storage);
 }
 
 test "mixed batch decode context keeps single item on direct kv cache path" {

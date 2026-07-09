@@ -2707,17 +2707,55 @@ fn flushRuntimeGeneratedTextBatch(
     if (requests.len == 0) return;
     if (requests.len != unit_indices.len) return error.InvalidAssetProducerResponse;
 
-    var produced = try producer.produceBatch(runtime.alloc, requests);
+    var produced = producer.produceBatch(runtime.alloc, requests) catch |err| {
+        if (isRetryableEnrichmentError(err)) return err;
+        return try flushRuntimeGeneratedTextBatchSequential(runtime, producer, requests, unit_indices, parts_values, units, method, kind);
+    };
+    if (produced.len != requests.len) {
+        for (produced) |item| {
+            if (item.len > 0) runtime.alloc.free(item);
+        }
+        runtime.alloc.free(produced);
+        return try flushRuntimeGeneratedTextBatchSequential(runtime, producer, requests, unit_indices, parts_values, units, method, kind);
+    }
+
     defer runtime.alloc.free(produced);
     errdefer {
         for (produced) |item| {
             if (item.len > 0) runtime.alloc.free(item);
         }
     }
-    if (produced.len != requests.len) return error.InvalidAssetProducerResponse;
     for (produced, unit_indices, 0..) |item, unit_idx, i| {
         produced[i] = &.{};
-        try applyRuntimeGeneratedUnitText(runtime.alloc, &units[unit_idx], item, method, "completed", kind);
+        applyRuntimeGeneratedUnitText(runtime.alloc, &units[unit_idx], item, method, "completed", kind) catch |err| {
+            if (isRetryableEnrichmentError(err)) return err;
+            try markRuntimeGeneratedUnitTextFailure(runtime.alloc, &units[unit_idx], method, kind, err);
+        };
+    }
+    clearRuntimeGeneratedTextBatchParts(runtime.alloc, parts_values);
+}
+
+fn flushRuntimeGeneratedTextBatchSequential(
+    runtime: *EnrichmentRuntime,
+    producer: asset_producer_mod.Producer,
+    requests: []const asset_producer_mod.Request,
+    unit_indices: []const usize,
+    parts_values: *std.ArrayListUnmanaged([]u8),
+    units: []document_extraction_mod.Unit,
+    method: []const u8,
+    kind: RuntimeGeneratedUnitTextKind,
+) !void {
+    if (requests.len != unit_indices.len) return error.InvalidAssetProducerResponse;
+    for (requests, unit_indices) |request, unit_idx| {
+        const produced = producer.produce(runtime.alloc, request) catch |err| {
+            if (isRetryableEnrichmentError(err)) return err;
+            try markRuntimeGeneratedUnitTextFailure(runtime.alloc, &units[unit_idx], method, kind, err);
+            continue;
+        };
+        applyRuntimeGeneratedUnitText(runtime.alloc, &units[unit_idx], produced, method, "completed", kind) catch |err| {
+            if (isRetryableEnrichmentError(err)) return err;
+            try markRuntimeGeneratedUnitTextFailure(runtime.alloc, &units[unit_idx], method, kind, err);
+        };
     }
     clearRuntimeGeneratedTextBatchParts(runtime.alloc, parts_values);
 }
@@ -2810,6 +2848,51 @@ fn applyRuntimeGeneratedUnitText(
     const start = unit.char_start orelse 0;
     unit.char_start = start;
     unit.char_end = std.math.cast(u32, @as(usize, @intCast(start)) + unit.text.len);
+}
+
+fn markRuntimeGeneratedUnitTextFailure(
+    alloc: Allocator,
+    unit: *document_extraction_mod.Unit,
+    method: []const u8,
+    kind: RuntimeGeneratedUnitTextKind,
+    err: anyerror,
+) !void {
+    const failed_status = switch (kind) {
+        .ocr => "failed_ocr",
+        .transcript => "failed_transcription",
+    };
+    const warning = try std.fmt.allocPrint(alloc, "{s} failed: {s}", .{ method, @errorName(err) });
+    errdefer alloc.free(warning);
+    const owned_text = try alloc.dupe(u8, "");
+    errdefer alloc.free(owned_text);
+    const owned_method = try alloc.dupe(u8, method);
+    errdefer alloc.free(owned_method);
+    const owned_status = try alloc.dupe(u8, failed_status);
+    errdefer alloc.free(owned_status);
+
+    alloc.free(unit.text);
+    alloc.free(unit.method);
+    if (unit.extraction_status) |value| alloc.free(value);
+    if (unit.extraction_warning) |value| alloc.free(value);
+
+    unit.text = owned_text;
+    unit.method = owned_method;
+    unit.extraction_status = owned_status;
+    unit.extraction_warning = warning;
+    switch (kind) {
+        .ocr => {
+            unit.ocr_used = false;
+            unit.ocr_confidence = null;
+            unit.ocr_bbox = null;
+        },
+        .transcript => {
+            unit.transcript_used = false;
+            unit.transcript_confidence = null;
+        },
+    }
+    const start = unit.char_start orelse 0;
+    unit.char_start = start;
+    unit.char_end = @intCast(start);
 }
 
 const RuntimeParsedGeneratedUnitText = struct {
@@ -8398,6 +8481,193 @@ test "document extraction generated OCR batches honor execution item cap" {
     try std.testing.expectEqualStrings("ocr text 0", units[0].text);
     try std.testing.expectEqualStrings("ocr text 1", units[1].text);
     try std.testing.expectEqualStrings("ocr text 0", units[2].text);
+}
+
+test "document extraction generated OCR batch fallback isolates permanent unit failure" {
+    const alloc = std.testing.allocator;
+
+    const FallbackProducer = struct {
+        batch_count: usize = 0,
+        single_count: usize = 0,
+
+        fn producer(self: *@This()) asset_producer_mod.Producer {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .produce = produce,
+                    .produce_batch = produceBatch,
+                },
+            };
+        }
+
+        fn produce(ptr: *anyopaque, a: Allocator, request: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.single_count += 1;
+            const parts = request.source_parts_json orelse "";
+            if (std.mem.indexOf(u8, parts, "unit:2") != null) return error.BadUnitInput;
+            if (std.mem.indexOf(u8, parts, "unit:1") != null) return try a.dupe(u8, "ok:unit:1");
+            if (std.mem.indexOf(u8, parts, "unit:3") != null) return try a.dupe(u8, "ok:unit:3");
+            return error.BadUnitInput;
+        }
+
+        fn produceBatch(ptr: *anyopaque, _: Allocator, _: []const asset_producer_mod.Request) ![][]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.batch_count += 1;
+            return error.BatchEnvelopeRejected;
+        }
+    };
+
+    const TestUnit = struct {
+        fn make(a: Allocator, id: []const u8) !document_extraction_mod.Unit {
+            return .{
+                .unit_id = try a.dupe(u8, id),
+                .unit_type = try a.dupe(u8, "image"),
+                .text = try a.dupe(u8, "ocr_pending"),
+                .method = try a.dupe(u8, "ocr_pending"),
+                .extraction_status = try a.dupe(u8, "pending_ocr"),
+            };
+        }
+    };
+
+    var fake = FallbackProducer{};
+    const producer = fake.producer();
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .asset_producer = producer },
+        .ownership = undefined,
+    };
+
+    var units = [_]document_extraction_mod.Unit{
+        try TestUnit.make(alloc, "unit:1"),
+        try TestUnit.make(alloc, "unit:2"),
+        try TestUnit.make(alloc, "unit:3"),
+    };
+    defer for (&units) |*unit| unit.deinit(alloc);
+
+    try completeRuntimeDocumentExtractionGeneratedTextBatch(
+        &runtime,
+        producer,
+        .{ .ocr_enabled = true },
+        .{ .max_items = 8, .max_bytes = 1024 * 1024 },
+        "data:application/pdf;base64,AA==",
+        "ocr",
+        "application/pdf",
+        units[0..],
+        .ocr,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), fake.batch_count);
+    try std.testing.expectEqual(@as(usize, 3), fake.single_count);
+    try std.testing.expectEqualStrings("ok:unit:1", units[0].text);
+    try std.testing.expectEqualStrings("completed", units[0].extraction_status.?);
+    try std.testing.expectEqualStrings("", units[1].text);
+    try std.testing.expectEqualStrings("failed_ocr", units[1].extraction_status.?);
+    try std.testing.expect(units[1].extraction_warning != null);
+    try std.testing.expect(std.mem.indexOf(u8, units[1].extraction_warning.?, "BadUnitInput") != null);
+    try std.testing.expectEqualStrings("ok:unit:3", units[2].text);
+    try std.testing.expectEqualStrings("completed", units[2].extraction_status.?);
+}
+
+test "document extraction generated OCR batch fallback isolates malformed batch response" {
+    const alloc = std.testing.allocator;
+
+    const FallbackProducer = struct {
+        batch_count: usize = 0,
+        single_count: usize = 0,
+
+        fn producer(self: *@This()) asset_producer_mod.Producer {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .produce = produce,
+                    .produce_batch = produceBatch,
+                },
+            };
+        }
+
+        fn produce(ptr: *anyopaque, a: Allocator, request: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.single_count += 1;
+            const parts = request.source_parts_json orelse "";
+            if (std.mem.indexOf(u8, parts, "unit:1") != null) return try a.dupe(u8, "ok:unit:1");
+            if (std.mem.indexOf(u8, parts, "unit:2") != null) return try a.dupe(u8, "ok:unit:2");
+            return error.BadUnitInput;
+        }
+
+        fn produceBatch(ptr: *anyopaque, a: Allocator, _: []const asset_producer_mod.Request) ![][]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.batch_count += 1;
+            const malformed = try a.alloc([]u8, 1);
+            errdefer a.free(malformed);
+            malformed[0] = try a.dupe(u8, "orphaned-batch-output");
+            return malformed;
+        }
+    };
+
+    const TestUnit = struct {
+        fn make(a: Allocator, id: []const u8) !document_extraction_mod.Unit {
+            return .{
+                .unit_id = try a.dupe(u8, id),
+                .unit_type = try a.dupe(u8, "image"),
+                .text = try a.dupe(u8, "ocr_pending"),
+                .method = try a.dupe(u8, "ocr_pending"),
+                .extraction_status = try a.dupe(u8, "pending_ocr"),
+            };
+        }
+    };
+
+    var fake = FallbackProducer{};
+    const producer = fake.producer();
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = undefined,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .asset_producer = producer },
+        .ownership = undefined,
+    };
+
+    var units = [_]document_extraction_mod.Unit{
+        try TestUnit.make(alloc, "unit:1"),
+        try TestUnit.make(alloc, "unit:2"),
+    };
+    defer for (&units) |*unit| unit.deinit(alloc);
+
+    try completeRuntimeDocumentExtractionGeneratedTextBatch(
+        &runtime,
+        producer,
+        .{ .ocr_enabled = true },
+        .{ .max_items = 8, .max_bytes = 1024 * 1024 },
+        "data:application/pdf;base64,AA==",
+        "ocr",
+        "application/pdf",
+        units[0..],
+        .ocr,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), fake.batch_count);
+    try std.testing.expectEqual(@as(usize, 2), fake.single_count);
+    try std.testing.expectEqualStrings("ok:unit:1", units[0].text);
+    try std.testing.expectEqualStrings("completed", units[0].extraction_status.?);
+    try std.testing.expectEqualStrings("ok:unit:2", units[1].text);
+    try std.testing.expectEqualStrings("completed", units[1].extraction_status.?);
 }
 
 test "enrichment runtime document extraction state parses byte-array keys" {
