@@ -22333,7 +22333,10 @@ fn mirrorHAReplayPayloadBestEffortContext(ctx: *const BatchExecutionContext, pay
     const mirror = ctx.ha_async_effect_mirror orelse return;
     lockAtomic(ctx.log_mutex);
     defer ctx.log_mutex.*.unlock();
-    const lsn = ha_effects_mod.appendEncodedDerivedChangeRecord(mirror.primary, payload, .{}) catch |err| {
+    const lsn = ha_effects_mod.appendEncodedDerivedChangeRecord(mirror.primary, payload, .{
+        .shard_id = ctx.identity_namespace.shard_id,
+        .table_id = ctx.identity_namespace.table_id,
+    }) catch |err| {
         if (mirror.failure_count) |counter| _ = counter.fetchAdd(1, .monotonic);
         std.log.warn("failed to mirror DB derived effect into HA stream: {s}", .{@errorName(err)});
         return;
@@ -22346,7 +22349,10 @@ fn mirrorHAReplayPayloadCommitContext(ctx: *const BatchExecutionContext, payload
     const lsn = blk: {
         lockAtomic(ctx.log_mutex);
         defer ctx.log_mutex.*.unlock();
-        const lsn = ha_effects_mod.appendEncodedDerivedChangeRecord(mirror.primary, payload, .{}) catch |err| {
+        const lsn = ha_effects_mod.appendEncodedDerivedChangeRecord(mirror.primary, payload, .{
+            .shard_id = ctx.identity_namespace.shard_id,
+            .table_id = ctx.identity_namespace.table_id,
+        }) catch |err| {
             noteHAMirrorFailure(mirror, "derived effect", err);
             if (haMirrorSyncEnabled(mirror)) return err;
             return;
@@ -22361,7 +22367,10 @@ fn mirrorHABatchMutationBestEffortContext(ctx: *const BatchExecutionContext, req
     const mirror = ctx.ha_async_batch_mirror orelse return;
     lockAtomic(ctx.log_mutex);
     defer ctx.log_mutex.*.unlock();
-    const lsn = ha_effects_mod.appendBatchMutationRequest(ctx.alloc, mirror.primary, request, .{}) catch |err| {
+    const lsn = ha_effects_mod.appendBatchMutationRequest(ctx.alloc, mirror.primary, request, .{
+        .shard_id = ctx.identity_namespace.shard_id,
+        .table_id = ctx.identity_namespace.table_id,
+    }) catch |err| {
         if (mirror.failure_count) |counter| _ = counter.fetchAdd(1, .monotonic);
         std.log.warn("failed to mirror DB batch mutation into HA stream: {s}", .{@errorName(err)});
         return;
@@ -22374,7 +22383,10 @@ fn mirrorHABatchMutationCommitContext(ctx: *const BatchExecutionContext, request
     const lsn = blk: {
         lockAtomic(ctx.log_mutex);
         defer ctx.log_mutex.*.unlock();
-        const lsn = ha_effects_mod.appendBatchMutationRequest(ctx.alloc, mirror.primary, request, .{}) catch |err| {
+        const lsn = ha_effects_mod.appendBatchMutationRequest(ctx.alloc, mirror.primary, request, .{
+            .shard_id = ctx.identity_namespace.shard_id,
+            .table_id = ctx.identity_namespace.table_id,
+        }) catch |err| {
             noteHAMirrorFailure(mirror, "batch mutation", err);
             if (haMirrorSyncEnabled(mirror)) return err;
             return;
@@ -22389,7 +22401,10 @@ fn mirrorHASchemaMetadataBestEffortContext(ctx: *const BatchExecutionContext, ta
     const mirror = ctx.ha_async_metadata_mirror orelse return;
     lockAtomic(ctx.log_mutex);
     defer ctx.log_mutex.*.unlock();
-    const lsn = ha_effects_mod.appendSchemaMetadataMutation(ctx.alloc, mirror.primary, table_schema, .{}) catch |err| {
+    const lsn = ha_effects_mod.appendSchemaMetadataMutation(ctx.alloc, mirror.primary, table_schema, .{
+        .shard_id = ctx.identity_namespace.shard_id,
+        .table_id = ctx.identity_namespace.table_id,
+    }) catch |err| {
         if (mirror.failure_count) |counter| _ = counter.fetchAdd(1, .monotonic);
         std.log.warn("failed to mirror DB schema metadata into HA stream: {s}", .{@errorName(err)});
         return;
@@ -22402,7 +22417,10 @@ fn mirrorHASchemaMetadataCommitContext(ctx: *const BatchExecutionContext, table_
     const lsn = blk: {
         lockAtomic(ctx.log_mutex);
         defer ctx.log_mutex.*.unlock();
-        const lsn = ha_effects_mod.appendSchemaMetadataMutation(ctx.alloc, mirror.primary, table_schema, .{}) catch |err| {
+        const lsn = ha_effects_mod.appendSchemaMetadataMutation(ctx.alloc, mirror.primary, table_schema, .{
+            .shard_id = ctx.identity_namespace.shard_id,
+            .table_id = ctx.identity_namespace.table_id,
+        }) catch |err| {
             noteHAMirrorFailure(mirror, "metadata mutation", err);
             if (haMirrorSyncEnabled(mirror)) return err;
             return;

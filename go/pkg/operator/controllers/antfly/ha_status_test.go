@@ -488,8 +488,39 @@ func TestHAPlannedActionStatusesDropPromotionSuccessMismatchedWithRecordedPromot
 		t.Fatalf("expected matching promotion execution state to survive replan, got %#v", preserved)
 	}
 
-	status.LastPromotion.NewTimelineID = 6
+	previous = action
+	previous.AdminJobName = haAdminDirectAPIName
+	previous.AdminJobPhase = haAdminJobPhaseFailed
+	previous.AdminError = "HA admin API returned status 409: BaseBackupSlotInUse"
+	status.PlannedActions = []antflyv1.HAPlannedActionStatus{previous}
 	notPreserved := haPreservePlannedActionExecution(action, status)
+	if notPreserved.AdminJobName != "" ||
+		notPreserved.AdminJobPhase != "" ||
+		notPreserved.AdminError != "" ||
+		notPreserved.AdminResult != nil {
+		t.Fatalf("expected failed direct-admin action to be retried, got %#v", notPreserved)
+	}
+
+	previous = action
+	previous.AdminJobName = haAdminDirectAPIName
+	previous.AdminJobPhase = haAdminJobPhaseFailed
+	previous.AdminError = "HA admin action DemoteFormerPrimary succeeded without typed rejoin assessment"
+	status.PlannedActions = []antflyv1.HAPlannedActionStatus{previous}
+	notPreserved = haPreservePlannedActionExecution(action, status)
+	if notPreserved.AdminJobName != "" ||
+		notPreserved.AdminJobPhase != "" ||
+		notPreserved.AdminError != "" ||
+		notPreserved.AdminResult != nil {
+		t.Fatalf("expected direct-admin typed evidence failure to be retried, got %#v", notPreserved)
+	}
+
+	previous = action
+	previous.AdminJobName = haAdminDirectAPIName
+	previous.AdminJobPhase = haAdminJobPhaseSucceeded
+	previous.AdminResult = haPromotionAdminResult(7, "ha-fence-token", "standby-a")
+	status.PlannedActions = []antflyv1.HAPlannedActionStatus{previous}
+	status.LastPromotion.NewTimelineID = 6
+	notPreserved = haPreservePlannedActionExecution(action, status)
 	if notPreserved.AdminJobName != "" ||
 		notPreserved.AdminJobPhase != "" ||
 		notPreserved.AdminResult != nil {
@@ -3224,6 +3255,62 @@ func TestUpdateHAStatusReportsFormerPrimaryRejoinDisposition(t *testing.T) {
 		t.Fatalf("expected assessed rewind planned action, got %#v", cluster.Status.HAStatus.PlannedActions)
 	}
 
+	cluster.Status.HAStatus.Standbys = []antflyv1.HAStandbyStatus{{
+		Name:        "standby-a",
+		SlotName:    "standby-a",
+		Active:      true,
+		TimelineID:  2,
+		ReceivedLSN: 12,
+		AppliedLSN:  12,
+		SafeReadLSN: 12,
+	}}
+	cluster.Status.HAStatus.FormerPrimary = &antflyv1.HAFormerPrimaryStatus{
+		NodeID:            "old-primary",
+		FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceHolder:       "standby-a",
+		FenceGeneration:   4,
+		TargetTimelineID:  2,
+		TargetEpoch:       2,
+		ForkLSN:           10,
+		FormerLastLSN:     11,
+		RetainedFromLSN:   8,
+		DataLossDiscarded: true,
+		AssessedAction:    "rewind",
+		AssessedReason:    "parent_timeline_retained",
+	}
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	former = cluster.Status.HAStatus.FormerPrimary
+	if former == nil ||
+		former.Action != string(haActionRewindFormerPrimary) ||
+		former.Reason != "parent_timeline_retained" ||
+		former.SwitchLSN != 10 ||
+		former.ObservedLSN != 11 {
+		t.Fatalf("expected recorded rejoin assessment to drive rewind without standby observation, got %#v", former)
+	}
+	rewindAction, ok = haPlannedActionByKind(cluster.Status.HAStatus.PlannedActions, haActionRewindFormerPrimary)
+	if !ok ||
+		rewindAction.TargetLSN != 10 ||
+		rewindAction.ObservedLSN != 11 {
+		t.Fatalf("expected assessment-only rewind planned action, got %#v", cluster.Status.HAStatus.PlannedActions)
+	}
+
+	cluster.Status.HAStatus.Standbys = []antflyv1.HAStandbyStatus{{
+		Name:        "old-primary",
+		SlotName:    "old-primary",
+		Active:      true,
+		TimelineID:  1,
+		ReceivedLSN: 11,
+		AppliedLSN:  11,
+	}, {
+		Name:        "standby-a",
+		SlotName:    "standby-a",
+		Active:      true,
+		TimelineID:  2,
+		ReceivedLSN: 12,
+		AppliedLSN:  12,
+		SafeReadLSN: 12,
+	}}
 	cluster.Status.HAStatus.FormerPrimary.FenceGeneration = 3
 	reconciler.updateHAStatusAndConditions(cluster)
 

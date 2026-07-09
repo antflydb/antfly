@@ -211,6 +211,14 @@ pub const Primary = struct {
         try validateSlotName(request.slot_name);
         if (request.manifest_id.len == 0) return error.InvalidManifestId;
 
+        if (self.slots.get(request.slot_name)) |state| {
+            if (state.timeline_id != self.identity.timeline_id) return error.WrongTimeline;
+            if (!state.reseed_required) {
+                if (try self.existingBaseBackupStart(request, state)) |existing| return existing;
+                if (state.active) return error.BaseBackupSlotInUse;
+            }
+        }
+
         const backup_lsn = self.nextLsn();
         const previous_lsn = backup_lsn - 1;
         try self.reserveBaseBackupSlot(request.slot_name, backup_lsn, previous_lsn);
@@ -482,7 +490,7 @@ pub const Primary = struct {
         try validateSlotName(slot_name);
         if (self.slots.get(slot_name)) |state| {
             if (state.timeline_id != self.identity.timeline_id) return error.WrongTimeline;
-            if (!state.reseed_required) return error.BaseBackupSlotInUse;
+            if (!state.reseed_required and state.active) return error.BaseBackupSlotInUse;
         }
 
         try self.slots.createOrUpdate(.{
@@ -522,6 +530,34 @@ pub const Primary = struct {
         if (!slot_state.active or slot_state.reseed_required) return error.BackupSlotNotRetained;
         if (slot_state.timeline_id != self.identity.timeline_id) return error.BackupSlotNotRetained;
         if (slot_state.restart_lsn > start.backup_lsn) return error.BackupSlotNotRetained;
+    }
+
+    fn existingBaseBackupStart(self: *Primary, request: BaseBackupStart, state: slot_store.SlotState) !?BaseBackupStartResult {
+        if (!state.active or state.restart_lsn == 0) return null;
+
+        var entry = (try self.log.entryAt(self.alloc, state.restart_lsn)) orelse return null;
+        defer entry.deinit(self.alloc);
+        if (entry.record.kind != .backup_start or entry.record.payload_codec != .json) return null;
+
+        var parsed = std.json.parseFromSlice(BackupStartPayload, self.alloc, entry.record.payload, .{}) catch return null;
+        defer parsed.deinit();
+
+        const start = parsed.value;
+        if (start.cluster_id != self.identity.cluster_id) return null;
+        if (start.shard_id != self.identity.shard_id) return null;
+        if (start.table_id != self.identity.table_id) return null;
+        if (start.timeline_id != self.identity.timeline_id) return null;
+        if (start.epoch != self.identity.epoch) return null;
+        if (start.backup_lsn != state.restart_lsn) return null;
+        if (!std.mem.eql(u8, start.slot_name, request.slot_name)) return null;
+        if (!std.mem.eql(u8, start.manifest_id, request.manifest_id)) return null;
+
+        return .{
+            .slot_name = request.slot_name,
+            .manifest_id = request.manifest_id,
+            .backup_lsn = start.backup_lsn,
+            .start_record_lsn = entry.wal_lsn,
+        };
     }
 };
 

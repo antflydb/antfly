@@ -4979,6 +4979,78 @@ func TestHARejoinSDKResultSatisfiesOperatorEvidenceGates(t *testing.T) {
 		}
 	}
 
+	demoteCluster := &antflyv1.AntflyCluster{
+		Status: antflyv1.AntflyClusterStatus{
+			HAStatus: &antflyv1.HAStatus{
+				LastPromotion: &antflyv1.HAPromotionStatus{
+					ClusterID:         9002003,
+					ShardID:           1024863633216429947,
+					TableID:           7062478063073158706,
+					OldPrimaryID:      "primary-a",
+					PromotedStandbyID: "standby-a",
+					ParentTimelineID:  1,
+					ParentEpoch:       1,
+					NewTimelineID:     2,
+					NewEpoch:          2,
+					SwitchLSN:         4,
+					RequiredLSN:       3,
+					ObservedLSN:       3,
+					FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
+					FenceGeneration:   1,
+					FenceToken:        "ha-fence-token",
+				},
+			},
+		},
+	}
+	demoteAction := antflyv1.HAPlannedActionStatus{
+		Kind:            string(haActionDemoteFormerPrimary),
+		StandbyName:     "primary-a",
+		TargetLSN:       4,
+		ObservedLSN:     4,
+		RetainedFromLSN: 3,
+		FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceGeneration: 1,
+		AdminJobName:    haAdminDirectAPIName,
+		AdminNodeID:     "primary-a",
+	}
+	demoteResponse := adminsdk.HARejoinAssessResponse{
+		SchemaVersion: 1,
+		Action: adminsdk.HAActionReceipt{
+			ActionId:   "rejoin_assess:primary-a",
+			ActionKind: adminsdk.HAActionKindRejoinAssess,
+			Target:     "primary-a",
+			State:      adminsdk.HAActionStateAssessed,
+			NodeId:     "primary-a",
+		},
+		Assessment: adminsdk.HARejoinAssessment{
+			Action:            adminsdk.HARejoinActionRejectUnfenced,
+			Reason:            adminsdk.HARejoinReasonNoFence,
+			FormerNodeId:      "primary-a",
+			TargetTimelineId:  1,
+			TargetEpoch:       1,
+			ParentClusterId:   9002003,
+			ParentShardId:     1024863633216429947,
+			ParentTableId:     7062478063073158706,
+			ParentTimelineId:  1,
+			ParentEpoch:       1,
+			ForkLsn:           4,
+			FormerLastLsn:     4,
+			RetainedFromLsn:   3,
+			DataLossDiscarded: false,
+		},
+	}
+	reconciler := &AntflyClusterReconciler{}
+	g.Expect(reconciler.applyHADirectRejoinAssessResultFromSDK(demoteCluster, &demoteAction, demoteResponse)).To(BeTrue())
+	demoteAction.AdminJobName = haAdminDirectAPIName
+	demoteAction.AdminJobPhase = haAdminJobPhaseSucceeded
+	g.Expect(demoteAction.AdminResult).NotTo(BeNil())
+	g.Expect(demoteAction.AdminResult.RejoinAction).To(Equal("reject_unfenced"))
+	g.Expect(haAdminActionSucceededWithStatusEvidence(demoteCluster.Status.HAStatus, demoteAction)).To(BeTrue())
+	g.Expect(demoteCluster.Status.HAStatus.FormerPrimary).NotTo(BeNil())
+	g.Expect(demoteCluster.Status.HAStatus.FormerPrimary.Action).To(Equal(string(haActionDemoteFormerPrimary)))
+	g.Expect(demoteCluster.Status.HAStatus.FormerPrimary.Fenced).To(BeFalse())
+	g.Expect(demoteCluster.Status.HAStatus.FormerPrimary.Reason).To(Equal("no_fence"))
+
 	cluster := newRejoinCluster()
 	rewindAction := antflyv1.HAPlannedActionStatus{
 		Kind:            string(haActionRewindFormerPrimary),
@@ -5029,7 +5101,6 @@ func TestHARejoinSDKResultSatisfiesOperatorEvidenceGates(t *testing.T) {
 		},
 	}
 
-	reconciler := &AntflyClusterReconciler{}
 	g.Expect(reconciler.applyHADirectRejoinAssessResultFromSDK(cluster, &rewindAction, response)).To(BeTrue())
 	g.Expect(rewindAction.AdminResult).NotTo(BeNil())
 	g.Expect(rewindAction.AdminResult.RejoinAction).To(Equal("rewind"))
@@ -5037,6 +5108,21 @@ func TestHARejoinSDKResultSatisfiesOperatorEvidenceGates(t *testing.T) {
 	g.Expect(cluster.Status.HAStatus.FormerPrimary).NotTo(BeNil())
 	g.Expect(cluster.Status.HAStatus.FormerPrimary.NodeID).To(Equal("primary-a"))
 	g.Expect(cluster.Status.HAStatus.FormerPrimary.Action).To(Equal(string(haActionRewindFormerPrimary)))
+
+	staleObservedAction := rewindAction
+	staleObservedAction.AdminResult = nil
+	staleObservedAction.ObservedLSN = 13
+	staleObservedResponse := response
+	staleObservedResponse.Assessment.FormerLastLsn = 12
+	staleObservedResponse.Assessment.DataLossDiscarded = false
+	staleObservedResponse.Rewind.PreviousLastLsn = 12
+	staleObservedResponse.Rewind.CurrentLastLsn = 12
+	staleObservedResponse.Rewind.DiscardedLsnCount = 0
+	staleObservedResponse.Rewind.DataLossDiscarded = false
+	staleObservedCluster := newRejoinCluster()
+	g.Expect(reconciler.applyHADirectRejoinAssessResultFromSDK(staleObservedCluster, &staleObservedAction, staleObservedResponse)).To(BeTrue())
+	g.Expect(staleObservedAction.AdminResult).NotTo(BeNil())
+	g.Expect(staleObservedAction.AdminResult.FormerLastLSN).To(Equal(uint64(12)))
 
 	reseedAction := antflyv1.HAPlannedActionStatus{
 		Kind:            string(haActionReseedFormerPrimary),

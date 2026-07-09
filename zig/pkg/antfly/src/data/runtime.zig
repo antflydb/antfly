@@ -1500,8 +1500,8 @@ pub const DataServerHAConfig = struct {
 };
 
 pub const HASyncWaitConfig = struct {
-    max_rounds: usize = 64,
-    sleep_ns: u64 = std.time.ns_per_ms,
+    max_rounds: usize = 200,
+    sleep_ns: u64 = 10 * std.time.ns_per_ms,
     poll_ctx: ?*anyopaque = null,
     poll_fn: ?antfly.db.HAProgressPollFn = null,
 };
@@ -1518,6 +1518,8 @@ fn haPrimarySyncWaitFromConfig(cfg: HASyncWaitConfig) antfly.db.HAPrimaryProgres
 pub const HAStandbyReplicationConfig = struct {
     upstream_base_uri: []const u8,
     slot_name: []const u8,
+    standby_log_path: ?[]const u8 = null,
+    standby_progress_path: ?[]const u8 = null,
     options: HAStandbyReplicationOptions = .{},
     catch_up_until_end_of_wal: bool = false,
     executor: ?antfly.common.http.RequestExecutor = null,
@@ -2130,6 +2132,7 @@ pub const DataServer = struct {
     ha_admin_server: ?antfly.ha.http_admin.Server = null,
     ha_internal_server: ?antfly.ha.http_internal.Server = null,
     ha_standby_replication_http_executor: ?antfly.common.http.StdHttpExecutor = null,
+    ha_promoted_primary: ?antfly.ha.primary.Primary = null,
     ha_primary_sync_wait: antfly.db.HAPrimaryProgressSyncWait = .{},
     ha_primary_mirror_last_lsn: std.atomic.Value(u64) = .init(0),
     ha_primary_mirror_failure_count: std.atomic.Value(u64) = .init(0),
@@ -2473,6 +2476,7 @@ pub const DataServer = struct {
 
     fn runHAStandbyReplicationRound(self: *DataServer) !void {
         const cfg = self.ha_cfg.standby_replication orelse return;
+        if (try self.openPromotedPrimaryFromStandbyIfReady(cfg)) return;
         const executor = try self.haStandbyReplicationExecutor(cfg);
         self.recordHAStandbyReplicationAttempt();
         if (cfg.catch_up_until_end_of_wal) {
@@ -2491,6 +2495,70 @@ pub const DataServer = struct {
             );
         }
         self.recordHAStandbyReplicationSuccess();
+    }
+
+    fn openPromotedPrimaryFromStandbyIfReady(self: *DataServer, cfg: HAStandbyReplicationConfig) !bool {
+        if (self.ha_cfg.admin_context == null) return false;
+        if (self.ha_cfg.admin_context.?.standby == null) return false;
+        if (self.ha_promoted_primary != null) return true;
+
+        const standby = self.ha_cfg.admin_context.?.standby.?;
+        const handoff = standby.promotedPrimaryHandoff() catch |err| switch (err) {
+            error.StandbyNotPromoted, error.PromotionNotApplied => return false,
+            else => return err,
+        };
+        standby.close();
+        self.ha_cfg.admin_context.?.standby = null;
+        if (self.ha_admin_server) |*server| {
+            server.ctx.standby = null;
+        }
+
+        const log_path = cfg.standby_log_path orelse return error.HAPromotedPrimaryLogMissing;
+        const progress_path = cfg.standby_progress_path orelse return error.HAPromotedPrimarySlotsMissing;
+        const log_path_z = try self.alloc.dupeZ(u8, log_path);
+        defer self.alloc.free(log_path_z);
+        const slots_path_buf = try std.fmt.allocPrint(self.alloc, "{s}.promoted-primary-slots", .{progress_path});
+        defer self.alloc.free(slots_path_buf);
+        const slots_path = try self.alloc.dupeZ(u8, slots_path_buf);
+        defer self.alloc.free(slots_path);
+
+        self.ha_promoted_primary = try antfly.ha.primary.Primary.openPromotedFromStandby(
+            self.alloc,
+            log_path_z.ptr,
+            slots_path.ptr,
+            handoff,
+            .{},
+        );
+        const promoted_primary = &self.ha_promoted_primary.?;
+        self.ha_cfg.internal_primary = promoted_primary;
+        self.ha_cfg.standby_replication = null;
+        const promoted_node_id = self.ha_cfg.admin_context.?.standby_node_id;
+        self.ha_cfg.admin_context.?.primary = promoted_primary;
+        self.ha_cfg.admin_context.?.primary_node_id = promoted_node_id;
+        if (self.ha_admin_server) |*server| {
+            server.ctx.primary = promoted_primary;
+            server.ctx.primary_node_id = promoted_node_id;
+        }
+        self.ha_internal_server = null;
+        self.api_server_cfg.ha_internal_executor = null;
+        if (self.ha_cfg.admin_context.?.primary) |handle| {
+            self.ha_internal_server = antfly.ha.http_internal.Server.init(self.alloc, handle);
+            self.api_server_cfg.ha_internal_executor = self.ha_internal_server.?.executor();
+        }
+        self.rewireHAAccessors();
+        return true;
+    }
+
+    fn rewireHAAccessors(self: *DataServer) void {
+        _ = self.read_source.withHAReadGate(self.haReadGate());
+        const ha_write_gate = self.haWriteGate();
+        const ha_primary_mirror = self.haPrimaryMirror();
+        _ = self.write_source.withHAWriteGate(ha_write_gate);
+        _ = self.write_source.withHAMirror(ha_primary_mirror);
+        if (self.data_raft_apply) |apply_sm| {
+            _ = apply_sm.write_source.withHAWriteGate(ha_write_gate);
+            _ = apply_sm.write_source.withHAMirror(ha_primary_mirror);
+        }
     }
 
     fn haStandbyReplicationExecutor(
@@ -2804,6 +2872,7 @@ pub const DataServer = struct {
                         result catch |err| switch (err) {
                             // Split runtime can briefly observe placement before the
                             // local replica root is fully provisioned on disk.
+                            error.LsmRootWriterAlreadyOpen,
                             error.FileNotFound,
                             error.UnknownGroup,
                             error.LmdbUnexpected,
@@ -2825,6 +2894,7 @@ pub const DataServer = struct {
                         self.maybeRequestProvisionedRootRefresh() catch |err| switch (err) {
                             // Local split-runtime provisioning can race with active writes.
                             // Treat those as transient and retry on the next provision tick.
+                            error.LsmRootWriterAlreadyOpen,
                             error.WriterLocked,
                             error.FileNotFound,
                             error.UnknownGroup,
@@ -2854,6 +2924,7 @@ pub const DataServer = struct {
         if (self.listener) |*listener| listener.deinit();
         if (self.http_server) |*http_server| http_server.deinit();
         if (self.ha_admin_server) |*server| server.deinit();
+        if (self.ha_promoted_primary) |*primary| primary.close();
         if (self.ha_standby_replication_http_executor) |*executor| executor.deinit();
         if (self.data_raft) |raft| {
             raft.stop();
@@ -2889,6 +2960,7 @@ pub const DataServer = struct {
         self.http_server = null;
         self.ha_admin_server = null;
         self.ha_standby_replication_http_executor = null;
+        self.ha_promoted_primary = null;
         self.ha_internal_server = null;
         self.data_raft = null;
         self.data_raft_factory = null;
@@ -2922,6 +2994,7 @@ pub const DataServer = struct {
     fn runLsmMaintenanceForegroundRound(self: *DataServer) !void {
         if (!self.haOwnerJobCanRun(.compaction_publish)) return;
         _ = self.liveRuntimeWriteSource().runLsmMaintenanceRound() catch |err| switch (err) {
+            error.LsmRootWriterAlreadyOpen,
             error.ReadOnly,
             error.FileNotFound,
             error.LmdbUnexpected,

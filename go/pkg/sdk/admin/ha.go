@@ -952,12 +952,12 @@ func ValidateHARejoinAssessResponse(response HARejoinAssessResponse) error {
 	if !HARejoinAssessmentComplete(response.Assessment) {
 		return fmt.Errorf("missing rejoin assessment fields")
 	}
-	switch response.Assessment.Action {
-	case HARejoinActionRewind:
+	switch response.Action.ActionKind {
+	case HAActionKindRejoinRewind:
 		if !HARejoinRewindComplete(response.Rewind) {
 			return fmt.Errorf("missing rejoin rewind fields")
 		}
-	case HARejoinActionReseed:
+	case HAActionKindRejoinReseed:
 		if !HARejoinReseedComplete(response.Reseed) {
 			return fmt.Errorf("missing rejoin reseed fields")
 		}
@@ -1023,12 +1023,12 @@ func ValidateHARejoinAssessResponseEvidence(raw []byte) error {
 	if !haRejoinAssessmentEvidenceComplete(response.Assessment) {
 		return fmt.Errorf("missing rejoin assessment field evidence")
 	}
-	switch strings.TrimSpace(response.Assessment.Action) {
-	case string(HARejoinActionRewind):
+	if haRejoinRewindEvidencePresent(response.Rewind) {
 		if !haRejoinRewindEvidenceComplete(response.Rewind) {
 			return fmt.Errorf("missing rejoin rewind field evidence")
 		}
-	case string(HARejoinActionReseed):
+	}
+	if haRejoinReseedEvidencePresent(response.Reseed) {
 		if !haRejoinReseedEvidenceComplete(response.Reseed) {
 			return fmt.Errorf("missing rejoin reseed field evidence")
 		}
@@ -1248,12 +1248,32 @@ func haRejoinRewindEvidenceComplete(rewind haRejoinRewindEvidence) bool {
 		rewind.TargetEpoch != nil
 }
 
+func haRejoinRewindEvidencePresent(rewind haRejoinRewindEvidence) bool {
+	return rewind.CurrentLastLsn != nil ||
+		rewind.DataLossDiscarded != nil ||
+		rewind.DiscardedLsnCount != nil ||
+		rewind.ForkLsn != nil ||
+		rewind.NextLsn != nil ||
+		rewind.PreviousLastLsn != nil ||
+		rewind.TargetTimelineId != nil ||
+		rewind.TargetEpoch != nil
+}
+
 func haRejoinReseedEvidenceComplete(reseed haRejoinReseedEvidence) bool {
 	return reseed.BaseBackupRequired != nil &&
 		reseed.ForkLsn != nil &&
 		reseed.FormerLastLsn != nil &&
 		reseed.ReseedRequired != nil &&
 		reseed.TargetTimelineId != nil &&
+		reseed.TargetEpoch != nil
+}
+
+func haRejoinReseedEvidencePresent(reseed haRejoinReseedEvidence) bool {
+	return reseed.BaseBackupRequired != nil ||
+		reseed.ForkLsn != nil ||
+		reseed.FormerLastLsn != nil ||
+		reseed.ReseedRequired != nil ||
+		reseed.TargetTimelineId != nil ||
 		reseed.TargetEpoch != nil
 }
 
@@ -1350,7 +1370,7 @@ func haRetainedLSNCountConsistent(primaryLSN uint64, oldestRestartLSN uint64, re
 	if retainedLSNCount == expected {
 		return true
 	}
-	return primaryLSN == 0 && oldestRestartLSN == 0 && retainedLSNCount == 1 && slotCount > 0
+	return primaryLSN == oldestRestartLSN && retainedLSNCount == 1 && slotCount > 0
 }
 
 func validateHASlotSnapshot(slot HASlotSnapshot, currentLSN uint64) error {
@@ -1409,9 +1429,6 @@ func validateHADurabilityDecision(decision HADurabilityDecision) error {
 	}
 	if decision.MissingLsnCount != decision.TargetLsn-decision.ProgressLsn {
 		return fmt.Errorf("durability decision inconsistent: missing_lsn_count=%d expected=%d", decision.MissingLsnCount, decision.TargetLsn-decision.ProgressLsn)
-	}
-	if decision.RequiredCount > decision.CandidateCount {
-		return fmt.Errorf("durability decision inconsistent: required_count=%d exceeds candidate_count=%d", decision.RequiredCount, decision.CandidateCount)
 	}
 	if decision.SatisfiedCount > decision.CandidateCount {
 		return fmt.Errorf("durability decision inconsistent: satisfied_count=%d exceeds candidate_count=%d", decision.SatisfiedCount, decision.CandidateCount)

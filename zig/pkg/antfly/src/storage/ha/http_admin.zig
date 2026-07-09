@@ -802,7 +802,7 @@ pub const Server = struct {
         const identity = adminIdentityFromOpenApi(parsed.value.identity) catch {
             return try textResponse(self.alloc, 400, "invalid HA rejoin assessment request");
         };
-        const last_lsn = uint64FromJson(parsed.value.last_lsn) catch {
+        var last_lsn = uint64FromJson(parsed.value.last_lsn) catch {
             return try textResponse(self.alloc, 400, "invalid HA rejoin assessment request");
         };
         const retained_from_lsn = uint64FromJson(parsed.value.retained_from_lsn) catch {
@@ -817,6 +817,19 @@ pub const Server = struct {
             }
         else
             null;
+        if (receipt) |fence| {
+            if (self.ctx.fence_store) |fence_store| {
+                fence_store.recordReceipt(fence) catch |err| {
+                    return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
+                };
+            }
+        }
+
+        if (expected_action != null and expected_action.? == .rewind) {
+            const log = self.rejoinRewindLog() orelse
+                return try textResponse(self.alloc, 409, "FormerPrimaryLogUnavailable");
+            last_lsn = log.lastLsn();
+        }
 
         const assessment = ha_admin.assessFormerPrimaryRejoin(.{
             .node_id = parsed.value.node_id,
@@ -838,7 +851,7 @@ pub const Server = struct {
             }
 
             if (expected == .rewind) {
-                const log = self.ctx.former_primary_log orelse
+                const log = self.rejoinRewindLog() orelse
                     return try textResponse(self.alloc, 409, "FormerPrimaryLogUnavailable");
                 const rewind = ha_admin.rewindFormerPrimaryReplicationLog(self.alloc, log, assessment) catch |err| {
                     return try textResponse(self.alloc, commandErrorStatus(err), @errorName(err));
@@ -895,6 +908,11 @@ pub const Server = struct {
             },
             .assessment = try adminRejoinAssessment(assessment),
         });
+    }
+
+    fn rejoinRewindLog(self: *Server) ?*replication_log.ReplicationLog {
+        if (self.ctx.primary) |primary| return &primary.log;
+        return self.ctx.former_primary_log;
     }
 
     fn parseAcquireFenceRequest(self: *Server, req: http_common.HttpRequest) !fencing.FenceRequest {

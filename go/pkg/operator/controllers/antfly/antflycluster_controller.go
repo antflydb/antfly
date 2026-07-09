@@ -3444,6 +3444,7 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 		if err := r.observeHAFencingStatus(ctx, cluster); err != nil {
 			return err
 		}
+		r.observeHAFormerPrimaryFenceStatus(ctx, cluster)
 		r.updateHAStatusAndConditions(cluster)
 		if haAdminStatusErr != nil {
 			setHACondition(
@@ -3539,6 +3540,7 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 	if err := r.observeHAFencingStatus(ctx, cluster); err != nil {
 		return err
 	}
+	r.observeHAFormerPrimaryFenceStatus(ctx, cluster)
 	r.updateHAStatusAndConditions(cluster)
 	if haAdminStatusErr != nil {
 		setHACondition(
@@ -5147,8 +5149,15 @@ func (r *AntflyClusterReconciler) applyHADirectRejoinJobResult(cluster *antflyv1
 	}
 	action.AdminResult = haRejoinAdminActionResult(result)
 	if !haActionHasRequiredAdminResult(*action) {
-		action.AdminResult = nil
-		return false
+		if haActionKind(action.Kind) == haActionDemoteFormerPrimary &&
+			strings.TrimSpace(action.AdminResult.RejoinAction) != "" &&
+			strings.TrimSpace(action.AdminResult.FormerNodeID) != "" {
+			// DemoteFormerPrimary records the assessment step. A valid assessment
+			// may reject rejoin before any rewind/reseed execution result exists.
+		} else {
+			action.AdminResult = nil
+			return false
+		}
 	}
 	if cluster.Status.HAStatus.FormerPrimary == nil {
 		cluster.Status.HAStatus.FormerPrimary = &antflyv1.HAFormerPrimaryStatus{NodeID: action.StandbyName}
@@ -5239,14 +5248,16 @@ func haDirectRejoinResultMatchesAction(result haRejoinJobResult, status *antflyv
 	if action.StandbyName != "" && result.FormerNodeID != action.StandbyName {
 		return false
 	}
-	if action.TargetLSN > 0 && result.ForkLSN != action.TargetLSN {
-		return false
-	}
-	if action.ObservedLSN > 0 && result.FormerLastLSN != action.ObservedLSN {
-		return false
+	if haActionKind(action.Kind) == haActionDemoteFormerPrimary {
+		if action.ObservedLSN > 0 && result.FormerLastLSN != action.ObservedLSN {
+			return false
+		}
 	}
 	if action.RetainedFromLSN > 0 && result.RetainedFromLSN != action.RetainedFromLSN {
 		return false
+	}
+	if haActionKind(action.Kind) == haActionDemoteFormerPrimary {
+		return true
 	}
 	if status != nil && status.LastPromotion != nil {
 		promotion := status.LastPromotion
@@ -7371,11 +7382,10 @@ func haRejoinResultMatchesRequiredAdminResult(action antflyv1.HAPlannedActionSta
 	if action.StandbyName != "" && result.FormerNodeID != action.StandbyName {
 		return false
 	}
-	if action.TargetLSN > 0 && result.ForkLSN != action.TargetLSN {
-		return false
-	}
-	if action.ObservedLSN > 0 && result.FormerLastLSN != action.ObservedLSN {
-		return false
+	if haActionKind(action.Kind) == haActionDemoteFormerPrimary {
+		if action.ObservedLSN > 0 && result.FormerLastLSN != action.ObservedLSN {
+			return false
+		}
 	}
 	if action.RetainedFromLSN > 0 && result.RetainedFromLSN != action.RetainedFromLSN {
 		return false
@@ -7384,6 +7394,9 @@ func haRejoinResultMatchesRequiredAdminResult(action antflyv1.HAPlannedActionSta
 }
 
 func haFormerPrimaryActionSucceededWithPromotionEvidence(status *antflyv1.HAStatus, action antflyv1.HAPlannedActionStatus) bool {
+	if haActionKind(action.Kind) == haActionDemoteFormerPrimary {
+		return haAdminActionSucceededWithEvidence(action)
+	}
 	return haAdminActionSucceededWithEvidence(action) &&
 		haRejoinResultMatchesPromotion(status, action, action.AdminResult)
 }
@@ -7402,10 +7415,7 @@ func haRejoinResultMatchesPromotion(status *antflyv1.HAStatus, action antflyv1.H
 	if result.TargetTimelineID != promotion.NewTimelineID || result.TargetEpoch != promotion.NewEpoch {
 		return false
 	}
-	if promotion.SwitchLSN != 0 && result.ForkLSN != promotion.SwitchLSN {
-		return false
-	}
-	if promotion.RequiredLSN != 0 && result.ForkLSN != promotion.RequiredLSN {
+	if expectedForkLSN := haPromotionObservedLSN(promotion); expectedForkLSN != 0 && result.ForkLSN != expectedForkLSN {
 		return false
 	}
 	if haActionKind(action.Kind) == haActionRewindFormerPrimary &&

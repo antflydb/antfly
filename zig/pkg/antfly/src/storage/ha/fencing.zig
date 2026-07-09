@@ -155,6 +155,18 @@ pub const Store = struct {
         return current_receipt.receipt;
     }
 
+    pub fn recordReceipt(self: *Store, receipt: Receipt) !void {
+        try validateReceipt(receipt);
+        if (self.current_receipt) |held| {
+            if (sameReceipt(held.receipt, receipt)) return;
+        }
+
+        const encoded = try encodeReceipt(self.alloc, .promotion_fence, receipt);
+        defer self.alloc.free(encoded);
+        _ = try self.wal.append(encoded);
+        try self.applyReceipt(receipt);
+    }
+
     pub fn acquirePromotionFence(self: *Store, request: FenceRequest) !Receipt {
         try validateFenceRequest(request);
         if (request.observed_lsn < request.required_lsn and !request.force) return error.FenceRequiresForce;

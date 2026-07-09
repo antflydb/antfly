@@ -6561,7 +6561,10 @@ pub const ApiHttpServer = struct {
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.UnsupportedBackupMigrationState => return error.UnsupportedBackupMigrationState,
             error.UnsupportedMultiRangeTable => return error.UnsupportedMultiRangeTable,
-            else => return error.InternalFailure,
+            else => {
+                std.log.err("table backup failed table={s} backup_id={s} err={s}", .{ table_name, backup_id, @errorName(err) });
+                return error.InternalFailure;
+            },
         };
     }
 
