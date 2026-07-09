@@ -1450,19 +1450,19 @@ func mediaPartImageURL(part MediaContentPart) string {
 }
 
 func generateBatchErrorFromHTTPStatus(status int, message string) GenerateBatchError {
-	code := "generation_failed"
+	code := "GENERATION_FAILED"
 	retryable := status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status >= 500
 	switch status {
 	case http.StatusBadRequest:
-		code = "invalid_request"
+		code = "INVALID_REQUEST"
 	case http.StatusNotFound:
-		code = "model_not_found"
+		code = "MODEL_NOT_FOUND"
 	case http.StatusRequestTimeout:
-		code = "request_timeout"
+		code = "REQUEST_TIMEOUT"
 	case http.StatusTooManyRequests:
-		code = "queue_full"
+		code = "QUEUE_FULL"
 	case http.StatusServiceUnavailable:
-		code = "service_unavailable"
+		code = "SERVICE_UNAVAILABLE"
 	}
 	return GenerateBatchError{
 		Code:      code,
@@ -1492,6 +1492,10 @@ func (ln *TermiteNode) handleApiGenerateBatch(w http.ResponseWriter, r *http.Req
 		http.Error(w, "requests are required", http.StatusBadRequest)
 		return
 	}
+	if len(req.Requests) > 128 {
+		http.Error(w, "requests must contain at most 128 items", http.StatusRequestEntityTooLarge)
+		return
+	}
 
 	resp := GenerateBatchResponse{
 		Object: GenerateBatchResponseObjectGenerateBatch,
@@ -1509,7 +1513,7 @@ func (ln *TermiteNode) handleApiGenerateBatch(w http.ResponseWriter, r *http.Req
 
 		if item.Body.Stream {
 			result.Error = GenerateBatchError{
-				Code:    "unsupported_stream",
+				Code:    "UNSUPPORTED_STREAM",
 				Message: "streaming is not supported for synchronous generate batches",
 			}
 			resp.Summary.Failed++
@@ -1520,7 +1524,7 @@ func (ln *TermiteNode) handleApiGenerateBatch(w http.ResponseWriter, r *http.Req
 		body, err := json.Marshal(item.Body)
 		if err != nil {
 			result.Error = GenerateBatchError{
-				Code:    "invalid_request",
+				Code:    "INVALID_REQUEST",
 				Message: fmt.Sprintf("encoding request item: %v", err),
 			}
 			resp.Summary.Failed++
@@ -1531,7 +1535,7 @@ func (ln *TermiteNode) handleApiGenerateBatch(w http.ResponseWriter, r *http.Req
 		itemReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, "/ai/v1/generate", bytes.NewReader(body))
 		if err != nil {
 			result.Error = GenerateBatchError{
-				Code:      "internal_error",
+				Code:      "INTERNAL_ERROR",
 				Message:   fmt.Sprintf("creating request item: %v", err),
 				Retryable: true,
 			}
@@ -1554,7 +1558,7 @@ func (ln *TermiteNode) handleApiGenerateBatch(w http.ResponseWriter, r *http.Req
 
 		if err := json.Unmarshal(itemWriter.body.Bytes(), &result.Response); err != nil {
 			result.Error = GenerateBatchError{
-				Code:      "invalid_response",
+				Code:      "INVALID_RESPONSE",
 				Message:   fmt.Sprintf("decoding generation response: %v", err),
 				Retryable: true,
 			}

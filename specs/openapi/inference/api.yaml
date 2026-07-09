@@ -1964,6 +1964,8 @@ components:
             - John Smith is 30 years old and works at Google.
         images:
           type: array
+          minItems: 1
+          maxItems: 64
           items:
             $ref: '#/components/schemas/ImageURL'
           description: |
@@ -2689,6 +2691,7 @@ components:
         requests:
           type: array
           minItems: 1
+          maxItems: 128
           items:
             $ref: '#/components/schemas/GenerateBatchRequestItem'
     GenerateBatchRequestItem:

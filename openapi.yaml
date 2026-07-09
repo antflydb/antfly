@@ -20304,6 +20304,7 @@ components:
         requests:
           type: array
           minItems: 1
+          maxItems: 128
           items:
             $ref: '#/components/schemas/InferenceGenerateBatchRequestItem'
     InferenceGenerateBatchRequestItem:

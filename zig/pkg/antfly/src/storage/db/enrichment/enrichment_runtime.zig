@@ -2371,8 +2371,83 @@ fn completeRuntimeDocumentExtractionGeneratedText(
     extraction: *document_extraction_mod.Result,
 ) !void {
     const producer = runtime.config.asset_producer orelse return;
-    for (extraction.units) |*unit| {
-        try completeRuntimeDocumentExtractionGeneratedTextUnit(runtime, producer, config, source_url, extraction.route_type, source_content_type, unit);
+    try completeRuntimeDocumentExtractionGeneratedTextBatch(runtime, producer, config, source_url, extraction.route_type, source_content_type, extraction.units, .ocr);
+    try completeRuntimeDocumentExtractionGeneratedTextBatch(runtime, producer, config, source_url, extraction.route_type, source_content_type, extraction.units, .transcript);
+}
+
+fn completeRuntimeDocumentExtractionGeneratedTextBatch(
+    runtime: *EnrichmentRuntime,
+    producer: asset_producer_mod.Producer,
+    config: document_extraction_mod.Config,
+    source_url: []const u8,
+    route_type: []const u8,
+    source_content_type: []const u8,
+    units: []document_extraction_mod.Unit,
+    kind: RuntimeGeneratedUnitTextKind,
+) !void {
+    const enabled = switch (kind) {
+        .ocr => config.ocr_enabled,
+        .transcript => config.transcription_enabled,
+    };
+    if (!enabled) return;
+
+    const pending_status = switch (kind) {
+        .ocr => "pending_ocr",
+        .transcript => "pending_transcription",
+    };
+    const producer_type: asset_producer_mod.ProducerType = switch (kind) {
+        .ocr => .reader,
+        .transcript => .transcriber,
+    };
+    const config_json = switch (kind) {
+        .ocr => config.ocr_config_json,
+        .transcript => config.transcription_config_json,
+    };
+    const method = switch (kind) {
+        .ocr => "ocr_text",
+        .transcript => "transcript_text",
+    };
+
+    const requests = try runtime.alloc.alloc(asset_producer_mod.Request, units.len);
+    defer runtime.alloc.free(requests);
+    const unit_indices = try runtime.alloc.alloc(usize, units.len);
+    defer runtime.alloc.free(unit_indices);
+    const parts_values = try runtime.alloc.alloc([]u8, units.len);
+    var parts_count: usize = 0;
+    defer {
+        for (parts_values[0..parts_count]) |parts_json| runtime.alloc.free(parts_json);
+        runtime.alloc.free(parts_values);
+    }
+
+    var count: usize = 0;
+    for (units, 0..) |unit, idx| {
+        if (unit.extraction_status == null or !std.mem.eql(u8, unit.extraction_status.?, pending_status)) continue;
+        const parts_json = try runtimeDocumentGeneratedTextPartsJsonAlloc(runtime.alloc, route_type, source_content_type, unit);
+        parts_values[parts_count] = parts_json;
+        parts_count += 1;
+        requests[count] = .{
+            .producer_type = producer_type,
+            .config_json = config_json,
+            .source_text = source_url,
+            .source_parts_json = parts_json,
+            .content_type = "text/plain",
+        };
+        unit_indices[count] = idx;
+        count += 1;
+    }
+    if (count == 0) return;
+
+    var produced = try producer.produceBatch(runtime.alloc, requests[0..count]);
+    defer runtime.alloc.free(produced);
+    errdefer {
+        for (produced) |item| {
+            if (item.len > 0) runtime.alloc.free(item);
+        }
+    }
+    if (produced.len != count) return error.InvalidAssetProducerResponse;
+    for (produced[0..count], unit_indices[0..count], 0..) |item, unit_idx, i| {
+        produced[i] = &.{};
+        try applyRuntimeGeneratedUnitText(runtime.alloc, &units[unit_idx], item, method, "completed", kind);
     }
 }
 
@@ -2385,33 +2460,37 @@ fn completeRuntimeDocumentExtractionGeneratedTextUnit(
     source_content_type: []const u8,
     unit: *document_extraction_mod.Unit,
 ) !void {
-    if (config.ocr_enabled and unit.extraction_status != null and std.mem.eql(u8, unit.extraction_status.?, "pending_ocr")) {
-        const parts_json = try runtimeDocumentGeneratedTextPartsJsonAlloc(runtime.alloc, route_type, source_content_type, unit.*);
-        defer runtime.alloc.free(parts_json);
-        const produced = try producer.produce(runtime.alloc, .{
-            .producer_type = .reader,
-            .config_json = config.ocr_config_json,
-            .source_text = source_url,
-            .source_parts_json = parts_json,
-            .content_type = "text/plain",
-        });
-        errdefer runtime.alloc.free(produced);
-        try applyRuntimeGeneratedUnitText(runtime.alloc, unit, produced, "ocr_text", "completed", .ocr);
+    const kind: RuntimeGeneratedUnitTextKind = if (config.ocr_enabled and unit.extraction_status != null and std.mem.eql(u8, unit.extraction_status.?, "pending_ocr"))
+        .ocr
+    else if (config.transcription_enabled and unit.extraction_status != null and std.mem.eql(u8, unit.extraction_status.?, "pending_transcription"))
+        .transcript
+    else
         return;
-    }
-    if (config.transcription_enabled and unit.extraction_status != null and std.mem.eql(u8, unit.extraction_status.?, "pending_transcription")) {
-        const parts_json = try runtimeDocumentGeneratedTextPartsJsonAlloc(runtime.alloc, route_type, source_content_type, unit.*);
-        defer runtime.alloc.free(parts_json);
-        const produced = try producer.produce(runtime.alloc, .{
-            .producer_type = .transcriber,
-            .config_json = config.transcription_config_json,
-            .source_text = source_url,
-            .source_parts_json = parts_json,
-            .content_type = "text/plain",
-        });
-        errdefer runtime.alloc.free(produced);
-        try applyRuntimeGeneratedUnitText(runtime.alloc, unit, produced, "transcript_text", "completed", .transcript);
-    }
+
+    const producer_type: asset_producer_mod.ProducerType = switch (kind) {
+        .ocr => .reader,
+        .transcript => .transcriber,
+    };
+    const config_json = switch (kind) {
+        .ocr => config.ocr_config_json,
+        .transcript => config.transcription_config_json,
+    };
+    const method = switch (kind) {
+        .ocr => "ocr_text",
+        .transcript => "transcript_text",
+    };
+
+    const parts_json = try runtimeDocumentGeneratedTextPartsJsonAlloc(runtime.alloc, route_type, source_content_type, unit.*);
+    defer runtime.alloc.free(parts_json);
+    const produced = try producer.produce(runtime.alloc, .{
+        .producer_type = producer_type,
+        .config_json = config_json,
+        .source_text = source_url,
+        .source_parts_json = parts_json,
+        .content_type = "text/plain",
+    });
+    errdefer runtime.alloc.free(produced);
+    try applyRuntimeGeneratedUnitText(runtime.alloc, unit, produced, method, "completed", kind);
 }
 
 const RuntimeGeneratedUnitTextKind = enum { ocr, transcript };

@@ -299,7 +299,7 @@ enrichment producer.execution override
   -> clamped by process/operator maximums and backend limits
 ```
 
-For reader/OCR assets, the initial policy should support item and byte caps:
+For reader/OCR assets, the policy supports item and byte caps:
 
 - default OCR batch items: 4
 - conservative hard cap: 8 unless the operator raises it
@@ -315,10 +315,16 @@ ANTFLY_ENRICHMENT_OCR_BATCH_MAX_ITEMS=8
 ANTFLY_ENRICHMENT_OCR_BATCH_BYTES=67108864
 ```
 
-Readers must stay model-neutral at this layer. Artifact workers batch
-`readers.Request.images`; inference decides whether a concrete reader can
-execute the batch natively, chunk it, or fall back. The artifact pipeline should
-not encode Florence-specific assumptions.
+Readers must stay model-neutral at this layer. The artifact producer exposes a
+batch request hook, and the local Antfly reader producer coalesces compatible
+reader requests into one `readers.Request.images` call when producer type,
+semantic config, prompt, and model options match. Inference decides whether a
+concrete reader can execute the batch natively, chunk it, or fall back. The
+artifact pipeline must not encode Florence-specific assumptions. Remote
+providers, mixed configs, mixed prompts, generators, extractors, and
+transcribers can use the same producer batch hook, but they currently fall back
+to sequential execution unless their provider implementation exposes a native
+batch operation.
 
 Execution policy is scoped to the catalog resource that owns the work. Explicit
 enrichments already name one producer operation, so their `execution` block uses
@@ -566,8 +572,9 @@ Extraction inference also has a batched request shape: multiple text inputs or
 image inputs can be submitted together and results are returned by input index.
 Recognizer-backed extraction should batch text inputs directly; for GLiNER2 this
 means one recognizer batch per schema label set, not one model run per text.
-Reader-backed image extraction should batch the reader/OCR step before schema
-extraction. As with readers and embedders, extraction batch policy belongs in
+Reader-backed image extraction batches the reader/OCR step before schema
+extraction when pending units share a compatible local Antfly reader
+configuration. As with readers and embedders, extraction batch policy belongs in
 `execution` and must be clamped by model and operator limits.
 
 The public asset enrichment shape uses `field` and `template`. The older

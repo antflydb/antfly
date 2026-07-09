@@ -106,7 +106,9 @@ response shape and so streaming, retries, and per-item failures are explicit.
 
 For JSON requests, the body is an envelope with an optional `mode`. The initial
 implementation only supports `sync`; `async` is reserved for future durable
-batch jobs:
+batch jobs. The synchronous envelope is capped at 128 items; larger jobs should
+be split by the client today and should move to durable async batches when that
+mode is implemented:
 
 ```json
 {
@@ -169,7 +171,7 @@ creating the durable job.
 
 ## Reader/OCR batching
 
-The `/read` endpoint accepts multiple images and should route them through a reader-level batch API instead of invoking the model once per image. The reader abstraction has two layers:
+The `/read` endpoint accepts multiple images and routes them through a reader-level batch API instead of invoking the model once per image. The public HTTP request is capped at 64 images so callers cannot monopolize memory before model-level budgeting runs. The reader abstraction has two layers:
 
 - `LoadedReader.readBatch`: the stable reader contract used by the server and local direct calls.
 - Model-family implementations: native Florence can use a real batch fast path; VLM, GenAI, Pix2Struct, and multistage OCR may keep the serial fallback until their runtimes expose safe batch execution.

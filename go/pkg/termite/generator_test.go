@@ -21,6 +21,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -130,6 +131,12 @@ func TestTermiteNode_HandleApiGenerateBatch_InvalidEnvelope(t *testing.T) {
 			wantCode: http.StatusBadRequest,
 			wantErr:  "unsupported batch mode",
 		},
+		{
+			name:     "too many requests",
+			body:     `{"requests":[` + strings.Repeat(`{"custom_id":"x","body":{"model":"test","messages":[{"role":"user","content":"hi"}]}},`, 128) + `{"custom_id":"x","body":{"model":"test","messages":[{"role":"user","content":"hi"}]}}]}`,
+			wantCode: http.StatusRequestEntityTooLarge,
+			wantErr:  "at most 128",
+		},
 	}
 
 	for _, tt := range tests {
@@ -172,10 +179,10 @@ func TestTermiteNode_HandleApiGenerateBatch_ItemErrors(t *testing.T) {
 	require.Len(t, resp.Data, 2)
 	assert.Equal(t, "streaming", resp.Data[0].CustomId)
 	assert.Equal(t, 0, resp.Data[0].Index)
-	assert.Equal(t, "unsupported_stream", resp.Data[0].Error.Code)
+	assert.Equal(t, "UNSUPPORTED_STREAM", resp.Data[0].Error.Code)
 	assert.Equal(t, "no-models", resp.Data[1].CustomId)
 	assert.Equal(t, 1, resp.Data[1].Index)
-	assert.Equal(t, "service_unavailable", resp.Data[1].Error.Code)
+	assert.Equal(t, "SERVICE_UNAVAILABLE", resp.Data[1].Error.Code)
 	assert.True(t, resp.Data[1].Error.Retryable)
 }
 

@@ -138,6 +138,8 @@ pub const WarmModel = struct {
 
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
+const max_generate_batch_items: usize = 128;
+const max_read_batch_images: usize = 64;
 
 const GenerateBackendSelection = struct {
     native_choice: native_backend_choice.Choice = .auto,
@@ -2958,6 +2960,12 @@ pub const Node = struct {
         if (body.requests.len == 0) {
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "'requests' must not be empty" });
         }
+        if (body.requests.len > max_generate_batch_items) {
+            return ctx.status(413).json(.{
+                .@"error" = "BATCH_TOO_LARGE",
+                .message = try std.fmt.allocPrint(ctx.allocator, "'requests' must contain at most {d} items", .{max_generate_batch_items}),
+            });
+        }
 
         const queue_units = self.estimateHttpRequestQueueUnits(ctx);
         if (try self.acquireSlotUnits(ctx, queue_units)) |resp| return resp;
@@ -3198,7 +3206,17 @@ pub const Node = struct {
                 }
                 var leases = try ctx.allocator.alloc(runtime.scheduler.native_generate.Lease, group_indices.items.len);
                 for (leases) |*lease| lease.* = .{ .request_id = 0, .reserved_units = 0, .prompt_bytes = 0, .max_tokens = 0, .prefill_chunk_size = 0, .active_requests_snapshot = 0 };
-                defer ctx.allocator.free(leases);
+                defer {
+                    if (model.native_generate_coordinator) |coordinator| {
+                        for (leases) |*lease| {
+                            if (lease.request_id != 0) {
+                                coordinator.release(lease.*);
+                                lease.request_id = 0;
+                            }
+                        }
+                    }
+                    ctx.allocator.free(leases);
+                }
                 var tasks = try ctx.allocator.alloc(BatchGenerateTask, group_indices.items.len);
                 defer ctx.allocator.free(tasks);
 
@@ -3210,11 +3228,15 @@ pub const Node = struct {
                     decode_states[pos] = generation.NativeDecodeState.initPaged(ctx.allocator, &kv_manager, pool_id, model.shared_moe_cache);
                     decode_states[pos].kv_storage = &kv_storage;
                     leases[pos] = if (model.native_generate_coordinator) |coordinator| blk: {
-                        const lease = try coordinator.acquire(.{
+                        const lease = coordinator.acquire(.{
                             .requested_units = queue_item_units,
                             .prompt_bytes = prompt_bytes[pos],
                             .max_tokens = configs[pos].max_tokens,
-                        });
+                        }) catch |err| {
+                            results[idx].@"error" = .{ .code = "QUEUE_FULL", .message = @errorName(err), .retryable = true };
+                            pending[idx] = false;
+                            continue;
+                        };
                         configs[pos].prefill_chunk_size = lease.prefill_chunk_size;
                         break :blk lease;
                     } else .{ .request_id = 0, .reserved_units = 0, .prompt_bytes = 0, .max_tokens = 0, .prefill_chunk_size = 256, .active_requests_snapshot = 0 };
@@ -3253,14 +3275,7 @@ pub const Node = struct {
                     spawned_any = true;
                 }
                 if (spawned_any) group.await(ctx.io) catch {};
-                if (model.native_generate_coordinator) |coordinator| {
-                    for (group_indices.items, 0..) |idx, pos| {
-                        if (leases[pos].request_id != 0) coordinator.release(leases[pos]);
-                        pending[idx] = false;
-                    }
-                } else {
-                    for (group_indices.items) |idx| pending[idx] = false;
-                }
+                for (group_indices.items) |idx| pending[idx] = false;
             }
         }
 
@@ -4590,6 +4605,12 @@ pub const Node = struct {
 
         if (body.images.len == 0) {
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "'images' must not be empty" });
+        }
+        if (body.images.len > max_read_batch_images) {
+            return ctx.status(413).json(.{
+                .@"error" = "BATCH_TOO_LARGE",
+                .message = try std.fmt.allocPrint(ctx.allocator, "'images' must contain at most {d} items", .{max_read_batch_images}),
+            });
         }
 
         // Resolve model
