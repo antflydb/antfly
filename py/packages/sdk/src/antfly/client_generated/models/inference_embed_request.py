@@ -7,6 +7,7 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.inference_embed_request_encoding_format import InferenceEmbedRequestEncodingFormat
+from ..models.inference_embed_request_error_policy import InferenceEmbedRequestErrorPolicy
 from ..models.inference_embed_request_input_type import InferenceEmbedRequestInputType
 from ..models.inference_embed_request_task_type import InferenceEmbedRequestTaskType
 from ..types import UNSET, Unset
@@ -42,6 +43,13 @@ class InferenceEmbedRequest:
         input_type (InferenceEmbedRequestInputType | Unset): Deprecated compatibility alias for task_type.
             search_query/query map to RETRIEVAL_QUERY; search_document/document map to RETRIEVAL_DOCUMENT; classification
             and clustering map to their Google task_type equivalents.
+        error_policy (InferenceEmbedRequestErrorPolicy | Unset): Controls how dense embedding requests report per-input
+            failures.
+            `fail_fast` preserves OpenAI-compatible all-or-error behavior.
+            `per_item` returns successful embeddings in `data` and indexed
+            permanent/transient failures in `errors` without failing the
+            entire HTTP request.
+             Default: InferenceEmbedRequestErrorPolicy.FAIL_FAST.
     """
 
     model: str
@@ -50,6 +58,7 @@ class InferenceEmbedRequest:
     dimensions: int | Unset = UNSET
     task_type: InferenceEmbedRequestTaskType | Unset = UNSET
     input_type: InferenceEmbedRequestInputType | Unset = UNSET
+    error_policy: InferenceEmbedRequestErrorPolicy | Unset = InferenceEmbedRequestErrorPolicy.FAIL_FAST
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -92,6 +101,10 @@ class InferenceEmbedRequest:
         if not isinstance(self.input_type, Unset):
             input_type = self.input_type.value
 
+        error_policy: str | Unset = UNSET
+        if not isinstance(self.error_policy, Unset):
+            error_policy = self.error_policy.value
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -108,6 +121,8 @@ class InferenceEmbedRequest:
             field_dict["task_type"] = task_type
         if input_type is not UNSET:
             field_dict["input_type"] = input_type
+        if error_policy is not UNSET:
+            field_dict["error_policy"] = error_policy
 
         return field_dict
 
@@ -197,6 +212,13 @@ class InferenceEmbedRequest:
         else:
             input_type = InferenceEmbedRequestInputType(_input_type)
 
+        _error_policy = d.pop("error_policy", UNSET)
+        error_policy: InferenceEmbedRequestErrorPolicy | Unset
+        if isinstance(_error_policy, Unset):
+            error_policy = UNSET
+        else:
+            error_policy = InferenceEmbedRequestErrorPolicy(_error_policy)
+
         inference_embed_request = cls(
             model=model,
             input_=input_,
@@ -204,6 +226,7 @@ class InferenceEmbedRequest:
             dimensions=dimensions,
             task_type=task_type,
             input_type=input_type,
+            error_policy=error_policy,
         )
 
         inference_embed_request.additional_properties = d

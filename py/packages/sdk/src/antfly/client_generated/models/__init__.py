@@ -295,10 +295,14 @@ from .inference_content_security_config import InferenceContentSecurityConfig
 from .inference_credentials import InferenceCredentials
 from .inference_embed_request import InferenceEmbedRequest
 from .inference_embed_request_encoding_format import InferenceEmbedRequestEncodingFormat
+from .inference_embed_request_error_policy import InferenceEmbedRequestErrorPolicy
 from .inference_embed_request_input_type import InferenceEmbedRequestInputType
 from .inference_embed_request_task_type import InferenceEmbedRequestTaskType
 from .inference_embed_response import InferenceEmbedResponse
 from .inference_embed_response_object import InferenceEmbedResponseObject
+from .inference_embedding_batch_summary import InferenceEmbeddingBatchSummary
+from .inference_embedding_item_error import InferenceEmbeddingItemError
+from .inference_embedding_item_error_stage import InferenceEmbeddingItemErrorStage
 from .inference_embedding_object import InferenceEmbeddingObject
 from .inference_embedding_object_object import InferenceEmbeddingObjectObject
 from .inference_embedding_usage import InferenceEmbeddingUsage
@@ -922,11 +926,15 @@ __all__ = (
     "InferenceConnectionModels",
     "InferenceContentSecurityConfig",
     "InferenceCredentials",
+    "InferenceEmbeddingBatchSummary",
+    "InferenceEmbeddingItemError",
+    "InferenceEmbeddingItemErrorStage",
     "InferenceEmbeddingObject",
     "InferenceEmbeddingObjectObject",
     "InferenceEmbeddingUsage",
     "InferenceEmbedRequest",
     "InferenceEmbedRequestEncodingFormat",
+    "InferenceEmbedRequestErrorPolicy",
     "InferenceEmbedRequestInputType",
     "InferenceEmbedRequestTaskType",
     "InferenceEmbedResponse",

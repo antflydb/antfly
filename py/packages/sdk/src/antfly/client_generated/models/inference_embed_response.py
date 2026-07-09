@@ -7,8 +7,11 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.inference_embed_response_object import InferenceEmbedResponseObject
+from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.inference_embedding_batch_summary import InferenceEmbeddingBatchSummary
+    from ..models.inference_embedding_item_error import InferenceEmbeddingItemError
     from ..models.inference_embedding_object import InferenceEmbeddingObject
     from ..models.inference_embedding_usage import InferenceEmbeddingUsage
 
@@ -25,12 +28,17 @@ class InferenceEmbedResponse:
         data (list[InferenceEmbeddingObject]): List of embedding objects
         model (str): Model used for embedding generation
         usage (InferenceEmbeddingUsage): Token usage information
+        errors (list[InferenceEmbeddingItemError] | Unset): Indexed per-input failures. Only populated when request
+            error_policy is per_item.
+        summary (InferenceEmbeddingBatchSummary | Unset): Counts for per-item embedding responses
     """
 
     object_: InferenceEmbedResponseObject
     data: list[InferenceEmbeddingObject]
     model: str
     usage: InferenceEmbeddingUsage
+    errors: list[InferenceEmbeddingItemError] | Unset = UNSET
+    summary: InferenceEmbeddingBatchSummary | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -45,6 +53,17 @@ class InferenceEmbedResponse:
 
         usage = self.usage.to_dict()
 
+        errors: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.errors, Unset):
+            errors = []
+            for errors_item_data in self.errors:
+                errors_item = errors_item_data.to_dict()
+                errors.append(errors_item)
+
+        summary: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.summary, Unset):
+            summary = self.summary.to_dict()
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -55,11 +74,17 @@ class InferenceEmbedResponse:
                 "usage": usage,
             }
         )
+        if errors is not UNSET:
+            field_dict["errors"] = errors
+        if summary is not UNSET:
+            field_dict["summary"] = summary
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.inference_embedding_batch_summary import InferenceEmbeddingBatchSummary
+        from ..models.inference_embedding_item_error import InferenceEmbeddingItemError
         from ..models.inference_embedding_object import InferenceEmbeddingObject
         from ..models.inference_embedding_usage import InferenceEmbeddingUsage
 
@@ -77,11 +102,29 @@ class InferenceEmbedResponse:
 
         usage = InferenceEmbeddingUsage.from_dict(d.pop("usage"))
 
+        _errors = d.pop("errors", UNSET)
+        errors: list[InferenceEmbeddingItemError] | Unset = UNSET
+        if _errors is not UNSET:
+            errors = []
+            for errors_item_data in _errors:
+                errors_item = InferenceEmbeddingItemError.from_dict(errors_item_data)
+
+                errors.append(errors_item)
+
+        _summary = d.pop("summary", UNSET)
+        summary: InferenceEmbeddingBatchSummary | Unset
+        if isinstance(_summary, Unset):
+            summary = UNSET
+        else:
+            summary = InferenceEmbeddingBatchSummary.from_dict(_summary)
+
         inference_embed_response = cls(
             object_=object_,
             data=data,
             model=model,
             usage=usage,
+            errors=errors,
+            summary=summary,
         )
 
         inference_embed_response.additional_properties = d

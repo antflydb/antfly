@@ -4240,6 +4240,8 @@ pub const InferenceEmbedRequest = struct {
     task_type: ?[]const u8 = null,
     /// Deprecated compatibility alias for task_type. search_query/query map to RETRIEVAL_QUERY; search_document/document map to RETRIEVAL_DOCUMENT; classification and clustering map to their Google task_type equivalents.
     input_type: ?[]const u8 = null,
+    /// Controls how dense embedding requests report per-input failures. `fail_fast` preserves OpenAI-compatible all-or-error behavior. `per_item` returns successful embeddings in `data` and indexed permanent/transient failures in `errors` without failing the entire HTTP request.
+    error_policy: ?[]const u8 = null,
 };
 
 /// OpenAI-compatible embedding response with a polymorphic `embedding` field for dense or sparse vectors
@@ -4251,6 +4253,32 @@ pub const InferenceEmbedResponse = struct {
     /// Model used for embedding generation
     model: []const u8,
     usage: InferenceEmbeddingUsage,
+    /// Indexed per-input failures. Only populated when request error_policy is per_item.
+    errors: ?[]const InferenceEmbeddingItemError = null,
+    summary: ?InferenceEmbeddingBatchSummary = null,
+};
+
+/// Counts for per-item embedding responses
+pub const InferenceEmbeddingBatchSummary = struct {
+    total: i64,
+    succeeded: i64,
+    failed: i64,
+};
+
+/// Per-input embedding failure for error_policy=per_item responses
+pub const InferenceEmbeddingItemError = struct {
+    /// Original input index that failed
+    index: i64,
+    /// Stable machine-readable failure code
+    code: []const u8,
+    /// Human-readable failure message
+    message: []const u8,
+    /// Pipeline stage that classified the failure
+    stage: []const u8,
+    /// Whether retrying the same item may succeed
+    retryable: bool,
+    /// HTTP-style status classification for this item
+    status: i64,
 };
 
 /// A single embedding result
