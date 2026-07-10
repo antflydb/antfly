@@ -14152,6 +14152,12 @@ pub const DB = struct {
         generation: ?u64,
     ) anyerror!?doc_set.ResolvedDocSet {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        // The complement cache contains identity visibility only. TTL is a
+        // time-varying visibility constraint applied by liveFilterDocSetCallback,
+        // so using the complement would bypass it and let an expired vector
+        // consume a top-k slot before postprocessing. Fall back to the existing
+        // TTL-aware positive live set for those tables.
+        if (ttlDurationNs(self) != 0) return null;
         return try self.nonVisibleDocSetCachedAlloc(alloc, generation);
     }
 
@@ -57496,6 +57502,60 @@ test "db search filters expired documents when ttl schema is configured" {
     defer text.deinit();
     try std.testing.expectEqual(@as(u32, 1), text.total_hits);
     try std.testing.expectEqualStrings("doc:fresh", text.hits[0].id);
+}
+
+test "db dense broad visibility filtering does not bypass ttl" {
+    const alloc = std.testing.allocator;
+    const ttl_duration_ns: u64 = 60 * std.time.ns_per_s;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.setSchema(.{
+        .version = 1,
+        .default_type = "_default",
+        .ttl_duration_ns = ttl_duration_ns,
+    });
+
+    const now_ns = currentTimeNs();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:expired", .value = "{\"embedding\":[1,0]}" }},
+        .timestamp_ns = now_ns - 2 * ttl_duration_ns,
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:fresh", .value = "{\"embedding\":[0,1]}" },
+            .{ .key = "doc:deleted", .value = "{\"embedding\":[0.5,0.5]}" },
+        },
+        .timestamp_ns = now_ns,
+    });
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    });
+    // Force broad identity visibility to have a cheap complement. TTL is a
+    // second visibility dimension and must still select the positive live set.
+    try db.batch(.{
+        .deletes = &.{"doc:deleted"},
+        .timestamp_ns = now_ns,
+        .sync_level = .full_index,
+    });
+
+    var result = try db.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{ .vector = &.{ 1.0, 0.0 }, .k = 1 },
+        .limit = 1,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc:fresh", result.hits[0].id);
 }
 
 test "db ttl falls back to write timestamp when ttl field is missing" {

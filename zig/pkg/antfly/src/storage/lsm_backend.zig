@@ -1050,6 +1050,103 @@ pub const Backend = struct {
         }
     };
 
+    // Keep all derived WAL accounting in one owner so mutation paths cannot
+    // accidentally update only half of the cached state. All Backend calls
+    // that mutate retained WAL belong on this type (rather than calling
+    // wal_mod directly). Appends advance the primary snapshot in O(1);
+    // destructive operations invalidate or replace the affected snapshot
+    // before exposing their result. The cache-coherence test below is the
+    // oracle for any new mutation method.
+    const WalRetentionState = struct {
+        primary: ?wal_mod.RetentionStats = null,
+        primary_ns: u64 = 0,
+        replay: ?wal_mod.RetentionStats = null,
+        replay_ns: u64 = 0,
+
+        fn append(
+            self: *@This(),
+            storage: storage_io.Storage,
+            allocator: Allocator,
+            root_dir: []const u8,
+            state: anytype,
+            sync_on_commit: bool,
+            options: wal_mod.AppendOptions,
+            now_ns: u64,
+        ) !wal_mod.AppendResult {
+            errdefer self.invalidatePrimary();
+            const result = try wal_mod.appendStateWithOptionsResult(
+                storage,
+                allocator,
+                root_dir,
+                state,
+                sync_on_commit,
+                options,
+            );
+            self.noteAppend(result, now_ns);
+            return result;
+        }
+
+        fn retireCoveredSegments(
+            self: *@This(),
+            storage: storage_io.Storage,
+            allocator: Allocator,
+            root_dir: []const u8,
+            covered_through: u64,
+        ) !void {
+            // The operation updates both segment files and the checkpoint
+            // index. Invalidate first so a partial failure cannot leave a
+            // seemingly authoritative pre-retirement snapshot.
+            self.invalidatePrimary();
+            try wal_mod.retireCoveredSegments(storage, allocator, root_dir, covered_through);
+        }
+
+        fn reset(
+            self: *@This(),
+            storage: storage_io.Storage,
+            allocator: Allocator,
+            root_dir: []const u8,
+            now_ns: u64,
+        ) !void {
+            // reset rewrites primary and replay indexes and removes segments.
+            // Publish the known empty state only after every write succeeds.
+            self.invalidateAll();
+            try wal_mod.reset(storage, allocator, root_dir);
+            self.installReset(now_ns);
+        }
+
+        fn noteAppend(self: *@This(), result: wal_mod.AppendResult, now_ns: u64) void {
+            if (result.bytes == 0 or result.segment == 0) return;
+            if (self.primary) |*stats| {
+                if (stats.current_segment == 0) {
+                    stats.oldest_retained_segment = 1;
+                }
+                stats.current_segment = result.segment;
+                stats.bytes +|= @intCast(result.bytes);
+                if (result.segment_became_nonempty) stats.segments +|= 1;
+                self.primary_ns = now_ns;
+            }
+        }
+
+        fn invalidatePrimary(self: *@This()) void {
+            self.primary = null;
+            self.primary_ns = 0;
+        }
+
+        fn invalidateAll(self: *@This()) void {
+            self.* = .{};
+        }
+
+        fn installReset(self: *@This(), now_ns: u64) void {
+            self.primary = .{
+                .oldest_retained_segment = 1,
+                .current_segment = 1,
+            };
+            self.primary_ns = now_ns;
+            self.replay = .{ .current_segment = 1 };
+            self.replay_ns = now_ns;
+        }
+    };
+
     allocator: Allocator,
     mu: std.atomic.Mutex = .unlocked,
     // Cached score used by best-effort maintenance scheduling and metrics.
@@ -1093,10 +1190,7 @@ pub const Backend = struct {
     background_io_oversized_jobs: u64 = 0,
     write_pressure_enforcing: bool = false,
     last_wal_retention_enforce_ns: u64 = 0,
-    cached_wal_retention: ?wal_mod.RetentionStats = null,
-    cached_wal_retention_ns: u64 = 0,
-    cached_wal_replay_retention: ?wal_mod.RetentionStats = null,
-    cached_wal_replay_retention_ns: u64 = 0,
+    wal_retention: WalRetentionState = .{},
     remembered_compaction: ?compaction_mod.RememberedCompaction = null,
     open_stats: OpenStats = .{},
     write_stats: WriteStats = .{},
@@ -1754,10 +1848,15 @@ pub const Backend = struct {
     }
 
     fn syncTrackedWalRetentionUsageCurrentLocked(self: *Backend) void {
+        const manager = self.options.resource_manager orelse return;
         if (!self.options.wal_enabled or self.root_dir == null) return;
-        const retention = wal_mod.snapshotRetention(self.storage.?, self.allocator, self.root_dir.?) catch wal_mod.RetentionStats{};
-        const replay_retention = wal_mod.snapshotReplayRetention(self.storage.?, self.allocator, self.root_dir.?) catch wal_mod.RetentionStats{};
-        self.syncTrackedWalRetentionUsageLocked(retention.bytes +| replay_retention.bytes);
+        const retention = self.cachedWalRetentionLocked() catch wal_mod.RetentionStats{};
+        const replay_retention = self.cachedWalReplayRetentionLocked() catch wal_mod.RetentionStats{};
+        manager.observeUsage(
+            .lsm_wal_retention,
+            &self.tracked_wal_retention_bytes,
+            retention.bytes +| replay_retention.bytes,
+        );
     }
 
     fn syncTrackedWalRetentionUsageLocked(self: *Backend, bytes: u64) void {
@@ -2123,7 +2222,12 @@ pub const Backend = struct {
         if (oldest_active <= 1) return;
         var wal_lock = try self.acquireWalOperationLock(.exclusive);
         defer wal_lock.release();
-        try wal_mod.retireCoveredSegments(self.storage.?, self.allocator, self.root_dir.?, oldest_active - 1);
+        try self.wal_retention.retireCoveredSegments(
+            self.storage.?,
+            self.allocator,
+            self.root_dir.?,
+            oldest_active - 1,
+        );
         self.syncTrackedWalRetentionUsageCurrentLocked();
     }
 
@@ -2966,19 +3070,20 @@ pub const Backend = struct {
         };
         var wal_lock = try self.acquireWalOperationLock(.exclusive);
         defer wal_lock.release();
-        const bytes = try wal_mod.appendStateWithOptions(
+        const append_result = try self.wal_retention.append(
             self.storage.?,
             self.allocator,
             self.root_dir.?,
             state,
             self.options.wal_sync_on_commit,
             .{ .segment_bytes = self.options.wal_segment_bytes },
+            self.writeStatsNowNs(),
         );
-        self.noteMutableWalSegment(try wal_mod.currentSegment(self.storage.?, self.allocator, self.root_dir.?));
+        self.noteMutableWalSegment(append_result.segment);
         self.syncTrackedWalRetentionUsageCurrentLocked();
         self.write_stats.wal_append_records += 1;
         self.write_stats.wal_append_entries += @intCast(state.entries.items.len);
-        self.write_stats.wal_append_bytes += bytes;
+        self.write_stats.wal_append_bytes += append_result.bytes;
         const append_ns = self.writeStatsElapsedNs(start_ns);
         self.write_stats.wal_append_ns += append_ns;
         if (self.options.wal_sync_on_commit) {
@@ -2991,6 +3096,10 @@ pub const Backend = struct {
         if (!self.options.wal_enabled or self.root_dir == null) return;
         const start_ns = self.writeStatsNowNs();
         const before_manifest_writes = self.write_stats.manifest_writes;
+        // Replay may truncate a corrupt primary tail and advances replay
+        // bookkeeping. Treat both derived snapshots as unknown until it has
+        // completed and the primary snapshot is rebuilt below.
+        self.wal_retention.invalidateAll();
         self.recovery_replaying_wal = true;
         errdefer self.recovery_replaying_wal = false;
         var recovery_session = RecoveryReplaySession{ .backend = self };
@@ -3031,7 +3140,7 @@ pub const Backend = struct {
         if (!self.options.backend.read_only and self.write_stats.manifest_writes != before_manifest_writes) {
             try self.maybeCheckpointWalAfterManifestPublish();
         }
-        const retention = try wal_mod.snapshotRetention(self.storage.?, self.allocator, self.root_dir.?);
+        const retention = try self.cachedWalRetentionLocked();
         self.mutable_wal_range = if (retention.segments == 0 or self.mutable.entries.items.len == 0)
             .{}
         else
@@ -3115,7 +3224,12 @@ pub const Backend = struct {
         const start_ns = self.writeStatsNowNs();
         var wal_lock = try self.acquireWalOperationLock(.exclusive);
         defer wal_lock.release();
-        try wal_mod.reset(self.storage.?, self.allocator, self.root_dir.?);
+        try self.wal_retention.reset(
+            self.storage.?,
+            self.allocator,
+            self.root_dir.?,
+            self.writeStatsNowNs(),
+        );
         self.syncTrackedWalRetentionUsageCurrentLocked();
         self.write_stats.wal_resets += 1;
         self.write_stats.wal_reset_ns += self.writeStatsElapsedNs(start_ns);
@@ -3928,41 +4042,37 @@ pub const Backend = struct {
         return try self.cachedWalRetentionLocked();
     }
 
-    // wal.snapshotRetention re-reads the checkpoint index and current
-    // segment and fstats every retained segment. Its callers (write-pressure
-    // enforcement, maintenance scoring, stats snapshots) run on every
-    // maintenance step under the backend lock, which starves writers and
-    // async index appliers during sustained ingest. Serve all of them from a
-    // short-lived cache; retention limits are approximate by nature, so
-    // 250ms staleness is immaterial. Paths that need to observe their own
-    // progress (the pressure flush loop) invalidate explicitly.
+    // wal.snapshotRetention re-reads the checkpoint index and current segment
+    // and fstats every retained segment. Serve read-only/background callers
+    // from a short-lived cache, while every in-process mutation updates or
+    // invalidates WalRetentionState. The cache is therefore exact with respect
+    // to this Backend; the TTL only bounds visibility of out-of-process changes.
     const wal_retention_cache_ttl_ns: u64 = 250 * std.time.ns_per_ms;
 
     fn cachedWalRetentionLocked(self: *Backend) !wal_mod.RetentionStats {
         const now_ns = self.writeStatsNowNs();
-        if (self.cached_wal_retention) |cached| {
-            if (now_ns -| self.cached_wal_retention_ns < wal_retention_cache_ttl_ns) return cached;
+        if (self.wal_retention.primary) |cached| {
+            if (now_ns -| self.wal_retention.primary_ns < wal_retention_cache_ttl_ns) return cached;
         }
         const fresh = try wal_mod.snapshotRetention(self.storage.?, self.allocator, self.root_dir.?);
-        self.cached_wal_retention = fresh;
-        self.cached_wal_retention_ns = now_ns;
+        self.wal_retention.primary = fresh;
+        self.wal_retention.primary_ns = now_ns;
         return fresh;
     }
 
     fn cachedWalReplayRetentionLocked(self: *Backend) !wal_mod.RetentionStats {
         const now_ns = self.writeStatsNowNs();
-        if (self.cached_wal_replay_retention) |cached| {
-            if (now_ns -| self.cached_wal_replay_retention_ns < wal_retention_cache_ttl_ns) return cached;
+        if (self.wal_retention.replay) |cached| {
+            if (now_ns -| self.wal_retention.replay_ns < wal_retention_cache_ttl_ns) return cached;
         }
         const fresh = try wal_mod.snapshotReplayRetention(self.storage.?, self.allocator, self.root_dir.?);
-        self.cached_wal_replay_retention = fresh;
-        self.cached_wal_replay_retention_ns = now_ns;
+        self.wal_retention.replay = fresh;
+        self.wal_retention.replay_ns = now_ns;
         return fresh;
     }
 
-    fn invalidateWalRetentionCacheLocked(self: *Backend) void {
-        self.cached_wal_retention = null;
-        self.cached_wal_replay_retention = null;
+    fn invalidatePrimaryWalRetentionCacheLocked(self: *Backend) void {
+        self.wal_retention.invalidatePrimary();
     }
 
     // Retention enforcement rotates memtables and loops over flushes; even
@@ -4061,7 +4171,7 @@ pub const Backend = struct {
         self.write_pressure_enforcing = true;
         defer self.write_pressure_enforcing = false;
 
-        try self.enforceWalRetentionHardPressure();
+        try self.enforceWalRetentionHardPressure(true);
 
         const hard_runs = self.effectiveL0HardLimitRuns();
         const hard_bytes = self.options.l0_hard_limit_bytes;
@@ -4107,11 +4217,14 @@ pub const Backend = struct {
         if (self.write_pressure_enforcing) return;
         self.write_pressure_enforcing = true;
         defer self.write_pressure_enforcing = false;
-        try self.enforceWalRetentionHardPressure();
+        try self.enforceWalRetentionHardPressure(false);
     }
 
-    fn enforceWalRetentionHardPressure(self: *Backend) anyerror!void {
-        if (!self.walRetentionEnforceDue()) return;
+    fn enforceWalRetentionHardPressure(self: *Backend, throttle_background: bool) anyerror!void {
+        // Best-effort maintenance is throttled, but foreground commit pressure
+        // must always check the configured hard bound. Otherwise a fast second
+        // commit can cross it inside the interval without forcing a checkpoint.
+        if (throttle_background and !self.walRetentionEnforceDue()) return;
         var retention = try self.snapshotWalRetentionForPressureLocked() orelse return;
         if (!self.walRetentionOverHardLimit(retention)) return;
 
@@ -4130,7 +4243,7 @@ pub const Backend = struct {
             flushes += 1;
             // Flushes advance the checkpoint; re-read fresh so the loop sees
             // its own progress instead of the cached snapshot.
-            self.invalidateWalRetentionCacheLocked();
+            self.invalidatePrimaryWalRetentionCacheLocked();
             retention = try self.snapshotWalRetentionForPressureLocked() orelse break;
         }
 
@@ -6342,6 +6455,59 @@ test "lsm backend maintenance stats report retained wal debt across reopen and r
     try std.testing.expectEqual(@as(u64, 0), maintenance.wal_checkpoint_covered_through_segment);
     try std.testing.expectEqual(@as(u64, 1), maintenance.wal_checkpoint_current_segment);
     try std.testing.expectEqual(@as(u64, 0), maintenance.wal_checkpoint_lag_segments);
+}
+
+fn expectWalRetentionCacheMatchesStorage(backend: *Backend) !void {
+    const cached_primary = try backend.cachedWalRetentionLocked();
+    const fresh_primary = try wal_mod.snapshotRetention(backend.storage.?, backend.allocator, backend.root_dir.?);
+    try std.testing.expectEqualDeep(fresh_primary, cached_primary);
+
+    const cached_replay = try backend.cachedWalReplayRetentionLocked();
+    const fresh_replay = try wal_mod.snapshotReplayRetention(backend.storage.?, backend.allocator, backend.root_dir.?);
+    try std.testing.expectEqualDeep(fresh_replay, cached_replay);
+}
+
+test "lsm backend wal retention cache stays coherent across append retire and reset" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    const root_dir = "/lsm-wal-retention-cache-coherence";
+    var backend = try Backend.open(std.testing.allocator, root_dir, .{
+        .flush_threshold = 1024,
+        .wal_segment_bytes = 32,
+        .storage = storage.storage(),
+    });
+    defer backend.close();
+
+    // Populate the empty cache first so the commits exercise the O(1) update
+    // path rather than merely causing a later lazy refresh.
+    try expectWalRetentionCacheMatchesStorage(&backend);
+    for ([_][]const u8{ "doc:a", "doc:b" }) |key| {
+        var txn = try backend.beginWrite();
+        defer txn.abort();
+        try txn.put(.{ .name = "docs" }, key, "value");
+        try txn.commit();
+        try expectWalRetentionCacheMatchesStorage(&backend);
+    }
+
+    try backend.rotateMutableToImmutable();
+    {
+        var txn = try backend.beginWrite();
+        defer txn.abort();
+        try txn.put(.{ .name = "docs" }, "doc:c", "value");
+        try txn.commit();
+    }
+    try expectWalRetentionCacheMatchesStorage(&backend);
+
+    {
+        const locked = runtime_mod.lockBackend(Backend, &backend);
+        defer runtime_mod.unlockBackend(Backend, &backend, locked);
+        try std.testing.expect(try backend.flushOldestImmutableMemtable());
+    }
+    try expectWalRetentionCacheMatchesStorage(&backend);
+
+    try backend.checkpointWalAfterDurableBoundary();
+    try expectWalRetentionCacheMatchesStorage(&backend);
 }
 
 test "lsm backend durable boundary checkpoint flushes mutable state and retires wal" {
