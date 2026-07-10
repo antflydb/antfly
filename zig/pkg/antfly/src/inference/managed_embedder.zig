@@ -2218,10 +2218,16 @@ fn appendExecutionObjectIfPresent(
 
 fn validateIndexExecutionObjectForCreateTable(execution: std.json.Value) !void {
     if (execution != .object) return error.InvalidCreateTableRequest;
-    for ([_][]const u8{ "indexing", "chunking", "embedding", "extracting", "reading", "generating", "transcribing" }) |field_name| {
-        const policy = execution.object.get(field_name) orelse continue;
-        _ = enrichment_types.parseExecutionPolicyValue(policy) catch return error.InvalidCreateTableRequest;
+    var iter = execution.object.iterator();
+    while (iter.next()) |entry| {
+        if (!isCreateTableIndexExecutionNamespace(entry.key_ptr.*)) return error.InvalidCreateTableRequest;
+        _ = enrichment_types.parseExecutionPolicyValue(entry.value_ptr.*) catch return error.InvalidCreateTableRequest;
     }
+}
+
+fn isCreateTableIndexExecutionNamespace(name: []const u8) bool {
+    return std.mem.eql(u8, name, "chunking") or
+        std.mem.eql(u8, name, "embedding");
 }
 
 fn stringifyManagedEmbedderConfigAlloc(
@@ -2366,7 +2372,7 @@ test "managed embedder uses embedder dimensions metadata at runtime" {
 test "managed embedder translates managed embeddings config into db generator config" {
     var local = TestLocalDenseProvider{ .dimensions = 384 };
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
-        \\{"type":"embeddings","field":"body","dimension":384,"embedder":{"provider":"antfly","model":"antflydb/clipclap"},"execution":{"indexing":{"batch_items":1024},"embedding":{"batch_items":16,"batch_bytes":262144}}}
+        \\{"type":"embeddings","field":"body","dimension":384,"embedder":{"provider":"antfly","model":"antflydb/clipclap"},"execution":{"chunking":{"batch_items":1024},"embedding":{"batch_items":16,"batch_bytes":262144}}}
     , .{});
     defer parsed.deinit();
 
@@ -2384,7 +2390,17 @@ test "managed embedder translates managed embeddings config into db generator co
 test "managed embedder rejects invalid execution batch policy" {
     var local = TestLocalDenseProvider{ .dimensions = 384 };
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
-        \\{"type":"embeddings","field":"body","dimension":384,"embedder":{"provider":"antfly","model":"antflydb/clipclap"},"execution":{"indexing":{"batch_items":0}}}
+        \\{"type":"embeddings","field":"body","dimension":384,"embedder":{"provider":"antfly","model":"antflydb/clipclap"},"execution":{"embedding":{"batch_items":0}}}
+    , .{});
+    defer parsed.deinit();
+
+    try std.testing.expectError(error.InvalidCreateTableRequest, translateEmbeddingsIndexConfigJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{ .antfly_provider = local.provider() }));
+}
+
+test "managed embedder rejects unsupported execution namespaces" {
+    var local = TestLocalDenseProvider{ .dimensions = 384 };
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"type":"embeddings","field":"body","dimension":384,"embedder":{"provider":"antfly","model":"antflydb/clipclap"},"execution":{"indexing":{"batch_items":8}}}
     , .{});
     defer parsed.deinit();
 

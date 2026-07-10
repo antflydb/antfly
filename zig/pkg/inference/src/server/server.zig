@@ -5015,6 +5015,12 @@ pub const Node = struct {
                 .message = "exactly one of texts or images must be provided",
             });
         }
+        if (images.len > max_read_batch_images) {
+            return ctx.status(413).json(.{
+                .@"error" = "BATCH_TOO_LARGE",
+                .message = try std.fmt.allocPrint(ctx.allocator, "'images' must contain at most {d} items", .{max_read_batch_images}),
+            });
+        }
         const schemas = extraction_mod.parseSchemas(ctx.allocator, &body.schema) catch |err| {
             const message = try std.fmt.allocPrint(ctx.allocator, "invalid schema: {s}", .{@errorName(err)});
             defer ctx.allocator.free(message);
@@ -5067,6 +5073,12 @@ pub const Node = struct {
                 .@"error" = "INVALID_REQUEST",
                 .message = "failed to download image content",
             }),
+            error.ReadBatchTooLarge,
+            error.StreamTooLong,
+            => return ctx.status(413).json(.{
+                .@"error" = "BATCH_TOO_LARGE",
+                .message = try std.fmt.allocPrint(ctx.allocator, "total downloaded image bytes must be at most {d}", .{readBatchMaxBytes()}),
+            }),
             error.InvalidModelForExtraction => return ctx.status(400).json(.{
                 .@"error" = "INVALID_MODEL",
                 .message = "model does not support extraction",
@@ -5111,11 +5123,19 @@ pub const Node = struct {
             ctx.allocator.free(image_datas);
         }
 
+        const batch_byte_cap = readBatchMaxBytes();
+        var batch_bytes: usize = 0;
         for (images, 0..) |img_url, i| {
-            var downloaded = downloadRemoteContent(self, ctx.allocator, img_url.url) catch
-                return error.ImageDownloadFailed;
+            var downloaded = downloadReadBatchContent(self, ctx.allocator, img_url.url, batch_byte_cap, batch_bytes) catch |err| switch (err) {
+                error.ReadBatchTooLarge,
+                error.StreamTooLong,
+                => return error.ReadBatchTooLarge,
+                else => return error.ImageDownloadFailed,
+            };
             defer downloaded.deinit(ctx.allocator);
 
+            batch_bytes = addReadBatchDownloadedBytes(batch_bytes, downloaded, batch_byte_cap) catch
+                return error.ReadBatchTooLarge;
             image_datas[i] = try ctx.allocator.dupe(u8, downloaded.data);
             initialized += 1;
         }
