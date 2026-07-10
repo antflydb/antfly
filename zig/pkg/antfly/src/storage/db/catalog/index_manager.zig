@@ -3924,6 +3924,7 @@ pub const IndexManager = struct {
                 .full_text_index = entry.full_text_index,
                 .content_type = if (entry.content_type.len > 0) try alloc.dupe(u8, entry.content_type) else "",
                 .producer_json = if (entry.producer_json.len > 0) try alloc.dupe(u8, entry.producer_json) else "",
+                .execution_json = if (entry.execution_json.len > 0) try alloc.dupe(u8, entry.execution_json) else "",
             });
         }
 
@@ -3943,6 +3944,7 @@ pub const IndexManager = struct {
                     .chunk_overlap = chunk_cfg.chunk_overlap,
                     .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
                     .full_text_index = true,
+                    .execution_json = if (chunk_cfg.execution_json.len > 0) try alloc.dupe(u8, chunk_cfg.execution_json) else "",
                 });
             }
         }
@@ -3970,6 +3972,7 @@ pub const IndexManager = struct {
                         .chunk_overlap = chunk_cfg.chunk_overlap,
                         .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
                         .full_text_index = chunk_cfg.full_text_index,
+                        .execution_json = if (chunk_cfg.chunking_execution_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunking_execution_json) else "",
                     });
                 }
                 if (!hasGeneratedDenseEmbeddingRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.artifact_name, embedding_name)) {
@@ -3986,6 +3989,7 @@ pub const IndexManager = struct {
                         .chunk_overlap = chunk_cfg.chunk_overlap,
                         .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
                         .full_text_index = chunk_cfg.full_text_index,
+                        .execution_json = if (chunk_cfg.embedding_execution_json.len > 0) try alloc.dupe(u8, chunk_cfg.embedding_execution_json) else "",
                     });
                 }
             } else if (entry.embedding_name) |embedding_name| {
@@ -4005,6 +4009,7 @@ pub const IndexManager = struct {
                             .chunk_overlap = chunk_cfg.chunk_overlap,
                             .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
                             .full_text_index = chunk_cfg.full_text_index,
+                            .execution_json = if (chunk_cfg.execution_json.len > 0) try alloc.dupe(u8, chunk_cfg.execution_json) else "",
                         });
                     }
                     if (!hasGeneratedDenseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, chunk_cfg.name, embedding_name)) {
@@ -4021,6 +4026,7 @@ pub const IndexManager = struct {
                             .chunk_overlap = chunk_cfg.chunk_overlap,
                             .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
                             .full_text_index = chunk_cfg.full_text_index,
+                            .execution_json = if (embedding_cfg.execution_json.len > 0) try alloc.dupe(u8, embedding_cfg.execution_json) else "",
                         });
                     }
                 } else {
@@ -4034,6 +4040,7 @@ pub const IndexManager = struct {
                             .source_field = try alloc.dupe(u8, embedding_cfg.source_field),
                             .source_template = if (embedding_cfg.source_template.len > 0) try alloc.dupe(u8, embedding_cfg.source_template) else "",
                             .expected_dims = entry.dims,
+                            .execution_json = if (embedding_cfg.execution_json.len > 0) try alloc.dupe(u8, embedding_cfg.execution_json) else "",
                         });
                     }
                 }
@@ -4063,6 +4070,7 @@ pub const IndexManager = struct {
                         .chunk_overlap = chunk_cfg.chunk_overlap,
                         .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
                         .full_text_index = chunk_cfg.full_text_index,
+                        .execution_json = if (chunk_cfg.chunking_execution_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunking_execution_json) else "",
                     });
                 }
                 try requests.append(alloc, .{
@@ -4077,6 +4085,7 @@ pub const IndexManager = struct {
                     .chunk_overlap = chunk_cfg.chunk_overlap,
                     .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
                     .full_text_index = chunk_cfg.full_text_index,
+                    .execution_json = if (chunk_cfg.embedding_execution_json.len > 0) try alloc.dupe(u8, chunk_cfg.embedding_execution_json) else "",
                 });
             } else if (entry.embedding_name) |embedding_name| {
                 const embedding_cfg = self.getEnrichment(.embedding, embedding_name) orelse continue;
@@ -4095,6 +4104,7 @@ pub const IndexManager = struct {
                             .chunk_overlap = chunk_cfg.chunk_overlap,
                             .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
                             .full_text_index = chunk_cfg.full_text_index,
+                            .execution_json = if (chunk_cfg.execution_json.len > 0) try alloc.dupe(u8, chunk_cfg.execution_json) else "",
                         });
                     }
                     if (!hasGeneratedSparseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, chunk_cfg.name, embedding_name)) {
@@ -4110,6 +4120,7 @@ pub const IndexManager = struct {
                             .chunk_overlap = chunk_cfg.chunk_overlap,
                             .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
                             .full_text_index = chunk_cfg.full_text_index,
+                            .execution_json = if (embedding_cfg.execution_json.len > 0) try alloc.dupe(u8, embedding_cfg.execution_json) else "",
                         });
                     }
                 } else if (!hasGeneratedSparseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, "", embedding_name)) {
@@ -4121,6 +4132,7 @@ pub const IndexManager = struct {
                         .doc_key = try alloc.dupe(u8, doc_key),
                         .source_field = try alloc.dupe(u8, embedding_cfg.source_field),
                         .source_template = if (embedding_cfg.source_template.len > 0) try alloc.dupe(u8, embedding_cfg.source_template) else "",
+                        .execution_json = if (embedding_cfg.execution_json.len > 0) try alloc.dupe(u8, embedding_cfg.execution_json) else "",
                     });
                 }
             }
@@ -7786,6 +7798,7 @@ pub const IndexManager = struct {
                             .chunk_size = chunk_cfg.chunk_size,
                             .chunk_overlap = chunk_cfg.chunk_overlap,
                             .chunker_json = if (chunk_cfg.chunker_json.len > 0) chunk_cfg.chunker_json else "",
+                            .execution_json = if (chunk_cfg.chunking_execution_json.len > 0) chunk_cfg.chunking_execution_json else "",
                             .full_text_index = chunk_cfg.full_text_index,
                         })) or changed;
                     }
@@ -7798,6 +7811,7 @@ pub const IndexManager = struct {
                         .expected_dims = dense_cfg.dims,
                         .chunk_size = chunk_cfg.chunk_size,
                         .chunk_overlap = chunk_cfg.chunk_overlap,
+                        .execution_json = if (chunk_cfg.embedding_execution_json.len > 0) chunk_cfg.embedding_execution_json else "",
                     })) or changed;
                 }
             },
@@ -7814,6 +7828,7 @@ pub const IndexManager = struct {
                             .chunk_size = chunk_cfg.chunk_size,
                             .chunk_overlap = chunk_cfg.chunk_overlap,
                             .chunker_json = if (chunk_cfg.chunker_json.len > 0) chunk_cfg.chunker_json else "",
+                            .execution_json = if (chunk_cfg.chunking_execution_json.len > 0) chunk_cfg.chunking_execution_json else "",
                             .full_text_index = chunk_cfg.full_text_index,
                         })) or changed;
                     }
@@ -7849,6 +7864,7 @@ pub const IndexManager = struct {
                 existing.chunk_size != cfg.chunk_size or
                 existing.chunk_overlap != cfg.chunk_overlap or
                 !std.mem.eql(u8, existing.chunker_json, cfg.chunker_json) or
+                !std.mem.eql(u8, existing.execution_json, cfg.execution_json) or
                 existing.full_text_index != cfg.full_text_index)
             {
                 return error.ConflictingEnrichmentConfig;
@@ -7865,7 +7881,8 @@ pub const IndexManager = struct {
             if (!std.mem.eql(u8, existing.source_field, cfg.source_field) or
                 !std.mem.eql(u8, existing.source_template, cfg.source_template) or
                 !std.mem.eql(u8, existing.source_artifact_name, cfg.source_artifact_name) or
-                existing.expected_dims != cfg.expected_dims)
+                existing.expected_dims != cfg.expected_dims or
+                !std.mem.eql(u8, existing.execution_json, cfg.execution_json))
             {
                 return error.ConflictingEnrichmentConfig;
             }
@@ -7881,7 +7898,8 @@ pub const IndexManager = struct {
             if (!std.mem.eql(u8, existing.source_field, cfg.source_field) or
                 !std.mem.eql(u8, existing.source_template, cfg.source_template) or
                 !std.mem.eql(u8, existing.content_type, cfg.content_type) or
-                !std.mem.eql(u8, existing.producer_json, cfg.producer_json))
+                !std.mem.eql(u8, existing.producer_json, cfg.producer_json) or
+                !std.mem.eql(u8, existing.execution_json, cfg.execution_json))
             {
                 return error.ConflictingEnrichmentConfig;
             }
@@ -7894,6 +7912,7 @@ pub const IndexManager = struct {
 
     fn validateEnrichmentConfig(self: *const IndexManager, cfg: enrichment_catalog.EnrichmentConfig) !void {
         if (cfg.name.len == 0 or (cfg.source_field.len == 0 and cfg.source_template.len == 0)) return error.InvalidEnrichmentConfig;
+        if (cfg.execution_json.len > 0) _ = try enrichment_types.parseExecutionPolicyJson(self.alloc, cfg.execution_json);
         if (cfg.full_text_index and cfg.kind == .embedding) return error.InvalidEnrichmentConfig;
         switch (cfg.kind) {
             .chunk => {
@@ -13258,6 +13277,8 @@ const GeneratorConfig = struct {
     chunk_size: u32 = 0,
     chunk_overlap: u32 = 0,
     chunker_json: []u8 = &.{},
+    chunking_execution_json: []u8 = &.{},
+    embedding_execution_json: []u8 = &.{},
     full_text_index: bool = false,
 
     fn deinit(self: *const GeneratorConfig, alloc: Allocator) void {
@@ -13266,6 +13287,8 @@ const GeneratorConfig = struct {
         alloc.free(self.artifact_name);
         if (self.embedding_name) |embedding_name| alloc.free(embedding_name);
         if (self.chunker_json.len > 0) alloc.free(self.chunker_json);
+        if (self.chunking_execution_json.len > 0) alloc.free(self.chunking_execution_json);
+        if (self.embedding_execution_json.len > 0) alloc.free(self.embedding_execution_json);
     }
 };
 
@@ -13389,6 +13412,13 @@ fn publicEnrichmentKindToInternal(kind: types.EnrichmentKind) enrichment_catalog
 }
 
 fn enrichmentFromPublic(alloc: Allocator, cfg: types.EnrichmentConfig) !enrichment_catalog.EnrichmentConfig {
+    const execution_json = if (cfg.execution) |execution| blk: {
+        const json = try std.json.Stringify.valueAlloc(alloc, execution, .{});
+        errdefer alloc.free(json);
+        _ = try enrichment_types.parseExecutionPolicyJson(alloc, json);
+        break :blk json;
+    } else "";
+    errdefer if (execution_json.len > 0) alloc.free(execution_json);
     return .{
         .name = try alloc.dupe(u8, cfg.name),
         .kind = publicEnrichmentKindToInternal(cfg.kind),
@@ -13402,6 +13432,7 @@ fn enrichmentFromPublic(alloc: Allocator, cfg: types.EnrichmentConfig) !enrichme
         .full_text_index = cfg.full_text_index,
         .content_type = if (cfg.content_type.len > 0) try alloc.dupe(u8, cfg.content_type) else "",
         .producer_json = if (cfg.producer_json.len > 0) try alloc.dupe(u8, cfg.producer_json) else "",
+        .execution_json = execution_json,
     };
 }
 
@@ -13417,7 +13448,8 @@ fn internalEnrichmentConfigsEqual(a: enrichment_catalog.EnrichmentConfig, b: enr
         std.mem.eql(u8, a.chunker_json, b.chunker_json) and
         a.full_text_index == b.full_text_index and
         std.mem.eql(u8, a.content_type, b.content_type) and
-        std.mem.eql(u8, a.producer_json, b.producer_json);
+        std.mem.eql(u8, a.producer_json, b.producer_json) and
+        std.mem.eql(u8, a.execution_json, b.execution_json);
 }
 
 fn internalEnrichmentKindToPublic(kind: enrichment_catalog.EnrichmentType) types.EnrichmentKind {
@@ -13429,6 +13461,10 @@ fn internalEnrichmentKindToPublic(kind: enrichment_catalog.EnrichmentType) types
 }
 
 fn enrichmentToPublic(alloc: Allocator, cfg: enrichment_catalog.EnrichmentConfig) !types.EnrichmentConfig {
+    const execution = if (cfg.execution_json.len > 0)
+        try parsePublicExecutionConfig(alloc, cfg.execution_json)
+    else
+        null;
     const out = types.EnrichmentConfig{
         .name = try alloc.dupe(u8, cfg.name),
         .kind = internalEnrichmentKindToPublic(cfg.kind),
@@ -13442,8 +13478,48 @@ fn enrichmentToPublic(alloc: Allocator, cfg: enrichment_catalog.EnrichmentConfig
         .full_text_index = cfg.full_text_index,
         .content_type = if (cfg.content_type.len > 0) try alloc.dupe(u8, cfg.content_type) else "",
         .producer_json = if (cfg.producer_json.len > 0) try alloc.dupe(u8, cfg.producer_json) else "",
+        .execution = execution,
     };
     return out;
+}
+
+fn parsePublicExecutionConfig(alloc: Allocator, execution_json: []const u8) !types.EnrichmentExecutionConfig {
+    const policy = try enrichment_types.parseExecutionPolicyJson(alloc, execution_json);
+    return .{
+        .batch_items = if (policy.batch_items) |value| std.math.cast(u32, value) orelse return error.InvalidEnrichmentConfig else null,
+        .batch_bytes = if (policy.batch_bytes) |value| std.math.cast(u64, value) orelse return error.InvalidEnrichmentConfig else null,
+    };
+}
+
+fn executionObjectFieldJsonAlloc(alloc: Allocator, object: std.json.ObjectMap, field_name: []const u8) ![]u8 {
+    const value = object.get(field_name) orelse return "";
+    if (value != .object) return error.InvalidIndexConfig;
+    const json = try std.json.Stringify.valueAlloc(alloc, value, .{});
+    errdefer alloc.free(json);
+    _ = try enrichment_types.parseExecutionPolicyJson(alloc, json);
+    return json;
+}
+
+fn executionNamespaceJsonAlloc(alloc: Allocator, root: std.json.Value, namespace: []const u8) ![]u8 {
+    if (root != .object) return error.InvalidIndexConfig;
+    const execution = root.object.get("execution") orelse return "";
+    if (execution != .object) return error.InvalidIndexConfig;
+    try validateIndexExecutionConfigValue(execution);
+    return try executionObjectFieldJsonAlloc(alloc, execution.object, namespace);
+}
+
+fn validateIndexExecutionConfigValue(execution: std.json.Value) !void {
+    if (execution != .object) return error.InvalidIndexConfig;
+    var iter = execution.object.iterator();
+    while (iter.next()) |entry| {
+        if (!isIndexExecutionNamespace(entry.key_ptr.*)) return error.InvalidIndexConfig;
+        _ = enrichment_types.parseExecutionPolicyValue(entry.value_ptr.*) catch return error.InvalidIndexConfig;
+    }
+}
+
+fn isIndexExecutionNamespace(name: []const u8) bool {
+    return std.mem.eql(u8, name, "chunking") or
+        std.mem.eql(u8, name, "embedding");
 }
 
 fn parseDenseConfig(alloc: Allocator, raw: []const u8) !DenseConfig {
@@ -13862,6 +13938,10 @@ fn parseDenseGeneratorConfig(alloc: Allocator, raw: []const u8) !?GeneratorConfi
     const chunk_name_value = generator.object.get("chunk_name");
     const chunker_json = try parseGeneratorChunkerJson(alloc, generator.object);
     errdefer if (chunker_json.len > 0) alloc.free(chunker_json);
+    const chunking_execution_json = try executionNamespaceJsonAlloc(alloc, root, "chunking");
+    errdefer if (chunking_execution_json.len > 0) alloc.free(chunking_execution_json);
+    const embedding_execution_json = try executionNamespaceJsonAlloc(alloc, root, "embedding");
+    errdefer if (embedding_execution_json.len > 0) alloc.free(embedding_execution_json);
     const full_text_index = if (chunker_json.len > 0)
         try chunking_types.parseHasFullTextIndexFromSlice(alloc, chunker_json)
     else
@@ -13892,6 +13972,8 @@ fn parseDenseGeneratorConfig(alloc: Allocator, raw: []const u8) !?GeneratorConfi
         else
             0,
         .chunker_json = chunker_json,
+        .chunking_execution_json = chunking_execution_json,
+        .embedding_execution_json = embedding_execution_json,
         .full_text_index = full_text_index,
     };
 }
@@ -13918,6 +14000,10 @@ fn parseSparseGeneratorConfig(alloc: Allocator, raw: []const u8) !?GeneratorConf
     const chunk_name_value = generator.object.get("chunk_name");
     const chunker_json = try parseGeneratorChunkerJson(alloc, generator.object);
     errdefer if (chunker_json.len > 0) alloc.free(chunker_json);
+    const chunking_execution_json = try executionNamespaceJsonAlloc(alloc, root, "chunking");
+    errdefer if (chunking_execution_json.len > 0) alloc.free(chunking_execution_json);
+    const embedding_execution_json = try executionNamespaceJsonAlloc(alloc, root, "embedding");
+    errdefer if (embedding_execution_json.len > 0) alloc.free(embedding_execution_json);
     const full_text_index = if (chunker_json.len > 0)
         try chunking_types.parseHasFullTextIndexFromSlice(alloc, chunker_json)
     else
@@ -13948,6 +14034,8 @@ fn parseSparseGeneratorConfig(alloc: Allocator, raw: []const u8) !?GeneratorConf
         else
             0,
         .chunker_json = chunker_json,
+        .chunking_execution_json = chunking_execution_json,
+        .embedding_execution_json = embedding_execution_json,
         .full_text_index = full_text_index,
     };
 }
@@ -14067,6 +14155,8 @@ fn resolveChunkGenerator(self: *const IndexManager, generator: GeneratorConfig) 
             .chunk_size = cfg.chunk_size,
             .chunk_overlap = cfg.chunk_overlap,
             .chunker_json = if (cfg.chunker_json.len > 0) @constCast(cfg.chunker_json) else &.{},
+            .chunking_execution_json = if (cfg.execution_json.len > 0) @constCast(cfg.execution_json) else &.{},
+            .embedding_execution_json = generator.embedding_execution_json,
             .full_text_index = cfg.full_text_index,
         };
     }
@@ -14089,6 +14179,7 @@ fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
     defer parsed.deinit();
     const root = parsed.value;
     if (root != .object) return error.InvalidIndexConfig;
+    if (root.object.get("execution") != null) return error.InvalidIndexConfig;
     const algebraic_semiring_traversal = try parseGraphAlgebraicSemiringTraversal(root);
     var artifact_source = try parseGraphArtifactSource(alloc, root);
     errdefer if (artifact_source) |*source| {
@@ -14345,6 +14436,8 @@ fn parseGraphShorthandAsset(alloc: Allocator, root: std.json.Value) !?enrichment
     else
         "";
     errdefer if (producer_json.len > 0) alloc.free(producer_json);
+    const execution_json = try executionObjectFieldJsonAlloc(alloc, artifact.object, "execution");
+    errdefer if (execution_json.len > 0) alloc.free(execution_json);
 
     return .{
         .name = try alloc.dupe(u8, name.string),
@@ -14353,6 +14446,7 @@ fn parseGraphShorthandAsset(alloc: Allocator, root: std.json.Value) !?enrichment
         .source_template = if (template.len > 0) try alloc.dupe(u8, template) else "",
         .content_type = if (content_type.len > 0) try alloc.dupe(u8, content_type) else "",
         .producer_json = producer_json,
+        .execution_json = execution_json,
     };
 }
 
@@ -14395,7 +14489,7 @@ test "graph config parses artifact source and shorthand asset enrichment" {
     var cfg = try parseGraphConfig(alloc,
         \\{
         \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"body","content_type":"application/json","producer_json":{"type":"extractor","config":{"provider":"antfly"}}}
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"body","content_type":"application/json","producer_json":{"type":"extractor","config":{"provider":"antfly"}},"execution":{"batch_items":8,"batch_bytes":262144}}
         \\}
     );
     defer cfg.deinit(alloc);
@@ -14410,6 +14504,32 @@ test "graph config parses artifact source and shorthand asset enrichment" {
     try std.testing.expectEqualStrings("body", cfg.shorthand_asset.?.source_field);
     try std.testing.expectEqualStrings("application/json", cfg.shorthand_asset.?.content_type);
     try std.testing.expect(std.mem.indexOf(u8, cfg.shorthand_asset.?.producer_json, "\"type\":\"extractor\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cfg.shorthand_asset.?.execution_json, "\"batch_items\":8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cfg.shorthand_asset.?.execution_json, "\"batch_bytes\":262144") != null);
+}
+
+test "graph config rejects invalid execution policy" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
+        \\{"execution":{"indexing":{"batch_items":8}}}
+    ));
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
+        \\{"execution":{"extracting":{"batch_items":8}}}
+    ));
+}
+
+test "graph shorthand asset uses artifact execution only" {
+    const alloc = std.testing.allocator;
+    var cfg = try parseGraphConfig(alloc,
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"pages_v1","path":"$.pages[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"pages_v1","kind":"asset","field":"image","producer_json":{"type":"reader","config":{"provider":"antfly"}},"execution":{"batch_items":3}}
+        \\}
+    );
+    defer cfg.deinit(alloc);
+
+    try std.testing.expect(cfg.shorthand_asset != null);
+    try std.testing.expect(std.mem.indexOf(u8, cfg.shorthand_asset.?.execution_json, "\"batch_items\":3") != null);
 }
 
 test "graph config parses artifact mapping templates and context fields" {
@@ -16403,6 +16523,43 @@ test "parseDenseGeneratorConfig promotes chunker full text flag" {
     defer generator.deinit(alloc);
 
     try std.testing.expect(generator.full_text_index);
+}
+
+test "parseDenseGeneratorConfig preserves execution namespaces" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"field":"embedding","dims":384,"execution":{"chunking":{"batch_items":4},"embedding":{"batch_items":8,"batch_bytes":65536}},"generator":{"kind":"dense_embedding","source_field":"body","artifact_name":"body_chunks","chunk_size":256}}
+    ;
+    const generator = try parseDenseGeneratorConfig(alloc, json) orelse return error.TestUnexpectedResult;
+    defer generator.deinit(alloc);
+
+    try std.testing.expect(std.mem.indexOf(u8, generator.chunking_execution_json, "\"batch_items\":4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generator.embedding_execution_json, "\"batch_items\":8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generator.embedding_execution_json, "\"batch_bytes\":65536") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generator.embedding_execution_json, "indexing") == null);
+}
+
+test "parseDenseGeneratorConfig rejects invalid execution policy" {
+    const alloc = std.testing.allocator;
+    const invalid_value =
+        \\{"field":"embedding","dims":384,"execution":{"embedding":{"batch_items":0}},"generator":{"kind":"dense_embedding","source_field":"body","artifact_name":"body_chunks","chunk_size":256}}
+    ;
+    try std.testing.expectError(error.InvalidIndexConfig, parseDenseGeneratorConfig(alloc, invalid_value));
+
+    const unsupported_namespace =
+        \\{"field":"embedding","dims":384,"execution":{"indexing":{"batch_items":8}},"generator":{"kind":"dense_embedding","source_field":"body","artifact_name":"body_chunks","chunk_size":256}}
+    ;
+    try std.testing.expectError(error.InvalidIndexConfig, parseDenseGeneratorConfig(alloc, unsupported_namespace));
+
+    const unknown_namespace =
+        \\{"field":"embedding","dims":384,"execution":{"embeddings":{"batch_items":8}},"generator":{"kind":"dense_embedding","source_field":"body","artifact_name":"body_chunks","chunk_size":256}}
+    ;
+    try std.testing.expectError(error.InvalidIndexConfig, parseDenseGeneratorConfig(alloc, unknown_namespace));
+
+    const unknown_policy_field =
+        \\{"field":"embedding","dims":384,"execution":{"embedding":{"batch_item":8}},"generator":{"kind":"dense_embedding","source_field":"body","artifact_name":"body_chunks","chunk_size":256}}
+    ;
+    try std.testing.expectError(error.InvalidIndexConfig, parseDenseGeneratorConfig(alloc, unknown_policy_field));
 }
 
 test "parseSparseGeneratorConfig parses source_template" {

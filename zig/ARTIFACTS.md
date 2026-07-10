@@ -259,6 +259,304 @@ enrichment fields. If `producer` is omitted, the enrichment defaults to `copy`
 behavior: the source field or rendered source template value is stored directly
 as the asset value.
 
+Execution policy belongs with the enrichment producer but is separate from the
+semantic provider config. The provider `config` describes what output should be
+produced: model, prompt, auth target, schema, and other behavior that can change
+artifact bytes. The optional `execution` block describes how the worker should
+run the producer: batch sizes, byte caps, concurrency hints, and retry/pacing
+knobs.
+
+Example reader/OCR producer with per-enrichment batching:
+
+```json
+{
+  "type": "reader",
+  "config": {
+    "provider": "antfly",
+    "model": "florence2-ocr",
+    "prompt": "Read the document text."
+  },
+  "execution": {
+    "batch_items": 4,
+    "batch_bytes": 67108864
+  }
+}
+```
+
+`execution` is still catalog configuration, so users can tune different
+enrichments and models independently. It is not part of artifact identity. A
+change from `batch_items: 4` to `batch_items: 8` should not by itself make an
+artifact stale or force a rebuild when the semantic `config`, source document,
+rendered template/media parts, and output content type are unchanged.
+
+Effective batching should be resolved as a layered execution policy:
+
+```text
+enrichment producer.execution override
+  -> model or reader manifest default
+  -> process/operator default
+  -> built-in fallback
+  -> clamped by process/operator maximums and backend limits
+```
+
+For reader/OCR assets, the policy supports item and byte caps:
+
+- default OCR batch items: 4
+- conservative hard cap: 8 unless the operator raises it
+- byte or pixel cap in addition to item count, because one full-page scan can
+  cost much more than one cropped receipt
+- final inference-side chunking remains a backend safety valve
+
+Suggested operator controls:
+
+```text
+ANTFLY_ENRICHMENT_OCR_BATCH_ITEMS=4
+ANTFLY_ENRICHMENT_OCR_BATCH_MAX_ITEMS=8
+ANTFLY_ENRICHMENT_OCR_BATCH_BYTES=67108864
+```
+
+Readers must stay model-neutral at this layer. The artifact producer exposes a
+batch request hook, and document-extraction OCR/transcription workers flush
+pending generated-text units according to the resolved `execution.batch_items`
+and `execution.batch_bytes` policy. The local Antfly reader producer coalesces
+compatible reader requests into one `readers.Request.images` call when producer
+type, semantic config, prompt, and model options match. Inference decides
+whether a concrete reader can execute the batch natively, chunk it, or fall
+back. The artifact pipeline must not encode Florence-specific assumptions.
+Remote providers, mixed configs, mixed prompts, generators, extractors, and
+transcribers can use the same producer batch hook, but they currently fall back
+to sequential execution unless their provider implementation exposes a native
+batch operation.
+
+Execution policy is scoped to the catalog resource that owns the work. Explicit
+enrichments already name one producer operation, so their `execution` block uses
+the policy fields directly. Index shorthand can expand into multiple work
+owners, but this implementation only exposes namespaces that are wired through
+runtime behavior today: `chunking` and `embedding`. The translator copies each
+nested policy to the generated resource where it becomes that resource's flat
+`execution` policy. Reader, generator, extractor, and transcriber batching for
+explicit asset enrichments uses that flat enrichment `execution` block directly.
+Graph indexes do not expose a root execution block yet; producer batching for a
+graph shorthand relation asset belongs in `artifact.execution`.
+
+Embedding enrichments should use the same execution-policy model. Existing dense
+and chunked embedding workers already resolve process-level batch item and byte
+limits; per-enrichment `producer.execution` overrides can feed that same
+resolution without becoming part of embedding artifact identity. Suggested
+fields are the same shape as readers:
+
+```json
+{
+  "execution": {
+    "batch_items": 8,
+    "batch_bytes": 262144
+  }
+}
+```
+
+Indexing execution and embedder execution are separate knobs. Indexing execution
+controls catalog/index maintenance windows: how many documents, artifacts, or
+posting-list writes the indexer processes per pass. Embedder execution controls
+inference calls: how many texts/chunks are sent to the embedder in one request
+and how large that request may be. They should not share one ambiguous
+`batch_items` field.
+
+For embeddings indexes that use the inline managed-embedder shorthand, the
+execution policy lives beside `embedder`, not inside it. The public shorthand
+surface only accepts namespaces that are wired to generated producer
+enrichments:
+
+```json
+{
+  "type": "embeddings",
+  "field": "body",
+  "dimension": 384,
+  "embedder": {
+    "provider": "antfly",
+    "model": "bge-base-en-v1.5"
+  },
+  "execution": {
+    "embedding": {
+      "batch_items": 16,
+      "batch_bytes": 262144
+    }
+  }
+}
+```
+
+The index translator copies `execution.embedding` onto the generated embedding
+enrichment. The vector index itself consumes the produced embedding artifact;
+the embedding batching policy applies to the producer that creates that
+artifact. Vector-index ingestion batching is not exposed here until it has a
+runtime consumer.
+
+For artifact-backed indexes that point at an existing embedding artifact,
+embedder batching belongs on the matching embedding enrichment:
+
+```json
+{
+  "type": "embeddings",
+  "field": "embedding",
+  "embedding_name": "document_chunk_dense_v1",
+  "source_artifact_name": "document_chunks_v1",
+  "dimension": 384
+}
+```
+
+```json
+{
+  "name": "document_chunk_dense_v1",
+  "kind": "embedding",
+  "field": "text",
+  "source_artifact_name": "document_chunks_v1",
+  "expected_dims": 384,
+  "embedder": {
+    "provider": "antfly",
+    "model": "bge-base-en-v1.5"
+  },
+  "execution": {
+    "batch_items": 32,
+    "batch_bytes": 524288
+  }
+}
+```
+
+Existing `embedder.batch_size` should be treated as a compatibility alias for
+the embedder-side batch size: `execution.embedding.batch_items` in inline index
+configs, or `execution.batch_items` on explicit embedding enrichments. It should
+then be normalized out of semantic embedder configuration before deriving
+artifact identity. New configs should prefer the `execution` block.
+
+Chunking follows the same split. Chunk shape is semantic: target size, overlap,
+tokenizer/model, store-chunks behavior, and full-text side effects can change
+the chunk artifacts. Chunker execution is non-semantic: how many source texts or
+asset values are sent through the chunker per pass or per remote chunker request.
+For an inline embedding index with managed chunking there can be two separate
+execution namespaces:
+
+```json
+{
+  "type": "embeddings",
+  "field": "body",
+  "dimension": 384,
+  "chunker": {
+    "provider": "antfly",
+    "text": {
+      "target_tokens": 512,
+      "overlap_tokens": 64
+    }
+  },
+  "embedder": {
+    "provider": "antfly",
+    "model": "bge-base-en-v1.5"
+  },
+  "execution": {
+    "chunking": {
+      "batch_items": 128,
+      "batch_bytes": 1048576
+    },
+    "embedding": {
+      "batch_items": 16,
+      "batch_bytes": 262144
+    }
+  }
+}
+```
+
+The translator copies `execution.chunking` onto the generated chunk enrichment
+and `execution.embedding` onto the generated embedding enrichment. For explicit
+chunk enrichments, the same chunker-side policy lives directly on the
+enrichment:
+
+```json
+{
+  "name": "body_chunks_v1",
+  "kind": "chunk",
+  "field": "body",
+  "chunker": {
+    "provider": "antfly",
+    "text": {
+      "target_tokens": 512,
+      "overlap_tokens": 64
+    }
+  },
+  "execution": {
+    "batch_items": 128,
+    "batch_bytes": 1048576
+  }
+}
+```
+
+Graph indexes use the same ownership boundary. A graph index consumes edge-like
+input from document `_edges`, a user-defined enrichment, or a shorthand-created
+asset enrichment. The graph index root does not expose an `execution` block yet,
+because graph edge materialization and replay batching are not wired to a public
+policy. Asset/extractor execution policy controls model calls that produce
+relations.
+
+```json
+{
+  "type": "graph",
+  "source": {
+    "kind": "artifact",
+    "artifact": "relations_v1",
+    "path": "$.relations[*]",
+    "format": "extraction_relation"
+  }
+}
+```
+
+If the graph index uses shorthand to create the relation-producing asset,
+producer batching belongs on that artifact object. The index translator should
+copy `artifact.execution` onto the generated asset enrichment. Do not also put
+artifact producer policy under graph root `execution`:
+
+```json
+{
+  "type": "graph",
+  "artifact": {
+    "name": "relations_v1",
+    "kind": "asset",
+    "field": "body",
+    "content_type": "application/json",
+    "producer_json": {
+      "type": "extractor",
+      "config": {
+        "provider": "antfly",
+        "model": "gliner2-relations",
+        "schema": "relations_v1"
+      }
+    },
+    "execution": {
+      "batch_items": 8,
+      "batch_bytes": 262144
+    }
+  },
+  "source": {
+    "kind": "artifact",
+    "artifact": "relations_v1",
+    "path": "$.relations[*]",
+    "format": "extraction_relation"
+  }
+}
+```
+
+Graph traversal limits are not enrichment batching. Defaults such as max depth,
+frontier caps, or result caps may be index or query execution policy, but they
+should be named as traversal/query defaults rather than sharing producer
+`batch_items`.
+
+Extraction inference also has a batched request shape: multiple text inputs or
+image inputs can be submitted together and results are returned by input index.
+Recognizer-backed extraction should batch text inputs directly; for GLiNER2 this
+means one recognizer batch per schema label set, not one model run per text.
+Reader-backed image extraction batches the reader/OCR step before schema
+extraction when pending units share a compatible local Antfly reader
+configuration. The worker preserves document unit order by flushing pending
+generated-text units before non-generated units and at stream end. As with
+readers and embedders, extraction batch policy belongs in `execution` and is
+clamped by model and operator limits.
+
 The public asset enrichment shape uses `field` and `template`. The older
 `source_field`/`source_template` names are internal catalog/replay names and are
 not part of the public enrichment config. `template` follows the existing
@@ -273,8 +571,9 @@ Model-backed assets run in both paths:
   on transient failures.
 
 For model-backed assets, Antfly stores a separate internal skip-state row keyed
-by the source value, rendered multimodal parts, and `producer_json`. Asset rows
-remain value-only.
+by the source value, rendered multimodal parts, and the semantic producer
+configuration. Non-semantic `producer.execution` fields are excluded from this
+identity. Asset rows remain value-only.
 
 The model-facing producer types are separate from artifact kinds:
 

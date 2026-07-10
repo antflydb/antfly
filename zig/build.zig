@@ -4178,6 +4178,7 @@ pub fn build(b: *std.Build) void {
         .root_module = api_table_writes_docid_test_mod,
         .filters = &.{
             "api auto bulk ingest does not open sessions for normal online writes",
+            "auto bulk group writes release leases so idle finish can publish",
             "provisioned table write source rejects stale doc identity namespace before write",
             "bound table write source backs up and restores a local table",
             "bound table write source backs up and restores a portable local table",

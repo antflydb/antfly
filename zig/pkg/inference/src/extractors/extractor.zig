@@ -164,17 +164,14 @@ const ReaderExtractor = struct {
         );
         defer reader.deinit();
 
-        var results = std.ArrayListUnmanaged(readers_mod.Result).empty;
+        const results = try reader.readBatch(image_datas, read_options);
         defer {
-            for (results.items) |*result| result.deinit();
-            results.deinit(ctx.allocator);
+            for (results) |*result| result.deinit();
+            ctx.allocator.free(results);
         }
+        if (results.len != image_datas.len) return error.InvalidReadResultCount;
 
-        for (image_datas) |image_data| {
-            try results.append(ctx.allocator, try reader.read(image_data, read_options));
-        }
-
-        return extraction_mod.extractBatchFromReaderResults(ctx.allocator, results.items, schemas, config);
+        return extraction_mod.extractBatchFromReaderResults(ctx.allocator, results, schemas, config);
     }
 };
 

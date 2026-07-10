@@ -513,6 +513,66 @@ pub const FunctionDefinition = struct {
     strict: ?bool = null,
 };
 
+pub const GenerateBatchError = struct {
+    code: []const u8,
+    message: []const u8,
+    retryable: ?bool = null,
+};
+
+/// Batch execution mode. Only synchronous batches are implemented.
+pub const GenerateBatchMode = enum {
+    sync,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .sync => "sync",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "sync", .sync },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const GenerateBatchRequest = struct {
+    mode: ?GenerateBatchMode = null,
+    requests: []const GenerateBatchRequestItem,
+};
+
+pub const GenerateBatchRequestItem = struct {
+    /// Caller-supplied identifier echoed in the result item.
+    custom_id: []const u8,
+    body: GenerateRequest,
+};
+
+pub const GenerateBatchResponse = struct {
+    object: []const u8,
+    data: []const GenerateBatchResultItem,
+    summary: GenerateBatchSummary,
+};
+
+pub const GenerateBatchResultItem = struct {
+    custom_id: []const u8,
+    /// Zero-based request index from the submitted batch.
+    index: i64,
+    response: ?GenerateResponse = null,
+    @"error": ?GenerateBatchError = null,
+};
+
+pub const GenerateBatchSummary = struct {
+    total: i64,
+    succeeded: i64,
+    failed: i64,
+};
+
 pub const GenerateChoice = struct {
     /// Index of this choice in the list
     index: i64,

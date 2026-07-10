@@ -746,6 +746,7 @@ pub const ProvisionedTableWriteCache = struct {
         auto_bulk_ingest_finish_requested: bool = false,
 
         fn detachRuntimeHooks(self: *Entry) void {
+            self.db.setQueryVisibilityHook(null);
             self.db.setResolutionCandidateSource(null);
             self.db.setEntitySink(null);
             self.db.setPromotionOwner(null);
