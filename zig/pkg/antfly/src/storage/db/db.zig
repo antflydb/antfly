@@ -668,6 +668,45 @@ const DocSetPlanningRuntimeStats = struct {
     }
 };
 
+const VisibilityRuntimeStats = struct {
+    cache_hits_total: AtomicU64 = AtomicU64.init(0),
+    cache_misses_total: AtomicU64 = AtomicU64.init(0),
+    mask_build_ns_total: AtomicU64 = AtomicU64.init(0),
+    mask_builds_total: AtomicU64 = AtomicU64.init(0),
+    full_scan_fallbacks_total: AtomicU64 = AtomicU64.init(0),
+    overflow_total: AtomicU64 = AtomicU64.init(0),
+
+    fn recordCacheHit(self: *@This()) void {
+        _ = self.cache_hits_total.fetchAdd(1, .monotonic);
+    }
+
+    fn recordCacheMiss(self: *@This()) void {
+        _ = self.cache_misses_total.fetchAdd(1, .monotonic);
+    }
+
+    fn recordBuild(self: *@This(), duration_ns: u64) void {
+        _ = self.mask_builds_total.fetchAdd(1, .monotonic);
+        _ = self.mask_build_ns_total.fetchAdd(duration_ns, .monotonic);
+    }
+
+    fn recordOverflow(self: *@This()) void {
+        _ = self.overflow_total.fetchAdd(1, .monotonic);
+        _ = self.full_scan_fallbacks_total.fetchAdd(1, .monotonic);
+    }
+
+    fn snapshot(self: *@This(), cache_entries: u64) types.VisibilityStats {
+        return .{
+            .cache_entries = cache_entries,
+            .cache_hits_total = self.cache_hits_total.load(.monotonic),
+            .cache_misses_total = self.cache_misses_total.load(.monotonic),
+            .mask_build_ns_total = self.mask_build_ns_total.load(.monotonic),
+            .mask_builds_total = self.mask_builds_total.load(.monotonic),
+            .full_scan_fallbacks_total = self.full_scan_fallbacks_total.load(.monotonic),
+            .overflow_total = self.overflow_total.load(.monotonic),
+        };
+    }
+};
+
 const DenseBulkSessionScope = enum {
     auto,
     external,
@@ -2773,6 +2812,7 @@ pub const DB = struct {
     nonvisible_doc_set_cache_overflow: bool = false,
     bulk_ingest_seen_doc_keys: std.StringHashMapUnmanaged(void) = .{},
     doc_set_planning_stats: DocSetPlanningRuntimeStats = .{},
+    visibility_runtime_stats: VisibilityRuntimeStats = .{},
     index_repair_barriers: std.atomic.Value(u32) = .init(0),
     published_dense_searches: std.atomic.Value(u32) = .init(0),
     index_repair_mutex: std.atomic.Mutex = .unlocked,
@@ -3638,6 +3678,8 @@ pub const DB = struct {
         self.clearLiveDocSetCache();
         self.clearNonVisibleDocSetCache();
         self.bulk_ingest_coalescer.deinit(self.alloc);
+        self.bulk_ingest_identity_state.deinit(self.alloc);
+        self.bulk_ingest_identity_all_new = false;
         self.clearBulkIngestSeenDocKeysLocked();
         self.bulk_ingest_seen_doc_keys.deinit(self.alloc);
         self.clearActiveIndexRepairsLocked();
@@ -4836,6 +4878,11 @@ pub const DB = struct {
             }
             identity_writes.deinit(self.alloc);
         }
+        var identity_visibility_deletes = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (identity_visibility_deletes.items) |key| self.alloc.free(key);
+            identity_visibility_deletes.deinit(self.alloc);
+        }
 
         const batch_timestamp_ns = if (effective_req.timestamp_ns != 0) effective_req.timestamp_ns else currentTimeNs();
 
@@ -5141,23 +5188,25 @@ pub const DB = struct {
             identity_upsert_keys.items.len > 0 and
             (assume_all_new_identity_upserts or identityUpsertStoreWritesAreNew(identity_upsert_write_indexes.items, overwritten_flags)))
         {
-            used_trusted_identity_path = try doc_identity.appendBatchIdentityMetadataAllNewTrustedStateForNamespaceAlloc(
+            used_trusted_identity_path = try doc_identity.appendBatchIdentityMetadataAllNewTrustedStateWithVisibilityDeletesForNamespaceAlloc(
                 self.alloc,
                 self.core.identity_namespace,
                 sequence,
                 &identity_writes,
+                &identity_visibility_deletes,
                 identity_upsert_keys.items,
                 &self.bulk_ingest_identity_state,
             );
             if (!used_trusted_identity_path) self.clearBulkIngestIdentityAllNewLocked();
         }
         if (!used_trusted_identity_path) {
-            try doc_identity.appendBatchIdentityMetadataForNamespaceAlloc(
+            try doc_identity.appendBatchIdentityMetadataForNamespaceWithVisibilityDeletesAlloc(
                 self.alloc,
                 self.core.store,
                 self.core.identity_namespace,
                 sequence,
                 &identity_writes,
+                &identity_visibility_deletes,
                 identity_upsert_keys.items,
                 effective_req.deletes,
             );
@@ -5237,6 +5286,7 @@ pub const DB = struct {
             &owned_store_keys,
             &owned_store_values,
         );
+        try delete_keys.appendSlice(self.alloc, identity_visibility_deletes.items);
         const replay_append: ?docstore_mod.DocStore.ReplayAppend = if (opts.suppress_derived_replay_append)
             null
         else
@@ -5393,7 +5443,7 @@ pub const DB = struct {
 
     fn clearBulkIngestIdentityAllNewLocked(self: *DB) void {
         self.bulk_ingest_identity_all_new = false;
-        self.bulk_ingest_identity_state = .{};
+        self.bulk_ingest_identity_state.deinit(self.alloc);
         self.clearBulkIngestSeenDocKeysLocked();
     }
 
@@ -8529,6 +8579,11 @@ pub const DB = struct {
             }
             identity_writes.deinit(self.alloc);
         }
+        var identity_visibility_deletes = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (identity_visibility_deletes.items) |key| self.alloc.free(key);
+            identity_visibility_deletes.deinit(self.alloc);
+        }
 
         if (status == .committed) {
             try self.core.collectTransactionIntentDocumentKeys(self.alloc, txn_id, &raw_identity_upserts, &raw_identity_deletes);
@@ -8538,12 +8593,13 @@ pub const DB = struct {
             for (raw_identity_deletes.items) |key| {
                 if (!isMetadataKey(key)) try identity_deletes.append(self.alloc, key);
             }
-            try doc_identity.appendBatchIdentityMetadataForNamespaceAlloc(
+            try doc_identity.appendBatchIdentityMetadataForNamespaceWithVisibilityDeletesAlloc(
                 self.alloc,
                 self.core.store,
                 self.core.identity_namespace,
                 self.core.nextDerivedSequence(),
                 &identity_writes,
+                &identity_visibility_deletes,
                 identity_upserts.items,
                 identity_deletes.items,
             );
@@ -8552,6 +8608,7 @@ pub const DB = struct {
         const pending_identity_visibility_summary = try doc_identity.visibilitySummaryFromWrites(identity_writes.items);
         try self.core.resolveTransactionIntentsWithExtraBatch(txn_id, status, commit_version, .{
             .writes = identity_writes.items,
+            .deletes = identity_visibility_deletes.items,
         });
         if (pending_identity_visibility_summary) |summary| {
             self.identity_visibility_summary_cache = summary;
@@ -12362,6 +12419,7 @@ pub const DB = struct {
             return .{
                 .async_indexing = self.snapshotAsyncIndexingStats(),
                 .doc_set_planning = self.snapshotDocSetPlanningStats(),
+                .visibility = self.snapshotVisibilityStats(),
                 .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else .{},
                 .resolution = self.resolutionStageStats(),
                 .promotion = self.promotionStageStats(),
@@ -12423,6 +12481,11 @@ pub const DB = struct {
             .state_rows = raw.state_rows,
             .live_ordinals = raw.live_ordinals,
             .tombstone_ordinals = raw.tombstone_ordinals,
+            .visibility_chunk_size = doc_identity.visibility_chunk_size,
+            .visibility_chunks = raw.visibility_chunks,
+            .visibility_deleted_ordinals = raw.visibility_deleted_ordinals,
+            .visibility_mask_bytes = raw.visibility_mask_bytes,
+            .visibility_repair_count = raw.visibility_repair_count,
             .min_created_generation = raw.min_created_generation,
             .max_created_generation = raw.max_created_generation,
             .min_deleted_generation = raw.min_deleted_generation,
@@ -12467,6 +12530,11 @@ pub const DB = struct {
 
     fn snapshotDocSetPlanningStats(self: *DB) types.DocSetPlanningStats {
         return self.doc_set_planning_stats.snapshot();
+    }
+
+    fn snapshotVisibilityStats(self: *DB) types.VisibilityStats {
+        const cache_entries: u64 = if (self.nonvisible_doc_set_cache_set != null and !self.nonvisible_doc_set_cache_overflow) 1 else 0;
+        return self.visibility_runtime_stats.snapshot(cache_entries);
     }
 
     const DocIdentityCoverage = struct {
@@ -12629,6 +12697,7 @@ pub const DB = struct {
             .repair_issue_count_estimated = !repair_summary.ready,
             .doc_identity = identity_stats,
             .doc_set_planning = self.snapshotDocSetPlanningStats(),
+            .visibility = self.snapshotVisibilityStats(),
             .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else .{},
             .resolution = self.resolutionStageStats(),
             .promotion = self.promotionStageStats(),
@@ -12826,6 +12895,7 @@ pub const DB = struct {
             .repair_issue_count_estimated = !repair_summary.ready,
             .doc_identity = identity_stats,
             .doc_set_planning = self.snapshotDocSetPlanningStats(),
+            .visibility = self.snapshotVisibilityStats(),
             .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else try self.persistedEnrichmentStats(),
             .resolution = self.resolutionStageStats(),
             .promotion = self.promotionStageStats(),
@@ -12943,6 +13013,7 @@ pub const DB = struct {
             .repair_issue_count_estimated = !repair_summary.ready,
             .doc_identity = identity_stats,
             .doc_set_planning = self.snapshotDocSetPlanningStats(),
+            .visibility = self.snapshotVisibilityStats(),
             .resolution = self.resolutionStageStats(),
             .promotion = self.promotionStageStats(),
             .resolver_replay = try self.resolverReplayDiagnosticsLocked(alloc),
@@ -14174,18 +14245,26 @@ pub const DB = struct {
             lockAtomic(&self.nonvisible_doc_set_cache_mutex);
             defer self.nonvisible_doc_set_cache_mutex.unlock();
             if (self.nonvisible_doc_set_cache_generation == gen) {
-                if (self.nonvisible_doc_set_cache_overflow) return null;
+                if (self.nonvisible_doc_set_cache_overflow) {
+                    self.visibility_runtime_stats.recordCacheHit();
+                    return null;
+                }
                 if (self.nonvisible_doc_set_cache_set) |*cached| {
+                    self.visibility_runtime_stats.recordCacheHit();
                     return try doc_set.cloneAlloc(alloc, cached);
                 }
             }
         }
+        self.visibility_runtime_stats.recordCacheMiss();
+        const build_start_ns = platform_time.monotonicNs();
         var computed = (try doc_identity.nonVisibleDocSetFromStoreAlloc(
             alloc,
             self.core.store,
             generation,
             doc_identity.default_max_nonvisible_doc_set_entries,
         )) orelse {
+            self.visibility_runtime_stats.recordBuild(platform_time.monotonicNs() -| build_start_ns);
+            self.visibility_runtime_stats.recordOverflow();
             // Overflow (more non-visible docs than the budget) is also worth
             // remembering, so each query does not rescan before falling back
             // to the include-set path.
@@ -14197,6 +14276,7 @@ pub const DB = struct {
             self.nonvisible_doc_set_cache_overflow = true;
             return null;
         };
+        self.visibility_runtime_stats.recordBuild(platform_time.monotonicNs() -| build_start_ns);
         errdefer computed.deinit(alloc);
         if (doc_set.cloneAlloc(self.alloc, &computed)) |cloned| {
             lockAtomic(&self.nonvisible_doc_set_cache_mutex);
@@ -22246,6 +22326,11 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
         }
         identity_writes.deinit(ctx.alloc);
     }
+    var identity_visibility_deletes = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (identity_visibility_deletes.items) |key| ctx.alloc.free(key);
+        identity_visibility_deletes.deinit(ctx.alloc);
+    }
     var delete_keys = std.ArrayListUnmanaged([]const u8).empty;
     defer delete_keys.deinit(ctx.alloc);
     var timestamp_delete_keys = std.ArrayListUnmanaged([]const u8).empty;
@@ -22289,12 +22374,13 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
     defer derived_types.deinitDerivedBatch(ctx.alloc, &derived_batch);
     const sequence = ctx.store.reserveNextReplaySequence(1);
     derived_batch.sequence = sequence;
-    try doc_identity.appendBatchIdentityMetadataForNamespaceAlloc(
+    try doc_identity.appendBatchIdentityMetadataForNamespaceWithVisibilityDeletesAlloc(
         ctx.alloc,
         ctx.store,
         ctx.identity_namespace,
         sequence,
         &identity_writes,
+        &identity_visibility_deletes,
         &.{},
         keys,
     );
@@ -22308,6 +22394,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
         &owned_store_values,
         &owned_delete_keys,
     );
+    try delete_keys.appendSlice(ctx.alloc, identity_visibility_deletes.items);
     const replay_payload = try encodeChangeRecordPayload(ctx, derived_batch, sequence);
     defer ctx.alloc.free(replay_payload);
     try ctx.store.putBatchWithReplay(ctx.io, store_writes.items, delete_keys.items, .{
