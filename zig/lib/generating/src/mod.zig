@@ -649,11 +649,13 @@ test "generator config preserves sampling controls" {
 
     const encoded = try stringifyConfigAlloc(alloc, cfg);
     defer alloc.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"temperature\":0.25") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"top_p\":0.9") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"top_k\":40") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"frequency_penalty\":0.1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"presence_penalty\":0.2") != null);
+    var reparsed = try parseConfigFromSlice(alloc, encoded);
+    defer reparsed.deinit(alloc);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), reparsed.temperature orelse return error.TestUnexpectedResult, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9), reparsed.top_p orelse return error.TestUnexpectedResult, 0.0001);
+    try std.testing.expectEqual(@as(?i64, 40), reparsed.top_k);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.1), reparsed.frequency_penalty orelse return error.TestUnexpectedResult, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.2), reparsed.presence_penalty orelse return error.TestUnexpectedResult, 0.0001);
 }
 
 test "chain link round trips through generating openapi types" {

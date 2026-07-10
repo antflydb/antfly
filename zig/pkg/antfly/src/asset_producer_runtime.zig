@@ -854,7 +854,7 @@ fn antflyGenerateBatchRequestJsonAlloc(
         if (cfg.top_k) |top_k| try appendBatchI64Field(alloc, &out, "top_k", top_k);
         if (cfg.frequency_penalty) |frequency_penalty| try appendBatchFloatField(alloc, &out, "frequency_penalty", frequency_penalty);
         if (cfg.presence_penalty) |presence_penalty| try appendBatchFloatField(alloc, &out, "presence_penalty", presence_penalty);
-        try out.appendSlice(alloc, "}}}");
+        try out.appendSlice(alloc, "}}");
     }
     try out.appendSlice(alloc, "]}");
     return try out.toOwnedSlice(alloc);
@@ -1217,11 +1217,39 @@ fn expectAntflyGenerateBatchRequest(req: httpx.testing_mod.RequestInfo) !void {
     try std.testing.expect(std.mem.indexOf(u8, req.body, "\"content\":\"first prompt\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, req.body, "\"content\":\"second prompt\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, req.body, "\"max_tokens\":24") != null);
-    try std.testing.expect(std.mem.indexOf(u8, req.body, "\"temperature\":0.25") != null);
-    try std.testing.expect(std.mem.indexOf(u8, req.body, "\"top_p\":0.9") != null);
-    try std.testing.expect(std.mem.indexOf(u8, req.body, "\"top_k\":40") != null);
-    try std.testing.expect(std.mem.indexOf(u8, req.body, "\"frequency_penalty\":0.1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, req.body, "\"presence_penalty\":0.2") != null);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, req.body, .{});
+    defer parsed.deinit();
+    const requests = parsed.value.object.get("requests") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 2), requests.array.items.len);
+    for (requests.array.items) |item| {
+        const body = item.object.get("body") orelse return error.TestUnexpectedResult;
+        try expectJsonI64Field(body, "max_tokens", 24);
+        try expectJsonF32Field(body, "temperature", 0.25);
+        try expectJsonF32Field(body, "top_p", 0.9);
+        try expectJsonI64Field(body, "top_k", 40);
+        try expectJsonF32Field(body, "frequency_penalty", 0.1);
+        try expectJsonF32Field(body, "presence_penalty", 0.2);
+    }
+}
+
+fn expectJsonI64Field(value: std.json.Value, field: []const u8, expected: i64) !void {
+    const raw = value.object.get(field) orelse return error.TestUnexpectedResult;
+    const actual = switch (raw) {
+        .integer => |integer| integer,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(expected, actual);
+}
+
+fn expectJsonF32Field(value: std.json.Value, field: []const u8, expected: f32) !void {
+    const raw = value.object.get(field) orelse return error.TestUnexpectedResult;
+    const actual: f32 = switch (raw) {
+        .float => |float| @floatCast(float),
+        .integer => |integer| @floatFromInt(integer),
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectApproxEqAbs(expected, actual, 0.0001);
 }
 
 test "asset producer runtime batches compatible antfly generator requests" {
