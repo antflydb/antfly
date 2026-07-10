@@ -8331,6 +8331,7 @@ pub const ProvisionedTableWriteSource = struct {
             }
             const seed_create_table_writer = self.seed_create_table_writers and self.write_cache != null;
             const open_mode: ManagedDbOpenMode = if (seed_create_table_writer) .default else .startup_catch_up;
+            const effective_ha_mirror = haMirrorForManagedDbOpenMode(open_mode, self.ha_async_mirror);
             var opened: ?db_mod.DB = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
                 alloc,
                 path,
@@ -8348,6 +8349,10 @@ pub const ProvisionedTableWriteSource = struct {
                 .{
                     .inference_api_url = self.inference_api_url,
                     .drain_resolver_backfill = false,
+                    .ha_write_gate = self.ha_write_gate,
+                    .ha_async_effect_mirror = effective_ha_mirror,
+                    .ha_async_batch_mirror = effective_ha_mirror,
+                    .ha_async_metadata_mirror = effective_ha_mirror,
                 },
             );
             defer if (opened) |*db| db.close();
@@ -8996,17 +9001,16 @@ pub const ProvisionedTableWriteSource = struct {
                 if (read_cache_exclusive) |*exclusive| exclusive.deinit();
             }
             if (self.write_cache) |cache| {
-                const deadline_ns = platform_time.monotonicNs() + 30 * std.time.ns_per_s;
-                var cached = while (true) {
-                    break self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default, null, null) catch |err| switch (err) {
-                        error.LsmRootWriterAlreadyOpen => {
-                            if (platform_time.monotonicNs() >= deadline_ns) return err;
-                            sleepNs(10 * std.time.ns_per_ms);
-                            continue;
-                        },
-                        else => return err,
-                    };
-                };
+                const target_generation = self.visibleRootGeneration(group_id);
+                var cached = try self.getOrOpenCachedDbForLocalMutation(
+                    alloc,
+                    cache,
+                    path,
+                    group_id,
+                    target_generation,
+                    table_name,
+                    true,
+                );
                 defer cached.deinit(alloc);
                 return try exportPortableBackupShard(alloc, cached.db, plan.backup_root, plan.backup_id, group_id);
             }
@@ -9021,17 +9025,16 @@ pub const ProvisionedTableWriteSource = struct {
             defer {
                 if (read_cache_exclusive) |*exclusive| exclusive.deinit();
             }
-            const deadline_ns = platform_time.monotonicNs() + 30 * std.time.ns_per_s;
-            var cached = while (true) {
-                break self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default, null, null) catch |err| switch (err) {
-                    error.LsmRootWriterAlreadyOpen => {
-                        if (platform_time.monotonicNs() >= deadline_ns) return err;
-                        sleepNs(10 * std.time.ns_per_ms);
-                        continue;
-                    },
-                    else => return err,
-                };
-            };
+            const target_generation = self.visibleRootGeneration(group_id);
+            var cached = try self.getOrOpenCachedDbForLocalMutation(
+                alloc,
+                cache,
+                path,
+                group_id,
+                target_generation,
+                table_name,
+                true,
+            );
             defer cached.deinit(alloc);
 
             var native_snapshot = try prepareNativeBackupShardSnapshot(alloc, cached.db, path, group_id, plan);

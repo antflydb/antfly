@@ -1149,6 +1149,10 @@ pub const ApiHttpServer = struct {
         };
     }
 
+    pub fn setHAInternalExecutor(self: *ApiHttpServer, executor_value: ?http_common.RequestExecutor) void {
+        self.cfg.ha_internal_executor = executor_value;
+    }
+
     pub fn configuredInferenceAPIURL(self: *const ApiHttpServer) ?[]const u8 {
         const node_config = self.cfg.node_config orelse return null;
         return node_config.inference.api_url;
@@ -6560,7 +6564,10 @@ pub const ApiHttpServer = struct {
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.UnsupportedBackupMigrationState => return error.UnsupportedBackupMigrationState,
             error.UnsupportedMultiRangeTable => return error.UnsupportedMultiRangeTable,
-            else => return error.InternalFailure,
+            else => {
+                std.log.err("table backup failed table={s} backup_id={s} err={s}", .{ table_name, backup_id, @errorName(err) });
+                return error.InternalFailure;
+            },
         };
     }
 
