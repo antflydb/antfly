@@ -1329,18 +1329,40 @@ fn buildTransactionRecoveryIdentityExtraBatch(
         }
         identity_writes.deinit(alloc);
     }
-    try doc_identity.appendBatchIdentityMetadataForNamespaceAlloc(
+    var identity_visibility_deletes = std.ArrayListUnmanaged([]u8).empty;
+    errdefer {
+        for (identity_visibility_deletes.items) |key| alloc.free(key);
+        identity_visibility_deletes.deinit(alloc);
+    }
+    try doc_identity.appendBatchIdentityMetadataForNamespaceWithVisibilityDeletesAlloc(
         alloc,
         identity_ctx.store,
         identity_ctx.identity_namespace,
         identity_ctx.store.lastReplaySequence(0),
         &identity_writes,
+        &identity_visibility_deletes,
         identity_upserts.items,
         identity_deletes.items,
     );
-    if (identity_writes.items.len == 0) return .{};
+    if (identity_writes.items.len == 0 and identity_visibility_deletes.items.len == 0) return .{};
+    const owned_writes = try identity_writes.toOwnedSlice(alloc);
+    errdefer {
+        for (owned_writes) |item| {
+            alloc.free(@constCast(item.key));
+            alloc.free(@constCast(item.value));
+        }
+        if (owned_writes.len > 0) alloc.free(owned_writes);
+    }
+    const owned_deletes = try identity_visibility_deletes.toOwnedSlice(alloc);
+    errdefer {
+        for (owned_deletes) |key| {
+            alloc.free(key);
+        }
+        if (owned_deletes.len > 0) alloc.free(owned_deletes);
+    }
     return .{
-        .writes = try identity_writes.toOwnedSlice(alloc),
+        .writes = owned_writes,
+        .deletes = owned_deletes,
     };
 }
 
@@ -1350,6 +1372,9 @@ fn cleanupTransactionRecoveryIdentityExtraBatch(ctx: ?*anyopaque, batch: transac
     for (batch.writes) |item| {
         alloc.free(@constCast(item.key));
         alloc.free(@constCast(item.value));
+    }
+    for (batch.deletes) |key| {
+        alloc.free(@constCast(key));
     }
     if (batch.writes.len > 0) alloc.free(@constCast(batch.writes));
     if (batch.deletes.len > 0) alloc.free(@constCast(batch.deletes));
