@@ -1092,6 +1092,11 @@ pub const Backend = struct {
     background_io_denied_jobs: u64 = 0,
     background_io_oversized_jobs: u64 = 0,
     write_pressure_enforcing: bool = false,
+    last_wal_retention_enforce_ns: u64 = 0,
+    cached_wal_retention: ?wal_mod.RetentionStats = null,
+    cached_wal_retention_ns: u64 = 0,
+    cached_wal_replay_retention: ?wal_mod.RetentionStats = null,
+    cached_wal_replay_retention_ns: u64 = 0,
     remembered_compaction: ?compaction_mod.RememberedCompaction = null,
     open_stats: OpenStats = .{},
     write_stats: WriteStats = .{},
@@ -1572,7 +1577,7 @@ pub const Backend = struct {
         stats.backend_lock_wait_ns = self.backend_lock_wait_ns.load(.monotonic);
         stats.backend_lock_max_wait_ns = self.backend_lock_max_wait_ns.load(.monotonic);
         if (include_retention and self.options.wal_enabled and self.root_dir != null) {
-            const wal_retention = wal_mod.snapshotRetention(self.storage.?, self.allocator, self.root_dir.?) catch wal_mod.RetentionStats{};
+            const wal_retention = self.cachedWalRetentionLocked() catch wal_mod.RetentionStats{};
             stats.wal_retained_segments = wal_retention.segments;
             stats.wal_retained_bytes = wal_retention.bytes;
             stats.wal_checkpoint_oldest_retained_segment = wal_retention.oldest_retained_segment;
@@ -1581,7 +1586,7 @@ pub const Backend = struct {
             if (wal_retention.current_segment > wal_retention.oldest_retained_segment) {
                 stats.wal_checkpoint_lag_segments = wal_retention.current_segment - wal_retention.oldest_retained_segment;
             }
-            const replay_retention = wal_mod.snapshotReplayRetention(self.storage.?, self.allocator, self.root_dir.?) catch wal_mod.RetentionStats{};
+            const replay_retention = self.cachedWalReplayRetentionLocked() catch wal_mod.RetentionStats{};
             stats.wal_retained_segments += replay_retention.segments;
             stats.wal_retained_bytes += replay_retention.bytes;
             stats.wal_replay_retained_segments = replay_retention.segments;
@@ -3920,7 +3925,56 @@ pub const Backend = struct {
     fn snapshotWalRetentionForPressureLocked(self: *Backend) !?wal_mod.RetentionStats {
         if (!self.walRetentionPressureEnabled()) return null;
         if (!self.options.wal_enabled or self.root_dir == null or self.options.backend.read_only) return null;
-        return try wal_mod.snapshotRetention(self.storage.?, self.allocator, self.root_dir.?);
+        return try self.cachedWalRetentionLocked();
+    }
+
+    // wal.snapshotRetention re-reads the checkpoint index and current
+    // segment and fstats every retained segment. Its callers (write-pressure
+    // enforcement, maintenance scoring, stats snapshots) run on every
+    // maintenance step under the backend lock, which starves writers and
+    // async index appliers during sustained ingest. Serve all of them from a
+    // short-lived cache; retention limits are approximate by nature, so
+    // 250ms staleness is immaterial. Paths that need to observe their own
+    // progress (the pressure flush loop) invalidate explicitly.
+    const wal_retention_cache_ttl_ns: u64 = 250 * std.time.ns_per_ms;
+
+    fn cachedWalRetentionLocked(self: *Backend) !wal_mod.RetentionStats {
+        const now_ns = self.writeStatsNowNs();
+        if (self.cached_wal_retention) |cached| {
+            if (now_ns -| self.cached_wal_retention_ns < wal_retention_cache_ttl_ns) return cached;
+        }
+        const fresh = try wal_mod.snapshotRetention(self.storage.?, self.allocator, self.root_dir.?);
+        self.cached_wal_retention = fresh;
+        self.cached_wal_retention_ns = now_ns;
+        return fresh;
+    }
+
+    fn cachedWalReplayRetentionLocked(self: *Backend) !wal_mod.RetentionStats {
+        const now_ns = self.writeStatsNowNs();
+        if (self.cached_wal_replay_retention) |cached| {
+            if (now_ns -| self.cached_wal_replay_retention_ns < wal_retention_cache_ttl_ns) return cached;
+        }
+        const fresh = try wal_mod.snapshotReplayRetention(self.storage.?, self.allocator, self.root_dir.?);
+        self.cached_wal_replay_retention = fresh;
+        self.cached_wal_replay_retention_ns = now_ns;
+        return fresh;
+    }
+
+    fn invalidateWalRetentionCacheLocked(self: *Backend) void {
+        self.cached_wal_retention = null;
+        self.cached_wal_replay_retention = null;
+    }
+
+    // Retention enforcement rotates memtables and loops over flushes; even
+    // with cached retention stats it is too heavy to run on every
+    // maintenance step. Once per interval is plenty for an approximate
+    // limit.
+    fn walRetentionEnforceDue(self: *Backend) bool {
+        const interval_ns: u64 = 250 * std.time.ns_per_ms;
+        const now_ns = self.writeStatsNowNs();
+        if (now_ns -| self.last_wal_retention_enforce_ns < interval_ns) return false;
+        self.last_wal_retention_enforce_ns = now_ns;
+        return true;
     }
 
     fn walRetentionOverSoftLimit(self: *const Backend, retention: wal_mod.RetentionStats) bool {
@@ -4057,6 +4111,7 @@ pub const Backend = struct {
     }
 
     fn enforceWalRetentionHardPressure(self: *Backend) anyerror!void {
+        if (!self.walRetentionEnforceDue()) return;
         var retention = try self.snapshotWalRetentionForPressureLocked() orelse return;
         if (!self.walRetentionOverHardLimit(retention)) return;
 
@@ -4073,6 +4128,9 @@ pub const Backend = struct {
         while (self.activeImmutableMemtableCount() > 0 and self.walRetentionOverHardLimit(retention)) {
             if (!try self.flushOldestImmutableMemtable()) break;
             flushes += 1;
+            // Flushes advance the checkpoint; re-read fresh so the loop sees
+            // its own progress instead of the cached snapshot.
+            self.invalidateWalRetentionCacheLocked();
             retention = try self.snapshotWalRetentionForPressureLocked() orelse break;
         }
 
