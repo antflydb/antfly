@@ -818,6 +818,7 @@ pub const HttpHost = struct {
         // Keep each asynchronous peer lane on an independent I/O pool so one
         // canceled request cannot interrupt another lane's connect syscall.
         transport_config.driver.isolated_worker_executors = executor != null;
+        transport_config.driver.isolated_worker_executor_config = cfg.executor;
         transport_stack.* = try transport.HttpTransportStack.init(
             alloc,
             transport_config,

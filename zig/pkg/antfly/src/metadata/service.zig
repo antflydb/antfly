@@ -4774,6 +4774,8 @@ fn collectLocalGroupStatusReport(
         .local_leader = serviceGroupLocalLeader(service, group_id),
         .local_voter = membership.local_voter,
         .voter_count = membership.voter_count,
+        .voter_set_known = membership.voter_set_known,
+        .voter_set_fingerprint = membership.voter_set_fingerprint,
         .joint_consensus = membership.joint_consensus,
         .transition_pending = readiness.transition_pending,
         .replay_required = readiness.replay_required,
@@ -4886,7 +4888,15 @@ fn raftRoleName(role: raft_engine.core.types.StateRole) []const u8 {
     };
 }
 
-fn serviceGroupMembership(service: anytype, group_id: u64) struct { local_voter: bool = false, voter_count: u16 = 0, joint_consensus: bool = false } {
+const ServiceGroupMembership = struct {
+    local_voter: bool = false,
+    voter_count: u16 = 0,
+    voter_set_known: bool = false,
+    voter_set_fingerprint: metadata_table_manager.VoterSetFingerprint = [_]u8{0} ** metadata_table_manager.voter_set_fingerprint_len,
+    joint_consensus: bool = false,
+};
+
+fn serviceGroupMembership(service: anytype, group_id: u64) ServiceGroupMembership {
     const Service = @TypeOf(service);
     if (Service == *MetadataService) {
         const raft_status = service.raft.host.host.raftStatus(group_id) orelse return .{};
@@ -4900,6 +4910,8 @@ fn serviceGroupMembership(service: anytype, group_id: u64) struct { local_voter:
         return .{
             .local_voter = local_voter,
             .voter_count = @intCast(raft_status.conf_state.voters.len),
+            .voter_set_known = true,
+            .voter_set_fingerprint = metadata_table_manager.voterSetFingerprint(raft_status.conf_state.voters, null),
             .joint_consensus = raft_status.conf_state.voters_outgoing.len > 0,
         };
     }
@@ -4915,6 +4927,8 @@ fn serviceGroupMembership(service: anytype, group_id: u64) struct { local_voter:
         return .{
             .local_voter = local_voter,
             .voter_count = @intCast(raft_status.conf_state.voters.len),
+            .voter_set_known = true,
+            .voter_set_fingerprint = metadata_table_manager.voterSetFingerprint(raft_status.conf_state.voters, null),
             .joint_consensus = raft_status.conf_state.voters_outgoing.len > 0,
         };
     }

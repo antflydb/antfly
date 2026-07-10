@@ -42,7 +42,6 @@ pub const StdHttpExecutor = struct {
     idle_cond: std.Io.Condition,
     closing: bool,
     in_flight: usize,
-    timeout_mutex: std.Io.Mutex,
     client_mutex: std.Io.Mutex,
     reuse_mutex: std.Io.Mutex,
     requests_on_current_connection: u32,
@@ -60,7 +59,6 @@ pub const StdHttpExecutor = struct {
             .idle_cond = .init,
             .closing = false,
             .in_flight = 0,
-            .timeout_mutex = .init,
             .client_mutex = .init,
             .reuse_mutex = .init,
             .requests_on_current_connection = 0,
@@ -84,7 +82,6 @@ pub const StdHttpExecutor = struct {
             .idle_cond = .init,
             .closing = false,
             .in_flight = 0,
-            .timeout_mutex = .init,
             .client_mutex = .init,
             .reuse_mutex = .init,
             .requests_on_current_connection = 0,
@@ -131,6 +128,9 @@ pub const StdHttpExecutor = struct {
 
     fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
         const self: *StdHttpExecutor = @ptrCast(@alignCast(ptr));
+        try self.beginRequest();
+        defer self.endRequest();
+
         if (req.timeout_ms) |timeout_ms| {
             return try self.executeWithTimeout(alloc, req, timeout_ms);
         }
@@ -139,10 +139,6 @@ pub const StdHttpExecutor = struct {
 
     fn executeWithTimeout(self: *StdHttpExecutor, alloc: std.mem.Allocator, req: common.HttpRequest, timeout_ms: u32) !common.HttpResponse {
         if (timeout_ms == 0) return error.Timeout;
-
-        const io = self.io_impl.io();
-        self.timeout_mutex.lockUncancelable(io);
-        defer self.timeout_mutex.unlock(io);
 
         const RequestResult = anyerror!common.HttpResponse;
         const TimeoutResult = anyerror!void;
@@ -173,6 +169,7 @@ pub const StdHttpExecutor = struct {
             }
         };
 
+        const io = self.io_impl.io();
         var select_buffer: [2]SelectResult = undefined;
         var select = std.Io.Select(SelectResult).init(io, &select_buffer);
         try select.concurrent(.request, Task.requestTask, .{ self, alloc, req });
@@ -199,9 +196,6 @@ pub const StdHttpExecutor = struct {
     }
 
     fn executeDirect(self: *StdHttpExecutor, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
-        try self.beginRequest();
-        defer self.endRequest();
-
         const io = self.io_impl.io();
         if (self.cfg.keep_alive) self.client_mutex.lockUncancelable(io);
         defer if (self.cfg.keep_alive) self.client_mutex.unlock(io);

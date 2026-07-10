@@ -835,6 +835,93 @@ test "std http executor enforces request timeout while waiting for response" {
     }));
 }
 
+test "std http executor deinit drains the complete timed operation" {
+    const std_http_executor = @import("std_http_executor.zig");
+
+    const App = struct {
+        entered: std.atomic.Value(bool) = .init(false),
+
+        fn iface(self: *@This()) common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, _: common.HttpRequest) !common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.entered.store(true, .release);
+            sleepMs(50);
+            return .{
+                .status = 200,
+                .body = try alloc.dupe(u8, "ok"),
+            };
+        }
+    };
+
+    const RequestThread = struct {
+        executor: common.RequestExecutor,
+        uri: []const u8,
+        failed: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            var response = self.executor.execute(std.heap.page_allocator, .{
+                .method = .GET,
+                .uri = self.uri,
+                .timeout_ms = 1_000,
+            }) catch {
+                self.failed.store(true, .release);
+                return;
+            };
+            response.deinit(std.heap.page_allocator);
+        }
+    };
+
+    const DeinitThread = struct {
+        executor: *std_http_executor.StdHttpExecutor,
+        done: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.executor.deinit();
+            self.done.store(true, .release);
+        }
+    };
+
+    var app = App{};
+    var listener = StdHttpListener.init(std.testing.allocator, .{}, app.iface());
+    defer listener.deinit();
+    try listener.start();
+
+    const base_uri = try listener.baseUri(std.testing.allocator);
+    defer std.testing.allocator.free(base_uri);
+
+    var executor = std_http_executor.StdHttpExecutor.init(std.heap.page_allocator, .{});
+    var request = RequestThread{ .executor = executor.executor(), .uri = base_uri };
+    const request_thread = try std.Thread.spawn(.{}, RequestThread.run, .{&request});
+    defer request_thread.join();
+
+    var entered = false;
+    for (0..1_000) |_| {
+        if (app.entered.load(.acquire)) {
+            entered = true;
+            break;
+        }
+        sleepMs(1);
+    }
+    try std.testing.expect(entered);
+
+    var shutdown = DeinitThread{ .executor = &executor };
+    const shutdown_thread = try std.Thread.spawn(.{}, DeinitThread.run, .{&shutdown});
+    defer shutdown_thread.join();
+
+    for (0..1_000) |_| {
+        if (shutdown.done.load(.acquire)) break;
+        sleepMs(1);
+    }
+    try std.testing.expect(shutdown.done.load(.acquire));
+    try std.testing.expect(!request.failed.load(.acquire));
+}
+
 test "std http listener and executor round-trip snapshot routes" {
     const raft_engine = @import("raft_engine");
     const http_server = @import("../../raft/transport/http_server.zig");
@@ -1659,7 +1746,7 @@ test "std http listener stop returns while saturated with a headerless connectio
     try std.testing.expect(stopped);
 }
 
-test "std http listener connection handoff serves fast request while slow request is blocked" {
+test "std http executor runs timed requests concurrently" {
     const std_http_executor = @import("std_http_executor.zig");
 
     const App = struct {
@@ -1712,6 +1799,7 @@ test "std http listener connection handoff serves fast request while slow reques
             var response = self.executor.execute(std.heap.page_allocator, .{
                 .method = .GET,
                 .uri = self.uri,
+                .timeout_ms = 5_000,
             }) catch {
                 self.failed.store(true, .release);
                 self.done.store(true, .release);

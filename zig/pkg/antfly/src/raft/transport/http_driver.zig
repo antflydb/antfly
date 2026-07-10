@@ -30,6 +30,7 @@ pub const HttpDriverConfig = struct {
     async_send_retry_max_ms: u64 = 1_000,
     async_send_worker_count: u32 = 4,
     isolated_worker_executors: bool = false,
+    isolated_worker_executor_config: common_http.StdHttpExecutorConfig = .{},
 };
 
 pub const AsyncSendMetricsSnapshot = struct {
@@ -176,7 +177,9 @@ pub const HttpFrameDriver = struct {
         try self.in_flight_peers.ensureTotalCapacity(self.alloc, self.cfg.async_send_worker_count);
         if (self.cfg.isolated_worker_executors) {
             self.isolated_executors = try self.alloc.alloc(common_http.StdHttpExecutor, self.cfg.async_send_worker_count);
-            for (self.isolated_executors) |*executor| executor.initInPlace(self.alloc, .{});
+            for (self.isolated_executors) |*executor| {
+                executor.initInPlace(self.alloc, self.cfg.isolated_worker_executor_config);
+            }
         }
         errdefer self.deinitIsolatedExecutors();
         self.threads = try self.alloc.alloc(std.Thread, self.cfg.async_send_worker_count);
@@ -620,4 +623,42 @@ test "http frame driver isolates blocked peers without reordering a peer lane" {
     // peer 3 progresses independently.
     try std.testing.expectEqual(@as(usize, 2), executor.callCount());
     executor.release();
+}
+
+test "http frame driver propagates isolated worker executor configuration" {
+    const UnusedExecutor = struct {
+        fn iface(self: *@This()) common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: common.HttpRequest) !common.HttpResponse {
+            return error.UnexpectedRequest;
+        }
+    };
+
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    var unused = UnusedExecutor{};
+    const executor_config: common_http.StdHttpExecutorConfig = .{
+        .read_buffer_size = 12_345,
+        .write_buffer_size = 2_345,
+        .max_response_bytes = 65_535,
+        .keep_alive = true,
+        .max_requests_per_connection = 17,
+    };
+    var driver: HttpFrameDriver = undefined;
+    try driver.initAsyncInPlace(std.testing.allocator, .{
+        .async_send_worker_count = 1,
+        .isolated_worker_executors = true,
+        .isolated_worker_executor_config = executor_config,
+    }, unused.iface(), io_impl.io());
+    defer driver.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), driver.isolated_executors.len);
+    const actual = driver.isolated_executors[0].cfg;
+    try std.testing.expectEqual(executor_config.read_buffer_size, actual.read_buffer_size);
+    try std.testing.expectEqual(executor_config.write_buffer_size, actual.write_buffer_size);
+    try std.testing.expectEqual(executor_config.max_response_bytes, actual.max_response_bytes);
+    try std.testing.expectEqual(executor_config.keep_alive, actual.keep_alive);
+    try std.testing.expectEqual(executor_config.max_requests_per_connection, actual.max_requests_per_connection);
 }

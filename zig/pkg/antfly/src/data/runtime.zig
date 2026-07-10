@@ -1872,6 +1872,8 @@ pub const GroupLeadershipSource = struct {
 pub const GroupMembership = struct {
     local_voter: bool = false,
     voter_count: u16 = 0,
+    voter_set_known: bool = false,
+    voter_set_fingerprint: antfly.metadata.table_manager.VoterSetFingerprint = [_]u8{0} ** antfly.metadata.table_manager.voter_set_fingerprint_len,
     joint_consensus: bool = false,
 };
 
@@ -1905,6 +1907,8 @@ pub const GroupMembershipSource = struct {
                         return .{
                             .local_voter = local_voter,
                             .voter_count = @intCast(raft_status.conf_state.voters.len),
+                            .voter_set_known = true,
+                            .voter_set_fingerprint = antfly.metadata.table_manager.voterSetFingerprint(raft_status.conf_state.voters, null),
                             .joint_consensus = raft_status.conf_state.voters_outgoing.len > 0,
                         };
                     }
@@ -1931,6 +1935,8 @@ pub const GroupMembershipSource = struct {
                         return .{
                             .local_voter = local_voter,
                             .voter_count = @intCast(raft_status.conf_state.voters.len),
+                            .voter_set_known = true,
+                            .voter_set_fingerprint = antfly.metadata.table_manager.voterSetFingerprint(raft_status.conf_state.voters, null),
                             .joint_consensus = raft_status.conf_state.voters_outgoing.len > 0,
                         };
                     }
@@ -7585,6 +7591,8 @@ fn localGroupStatusFingerprint(
         const membership = if (group_membership_source) |source| source.membership(group_id) else GroupMembership{};
         hasher.update(std.mem.asBytes(&membership.local_voter));
         hasher.update(std.mem.asBytes(&membership.voter_count));
+        hasher.update(std.mem.asBytes(&membership.voter_set_known));
+        hasher.update(&membership.voter_set_fingerprint);
         hasher.update(std.mem.asBytes(&membership.joint_consensus));
     }
     for (tables) |table| hasher.update(std.mem.asBytes(&table.table_id));
@@ -7656,6 +7664,8 @@ fn hashGroupStatus(hasher: *std.hash.Wyhash, status: antfly.metadata.table_manag
     hasher.update(std.mem.asBytes(&status.local_leader));
     hasher.update(std.mem.asBytes(&status.local_voter));
     hasher.update(std.mem.asBytes(&status.voter_count));
+    hasher.update(std.mem.asBytes(&status.voter_set_known));
+    hasher.update(&status.voter_set_fingerprint);
     hasher.update(std.mem.asBytes(&status.joint_consensus));
     hasher.update(std.mem.asBytes(&status.transition_pending));
     hasher.update(std.mem.asBytes(&status.replay_required));
@@ -8082,6 +8092,8 @@ fn collectLocalGroupStatusFromDb(
         .local_leader = if (group_leadership_source) |source| source.isLocalLeader(group_id) else false,
         .local_voter = membership.local_voter,
         .voter_count = membership.voter_count,
+        .voter_set_known = membership.voter_set_known,
+        .voter_set_fingerprint = membership.voter_set_fingerprint,
         .joint_consensus = membership.joint_consensus,
         .transition_pending = readiness.transition_pending,
         .replay_required = readiness.replay_required,
@@ -8109,6 +8121,8 @@ fn collectRaftOnlyLocalGroupStatus(
         .local_leader = if (group_leadership_source) |source| source.isLocalLeader(group_id) else false,
         .local_voter = membership.local_voter,
         .voter_count = membership.voter_count,
+        .voter_set_known = membership.voter_set_known,
+        .voter_set_fingerprint = membership.voter_set_fingerprint,
         .joint_consensus = membership.joint_consensus,
     };
 }
@@ -8229,6 +8243,8 @@ fn collectLocalGroupStatusFromRuntimeStatus(
         .local_leader = if (group_leadership_source) |source| source.isLocalLeader(group_id) else fallback.local_leader,
         .local_voter = membership.local_voter,
         .voter_count = membership.voter_count,
+        .voter_set_known = membership.voter_set_known,
+        .voter_set_fingerprint = membership.voter_set_fingerprint,
         .joint_consensus = membership.joint_consensus,
         .transition_pending = readiness.transition_pending,
         .replay_required = readiness.replay_required,

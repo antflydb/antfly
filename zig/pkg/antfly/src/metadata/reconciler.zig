@@ -934,7 +934,7 @@ fn relocationTargetCutoverReady(current: CurrentMetadataState, intent: raft_reco
         // authoritative while a data transition is pending.
         if (status.local_voter and
             !status.joint_consensus and
-            @as(usize, status.voter_count) >= intent.peer_node_ids.len)
+            voterSetMatchesIntent(status, intent))
         {
             return true;
         }
@@ -998,7 +998,7 @@ fn compactShrinkSafeToRemove(
         if (desired.record.local_node_id == source.record.local_node_id) continue;
         const current_target = findPlacementIntent(current.placement_intents, desired.record.group_id, desired.record.local_node_id) orelse return false;
         if (current_target.serving_state != .serving) return false;
-        if (!placementReadyForCompactShrink(current, current_target, desired_count)) return false;
+        if (!placementReadyForCompactShrink(current, desired, desired_count)) return false;
         survivors += 1;
     }
     if (survivors != desired_count) return false;
@@ -1023,12 +1023,24 @@ fn placementReadyForCompactShrink(
     for (store.group_statuses) |status| {
         if (status.group_id != target.record.group_id) continue;
         if (!status.local_voter) return false;
-        if (@as(usize, status.voter_count) < desired_count) return false;
+        if (@as(usize, status.voter_count) != desired_count) return false;
         if (status.joint_consensus or status.transition_pending) return false;
         if (status.replay_required and !status.replay_caught_up) return false;
+        if (!voterSetMatchesIntent(status, target)) return false;
         return true;
     }
     return false;
+}
+
+fn voterSetMatchesIntent(
+    status: table_manager.GroupStatusReport,
+    intent: raft_reconciler.PlacementIntent,
+) bool {
+    if (!status.voter_set_known) return false;
+    const expected_count = table_manager.normalizedVoterCount(intent.peer_node_ids, intent.record.local_node_id);
+    if (@as(usize, status.voter_count) != expected_count) return false;
+    const expected = table_manager.voterSetFingerprint(intent.peer_node_ids, intent.record.local_node_id);
+    return std.mem.eql(u8, &status.voter_set_fingerprint, &expected);
 }
 
 fn emptyGroupSourceSafeToRemove(
@@ -2712,10 +2724,41 @@ test "metadata reconciler promotes ordinary relocation after stable raft members
             .empty = false,
             .local_voter = true,
             .voter_count = 3,
+            .voter_set_known = true,
+            .voter_set_fingerprint = table_manager.voterSetFingerprint(&.{ 101, 102, 104 }, null),
         }})[0..]),
     }};
 
     try std.testing.expect(relocationTargetCutoverReady(.{ .stores = &stores }, intent));
+}
+
+test "metadata reconciler rejects stable raft membership with the wrong voter set" {
+    const intent: raft_reconciler.PlacementIntent = .{
+        .record = .{ .group_id = 2242, .replica_id = 3, .local_node_id = 104 },
+        .peer_node_ids = &.{ 101, 102, 104 },
+        .serving_state = .replaying,
+        .relocation_doc_count_watermark = 12,
+        .relocation_disk_bytes_watermark = 10_052,
+    };
+    const stores = [_]table_manager.StoreRecord{.{
+        .store_id = 104,
+        .node_id = 104,
+        .role = "data",
+        .health_class = "healthy",
+        .live = true,
+        .group_statuses = @constCast((&[_]table_manager.GroupStatusReport{.{
+            .group_id = 2242,
+            .doc_count = 12,
+            .disk_bytes = 8_192,
+            .empty = false,
+            .local_voter = true,
+            .voter_count = 3,
+            .voter_set_known = true,
+            .voter_set_fingerprint = table_manager.voterSetFingerprint(&.{ 101, 103, 104 }, null),
+        }})[0..]),
+    }};
+
+    try std.testing.expect(!relocationTargetCutoverReady(.{ .stores = &stores }, intent));
 }
 
 test "metadata reconciler retains a compact shrink source until a survivor leads" {
@@ -2759,6 +2802,8 @@ test "metadata reconciler retains a compact shrink source until a survivor leads
                 .empty = false,
                 .local_voter = true,
                 .voter_count = 3,
+                .voter_set_known = true,
+                .voter_set_fingerprint = table_manager.voterSetFingerprint(&.{ 101, 102, 103 }, null),
             }})[0..]),
             .runtime_statuses = @constCast((&[_]table_manager.RuntimeGroupStatusReport{.{
                 .table_id = 225,
@@ -2781,7 +2826,9 @@ test "metadata reconciler retains a compact shrink source until a survivor leads
                 .disk_bytes = 1024,
                 .empty = false,
                 .local_voter = true,
-                .voter_count = 3,
+                .voter_count = 2,
+                .voter_set_known = true,
+                .voter_set_fingerprint = table_manager.voterSetFingerprint(&.{ 102, 103 }, null),
             }})[0..]),
         },
         .{
@@ -2796,7 +2843,9 @@ test "metadata reconciler retains a compact shrink source until a survivor leads
                 .disk_bytes = 2048,
                 .empty = false,
                 .local_voter = true,
-                .voter_count = 3,
+                .voter_count = 2,
+                .voter_set_known = true,
+                .voter_set_fingerprint = table_manager.voterSetFingerprint(&.{ 102, 103 }, null),
             }})[0..]),
         },
     };
@@ -2808,8 +2857,8 @@ test "metadata reconciler retains a compact shrink source until a survivor leads
         .leader_known = true,
         .leader_store_id = 101,
         .voter_count_known = true,
-        .voter_count = 3,
-        .healthy_voter_reports = 3,
+        .voter_count = 2,
+        .healthy_voter_reports = 2,
     }};
     const candidates = [_]@import("state.zig").CandidatePlacementInfo{
         .{ .node_id = 102, .store_id = 102, .role = "data", .failure_domain = "rack-b", .retain_current = true },
@@ -2865,7 +2914,9 @@ test "metadata reconciler compact shrink uses stable raft membership instead of 
         .disk_bytes = 2048,
         .empty = false,
         .local_voter = true,
-        .voter_count = 3,
+        .voter_count = 2,
+        .voter_set_known = true,
+        .voter_set_fingerprint = table_manager.voterSetFingerprint(&.{ 102, 103 }, null),
     };
     const stores = [_]table_manager.StoreRecord{
         .{
@@ -2898,7 +2949,9 @@ test "metadata reconciler compact shrink uses stable raft membership instead of 
                 .empty = false,
                 .local_leader = true,
                 .local_voter = true,
-                .voter_count = 3,
+                .voter_count = 2,
+                .voter_set_known = true,
+                .voter_set_fingerprint = table_manager.voterSetFingerprint(&.{ 102, 103 }, null),
             }})[0..]),
         },
         .{
